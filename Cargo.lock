@@ -598,6 +598,7 @@ dependencies = [
  "async-trait",
  "bytes",
  "clap",
+ "libc",
  "talon-core",
  "tokio",
  "tracing",
