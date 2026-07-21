@@ -11,6 +11,7 @@ description = "Shared types, traits, and protocol definitions for Talon distribu
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
