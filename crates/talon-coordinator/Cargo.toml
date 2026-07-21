@@ -1,0 +1,22 @@
+[package]
+name = "talon-coordinator"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Cluster coordinator: metadata, membership, and object placement for Talon"
+
+[[bin]]
+name = "talon-coordinator"
+path = "src/main.rs"
+
+[dependencies]
+talon-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+serde.workspace = true
+clap.workspace = true
+async-trait.workspace = true

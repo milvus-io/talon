@@ -1,0 +1,22 @@
+[package]
+name = "talon-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Worker node: stores and serves cached object data for Talon"
+
+[[bin]]
+name = "talon-worker"
+path = "src/main.rs"
+
+[dependencies]
+talon-core.workspace = true
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+bytes.workspace = true
+async-trait.workspace = true
+clap.workspace = true
