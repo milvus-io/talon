@@ -16,6 +16,19 @@ pub enum Error {
     #[error("node unavailable: {0}")]
     NodeUnavailable(String),
 
+    /// A backend (origin store) operation failed.
+    #[error("backend error: {0}")]
+    Backend(String),
+
+    /// The source version/etag did not match the expected value.
+    #[error("version mismatch: expected {expected}, found {found}")]
+    VersionMismatch {
+        /// The version the caller expected.
+        expected: String,
+        /// The version the backend reported.
+        found: String,
+    },
+
     /// Serialization or deserialization failed.
     #[error("serialization error: {0}")]
     Serialization(String),

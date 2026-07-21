@@ -1,15 +1,20 @@
 //! A simple in-memory [`ObjectStore`] implementation.
+//!
+//! This backs the optional L1 memory path and tests. It fully implements the
+//! byte-oriented methods (`get_bytes`/`put`/`delete`/`contains`); the zero-copy
+//! fd methods (`get_block`/`get_page`/`get_range`) are wired in the dedicated
+//! worker-store PR and currently report the block/page as absent.
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::HashMap;
 use std::sync::RwLock;
-use talon_core::{CacheKey, Error, ObjectStore, Result};
+use talon_core::{BlockHandle, BlockId, Error, ObjectStore, PageIndex, Result};
 
 /// An in-memory object store backed by a hash map.
 #[derive(Default)]
 pub struct MemoryStore {
-    inner: RwLock<HashMap<CacheKey, Bytes>>,
+    inner: RwLock<HashMap<BlockId, Bytes>>,
 }
 
 impl MemoryStore {
@@ -18,7 +23,7 @@ impl MemoryStore {
         Self::default()
     }
 
-    /// Return the number of stored objects.
+    /// Return the number of stored blocks.
     pub fn len(&self) -> usize {
         self.inner.read().unwrap().len()
     }
@@ -31,22 +36,35 @@ impl MemoryStore {
 
 #[async_trait]
 impl ObjectStore for MemoryStore {
-    async fn get(&self, key: &CacheKey) -> Result<Bytes> {
+    async fn get_block(&self, id: &BlockId) -> Result<BlockHandle> {
+        // Zero-copy fd path is provided by the NVMe-backed worker store.
+        Err(Error::NotFound(id.to_string()))
+    }
+
+    async fn get_page(&self, id: &BlockId, page: PageIndex) -> Result<BlockHandle> {
+        Err(Error::NotFound(format!("{id} page {}", page.0)))
+    }
+
+    async fn get_range(&self, id: &BlockId, _offset: u64, _len: u64) -> Result<Vec<BlockHandle>> {
+        Err(Error::NotFound(id.to_string()))
+    }
+
+    async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
         self.inner
             .read()
             .unwrap()
-            .get(key)
+            .get(id)
             .cloned()
-            .ok_or_else(|| Error::NotFound(key.to_string()))
+            .ok_or_else(|| Error::NotFound(id.to_string()))
     }
 
-    async fn put(&self, key: &CacheKey, value: Bytes) -> Result<()> {
-        self.inner.write().unwrap().insert(key.clone(), value);
+    async fn put(&self, id: &BlockId, value: Bytes) -> Result<()> {
+        self.inner.write().unwrap().insert(id.clone(), value);
         Ok(())
     }
 
-    async fn delete(&self, key: &CacheKey) -> Result<()> {
-        self.inner.write().unwrap().remove(key);
+    async fn delete(&self, id: &BlockId) -> Result<()> {
+        self.inner.write().unwrap().remove(id);
         Ok(())
     }
 }
@@ -54,17 +72,27 @@ impl ObjectStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use talon_core::{Backend, ObjectId, Version};
+
+    fn block(name: &str) -> BlockId {
+        BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", name),
+            0,
+            256 * 1024 * 1024,
+            Version::new("v1"),
+        )
+    }
 
     #[tokio::test]
     async fn put_get_delete_roundtrip() {
         let store = MemoryStore::new();
-        let key = CacheKey::new("hello");
+        let id = block("hello");
 
-        store.put(&key, Bytes::from_static(b"world")).await.unwrap();
-        assert_eq!(store.get(&key).await.unwrap(), Bytes::from_static(b"world"));
-        assert!(store.contains(&key).await.unwrap());
+        store.put(&id, Bytes::from_static(b"world")).await.unwrap();
+        assert_eq!(store.get_bytes(&id).await.unwrap(), Bytes::from_static(b"world"));
+        assert!(store.contains(&id).await.unwrap());
 
-        store.delete(&key).await.unwrap();
-        assert!(!store.contains(&key).await.unwrap());
+        store.delete(&id).await.unwrap();
+        assert!(!store.contains(&id).await.unwrap());
     }
 }
