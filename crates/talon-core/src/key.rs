@@ -93,7 +93,11 @@ pub struct ObjectId {
 
 impl ObjectId {
     /// Create a new object id.
-    pub fn new(backend: Backend, bucket: impl Into<String>, object_path: impl Into<String>) -> Self {
+    pub fn new(
+        backend: Backend,
+        bucket: impl Into<String>,
+        object_path: impl Into<String>,
+    ) -> Self {
         Self {
             backend,
             bucket: bucket.into(),
@@ -129,7 +133,11 @@ impl ObjectId {
             .next()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Other(format!("missing object path in path: {path}")))?;
-        Ok(ObjectId::new(prefix.parse::<Backend>()?, bucket, object_path))
+        Ok(ObjectId::new(
+            prefix.parse::<Backend>()?,
+            bucket,
+            object_path,
+        ))
     }
 }
 
