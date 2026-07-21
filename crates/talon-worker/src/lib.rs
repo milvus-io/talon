@@ -10,6 +10,7 @@ pub mod eviction;
 pub mod index;
 pub mod loader;
 pub mod memory_store;
+pub mod miss;
 pub mod paged_store;
 pub mod staging;
 
@@ -19,5 +20,6 @@ pub use eviction::{CacheUnit, Lru};
 pub use index::{BlockIndex, Presence};
 pub use loader::{LoadOutcome, LoadTask, LoaderPool};
 pub use memory_store::MemoryStore;
+pub use miss::{touched_pages, Admission, InFlightLoads, LoadKey};
 pub use paged_store::PagedBlockStore;
 pub use staging::{Checksum, Stager};
