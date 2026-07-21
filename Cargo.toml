@@ -6,6 +6,7 @@ members = [
     "crates/talon-worker",
     "crates/talon-fuse",
     "crates/talon-transport",
+    "crates/talon-backend",
 ]
 
 [workspace.package]

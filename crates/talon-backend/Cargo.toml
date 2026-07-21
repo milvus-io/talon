@@ -1,0 +1,16 @@
+[package]
+name = "talon-backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Blob-store BackendStore implementations (S3/GCS/Azure) for Talon"
+
+[dependencies]
+talon-core.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
