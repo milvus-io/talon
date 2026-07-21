@@ -12,6 +12,8 @@
 
 pub mod codec;
 pub mod frame;
+pub mod pool;
 
 pub use codec::{decode, encode, CodecError, ControlMessage, CONTROL_SCHEMA_VERSION};
 pub use frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
+pub use pool::{Channel, CheckoutError, Connector, Pool, PoolConfig};
