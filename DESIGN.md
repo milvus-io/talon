@@ -1,7 +1,8 @@
 # Talon Design (v1)
 
 Talon is a distributed object-store cache. It sits between compute clients and a
-durable backing store (Azure Blob first), caching large immutable objects on
+durable backing store (any mainstream blob store — S3, GCS, Azure Blob),
+caching large immutable objects on
 local NVMe across a fleet of worker nodes, and exposing them through a read-only
 FUSE filesystem.
 
@@ -41,7 +42,7 @@ deferred until workload data justifies them.
         |
         v  cache miss
    +------------+
-   | Azure Blob |   BackendStore
+   | Blob store |   BackendStore (S3 / GCS / Azure Blob)
    +------------+
 ```
 
@@ -112,20 +113,23 @@ Three planes:
   `lookup / getattr / readdir / open / read / release`. No
   `write / rename / unlink / chmod`. `mmap` relies on the kernel page cache to
   trigger reads; no writable-mmap POSIX guarantees.
-- **Key ↔ path mapping:** deterministic and reversible, hierarchical namespace,
-  e.g. `/az/<account>/<container>/<blob-path>`. The internal `CacheKey` carries
-  backend + container/bucket + object path + offset + block size +
-  etag/version. Not a flat string (escaping/collisions).
+- **Key ↔ path mapping:** deterministic and reversible, hierarchical namespace
+  prefixed by backend, e.g. `/s3/<bucket>/<object-path>`,
+  `/gcs/<bucket>/<object-path>`, `/az/<account>/<container>/<blob-path>`. The
+  internal `CacheKey` carries backend + bucket/container + object path + offset +
+  block size + etag/version. Not a flat string (escaping/collisions).
 - **Client caching / readahead:** rely on the kernel page cache first; the client
   does sequential-read detection and next-N-block readahead. No separate
   client-side disk cache in v1.
 
 ## 5. Cross-cutting
 
-- **Backing store:** Azure Blob is the first backend (closest deployment/auth
-  path). Keep a `BackendStore` abstraction for later S3 / HTTP / file. Milvus is
-  not a direct miss source unless object identity + version map cleanly; cache
-  the underlying blobs instead.
+- **Backing store:** support all mainstream blob stores — S3, GCS, and Azure
+  Blob — behind a single `BackendStore` abstraction, with room for HTTP / local
+  file later. Each backend implements the same block-range fetch + metadata
+  (etag/version) contract; credentials and endpoint config are per-backend.
+  Milvus is not a direct miss source unless object identity + version map
+  cleanly; cache the underlying blobs instead.
 - **Observability:** full-path Prometheus metrics + tracing. Key metrics:
   hit/miss, bytes served, block-load latency, backend fetch errors, evictions,
   disk usage, worker health, client retry/fallback, placement epoch refresh.
@@ -142,7 +146,8 @@ Three planes:
 ## v1 summary
 
 Single coordinator, K8s membership, rendezvous / top-K placement, RF=1, NVMe
-block cache, custom TCP data plane, read-only FUSE, Azure Blob backing store.
+block cache, custom TCP data plane, read-only FUSE, and pluggable blob backends
+(S3 / GCS / Azure Blob).
 
 Add RF=2, leader election, and a protobuf control API once miss cost and
 availability requirements are demonstrated.
@@ -152,9 +157,9 @@ availability requirements are demonstrated.
 Decisions above that diverge from the current code, to be addressed in later PRs:
 
 - Replace `CacheKey(String)` with a structured, reversible key
-  (`backend + container/bucket + object_path + offset + block_size + etag/version`).
+  (`backend + bucket/container + object_path + offset + block_size + etag/version`).
 - Add a `BackendStore` trait in `talon-core`, distinct from `ObjectStore`
-  (cache access) — Azure Blob implementation to follow.
+  (cache access) — S3 / GCS / Azure Blob implementations to follow.
 - Adjust `ObjectStore` for block-level, byte-accounted access and an fd/offset
   path for `sendfile`, rather than only returning `Bytes`.
 - Replace control-plane `serde_json` with framed `bincode`; define a data-plane
