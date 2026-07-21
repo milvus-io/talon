@@ -1,0 +1,12 @@
+{
+  "core_benches::bitmap_range_present/1024": 648.4,
+  "core_benches::bitmap_range_present/64": 49.78,
+  "core_benches::bitmap_set_all/1024": 1362.0,
+  "core_benches::bitmap_set_all/64": 83.28,
+  "core_benches::block_page_count": 1.553,
+  "core_benches::object_id_from_path": 74.81,
+  "core_benches::object_id_to_path": 119.3,
+  "placement_benches::locate/256": 14030.0,
+  "placement_benches::locate/64": 3316.0,
+  "placement_benches::locate/8": 432.9
+}

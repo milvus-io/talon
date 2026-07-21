@@ -20,3 +20,10 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 clap.workspace = true
 async-trait.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "placement_benches"
+harness = false

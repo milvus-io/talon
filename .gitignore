@@ -1,6 +1,9 @@
 # Build artifacts
 /target
 
+# Benchmark run output (baselines are committed; per-run results are not)
+/bench/results/
+
 # Editor / OS
 *.swp
 .DS_Store
