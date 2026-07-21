@@ -8,6 +8,7 @@ pub mod block;
 pub mod config;
 pub mod error;
 pub mod key;
+pub mod metrics;
 pub mod node;
 pub mod store;
 
@@ -16,5 +17,6 @@ pub use block::{BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{Patch, WorkerConfig, WorkerConfigPatch};
 pub use error::{Error, Result};
 pub use key::{Backend, BlockId, ObjectId, PageIndex, Version};
+pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use node::{NodeId, NodeInfo, NodeRole};
 pub use store::{BlockHandle, ObjectStore};
