@@ -143,8 +143,10 @@ absolute-time gating).
 
 ## Commit and PR conventions
 
-We follow [Conventional Commits](https://www.conventionalcommits.org/). CI
-validates the format (see below), so please match it.
+We follow the [Conventional Commits](https://www.conventionalcommits.org/)
+style, using the same type vocabulary as the main
+[Milvus](https://github.com/milvus-io/milvus) project so contributors moving
+between repos see a familiar format. CI validates it (see below).
 
 **Format**
 
@@ -159,31 +161,37 @@ validates the format (see below), so please match it.
 - **type** (required) — one of:
   - `feat` — a new feature or capability
   - `fix` — a bug fix
-  - `refactor` — code change that neither fixes a bug nor adds a feature
-  - `perf` — a performance improvement
-  - `docs` — documentation only
+  - `enhance` — improve existing code (refactor, performance, cleanup) with no
+    new user-facing feature
   - `test` — adding or fixing tests
+  - `doc` — documentation only
   - `bench` — benchmarks or the perf harness
   - `build` — build system, dependencies, or `Cargo.toml`
   - `ci` — CI configuration and workflows
   - `chore` — miscellaneous maintenance with no src/test impact
 - **scope** (optional but encouraged) — the affected area, typically a crate
   without the `talon-` prefix: `core`, `coordinator`, `worker`, `fuse`. Other
-  useful scopes: `bench`, `ci`, `deps`. Omit for repo-wide changes.
+  useful scopes: `bench`, `ci`, `deps`. Omit for repo-wide changes. (Milvus
+  itself rarely uses scopes; we encourage them because the workspace has clearly
+  separated crates.)
 - **description** (required) — imperative mood, lower-case start, no trailing
   period, ≤ 72 chars for the whole subject line.
 - **body** (optional) — explain the *why*, not just the *what*. Wrap at ~72 cols.
 - **breaking changes** — append `!` after the type/scope and/or add a
   `BREAKING CHANGE:` footer, e.g. `feat(core)!: replace CacheKey with BlockId`.
 
+As in Milvus, a `feat:` change (or anything introducing new architecture,
+storage formats, or public behavior) should come with a design note — for Talon
+that means updating or referencing [`DESIGN.md`](DESIGN.md).
+
 **Examples**
 
 ```
 feat(worker): add page-level eviction to the block index
 fix(coordinator): stabilize rendezvous hash for renamed nodes
-perf(core): avoid allocation in ObjectId::from_path
-docs: document the whole-vs-paged block layout
-refactor(core)!: replace CacheKey with structured BlockId
+enhance(core): avoid allocation in ObjectId::from_path
+doc: document the whole-vs-paged block layout
+enhance(core)!: replace CacheKey with structured BlockId
 ci: enforce conventional commit format on PR titles
 ```
 

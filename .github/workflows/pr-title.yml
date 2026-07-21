@@ -27,7 +27,7 @@ jobs:
           import os, re, sys
 
           title = os.environ["PR_TITLE"]
-          types = "feat|fix|refactor|perf|docs|test|bench|build|ci|chore"
+          types = "feat|fix|enhance|test|doc|bench|build|ci|chore"
           # <type>(<scope>)?!?: <description>   (scope optional, ! = breaking)
           pattern = rf"^(?:{types})(?:\([a-z0-9._-]+\))?!?: .+"
 
