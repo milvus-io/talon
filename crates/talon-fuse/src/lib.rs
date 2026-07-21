@@ -7,7 +7,9 @@
 pub mod fs;
 pub mod mapping;
 pub mod placement_cache;
+pub mod readahead;
 
 pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
+pub use readahead::{ReadaheadConfig, ReadaheadState};
