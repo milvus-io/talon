@@ -21,3 +21,4 @@ bytes.workspace = true
 async-trait.workspace = true
 clap.workspace = true
 xxhash-rust.workspace = true
+libc.workspace = true
