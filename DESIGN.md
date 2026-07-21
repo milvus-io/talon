@@ -67,6 +67,87 @@ Three planes:
   revisit RDMA only if TCP + NVMe is proven insufficient in a fast rack network.
 - **Zero-copy:** `bytes::Bytes` for small messages and in-memory buffer sharing;
   `sendfile`/`splice` for disk-block transfer.
+- **Runtime:** two-layer model (control ring + zero-copy syscalls) — see
+  *Runtime & I/O model* below.
+
+## Runtime & I/O model
+
+Reference design (validated in the sibling `spiro-cache` prototype). Each
+`master` / `worker` / `client` process splits I/O into two layers.
+
+### Layer 1 — control & protocol scheduling (io_uring)
+
+Each process runs a `monoio::Runtime<IoUringDriver>` (single-threaded ring in
+v1). The ring owns: `accept`, read/write of protocol headers, small messages,
+task spawning, timers, and metrics. All connection management and scheduling
+lives here. Large object bytes never enter userspace through this ring.
+
+### Layer 2 — bulk data movement (Linux zero-copy syscalls)
+
+Large payloads move via kernel zero-copy, not through Rust heap buffers:
+
+- **GET / cache read:** `sendfile(block_file_fd → socket_fd)`.
+- **PUT / ingest:** `splice(socket ↔ pipe ↔ file)`.
+
+These blocking libc syscalls run on a `spawn_blocking` thread pool so they never
+stall the monoio ring. Default chunk size **1 MiB**, block size **64 MiB**
+(our v1 default is 256 MiB — see §3 chunking; treat block size as configurable).
+
+### Data-plane paths
+
+**L1 memory hit** (optional, default off; for very hot small blocks): decode
+header + key → `mem_cache` lookup → send header → plain async socket write from
+an `Rc<Vec<u8>>`. No disk, no `sendfile`.
+
+**L2 NVMe hit** (primary hot path): decode header + key → `BlockIndex` lookup →
+open cached `.blk` fd → write response header → `sendfile(cached_fd → socket)` in
+the blocking helper. The block is **never** read into a `Vec<u8>`, avoiding
+NVMe→userspace and userspace→socket copies, heap pressure, and buffer bloat on
+the runtime. Path is `NVMe/page-cache → kernel → TCP socket`.
+
+**GET_RANGE hit:** identical to L2 hit but `sendfile` uses `(offset, length)` —
+suited to Lance / checkpoint footer / partial reads.
+
+**PUT:** client `splice(file → pipe → socket)`; worker decodes key + `data_len`,
+creates a staged file, `splice(socket → pipe → file)`, `sync_all`,
+rename-commit, update index. Known tradeoff: because bytes bypass userspace,
+streaming `xxh3` checksum is not computed on the zero-copy PUT path (loader path
+can, since it downloads into a `Vec`).
+
+### Miss path (deliberately off-ring)
+
+The ring does **not** call the backend directly. On miss for a `blob://` key it
+checks in-flight demand loads, submits a `LoadTask` to a **loader thread pool**,
+and returns `LOADING` immediately. A loader thread does a blocking HTTP Range GET
+into a `Vec`, computes checksum, writes + syncs a staged file, and signals a
+completion channel. A ring-side watcher drains the channel (~10 ms), rename-commits
+the block, updates `BlockIndex`, optionally populates L1, and evicts if needed.
+The client, seeing `LOADING`, tries the next healthy replica or backs off and
+retries — then hits the fast path.
+
+Backend HTTP is kept off io_uring on purpose: the blob client is blocking, and
+TLS/HTTP would break the file/socket zero-copy anyway. Miss is the slow path;
+isolating it to loader threads keeps the data-plane ring responsive.
+
+### LOAD (prewarm) path
+
+Master-initiated, similar to miss but not a client data-plane transfer: master
+lists blobs on a background thread, splits into blocks, assigns a primary worker
+via jump hash, and sends `LoadBlobs`. Workers' loader threads download the ranges
+and commit into cache. Workers pull from the backend themselves; no
+client→worker zero-copy involved.
+
+### Why not pure io_uring for all data movement
+
+- **monoio / io_uring:** async TCP, small messages, scheduling, timers, metrics.
+- **sendfile / splice:** the actual large-block zero-copy movement.
+- **spawn_blocking:** isolates the blocking libc zero-copy syscalls off the ring.
+
+Future optimizations (drive by benchmarks, not speculation): thread-per-core
+runtimes (one ring per core), hash-partitioned request affinity to a ring, fd
+registration, pipelined double-buffer splice, and evaluating
+`IORING_OP_SPLICE` / send-zero-copy. Current `sendfile`/`splice` is the simpler,
+stable Linux fast path.
 
 ## 2. Coordinator
 
