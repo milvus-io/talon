@@ -198,8 +198,9 @@ stable Linux fast path.
   space:
   - **Whole block:** the entire 256MB is cached as one unit. Best for
     sequential-scan workloads (checkpoints, datasets) paired with readahead.
-    Backed by a single `.blk` file; `sendfile(fd, offset, len)` serves it
-    directly — identical to the base data-plane path.
+    When a block is loaded as whole, it is backed by a **single `.blk` file** and
+    `sendfile(fd, offset, len)` serves it directly — identical to the base
+    data-plane path.
   - **Paged virtual block:** only the hot pages within a block are materialized
     on demand. Best for point-query workloads (database lookups). Page size is
     configurable **256KB–4MB** (per-namespace default). A 256MB block therefore
@@ -217,13 +218,16 @@ stable Linux fast path.
   - **Index:** each block entry carries its form,
     `enum { Whole, Paged { page_size, present_bitmap } }`. The present bitmap is
     cheap (1024 bits = 128 bytes worst case) and drives page-hit checks.
-  - **Open question — physical layout of paged blocks:** prefer a single **sparse
-    `.blk` file** (pages materialized at their `page_size` offset, `sendfile`
-    serves any present page by offset) over one real file per page. The
-    `block_id/page_index` form is the logical address, not necessarily the
-    on-disk layout; a file-per-page directory risks inode pressure and excessive
-    `open` calls under high-concurrency point queries. To be confirmed by
-    benchmark.
+  - **Physical layout:** the on-disk form follows the LOAD-time choice. A
+    **whole block is a single `.blk` file**. A **paged block is a directory
+    `block_id/` with one file per materialized page** (`block_id/page_index`),
+    *not* a single sparse file. Each present page is an independent `.page` file
+    served by its own `sendfile`. Per-page files keep materialization, commit
+    (per-page rename), and eviction (per-page `unlink`) simple and independent,
+    avoid sparse-file semantics and fragmentation, and make the on-disk form
+    match the logical `block_id/page_index` address. The tradeoff — more inodes
+    and `open` calls under high-concurrency point queries — is accepted; mitigate
+    with an fd cache for hot pages if benchmarks show pressure.
 
 ## 4. talon-fuse client
 
