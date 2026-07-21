@@ -7,11 +7,13 @@
 pub mod bridge;
 pub mod fs;
 pub mod mapping;
+pub mod ops;
 pub mod placement_cache;
 pub mod readahead;
 
 pub use bridge::{spawn_bridge, BridgeClient, BridgeError};
 pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
+pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use readahead::{ReadaheadConfig, ReadaheadState};
