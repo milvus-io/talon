@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/talon-core",
+    "crates/talon-coordinator",
+    "crates/talon-worker",
+    "crates/talon-fuse",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/talon/talon"
+rust-version = "1.80"
+
+[workspace.dependencies]
+talon-core = { path = "crates/talon-core" }
+
+# Common third-party dependencies shared across crates
+anyhow = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytes = "1"
+async-trait = "0.1"
+clap = { version = "4", features = ["derive"] }
