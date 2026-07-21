@@ -9,9 +9,11 @@ pub mod eviction;
 pub mod index;
 pub mod memory_store;
 pub mod paged_store;
+pub mod staging;
 
 pub use block_store::WholeBlockStore;
 pub use eviction::{CacheUnit, Lru};
 pub use index::{BlockIndex, Presence};
 pub use memory_store::MemoryStore;
 pub use paged_store::PagedBlockStore;
+pub use staging::{Checksum, Stager};

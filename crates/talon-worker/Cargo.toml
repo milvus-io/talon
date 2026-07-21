@@ -20,3 +20,4 @@ tracing-subscriber.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+xxhash-rust.workspace = true
