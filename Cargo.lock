@@ -528,6 +528,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-transport"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+]
+
+[[package]]
 name = "talon-worker"
 version = "0.1.0"
 dependencies = [
