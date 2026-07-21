@@ -588,6 +588,8 @@ dependencies = [
  "serde",
  "talon-core",
  "thiserror",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
