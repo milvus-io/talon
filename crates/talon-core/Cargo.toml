@@ -14,3 +14,10 @@ serde_json.workspace = true
 bytes.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "core_benches"
+harness = false

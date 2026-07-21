@@ -62,3 +62,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
+
+  bench:
+    name: bench (informational)
+    runs-on: ubuntu-latest
+    # Never blocks a merge: shared runners are too noisy for absolute-time
+    # gating. This posts the baseline diff for visibility only.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Benchmark check vs committed baseline
+        id: bench
+        run: |
+          python3 scripts/bench.py check main --soft | tee bench-report.md
+      - name: Publish report to job summary
+        if: always()
+        run: cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
