@@ -7,4 +7,4 @@ pub mod membership;
 pub mod placement;
 
 pub use membership::Membership;
-pub use placement::{Placement, RendezvousPlacement};
+pub use placement::{Epoch, Placement, RendezvousPlacement};
