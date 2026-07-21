@@ -536,6 +536,7 @@ dependencies = [
  "divan",
  "serde",
  "talon-core",
+ "talon-transport",
  "tokio",
  "tracing",
  "tracing-subscriber",
