@@ -11,5 +11,7 @@ talon-core.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 bincode.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
