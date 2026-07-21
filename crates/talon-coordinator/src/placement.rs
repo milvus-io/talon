@@ -2,12 +2,12 @@
 
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use talon_core::{CacheKey, NodeId, NodeInfo};
+use talon_core::{BlockId, NodeId, NodeInfo};
 
-/// Decides which node should hold a given key.
+/// Decides which node should hold a given block.
 pub trait Placement {
-    /// Return the node responsible for `key`, given the current node set.
-    fn locate(&self, key: &CacheKey, nodes: &[NodeInfo]) -> Option<NodeId>;
+    /// Return the node responsible for `block`, given the current node set.
+    fn locate(&self, block: &BlockId, nodes: &[NodeInfo]) -> Option<NodeId>;
 }
 
 /// Rendezvous (highest random weight) hashing placement.
@@ -17,19 +17,19 @@ pub trait Placement {
 pub struct RendezvousPlacement;
 
 impl RendezvousPlacement {
-    fn weight(key: &CacheKey, node: &NodeId) -> u64 {
+    fn weight(block: &BlockId, node: &NodeId) -> u64 {
         let mut hasher = DefaultHasher::new();
-        key.as_str().hash(&mut hasher);
+        block.hash(&mut hasher);
         node.0.hash(&mut hasher);
         hasher.finish()
     }
 }
 
 impl Placement for RendezvousPlacement {
-    fn locate(&self, key: &CacheKey, nodes: &[NodeInfo]) -> Option<NodeId> {
+    fn locate(&self, block: &BlockId, nodes: &[NodeInfo]) -> Option<NodeId> {
         nodes
             .iter()
-            .max_by_key(|n| Self::weight(key, &n.id))
+            .max_by_key(|n| Self::weight(block, &n.id))
             .map(|n| n.id.clone())
     }
 }
