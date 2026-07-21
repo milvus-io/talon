@@ -108,6 +108,13 @@ the runtime. Path is `NVMe/page-cache → kernel → TCP socket`.
 **GET_RANGE hit:** identical to L2 hit but `sendfile` uses `(offset, length)` —
 suited to Lance / checkpoint footer / partial reads.
 
+**Paged block hit:** for paged virtual blocks (see §3), a read resolves to the
+covered pages via the block's `present_bitmap`. Present pages are served with
+one `sendfile` per page (contiguous present pages coalesced into a single call
+by offset). Any page in the range that is absent triggers a **page-level miss**:
+the loader fetches only those pages' byte ranges from the backend, not the whole
+256MB block. In-flight tracking is keyed by `(block_id, page_index)`.
+
 **PUT:** client `splice(file → pipe → socket)`; worker decodes key + `data_len`,
 creates a staged file, `splice(socket → pipe → file)`, `sync_all`,
 rename-commit, update index. Known tradeoff: because bytes bypass userspace,
@@ -179,10 +186,44 @@ stable Linux fast path.
   stale hotspots; TinyLFU is more complex — revisit with real workload data.
   Capacity is per-worker, with support for multiple cache dirs each with its own
   cap.
-- **Chunking:** objects are split into blocks. Configurable block size, default
-  **256MB** (favors sequential throughput, low metadata). The cache key includes
+- **Chunking:** the logical addressing unit is a fixed **256MB block**. Placement,
+  the coordinator inventory, `etag/version`, and the cache key all operate at
+  block granularity. The cache key includes
   `source_uri + offset + block_size + etag/version` so a source update never
   serves a stale block.
+- **Block materialization — whole vs paged:** block size stays fixed at 256MB,
+  but a block has two physical forms, chosen per block. This decouples the
+  *logical addressing unit* from the *physical caching granularity* so a single
+  scheme adapts to different workloads without changing placement or the key
+  space:
+  - **Whole block:** the entire 256MB is cached as one unit. Best for
+    sequential-scan workloads (checkpoints, datasets) paired with readahead.
+    Backed by a single `.blk` file; `sendfile(fd, offset, len)` serves it
+    directly — identical to the base data-plane path.
+  - **Paged virtual block:** only the hot pages within a block are materialized
+    on demand. Best for point-query workloads (database lookups). Page size is
+    configurable **256KB–4MB** (per-namespace default). A 256MB block therefore
+    holds up to 1024 pages (256KB) or 64 pages (4MB). Addressed logically as
+    `block_id/page_index`.
+  - **Form is decided at LOAD time via a hint** (per-namespace or per-LOAD
+    request); e.g. checkpoint prefixes load as whole, database prefixes load as
+    paged. Dynamic promotion (paged → whole on detected sequential scan) is
+    deferred to a later version to keep the v1 state machine simple.
+  - **Page-level miss / in-flight / eviction:** for paged blocks, miss handling,
+    `demand_loads_in_flight` tracking, and LRU accounting all descend to
+    `(block_id, page_index)` granularity — a point query fetches only the pages
+    it touches, never the full 256MB, and cold pages can be evicted while the
+    block entry survives. Whole blocks remain a single LRU unit.
+  - **Index:** each block entry carries its form,
+    `enum { Whole, Paged { page_size, present_bitmap } }`. The present bitmap is
+    cheap (1024 bits = 128 bytes worst case) and drives page-hit checks.
+  - **Open question — physical layout of paged blocks:** prefer a single **sparse
+    `.blk` file** (pages materialized at their `page_size` offset, `sendfile`
+    serves any present page by offset) over one real file per page. The
+    `block_id/page_index` form is the logical address, not necessarily the
+    on-disk layout; a file-per-page directory risks inode pressure and excessive
+    `open` calls under high-concurrency point queries. To be confirmed by
+    benchmark.
 
 ## 4. talon-fuse client
 
@@ -243,6 +284,9 @@ Decisions above that diverge from the current code, to be addressed in later PRs
   (cache access) — S3 / GCS / Azure Blob implementations to follow.
 - Adjust `ObjectStore` for block-level, byte-accounted access and an fd/offset
   path for `sendfile`, rather than only returning `Bytes`.
+- Model block materialization as `enum { Whole, Paged { page_size,
+  present_bitmap } }` in the block index, decided by a LOAD-time hint; add
+  page-level miss / in-flight / eviction for paged blocks.
 - Replace control-plane `serde_json` with framed `bincode`; define a data-plane
   frame header.
 - Extend `RendezvousPlacement` to top-K + epoch.
