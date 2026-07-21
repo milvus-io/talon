@@ -11,6 +11,7 @@ pub mod key;
 pub mod metrics;
 pub mod node;
 pub mod store;
+pub mod trace;
 
 pub use backend::{BackendStore, ObjectStat};
 pub use block::{BlockForm, BlockMeta, LoadHint, PresentBitmap};
@@ -20,3 +21,4 @@ pub use key::{Backend, BlockId, ObjectId, PageIndex, Version};
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use node::{NodeId, NodeInfo, NodeRole};
 pub use store::{BlockHandle, ObjectStore};
+pub use trace::{init_tracing, RequestId};
