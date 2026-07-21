@@ -1,9 +1,8 @@
 //! Control-plane message codec.
 //!
 //! Control messages are a versioned [`ControlMessage`] enum, serialized with
-//! **bincode** and framed by a [`FrameHeader`](crate::FrameHeader) whose
-//! `msg_type` is [`MsgType::Control`](crate::MsgType). No JSON is used on the
-//! wire.
+//! **bincode** and framed by a [`FrameHeader`] whose `msg_type` is
+//! [`Control`](crate::MsgType::Control). No JSON is used on the wire.
 //!
 //! [`encode`] produces `header || bincode(msg)` as a single buffer;
 //! [`decode`] validates the header, checks the declared length against the
