@@ -143,11 +143,49 @@ absolute-time gating).
 
 ## Commit and PR conventions
 
-**Commits**
+We follow [Conventional Commits](https://www.conventionalcommits.org/). CI
+validates the format (see below), so please match it.
 
-- Imperative subject, ≤ 72 chars: *"Add page-level eviction to the block index"*.
-- Explain the *why* in the body, not just the *what*.
-- Keep commits focused; avoid mixing unrelated changes.
+**Format**
+
+```
+<type>(<scope>): <description>
+
+[optional body]
+
+[optional footer(s)]
+```
+
+- **type** (required) — one of:
+  - `feat` — a new feature or capability
+  - `fix` — a bug fix
+  - `refactor` — code change that neither fixes a bug nor adds a feature
+  - `perf` — a performance improvement
+  - `docs` — documentation only
+  - `test` — adding or fixing tests
+  - `bench` — benchmarks or the perf harness
+  - `build` — build system, dependencies, or `Cargo.toml`
+  - `ci` — CI configuration and workflows
+  - `chore` — miscellaneous maintenance with no src/test impact
+- **scope** (optional but encouraged) — the affected area, typically a crate
+  without the `talon-` prefix: `core`, `coordinator`, `worker`, `fuse`. Other
+  useful scopes: `bench`, `ci`, `deps`. Omit for repo-wide changes.
+- **description** (required) — imperative mood, lower-case start, no trailing
+  period, ≤ 72 chars for the whole subject line.
+- **body** (optional) — explain the *why*, not just the *what*. Wrap at ~72 cols.
+- **breaking changes** — append `!` after the type/scope and/or add a
+  `BREAKING CHANGE:` footer, e.g. `feat(core)!: replace CacheKey with BlockId`.
+
+**Examples**
+
+```
+feat(worker): add page-level eviction to the block index
+fix(coordinator): stabilize rendezvous hash for renamed nodes
+perf(core): avoid allocation in ObjectId::from_path
+docs: document the whole-vs-paged block layout
+refactor(core)!: replace CacheKey with structured BlockId
+ci: enforce conventional commit format on PR titles
+```
 
 **Branches**
 
@@ -156,6 +194,9 @@ absolute-time gating).
 
 **Pull requests**
 
+- **The PR title must follow the same Conventional Commits format** — because we
+  **squash merge**, the PR title becomes the commit subject on `main`. CI checks
+  the PR title.
 - Fill out the PR template (summary, design alignment, test plan).
 - Keep PRs small and single-purpose — easier to review, faster to merge.
 - Ensure `just ci` passes locally and the workspace compiles.
@@ -165,8 +206,9 @@ absolute-time gating).
 - Rebase on the latest `main` before requesting review; resolve conflicts
   locally.
 
-We use **squash merges**, so the PR title becomes the commit subject — make it a
-good imperative summary.
+Because merges are squashed, individual commit messages on a PR branch are not
+required to pass the check — only the PR title is enforced — but keeping commits
+conventional helps reviewers.
 
 ## Review process
 

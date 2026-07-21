@@ -53,7 +53,7 @@ intentional, note it and confirm the baseline was refreshed and committed.
 
 ## Checklist
 
-- [ ] PR title is an imperative summary (it becomes the squash-merge commit)
+- [ ] PR title follows [Conventional Commits](https://www.conventionalcommits.org/) (`<type>(<scope>): <description>`) — it becomes the squash-merge commit subject and is checked by CI
 - [ ] Public items are documented; no broken intra-doc links
 - [ ] No new dependencies without discussion
 - [ ] Rebased on the latest `main`
