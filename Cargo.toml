@@ -17,6 +17,7 @@ rust-version = "1.80"
 
 [workspace.dependencies]
 talon-core = { path = "crates/talon-core" }
+talon-transport = { path = "crates/talon-transport" }
 
 # Common third-party dependencies shared across crates
 anyhow = "1"
