@@ -1,0 +1,49 @@
+name: PR title
+
+on:
+  pull_request:
+    # Re-check when the title (or base) changes, not just on new commits.
+    types: [opened, edited, reopened, synchronize]
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  conventional:
+    name: conventional commits
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate PR title
+        env:
+          # Passed via env to avoid shell-injection from the title.
+          PR_TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          python3 - <<'PY'
+          import os, re, sys
+
+          title = os.environ["PR_TITLE"]
+          types = "feat|fix|enhance|test|doc|bench|build|ci|chore"
+          # <type>(<scope>)?!?: <description>   (scope optional, ! = breaking)
+          pattern = rf"^(?:{types})(?:\([a-z0-9._-]+\))?!?: .+"
+
+          if not re.match(pattern, title):
+              print(f"::error::PR title does not follow Conventional Commits: {title!r}")
+              print()
+              print("Expected: <type>(<scope>): <description>")
+              print(f"  type  : {types.replace('|', ', ')}")
+              print("  scope : optional, e.g. core, coordinator, worker, fuse")
+              print("  Example: feat(worker): add page-level eviction")
+              sys.exit(1)
+
+          subject_max = 72
+          if len(title) > subject_max:
+              print(f"::error::PR title is {len(title)} chars; keep it <= {subject_max}.")
+              sys.exit(1)
+
+          print(f"OK: {title}")
+          PY

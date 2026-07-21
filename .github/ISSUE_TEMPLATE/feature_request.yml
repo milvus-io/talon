@@ -1,0 +1,78 @@
+name: Feature request
+description: Propose new functionality or a design change for Talon
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the proposal. For large or cross-cutting changes, please open
+        this issue and align on approach **before** writing code. Read
+        [`DESIGN.md`](../blob/main/DESIGN.md) so the request fits the v1
+        architecture (or clearly proposes amending it).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What need or limitation prompts this? Describe the use case, not just the solution.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should Talon do? Sketch the API/behavior if you can.
+    validations:
+      required: true
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      description: Which part(s) would this affect?
+      multiple: true
+      options:
+        - talon-core
+        - talon-coordinator
+        - talon-worker
+        - talon-fuse
+        - build / CI / tooling
+        - benchmarks / harness
+        - docs
+        - unsure
+    validations:
+      required: true
+  - type: textarea
+    id: design-fit
+    attributes:
+      label: Design alignment
+      description: >
+        How does this fit DESIGN.md? Reference the relevant section(s). If it
+        diverges from a v1 decision (e.g. RF=1, single coordinator, read-only
+        FUSE), explain why the change is warranted.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed and why you rejected them.
+    validations:
+      required: false
+  - type: textarea
+    id: perf
+    attributes:
+      label: Performance considerations
+      description: >
+        Does this touch a hot path (keys, placement, block/page index, data
+        plane)? Note expected impact and whether new benchmarks are needed.
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Confirmation
+      options:
+        - label: I searched existing issues and this is not a duplicate.
+          required: true
+        - label: I'm willing to help implement this.
+          required: false
