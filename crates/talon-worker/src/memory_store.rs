@@ -89,7 +89,10 @@ mod tests {
         let id = block("hello");
 
         store.put(&id, Bytes::from_static(b"world")).await.unwrap();
-        assert_eq!(store.get_bytes(&id).await.unwrap(), Bytes::from_static(b"world"));
+        assert_eq!(
+            store.get_bytes(&id).await.unwrap(),
+            Bytes::from_static(b"world")
+        );
         assert!(store.contains(&id).await.unwrap());
 
         store.delete(&id).await.unwrap();

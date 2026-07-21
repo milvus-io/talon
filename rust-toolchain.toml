@@ -1,0 +1,6 @@
+# Pin the toolchain so local dev and CI agree.
+# Bump deliberately; CI verifies fmt/clippy/test/build on this version.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]
+profile = "minimal"
