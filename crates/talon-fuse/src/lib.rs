@@ -5,5 +5,7 @@
 //! into object store operations against the cluster.
 
 pub mod fs;
+pub mod mapping;
 
 pub use fs::TalonFs;
+pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
