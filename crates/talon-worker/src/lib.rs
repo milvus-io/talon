@@ -13,6 +13,7 @@ pub mod memory_store;
 pub mod miss;
 pub mod paged_store;
 pub mod sendfile;
+pub mod splice;
 pub mod staging;
 
 pub use block_store::WholeBlockStore;
@@ -24,4 +25,5 @@ pub use memory_store::MemoryStore;
 pub use miss::{touched_pages, Admission, InFlightLoads, LoadKey};
 pub use paged_store::PagedBlockStore;
 pub use sendfile::{send_file_range, DEFAULT_CHUNK};
+pub use splice::{ingest_put, splice_to_file};
 pub use staging::{Checksum, Stager};
