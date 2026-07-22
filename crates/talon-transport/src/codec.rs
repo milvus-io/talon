@@ -69,6 +69,16 @@ pub enum ControlMessage {
         /// The new epoch value.
         epoch: u64,
     },
+    /// Client → coordinator: list the currently-known live nodes.
+    ///
+    /// A placement lookup returns owner [`NodeId`]s; the client resolves those
+    /// ids to worker addresses with this query.
+    MembershipQuery {},
+    /// Coordinator → client: the current membership snapshot (id + address).
+    MembershipList {
+        /// All nodes the coordinator currently knows about.
+        nodes: Vec<NodeInfo>,
+    },
     /// Generic acknowledgement / error reply.
     Ack {
         /// True on success; false carries `detail`.
@@ -197,6 +207,10 @@ mod tests {
                 len: 1 << 20,
             },
             ControlMessage::EpochBump { epoch: 8 },
+            ControlMessage::MembershipQuery {},
+            ControlMessage::MembershipList {
+                nodes: vec![node.clone()],
+            },
             ControlMessage::Ack {
                 ok: false,
                 detail: Some("nope".into()),

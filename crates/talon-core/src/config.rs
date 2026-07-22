@@ -45,6 +45,23 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// Azure Blob storage account for the backend origin (`None` if unset).
+    ///
+    /// The container is taken per-object from the request path; the SAS token is
+    /// **not** stored here — it is read from the environment at use time (see
+    /// [`azure_sas_from_env`]) so a secret never lands in a config struct or log.
+    pub azure_account: Option<String>,
+}
+
+/// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
+///
+/// Returned as an opaque string and intended for immediate use; it is
+/// deliberately kept out of [`WorkerConfig`] so it is never serialized, printed
+/// via `Debug`, or logged.
+pub fn azure_sas_from_env() -> Option<String> {
+    std::env::var("TALON_WORKER_AZURE_SAS")
+        .ok()
+        .filter(|s| !s.is_empty())
 }
 
 impl Default for WorkerConfig {
@@ -55,6 +72,7 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            azure_account: None,
         }
     }
 }
@@ -76,6 +94,8 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::azure_account`].
+    pub azure_account: Option<String>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -86,6 +106,7 @@ impl Patch for WorkerConfigPatch {
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            azure_account: self.azure_account.or(base.azure_account),
         }
     }
 }
@@ -136,6 +157,7 @@ impl WorkerConfigPatch {
             capacity_bytes: get("TALON_WORKER_CAPACITY_BYTES")
                 .map(|v| parse_u64(v, "TALON_WORKER_CAPACITY_BYTES"))
                 .transpose()?,
+            azure_account: get("TALON_WORKER_AZURE_ACCOUNT"),
         })
     }
 }
@@ -160,6 +182,7 @@ impl WorkerConfig {
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
+            azure_account: merged.azure_account.or(d.azure_account),
         };
         cfg.validate()?;
         Ok(cfg)

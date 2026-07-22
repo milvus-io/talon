@@ -11,11 +11,15 @@
 //! See [`frame`] for the byte layout.
 
 pub mod codec;
+pub mod data;
 pub mod frame;
 pub mod pool;
 pub mod runtime;
 
 pub use codec::{decode, encode, CodecError, ControlMessage, CONTROL_SCHEMA_VERSION};
+pub use data::{
+    decode_request, encode_error, encode_request, response_header_ok, DataError, RangeRequest,
+};
 pub use frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
 pub use pool::{Channel, CheckoutError, Connector, Pool, PoolConfig};
 pub use runtime::{spawn_blocking, Handler, Server, Shutdown};
