@@ -208,4 +208,34 @@ mod tests {
         assert!(c.observe_epoch(&block(3), 6));
         assert!(c.get(&block(3), 0).is_none());
     }
+
+    #[test]
+    fn coordinator_restart_invalidates_stale_cache() {
+        // Regression for issue #69: a client caches placement at a high epoch
+        // produced by one coordinator process; that coordinator restarts and,
+        // because epochs are now seeded from the process start time (wall-clock
+        // second in the high 32 bits), the restarted process advertises a
+        // *larger* epoch — so the client's pre-restart cache is invalidated.
+        //
+        // Before the fix, the restarted coordinator restarted its counter at 0,
+        // `cached_epoch < 0` was false, and the stale entry lived forever.
+        let seed = |secs: u64, counter: u64| (secs << 32) | counter;
+
+        // Pre-restart: coordinator seeded at second T1, churned to counter 37.
+        let pre_restart = seed(1_000, 37);
+        let c = PlacementCache::new(10_000);
+        c.insert(block(7), cached(pre_restart, &["w3"]), 0);
+
+        // Post-restart: a fresh process seeded at a later second T2. Its very
+        // first advertised epoch already exceeds the pre-restart one.
+        let post_restart = seed(1_001, 0);
+        assert!(
+            post_restart > pre_restart,
+            "restart epoch must outrank pre-restart"
+        );
+
+        // The stale entry pinning the client to the now-dead w3 is dropped.
+        assert!(c.observe_epoch(&block(7), post_restart));
+        assert!(c.get(&block(7), 0).is_none());
+    }
 }

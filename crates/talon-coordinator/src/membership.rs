@@ -17,21 +17,43 @@ use talon_core::{NodeId, NodeInfo};
 use crate::Epoch;
 
 /// An in-memory registry of known cluster nodes, versioned by an epoch.
-#[derive(Default)]
 pub struct Membership {
     inner: RwLock<Inner>,
 }
 
-#[derive(Default)]
+impl Default for Membership {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 struct Inner {
     nodes: HashMap<NodeId, NodeInfo>,
     epoch: Epoch,
 }
 
 impl Membership {
-    /// Create an empty membership registry at epoch 0.
+    /// Create an empty membership registry seeded from the process start time.
+    ///
+    /// The epoch base comes from [`Epoch::seeded_now`] rather than `0` so that
+    /// this coordinator's epochs outrank any earlier process's, keeping client
+    /// placement caches correct across a coordinator restart (issue #69).
     pub fn new() -> Self {
-        Self::default()
+        Self::with_epoch_base(Epoch::seeded_now())
+    }
+
+    /// Create an empty registry starting at a specific epoch base.
+    ///
+    /// Production uses [`Membership::new`] (wall-clock seed); this constructor
+    /// lets tests pin a deterministic base (e.g. `Epoch(0)`) or simulate a
+    /// restart by seeding a second instance at a strictly larger base.
+    pub fn with_epoch_base(base: Epoch) -> Self {
+        Self {
+            inner: RwLock::new(Inner {
+                nodes: HashMap::new(),
+                epoch: base,
+            }),
+        }
     }
 
     /// Register or update a node. Bumps the epoch if this changed the set.
@@ -158,7 +180,9 @@ mod tests {
 
     #[test]
     fn reconcile_bumps_epoch_only_on_change() {
-        let m = Membership::new();
+        // Pin a deterministic base so we can assert exact epoch values; the
+        // +1-on-change semantics are what matter here, not the base.
+        let m = Membership::with_epoch_base(Epoch(0));
         assert_eq!(m.epoch(), Epoch(0));
 
         assert!(m.reconcile(vec![worker("a", "1"), worker("b", "2")]));
@@ -181,7 +205,7 @@ mod tests {
 
     #[test]
     fn register_and_remove_track_epoch() {
-        let m = Membership::new();
+        let m = Membership::with_epoch_base(Epoch(0));
         m.register(worker("a", "1"));
         assert_eq!(m.epoch(), Epoch(1));
         // Re-register identical -> no change.
@@ -191,6 +215,38 @@ mod tests {
         assert_eq!(m.epoch(), Epoch(2));
         m.remove(&NodeId::new("a")); // absent -> no bump
         assert_eq!(m.epoch(), Epoch(2));
+    }
+
+    #[test]
+    fn new_seeds_nonzero_epoch_base() {
+        // A production Membership seeds from the wall clock, so its base is far
+        // above 0 and — critically — above the low-counter range a prior
+        // process would have reached (issue #69).
+        let m = Membership::new();
+        assert!(m.epoch().0 > 0, "epoch base must be seeded, not 0");
+        // The seed lives in the high 32 bits; the low counter starts at 0.
+        assert_eq!(m.epoch().0 & 0xFFFF_FFFF, 0);
+    }
+
+    #[test]
+    fn restarted_coordinator_outranks_prior_process() {
+        // Simulate: an earlier process seeded at second T1 that then churned
+        // through many membership changes, vs. a later process seeded at a
+        // strictly greater second T2. The later process's *initial* epoch must
+        // already exceed the earlier one's *final* epoch, so clients refresh.
+        let t1 = 1_000u64;
+        let t2 = 1_001u64; // one second later
+        let old = Membership::with_epoch_base(Epoch(t1 << 32));
+        for i in 0..10_000 {
+            old.register(worker(&format!("w{i}"), "a"));
+        }
+        let new = Membership::with_epoch_base(Epoch(t2 << 32));
+        assert!(
+            new.epoch() > old.epoch(),
+            "restarted coordinator epoch {:?} must outrank prior {:?}",
+            new.epoch(),
+            old.epoch()
+        );
     }
 
     #[test]
@@ -210,7 +266,7 @@ mod tests {
             })
         });
 
-        let m = Membership::new();
+        let m = Membership::with_epoch_base(Epoch(0));
 
         assert!(m.reconcile(source.poll().unwrap()));
         assert_eq!(m.snapshot().len(), 1);
