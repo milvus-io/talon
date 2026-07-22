@@ -9,9 +9,11 @@
 pub mod azure;
 pub mod gcs;
 pub mod http;
+pub mod reqwest_client;
 pub mod s3;
 
 pub use azure::{AzureBackend, AzureConfig};
 pub use gcs::{GcsBackend, GcsConfig};
 pub use http::{HttpClient, HttpRequest, HttpResponse, Method};
+pub use reqwest_client::ReqwestClient;
 pub use s3::{S3Backend, S3Config, S3Credentials};

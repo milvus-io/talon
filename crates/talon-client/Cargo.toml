@@ -1,26 +1,21 @@
 [package]
-name = "talon-worker"
+name = "talon-client"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
-description = "Worker node: stores and serves cached object data for Talon"
+description = "CLI client that reads Talon cache objects via the coordinator + workers"
 
 [[bin]]
-name = "talon-worker"
+name = "talon-client"
 path = "src/main.rs"
 
 [dependencies]
 talon-core.workspace = true
 talon-transport.workspace = true
-talon-backend = { path = "../talon-backend" }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-bytes.workspace = true
-async-trait.workspace = true
 clap.workspace = true
-xxhash-rust.workspace = true
-libc.workspace = true
