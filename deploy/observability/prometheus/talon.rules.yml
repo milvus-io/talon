@@ -1,0 +1,105 @@
+# Talon recording rules.
+#
+# Precompute the rates, ratios, and freshness signals the dashboard and alerts
+# consume, so expensive range queries run once per evaluation interval instead
+# of once per panel/alert. Every expression references only the stable metric
+# contract delivered by #76 (worker) and #77 (coordinator):
+#
+#   worker:      talon_worker_requests_total, _request_errors_total,
+#                _request_duration_seconds_{bucket,count}, _cache_hits_total,
+#                _cache_misses_total, _bytes_served_total, _backend_fetch_*_total,
+#                _capacity_bytes, _resident_bytes, _ready, _process_uptime_seconds
+#   coordinator: talon_coordinator_control_requests_total, _control_errors_total,
+#                _control_duration_seconds_bucket, _placement_errors_total,
+#                _state_store_errors_total, _state_snapshot_age_seconds,
+#                _live_nodes, _ready, _active_connections
+#
+# Naming: `level:metric:operation` per the Prometheus recording-rule convention.
+# `job` and `instance` are the standard scrape labels; `cluster` is an external
+# label set by the Prometheus deployment (one Prometheus may scrape > 1 Talon
+# cluster). Aggregations preserve `cluster` so a multi-cluster Prometheus never
+# blends two clusters into one number.
+groups:
+  - name: talon_worker.rules
+    interval: 30s
+    rules:
+      # Per-instance request rate (5m window matches the scrape-to-alert budget).
+      - record: instance_job:talon_worker_requests:rate5m
+        expr: sum by (cluster, instance, job) (rate(talon_worker_requests_total[5m]))
+
+      # Per-instance error ratio. `> 0` guard on the denominator avoids a 0/0
+      # NaN that would otherwise mask a healthy idle worker as "no data".
+      - record: instance_job:talon_worker_request_errors:ratio5m
+        expr: |
+          sum by (cluster, instance, job) (rate(talon_worker_request_errors_total[5m]))
+          /
+          clamp_min(sum by (cluster, instance, job) (rate(talon_worker_requests_total[5m])), 1)
+
+      # Cluster-wide cache hit rate. Hits and misses are disjoint, so the
+      # denominator is their sum; clamp_min keeps an all-cold cluster at 0, not
+      # NaN.
+      - record: cluster:talon_worker_cache_hit:ratio5m
+        expr: |
+          sum by (cluster) (rate(talon_worker_cache_hits_total[5m]))
+          /
+          clamp_min(
+            sum by (cluster) (rate(talon_worker_cache_hits_total[5m]))
+            + sum by (cluster) (rate(talon_worker_cache_misses_total[5m])),
+            1
+          )
+
+      # P99 request latency per instance from the native histogram buckets.
+      - record: instance_job:talon_worker_request_duration:p99_5m
+        expr: |
+          histogram_quantile(
+            0.99,
+            sum by (cluster, instance, job, le) (rate(talon_worker_request_duration_seconds_bucket[5m]))
+          )
+
+      # Capacity saturation: resident bytes as a fraction of configured capacity.
+      # clamp_min guards a worker that reports 0 capacity before its first
+      # capacity update (division by zero -> +Inf would trip the alert falsely).
+      - record: instance_job:talon_worker_capacity:saturation
+        expr: |
+          talon_worker_resident_bytes
+          /
+          clamp_min(talon_worker_capacity_bytes, 1)
+
+      # Backend fetch error ratio (object-store faults surface here, not as
+      # client-visible request errors, until retries are exhausted).
+      - record: cluster:talon_worker_backend_fetch_errors:ratio5m
+        expr: |
+          sum by (cluster) (rate(talon_worker_backend_fetch_errors_total[5m]))
+          /
+          clamp_min(sum by (cluster) (rate(talon_worker_backend_fetch_duration_seconds_count[5m])), 1)
+
+  - name: talon_coordinator.rules
+    interval: 30s
+    rules:
+      - record: instance_job:talon_coordinator_control_requests:rate5m
+        expr: sum by (cluster, instance, job) (rate(talon_coordinator_control_requests_total[5m]))
+
+      - record: instance_job:talon_coordinator_control_errors:ratio5m
+        expr: |
+          sum by (cluster, instance, job) (rate(talon_coordinator_control_errors_total[5m]))
+          /
+          clamp_min(sum by (cluster, instance, job) (rate(talon_coordinator_control_requests_total[5m])), 1)
+
+      # Number of coordinator replicas currently scraping as ready. Alerts use
+      # this as the active-active quorum signal.
+      - record: cluster:talon_coordinator_ready:count
+        expr: sum by (cluster) (talon_coordinator_ready)
+
+      # State-store error rate across all coordinators (a shared-backend outage
+      # shows up on every replica at once).
+      - record: cluster:talon_coordinator_state_store_errors:rate5m
+        expr: sum by (cluster) (rate(talon_coordinator_state_store_errors_total[5m]))
+
+      # Worst (max) snapshot age across coordinators: how stale the freshest
+      # available cluster view is. Distinct from a missing scrape (see alerts).
+      - record: cluster:talon_coordinator_state_snapshot_age:max
+        expr: max by (cluster) (talon_coordinator_state_snapshot_age_seconds)
+
+      # Live healthy workers, the denominator for capacity/quorum dashboards.
+      - record: cluster:talon_live_workers:count
+        expr: sum by (cluster) (talon_coordinator_live_nodes{role="worker", health="healthy"})

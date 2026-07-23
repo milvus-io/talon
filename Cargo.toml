@@ -8,6 +8,7 @@ members = [
     "crates/talon-transport",
     "crates/talon-backend",
     "crates/talon-client",
+    "crates/talon-observability",
 ]
 
 [workspace.package]
@@ -38,3 +39,4 @@ libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 divan = "0.1"
 axum = "0.8"
+serde_yaml = "0.9"

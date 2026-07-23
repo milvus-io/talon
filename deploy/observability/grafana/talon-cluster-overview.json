@@ -1,0 +1,280 @@
+{
+  "__inputs": [
+    {
+      "name": "DS_PROMETHEUS",
+      "label": "Prometheus",
+      "description": "Prometheus data source scraping Talon coordinators and workers.",
+      "type": "datasource",
+      "pluginId": "prometheus",
+      "pluginName": "Prometheus"
+    }
+  ],
+  "__requires": [
+    { "type": "grafana", "id": "grafana", "name": "Grafana", "version": "9.0.0" },
+    { "type": "datasource", "id": "prometheus", "name": "Prometheus", "version": "1.0.0" }
+  ],
+  "annotations": { "list": [] },
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "tags": ["talon", "cache", "ha"],
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "",
+  "title": "Talon Cluster Overview",
+  "uid": "talon-cluster-overview",
+  "templating": {
+    "list": [
+      {
+        "name": "datasource",
+        "type": "datasource",
+        "query": "prometheus",
+        "current": {},
+        "hide": 0,
+        "label": "Data source"
+      },
+      {
+        "name": "cluster",
+        "type": "query",
+        "datasource": { "type": "prometheus", "uid": "${datasource}" },
+        "query": "label_values(talon_coordinator_ready, cluster)",
+        "refresh": 2,
+        "sort": 1,
+        "includeAll": false,
+        "multi": false,
+        "label": "Cluster",
+        "description": "Bounded by cluster label; keeps queries scoped for large multi-cluster Prometheus."
+      }
+    ]
+  },
+  "panels": [
+    {
+      "type": "row",
+      "title": "Cluster",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 0 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "stat",
+      "title": "Ready coordinators",
+      "description": "Active-active quorum. 0 means the control plane is down.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 1 },
+              { "color": "green", "value": 2 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cluster:talon_coordinator_ready:count{cluster=\"$cluster\"} or on() vector(0)",
+          "legendFormat": "ready"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Healthy workers",
+      "description": "Live leased workers reporting healthy.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 1 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cluster:talon_live_workers:count{cluster=\"$cluster\"} or on() vector(0)",
+          "legendFormat": "workers"
+        }
+      ]
+    },
+    {
+      "type": "gauge",
+      "title": "Cache hit rate (5m)",
+      "description": "Cluster-wide worker cache hit ratio.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.5 },
+              { "color": "green", "value": 0.8 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cluster:talon_worker_cache_hit:ratio5m{cluster=\"$cluster\"}",
+          "legendFormat": "hit rate"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Freshest cluster view age",
+      "description": "Max state snapshot age across coordinators. High = stale membership.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 1 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 30 },
+              { "color": "red", "value": 60 }
+            ]
+          }
+        }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cluster:talon_coordinator_state_snapshot_age:max{cluster=\"$cluster\"}",
+          "legendFormat": "age"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Coordinator",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Control request rate by instance",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "reqps" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "instance_job:talon_coordinator_control_requests:rate5m{cluster=\"$cluster\"}",
+          "legendFormat": "{{ instance }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Control error ratio by instance",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "instance_job:talon_coordinator_control_errors:ratio5m{cluster=\"$cluster\"}",
+          "legendFormat": "{{ instance }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "State-store error rate",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 14 },
+      "fieldConfig": { "defaults": { "unit": "ops" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cluster:talon_coordinator_state_store_errors:rate5m{cluster=\"$cluster\"}",
+          "legendFormat": "errors/s"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Live nodes by role and health",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 14 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (role, health) (talon_coordinator_live_nodes{cluster=\"$cluster\"})",
+          "legendFormat": "{{ role }} / {{ health }}"
+        }
+      ]
+    },
+    {
+      "type": "row",
+      "title": "Worker & Storage",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 22 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker P99 request latency",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 23 },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "instance_job:talon_worker_request_duration:p99_5m{cluster=\"$cluster\"}",
+          "legendFormat": "{{ instance }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Worker capacity saturation",
+      "description": "Resident bytes / configured capacity. Alert fires above 0.9.",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 23 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0, "max": 1 } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "instance_job:talon_worker_capacity:saturation{cluster=\"$cluster\"}",
+          "legendFormat": "{{ instance }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Bytes served rate",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "Bps" } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (instance) (rate(talon_worker_bytes_served_total{cluster=\"$cluster\"}[5m]))",
+          "legendFormat": "{{ instance }}"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Backend fetch error ratio",
+      "datasource": { "type": "prometheus", "uid": "${datasource}" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 31 },
+      "fieldConfig": { "defaults": { "unit": "percentunit", "min": 0 } },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "cluster:talon_worker_backend_fetch_errors:ratio5m{cluster=\"$cluster\"}",
+          "legendFormat": "backend errors"
+        }
+      ]
+    }
+  ]
+}

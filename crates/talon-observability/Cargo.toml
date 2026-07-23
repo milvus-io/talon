@@ -1,0 +1,15 @@
+[package]
+name = "talon-observability"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Prometheus recording rules, alerts, and Grafana dashboard assets for Talon, with validation"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+
+[dev-dependencies]
