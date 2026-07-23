@@ -5,6 +5,7 @@
 //! into object store operations against the cluster.
 
 pub mod bridge;
+pub mod coordinator_client;
 pub mod fs;
 pub mod mapping;
 pub mod ops;
@@ -12,6 +13,7 @@ pub mod placement_cache;
 pub mod readahead;
 
 pub use bridge::{spawn_bridge, BridgeClient, BridgeError};
+pub use coordinator_client::{CoordinatorClient, CoordinatorError, Placement, ResolvedPlacement};
 pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
 pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
