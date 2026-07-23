@@ -62,6 +62,20 @@ impl BlockIndex {
         self.inner.read().unwrap().resident_bytes
     }
 
+    /// Number of materialized pages across all paged blocks.
+    pub fn page_count(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap()
+            .map
+            .values()
+            .map(|meta| match &meta.form {
+                BlockForm::Whole => 0,
+                BlockForm::Paged { present, .. } => u64::from(present.count()),
+            })
+            .sum()
+    }
+
     /// Look up a copy of a block's metadata.
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
         self.inner.read().unwrap().map.get(id).cloned()
@@ -222,6 +236,7 @@ mod tests {
 
         assert!(idx.mark_page(&id, PageIndex(0)));
         assert!(idx.mark_page(&id, PageIndex(1)));
+        assert_eq!(idx.page_count(), 2);
         assert_eq!(
             idx.presence(&id, PageIndex(0), PageIndex(2)),
             Presence::PageHit

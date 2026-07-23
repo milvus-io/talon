@@ -11,6 +11,10 @@ description = "Worker node: stores and serves cached object data for Talon"
 name = "talon-worker"
 path = "src/main.rs"
 
+[[bench]]
+name = "observability_benches"
+harness = false
+
 [dependencies]
 talon-core.workspace = true
 talon-transport.workspace = true
@@ -24,3 +28,8 @@ async-trait.workspace = true
 clap.workspace = true
 xxhash-rust.workspace = true
 libc.workspace = true
+serde_json.workspace = true
+axum.workspace = true
+
+[dev-dependencies]
+divan.workspace = true

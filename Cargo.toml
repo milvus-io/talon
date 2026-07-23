@@ -37,3 +37,4 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 divan = "0.1"
+axum = "0.8"
