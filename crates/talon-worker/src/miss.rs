@@ -11,13 +11,16 @@
 //!   only the touched pages, never the whole 256MB block.
 //!
 //! [`InFlightLoads::admit`] returns an [`Admission`]: `Started` for the first
-//! caller (which submits a [`LoadTask`](crate::LoadTask) to the loader pool) or
-//! `AlreadyLoading` for the rest (which just return `LOADING`). When a load
-//! completes, [`InFlightLoads::complete`] clears the key so a later refetch can
-//! proceed if needed.
+//! caller (which performs the backend load) or `AlreadyLoading` for the rest.
+//! An `AlreadyLoading` caller can [`InFlightLoads::wait`] for the leader's load
+//! to finish and then serve from the now-warm cache, so N concurrent misses for
+//! the same block trigger exactly **one** backend fetch. When a load completes,
+//! [`InFlightLoads::complete`] clears the key and wakes all waiters.
 
-use std::collections::HashSet;
-use std::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+
+use tokio::sync::Notify;
 
 use talon_core::{BlockId, PageIndex};
 
@@ -33,16 +36,21 @@ pub enum LoadKey {
 /// Outcome of trying to admit a demand load.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Admission {
-    /// This caller is the first; it owns submitting the load.
+    /// This caller is the first; it owns performing the load.
     Started,
-    /// A load for this key is already in flight; caller returns `LOADING`.
+    /// A load for this key is already in flight; the caller can [`wait`] for it.
+    ///
+    /// [`wait`]: InFlightLoads::wait
     AlreadyLoading,
 }
 
 /// Tracks demand loads currently in flight to deduplicate concurrent misses.
+///
+/// Each in-flight key carries a [`Notify`] the leader signals on completion, so
+/// followers can await the leader instead of each issuing a redundant fetch.
 #[derive(Default)]
 pub struct InFlightLoads {
-    inner: Mutex<HashSet<LoadKey>>,
+    inner: Mutex<HashMap<LoadKey, Arc<Notify>>>,
 }
 
 impl InFlightLoads {
@@ -57,25 +65,66 @@ impl InFlightLoads {
     /// [`complete`](Self::complete); all overlapping callers get
     /// [`Admission::AlreadyLoading`].
     pub fn admit(&self, key: LoadKey) -> Admission {
+        use std::collections::hash_map::Entry;
         let mut g = self.inner.lock().unwrap();
-        if g.insert(key) {
-            Admission::Started
-        } else {
-            Admission::AlreadyLoading
+        match g.entry(key) {
+            Entry::Occupied(_) => Admission::AlreadyLoading,
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::new(Notify::new()));
+                Admission::Started
+            }
         }
     }
 
-    /// Mark a load complete (success or failure), clearing its key.
+    /// Wait until the in-flight load for `key` completes.
+    ///
+    /// Returns immediately if no load is in flight (it already finished). Uses
+    /// the register-then-recheck pattern so a `complete` racing between the
+    /// lookup and the await cannot cause a missed wakeup.
+    pub async fn wait(&self, key: &LoadKey) {
+        loop {
+            let notify = {
+                let g = self.inner.lock().unwrap();
+                match g.get(key) {
+                    Some(n) => Arc::clone(n),
+                    None => return, // load already completed
+                }
+            };
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            // Register interest before re-checking, so a completion after this
+            // point is guaranteed to wake us.
+            notified.as_mut().enable();
+            // Re-check: if the leader completed between the lookup and enable(),
+            // the key is gone and we must not wait for a signal that won't come.
+            if !self.is_in_flight(key) {
+                return;
+            }
+            notified.await;
+            // Woken; loop to confirm the key is actually gone (guards spurious
+            // wakeups and re-admitted keys).
+        }
+    }
+
+    /// Mark a load complete (success or failure), clearing its key and waking
+    /// any waiters.
     ///
     /// Returns `true` if the key was in flight. After this a subsequent miss for
     /// the same key can start a fresh load.
     pub fn complete(&self, key: &LoadKey) -> bool {
-        self.inner.lock().unwrap().remove(key)
+        let notify = self.inner.lock().unwrap().remove(key);
+        match notify {
+            Some(n) => {
+                n.notify_waiters();
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether a load for `key` is currently in flight.
     pub fn is_in_flight(&self, key: &LoadKey) -> bool {
-        self.inner.lock().unwrap().contains(key)
+        self.inner.lock().unwrap().contains_key(key)
     }
 
     /// Number of loads currently in flight.
@@ -163,6 +212,40 @@ mod tests {
             Admission::AlreadyLoading
         );
         assert_eq!(f.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_immediately_when_not_in_flight() {
+        let f = InFlightLoads::new();
+        // No load in flight -> wait returns at once.
+        f.wait(&LoadKey::Whole(block(10))).await;
+    }
+
+    #[tokio::test]
+    async fn waiters_wake_on_completion() {
+        use std::sync::Arc;
+        let f = Arc::new(InFlightLoads::new());
+        let key = LoadKey::Whole(block(11));
+        assert_eq!(f.admit(key.clone()), Admission::Started);
+
+        // Spawn several followers that wait for the leader.
+        let mut waiters = Vec::new();
+        for _ in 0..4 {
+            let f = Arc::clone(&f);
+            let key = key.clone();
+            waiters.push(tokio::spawn(async move {
+                f.wait(&key).await;
+                // After waking, the key must be gone.
+                assert!(!f.is_in_flight(&key));
+            }));
+        }
+
+        // Give the waiters a moment to register interest, then complete.
+        tokio::task::yield_now().await;
+        assert!(f.complete(&key));
+        for w in waiters {
+            w.await.unwrap();
+        }
     }
 
     #[test]

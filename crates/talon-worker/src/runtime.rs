@@ -8,7 +8,9 @@ use talon_core::{
 };
 use talon_transport::data::RangeRequest;
 
-use crate::{BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics};
+use crate::{
+    Admission, BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics,
+};
 
 /// Placeholder source version used until coordinator metadata includes etags.
 const PLACEHOLDER_VERSION: &str = "e2e-v1";
@@ -106,35 +108,85 @@ impl WorkerRuntime {
 
     /// Return the full committed/fetched bytes of a single block, using the
     /// cache-hit path when resident and the backend-miss path otherwise.
+    ///
+    /// Concurrent misses for the same block are deduplicated: the first caller
+    /// (`Admission::Started`) performs the backend fetch; the rest wait for it
+    /// and then serve from the now-warm cache, so N concurrent misses trigger a
+    /// single backend fetch instead of N (issue #113).
     async fn block_bytes(
         &self,
         request: &RangeRequest,
         block: &BlockId,
     ) -> anyhow::Result<bytes::Bytes> {
+        if let Some(bytes) = self.cached_block(block).await? {
+            return Ok(bytes);
+        }
+
+        self.metrics.record_cache_miss();
+        let key = LoadKey::Whole(block.clone());
+        match self.inflight.admit(key.clone()) {
+            Admission::AlreadyLoading => {
+                // A peer is already fetching this block; wait for it and serve
+                // from cache rather than issuing a duplicate backend fetch.
+                self.inflight.wait(&key).await;
+                if let Some(bytes) = self.cached_block(block).await? {
+                    return Ok(bytes);
+                }
+                // The leader's load failed (key cleared, block still absent).
+                // Fall through and fetch ourselves, admitting a fresh load.
+                if self.inflight.admit(key.clone()) == Admission::AlreadyLoading {
+                    // Another peer already restarted; wait once more, then, if
+                    // still absent, fetch without holding admission to avoid an
+                    // unbounded wait loop.
+                    self.inflight.wait(&key).await;
+                    if let Some(bytes) = self.cached_block(block).await? {
+                        return Ok(bytes);
+                    }
+                    return self.fetch_and_commit(request, block).await;
+                }
+                let result = self.fetch_and_commit(request, block).await;
+                self.inflight.complete(&key);
+                result
+            }
+            Admission::Started => {
+                let result = self.fetch_and_commit(request, block).await;
+                self.inflight.complete(&key);
+                result
+            }
+        }
+    }
+
+    /// Return a block's bytes from the local cache if resident, else `None`.
+    async fn cached_block(&self, block: &BlockId) -> anyhow::Result<Option<bytes::Bytes>> {
         if matches!(
             self.index.presence(block, PageIndex(0), PageIndex(1)),
             Presence::Whole
         ) {
             self.metrics.record_cache_hit();
             tracing::info!(block = %block, "HIT");
-            return self
+            let bytes = self
                 .store
                 .get_bytes(block)
                 .await
-                .map_err(|error| anyhow::anyhow!("read committed block: {error}"));
+                .map_err(|error| anyhow::anyhow!("read committed block: {error}"))?;
+            Ok(Some(bytes))
+        } else {
+            Ok(None)
         }
+    }
 
-        self.metrics.record_cache_miss();
+    /// Fetch a block from the backend and commit it to the local cache.
+    async fn fetch_and_commit(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+    ) -> anyhow::Result<bytes::Bytes> {
         tracing::info!(block = %block, "MISS -> backend fetch");
-        let key = LoadKey::Whole(block.clone());
-        let _ = self.inflight.admit(key.clone());
-
         let started = Instant::now();
         let fetched = self
             .backend
             .fetch_range(&request.object, block.offset, self.block_size as u64)
             .await;
-        self.inflight.complete(&key);
         let bytes = match fetched {
             Ok(bytes) => {
                 self.metrics
@@ -372,6 +424,58 @@ mod tests {
         };
         let got = runtime.serve_range(&req).await.unwrap();
         assert_eq!(got, expected(2, 4));
+        assert_eq!(runtime.block_count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A backend that counts calls and is slow enough that concurrent misses
+    /// overlap, so the dedup path is actually exercised.
+    struct SlowCountingBackend {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BackendStore for SlowCountingBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            Ok(Bytes::from_static(b"abcdefgh"))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 8,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_misses_trigger_a_single_backend_fetch() {
+        // Many simultaneous misses for the same block must dedup to one backend
+        // fetch; the followers wait for the leader and serve from cache (#113).
+        let root = tmp_root();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(SlowCountingBackend {
+            calls: Arc::clone(&calls),
+        });
+        let runtime = Arc::new(runtime_with(backend, WorkerMetrics::new(1024), &root, 8));
+
+        let mut tasks = Vec::new();
+        for _ in 0..16 {
+            let runtime = Arc::clone(&runtime);
+            tasks.push(tokio::spawn(async move {
+                runtime.serve_range(&request("ok")).await.unwrap()
+            }));
+        }
+        for t in tasks {
+            assert_eq!(t.await.unwrap(), Bytes::from_static(b"abcd"));
+        }
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "concurrent misses must dedup to one backend fetch"
+        );
         assert_eq!(runtime.block_count(), 1);
         std::fs::remove_dir_all(root).ok();
     }
