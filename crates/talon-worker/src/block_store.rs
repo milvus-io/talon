@@ -23,7 +23,12 @@ use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use talon_core::{BlockHandle, BlockId, Error, ObjectStore, PageIndex, Result};
+
+/// Process-wide monotonic counter making staging temp filenames unique, so two
+/// concurrent writers of the same block never share a `.tmp` path (issue #113).
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
@@ -110,15 +115,27 @@ impl ObjectStore for WholeBlockStore {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Write to a temp file then rename so a present `.blk` is always
-        // complete (crash-atomic commit).
-        let tmp = path.with_extension("blk.tmp");
+        // Write to a per-writer-unique temp file then rename, so a present
+        // `.blk` is always complete (crash-atomic commit) AND two concurrent
+        // writers of the same block never truncate each other's staging file
+        // (issue #113). Both writers stage identical content; whichever renames
+        // last wins with a complete file, and the loser's rename is a harmless
+        // overwrite of the same bytes.
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("blk.tmp.{}.{seq}", std::process::id()));
         {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&value)?;
             f.sync_all()?;
         }
-        std::fs::rename(&tmp, &path)?;
+        // Rename our own unique temp into place. If a concurrent writer already
+        // renamed theirs, this atomically replaces it with identical bytes.
+        if let Err(e) = std::fs::rename(&tmp, &path) {
+            // Best-effort cleanup of our staging file on failure so a failed
+            // commit never leaks a `.tmp`.
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         Ok(())
     }
 
@@ -140,6 +157,7 @@ impl ObjectStore for WholeBlockStore {
 mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
+    use std::sync::Arc;
     use talon_core::{Backend, ObjectId, Version};
 
     fn block(n: u64) -> BlockId {
@@ -189,6 +207,43 @@ mod tests {
         assert!(!store.contains(&id).await.unwrap());
         // Deleting again is a no-op.
         store.delete(&id).await.unwrap();
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_puts_of_same_block_commit_complete_bytes() {
+        // Two writers staging the same block must not share a temp file and
+        // truncate each other; the committed `.blk` is always the full content
+        // and no `.tmp` is leaked (issue #113).
+        let root = tmp_root();
+        let store = Arc::new(WholeBlockStore::open(&root).unwrap());
+        let id = block(7);
+        let data = Bytes::from(vec![0xABu8; 4096]);
+
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let store = Arc::clone(&store);
+            let id = id.clone();
+            let data = data.clone();
+            tasks.push(tokio::spawn(
+                async move { store.put(&id, data).await.unwrap() },
+            ));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+
+        // The committed block is complete.
+        assert_eq!(store.get_bytes(&id).await.unwrap(), data);
+        // No staging temp files leaked.
+        let shard = store.path_for(&id).parent().unwrap().to_path_buf();
+        let leaked: Vec<_> = std::fs::read_dir(&shard)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .collect();
+        assert!(leaked.is_empty(), "leaked staging temp files: {leaked:?}");
 
         std::fs::remove_dir_all(&root).ok();
     }
