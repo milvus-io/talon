@@ -21,10 +21,11 @@
 
 use std::sync::Arc;
 
-use talon_core::BlockId;
+use talon_core::{BlockId, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::placement_cache::{Cached, PlacementCache};
+use crate::read_plan::plan_read;
 use crate::worker_client::{WorkerClient, WorkerError};
 
 /// Errors from a block read.
@@ -42,6 +43,23 @@ pub enum BlockReadError {
     /// An owner id had no resolvable worker address in membership.
     #[error("owner has no known worker address")]
     UnresolvedOwner,
+}
+
+/// The coordinates of an open file needed to plan a read: its object identity,
+/// logical block size, source version/etag, and total size (for EOF clamping).
+///
+/// Grouping these keeps [`BlockReader::read`] to a small argument list and
+/// mirrors what a `getattr`/HEAD lookup yields for an open handle.
+#[derive(Debug, Clone)]
+pub struct FileView<'a> {
+    /// The object being read.
+    pub object: &'a ObjectId,
+    /// Logical block size in bytes.
+    pub block_size: u32,
+    /// Source version/etag guarding the blocks.
+    pub version: &'a Version,
+    /// Total object length, used to clamp reads at EOF.
+    pub size: u64,
 }
 
 /// Orchestrates block reads against the coordinator + workers with caching.
@@ -89,6 +107,39 @@ impl BlockReader {
             .fetch_range(&block.object, abs_offset, len as u64)
             .await?;
         Ok(bytes)
+    }
+
+    /// Read `[offset, offset+len)` of a file, spanning block boundaries.
+    ///
+    /// Splits the request into per-block segments via
+    /// [`crate::read_plan::plan_read`] (clamped to `file.size` at EOF),
+    /// fetches each segment through [`read_block`](Self::read_block) — so each
+    /// segment independently benefits from the placement cache — and
+    /// concatenates the results in order. A read at or past EOF returns an empty
+    /// buffer (POSIX short read).
+    pub async fn read(
+        &self,
+        file: &FileView<'_>,
+        offset: u64,
+        len: u64,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, BlockReadError> {
+        let plan = plan_read(
+            file.object,
+            offset,
+            len,
+            file.block_size,
+            file.version,
+            file.size,
+        );
+        let mut out = Vec::with_capacity(plan.iter().map(|s| s.len as usize).sum());
+        for seg in plan {
+            let bytes = self
+                .read_block(&seg.block, seg.offset_in_block, seg.len, now_ms)
+                .await?;
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
     }
 
     /// Look the block up via the coordinator and insert the resolved,
@@ -308,5 +359,60 @@ mod tests {
             err,
             BlockReadError::Worker(WorkerError::Remote(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn multi_block_read_stitches_in_order() {
+        // Small block size so a modest read spans several blocks.
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_addr = mock_worker(Arc::clone(&hits)).await;
+        let coord_addr = mock_coordinator(worker_addr).await;
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
+
+        let obj = ObjectId::new(Backend::S3, "b", "o/1");
+        let ver = Version::new("v1");
+        let bs = 1024u32;
+        let size = 100_000u64;
+        // Read 900..900+2300 → spans 4 blocks (tail, full, full, head).
+        let offset = 900u64;
+        let len = 2300u64;
+        let file = FileView {
+            object: &obj,
+            block_size: bs,
+            version: &ver,
+            size,
+        };
+        let bytes = reader.read(&file, offset, len, 0).await.unwrap();
+        assert_eq!(bytes.len() as u64, len);
+        // The mock worker fills each byte with (absolute_offset % 256); the
+        // stitched buffer must be contiguous across block boundaries.
+        for (i, b) in bytes.iter().enumerate() {
+            assert_eq!(*b, ((offset + i as u64) % 256) as u8, "byte {i} mismatch");
+        }
+        // Four distinct blocks were fetched (one worker call each).
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(cache.len(), 4, "each block's placement cached");
+    }
+
+    #[tokio::test]
+    async fn read_past_eof_is_empty_without_fetch() {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_addr = mock_worker(Arc::clone(&hits)).await;
+        let coord_addr = mock_coordinator(worker_addr).await;
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
+
+        let obj = ObjectId::new(Backend::S3, "b", "o/1");
+        let ver = Version::new("v1");
+        let file = FileView {
+            object: &obj,
+            block_size: 1024,
+            version: &ver,
+            size: 1500,
+        };
+        let bytes = reader.read(&file, 5000, 10, 0).await.unwrap();
+        assert!(bytes.is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 }
