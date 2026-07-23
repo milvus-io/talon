@@ -119,7 +119,9 @@ impl BackendStore for AzureBackend {
             .await
             .map_err(Error::Backend)?;
         match resp.status {
-            200 | 206 => Ok(resp.body),
+            200 | 206 => {
+                crate::http::range_body(resp.status, resp.body, offset, len).map_err(Error::Backend)
+            }
             404 => Err(Error::NotFound(obj.to_path())),
             s => Err(Error::Backend(format!(
                 "Azure GET {} -> HTTP {s}",
