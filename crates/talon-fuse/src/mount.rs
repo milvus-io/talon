@@ -18,7 +18,8 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::block_reader::BlockReader;
+use crate::block_reader::{BlockReader, FileView};
+use crate::mapping::path_to_object;
 use crate::ops::{Attr, FileKind, FsError, ReadOnlyFs};
 
 /// How long the kernel may cache a metadata reply before re-asking.
@@ -82,6 +83,14 @@ pub struct TalonFuse {
     reader: BlockReader,
     /// Handle to the async runtime the callbacks dispatch onto.
     runtime: tokio::runtime::Handle,
+    /// Logical block size used to split reads into per-block fetches.
+    block_size: u32,
+    /// Source version/etag used to address blocks.
+    ///
+    /// v1 has no per-object version negotiation on the mount path, so a single
+    /// placeholder version is used cluster-wide (client and worker agree by
+    /// construction); a future revision resolves it from a coordinator `HEAD`.
+    version: talon_core::Version,
 }
 
 impl TalonFuse {
@@ -89,12 +98,21 @@ impl TalonFuse {
     ///
     /// `runtime` is the handle the synchronous FUSE callbacks use to run async
     /// work; typically `tokio::runtime::Handle::current()` on the mounting
-    /// thread.
-    pub fn new(fs: Arc<ReadOnlyFs>, reader: BlockReader, runtime: tokio::runtime::Handle) -> Self {
+    /// thread. `block_size` and `version` address the objects' blocks (see the
+    /// field docs on `version`).
+    pub fn new(
+        fs: Arc<ReadOnlyFs>,
+        reader: BlockReader,
+        runtime: tokio::runtime::Handle,
+        block_size: u32,
+        version: talon_core::Version,
+    ) -> Self {
         Self {
             fs,
             reader,
             runtime,
+            block_size,
+            version,
         }
     }
 
@@ -188,6 +206,87 @@ impl fuser::Filesystem for TalonFuse {
         }
         reply.ok();
     }
+
+    /// Open a file inode, returning a handle for subsequent reads.
+    ///
+    /// Directories are rejected with `EISDIR`-equivalent `ENOSYS` semantics via
+    /// the op layer (`FsError::Unsupported`). The handle indexes into the
+    /// namespace so the `read` callback can recover the object.
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
+        match self.fs.open(ino) {
+            Ok(fh) => reply.opened(fh, 0),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Serve `size` bytes at `offset` for an open handle.
+    ///
+    /// Recovers the object from the handle, then dispatches the (possibly
+    /// multi-block) fetch onto the async runtime via
+    /// [`BlockReader::read`], which splits across block boundaries, serves each
+    /// block through the placement cache, and stitches the result. The
+    /// synchronous FUSE thread blocks on the runtime — never the reverse — so
+    /// the kernel side stays responsive.
+    fn read(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        size: u32,
+        _flags: i32,
+        _lock: Option<u64>,
+        reply: fuser::ReplyData,
+    ) {
+        let (path, file_size) = match self.fs.file_meta(fh) {
+            Ok(m) => m,
+            Err(e) => return reply.error(errno(e)),
+        };
+        let object = match path_to_object(&path) {
+            Ok(o) => o,
+            Err(_) => return reply.error(libc::EINVAL),
+        };
+        let reader = self.reader.clone();
+        let block_size = self.block_size;
+        let version = self.version.clone();
+        let offset = offset.max(0) as u64;
+        // A monotonic-ish millisecond stamp for the placement cache TTL.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
+        let result = self.runtime.block_on(async move {
+            let view = FileView {
+                object: &object,
+                block_size,
+                version: &version,
+                size: file_size,
+            };
+            reader.read(&view, offset, size as u64, now_ms).await
+        });
+        match result {
+            Ok(bytes) => reply.data(&bytes),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    /// Release a previously opened handle.
+    fn release(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        match self.fs.release(fh) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -205,7 +304,13 @@ mod tests {
             Arc::new(PlacementCache::new(1000)),
             1,
         );
-        let mounted = TalonFuse::new(Arc::clone(&fs), reader, tokio::runtime::Handle::current());
+        let mounted = TalonFuse::new(
+            Arc::clone(&fs),
+            reader,
+            tokio::runtime::Handle::current(),
+            256 << 20,
+            talon_core::Version::new("v1"),
+        );
         // The adapter exposes its components for the callbacks to use.
         assert_eq!(mounted.namespace().getattr(1).unwrap().ino, 1);
         assert_eq!(mounted.reader().coordinator_addr(), "127.0.0.1:7000");
