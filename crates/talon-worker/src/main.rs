@@ -147,7 +147,27 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = WholeBlockStore::open(&root)?;
 
+    // Rebuild the in-memory index from blocks already on local disk so a restart
+    // does not re-download the resident working set (issue #114).
     let index = Arc::new(BlockIndex::new());
+    match store.scan() {
+        Ok(metas) => {
+            let count = metas.len();
+            for meta in metas {
+                index.commit(meta);
+            }
+            if count > 0 {
+                tracing::info!(
+                    blocks = count,
+                    resident_bytes = index.resident_bytes(),
+                    "rebuilt block index from on-disk cache"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to scan on-disk cache; starting with an empty index");
+        }
+    }
     let inflight = Arc::new(InFlightLoads::new());
     let node = NodeInfo {
         id: NodeId::new(
