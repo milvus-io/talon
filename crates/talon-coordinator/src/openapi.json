@@ -1,0 +1,179 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Talon Coordinator Management API",
+    "version": "v1",
+    "description": "Read-only, versioned view of the live Talon cluster served by every coordinator from shared cluster state. Responses are equivalent across coordinators for the same backend revision."
+  },
+  "servers": [
+    { "url": "/", "description": "Coordinator administration server" }
+  ],
+  "paths": {
+    "/api/v1/cluster": {
+      "get": {
+        "summary": "Cluster summary",
+        "description": "Aggregate counts and capacity for the whole cluster.",
+        "responses": {
+          "200": {
+            "description": "Cluster summary.",
+            "headers": {
+              "Cache-Control": { "schema": { "type": "string" }, "description": "Short-lived caching (max-age=2)." },
+              "ETag": { "schema": { "type": "string" }, "description": "Weak ETag equal to the snapshot revision." }
+            },
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ClusterSummary" } } }
+          },
+          "503": { "$ref": "#/components/responses/BackendUnavailable" }
+        }
+      }
+    },
+    "/api/v1/nodes": {
+      "get": {
+        "summary": "List nodes",
+        "description": "Bounded, stably-ordered (by node id) page of nodes, optionally filtered by role and health.",
+        "parameters": [
+          { "name": "role", "in": "query", "required": false, "schema": { "type": "string", "enum": ["coordinator", "worker"] } },
+          { "name": "health", "in": "query", "required": false, "schema": { "type": "string", "enum": ["healthy", "degraded", "unhealthy", "unknown"] } },
+          { "name": "offset", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 0 } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 500, "default": 100 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "A page of nodes.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NodeList" } } }
+          },
+          "503": { "$ref": "#/components/responses/BackendUnavailable" }
+        }
+      }
+    },
+    "/api/v1/nodes/{node_id}": {
+      "get": {
+        "summary": "Node detail",
+        "parameters": [
+          { "name": "node_id", "in": "path", "required": true, "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "One node's detail.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/NodeView" } } }
+          },
+          "404": {
+            "description": "No such node in the current snapshot.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+          },
+          "503": { "$ref": "#/components/responses/BackendUnavailable" }
+        }
+      }
+    },
+    "/api/v1/backend": {
+      "get": {
+        "summary": "Backend status",
+        "description": "Shared-state backend readiness and current revision.",
+        "responses": {
+          "200": {
+            "description": "Backend status.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/BackendStatus" } } }
+          },
+          "503": { "$ref": "#/components/responses/BackendUnavailable" }
+        }
+      }
+    },
+    "/api/v1/openapi.json": {
+      "get": {
+        "summary": "This OpenAPI document",
+        "responses": {
+          "200": { "description": "The OpenAPI 3.0 contract.", "content": { "application/json": {} } }
+        }
+      }
+    }
+  },
+  "components": {
+    "responses": {
+      "BackendUnavailable": {
+        "description": "The shared-state backend could not serve an authoritative snapshot within the coordinator timeout; no stale data is returned.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/ApiError" } } }
+      }
+    },
+    "schemas": {
+      "ResponseMeta": {
+        "type": "object",
+        "required": ["api_version", "generated_at_unix_ms", "snapshot_revision", "snapshot_age_ms", "backend"],
+        "properties": {
+          "api_version": { "type": "string" },
+          "generated_at_unix_ms": { "type": "integer", "format": "int64" },
+          "snapshot_revision": { "type": "string", "description": "Opaque backend revision; compare for equality only." },
+          "snapshot_age_ms": { "type": "integer", "format": "int64" },
+          "backend": { "type": "string", "enum": ["memory", "etcd", "kubernetes"] }
+        }
+      },
+      "ClusterSummary": {
+        "type": "object",
+        "required": ["cluster_id", "node_count", "coordinator_count", "worker_count", "healthy_worker_count", "total_capacity_bytes", "total_resident_bytes", "total_block_count", "meta"],
+        "properties": {
+          "cluster_id": { "type": "string" },
+          "node_count": { "type": "integer" },
+          "coordinator_count": { "type": "integer" },
+          "worker_count": { "type": "integer" },
+          "healthy_worker_count": { "type": "integer" },
+          "total_capacity_bytes": { "type": "integer", "format": "int64" },
+          "total_resident_bytes": { "type": "integer", "format": "int64" },
+          "total_block_count": { "type": "integer", "format": "int64" },
+          "meta": { "$ref": "#/components/schemas/ResponseMeta" }
+        }
+      },
+      "NodeView": {
+        "type": "object",
+        "required": ["node_id", "role", "address", "health", "ready", "build_version", "started_at_unix_ms", "reported_at_unix_ms", "requests_total", "errors_total", "bytes_served_total", "cache_hits_total", "cache_misses_total", "block_count", "resident_bytes", "capacity_bytes", "labels"],
+        "properties": {
+          "node_id": { "type": "string" },
+          "role": { "type": "string", "enum": ["coordinator", "worker"] },
+          "address": { "type": "string" },
+          "admin_address": { "type": "string", "nullable": true },
+          "health": { "type": "string", "enum": ["healthy", "degraded", "unhealthy", "unknown"] },
+          "ready": { "type": "boolean" },
+          "build_version": { "type": "string" },
+          "started_at_unix_ms": { "type": "integer", "format": "int64" },
+          "reported_at_unix_ms": { "type": "integer", "format": "int64" },
+          "requests_total": { "type": "integer", "format": "int64" },
+          "errors_total": { "type": "integer", "format": "int64" },
+          "bytes_served_total": { "type": "integer", "format": "int64" },
+          "cache_hits_total": { "type": "integer", "format": "int64" },
+          "cache_misses_total": { "type": "integer", "format": "int64" },
+          "block_count": { "type": "integer", "format": "int64" },
+          "resident_bytes": { "type": "integer", "format": "int64" },
+          "capacity_bytes": { "type": "integer", "format": "int64" },
+          "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      },
+      "NodeList": {
+        "type": "object",
+        "required": ["nodes", "total", "offset", "limit", "meta"],
+        "properties": {
+          "nodes": { "type": "array", "items": { "$ref": "#/components/schemas/NodeView" } },
+          "total": { "type": "integer" },
+          "offset": { "type": "integer" },
+          "limit": { "type": "integer" },
+          "meta": { "$ref": "#/components/schemas/ResponseMeta" }
+        }
+      },
+      "BackendStatus": {
+        "type": "object",
+        "required": ["backend", "ready", "revision", "snapshot_age_ms", "meta"],
+        "properties": {
+          "backend": { "type": "string", "enum": ["memory", "etcd", "kubernetes"] },
+          "ready": { "type": "boolean" },
+          "revision": { "type": "string" },
+          "snapshot_age_ms": { "type": "integer", "format": "int64" },
+          "meta": { "$ref": "#/components/schemas/ResponseMeta" }
+        }
+      },
+      "ApiError": {
+        "type": "object",
+        "required": ["error", "message"],
+        "properties": {
+          "error": { "type": "string", "description": "Stable machine-readable code." },
+          "message": { "type": "string" }
+        }
+      }
+    }
+  }
+}

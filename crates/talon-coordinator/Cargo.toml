@@ -39,6 +39,7 @@ futures = { workspace = true, optional = true }
 [dev-dependencies]
 divan.workspace = true
 tokio.workspace = true
+tower = { version = "0.5", features = ["util"] }
 
 [[bench]]
 name = "placement_benches"

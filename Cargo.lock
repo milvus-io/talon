@@ -2092,6 +2092,7 @@ dependencies = [
  "thiserror 2.0.19",
  "tokio",
  "toml",
+ "tower",
  "tracing",
  "tracing-subscriber",
  "xxhash-rust",
