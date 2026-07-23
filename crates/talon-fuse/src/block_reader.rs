@@ -25,6 +25,7 @@ use std::sync::Arc;
 use talon_core::{BlockId, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
+use crate::metrics::ReadStats;
 use crate::placement_cache::{Cached, PlacementCache, RefreshReason};
 use crate::read_plan::plan_read;
 use crate::worker_client::{WorkerClient, WorkerError};
@@ -73,6 +74,8 @@ pub struct BlockReader {
     cache: Arc<PlacementCache>,
     /// Number of replicas to request from the coordinator (RF=1 → 1 in v1).
     replicas_k: u8,
+    /// Read-path counters (cache hit/miss, worker fetches, bytes served).
+    stats: ReadStats,
 }
 
 impl BlockReader {
@@ -80,17 +83,37 @@ impl BlockReader {
     ///
     /// `replicas_k` is how many owners to request per placement lookup; with
     /// RF=1 this is `1`, but requesting more reserves an ordered fallback list.
+    /// Metrics are collected into a fresh [`ReadStats`]; use
+    /// [`with_stats`](Self::with_stats) to share an existing one.
     pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
+        Self::with_stats(coordinator, cache, replicas_k, ReadStats::new())
+    }
+
+    /// Like [`new`](Self::new) but records metrics into the provided
+    /// [`ReadStats`], so a caller (e.g. the mount layer) can observe the same
+    /// counters this reader bumps.
+    pub fn with_stats(
+        coordinator: CoordinatorClient,
+        cache: Arc<PlacementCache>,
+        replicas_k: u8,
+        stats: ReadStats,
+    ) -> Self {
         Self {
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
+            stats,
         }
     }
 
     /// The coordinator address this reader resolves placement against.
     pub fn coordinator_addr(&self) -> &str {
         self.coordinator.addr()
+    }
+
+    /// The read-path counters this reader updates.
+    pub fn stats(&self) -> &ReadStats {
+        &self.stats
     }
 
     /// Read `len` bytes at `offset_in_block` within `block`.
@@ -118,8 +141,14 @@ impl BlockReader {
         now_ms: u64,
     ) -> Result<Vec<u8>, BlockReadError> {
         let cached = match self.cache.get(block, now_ms) {
-            Some(c) => c,
-            None => self.resolve_and_cache(block, now_ms).await?,
+            Some(c) => {
+                self.stats.record_cache_hit();
+                c
+            }
+            None => {
+                self.stats.record_cache_miss();
+                self.resolve_and_cache(block, now_ms).await?
+            }
         };
         let abs_offset = block.offset + offset_in_block as u64;
 
@@ -128,18 +157,26 @@ impl BlockReader {
             .try_replicas(block, &cached.replicas, abs_offset, len)
             .await
         {
-            Ok(bytes) => return Ok(bytes),
+            Ok(bytes) => {
+                self.stats.add_bytes_served(bytes.len() as u64);
+                return Ok(bytes);
+            }
             Err(reason) => {
                 // Every cached replica failed; drop the stale placement and do a
                 // single coordinator refresh before giving up.
+                tracing::debug!(%block, ?reason, "all cached replicas failed; refreshing placement");
                 self.cache.invalidate(block, reason);
+                self.stats.record_coordinator_refresh();
             }
         }
 
         let fresh = self.resolve_and_cache(block, now_ms).await?;
-        self.try_replicas(block, &fresh.replicas, abs_offset, len)
+        let bytes = self
+            .try_replicas(block, &fresh.replicas, abs_offset, len)
             .await
-            .map_err(|_| BlockReadError::AllReplicasFailed)
+            .map_err(|_| BlockReadError::AllReplicasFailed)?;
+        self.stats.add_bytes_served(bytes.len() as u64);
+        Ok(bytes)
     }
 
     /// Try each replica address in order; return the first success, or the
@@ -161,16 +198,21 @@ impl BlockReader {
         let mut last = RefreshReason::WrongOwner;
         for addr in replicas {
             let worker = WorkerClient::new(addr.clone());
+            self.stats.record_worker_fetch();
             match worker
                 .fetch_range(&block.object, abs_offset, len as u64)
                 .await
             {
                 Ok(bytes) => return Ok(bytes),
-                Err(WorkerError::Io(_)) => last = RefreshReason::ConnectFailure,
-                Err(WorkerError::Remote(_)) => last = RefreshReason::WrongOwner,
-                // A framing/encode error is not a placement problem; surface it
-                // as a wrong-owner refresh so we still try to recover.
-                Err(_) => last = RefreshReason::WrongOwner,
+                Err(e) => {
+                    self.stats.record_worker_failure();
+                    last = match e {
+                        WorkerError::Io(_) => RefreshReason::ConnectFailure,
+                        // A framing/encode error is not a placement problem, but
+                        // treat it as a wrong-owner refresh so we still recover.
+                        _ => RefreshReason::WrongOwner,
+                    };
+                }
             }
         }
         Err(last)
@@ -470,6 +512,15 @@ mod tests {
         // Second read: cache hit (still 1 entry), worker serves again.
         let _ = reader.read_block(&blk, 0, 16, 1).await.unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        // Metrics reflect one miss then one hit, two worker fetches, bytes served.
+        let snap = reader.stats().snapshot();
+        assert_eq!(snap.cache_misses, 1);
+        assert_eq!(snap.cache_hits, 1);
+        assert_eq!(snap.worker_fetches, 2);
+        assert_eq!(snap.worker_failures, 0);
+        assert_eq!(snap.bytes_served, 64 + 16);
+        assert_eq!(snap.hit_ratio(), 0.5);
     }
 
     #[tokio::test]
