@@ -5,7 +5,7 @@
 //! (evicted, forcing a re-lookup) on any staleness trigger:
 //!
 //! - **TTL expiry** — the cached entry aged out.
-//! - **Epoch mismatch** — a response carried a newer placement epoch.
+//! - **Version mismatch** — a response carried a different placement version.
 //! - **Wrong owner / NOT_FOUND** — the contacted worker doesn't have the block.
 //! - **Connect failure** — the contacted worker is unreachable.
 //!
@@ -23,7 +23,7 @@ use talon_core::BlockId;
 pub enum RefreshReason {
     /// The entry's TTL elapsed.
     Expired,
-    /// A newer epoch was observed than the cached entry's.
+    /// A placement version token different from the cached entry's was observed.
     EpochMismatch,
     /// The contacted worker did not own / have the block.
     WrongOwner,
@@ -31,12 +31,16 @@ pub enum RefreshReason {
     ConnectFailure,
 }
 
-/// A cached placement: ordered replicas + the epoch they were computed at.
+/// A cached placement: ordered replicas + the version they were computed at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cached {
     /// Ordered replica node ids (primary first).
     pub replicas: Vec<String>,
-    /// Placement epoch these replicas were computed against.
+    /// Placement version token these replicas were computed against.
+    ///
+    /// This is an opaque coordinator-issued token (a content hash of the node
+    /// set), **not** a monotonically increasing counter. Clients compare it for
+    /// equality only — see [`PlacementCache::observe_epoch`].
     pub epoch: u64,
 }
 
@@ -113,14 +117,23 @@ impl PlacementCache {
         self.entries.write().unwrap().remove(block).is_some()
     }
 
-    /// Reconcile against an observed epoch: if the cached entry predates
-    /// `observed_epoch`, drop it so the next access re-looks-up.
+    /// Reconcile against an observed placement version: if the cached entry's
+    /// version differs from `observed_epoch`, drop it so the next access
+    /// re-looks-up.
     ///
-    /// Returns `true` if the entry was invalidated by the epoch check.
+    /// The version is an opaque token (a content hash of the coordinator's node
+    /// set), not an ordered counter, so this compares for **inequality** rather
+    /// than `<`. Any difference — a membership change on one coordinator, or a
+    /// response served by a peer that observed a different set — invalidates the
+    /// entry. Because identical membership always hashes to the identical token
+    /// (issue #80), a client load-balanced across active-active coordinators
+    /// with a stable cluster sees no spurious invalidations.
+    ///
+    /// Returns `true` if the entry was invalidated by the version check.
     pub fn observe_epoch(&self, block: &BlockId, observed_epoch: u64) -> bool {
         let mut g = self.entries.write().unwrap();
         if let Some(e) = g.get(block) {
-            if e.cached.epoch < observed_epoch {
+            if e.cached.epoch != observed_epoch {
                 g.remove(block);
                 return true;
             }
@@ -198,44 +211,44 @@ mod tests {
     }
 
     #[test]
-    fn epoch_mismatch_self_heals() {
+    fn version_mismatch_self_heals() {
         let c = PlacementCache::new(10_000);
         c.insert(block(3), cached(5, &["a"]), 0);
-        // Older/equal epoch does not invalidate.
+        // Identical version token does not invalidate.
         assert!(!c.observe_epoch(&block(3), 5));
         assert!(c.get(&block(3), 0).is_some());
-        // Newer epoch drops the stale entry.
+        // Any different token drops the stale entry — the token is a content
+        // hash, not an ordered counter, so "different" (not "greater") is the
+        // trigger.
         assert!(c.observe_epoch(&block(3), 6));
         assert!(c.get(&block(3), 0).is_none());
     }
 
     #[test]
-    fn coordinator_restart_invalidates_stale_cache() {
-        // Regression for issue #69: a client caches placement at a high epoch
-        // produced by one coordinator process; that coordinator restarts and,
-        // because epochs are now seeded from the process start time (wall-clock
-        // second in the high 32 bits), the restarted process advertises a
-        // *larger* epoch — so the client's pre-restart cache is invalidated.
-        //
-        // Before the fix, the restarted coordinator restarted its counter at 0,
-        // `cached_epoch < 0` was false, and the stale entry lived forever.
-        let seed = |secs: u64, counter: u64| (secs << 32) | counter;
-
-        // Pre-restart: coordinator seeded at second T1, churned to counter 37.
-        let pre_restart = seed(1_000, 37);
+    fn membership_change_invalidates_regardless_of_token_order() {
+        // Regression for issue #80: the version is a content hash, so a newer
+        // membership can hash to a *numerically smaller* token. Invalidation
+        // must still fire on any difference, not only on an increase.
         let c = PlacementCache::new(10_000);
-        c.insert(block(7), cached(pre_restart, &["w3"]), 0);
-
-        // Post-restart: a fresh process seeded at a later second T2. Its very
-        // first advertised epoch already exceeds the pre-restart one.
-        let post_restart = seed(1_001, 0);
-        assert!(
-            post_restart > pre_restart,
-            "restart epoch must outrank pre-restart"
-        );
-
-        // The stale entry pinning the client to the now-dead w3 is dropped.
-        assert!(c.observe_epoch(&block(7), post_restart));
+        c.insert(block(7), cached(9_000, &["w3"]), 0);
+        // A different membership hashes to a smaller value here.
+        let different_but_smaller = 42u64;
+        assert!(different_but_smaller < 9_000);
+        assert!(c.observe_epoch(&block(7), different_but_smaller));
         assert!(c.get(&block(7), 0).is_none());
+    }
+
+    #[test]
+    fn stable_membership_across_coordinators_does_not_thrash() {
+        // A client load-balanced between two active-active coordinators that
+        // observe the *same* membership sees the *same* token, so its cache is
+        // never spuriously invalidated (issue #80).
+        let c = PlacementCache::new(10_000);
+        let token = 0xABCD_1234u64; // both coordinators compute this same hash.
+        c.insert(block(4), cached(token, &["a", "b"]), 0);
+        // Repeated observations from either coordinator, same token -> no drop.
+        assert!(!c.observe_epoch(&block(4), token));
+        assert!(!c.observe_epoch(&block(4), token));
+        assert!(c.get(&block(4), 0).is_some());
     }
 }

@@ -28,6 +28,7 @@ thiserror.workspace = true
 serde_json.workspace = true
 toml.workspace = true
 axum.workspace = true
+xxhash-rust.workspace = true
 
 [dev-dependencies]
 divan.workspace = true

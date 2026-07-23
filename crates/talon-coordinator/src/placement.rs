@@ -9,53 +9,90 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use talon_core::{BlockId, NodeId, NodeInfo};
+use xxhash_rust::xxh3::xxh3_64;
 
-/// A monotonically increasing version of the placement/node set.
+/// A content-derived version of the placement/node set.
 ///
-/// The coordinator bumps the epoch whenever membership changes so that clients
-/// and workers can detect stale placement decisions and refresh.
+/// The coordinator publishes this version alongside every placement answer so
+/// clients and workers can detect when their cached placement predates a
+/// membership change and refresh.
 ///
-/// # Monotonicity across restarts
+/// # Deterministic across coordinators
 ///
-/// Clients only refresh cached placement when they observe an epoch **strictly
-/// greater** than the one they hold, so the epoch must never move backwards —
-/// including across a coordinator process restart. A plain in-memory counter
-/// from `0` breaks this: a restarted coordinator would re-advertise low epochs
-/// that clients (holding a higher pre-restart epoch) silently ignore, pinning
-/// them to a stale replica list forever (see issue #69).
+/// Talon runs coordinators **active-active**: several stateless processes serve
+/// placement for the same cluster behind a load balancer. A client's successive
+/// lookups can land on different coordinators, so the version a client caches
+/// must depend only on the *observable membership*, never on which process
+/// answered or when it started.
 ///
-/// To stay monotonic without external state, the epoch is seeded from the
-/// process **start time**: the wall-clock second occupies the high 32 bits and
-/// an in-process counter the low 32 bits. A later process always starts from a
-/// larger seed than any earlier one produced, so its epochs outrank them.
+/// Earlier revisions seeded the version from the process start time plus a
+/// process-local counter (issue #69/#71). That is fine for a single coordinator
+/// but breaks under active-active: two processes holding the **same** healthy
+/// worker set would advertise **different** counters, so a load-balanced client
+/// would see the version flip on every other request and refresh its cache
+/// continuously — or, worse, treat a peer's legitimately different value as
+/// "older" and ignore it.
 ///
-/// This keeps the coordinator free of unrebuildable persistent state (a v1
-/// design invariant). The residual edge — two restarts within the *same* second
-/// where the later process observes fewer membership changes — is negligible in
-/// practice (pod restarts take seconds). A future revision may instead derive
-/// the epoch from the Kubernetes `resourceVersion` of the worker endpoints,
-/// which is monotonic by construction (tracked for v1.5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
+/// Instead the version is a stable 64-bit hash of the placement-relevant fields
+/// of the healthy node set (each node's id, address, and role), computed over a
+/// canonical, id-sorted encoding. Two coordinators with identical membership
+/// therefore compute the **identical** version, and any placement-relevant
+/// change (a node joining, leaving, or changing address) changes it. The value
+/// carries no ordering meaning: clients compare versions for **equality**, not
+/// magnitude (see the FUSE placement cache).
+///
+/// The hash keeps coordinators free of unrebuildable persistent state (a v1
+/// design invariant) while remaining backend-neutral: a future revision can map
+/// an opaque Kubernetes `resourceVersion` or etcd revision onto the same token
+/// type without changing clients.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub struct Epoch(pub u64);
 
 impl Epoch {
-    /// Return the next epoch (this + 1).
-    pub fn next(self) -> Self {
-        Epoch(self.0 + 1)
-    }
+    /// The version of an empty node set.
+    ///
+    /// Distinct from any non-empty membership's version so a client caching a
+    /// placement against a populated cluster still refreshes if the cluster
+    /// drains to zero nodes.
+    pub const EMPTY: Epoch = Epoch(0);
 
-    /// A fresh epoch seeded from the current wall-clock second in the high 32
-    /// bits, with a zero low counter. Used as the base for a newly started
-    /// coordinator so its epochs outrank any earlier process's (see the type
-    /// docs for the monotonicity rationale).
-    pub fn seeded_now() -> Self {
-        let secs = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
-        // Clamp to 32 bits (good past year 2106) and shift into the high half.
-        Epoch((secs & 0xFFFF_FFFF) << 32)
+    /// Compute the deterministic placement version for a node set.
+    ///
+    /// The result depends only on the placement-relevant fields (id, address,
+    /// role) of the nodes, is independent of their input order, and is identical
+    /// on any coordinator observing the same membership. An empty set maps to
+    /// [`Epoch::EMPTY`].
+    pub fn for_nodes(nodes: &[NodeInfo]) -> Self {
+        if nodes.is_empty() {
+            return Epoch::EMPTY;
+        }
+        // Canonicalize: sort by node id so input order never affects the hash,
+        // and encode each placement-relevant field with an unambiguous length
+        // delimiter so distinct field boundaries can never collide (e.g.
+        // id="ab",addr="c" must not hash like id="a",addr="bc").
+        let mut ids: Vec<&NodeInfo> = nodes.iter().collect();
+        ids.sort_unstable_by(|a, b| a.id.0.cmp(&b.id.0));
+        let mut buf: Vec<u8> = Vec::with_capacity(nodes.len() * 48);
+        for node in ids {
+            let role = match node.role {
+                talon_core::NodeRole::Coordinator => 0u8,
+                talon_core::NodeRole::Worker => 1u8,
+            };
+            push_field(&mut buf, node.id.0.as_bytes());
+            push_field(&mut buf, node.address.as_bytes());
+            buf.push(role);
+        }
+        // A non-empty set must never hash to the reserved empty sentinel, so a
+        // populated cluster is always distinguishable from a drained one.
+        let raw = xxh3_64(&buf);
+        Epoch(if raw == Epoch::EMPTY.0 { 1 } else { raw })
     }
+}
+
+/// Append a length-prefixed field to the canonical membership encoding.
+fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
+    buf.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+    buf.extend_from_slice(bytes);
 }
 
 /// Decides which node(s) should hold a given block.
@@ -189,21 +226,45 @@ mod tests {
     }
 
     #[test]
-    fn epoch_increments() {
-        let e = Epoch::default();
-        assert_eq!(e.0, 0);
-        assert_eq!(e.next().0, 1);
-        assert!(e < e.next());
+    fn version_is_deterministic_and_order_independent() {
+        let a = nodes(&["a", "b", "c"]);
+        let mut shuffled = a.clone();
+        shuffled.reverse();
+        // Same membership, different input order -> identical version.
+        assert_eq!(Epoch::for_nodes(&a), Epoch::for_nodes(&shuffled));
+        // Recomputing on a fresh process (simulated by a fresh call) is stable.
+        assert_eq!(Epoch::for_nodes(&a), Epoch::for_nodes(&a));
     }
 
     #[test]
-    fn seeded_now_puts_time_in_high_bits() {
-        let e = Epoch::seeded_now();
-        // High 32 bits carry a nonzero wall-clock second; low 32 start clear.
-        assert!(e.0 >> 32 > 0, "seed must occupy the high bits");
-        assert_eq!(e.0 & 0xFFFF_FFFF, 0, "low counter starts at 0");
-        // A seed leaves ample low-bit headroom before it could collide with the
-        // next second's seed (2^32 counter increments per second).
-        assert!(e.next().0 > e.0);
+    fn version_changes_on_placement_relevant_change() {
+        let base = Epoch::for_nodes(&nodes(&["a", "b"]));
+        // Adding a node changes the version.
+        assert_ne!(base, Epoch::for_nodes(&nodes(&["a", "b", "c"])));
+        // Removing a node changes the version.
+        assert_ne!(base, Epoch::for_nodes(&nodes(&["a"])));
+        // An address change on the same id changes the version.
+        let mut moved = nodes(&["a", "b"]);
+        moved[0].address = "moved:9999".into();
+        assert_ne!(base, Epoch::for_nodes(&moved));
+    }
+
+    #[test]
+    fn empty_set_is_reserved_sentinel() {
+        assert_eq!(Epoch::for_nodes(&[]), Epoch::EMPTY);
+        assert_eq!(Epoch::EMPTY.0, 0);
+        // A populated cluster is always distinguishable from a drained one.
+        assert_ne!(Epoch::for_nodes(&nodes(&["a"])), Epoch::EMPTY);
+    }
+
+    #[test]
+    fn field_boundaries_do_not_collide() {
+        // Length-delimited encoding: shifting a byte across the id/address
+        // boundary must produce a different version.
+        let mut left = nodes(&["ab"]);
+        left[0].address = "c".into();
+        let mut right = nodes(&["a"]);
+        right[0].address = "bc".into();
+        assert_ne!(Epoch::for_nodes(&left), Epoch::for_nodes(&right));
     }
 }
