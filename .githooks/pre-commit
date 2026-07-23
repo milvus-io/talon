@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+# Talon pre-commit secret scanner.
+#
+# Blocks a commit if any staged content looks like an Azure (or generic) secret.
+# Secrets in Talon are supplied at runtime via environment variables
+# (TALON_WORKER_AZURE_SAS / TALON_WORKER_AZURE_ACCOUNT) and must never be
+# committed. This is a best-effort net, not a guarantee — treat a hit as a hard
+# stop and rotate anything that leaked.
+#
+# Install once per clone:
+#     git config core.hooksPath .githooks
+#
+# Emergency bypass (discouraged; only for a verified false positive):
+#     git commit --no-verify
+
+set -euo pipefail
+
+# Patterns that indicate a leaked secret. Kept deliberately tight to limit
+# false positives while catching the shapes that actually matter here.
+patterns=(
+    'sig=[A-Za-z0-9%/+]{20,}'                 # SAS signature query param
+    'SharedAccessSignature'                    # SAS / connection-string marker
+    'AccountKey=[A-Za-z0-9/+]{40,}'            # Storage account key in a conn string
+    'BlobEndpoint=.*core\.windows\.net'        # Connection string endpoint
+    '[?&](sv|se|sp|sr|st|sig)=[A-Za-z0-9%/+]{6,}' # SAS token query fragments
+)
+
+# Only scan text added to the index (the '+' lines of the staged diff).
+# Exclude this hook itself: it necessarily contains the very patterns it looks
+# for, and matching them here would be a false positive on every edit.
+staged_added="$(git diff --cached --no-color -U0 -- . ':(exclude).githooks/pre-commit' \
+    | grep '^+' | grep -v '^+++' || true)"
+
+if [ -z "$staged_added" ]; then
+    exit 0
+fi
+
+hit=0
+for pat in "${patterns[@]}"; do
+    if printf '%s\n' "$staged_added" | grep -E -q "$pat"; then
+        if [ "$hit" -eq 0 ]; then
+            echo "ERROR: pre-commit secret scan blocked this commit." >&2
+            echo "Staged content matches a secret pattern. Nothing secret may be committed." >&2
+            echo "Secrets belong in env vars (TALON_WORKER_AZURE_SAS), never in the tree." >&2
+            echo >&2
+            echo "Matched pattern(s):" >&2
+        fi
+        echo "  - $pat" >&2
+        hit=1
+    fi
+done
+
+if [ "$hit" -ne 0 ]; then
+    echo >&2
+    echo "If this is a genuine false positive, review carefully, then bypass with:" >&2
+    echo "    git commit --no-verify" >&2
+    exit 1
+fi
+
+exit 0
