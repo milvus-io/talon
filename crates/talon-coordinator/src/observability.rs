@@ -675,17 +675,22 @@ pub async fn serve_admin(
     listener: TcpListener,
     state: Arc<CoordinatorObservability>,
 ) -> std::io::Result<()> {
-    axum::serve(
-        listener,
-        Router::new()
-            .route("/metrics", get(metrics_handler))
-            .route("/healthz", get(health_handler))
-            .route("/readyz", get(readiness_handler))
-            .with_state(Arc::clone(&state))
-            // Read-only versioned management API under /api/v1 (issue #82).
-            .merge(crate::api::router(state)),
-    )
-    .await
+    axum::serve(listener, admin_router(state)).await
+}
+
+/// Build the coordinator administration router: metrics/health/readiness, the
+/// versioned management API (#82), and the embedded UI (#83). Split out from
+/// [`serve_admin`] so route coexistence is unit-testable without binding a port.
+pub fn admin_router(state: Arc<CoordinatorObservability>) -> Router {
+    Router::new()
+        .route("/metrics", get(metrics_handler))
+        .route("/healthz", get(health_handler))
+        .route("/readyz", get(readiness_handler))
+        .with_state(Arc::clone(&state))
+        // Read-only versioned management API under /api/v1 (issue #82).
+        .merge(crate::api::router(state))
+        // Embedded management UI under / and /ui (issue #83).
+        .merge(crate::ui::router())
 }
 
 async fn metrics_handler(State(state): State<Arc<CoordinatorObservability>>) -> impl IntoResponse {
@@ -904,6 +909,40 @@ mod tests {
         let ready = request(address, "/readyz").await;
         assert!(ready.starts_with("HTTP/1.1 503 Service Unavailable"));
         assert!(ready.contains("\"reason\":\"unavailable\""));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn ui_and_api_coexist_without_shadowing_admin_routes() {
+        // The embedded UI (#83) and the management API (#82) share the admin
+        // server with /metrics, /healthz, /readyz. None must shadow another.
+        let (observability, _store) = observability();
+        observability.check_ready().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_admin(listener, Arc::clone(&observability)));
+
+        // UI shell at / and /ui, with the strict CSP.
+        let root = request(address, "/").await;
+        assert!(root.starts_with("HTTP/1.1 200 OK"));
+        assert!(root.contains("content-security-policy"));
+        assert!(root.contains("id=\"app\""));
+        let asset = request(address, "/ui/assets/app.js").await;
+        assert!(asset.contains("text/javascript"));
+
+        // API still answers under /api/v1.
+        let cluster = request(address, "/api/v1/cluster").await;
+        assert!(cluster.starts_with("HTTP/1.1 200 OK"));
+        assert!(cluster.contains("\"cluster_id\""));
+
+        // Operational routes are unaffected.
+        assert!(request(address, "/healthz")
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+        assert!(request(address, "/metrics")
+            .await
+            .contains("talon_coordinator_build_info"));
 
         server.abort();
     }

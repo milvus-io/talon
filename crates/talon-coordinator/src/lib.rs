@@ -12,6 +12,7 @@ pub mod observability;
 pub mod placement;
 pub mod service;
 pub mod state_store;
+pub mod ui;
 
 pub use config::{CoordinatorConfig, CoordinatorConfigPatch};
 pub use heartbeat::{HeartbeatConfig, HeartbeatTracker, Inventory};
