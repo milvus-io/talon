@@ -24,7 +24,9 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use talon_core::{BlockHandle, BlockId, Error, ObjectStore, PageIndex, Result};
+use talon_core::{
+    BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result,
+};
 
 /// Process-wide monotonic counter making staging temp filenames unique, so two
 /// concurrent writers of the same block never share a `.tmp` path (issue #113).
@@ -72,6 +74,62 @@ impl WholeBlockStore {
         let digest = hasher.finish();
         let hex = format!("{digest:016x}");
         self.root.join(&hex[0..2]).join(format!("{hex}.blk"))
+    }
+
+    /// Sidecar metadata path for a block: `<root>/<shard>/<digest>.meta`.
+    ///
+    /// The `.blk` filename is a one-way digest of the [`BlockId`], so the id
+    /// cannot be recovered from the block file alone. This sidecar stores the
+    /// serialized [`BlockMeta`] (id, form, len) next to each committed block so
+    /// the index can be rebuilt on startup from on-disk cache (issue #114).
+    fn meta_path_for(&self, id: &BlockId) -> PathBuf {
+        self.path_for(id).with_extension("meta")
+    }
+
+    /// Scan the cache directory and return the [`BlockMeta`] of every committed
+    /// block, reconstructed from the on-disk `.meta` sidecars.
+    ///
+    /// Used at worker startup to repopulate the in-memory [`BlockIndex`] so a
+    /// restart does not re-download blocks already resident on local disk. A
+    /// sidecar without a matching `.blk` (or vice versa) is skipped, and a
+    /// malformed sidecar is ignored rather than failing the whole scan.
+    pub fn scan(&self) -> Result<Vec<BlockMeta>> {
+        let mut out = Vec::new();
+        let shards = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for shard in shards.flatten() {
+            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("meta") {
+                    continue;
+                }
+                // Require the matching block file to still be present.
+                if !path.with_extension("blk").exists() {
+                    continue;
+                }
+                match std::fs::read(&path) {
+                    Ok(bytes) => match serde_json::from_slice::<BlockMeta>(&bytes) {
+                        Ok(meta) => out.push(meta),
+                        Err(error) => {
+                            tracing::warn!(path = %path.display(), %error, "skipping malformed block sidecar");
+                        }
+                    },
+                    Err(error) => {
+                        tracing::warn!(path = %path.display(), %error, "skipping unreadable block sidecar");
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Open a present block file read-only, returning its fd and byte length.
@@ -134,12 +192,19 @@ impl ObjectStore for WholeBlockStore {
 
     async fn put(&self, id: &BlockId, value: Bytes) -> Result<()> {
         let path = self.path_for(id);
+        let meta_path = self.meta_path_for(id);
+        let meta = BlockMeta {
+            id: id.clone(),
+            form: BlockForm::Whole,
+            len: value.len() as u64,
+        };
         // The write + fsync of a whole block is blocking disk I/O; keep it off
         // the reactor thread (issue #115).
         spawn_blocking_io(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            let pid = std::process::id();
             // Write to a per-writer-unique temp file then rename, so a present
             // `.blk` is always complete (crash-atomic commit) AND two concurrent
             // writers of the same block never truncate each other's staging file
@@ -147,7 +212,7 @@ impl ObjectStore for WholeBlockStore {
             // renames last wins with a complete file, and the loser's rename is
             // a harmless overwrite of the same bytes.
             let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = path.with_extension(format!("blk.tmp.{}.{seq}", std::process::id()));
+            let tmp = path.with_extension(format!("blk.tmp.{pid}.{seq}"));
             {
                 let mut f = std::fs::File::create(&tmp)?;
                 f.write_all(&value)?;
@@ -162,6 +227,24 @@ impl ObjectStore for WholeBlockStore {
                 let _ = std::fs::remove_file(&tmp);
                 return Err(e.into());
             }
+            // Write the sidecar (id + form + len) so the index can be rebuilt on
+            // startup (issue #114). Same unique-temp-then-rename discipline. The
+            // block file is already committed; a missing sidecar only costs a
+            // re-fetch of that block after a restart, so a sidecar failure is
+            // logged but does not fail the commit.
+            let encoded = serde_json::to_vec(&meta)
+                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
+            let meta_seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+            let meta_tmp = meta_path.with_extension(format!("meta.tmp.{pid}.{meta_seq}"));
+            if let Err(error) = (|| -> std::io::Result<()> {
+                let mut f = std::fs::File::create(&meta_tmp)?;
+                f.write_all(&encoded)?;
+                f.sync_all()?;
+                std::fs::rename(&meta_tmp, &meta_path)
+            })() {
+                let _ = std::fs::remove_file(&meta_tmp);
+                tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
+            }
             Ok(())
         })
         .await
@@ -169,10 +252,16 @@ impl ObjectStore for WholeBlockStore {
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
         let path = self.path_for(id);
-        spawn_blocking_io(move || match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        let meta_path = self.meta_path_for(id);
+        spawn_blocking_io(move || {
+            // Remove the sidecar too so a deleted block is not resurrected by a
+            // startup scan.
+            let _ = std::fs::remove_file(&meta_path);
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         })
         .await
     }
@@ -274,6 +363,68 @@ mod tests {
             .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
             .collect();
         assert!(leaked.is_empty(), "leaked staging temp files: {leaked:?}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn scan_rebuilds_metadata_for_committed_blocks() {
+        // Commit several blocks, then scan reconstructs each BlockMeta (id +
+        // Whole + len) from the on-disk sidecars — the basis for rebuilding the
+        // index on startup (issue #114).
+        let root = tmp_root();
+        let store = WholeBlockStore::open(&root).unwrap();
+        let committed = [
+            (block(1), Bytes::from_static(b"one")),
+            (block(2), Bytes::from(vec![0u8; 100])),
+            (block(3), Bytes::from_static(b"three-block")),
+        ];
+        for (id, data) in &committed {
+            store.put(id, data.clone()).await.unwrap();
+        }
+
+        let mut metas = store.scan().unwrap();
+        metas.sort_by_key(|m| m.len);
+        assert_eq!(metas.len(), 3);
+        // Every committed block is present with the right id, form, and length.
+        for (id, data) in &committed {
+            let found = metas
+                .iter()
+                .find(|m| &m.id == id)
+                .unwrap_or_else(|| panic!("scan missing block {id}"));
+            assert_eq!(found.form, BlockForm::Whole);
+            assert_eq!(found.len, data.len() as u64);
+        }
+
+        // A fresh store over the same root rebuilds the same set (restart).
+        let reopened = WholeBlockStore::open(&root).unwrap();
+        assert_eq!(reopened.scan().unwrap().len(), 3);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn scan_skips_deleted_blocks_and_handles_empty_root() {
+        let root = tmp_root();
+        let store = WholeBlockStore::open(&root).unwrap();
+        // Empty cache -> empty scan.
+        assert!(store.scan().unwrap().is_empty());
+
+        store
+            .put(&block(1), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        store
+            .put(&block(2), Bytes::from_static(b"y"))
+            .await
+            .unwrap();
+        assert_eq!(store.scan().unwrap().len(), 2);
+
+        // Deleting a block removes it (and its sidecar) from the scan.
+        store.delete(&block(1)).await.unwrap();
+        let metas = store.scan().unwrap();
+        assert_eq!(metas.len(), 1);
+        assert_eq!(metas[0].id, block(2));
 
         std::fs::remove_dir_all(&root).ok();
     }
