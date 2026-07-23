@@ -5,7 +5,11 @@ use std::path::Path;
 use serde::Deserialize;
 use talon_core::{Patch, MAX_STATUS_FIELD_BYTES};
 
+#[cfg(feature = "kubernetes")]
+use crate::KubernetesConfig;
 use crate::{ClusterStateConfig, StateBackend};
+#[cfg(feature = "etcd")]
+use crate::{EtcdConfig, EtcdTlsConfig};
 
 /// Fully resolved coordinator configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,6 +26,12 @@ pub struct CoordinatorConfig {
     pub node_id: String,
     /// Shared-state and lease settings.
     pub state: ClusterStateConfig,
+    /// etcd backend connection settings, required when `state.backend` is etcd.
+    #[cfg(feature = "etcd")]
+    pub etcd: Option<EtcdConfig>,
+    /// Kubernetes backend settings, required when `state.backend` is kubernetes.
+    #[cfg(feature = "kubernetes")]
+    pub kubernetes: Option<KubernetesConfig>,
 }
 
 impl Default for CoordinatorConfig {
@@ -33,6 +43,10 @@ impl Default for CoordinatorConfig {
             cluster_id: "default".into(),
             node_id: "127.0.0.1:7000".into(),
             state: ClusterStateConfig::default(),
+            #[cfg(feature = "etcd")]
+            etcd: None,
+            #[cfg(feature = "kubernetes")]
+            kubernetes: None,
         }
     }
 }
@@ -65,6 +79,41 @@ pub struct CoordinatorConfigPatch {
     pub lease_ttl_ms: Option<u64>,
     /// Shared-state request timeout.
     pub request_timeout_ms: Option<u64>,
+    /// etcd backend connection block (TOML `[etcd]`).
+    #[cfg(feature = "etcd")]
+    pub etcd: Option<EtcdConfig>,
+    /// Kubernetes backend block (TOML `[kubernetes]`).
+    #[cfg(feature = "kubernetes")]
+    pub kubernetes: Option<KubernetesConfig>,
+    /// env/CLI-only override for `etcd.endpoints` (never a TOML key).
+    #[cfg(feature = "etcd")]
+    #[serde(skip)]
+    pub etcd_endpoints: Option<Vec<String>>,
+    /// env/CLI-only override for `etcd.username` (never a TOML key).
+    #[cfg(feature = "etcd")]
+    #[serde(skip)]
+    pub etcd_username: Option<String>,
+    /// env/CLI-only override for `etcd.password`, so secrets stay out of the
+    /// config file (never a TOML key).
+    #[cfg(feature = "etcd")]
+    #[serde(skip)]
+    pub etcd_password: Option<String>,
+    /// env/CLI-only override for the etcd CA certificate path (never a TOML key).
+    #[cfg(feature = "etcd")]
+    #[serde(skip)]
+    pub etcd_ca_cert_path: Option<String>,
+    /// env/CLI-only override for the etcd client certificate path.
+    #[cfg(feature = "etcd")]
+    #[serde(skip)]
+    pub etcd_client_cert_path: Option<String>,
+    /// env/CLI-only override for the etcd client key path.
+    #[cfg(feature = "etcd")]
+    #[serde(skip)]
+    pub etcd_client_key_path: Option<String>,
+    /// env/CLI-only override for `kubernetes.namespace` (never a TOML key).
+    #[cfg(feature = "kubernetes")]
+    #[serde(skip)]
+    pub kubernetes_namespace: Option<String>,
 }
 
 impl Patch for CoordinatorConfigPatch {
@@ -82,6 +131,24 @@ impl Patch for CoordinatorConfigPatch {
             unhealthy_after_ms: self.unhealthy_after_ms.or(base.unhealthy_after_ms),
             lease_ttl_ms: self.lease_ttl_ms.or(base.lease_ttl_ms),
             request_timeout_ms: self.request_timeout_ms.or(base.request_timeout_ms),
+            #[cfg(feature = "etcd")]
+            etcd: self.etcd.or(base.etcd),
+            #[cfg(feature = "kubernetes")]
+            kubernetes: self.kubernetes.or(base.kubernetes),
+            #[cfg(feature = "etcd")]
+            etcd_endpoints: self.etcd_endpoints.or(base.etcd_endpoints),
+            #[cfg(feature = "etcd")]
+            etcd_username: self.etcd_username.or(base.etcd_username),
+            #[cfg(feature = "etcd")]
+            etcd_password: self.etcd_password.or(base.etcd_password),
+            #[cfg(feature = "etcd")]
+            etcd_ca_cert_path: self.etcd_ca_cert_path.or(base.etcd_ca_cert_path),
+            #[cfg(feature = "etcd")]
+            etcd_client_cert_path: self.etcd_client_cert_path.or(base.etcd_client_cert_path),
+            #[cfg(feature = "etcd")]
+            etcd_client_key_path: self.etcd_client_key_path.or(base.etcd_client_key_path),
+            #[cfg(feature = "kubernetes")]
+            kubernetes_namespace: self.kubernetes_namespace.or(base.kubernetes_namespace),
         }
     }
 }
@@ -141,6 +208,30 @@ impl CoordinatorConfigPatch {
             request_timeout_ms: get("TALON_COORDINATOR_REQUEST_TIMEOUT_MS")
                 .map(|value| parse(value, "TALON_COORDINATOR_REQUEST_TIMEOUT_MS"))
                 .transpose()?,
+            #[cfg(feature = "etcd")]
+            etcd: None,
+            #[cfg(feature = "kubernetes")]
+            kubernetes: None,
+            #[cfg(feature = "etcd")]
+            etcd_endpoints: get("TALON_COORDINATOR_ETCD_ENDPOINTS").map(|value| {
+                value
+                    .split(',')
+                    .map(|endpoint| endpoint.trim().to_string())
+                    .filter(|endpoint| !endpoint.is_empty())
+                    .collect()
+            }),
+            #[cfg(feature = "etcd")]
+            etcd_username: get("TALON_COORDINATOR_ETCD_USERNAME"),
+            #[cfg(feature = "etcd")]
+            etcd_password: get("TALON_COORDINATOR_ETCD_PASSWORD"),
+            #[cfg(feature = "etcd")]
+            etcd_ca_cert_path: get("TALON_COORDINATOR_ETCD_CA_CERT_PATH"),
+            #[cfg(feature = "etcd")]
+            etcd_client_cert_path: get("TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH"),
+            #[cfg(feature = "etcd")]
+            etcd_client_key_path: get("TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH"),
+            #[cfg(feature = "kubernetes")]
+            kubernetes_namespace: get("TALON_COORDINATOR_K8S_NAMESPACE"),
         })
     }
 }
@@ -157,6 +248,69 @@ impl CoordinatorConfig {
         let default_state = defaults.state;
         let listen = merged.listen.unwrap_or(defaults.listen);
         let admin_listen = merged.admin_listen.unwrap_or(defaults.admin_listen);
+        let cluster_id = merged.cluster_id.unwrap_or(defaults.cluster_id);
+
+        // Fold backend blocks with their env/CLI scalar overrides. The block may
+        // come entirely from an env override even with no `[etcd]`/`[kubernetes]`
+        // table in the config file.
+        #[cfg(feature = "etcd")]
+        let etcd = {
+            let mut etcd = merged.etcd;
+            let has_override = merged.etcd_endpoints.is_some()
+                || merged.etcd_username.is_some()
+                || merged.etcd_password.is_some()
+                || merged.etcd_ca_cert_path.is_some()
+                || merged.etcd_client_cert_path.is_some()
+                || merged.etcd_client_key_path.is_some();
+            if has_override {
+                let block = etcd.get_or_insert_with(EtcdConfig::default);
+                if let Some(endpoints) = merged.etcd_endpoints {
+                    block.endpoints = endpoints;
+                }
+                if let Some(username) = merged.etcd_username {
+                    block.username = Some(username);
+                }
+                if let Some(password) = merged.etcd_password {
+                    block.password = Some(password);
+                }
+                // TLS material paths compose over any file-provided [etcd.tls].
+                if merged.etcd_ca_cert_path.is_some()
+                    || merged.etcd_client_cert_path.is_some()
+                    || merged.etcd_client_key_path.is_some()
+                {
+                    let tls = block.tls.get_or_insert_with(EtcdTlsConfig::default);
+                    if let Some(path) = merged.etcd_ca_cert_path {
+                        tls.ca_cert_path = Some(path.into());
+                    }
+                    if let Some(path) = merged.etcd_client_cert_path {
+                        tls.client_cert_path = Some(path.into());
+                    }
+                    if let Some(path) = merged.etcd_client_key_path {
+                        tls.client_key_path = Some(path.into());
+                    }
+                }
+            }
+            etcd
+        };
+        #[cfg(feature = "kubernetes")]
+        let kubernetes = {
+            let mut kubernetes = merged.kubernetes;
+            if merged.kubernetes_namespace.is_some() {
+                let block = kubernetes.get_or_insert_with(KubernetesConfig::default);
+                if let Some(namespace) = merged.kubernetes_namespace {
+                    block.namespace = namespace;
+                }
+            }
+            // Default the backend's logical cluster id to the coordinator's when
+            // left blank, so operators configure it in one place.
+            if let Some(block) = kubernetes.as_mut() {
+                if block.cluster_id.trim().is_empty() {
+                    block.cluster_id = cluster_id.clone();
+                }
+            }
+            kubernetes
+        };
+
         let config = Self {
             node_id: merged.node_id.unwrap_or_else(|| listen.clone()),
             admin_advertise: merged
@@ -164,7 +318,7 @@ impl CoordinatorConfig {
                 .unwrap_or_else(|| admin_listen.clone()),
             listen,
             admin_listen,
-            cluster_id: merged.cluster_id.unwrap_or(defaults.cluster_id),
+            cluster_id,
             state: ClusterStateConfig {
                 backend: merged.state_backend.unwrap_or(default_state.backend),
                 ha_enabled: merged.ha_enabled.unwrap_or(default_state.ha_enabled),
@@ -182,6 +336,10 @@ impl CoordinatorConfig {
                     .request_timeout_ms
                     .unwrap_or(default_state.request_timeout_ms),
             },
+            #[cfg(feature = "etcd")]
+            etcd,
+            #[cfg(feature = "kubernetes")]
+            kubernetes,
         };
         config.validate()?;
         Ok(config)
@@ -207,6 +365,45 @@ impl CoordinatorConfig {
             }
         }
         self.state.validate()?;
+
+        // The selected backend must have a matching configuration block, and the
+        // block itself must be valid. Memory needs no block.
+        match self.state.backend {
+            StateBackend::Memory => {}
+            StateBackend::Etcd => {
+                #[cfg(feature = "etcd")]
+                {
+                    let etcd = self.etcd.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "state_backend is \"etcd\" but no [etcd] configuration was provided"
+                        )
+                    })?;
+                    etcd.validate()?;
+                }
+                #[cfg(not(feature = "etcd"))]
+                anyhow::bail!(
+                    "state_backend is \"etcd\" but this binary was built without the \"etcd\" \
+                     feature; rebuild with --features etcd"
+                );
+            }
+            StateBackend::Kubernetes => {
+                #[cfg(feature = "kubernetes")]
+                {
+                    let kubernetes = self.kubernetes.as_ref().ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "state_backend is \"kubernetes\" but no [kubernetes] configuration \
+                             was provided"
+                        )
+                    })?;
+                    kubernetes.validate()?;
+                }
+                #[cfg(not(feature = "kubernetes"))]
+                anyhow::bail!(
+                    "state_backend is \"kubernetes\" but this binary was built without the \
+                     \"kubernetes\" feature; rebuild with --features kubernetes"
+                );
+            }
+        }
         Ok(())
     }
 }
@@ -283,5 +480,93 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("request_timeout_ms"));
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn etcd_backend_requires_config_block() {
+        // Selecting etcd without an [etcd] block fails validation.
+        let cli = CoordinatorConfigPatch {
+            state_backend: Some(StateBackend::Etcd),
+            ha_enabled: Some(true),
+            coordinator_replicas: Some(3),
+            ..Default::default()
+        };
+        let error = CoordinatorConfig::resolve(
+            CoordinatorConfigPatch::default(),
+            CoordinatorConfigPatch::default(),
+            cli,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("[etcd]"), "unexpected error: {error}");
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn etcd_block_parses_from_toml_and_env_overrides_endpoints() {
+        let file = CoordinatorConfigPatch::from_toml(
+            "state_backend = \"etcd\"\n\
+             ha_enabled = true\n\
+             coordinator_replicas = 3\n\
+             [etcd]\n\
+             endpoints = [\"https://etcd-a:2379\"]\n\
+             prefix = \"/talon\"\n\
+             username = \"root\"\n",
+        )
+        .unwrap();
+        let env = CoordinatorConfigPatch::from_env_with(|key| match key {
+            "TALON_COORDINATOR_ETCD_ENDPOINTS" => {
+                Some("https://etcd-x:2379, https://etcd-y:2379".into())
+            }
+            "TALON_COORDINATOR_ETCD_USERNAME" => Some("root".into()),
+            "TALON_COORDINATOR_ETCD_PASSWORD" => Some("s3cr3t".into()),
+            "TALON_COORDINATOR_ETCD_CA_CERT_PATH" => Some("/etc/talon/etcd/ca.crt".into()),
+            _ => None,
+        })
+        .unwrap();
+        let config =
+            CoordinatorConfig::resolve(file, env, CoordinatorConfigPatch::default()).unwrap();
+        let etcd = config.etcd.clone().expect("etcd block present");
+        // env endpoints win over the file's; password comes from env only.
+        assert_eq!(
+            etcd.endpoints,
+            vec![
+                "https://etcd-x:2379".to_string(),
+                "https://etcd-y:2379".to_string()
+            ]
+        );
+        assert_eq!(etcd.password.as_deref(), Some("s3cr3t"));
+        assert_eq!(
+            etcd.tls.as_ref().and_then(|t| t.ca_cert_path.as_deref()),
+            Some(std::path::Path::new("/etc/talon/etcd/ca.crt"))
+        );
+        // Secret must never appear in Debug output.
+        assert!(!format!("{config:?}").contains("s3cr3t"));
+    }
+
+    #[cfg(feature = "kubernetes")]
+    #[test]
+    fn kubernetes_block_defaults_cluster_id_and_reads_namespace_env() {
+        let file = CoordinatorConfigPatch::from_toml(
+            "state_backend = \"kubernetes\"\n\
+             cluster_id = \"prod\"\n\
+             ha_enabled = true\n\
+             coordinator_replicas = 2\n\
+             [kubernetes]\n\
+             namespace = \"talon\"\n",
+        )
+        .unwrap();
+        let env = CoordinatorConfigPatch::from_env_with(|key| match key {
+            "TALON_COORDINATOR_K8S_NAMESPACE" => Some("talon-system".into()),
+            _ => None,
+        })
+        .unwrap();
+        let config =
+            CoordinatorConfig::resolve(file, env, CoordinatorConfigPatch::default()).unwrap();
+        let kubernetes = config.kubernetes.expect("kubernetes block present");
+        assert_eq!(kubernetes.namespace, "talon-system");
+        // cluster_id defaults from the coordinator's cluster_id.
+        assert_eq!(kubernetes.cluster_id, "prod");
     }
 }
