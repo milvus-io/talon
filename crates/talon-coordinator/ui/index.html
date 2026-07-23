@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Talon — Cluster Management</title>
+    <link rel="stylesheet" href="/ui/assets/app.css" />
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to main content</a>
+    <div id="app" data-loading="true">
+      <header class="topbar" role="banner">
+        <div class="brand">
+          <span class="brand-mark" aria-hidden="true">◆</span>
+          <span class="brand-name">Talon</span>
+        </div>
+        <nav class="nav" aria-label="Primary">
+          <a href="#/overview" data-route="overview" class="nav-link">Overview</a>
+          <a href="#/nodes" data-route="nodes" class="nav-link">Fleet</a>
+          <a href="#/backend" data-route="backend" class="nav-link">Backend</a>
+        </nav>
+        <div class="conn" id="conn-status" role="status" aria-live="polite"></div>
+      </header>
+      <main id="main" class="main" tabindex="-1">
+        <div id="view" class="view">
+          <!-- Populated by app.js. Static fallback content below is replaced
+               once the app boots, so no-JS users still see a real shell. -->
+          <section class="panel">
+            <h1>Talon Cluster Management</h1>
+            <p class="muted">Loading the management console…</p>
+            <noscript>
+              <p class="error">
+                This console requires JavaScript. The read-only management API is
+                available at <code>/api/v1/</code>.
+              </p>
+            </noscript>
+          </section>
+        </div>
+      </main>
+      <footer class="footer" role="contentinfo">
+        <span id="app-meta" class="muted"></span>
+      </footer>
+    </div>
+    <script src="/ui/assets/app.js" defer></script>
+  </body>
+</html>

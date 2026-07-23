@@ -1,0 +1,101 @@
+/* Talon management console — design tokens + application shell.
+ * No external fonts or assets: everything ships with the coordinator binary,
+ * so the console works in air-gapped deployments with a strict CSP. */
+:root {
+  --bg: #0f1419;
+  --bg-panel: #171d26;
+  --bg-elev: #1e2530;
+  --border: #2a3441;
+  --text: #e6edf3;
+  --text-muted: #8b98a9;
+  --accent: #4c9aff;
+  --ok: #3fb950;
+  --warn: #d29922;
+  --err: #f85149;
+  --radius: 8px;
+  --space: 8px;
+  --font: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+  --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: light) {
+  :root {
+    --bg: #f6f8fa; --bg-panel: #ffffff; --bg-elev: #f0f3f6;
+    --border: #d0d7de; --text: #1f2328; --text-muted: #656d76;
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  background: var(--bg); color: var(--text);
+  font-family: var(--font); font-size: 14px; line-height: 1.5;
+}
+.skip-link {
+  position: absolute; left: -9999px; top: 0;
+  background: var(--accent); color: #fff; padding: var(--space);
+  z-index: 100; border-radius: 0 0 var(--radius) 0;
+}
+.skip-link:focus { left: 0; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.topbar {
+  display: flex; align-items: center; gap: calc(var(--space) * 3);
+  padding: 0 calc(var(--space) * 2); height: 56px;
+  background: var(--bg-panel); border-bottom: 1px solid var(--border);
+  position: sticky; top: 0; z-index: 10;
+}
+.brand { display: flex; align-items: center; gap: var(--space); font-weight: 600; }
+.brand-mark { color: var(--accent); }
+.nav { display: flex; gap: var(--space); flex: 1; }
+.nav-link {
+  color: var(--text-muted); text-decoration: none;
+  padding: var(--space) calc(var(--space) * 1.5); border-radius: var(--radius);
+}
+.nav-link:hover { background: var(--bg-elev); color: var(--text); }
+.nav-link[aria-current="page"] { color: var(--text); background: var(--bg-elev); }
+.conn { font-size: 12px; color: var(--text-muted); }
+.conn[data-state="ok"]::before { content: "● "; color: var(--ok); }
+.conn[data-state="stale"]::before { content: "● "; color: var(--warn); }
+.conn[data-state="down"]::before { content: "● "; color: var(--err); }
+
+.main { padding: calc(var(--space) * 3); max-width: 1200px; margin: 0 auto; }
+.view { display: grid; gap: calc(var(--space) * 2); }
+.panel {
+  background: var(--bg-panel); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: calc(var(--space) * 2);
+}
+h1 { font-size: 20px; margin: 0 0 var(--space); }
+h2 { font-size: 16px; margin: 0 0 var(--space); }
+.muted { color: var(--text-muted); }
+.error { color: var(--err); }
+code { font-family: var(--mono); background: var(--bg-elev); padding: 1px 5px; border-radius: 4px; }
+
+.stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: calc(var(--space) * 2); }
+.stat { background: var(--bg-elev); border-radius: var(--radius); padding: calc(var(--space) * 2); }
+.stat .value { font-size: 28px; font-weight: 600; }
+.stat .label { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: var(--space) calc(var(--space) * 1.5); border-bottom: 1px solid var(--border); }
+th { color: var(--text-muted); font-weight: 500; font-size: 12px; text-transform: uppercase; }
+tbody tr:hover { background: var(--bg-elev); }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 12px; font-size: 12px; }
+.badge.healthy { background: rgba(63,185,80,0.15); color: var(--ok); }
+.badge.degraded, .badge.unknown { background: rgba(210,153,34,0.15); color: var(--warn); }
+.badge.unhealthy { background: rgba(248,81,73,0.15); color: var(--err); }
+
+.boundary { text-align: center; padding: calc(var(--space) * 6) var(--space); color: var(--text-muted); }
+.spinner {
+  width: 24px; height: 24px; margin: 0 auto var(--space);
+  border: 3px solid var(--border); border-top-color: var(--accent);
+  border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .spinner { animation: none; } }
+@keyframes spin { to { transform: rotate(360deg); } }
+
+.footer { padding: calc(var(--space) * 2); text-align: center; border-top: 1px solid var(--border); font-size: 12px; }
+
+@media (max-width: 640px) {
+  .topbar { gap: var(--space); }
+  .nav-link { padding: var(--space); }
+  .main { padding: var(--space); }
+}
