@@ -22,5 +22,14 @@ clap.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
 
-# Uncomment to implement the actual FUSE mount layer:
-# fuser = "0.14"
+# The kernel mount layer is optional: enabling the `mount` feature pulls in
+# `fuser` and compiles the `fuser::Filesystem` adapter. Default builds (and CI
+# environments without `/dev/fuse` or libfuse) omit it entirely, so the read
+# path stays testable everywhere. `default-features = false` drops fuser's
+# libfuse C dependency (it talks to /dev/fuse directly), so `--features mount`
+# compiles without the libfuse headers installed.
+fuser = { version = "0.14", optional = true, default-features = false }
+
+[features]
+# Compile the kernel FUSE mount adapter (requires fuser).
+mount = ["dep:fuser"]
