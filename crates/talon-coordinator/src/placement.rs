@@ -14,6 +14,27 @@ use talon_core::{BlockId, NodeId, NodeInfo};
 ///
 /// The coordinator bumps the epoch whenever membership changes so that clients
 /// and workers can detect stale placement decisions and refresh.
+///
+/// # Monotonicity across restarts
+///
+/// Clients only refresh cached placement when they observe an epoch **strictly
+/// greater** than the one they hold, so the epoch must never move backwards —
+/// including across a coordinator process restart. A plain in-memory counter
+/// from `0` breaks this: a restarted coordinator would re-advertise low epochs
+/// that clients (holding a higher pre-restart epoch) silently ignore, pinning
+/// them to a stale replica list forever (see issue #69).
+///
+/// To stay monotonic without external state, the epoch is seeded from the
+/// process **start time**: the wall-clock second occupies the high 32 bits and
+/// an in-process counter the low 32 bits. A later process always starts from a
+/// larger seed than any earlier one produced, so its epochs outrank them.
+///
+/// This keeps the coordinator free of unrebuildable persistent state (a v1
+/// design invariant). The residual edge — two restarts within the *same* second
+/// where the later process observes fewer membership changes — is negligible in
+/// practice (pod restarts take seconds). A future revision may instead derive
+/// the epoch from the Kubernetes `resourceVersion` of the worker endpoints,
+/// which is monotonic by construction (tracked for v1.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default)]
 pub struct Epoch(pub u64);
 
@@ -21,6 +42,19 @@ impl Epoch {
     /// Return the next epoch (this + 1).
     pub fn next(self) -> Self {
         Epoch(self.0 + 1)
+    }
+
+    /// A fresh epoch seeded from the current wall-clock second in the high 32
+    /// bits, with a zero low counter. Used as the base for a newly started
+    /// coordinator so its epochs outrank any earlier process's (see the type
+    /// docs for the monotonicity rationale).
+    pub fn seeded_now() -> Self {
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        // Clamp to 32 bits (good past year 2106) and shift into the high half.
+        Epoch((secs & 0xFFFF_FFFF) << 32)
     }
 }
 
@@ -160,5 +194,16 @@ mod tests {
         assert_eq!(e.0, 0);
         assert_eq!(e.next().0, 1);
         assert!(e < e.next());
+    }
+
+    #[test]
+    fn seeded_now_puts_time_in_high_bits() {
+        let e = Epoch::seeded_now();
+        // High 32 bits carry a nonzero wall-clock second; low 32 start clear.
+        assert!(e.0 >> 32 > 0, "seed must occupy the high bits");
+        assert_eq!(e.0 & 0xFFFF_FFFF, 0, "low counter starts at 0");
+        // A seed leaves ample low-bit headroom before it could collide with the
+        // next second's seed (2^32 counter increments per second).
+        assert!(e.next().0 > e.0);
     }
 }

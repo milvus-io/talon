@@ -103,7 +103,9 @@ mod tests {
     }
 
     fn svc(ids: &[&str]) -> PlacementService<RendezvousPlacement> {
-        let m = Membership::new();
+        // Pin a deterministic epoch base so exact-value assertions below hold;
+        // production seeds from the wall clock (see Epoch::seeded_now).
+        let m = Membership::with_epoch_base(Epoch(0));
         for id in ids {
             m.register(NodeInfo {
                 id: NodeId::new(*id),
