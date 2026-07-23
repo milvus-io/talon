@@ -115,6 +115,29 @@ pub enum ControlMessage {
         /// Current source version/etag of the object.
         version: String,
     },
+    /// Client → coordinator: list objects under a mount-relative prefix.
+    ///
+    /// Backs FUSE `readdir`: the client asks for the objects beneath a
+    /// directory prefix (e.g. `s3/bucket/dir`) and synthesizes the namespace
+    /// tree from the returned paths. Schema v2.
+    ListObjects {
+        /// Mount-relative prefix to list under (may be empty for the root).
+        prefix: String,
+    },
+    /// Coordinator → client: object entries matching a `ListObjects` prefix.
+    ObjectList {
+        /// Matching objects as `(mount-relative path, size in bytes)` pairs.
+        entries: Vec<ObjectEntry>,
+    },
+}
+
+/// One object listing entry: its mount-relative path and byte size.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectEntry {
+    /// Mount-relative object path, e.g. `s3/bucket/dir/file.bin`.
+    pub path: String,
+    /// Object size in bytes.
+    pub size: u64,
 }
 
 impl ControlMessage {
@@ -123,6 +146,7 @@ impl ControlMessage {
         match self {
             Self::NodeStatusHeartbeat { .. } => 2,
             Self::StatObject { .. } | Self::ObjectStat { .. } => 2,
+            Self::ListObjects { .. } | Self::ObjectList { .. } => 2,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }
@@ -372,6 +396,21 @@ mod tests {
                 size: 2_500_000_000,
                 version: "etag-xyz".into(),
             },
+            ControlMessage::ListObjects {
+                prefix: "s3/bkt/dir".into(),
+            },
+            ControlMessage::ObjectList {
+                entries: vec![
+                    ObjectEntry {
+                        path: "s3/bkt/dir/a.bin".into(),
+                        size: 10,
+                    },
+                    ObjectEntry {
+                        path: "s3/bkt/dir/b.bin".into(),
+                        size: 20,
+                    },
+                ],
+            },
         ]
     }
 
@@ -434,6 +473,28 @@ mod tests {
                 selected: 1
             })
         ));
+    }
+
+    #[test]
+    fn list_objects_and_object_list_are_v2() {
+        let req = ControlMessage::ListObjects {
+            prefix: "s3/bkt/dir".into(),
+        };
+        let resp = ControlMessage::ObjectList {
+            entries: vec![ObjectEntry {
+                path: "s3/bkt/dir/a.bin".into(),
+                size: 10,
+            }],
+        };
+        for msg in [req, resp] {
+            let buf = encode(1, &msg).unwrap();
+            assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 2);
+            assert_eq!(decode(&buf).unwrap().1, msg);
+            assert!(matches!(
+                decode_with_max_schema(&buf, 1),
+                Err(CodecError::UnsupportedSchema { got: 2, ours: 1 })
+            ));
+        }
     }
 
     #[test]

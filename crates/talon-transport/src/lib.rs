@@ -17,8 +17,8 @@ pub mod pool;
 pub mod runtime;
 
 pub use codec::{
-    decode, encode, encode_for_schema, CodecError, ControlMessage, CONTROL_SCHEMA_VERSION,
-    MIN_CONTROL_SCHEMA_VERSION,
+    decode, encode, encode_for_schema, CodecError, ControlMessage, ObjectEntry,
+    CONTROL_SCHEMA_VERSION, MIN_CONTROL_SCHEMA_VERSION,
 };
 pub use data::{
     decode_request, encode_error, encode_request, response_header_ok, DataError, RangeRequest,
