@@ -165,9 +165,13 @@ stable Linux fast path.
 - **Replication:** **RF=1** in v1 — the backing store is the durable source.
   Hot blocks may get RF=2 later once miss cost is measured. Avoid blanket
   multi-copy; it burns NVMe.
-- **HA:** single coordinator for v1 — it holds no unrebuildable authoritative
-  state. v1.5: K8s leader election + standby. Raft only if the coordinator ever
-  owns strongly-consistent, non-loseable metadata (e.g. write-back).
+- **HA:** single coordinator for v1. The post-v1 management plane uses
+  active-active, stateless coordinators over a user-selected Kubernetes Lease
+  or etcd shared-state backend. The accepted contract and failure semantics are
+  defined in
+  [`docs/adr/0001-management-plane-ha.md`](docs/adr/0001-management-plane-ha.md).
+  Raft remains out of scope unless the coordinator later owns durable,
+  non-rebuildable metadata such as write-back state.
 - **Membership:** Kubernetes watch/poll as the membership source; worker
   heartbeats provide liveness + block inventory. No gossip. Timeout at 3–6
   heartbeat windows (e.g. 10s heartbeat → 30–60s to mark unhealthy).
@@ -275,8 +279,9 @@ Single coordinator, K8s membership, rendezvous / top-K placement, RF=1, NVMe
 block cache, custom TCP data plane, read-only FUSE, and pluggable blob backends
 (S3 / GCS / Azure Blob).
 
-Add RF=2, leader election, and a protobuf control API once miss cost and
-availability requirements are demonstrated.
+Add RF=2 and a protobuf control API once miss cost and compatibility
+requirements are demonstrated. Coordinator HA follows
+[`ADR 0001`](docs/adr/0001-management-plane-ha.md).
 
 ## Follow-up skeleton changes
 
