@@ -63,6 +63,7 @@ pub struct FileView<'a> {
 }
 
 /// Orchestrates block reads against the coordinator + workers with caching.
+#[derive(Clone)]
 pub struct BlockReader {
     coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
