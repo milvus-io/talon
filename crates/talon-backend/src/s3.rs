@@ -136,9 +136,11 @@ impl BackendStore for S3Backend {
         }
         let req = self.build_get(obj, offset, len);
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
-        // 206 Partial Content (range) or 200 (whole) are both acceptable.
+        // 206 (range honored) or 200 (server ignored Range, returned the whole
+        // object). `range_body` yields exactly the requested window in both
+        // cases and rejects a short 206 (issue #117).
         if resp.status == 206 || resp.status == 200 {
-            Ok(resp.body)
+            crate::http::range_body(resp.status, resp.body, offset, len).map_err(Error::Backend)
         } else if resp.status == 404 {
             Err(Error::NotFound(obj.to_path()))
         } else {
@@ -264,6 +266,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_range_slices_whole_object_on_200() {
+        // A range-ignoring store/proxy returns HTTP 200 + the whole object; the
+        // backend must slice out the requested window rather than caching the
+        // object head under a non-zero-offset block (issue #117).
+        let object: Vec<u8> = (0..255u8).cycle().take(600).collect();
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::from(object.clone()),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http);
+        let got = s3.fetch_range(&obj(), 256, 256).await.unwrap();
+        assert_eq!(&got[..], &object[256..512]);
+    }
+
+    #[tokio::test]
     async fn fetch_range_maps_404_to_notfound() {
         let http = MockHttp::new(HttpResponse {
             status: 404,
@@ -310,7 +328,7 @@ mod tests {
         let http = MockHttp::new(HttpResponse {
             status: 206,
             headers: vec![],
-            body: bytes::Bytes::new(),
+            body: bytes::Bytes::from_static(b"12345678"),
         });
         let mut c = creds();
         c.session_token = Some("token123".into());
