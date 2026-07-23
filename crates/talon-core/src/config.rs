@@ -38,6 +38,12 @@ pub trait Patch {
 pub struct WorkerConfig {
     /// Address the worker's RPC service binds to.
     pub listen: String,
+    /// Routable address advertised to the coordinator for clients to dial.
+    ///
+    /// Distinct from [`listen`](Self::listen) so a worker can bind a wildcard
+    /// address (e.g. `0.0.0.0:7001`) for reachability while advertising a
+    /// concrete routable address. Defaults to `listen` when unset.
+    pub advertise_addr: String,
     /// Address the worker's HTTP administration service binds to.
     pub admin_listen: String,
     /// Address of the coordinator to register with.
@@ -77,6 +83,7 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:7001".into(),
+            advertise_addr: "127.0.0.1:7001".into(),
             admin_listen: "127.0.0.1:8001".into(),
             coordinator: "127.0.0.1:7000".into(),
             cluster_id: "default".into(),
@@ -99,6 +106,8 @@ impl Default for WorkerConfig {
 pub struct WorkerConfigPatch {
     /// Override for [`WorkerConfig::listen`].
     pub listen: Option<String>,
+    /// Override for [`WorkerConfig::advertise_addr`].
+    pub advertise_addr: Option<String>,
     /// Override for [`WorkerConfig::admin_listen`].
     pub admin_listen: Option<String>,
     /// Override for [`WorkerConfig::coordinator`].
@@ -123,6 +132,7 @@ impl Patch for WorkerConfigPatch {
     fn merge(self, base: Self) -> Self {
         Self {
             listen: self.listen.or(base.listen),
+            advertise_addr: self.advertise_addr.or(base.advertise_addr),
             admin_listen: self.admin_listen.or(base.admin_listen),
             coordinator: self.coordinator.or(base.coordinator),
             cluster_id: self.cluster_id.or(base.cluster_id),
@@ -176,6 +186,7 @@ impl WorkerConfigPatch {
         };
         Ok(Self {
             listen: get("TALON_WORKER_LISTEN"),
+            advertise_addr: get("TALON_WORKER_ADVERTISE_ADDR"),
             admin_listen: get("TALON_WORKER_ADMIN_LISTEN"),
             coordinator: get("TALON_WORKER_COORDINATOR"),
             cluster_id: get("TALON_WORKER_CLUSTER_ID"),
@@ -210,8 +221,12 @@ impl WorkerConfig {
         // Fold highest-first onto lower layers, then onto defaults.
         let merged = cli.merge(env).merge(file);
         let d = WorkerConfig::default();
+        let listen = merged.listen.unwrap_or(d.listen);
         let cfg = WorkerConfig {
-            listen: merged.listen.unwrap_or(d.listen),
+            // Advertise the routable address if set, else fall back to the bind
+            // address (issue #118: never silently advertise a wildcard bind).
+            advertise_addr: merged.advertise_addr.unwrap_or_else(|| listen.clone()),
+            listen,
             admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
             cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
@@ -246,6 +261,18 @@ impl WorkerConfig {
         }
         if self.node_id.as_ref().is_some_and(String::is_empty) {
             return Err(Error::Other("node_id must not be empty when set".into()));
+        }
+        // The advertised address is handed to clients to dial, so it must be a
+        // concrete routable address, never a wildcard bind (issue #118).
+        if self.advertise_addr.is_empty() {
+            return Err(Error::Other("advertise_addr must not be empty".into()));
+        }
+        if self.advertise_addr.starts_with("0.0.0.0:") || self.advertise_addr.starts_with("[::]:") {
+            return Err(Error::Other(format!(
+                "advertise_addr {:?} is a wildcard bind and is unreachable by clients; \
+                 set advertise_addr (or TALON_WORKER_ADVERTISE_ADDR) to a routable address",
+                self.advertise_addr
+            )));
         }
         if self.heartbeat_interval_ms == 0 {
             return Err(Error::Other(
@@ -530,6 +557,54 @@ mod tests {
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("cluster_id"));
+    }
+
+    #[test]
+    fn advertise_addr_defaults_to_listen_and_rejects_wildcard() {
+        // Unset: advertise defaults to the resolved listen address.
+        let cli = WorkerConfigPatch {
+            listen: Some("10.0.0.5:7001".into()),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "10.0.0.5:7001");
+
+        // A wildcard bind can be used for `listen` as long as `advertise_addr`
+        // is a routable address.
+        let cli = WorkerConfigPatch {
+            listen: Some("0.0.0.0:7001".into()),
+            advertise_addr: Some("10.0.0.5:7001".into()),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "10.0.0.5:7001");
+
+        // A wildcard advertise address is rejected (unreachable by clients).
+        let cli = WorkerConfigPatch {
+            advertise_addr: Some("0.0.0.0:7001".into()),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("advertise_addr"));
+
+        // Defaulting advertise from a wildcard `listen` is likewise rejected, so
+        // an operator binding 0.0.0.0 without setting advertise fails fast.
+        let cli = WorkerConfigPatch {
+            listen: Some("0.0.0.0:7001".into()),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("advertise_addr"));
+    }
+
+    #[test]
+    fn advertise_addr_from_env() {
+        let map = |k: &str| match k {
+            "TALON_WORKER_ADVERTISE_ADDR" => Some("worker-1.svc:7001".to_string()),
+            _ => None,
+        };
+        let patch = WorkerConfigPatch::from_env_with(map).unwrap();
+        assert_eq!(patch.advertise_addr.as_deref(), Some("worker-1.svc:7001"));
     }
 
     #[test]

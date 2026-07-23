@@ -568,10 +568,18 @@ impl CoordinatorObservability {
         match result {
             Ok(snapshot) => {
                 self.metrics.update_snapshot(&snapshot);
+                // Only healthy, ready workers are placement targets. Expired
+                // leases are already absent from the snapshot; this additionally
+                // excludes present-but-unhealthy/not-ready workers so a degraded
+                // node is not handed to clients as an owner (issue #118).
                 let workers: Vec<NodeInfo> = snapshot
                     .nodes
                     .iter()
-                    .filter(|status| status.node.role == NodeRole::Worker)
+                    .filter(|status| {
+                        status.node.role == NodeRole::Worker
+                            && status.health == NodeHealth::Healthy
+                            && status.ready
+                    })
                     .map(|status| status.node.clone())
                     .collect();
                 membership.reconcile(workers);
@@ -869,6 +877,41 @@ mod tests {
             metrics: NodeMetricsSnapshot::default(),
             labels: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn reconcile_excludes_unhealthy_and_not_ready_workers() {
+        use crate::Membership;
+        let (observability, _store) = observability();
+        observability.check_ready().await.unwrap();
+
+        // A healthy+ready worker, an unhealthy worker, and a not-ready worker.
+        let healthy = worker_status();
+        let mut unhealthy = worker_status();
+        unhealthy.node.id = NodeId::new("worker-unhealthy");
+        unhealthy.incarnation_id = "inc-unhealthy".into();
+        unhealthy.health = NodeHealth::Unhealthy;
+        let mut not_ready = worker_status();
+        not_ready.node.id = NodeId::new("worker-not-ready");
+        not_ready.incarnation_id = "inc-not-ready".into();
+        not_ready.ready = false;
+
+        for status in [healthy, unhealthy, not_ready] {
+            observability
+                .upsert_status(status, Duration::from_secs(30))
+                .await
+                .unwrap();
+        }
+
+        let membership = Membership::new();
+        observability
+            .reconcile_membership(&membership)
+            .await
+            .unwrap();
+
+        // Only the healthy, ready worker is a placement target.
+        let ids: Vec<String> = membership.snapshot().into_iter().map(|n| n.id.0).collect();
+        assert_eq!(ids, vec!["worker-1".to_string()]);
     }
 
     #[tokio::test]

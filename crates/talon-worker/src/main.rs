@@ -53,6 +53,9 @@ struct Args {
     /// Address to bind the worker RPC service to.
     #[arg(long)]
     listen: Option<String>,
+    /// Routable address advertised to clients (defaults to `listen`).
+    #[arg(long)]
+    advertise_addr: Option<String>,
     /// Address to bind the worker HTTP administration service to.
     #[arg(long)]
     admin_listen: Option<String>,
@@ -77,6 +80,7 @@ impl Args {
     fn into_patch(self) -> WorkerConfigPatch {
         WorkerConfigPatch {
             listen: self.listen,
+            advertise_addr: self.advertise_addr,
             admin_listen: self.admin_listen,
             coordinator: self.coordinator,
             cluster_id: self.cluster_id,
@@ -146,8 +150,14 @@ async fn main() -> anyhow::Result<()> {
     let index = Arc::new(BlockIndex::new());
     let inflight = Arc::new(InFlightLoads::new());
     let node = NodeInfo {
-        id: NodeId::new(cfg.node_id.clone().unwrap_or_else(|| cfg.listen.clone())),
-        address: cfg.listen.clone(),
+        id: NodeId::new(
+            cfg.node_id
+                .clone()
+                .unwrap_or_else(|| cfg.advertise_addr.clone()),
+        ),
+        // Advertise the routable address, not the (possibly wildcard) bind
+        // address, so clients receive a connectable owner (issue #118).
+        address: cfg.advertise_addr.clone(),
         role: NodeRole::Worker,
     };
     let observability = Arc::new(WorkerObservability::new(
