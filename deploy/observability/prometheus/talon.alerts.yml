@@ -1,0 +1,168 @@
+# Talon alerting rules.
+#
+# Every alert carries the label/annotation set required by #87:
+#   labels:      severity (critical|warning), plus component for routing.
+#   annotations: summary, description, runbook_url.
+#
+# The runbook lives at docs/operations (delivered by #90); links use a stable
+# anchor per alert so they resolve once that page lands.
+#
+# Design notes:
+# - "Missing scrape" (target down) and "stale data" (target up, data old) are
+#   deliberately DISTINCT alerts. `up == 0` is absence of scrape; a fresh scrape
+#   carrying an old snapshot age is staleness. Conflating them hides a live-but-
+#   wedged coordinator behind a "target down" page, or vice versa.
+# - `for:` durations exceed one scrape+eval cycle so a single missed scrape or
+#   transient blip does not page.
+groups:
+  - name: talon_availability.alerts
+    rules:
+      # No coordinator is ready -> the whole control plane is down. Uses the
+      # recording rule so a total scrape loss (vector becomes empty) still fires:
+      # `or on() vector(0)` supplies an explicit 0 when no series exist.
+      - alert: TalonCoordinatorQuorumLost
+        expr: (cluster:talon_coordinator_ready:count or on(cluster) vector(0)) < 1
+        for: 1m
+        labels:
+          severity: critical
+          component: coordinator
+        annotations:
+          summary: "No ready Talon coordinator in cluster {{ $labels.cluster }}"
+          description: >
+            Zero coordinator replicas report ready for over 1 minute. Registration,
+            heartbeat, placement, the management API, and the UI are unavailable
+            cluster-wide.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#coordinator-quorum-lost"
+
+      # A coordinator instance stopped being scraped: distinguishes a crashed/
+      # unreachable process (up==0) from one that is up but unready.
+      - alert: TalonCoordinatorScrapeMissing
+        expr: up{job=~".*coordinator.*"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: coordinator
+        annotations:
+          summary: "Coordinator scrape target down: {{ $labels.instance }}"
+          description: >
+            Prometheus cannot scrape coordinator {{ $labels.instance }} for over
+            2 minutes. The process may be crashed, restarting, or network-isolated.
+            This is scrape absence, not stale data — see TalonClusterViewStale.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#coordinator-scrape-missing"
+
+      - alert: TalonWorkerScrapeMissing
+        expr: up{job=~".*worker.*"} == 0
+        for: 2m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Worker scrape target down: {{ $labels.instance }}"
+          description: >
+            Prometheus cannot scrape worker {{ $labels.instance }} for over 2
+            minutes. Its cached blocks are unreachable via this endpoint.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#worker-scrape-missing"
+
+  - name: talon_state.alerts
+    rules:
+      # Shared state-store faults: the active-active plane cannot serve
+      # authoritative reads. Fires on a sustained error rate, not a single blip.
+      - alert: TalonStateStoreErrors
+        expr: cluster:talon_coordinator_state_store_errors:rate5m > 0.1
+        for: 5m
+        labels:
+          severity: critical
+          component: state-store
+        annotations:
+          summary: "Talon state-store errors in cluster {{ $labels.cluster }}"
+          description: >
+            Coordinators are failing shared state-store operations at
+            {{ printf "%.2f" $value }}/s over 5m. etcd/Kubernetes may be
+            unavailable, throttling, or rejecting auth. New authoritative reads
+            are failing closed.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#state-store-errors"
+
+      # Cluster view is stale despite live scrapes: coordinators are up but their
+      # freshest snapshot is old (watch wedged, backend slow). Distinct from a
+      # missing scrape by construction — this reads the age gauge, which only
+      # exists on a successful scrape.
+      - alert: TalonClusterViewStale
+        expr: cluster:talon_coordinator_state_snapshot_age:max > 60
+        for: 3m
+        labels:
+          severity: warning
+          component: coordinator
+        annotations:
+          summary: "Stale cluster view in {{ $labels.cluster }} ({{ printf \"%.0f\" $value }}s old)"
+          description: >
+            The freshest cluster snapshot across all ready coordinators is over 60s
+            old for 3m, while scrapes are succeeding. The state-store watch may be
+            wedged or the backend severely lagged. Placement decisions risk using
+            outdated membership.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#cluster-view-stale"
+
+  - name: talon_capacity.alerts
+    rules:
+      - alert: TalonWorkerCapacityPressure
+        expr: instance_job:talon_worker_capacity:saturation > 0.9
+        for: 10m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Worker {{ $labels.instance }} above 90% capacity"
+          description: >
+            Worker {{ $labels.instance }} has been over 90% of configured cache
+            capacity for 10m ({{ printf "%.0f" ($value | humanizePercentage) }}).
+            Eviction pressure is high; hit rate may degrade.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#worker-capacity-pressure"
+
+  - name: talon_quality.alerts
+    rules:
+      # Backend (object-store) errors: upstream fetch faults that erode the cache.
+      - alert: TalonBackendFetchErrors
+        expr: cluster:talon_worker_backend_fetch_errors:ratio5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: backend
+        annotations:
+          summary: "Elevated backend fetch errors in {{ $labels.cluster }}"
+          description: >
+            Over 5% of worker backend fetches are failing over 5m
+            ({{ printf "%.1f" ($value | humanizePercentage) }}). The object store
+            may be throttling, misconfigured, or returning bad ranges.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#backend-fetch-errors"
+
+      # Cache degradation: hit rate collapse means workers are missing to the
+      # backend for most reads, defeating the cache's purpose. Guarded on real
+      # traffic so an idle cluster (0 req/s -> undefined hit rate) never pages.
+      - alert: TalonCacheHitRateLow
+        expr: |
+          cluster:talon_worker_cache_hit:ratio5m < 0.5
+          and
+          sum by (cluster) (rate(talon_worker_requests_total[5m])) > 1
+        for: 15m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Low cache hit rate in {{ $labels.cluster }}"
+          description: >
+            Cluster cache hit rate is below 50% for 15m under real traffic
+            ({{ printf "%.1f" ($value | humanizePercentage) }}). Investigate
+            capacity, eviction churn, or a cold/rebalancing fleet.
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#cache-hit-rate-low"
+
+      - alert: TalonWorkerHighErrorRatio
+        expr: instance_job:talon_worker_request_errors:ratio5m > 0.05
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Worker {{ $labels.instance }} error ratio above 5%"
+          description: >
+            Worker {{ $labels.instance }} is returning errors for over 5% of
+            requests for 5m ({{ printf "%.1f" ($value | humanizePercentage) }}).
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#worker-high-error-ratio"
