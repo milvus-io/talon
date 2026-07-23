@@ -99,6 +99,22 @@ pub enum ControlMessage {
         /// Bounded, versioned status snapshot.
         status: Box<NodeStatus>,
     },
+    /// Client → coordinator: what is this object's size and version?
+    ///
+    /// Backs FUSE `getattr`: the client needs the object length to report file
+    /// size and the version/etag to address blocks. Schema v2. The coordinator
+    /// answers from the backend `HEAD` (or its index).
+    StatObject {
+        /// The object to stat.
+        object: ObjectId,
+    },
+    /// Coordinator → client: an object's size and version.
+    ObjectStat {
+        /// Total object length in bytes.
+        size: u64,
+        /// Current source version/etag of the object.
+        version: String,
+    },
 }
 
 impl ControlMessage {
@@ -106,6 +122,7 @@ impl ControlMessage {
     pub fn minimum_schema(&self) -> u16 {
         match self {
             Self::NodeStatusHeartbeat { .. } => 2,
+            Self::StatObject { .. } | Self::ObjectStat { .. } => 2,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }
@@ -348,6 +365,13 @@ mod tests {
             ControlMessage::NodeStatusHeartbeat {
                 status: Box::new(sample_status(node)),
             },
+            ControlMessage::StatObject {
+                object: block.object.clone(),
+            },
+            ControlMessage::ObjectStat {
+                size: 2_500_000_000,
+                version: "etag-xyz".into(),
+            },
         ]
     }
 
@@ -410,6 +434,36 @@ mod tests {
                 selected: 1
             })
         ));
+    }
+
+    #[test]
+    fn stat_object_and_object_stat_are_v2() {
+        let stat_req = ControlMessage::StatObject {
+            object: ObjectId::new(Backend::S3, "bkt", "path/obj.bin"),
+        };
+        let stat_resp = ControlMessage::ObjectStat {
+            size: 2_500_000_000,
+            version: "etag-xyz".into(),
+        };
+        for msg in [stat_req, stat_resp] {
+            let buf = encode(1, &msg).unwrap();
+            // Encoded at schema v2 and round-trips.
+            assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 2);
+            assert_eq!(decode(&buf).unwrap().1, msg);
+            // An old v1-only peer rejects it cleanly rather than misreading it.
+            assert!(matches!(
+                decode_with_max_schema(&buf, 1),
+                Err(CodecError::UnsupportedSchema { got: 2, ours: 1 })
+            ));
+            // Forcing v1 on encode is refused.
+            assert!(matches!(
+                encode_for_schema(1, &msg, 1),
+                Err(CodecError::MessageRequiresSchema {
+                    required: 2,
+                    selected: 1
+                })
+            ));
+        }
     }
 
     #[test]

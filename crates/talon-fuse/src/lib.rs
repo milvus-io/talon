@@ -18,7 +18,9 @@ pub mod worker_client;
 
 pub use block_reader::{BlockReadError, BlockReader, FileView};
 pub use bridge::{spawn_bridge, BridgeClient, BridgeError};
-pub use coordinator_client::{CoordinatorClient, CoordinatorError, Placement, ResolvedPlacement};
+pub use coordinator_client::{
+    CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
+};
 pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
 pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
