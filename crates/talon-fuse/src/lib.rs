@@ -4,6 +4,7 @@
 //! mountable POSIX filesystem. Reads and writes to the mount are translated
 //! into object store operations against the cluster.
 
+pub mod block_reader;
 pub mod bridge;
 pub mod coordinator_client;
 pub mod fs;
@@ -13,6 +14,7 @@ pub mod placement_cache;
 pub mod readahead;
 pub mod worker_client;
 
+pub use block_reader::{BlockReadError, BlockReader};
 pub use bridge::{spawn_bridge, BridgeClient, BridgeError};
 pub use coordinator_client::{CoordinatorClient, CoordinatorError, Placement, ResolvedPlacement};
 pub use fs::TalonFs;

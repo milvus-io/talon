@@ -1,0 +1,312 @@
+//! Block read orchestration: placement cache → coordinator → worker.
+//!
+//! [`BlockReader`] is the heart of the FUSE read path. Given a [`BlockId`] and a
+//! sub-range within it, it answers "where does this block live?" from the
+//! client-side [`PlacementCache`] when warm, or falls back to a
+//! [`CoordinatorClient`] lookup on a miss, then fetches the bytes from the
+//! owning worker with a [`WorkerClient`].
+//!
+//! # Cached addresses, not node ids
+//!
+//! The placement cache stores an ordered list of **worker addresses** (what the
+//! client actually dials), derived by resolving the coordinator's owner
+//! [`NodeId`](talon_core::NodeId)s through the membership snapshot. Storing the
+//! dialable address keeps the hot path allocation-light and makes replica
+//! fallback (a future step, issue #97) a simple walk down the ordered list.
+//!
+//! This step (issue #94) implements the **single-block, primary-owner** path:
+//! it reads from the first (highest-weight) owner. Multi-block splitting
+//! (#95), readahead (#96), and replica fallback / epoch reconciliation (#97)
+//! build on this without changing the cache shape.
+
+use std::sync::Arc;
+
+use talon_core::BlockId;
+
+use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
+use crate::placement_cache::{Cached, PlacementCache};
+use crate::worker_client::{WorkerClient, WorkerError};
+
+/// Errors from a block read.
+#[derive(Debug, thiserror::Error)]
+pub enum BlockReadError {
+    /// The coordinator lookup failed.
+    #[error(transparent)]
+    Coordinator(#[from] CoordinatorError),
+    /// The worker fetch failed.
+    #[error(transparent)]
+    Worker(#[from] WorkerError),
+    /// The cluster returned no owners for the block (empty cluster).
+    #[error("no owners for block")]
+    NoOwners,
+    /// An owner id had no resolvable worker address in membership.
+    #[error("owner has no known worker address")]
+    UnresolvedOwner,
+}
+
+/// Orchestrates block reads against the coordinator + workers with caching.
+pub struct BlockReader {
+    coordinator: CoordinatorClient,
+    cache: Arc<PlacementCache>,
+    /// Number of replicas to request from the coordinator (RF=1 → 1 in v1).
+    replicas_k: u8,
+}
+
+impl BlockReader {
+    /// Create a reader over the given coordinator client and placement cache.
+    ///
+    /// `replicas_k` is how many owners to request per placement lookup; with
+    /// RF=1 this is `1`, but requesting more reserves an ordered fallback list.
+    pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
+        Self {
+            coordinator,
+            cache,
+            replicas_k: replicas_k.max(1),
+        }
+    }
+
+    /// Read `len` bytes at `offset_in_block` within `block`.
+    ///
+    /// Resolves placement (cache hit, else coordinator lookup that populates the
+    /// cache at `now_ms`), then fetches the sub-range from the primary owner.
+    /// The absolute object offset handed to the worker is
+    /// `block.offset + offset_in_block`.
+    pub async fn read_block(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        len: u32,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, BlockReadError> {
+        let cached = match self.cache.get(block, now_ms) {
+            Some(c) => c,
+            None => self.resolve_and_cache(block, now_ms).await?,
+        };
+        let addr = cached.primary().ok_or(BlockReadError::NoOwners)?;
+        let worker = WorkerClient::new(addr);
+        let abs_offset = block.offset + offset_in_block as u64;
+        let bytes = worker
+            .fetch_range(&block.object, abs_offset, len as u64)
+            .await?;
+        Ok(bytes)
+    }
+
+    /// Look the block up via the coordinator and insert the resolved,
+    /// address-ordered placement into the cache.
+    async fn resolve_and_cache(
+        &self,
+        block: &BlockId,
+        now_ms: u64,
+    ) -> Result<Cached, BlockReadError> {
+        let resolved = self
+            .coordinator
+            .locate_primary(block, self.replicas_k)
+            .await?
+            .ok_or(BlockReadError::NoOwners)?;
+        // Map ordered owner ids → dialable worker addresses, preserving order.
+        let replicas: Vec<String> = resolved
+            .owners
+            .iter()
+            .filter_map(|id| resolved.address_of(id).map(String::from))
+            .collect();
+        if replicas.is_empty() {
+            return Err(BlockReadError::UnresolvedOwner);
+        }
+        let cached = Cached {
+            replicas,
+            epoch: resolved.epoch,
+        };
+        self.cache.insert(block.clone(), cached.clone(), now_ms);
+        Ok(cached)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use talon_core::{Backend, NodeId, NodeInfo, NodeRole, ObjectId, Version};
+    use talon_transport::frame::{FrameHeader, HEADER_LEN};
+    use talon_transport::{
+        decode_request, encode_error, response_header_ok, ControlMessage, RangeRequest,
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpListener;
+
+    fn block() -> BlockId {
+        BlockId::new(
+            ObjectId::new(Backend::S3, "b", "o/1"),
+            256 << 20, // second block, non-zero offset
+            256 << 20,
+            Version::new("v1"),
+        )
+    }
+
+    /// A mock coordinator that answers PlacementLookup then MembershipQuery,
+    /// pointing the single owner `w1` at `worker_addr`.
+    async fn mock_coordinator(worker_addr: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let worker_addr = worker_addr.clone();
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; HEADER_LEN];
+                    if s.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let h = FrameHeader::decode(&hdr).unwrap();
+                    let mut body = vec![0u8; h.length as usize];
+                    s.read_exact(&mut body).await.unwrap();
+                    let mut full = hdr.to_vec();
+                    full.extend_from_slice(&body);
+                    let (_h, msg) = talon_transport::decode(&full).unwrap();
+                    let reply = match msg {
+                        ControlMessage::PlacementLookup { .. } => {
+                            ControlMessage::PlacementResponse {
+                                owners: vec![NodeId::new("w1")],
+                                epoch: 3,
+                            }
+                        }
+                        ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
+                            nodes: vec![NodeInfo {
+                                id: NodeId::new("w1"),
+                                address: worker_addr.clone(),
+                                role: NodeRole::Worker,
+                            }],
+                        },
+                        _ => ControlMessage::Ack {
+                            ok: false,
+                            detail: None,
+                        },
+                    };
+                    let out = talon_transport::encode(0, &reply).unwrap();
+                    s.write_all(&out).await.unwrap();
+                    s.flush().await.unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    /// A mock worker that returns deterministic bytes for the requested range,
+    /// and records how many fetches it served.
+    async fn mock_worker(hits: Arc<std::sync::atomic::AtomicU32>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let hits = Arc::clone(&hits);
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; HEADER_LEN];
+                    if s.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let h = FrameHeader::decode(&hdr).unwrap();
+                    let mut body = vec![0u8; h.length as usize];
+                    s.read_exact(&mut body).await.unwrap();
+                    let mut full = hdr.to_vec();
+                    full.extend_from_slice(&body);
+                    let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    // Encode the absolute offset into the bytes so tests can
+                    // verify the worker got the right sub-range.
+                    let payload: Vec<u8> = (0..req.len)
+                        .map(|i| ((req.offset + i) % 256) as u8)
+                        .collect();
+                    let mut out = response_header_ok(0, payload.len() as u32).to_vec();
+                    out.extend_from_slice(&payload);
+                    s.write_all(&out).await.unwrap();
+                    s.flush().await.unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn miss_then_hit_fetches_correct_range() {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_addr = mock_worker(Arc::clone(&hits)).await;
+        let coord_addr = mock_coordinator(worker_addr).await;
+
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
+
+        let blk = block();
+        // First read: cache miss → coordinator resolve → worker fetch.
+        let bytes = reader.read_block(&blk, 100, 64, 0).await.unwrap();
+        assert_eq!(bytes.len(), 64);
+        let abs = blk.offset + 100;
+        assert_eq!(bytes[0], (abs % 256) as u8);
+        assert_eq!(bytes[1], ((abs + 1) % 256) as u8);
+        assert_eq!(cache.len(), 1, "placement cached after miss");
+
+        // Second read: cache hit (still 1 entry), worker serves again.
+        let _ = reader.read_block(&blk, 0, 16, 1).await.unwrap();
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn empty_cluster_yields_no_owners() {
+        // Coordinator answers with zero owners.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            s.read_exact(&mut hdr).await.unwrap();
+            let h = FrameHeader::decode(&hdr).unwrap();
+            let mut body = vec![0u8; h.length as usize];
+            s.read_exact(&mut body).await.unwrap();
+            let reply = ControlMessage::PlacementResponse {
+                owners: vec![],
+                epoch: 0,
+            };
+            s.write_all(&talon_transport::encode(0, &reply).unwrap())
+                .await
+                .unwrap();
+            s.flush().await.unwrap();
+        });
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(addr), cache, 1);
+        let err = reader.read_block(&block(), 0, 16, 0).await.unwrap_err();
+        assert!(matches!(err, BlockReadError::NoOwners));
+    }
+
+    #[tokio::test]
+    async fn worker_error_propagates() {
+        let worker_addr = {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let a = listener.local_addr().unwrap().to_string();
+            tokio::spawn(async move {
+                let (mut s, _) = listener.accept().await.unwrap();
+                let mut hdr = [0u8; HEADER_LEN];
+                s.read_exact(&mut hdr).await.unwrap();
+                let h = FrameHeader::decode(&hdr).unwrap();
+                let mut body = vec![0u8; h.length as usize];
+                s.read_exact(&mut body).await.unwrap();
+                s.write_all(&encode_error(0, "block not present"))
+                    .await
+                    .unwrap();
+                s.flush().await.unwrap();
+            });
+            a
+        };
+        let coord_addr = mock_coordinator(worker_addr).await;
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
+        let err = reader.read_block(&block(), 0, 16, 0).await.unwrap_err();
+        assert!(matches!(
+            err,
+            BlockReadError::Worker(WorkerError::Remote(_))
+        ));
+    }
+}
