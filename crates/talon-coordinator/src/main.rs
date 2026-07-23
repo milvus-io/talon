@@ -129,14 +129,22 @@ impl Coordinator {
                     };
                 }
                 let node = status.node.clone();
+                let healthy_ready =
+                    status.health == talon_core::NodeHealth::Healthy && status.ready;
                 match self
                     .observability
                     .upsert_status(*status, self.lease_ttl)
                     .await
                 {
                     Ok(result) => {
+                        // Fast-path local visibility before the next reconcile
+                        // tick, but only for a healthy, ready worker — an
+                        // unhealthy/not-ready node must not be injected into
+                        // placement (issue #118); the store reconcile remains the
+                        // authoritative source and will drop it otherwise.
                         if result.disposition == WriteDisposition::Applied
                             && node.role == NodeRole::Worker
+                            && healthy_ready
                         {
                             self.service.membership().register(node);
                         }
