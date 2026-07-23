@@ -55,23 +55,73 @@ impl WorkerRuntime {
         )
     }
 
-    /// Serve `[offset, offset + len)` using cache hit or backend miss paths.
+    /// Serve `[offset, offset + len)`, spanning block boundaries as needed.
+    ///
+    /// A request whose range crosses one or more block boundaries is split into
+    /// per-block reads (each a cache hit or a backend miss) and the pieces are
+    /// stitched into one contiguous buffer. Previously only the block containing
+    /// the *start* offset was read and the result clamped to that block's end,
+    /// silently truncating cross-block reads (issue #112).
     pub async fn serve_range(&self, request: &RangeRequest) -> anyhow::Result<bytes::Bytes> {
-        let block = self.block_for(&request.object, request.offset);
-        let offset_in_block = request.offset - block.offset;
+        if request.len == 0 {
+            return Ok(bytes::Bytes::new());
+        }
+        let block_size = self.block_size as u64;
+        let end = request
+            .offset
+            .checked_add(request.len)
+            .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
 
+        // Fast path: the whole range lies within a single block. Keeps the
+        // common case allocation-free (returns the per-block slice directly).
+        let start_block = (request.offset / block_size) * block_size;
+        if end <= start_block + block_size {
+            let block = self.block_for(&request.object, request.offset);
+            let offset_in_block = request.offset - block.offset;
+            let bytes = self.block_bytes(request, &block).await?;
+            return slice(&bytes, offset_in_block, request.len);
+        }
+
+        // Slow path: stitch across blocks.
+        let mut out = bytes::BytesMut::with_capacity(request.len as usize);
+        let mut cursor = request.offset;
+        while cursor < end {
+            let block = self.block_for(&request.object, cursor);
+            let offset_in_block = cursor - block.offset;
+            let block_end = block.offset + block_size;
+            let take = block_end.min(end) - cursor;
+            let bytes = self.block_bytes(request, &block).await?;
+            let piece = slice(&bytes, offset_in_block, take)?;
+            // A block that returned fewer bytes than its share means the object
+            // ends inside it; stop rather than silently returning a short read.
+            let short = piece.len() < take as usize;
+            out.extend_from_slice(&piece);
+            if short {
+                break;
+            }
+            cursor += take;
+        }
+        Ok(out.freeze())
+    }
+
+    /// Return the full committed/fetched bytes of a single block, using the
+    /// cache-hit path when resident and the backend-miss path otherwise.
+    async fn block_bytes(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+    ) -> anyhow::Result<bytes::Bytes> {
         if matches!(
-            self.index.presence(&block, PageIndex(0), PageIndex(1)),
+            self.index.presence(block, PageIndex(0), PageIndex(1)),
             Presence::Whole
         ) {
             self.metrics.record_cache_hit();
             tracing::info!(block = %block, "HIT");
-            let bytes = self
+            return self
                 .store
-                .get_bytes(&block)
+                .get_bytes(block)
                 .await
-                .map_err(|error| anyhow::anyhow!("read committed block: {error}"))?;
-            return slice(&bytes, offset_in_block, request.len);
+                .map_err(|error| anyhow::anyhow!("read committed block: {error}"));
         }
 
         self.metrics.record_cache_miss();
@@ -98,7 +148,7 @@ impl WorkerRuntime {
         };
 
         self.store
-            .put(&block, bytes.clone())
+            .put(block, bytes.clone())
             .await
             .map_err(|error| anyhow::anyhow!("commit block failed: {error}"))?;
         self.index.commit(BlockMeta {
@@ -107,8 +157,7 @@ impl WorkerRuntime {
             len: bytes.len() as u64,
         });
         tracing::info!(block = %block, bytes = bytes.len(), "committed block");
-
-        slice(&bytes, offset_in_block, request.len)
+        Ok(bytes)
     }
 
     /// Number of blocks currently indexed.
@@ -212,6 +261,118 @@ mod tests {
         assert!(rendered.contains("talon_worker_cache_misses_total{form=\"whole\"} 1"));
         assert!(rendered.contains("talon_worker_cache_hits_total{form=\"whole\"} 1"));
         assert!(rendered.contains("talon_worker_backend_fetch_bytes_total{backend=\"azure\"} 8"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A backend whose block content is deterministic per absolute offset, so a
+    /// stitched multi-block read can be verified byte-for-byte.
+    struct RampBackend {
+        block_size: u64,
+    }
+
+    #[async_trait]
+    impl BackendStore for RampBackend {
+        async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            // Return one block worth of bytes starting at `offset`; byte i has
+            // value (offset + i) % 251 (prime, so no accidental alignment).
+            let n = len.min(self.block_size) as usize;
+            let buf: Vec<u8> = (0..n).map(|i| ((offset + i as u64) % 251) as u8).collect();
+            Ok(Bytes::from(buf))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: u64::MAX,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    fn expected(offset: u64, len: u64) -> Bytes {
+        Bytes::from(
+            (0..len)
+                .map(|i| ((offset + i) % 251) as u8)
+                .collect::<Vec<u8>>(),
+        )
+    }
+
+    fn runtime_with<B: BackendStore + 'static>(
+        backend: Arc<B>,
+        metrics: WorkerMetrics,
+        root: &PathBuf,
+        block_size: u32,
+    ) -> WorkerRuntime {
+        WorkerRuntime::new(
+            WholeBlockStore::open(root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            block_size,
+            metrics,
+        )
+    }
+
+    #[tokio::test]
+    async fn cross_block_read_stitches_multiple_blocks() {
+        // block_size 8; read [6, 14) spans blocks [0,8) and [8,16), so it must
+        // stitch two per-block fetches into one 8-byte contiguous result.
+        let root = tmp_root();
+        let runtime = runtime_with(
+            Arc::new(RampBackend { block_size: 8 }),
+            WorkerMetrics::new(1024),
+            &root,
+            8,
+        );
+        let req = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "ramp"),
+            offset: 6,
+            len: 8,
+        };
+        let got = runtime.serve_range(&req).await.unwrap();
+        assert_eq!(got.len(), 8);
+        assert_eq!(got, expected(6, 8));
+        assert_eq!(runtime.block_count(), 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn read_spanning_three_blocks_is_contiguous() {
+        let root = tmp_root();
+        let runtime = runtime_with(
+            Arc::new(RampBackend { block_size: 8 }),
+            WorkerMetrics::new(1024),
+            &root,
+            8,
+        );
+        // [4, 22): tail of block0, all of block1, head of block2.
+        let req = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "ramp"),
+            offset: 4,
+            len: 18,
+        };
+        let got = runtime.serve_range(&req).await.unwrap();
+        assert_eq!(got, expected(4, 18));
+        assert_eq!(runtime.block_count(), 3);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn single_block_read_still_works() {
+        let root = tmp_root();
+        let runtime = runtime_with(
+            Arc::new(RampBackend { block_size: 8 }),
+            WorkerMetrics::new(1024),
+            &root,
+            8,
+        );
+        let req = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "ramp"),
+            offset: 2,
+            len: 4,
+        };
+        let got = runtime.serve_range(&req).await.unwrap();
+        assert_eq!(got, expected(2, 4));
+        assert_eq!(runtime.block_count(), 1);
         std::fs::remove_dir_all(root).ok();
     }
 

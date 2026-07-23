@@ -81,6 +81,18 @@ async fn main() -> anyhow::Result<()> {
     let bytes = fetch_range(&worker_addr, &object, args.offset, args.len).await?;
     let elapsed = start.elapsed();
 
+    // Verify the worker returned the full requested range. A short read means
+    // truncation (or the object ended inside the range); either way, silently
+    // reporting it as success would hide corruption (issue #112).
+    if (bytes.len() as u64) < args.len {
+        anyhow::bail!(
+            "short read: requested {} bytes at offset {}, got {} (truncated or past EOF)",
+            args.len,
+            args.offset,
+            bytes.len()
+        );
+    }
+
     println!(
         "read {} bytes from {} in {:.1?}",
         bytes.len(),
