@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 
-use talon_core::{BlockId, NodeId, NodeInfo};
+use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::ControlMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -31,6 +31,15 @@ pub struct Placement {
     pub owners: Vec<NodeId>,
     /// Placement epoch these owners were computed against.
     pub epoch: u64,
+}
+
+/// An object's metadata as answered by the coordinator, for `getattr`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectStat {
+    /// Total object length in bytes (the file size reported to FUSE).
+    pub size: u64,
+    /// Current source version/etag, used to address the object's blocks.
+    pub version: String,
 }
 
 /// Errors from a coordinator round-trip.
@@ -100,8 +109,21 @@ impl CoordinatorClient {
         }
     }
 
+    /// Fetch an object's size + version for `getattr` / block addressing.
+    pub async fn stat_object(&self, object: &ObjectId) -> Result<ObjectStat, CoordinatorError> {
+        let req = ControlMessage::StatObject {
+            object: object.clone(),
+        };
+        match self.round_trip(req, "StatObject").await? {
+            ControlMessage::ObjectStat { size, version } => Ok(ObjectStat { size, version }),
+            other => Err(CoordinatorError::Unexpected {
+                expected: "StatObject",
+                got: Box::new(other),
+            }),
+        }
+    }
+
     /// Locate `block` and resolve the primary owner to a worker address.
-    ///
     /// Combines [`placement_lookup`](Self::placement_lookup) with a
     /// [`membership`](Self::membership) resolution so a caller gets a directly
     /// dialable `host:port` for the highest-weight owner. Returns `Ok(None)`
@@ -268,6 +290,22 @@ mod tests {
         let nodes = client.membership().await.unwrap();
         assert_eq!(nodes.len(), 2);
         assert_eq!(nodes[0].address, "10.0.0.1:7001");
+    }
+
+    #[tokio::test]
+    async fn stat_object_parses_response() {
+        let addr = mock_coordinator(ControlMessage::ObjectStat {
+            size: 2_500_000_000,
+            version: "etag-9".into(),
+        })
+        .await;
+        let client = CoordinatorClient::new(addr);
+        let stat = client
+            .stat_object(&ObjectId::new(Backend::S3, "b", "o/1"))
+            .await
+            .unwrap();
+        assert_eq!(stat.size, 2_500_000_000);
+        assert_eq!(stat.version, "etag-9");
     }
 
     #[tokio::test]
