@@ -30,6 +30,23 @@ use talon_core::{BlockHandle, BlockId, Error, ObjectStore, PageIndex, Result};
 /// concurrent writers of the same block never share a `.tmp` path (issue #113).
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Run blocking filesystem work on Tokio's blocking pool, so a large read or
+/// write-plus-fsync never stalls the async reactor thread and the other
+/// connections multiplexed on it (issue #115). A panic in the closure is mapped
+/// to a backend error.
+async fn spawn_blocking_io<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(join_error) => Err(Error::Backend(format!(
+            "blocking store task failed: {join_error}"
+        ))),
+    }
+}
+
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
     root: PathBuf,
@@ -97,7 +114,11 @@ impl ObjectStore for WholeBlockStore {
 
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
         let path = self.path_for(id);
-        match std::fs::File::open(&path) {
+        let id = id.clone();
+        // A whole-block read is up to block_size (256 MiB default) of blocking
+        // disk I/O; run it on the blocking pool so it never stalls the async
+        // reactor thread and its other multiplexed connections (issue #115).
+        spawn_blocking_io(move || match std::fs::File::open(&path) {
             Ok(mut f) => {
                 let mut buf = Vec::new();
                 f.read_to_end(&mut buf)?;
@@ -107,49 +128,58 @@ impl ObjectStore for WholeBlockStore {
                 Err(Error::NotFound(id.to_string()))
             }
             Err(e) => Err(e.into()),
-        }
+        })
+        .await
     }
 
     async fn put(&self, id: &BlockId, value: Bytes) -> Result<()> {
         let path = self.path_for(id);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        // Write to a per-writer-unique temp file then rename, so a present
-        // `.blk` is always complete (crash-atomic commit) AND two concurrent
-        // writers of the same block never truncate each other's staging file
-        // (issue #113). Both writers stage identical content; whichever renames
-        // last wins with a complete file, and the loser's rename is a harmless
-        // overwrite of the same bytes.
-        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp = path.with_extension(format!("blk.tmp.{}.{seq}", std::process::id()));
-        {
-            let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&value)?;
-            f.sync_all()?;
-        }
-        // Rename our own unique temp into place. If a concurrent writer already
-        // renamed theirs, this atomically replaces it with identical bytes.
-        if let Err(e) = std::fs::rename(&tmp, &path) {
-            // Best-effort cleanup of our staging file on failure so a failed
-            // commit never leaks a `.tmp`.
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
-        Ok(())
+        // The write + fsync of a whole block is blocking disk I/O; keep it off
+        // the reactor thread (issue #115).
+        spawn_blocking_io(move || {
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            // Write to a per-writer-unique temp file then rename, so a present
+            // `.blk` is always complete (crash-atomic commit) AND two concurrent
+            // writers of the same block never truncate each other's staging file
+            // (issue #113). Both writers stage identical content; whichever
+            // renames last wins with a complete file, and the loser's rename is
+            // a harmless overwrite of the same bytes.
+            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = path.with_extension(format!("blk.tmp.{}.{seq}", std::process::id()));
+            {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&value)?;
+                f.sync_all()?;
+            }
+            // Rename our own unique temp into place. If a concurrent writer
+            // already renamed theirs, this atomically replaces it with identical
+            // bytes.
+            if let Err(e) = std::fs::rename(&tmp, &path) {
+                // Best-effort cleanup of our staging file on failure so a failed
+                // commit never leaks a `.tmp`.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            Ok(())
+        })
+        .await
     }
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
         let path = self.path_for(id);
-        match std::fs::remove_file(&path) {
+        spawn_blocking_io(move || match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
-        }
+        })
+        .await
     }
 
     async fn contains(&self, id: &BlockId) -> Result<bool> {
-        Ok(self.path_for(id).exists())
+        let path = self.path_for(id);
+        spawn_blocking_io(move || Ok(path.exists())).await
     }
 }
 
