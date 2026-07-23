@@ -675,7 +675,22 @@ pub async fn serve_admin(
     listener: TcpListener,
     state: Arc<CoordinatorObservability>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, admin_router(state)).await
+    serve_admin_secured(
+        listener,
+        state,
+        Arc::new(crate::security::SecurityConfig::default()),
+    )
+    .await
+}
+
+/// Serve the admin surface with an explicit security configuration (auth,
+/// security headers, request-size cap). See [`crate::security`].
+pub async fn serve_admin_secured(
+    listener: TcpListener,
+    state: Arc<CoordinatorObservability>,
+    security: Arc<crate::security::SecurityConfig>,
+) -> std::io::Result<()> {
+    axum::serve(listener, secured_admin_router(state, security)).await
 }
 
 /// Build the coordinator administration router: metrics/health/readiness, the
@@ -691,6 +706,29 @@ pub fn admin_router(state: Arc<CoordinatorObservability>) -> Router {
         .merge(crate::api::router(state))
         // Embedded management UI under / and /ui (issue #83).
         .merge(crate::ui::router())
+}
+
+/// Build the admin router wrapped with the management-security layer (#85):
+/// authentication on protected routes, security headers on every response, and
+/// a bounded request-body limit.
+pub fn secured_admin_router(
+    state: Arc<CoordinatorObservability>,
+    security: Arc<crate::security::SecurityConfig>,
+) -> Router {
+    admin_router(state)
+        .layer(axum::middleware::from_fn_with_state(
+            Arc::clone(&security),
+            |axum::extract::State(sec): axum::extract::State<
+                Arc<crate::security::SecurityConfig>,
+            >,
+             req: axum::extract::Request,
+             next: axum::middleware::Next| async move {
+                crate::security::guard(sec, req, next).await
+            },
+        ))
+        .layer(axum::extract::DefaultBodyLimit::max(
+            crate::security::MAX_REQUEST_BODY_BYTES,
+        ))
 }
 
 async fn metrics_handler(State(state): State<Arc<CoordinatorObservability>>) -> impl IntoResponse {
@@ -948,16 +986,99 @@ mod tests {
     }
 
     async fn request(address: std::net::SocketAddr, path: &str) -> String {
+        request_with(address, path, "").await
+    }
+
+    async fn request_with(address: std::net::SocketAddr, path: &str, extra: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
             .write_all(
-                format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-                    .as_bytes(),
+                format!(
+                    "GET {path} HTTP/1.1\r\nHost: localhost\r\n{extra}Connection: close\r\n\r\n"
+                )
+                .as_bytes(),
             )
             .await
             .unwrap();
         let mut response = Vec::new();
         stream.read_to_end(&mut response).await.unwrap();
         String::from_utf8(response).unwrap()
+    }
+
+    #[tokio::test]
+    async fn security_layer_enforces_auth_and_headers() {
+        use crate::security::{AuthMode, SecurityConfig};
+        let (observability, _store) = observability();
+        observability.check_ready().await.unwrap();
+        let security = Arc::new(SecurityConfig {
+            auth: AuthMode::BearerToken {
+                token: "an-adequately-long-token".into(),
+            },
+            trust_forwarded_headers: false,
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_admin_secured(
+            listener,
+            Arc::clone(&observability),
+            security,
+        ));
+
+        // Public operational endpoints require no auth.
+        assert!(request(address, "/healthz")
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+        assert!(request(address, "/metrics")
+            .await
+            .starts_with("HTTP/1.1 200 OK"));
+
+        // Protected API without a token fails closed with a challenge.
+        let unauth = request(address, "/api/v1/cluster").await;
+        assert!(unauth.starts_with("HTTP/1.1 401 Unauthorized"));
+        assert!(unauth.to_lowercase().contains("www-authenticate"));
+
+        // A wrong token is still rejected.
+        let bad = request_with(
+            address,
+            "/api/v1/cluster",
+            "Authorization: Bearer wrong-token\r\n",
+        )
+        .await;
+        assert!(bad.starts_with("HTTP/1.1 401 Unauthorized"));
+
+        // The correct token is accepted and the response carries hardening
+        // headers.
+        let ok = request_with(
+            address,
+            "/api/v1/cluster",
+            "Authorization: Bearer an-adequately-long-token\r\n",
+        )
+        .await;
+        assert!(ok.starts_with("HTTP/1.1 200 OK"));
+        let lower = ok.to_lowercase();
+        assert!(lower.contains("x-content-type-options: nosniff"));
+        assert!(lower.contains("x-frame-options: deny"));
+        assert!(lower.contains("referrer-policy: no-referrer"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn disabled_auth_allows_management_but_still_stamps_headers() {
+        let (observability, _store) = observability();
+        observability.check_ready().await.unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        // Default security config = auth disabled.
+        let server = tokio::spawn(serve_admin_secured(
+            listener,
+            Arc::clone(&observability),
+            Arc::new(crate::security::SecurityConfig::default()),
+        ));
+
+        let resp = request(address, "/api/v1/cluster").await;
+        assert!(resp.starts_with("HTTP/1.1 200 OK"));
+        assert!(resp.to_lowercase().contains("x-frame-options: deny"));
+        server.abort();
     }
 }
