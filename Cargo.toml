@@ -46,3 +46,10 @@ serde_yaml = "0.9"
 kube = { version = "0.97", default-features = false, features = ["client", "config", "rustls-tls", "runtime"] }
 k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30"] }
 futures = "0.3"
+# etcd v3 client for the production ClusterStateStore backend. `tls-roots`
+# enables TLS via tonic/ring with the platform's native root certificates and
+# avoids a system OpenSSL build dependency.
+etcd-client = { version = "0.19", default-features = false, features = ["tls", "tls-roots"] }
+# gRPC status codes surfaced by etcd-client errors. Pinned to the same tonic
+# major the etcd client depends on so error mapping stays in sync.
+tonic = { version = "0.14", default-features = false }

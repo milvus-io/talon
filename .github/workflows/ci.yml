@@ -39,6 +39,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install toolchain (clippy)
         run: rustup component add clippy
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Lint
         run: cargo clippy --workspace --all-targets --all-features
@@ -48,6 +50,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --workspace --all-targets --all-features --locked
@@ -59,9 +63,50 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
+
+  etcd-contract:
+    name: etcd backend contract
+    runs-on: ubuntu-latest
+    # Exercises the production etcd ClusterStateStore backend against a real
+    # ephemeral etcd, as required by the state-store contract. etcd is launched
+    # explicitly rather than as a service container because that image's
+    # healthcheck is unreliable on GitHub-hosted runners.
+    env:
+      ETCD_VERSION: v3.5.16
+      TALON_ETCD_TEST_ENDPOINT: 127.0.0.1:2379
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Start ephemeral etcd
+        run: |
+          curl -fsSL -o /tmp/etcd.tar.gz \
+            "https://github.com/etcd-io/etcd/releases/download/${ETCD_VERSION}/etcd-${ETCD_VERSION}-linux-amd64.tar.gz"
+          tar xzf /tmp/etcd.tar.gz -C /tmp
+          ETCD_DIR="/tmp/etcd-${ETCD_VERSION}-linux-amd64"
+          "$ETCD_DIR/etcd" --data-dir /tmp/etcd-data \
+            --listen-client-urls http://127.0.0.1:2379 \
+            --advertise-client-urls http://127.0.0.1:2379 &
+          echo "ETCD_PID=$!" >> "$GITHUB_ENV"
+          for i in $(seq 1 30); do
+            if "$ETCD_DIR/etcdctl" --endpoints=127.0.0.1:2379 endpoint health; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "etcd did not become healthy" >&2
+          exit 1
+      - uses: Swatinem/rust-cache@v2
+      - name: Run etcd backend contract tests
+        run: >-
+          cargo test -p talon-coordinator
+          --features etcd,state-store-testkit
+          --test etcd_contract --locked
 
   bench:
     name: bench (informational)

@@ -6,6 +6,8 @@
 //! ordered by clients.
 
 mod config;
+#[cfg(feature = "etcd")]
+mod etcd;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
 mod memory;
@@ -21,6 +23,8 @@ use async_trait::async_trait;
 use talon_core::{NodeId, NodeStatus, NodeStatusError};
 
 pub use config::{ClusterStateConfig, ConfigError, StateBackend};
+#[cfg(feature = "etcd")]
+pub use etcd::{EtcdConfig, EtcdConfigError, EtcdStateStore, EtcdTlsConfig, DEFAULT_ETCD_PREFIX};
 #[cfg(feature = "kubernetes")]
 pub use kubernetes::{
     KubernetesConfig, KubernetesConfigError, KubernetesStateStore, DEFAULT_LEASE_LABEL_PREFIX,
