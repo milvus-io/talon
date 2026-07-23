@@ -148,10 +148,28 @@ impl Coordinator {
                     }
                 }
             }
-            lookup @ ControlMessage::PlacementLookup { .. } => self.service.handle(lookup),
-            ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                nodes: self.service.membership().snapshot(),
-            },
+            lookup @ ControlMessage::PlacementLookup { .. } => {
+                // Fail closed: without a fresh authoritative snapshot we must not
+                // answer placement from possibly-stale local membership (#73).
+                if !self.observability.is_ready() {
+                    return ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("coordinator not ready: shared state unavailable".into()),
+                    };
+                }
+                self.service.handle(lookup)
+            }
+            ControlMessage::MembershipQuery {} => {
+                if !self.observability.is_ready() {
+                    return ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("coordinator not ready: shared state unavailable".into()),
+                    };
+                }
+                ControlMessage::MembershipList {
+                    nodes: self.service.membership().snapshot(),
+                }
+            }
             other => ControlMessage::Ack {
                 ok: false,
                 detail: Some(format!("unexpected control message: {other:?}")),
@@ -223,18 +241,61 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(config.state.heartbeat_interval_ms),
         Duration::from_millis(config.state.lease_ttl_ms),
     );
+    // Keep local placement membership reconciled from shared state so this
+    // coordinator serves the same node set as its peers (active-active).
+    spawn_membership_reconcile(
+        Arc::clone(&observability),
+        Arc::clone(&state),
+        Duration::from_millis(config.state.heartbeat_interval_ms),
+    );
 
     let listener = TcpListener::bind(&config.listen).await?;
     tracing::info!(listen = %config.listen, "coordinator serving control plane");
     loop {
-        let (stream, peer) = listener.accept().await?;
-        let state = Arc::clone(&state);
-        tokio::spawn(async move {
-            if let Err(error) = handle_conn(stream, state).await {
-                tracing::debug!(%peer, %error, "coordinator connection ended");
+        tokio::select! {
+            accepted = listener.accept() => {
+                let (stream, peer) = accepted?;
+                let state = Arc::clone(&state);
+                tokio::spawn(async move {
+                    if let Err(error) = handle_conn(stream, state).await {
+                        tracing::debug!(%peer, %error, "coordinator connection ended");
+                    }
+                });
             }
-        });
+            _ = tokio::signal::ctrl_c() => {
+                tracing::info!("SIGINT received; draining and releasing coordinator lease");
+                observability.begin_shutdown();
+                // Best-effort: remove our own lease so peers see us leave promptly
+                // instead of waiting out the TTL.
+                if let Err(error) = observability.remove_self().await {
+                    tracing::warn!(%error, "failed to release coordinator lease on shutdown");
+                }
+                return Ok(());
+            }
+        }
     }
+}
+
+fn spawn_membership_reconcile(
+    observability: Arc<CoordinatorObservability>,
+    state: Arc<Coordinator>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = observability
+                .reconcile_membership(state.service.membership())
+                .await
+            {
+                // Non-fatal: local membership is left last-good and readiness is
+                // cleared, so placement fails closed until the store recovers.
+                tracing::warn!(%error, "membership reconcile from shared state failed");
+            }
+        }
+    })
 }
 
 fn spawn_self_heartbeat(
@@ -378,5 +439,176 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    fn worker_status(cluster: &str, id: &str, incarnation: &str, addr: &str) -> NodeStatus {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        NodeStatus {
+            schema_version: NODE_STATUS_SCHEMA_VERSION,
+            cluster_id: cluster.into(),
+            node: NodeInfo {
+                id: NodeId::new(id),
+                address: addr.into(),
+                role: NodeRole::Worker,
+            },
+            incarnation_id: incarnation.into(),
+            admin_address: Some("127.0.0.1:9001".into()),
+            build_version: "test".into(),
+            started_at_unix_ms: now,
+            reported_at_unix_ms: now,
+            heartbeat_seq: 0,
+            health: NodeHealth::Healthy,
+            ready: true,
+            metrics: NodeMetricsSnapshot::default(),
+            labels: BTreeMap::new(),
+        }
+    }
+
+    fn observability_over(
+        store: Arc<dyn ClusterStateStore>,
+        node_id: &str,
+    ) -> Arc<CoordinatorObservability> {
+        Arc::new(
+            CoordinatorObservability::new(
+                "cluster-a".into(),
+                NodeInfo {
+                    id: NodeId::new(node_id),
+                    address: format!("127.0.0.1:70{}", node_id.len()),
+                    role: NodeRole::Coordinator,
+                },
+                "127.0.0.1:8000".into(),
+                Duration::from_secs(1),
+                store,
+            )
+            .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn worker_registered_on_one_coordinator_is_visible_through_another() {
+        // Two coordinators share one backend. A worker heartbeat lands on A; B
+        // must observe it after reconciling from shared state, and both derive
+        // the same deterministic placement version (#80/#81).
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        let obs_a = observability_over(Arc::clone(&store), "coord-a");
+        let obs_b = observability_over(Arc::clone(&store), "coord-b");
+        obs_a.check_ready().await.unwrap();
+        obs_b.check_ready().await.unwrap();
+        let coord_a = Coordinator::new(Arc::clone(&obs_a), Duration::from_secs(30));
+        let coord_b = Coordinator::new(Arc::clone(&obs_b), Duration::from_secs(30));
+
+        let reply = coord_a
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(worker_status(
+                    "cluster-a",
+                    "worker-1",
+                    "inc-1",
+                    "127.0.0.1:7001",
+                )),
+            })
+            .await;
+        assert!(matches!(reply, ControlMessage::Ack { ok: true, .. }));
+
+        // B has not seen the worker locally yet.
+        assert_eq!(coord_b.service.membership().snapshot().len(), 0);
+        // After B reconciles from the shared store, it sees the worker.
+        obs_b
+            .reconcile_membership(coord_b.service.membership())
+            .await
+            .unwrap();
+        assert_eq!(coord_b.service.membership().snapshot().len(), 1);
+
+        // Both coordinators now compute the identical placement version.
+        obs_a
+            .reconcile_membership(coord_a.service.membership())
+            .await
+            .unwrap();
+        assert_eq!(
+            coord_a.service.membership().epoch(),
+            coord_b.service.membership().epoch()
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_fail_closed_when_state_store_unavailable() {
+        // With shared state unavailable the coordinator must not answer placement
+        // or membership from stale local state (#73).
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store) as Arc<dyn ClusterStateStore>, "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(Arc::clone(&obs), Duration::from_secs(30));
+        // Seed a worker so a "leaky" implementation would have something to serve.
+        coord
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(worker_status(
+                    "cluster-a",
+                    "worker-1",
+                    "inc-1",
+                    "127.0.0.1:7001",
+                )),
+            })
+            .await;
+
+        // Inject a store outage; the next reconcile clears readiness.
+        store.set_available(false);
+        let _ = obs.reconcile_membership(coord.service.membership()).await;
+        assert!(!obs.is_ready());
+
+        let placement = coord
+            .dispatch(ControlMessage::PlacementLookup {
+                block: sample_block(),
+                k: 1,
+            })
+            .await;
+        assert!(matches!(placement, ControlMessage::Ack { ok: false, .. }));
+        let membership = coord.dispatch(ControlMessage::MembershipQuery {}).await;
+        assert!(matches!(membership, ControlMessage::Ack { ok: false, .. }));
+
+        // Recovery restores service.
+        store.set_available(true);
+        obs.reconcile_membership(coord.service.membership())
+            .await
+            .unwrap();
+        assert!(obs.is_ready());
+        let placement = coord
+            .dispatch(ControlMessage::PlacementLookup {
+                block: sample_block(),
+                k: 1,
+            })
+            .await;
+        assert!(matches!(
+            placement,
+            ControlMessage::PlacementResponse { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_releases_lease_and_stops_serving() {
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store), "coord-a");
+        obs.check_ready().await.unwrap();
+        // The coordinator has registered its own lease via a heartbeat.
+        obs.upsert_status(obs.status(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert_eq!(store.snapshot("cluster-a").await.unwrap().nodes.len(), 1);
+
+        obs.begin_shutdown();
+        assert!(!obs.is_ready(), "shutting-down coordinator is not ready");
+        let removed = obs.remove_self().await.unwrap();
+        assert_eq!(removed.disposition, WriteDisposition::Applied);
+        assert_eq!(store.snapshot("cluster-a").await.unwrap().nodes.len(), 0);
+    }
+
+    fn sample_block() -> talon_core::BlockId {
+        talon_core::BlockId::new(
+            talon_core::ObjectId::new(talon_core::Backend::S3, "b", "o/1"),
+            0,
+            256 << 20,
+            talon_core::Version::new("v1"),
+        )
     }
 }

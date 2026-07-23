@@ -510,6 +510,83 @@ impl CoordinatorObservability {
         }
     }
 
+    /// Reconcile local membership from an authoritative store snapshot.
+    ///
+    /// This is what makes coordinators active-active: the node set consulted by
+    /// placement is derived from shared state, not from whichever heartbeats
+    /// happened to land on this process. A worker registered through any
+    /// coordinator becomes visible through every coordinator once it reconciles.
+    ///
+    /// Only non-expired **worker** records populate placement membership;
+    /// coordinator records are tracked in the store for the management view but
+    /// are not placement targets. On a store error the local membership is left
+    /// untouched (last-good), readiness is cleared, and the error is returned so
+    /// the caller can apply the #73 fail-closed policy.
+    pub async fn reconcile_membership(
+        &self,
+        membership: &crate::Membership,
+    ) -> StateStoreResult<()> {
+        let started = Instant::now();
+        let result =
+            match tokio::time::timeout(self.request_timeout, self.store.snapshot(&self.cluster_id))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(StateStoreError::Timeout {
+                    backend: self.store.backend(),
+                }),
+            };
+        self.metrics
+            .record_state("snapshot", &result, started.elapsed());
+        match result {
+            Ok(snapshot) => {
+                self.metrics.update_snapshot(&snapshot);
+                let workers: Vec<NodeInfo> = snapshot
+                    .nodes
+                    .iter()
+                    .filter(|status| status.node.role == NodeRole::Worker)
+                    .map(|status| status.node.clone())
+                    .collect();
+                membership.reconcile(workers);
+                self.ready.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(error) => {
+                self.ready.store(false, Ordering::Release);
+                Err(error)
+            }
+        }
+    }
+
+    /// Begin graceful shutdown: mark this coordinator not-live/not-ready so new
+    /// authoritative reads fail closed while in-flight ones drain.
+    pub fn begin_shutdown(&self) {
+        self.shutting_down.store(true, Ordering::Release);
+        self.ready.store(false, Ordering::Release);
+    }
+
+    /// Remove this coordinator's own lease from shared state on shutdown, so a
+    /// crashed-or-draining coordinator disappears from the cluster view without
+    /// waiting for lease expiry. Best-effort and deadline-bounded.
+    pub async fn remove_self(&self) -> StateStoreResult<WriteResult> {
+        let started = Instant::now();
+        let result = match tokio::time::timeout(
+            self.request_timeout,
+            self.store
+                .remove_node(&self.cluster_id, &self.node.id, &self.incarnation_id),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => Err(StateStoreError::Timeout {
+                backend: self.store.backend(),
+            }),
+        };
+        self.metrics
+            .record_state("upsert", &result, started.elapsed());
+        result
+    }
+
     /// Build the coordinator's own leased status record.
     pub fn status(&self) -> NodeStatus {
         let (requests_total, errors_total) = self.metrics.totals();
