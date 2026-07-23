@@ -13,12 +13,14 @@ path = "src/main.rs"
 
 [dependencies]
 talon-core.workspace = true
+talon-transport.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
+thiserror.workspace = true
 
 # Uncomment to implement the actual FUSE mount layer:
 # fuser = "0.14"

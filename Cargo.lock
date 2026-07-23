@@ -1223,6 +1223,8 @@ dependencies = [
  "async-trait",
  "clap",
  "talon-core",
+ "talon-transport",
+ "thiserror",
  "tokio",
  "tracing",
  "tracing-subscriber",
