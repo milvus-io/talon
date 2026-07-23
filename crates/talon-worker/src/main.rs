@@ -8,8 +8,9 @@
 //! # Wiring
 //!
 //! - Control plane (register/heartbeat) reuses [`talon_transport::codec`].
-//! - Data plane uses [`talon_transport::data`]: a [`RangeRequest`] in, raw bytes
-//!   (or an `ERROR`-flagged frame) out.
+//! - Data plane uses [`talon_transport::data`]: a
+//!   [`talon_transport::data::RangeRequest`] in, raw bytes (or an
+//!   `ERROR`-flagged frame) out.
 //! - Backend fetch is the real [`AzureBackend`] over [`ReqwestClient`]; the SAS
 //!   token is read from the environment and **never logged**.
 //!
@@ -19,26 +20,23 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use talon_backend::{AzureBackend, AzureConfig, ReqwestClient};
 use talon_core::{
-    azure_sas_from_env, BackendStore, BlockForm, BlockId, BlockMeta, NodeId, NodeInfo, NodeRole,
-    ObjectId, ObjectStore, PageIndex, Version, WorkerConfig, WorkerConfigPatch,
+    azure_sas_from_env, BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
 };
-use talon_transport::data::{self, RangeRequest};
+use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
-use talon_worker::{BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore};
+use talon_worker::{
+    serve_admin, BlockIndex, InFlightLoads, WholeBlockStore, WorkerObservability, WorkerRuntime,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-/// Fixed placeholder version used for block identity in this single-worker e2e.
-///
-/// A production worker would carry the object's real etag (from a coordinator
-/// `HEAD`) so a source overwrite invalidates the key. Here client and worker
-/// agree on a constant so the client need not hold Azure credentials.
-const PLACEHOLDER_VERSION: &str = "e2e-v1";
+const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Command-line arguments for a Talon worker.
 #[derive(Debug, Parser)]
@@ -50,9 +48,21 @@ struct Args {
     /// Address to bind the worker RPC service to.
     #[arg(long)]
     listen: Option<String>,
+    /// Address to bind the worker HTTP administration service to.
+    #[arg(long)]
+    admin_listen: Option<String>,
     /// Address of the coordinator to register with.
     #[arg(long)]
     coordinator: Option<String>,
+    /// Logical cluster advertised by worker status.
+    #[arg(long)]
+    cluster_id: Option<String>,
+    /// Stable node identity; defaults to the RPC listen address.
+    #[arg(long)]
+    node_id: Option<String>,
+    /// Control-plane heartbeat interval in milliseconds.
+    #[arg(long)]
+    heartbeat_interval_ms: Option<u64>,
     /// Logical block size in bytes.
     #[arg(long)]
     block_size: Option<u32>,
@@ -62,22 +72,17 @@ impl Args {
     fn into_patch(self) -> WorkerConfigPatch {
         WorkerConfigPatch {
             listen: self.listen,
+            admin_listen: self.admin_listen,
             coordinator: self.coordinator,
+            cluster_id: self.cluster_id,
+            node_id: self.node_id,
+            heartbeat_interval_ms: self.heartbeat_interval_ms,
             block_size: self.block_size,
             cache_dirs: None,
             capacity_bytes: None,
             azure_account: None,
         }
     }
-}
-
-/// Everything a request handler needs, shared across connections.
-struct Worker {
-    store: WholeBlockStore,
-    index: BlockIndex,
-    inflight: InFlightLoads,
-    backend: Arc<dyn BackendStore>,
-    block_size: u32,
 }
 
 #[tokio::main]
@@ -99,7 +104,11 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!(
         listen = %cfg.listen,
+        admin_listen = %cfg.admin_listen,
         coordinator = %cfg.coordinator,
+        cluster_id = %cfg.cluster_id,
+        node_id = ?cfg.node_id,
+        heartbeat_interval_ms = cfg.heartbeat_interval_ms,
         block_size = cfg.block_size,
         cache_dirs = ?cfg.cache_dirs,
         capacity_bytes = cfg.capacity_bytes,
@@ -129,25 +138,48 @@ async fn main() -> anyhow::Result<()> {
     std::fs::create_dir_all(&root)?;
     let store = WholeBlockStore::open(&root)?;
 
-    let worker = Arc::new(Worker {
-        store,
-        index: BlockIndex::new(),
-        inflight: InFlightLoads::new(),
-        backend,
-        block_size: cfg.block_size,
-    });
-
-    // Register with the coordinator and start a heartbeat task.
+    let index = Arc::new(BlockIndex::new());
+    let inflight = Arc::new(InFlightLoads::new());
     let node = NodeInfo {
-        id: NodeId::new(cfg.listen.clone()),
+        id: NodeId::new(cfg.node_id.clone().unwrap_or_else(|| cfg.listen.clone())),
         address: cfg.listen.clone(),
         role: NodeRole::Worker,
     };
-    register_with_coordinator(&cfg.coordinator, &node).await?;
-    spawn_heartbeat(
+    let observability = Arc::new(WorkerObservability::new(
+        cfg.cluster_id.clone(),
+        node.clone(),
+        cfg.admin_listen.clone(),
+        cfg.capacity_bytes,
+        Arc::clone(&index),
+        Arc::clone(&inflight),
+    )?);
+    observability.readiness().set_backend_ready(true);
+    observability.readiness().set_store_ready(true);
+
+    let worker = Arc::new(WorkerRuntime::new(
+        store,
+        index,
+        inflight,
+        backend,
+        cfg.block_size,
+        observability.metrics().clone(),
+    ));
+
+    let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
+    tracing::info!(listen = %cfg.admin_listen, "worker serving administration API");
+    let admin_observability = Arc::clone(&observability);
+    tokio::spawn(async move {
+        if let Err(error) = serve_admin(admin_listener, admin_observability).await {
+            tracing::error!(%error, "worker administration server stopped");
+        }
+    });
+
+    let _control_plane = spawn_control_plane(
         cfg.coordinator.clone(),
-        node.id.clone(),
+        node,
         Arc::clone(&worker),
+        Arc::clone(&observability),
+        Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
     // Serve the data plane.
@@ -156,8 +188,9 @@ async fn main() -> anyhow::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let worker = Arc::clone(&worker);
+        let observability = Arc::clone(&observability);
         tokio::spawn(async move {
-            if let Err(e) = handle_conn(stream, worker).await {
+            if let Err(e) = handle_conn(stream, worker, observability).await {
                 tracing::debug!(%peer, error = %e, "worker: connection ended");
             }
         });
@@ -170,32 +203,91 @@ async fn register_with_coordinator(coordinator: &str, node: &NodeInfo) -> anyhow
     let buf = codec::encode(0, &ControlMessage::Register { node: node.clone() })?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
-    // Read the Ack (best-effort).
-    if let Some(ControlMessage::Ack { ok, detail }) = read_control(&mut stream).await? {
-        if !ok {
-            anyhow::bail!("coordinator rejected registration: {detail:?}");
+    match read_control(&mut stream).await? {
+        Some(ControlMessage::Ack {
+            ok: true,
+            detail: _,
+        }) => {}
+        Some(ControlMessage::Ack { ok: false, detail }) => {
+            anyhow::bail!("coordinator rejected registration: {detail:?}")
         }
+        Some(other) => anyhow::bail!("unexpected coordinator registration reply: {other:?}"),
+        None => anyhow::bail!("coordinator closed registration connection without an Ack"),
     }
     tracing::info!(%coordinator, "registered with coordinator");
     Ok(())
 }
 
-/// Periodically send a `Heartbeat` with the current resident block count.
-fn spawn_heartbeat(coordinator: String, node: NodeId, worker: Arc<Worker>) {
+/// Maintain registration and send legacy plus versioned status heartbeats.
+fn spawn_control_plane(
+    coordinator: String,
+    node: NodeInfo,
+    worker: Arc<WorkerRuntime>,
+    observability: Arc<WorkerObservability>,
+    heartbeat_interval: Duration,
+) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(5));
+        let mut ticker = tokio::time::interval(heartbeat_interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut registered = false;
         loop {
             ticker.tick().await;
-            let block_count = worker.index.len() as u64;
-            let msg = ControlMessage::Heartbeat {
-                node: node.clone(),
-                block_count,
+
+            if !registered {
+                match tokio::time::timeout(
+                    CONTROL_OPERATION_TIMEOUT,
+                    register_with_coordinator(&coordinator, &node),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        registered = true;
+                        observability.readiness().set_control_registered(true);
+                    }
+                    Ok(Err(error)) => {
+                        observability.metrics().record_heartbeat_failure();
+                        observability.readiness().set_control_registered(false);
+                        tracing::warn!(%error, "worker registration failed; retrying");
+                        continue;
+                    }
+                    Err(_) => {
+                        observability.metrics().record_heartbeat_failure();
+                        observability.readiness().set_control_registered(false);
+                        tracing::warn!("worker registration timed out; retrying");
+                        continue;
+                    }
+                }
+            }
+
+            let legacy = ControlMessage::Heartbeat {
+                node: node.id.clone(),
+                block_count: worker.block_count(),
             };
-            if let Err(e) = send_oneshot(&coordinator, &msg).await {
-                tracing::debug!(error = %e, "heartbeat send failed");
+            let status = ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(observability.status()),
+            };
+            let heartbeat = tokio::time::timeout(CONTROL_OPERATION_TIMEOUT, async {
+                send_oneshot(&coordinator, &legacy).await?;
+                send_oneshot(&coordinator, &status).await
+            })
+            .await;
+            match heartbeat {
+                Ok(Ok(())) => observability.metrics().record_heartbeat_success(),
+                Ok(Err(error)) => {
+                    registered = false;
+                    observability.metrics().record_heartbeat_failure();
+                    observability.readiness().set_control_registered(false);
+                    tracing::warn!(%error, "control heartbeat failed; registration will retry");
+                }
+                Err(_) => {
+                    registered = false;
+                    observability.metrics().record_heartbeat_failure();
+                    observability.readiness().set_control_registered(false);
+                    tracing::warn!("control heartbeat timed out; registration will retry");
+                }
             }
         }
-    });
+    })
 }
 
 /// Connect, send one control message, and drop (fire-and-forget over TCP).
@@ -208,8 +300,14 @@ async fn send_oneshot(addr: &str, msg: &ControlMessage) -> anyhow::Result<()> {
 }
 
 /// Serve data-plane range requests on one connection until EOF.
-async fn handle_conn(mut stream: TcpStream, worker: Arc<Worker>) -> anyhow::Result<()> {
+async fn handle_conn(
+    mut stream: TcpStream,
+    worker: Arc<WorkerRuntime>,
+    observability: Arc<WorkerObservability>,
+) -> anyhow::Result<()> {
+    let _active_connection = observability.metrics().track_connection();
     loop {
+        let request_started = Instant::now();
         let mut header_buf = [0u8; HEADER_LEN];
         match stream.read_exact(&mut header_buf).await {
             Ok(_) => {}
@@ -224,6 +322,9 @@ async fn handle_conn(mut stream: TcpStream, worker: Arc<Worker>) -> anyhow::Resu
             let err = data::encode_error(header.request_id, "worker only serves GetRange");
             stream.write_all(&err).await?;
             stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
             continue;
         }
 
@@ -236,9 +337,22 @@ async fn handle_conn(mut stream: TcpStream, worker: Arc<Worker>) -> anyhow::Resu
                 let err = data::encode_error(header.request_id, &format!("bad request: {e}"));
                 stream.write_all(&err).await?;
                 stream.flush().await?;
+                observability
+                    .metrics()
+                    .record_request_error(request_started.elapsed());
                 continue;
             }
         };
+
+        if !observability.is_ready() {
+            let err = data::encode_error(h.request_id, "worker is not ready");
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
 
         match worker.serve_range(&req).await {
             Ok(bytes) => {
@@ -246,88 +360,20 @@ async fn handle_conn(mut stream: TcpStream, worker: Arc<Worker>) -> anyhow::Resu
                 stream.write_all(&hdr).await?;
                 stream.write_all(&bytes).await?;
                 stream.flush().await?;
+                observability
+                    .metrics()
+                    .record_request_success(bytes.len() as u64, request_started.elapsed());
             }
             Err(e) => {
                 let err = data::encode_error(h.request_id, &e.to_string());
                 stream.write_all(&err).await?;
                 stream.flush().await?;
+                observability
+                    .metrics()
+                    .record_request_error(request_started.elapsed());
             }
         }
     }
-}
-
-impl Worker {
-    /// The block-aligned [`BlockId`] that contains `offset` of `object`.
-    fn block_for(&self, object: &ObjectId, offset: u64) -> BlockId {
-        let bs = self.block_size as u64;
-        let block_start = (offset / bs) * bs;
-        BlockId::new(
-            object.clone(),
-            block_start,
-            self.block_size,
-            Version::new(PLACEHOLDER_VERSION),
-        )
-    }
-
-    /// Serve `[offset, offset+len)` of `object`: local hit, or miss→Azure→commit.
-    async fn serve_range(&self, req: &RangeRequest) -> anyhow::Result<bytes::Bytes> {
-        let block = self.block_for(&req.object, req.offset);
-        let offset_in_block = req.offset - block.offset;
-
-        // Hit path: whole block already resident.
-        if matches!(
-            self.index.presence(&block, PageIndex(0), PageIndex(1)),
-            Presence::Whole
-        ) {
-            tracing::info!(block = %block, "HIT");
-            let bytes = self
-                .store
-                .get_bytes(&block)
-                .await
-                .map_err(|e| anyhow::anyhow!("read committed block: {e}"))?;
-            return slice(&bytes, offset_in_block, req.len);
-        }
-
-        // Miss path: fetch the block-aligned range once, commit, then serve.
-        tracing::info!(block = %block, "MISS -> Azure fetch");
-        let key = LoadKey::Whole(block.clone());
-        // Dedup marker for observability; a real herd would coordinate on this.
-        let _ = self.inflight.admit(key.clone());
-
-        let fetch_len = self.block_size as u64; // whole block-aligned range
-        let fetched = self
-            .backend
-            .fetch_range(&req.object, block.offset, fetch_len)
-            .await;
-        self.inflight.complete(&key);
-        let bytes = fetched?;
-
-        // Commit durably via the store's atomic write (temp file + fsync +
-        // rename), then register the block so future reads are hits.
-        self.store
-            .put(&block, bytes.clone())
-            .await
-            .map_err(|e| anyhow::anyhow!("commit block failed: {e}"))?;
-        self.index.commit(BlockMeta {
-            id: block.clone(),
-            form: BlockForm::Whole,
-            len: bytes.len() as u64,
-        });
-        tracing::info!(block = %block, bytes = bytes.len(), "committed block");
-
-        // Serve the requested sub-range from the freshly fetched bytes.
-        slice(&bytes, offset_in_block, req.len)
-    }
-}
-
-/// Slice `[offset, offset+len)` out of `buf`, clamping `len` to what is present.
-fn slice(buf: &[u8], offset: u64, len: u64) -> anyhow::Result<bytes::Bytes> {
-    let start = offset as usize;
-    if start > buf.len() {
-        anyhow::bail!("offset {offset} beyond block length {} bytes", buf.len());
-    }
-    let end = (start + len as usize).min(buf.len());
-    Ok(bytes::Bytes::copy_from_slice(&buf[start..end]))
 }
 
 /// Read one framed control message (header + payload). `Ok(None)` on clean EOF.
@@ -346,4 +392,199 @@ async fn read_control(stream: &mut TcpStream) -> anyhow::Result<Option<ControlMe
     full.extend_from_slice(&payload);
     let (_h, msg) = codec::decode(&full)?;
     Ok(Some(msg))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicUsize;
+    use std::time::SystemTime;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use talon_core::{Error, ObjectId, ObjectStat, Result, Version};
+    use tokio::sync::oneshot;
+
+    use super::*;
+
+    struct MockBackend {
+        _calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for MockBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            Err(Error::Backend("not used".into()))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 0,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn control_plane_sends_legacy_and_versioned_heartbeats() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = listener.local_addr().unwrap();
+        let (messages_tx, messages_rx) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut messages = Vec::new();
+            for _ in 0..3 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let message = read_control(&mut stream).await.unwrap().unwrap();
+                if matches!(message, ControlMessage::Register { .. }) {
+                    let ack = codec::encode(
+                        0,
+                        &ControlMessage::Ack {
+                            ok: true,
+                            detail: None,
+                        },
+                    )
+                    .unwrap();
+                    stream.write_all(&ack).await.unwrap();
+                    stream.flush().await.unwrap();
+                }
+                messages.push(message);
+            }
+            messages_tx.send(messages).unwrap();
+        });
+
+        let (worker, observability, node, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        let control = spawn_control_plane(
+            coordinator.to_string(),
+            node.clone(),
+            worker,
+            Arc::clone(&observability),
+            Duration::from_secs(60),
+        );
+
+        let messages = tokio::time::timeout(Duration::from_secs(2), messages_rx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            &messages[0],
+            ControlMessage::Register { node: registered } if registered == &node
+        ));
+        assert!(matches!(
+            &messages[1],
+            ControlMessage::Heartbeat {
+                node: heartbeat_node,
+                block_count: 0
+            } if heartbeat_node == &node.id
+        ));
+        match &messages[2] {
+            ControlMessage::NodeStatusHeartbeat { status } => {
+                status.validate().unwrap();
+                assert_eq!(status.node, node);
+                assert!(status.ready);
+            }
+            other => panic!("unexpected status heartbeat: {other:?}"),
+        }
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(observability.is_ready());
+        assert!(observability
+            .metrics()
+            .render()
+            .contains("talon_worker_control_heartbeat_total{result=\"success\"} 1"));
+
+        control.abort();
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn registration_failure_keeps_worker_unready_and_is_counted() {
+        let unused = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = unused.local_addr().unwrap();
+        drop(unused);
+
+        let (worker, observability, node, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        let control = spawn_control_plane(
+            coordinator.to_string(),
+            node,
+            worker,
+            Arc::clone(&observability),
+            Duration::from_secs(60),
+        );
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if observability
+                    .metrics()
+                    .render()
+                    .contains("talon_worker_control_heartbeat_total{result=\"failure\"} 1")
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(!observability.is_ready());
+
+        control.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn test_worker() -> (
+        Arc<WorkerRuntime>,
+        Arc<WorkerObservability>,
+        NodeInfo,
+        PathBuf,
+    ) {
+        let root = tmp_root();
+        let index = Arc::new(BlockIndex::new());
+        let inflight = Arc::new(InFlightLoads::new());
+        let node = NodeInfo {
+            id: NodeId::new("worker-test"),
+            address: "127.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let observability = Arc::new(
+            WorkerObservability::new(
+                "test-cluster".into(),
+                node.clone(),
+                "127.0.0.1:8001".into(),
+                1024,
+                Arc::clone(&index),
+                Arc::clone(&inflight),
+            )
+            .unwrap(),
+        );
+        let backend: Arc<dyn BackendStore> = Arc::new(MockBackend {
+            _calls: AtomicUsize::new(0),
+        });
+        let worker = Arc::new(WorkerRuntime::new(
+            WholeBlockStore::open(&root).unwrap(),
+            index,
+            inflight,
+            backend,
+            8,
+            observability.metrics().clone(),
+        ));
+        (worker, observability, node, root)
+    }
+
+    fn tmp_root() -> PathBuf {
+        let mut hasher = DefaultHasher::new();
+        SystemTime::now().hash(&mut hasher);
+        std::thread::current().id().hash(&mut hasher);
+        std::env::temp_dir().join(format!(
+            "talon-control-{}-{}",
+            std::process::id(),
+            hasher.finish()
+        ))
+    }
 }

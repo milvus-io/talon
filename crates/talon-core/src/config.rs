@@ -21,6 +21,7 @@
 use serde::Deserialize;
 use std::path::PathBuf;
 
+use crate::status::MAX_STATUS_FIELD_BYTES;
 use crate::{Error, Result};
 
 /// A configuration patch: a set of optionally-present overrides.
@@ -37,8 +38,16 @@ pub trait Patch {
 pub struct WorkerConfig {
     /// Address the worker's RPC service binds to.
     pub listen: String,
+    /// Address the worker's HTTP administration service binds to.
+    pub admin_listen: String,
     /// Address of the coordinator to register with.
     pub coordinator: String,
+    /// Logical cluster advertised in node status.
+    pub cluster_id: String,
+    /// Stable node identity; defaults to the RPC listen address when unset.
+    pub node_id: Option<String>,
+    /// Control-plane heartbeat interval in milliseconds.
+    pub heartbeat_interval_ms: u64,
     /// Logical block size in bytes (256 MiB default).
     pub block_size: u32,
     /// One or more cache directory roots on local NVMe.
@@ -68,7 +77,11 @@ impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:7001".into(),
+            admin_listen: "127.0.0.1:8001".into(),
             coordinator: "127.0.0.1:7000".into(),
+            cluster_id: "default".into(),
+            node_id: None,
+            heartbeat_interval_ms: 5_000,
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
@@ -86,8 +99,16 @@ impl Default for WorkerConfig {
 pub struct WorkerConfigPatch {
     /// Override for [`WorkerConfig::listen`].
     pub listen: Option<String>,
+    /// Override for [`WorkerConfig::admin_listen`].
+    pub admin_listen: Option<String>,
     /// Override for [`WorkerConfig::coordinator`].
     pub coordinator: Option<String>,
+    /// Override for [`WorkerConfig::cluster_id`].
+    pub cluster_id: Option<String>,
+    /// Override for [`WorkerConfig::node_id`].
+    pub node_id: Option<String>,
+    /// Override for [`WorkerConfig::heartbeat_interval_ms`].
+    pub heartbeat_interval_ms: Option<u64>,
     /// Override for [`WorkerConfig::block_size`].
     pub block_size: Option<u32>,
     /// Override for [`WorkerConfig::cache_dirs`].
@@ -102,7 +123,11 @@ impl Patch for WorkerConfigPatch {
     fn merge(self, base: Self) -> Self {
         Self {
             listen: self.listen.or(base.listen),
+            admin_listen: self.admin_listen.or(base.admin_listen),
             coordinator: self.coordinator.or(base.coordinator),
+            cluster_id: self.cluster_id.or(base.cluster_id),
+            node_id: self.node_id.or(base.node_id),
+            heartbeat_interval_ms: self.heartbeat_interval_ms.or(base.heartbeat_interval_ms),
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
@@ -128,9 +153,12 @@ impl WorkerConfigPatch {
 
     /// Assemble a patch from `TALON_WORKER_*` environment variables.
     ///
-    /// Recognized keys: `TALON_WORKER_LISTEN`, `TALON_WORKER_COORDINATOR`,
-    /// `TALON_WORKER_BLOCK_SIZE`, `TALON_WORKER_CACHE_DIRS` (`:`-separated),
-    /// `TALON_WORKER_CAPACITY_BYTES`.
+    /// Recognized keys include `TALON_WORKER_LISTEN`,
+    /// `TALON_WORKER_ADMIN_LISTEN`, `TALON_WORKER_COORDINATOR`,
+    /// `TALON_WORKER_CLUSTER_ID`, `TALON_WORKER_NODE_ID`,
+    /// `TALON_WORKER_HEARTBEAT_INTERVAL_MS`, `TALON_WORKER_BLOCK_SIZE`,
+    /// `TALON_WORKER_CACHE_DIRS` (`:`-separated), and
+    /// `TALON_WORKER_CAPACITY_BYTES`, and `TALON_WORKER_AZURE_ACCOUNT`.
     pub fn from_env() -> Result<Self> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -148,7 +176,13 @@ impl WorkerConfigPatch {
         };
         Ok(Self {
             listen: get("TALON_WORKER_LISTEN"),
+            admin_listen: get("TALON_WORKER_ADMIN_LISTEN"),
             coordinator: get("TALON_WORKER_COORDINATOR"),
+            cluster_id: get("TALON_WORKER_CLUSTER_ID"),
+            node_id: get("TALON_WORKER_NODE_ID"),
+            heartbeat_interval_ms: get("TALON_WORKER_HEARTBEAT_INTERVAL_MS")
+                .map(|v| parse_u64(v, "TALON_WORKER_HEARTBEAT_INTERVAL_MS"))
+                .transpose()?,
             block_size: get("TALON_WORKER_BLOCK_SIZE")
                 .map(|v| parse_u32(v, "TALON_WORKER_BLOCK_SIZE"))
                 .transpose()?,
@@ -178,7 +212,13 @@ impl WorkerConfig {
         let d = WorkerConfig::default();
         let cfg = WorkerConfig {
             listen: merged.listen.unwrap_or(d.listen),
+            admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
+            cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
+            node_id: merged.node_id.or(d.node_id),
+            heartbeat_interval_ms: merged
+                .heartbeat_interval_ms
+                .unwrap_or(d.heartbeat_interval_ms),
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
@@ -193,8 +233,44 @@ impl WorkerConfig {
         if self.listen.is_empty() {
             return Err(Error::Other("listen address must not be empty".into()));
         }
+        if self.admin_listen.is_empty() {
+            return Err(Error::Other(
+                "admin_listen address must not be empty".into(),
+            ));
+        }
         if self.coordinator.is_empty() {
             return Err(Error::Other("coordinator address must not be empty".into()));
+        }
+        if self.cluster_id.is_empty() {
+            return Err(Error::Other("cluster_id must not be empty".into()));
+        }
+        if self.node_id.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::Other("node_id must not be empty when set".into()));
+        }
+        if self.heartbeat_interval_ms == 0 {
+            return Err(Error::Other(
+                "heartbeat_interval_ms must be greater than zero".into(),
+            ));
+        }
+        for (name, value) in [
+            ("listen", self.listen.as_str()),
+            ("admin_listen", self.admin_listen.as_str()),
+            ("cluster_id", self.cluster_id.as_str()),
+        ] {
+            if value.len() > MAX_STATUS_FIELD_BYTES {
+                return Err(Error::Other(format!(
+                    "{name} is {} bytes; maximum is {MAX_STATUS_FIELD_BYTES}",
+                    value.len()
+                )));
+            }
+        }
+        if let Some(node_id) = &self.node_id {
+            if node_id.len() > MAX_STATUS_FIELD_BYTES {
+                return Err(Error::Other(format!(
+                    "node_id is {} bytes; maximum is {MAX_STATUS_FIELD_BYTES}",
+                    node_id.len()
+                )));
+            }
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
@@ -416,11 +492,15 @@ mod tests {
         let map = |k: &str| match k {
             "TALON_WORKER_BLOCK_SIZE" => Some("1048576".to_string()),
             "TALON_WORKER_CACHE_DIRS" => Some("/x:/y:/z".to_string()),
+            "TALON_WORKER_ADMIN_LISTEN" => Some("0.0.0.0:9001".to_string()),
+            "TALON_WORKER_HEARTBEAT_INTERVAL_MS" => Some("2500".to_string()),
             _ => None,
         };
         let patch = WorkerConfigPatch::from_env_with(map).unwrap();
         assert_eq!(patch.block_size, Some(1 << 20));
         assert_eq!(patch.cache_dirs.as_ref().unwrap().len(), 3);
+        assert_eq!(patch.admin_listen.as_deref(), Some("0.0.0.0:9001"));
+        assert_eq!(patch.heartbeat_interval_ms, Some(2_500));
         assert!(patch.listen.is_none());
 
         let bad = |k: &str| (k == "TALON_WORKER_BLOCK_SIZE").then(|| "notanum".to_string());
@@ -436,6 +516,20 @@ mod tests {
         // capacity < block_size
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("capacity_bytes"));
+
+        let cli = WorkerConfigPatch {
+            heartbeat_interval_ms: Some(0),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("heartbeat_interval_ms"));
+
+        let cli = WorkerConfigPatch {
+            cluster_id: Some("x".repeat(MAX_STATUS_FIELD_BYTES + 1)),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("cluster_id"));
     }
 
     #[test]
