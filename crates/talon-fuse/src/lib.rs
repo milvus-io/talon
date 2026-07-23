@@ -9,6 +9,8 @@ pub mod bridge;
 pub mod coordinator_client;
 pub mod fs;
 pub mod mapping;
+#[cfg(feature = "mount")]
+pub mod mount;
 pub mod ops;
 pub mod placement_cache;
 pub mod prefetch;
@@ -23,6 +25,8 @@ pub use coordinator_client::{
 };
 pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
+#[cfg(feature = "mount")]
+pub use mount::TalonFuse;
 pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use prefetch::Prefetcher;

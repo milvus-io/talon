@@ -88,6 +88,11 @@ impl BlockReader {
         }
     }
 
+    /// The coordinator address this reader resolves placement against.
+    pub fn coordinator_addr(&self) -> &str {
+        self.coordinator.addr()
+    }
+
     /// Read `len` bytes at `offset_in_block` within `block`.
     ///
     /// Resolves placement (cache hit, else coordinator lookup that populates the
