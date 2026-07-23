@@ -31,3 +31,11 @@ pub use state_store::{
     StateBackend, StateStoreError, StateStoreResult, StoreRevision, TimeSource, WriteDisposition,
     WriteResult,
 };
+#[cfg(feature = "etcd")]
+pub use state_store::{
+    EtcdConfig, EtcdConfigError, EtcdStateStore, EtcdTlsConfig, DEFAULT_ETCD_PREFIX,
+};
+#[cfg(feature = "kubernetes")]
+pub use state_store::{
+    KubernetesConfig, KubernetesConfigError, KubernetesStateStore, DEFAULT_LEASE_LABEL_PREFIX,
+};

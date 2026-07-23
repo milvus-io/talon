@@ -16,6 +16,9 @@ state-store-testkit = []
 # Production Kubernetes Lease ClusterStateStore backend. Off by default so
 # non-Kubernetes builds do not pull in the kube/k8s-openapi client stack.
 kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:futures"]
+# Production etcd v3 ClusterStateStore backend. Kept off by default so
+# non-etcd builds do not pull in the gRPC/TLS stack.
+etcd = ["dep:etcd-client", "dep:tonic"]
 
 [dependencies]
 talon-core.workspace = true
@@ -35,6 +38,8 @@ xxhash-rust.workspace = true
 kube = { workspace = true, optional = true }
 k8s-openapi = { workspace = true, optional = true }
 futures = { workspace = true, optional = true }
+etcd-client = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan.workspace = true
