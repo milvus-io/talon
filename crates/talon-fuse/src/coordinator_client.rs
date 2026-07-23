@@ -123,6 +123,26 @@ impl CoordinatorClient {
         }
     }
 
+    /// List objects under `prefix` (mount-relative) for `readdir`.
+    ///
+    /// Returns `(path, size)` entries the caller can feed into a
+    /// [`ReadOnlyFs`](crate::ops::ReadOnlyFs) to synthesize the namespace tree.
+    pub async fn list_objects(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<talon_transport::ObjectEntry>, CoordinatorError> {
+        let req = ControlMessage::ListObjects {
+            prefix: prefix.to_string(),
+        };
+        match self.round_trip(req, "ListObjects").await? {
+            ControlMessage::ObjectList { entries } => Ok(entries),
+            other => Err(CoordinatorError::Unexpected {
+                expected: "ListObjects",
+                got: Box::new(other),
+            }),
+        }
+    }
+
     /// Locate `block` and resolve the primary owner to a worker address.
     /// Combines [`placement_lookup`](Self::placement_lookup) with a
     /// [`membership`](Self::membership) resolution so a caller gets a directly
@@ -306,6 +326,28 @@ mod tests {
             .unwrap();
         assert_eq!(stat.size, 2_500_000_000);
         assert_eq!(stat.version, "etag-9");
+    }
+
+    #[tokio::test]
+    async fn list_objects_parses_entries() {
+        let addr = mock_coordinator(ControlMessage::ObjectList {
+            entries: vec![
+                talon_transport::ObjectEntry {
+                    path: "s3/b/dir/a.bin".into(),
+                    size: 10,
+                },
+                talon_transport::ObjectEntry {
+                    path: "s3/b/dir/c.bin".into(),
+                    size: 30,
+                },
+            ],
+        })
+        .await;
+        let client = CoordinatorClient::new(addr);
+        let entries = client.list_objects("s3/b/dir").await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].path, "s3/b/dir/a.bin");
+        assert_eq!(entries[1].size, 30);
     }
 
     #[tokio::test]

@@ -157,6 +157,24 @@ impl ReadOnlyFs {
         parent
     }
 
+    /// Bulk-register `(path, size)` listing entries, synthesizing directories.
+    ///
+    /// Convenience over [`insert_object`](Self::insert_object) for populating the
+    /// namespace from a coordinator `ObjectList`. Idempotent: re-inserting an
+    /// existing object is a no-op for the tree shape (the path already resolves).
+    /// Returns the number of entries processed.
+    pub fn populate_from_listing<'a, I>(&self, entries: I) -> usize
+    where
+        I: IntoIterator<Item = (&'a str, u64)>,
+    {
+        let mut n = 0;
+        for (path, size) in entries {
+            self.insert_object(path, size);
+            n += 1;
+        }
+        n
+    }
+
     fn attr_of(node: &Node) -> Attr {
         let perm = match node.kind {
             FileKind::Directory => 0o555,
@@ -321,5 +339,46 @@ mod tests {
     fn mutating_ops_are_read_only() {
         let fs = fs();
         assert_eq!(fs.mutate(), FsError::ReadOnly);
+    }
+
+    #[test]
+    fn populate_from_listing_builds_tree_and_readdir() {
+        let fs = ReadOnlyFs::new();
+        let n = fs.populate_from_listing([
+            ("s3/bkt/dir/a.bin", 10u64),
+            ("s3/bkt/dir/b.bin", 20u64),
+            ("s3/bkt/other.bin", 5u64),
+        ]);
+        assert_eq!(n, 3);
+
+        // Root shows the single backend dir.
+        let root: Vec<String> = fs
+            .readdir(ROOT_INO)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(root, vec!["s3"]);
+
+        // Walk into the synthesized directories.
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bkt = fs.lookup(s3.ino, "bkt").unwrap();
+        let bkt_children: Vec<String> = fs
+            .readdir(bkt.ino)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        assert_eq!(bkt_children, vec!["dir", "other.bin"]);
+
+        let dir = fs.lookup(bkt.ino, "dir").unwrap();
+        let a = fs.lookup(dir.ino, "a.bin").unwrap();
+        assert_eq!(a.kind, FileKind::File);
+        assert_eq!(a.size, 10);
+
+        // Idempotent: re-inserting keeps the same inode / shape.
+        let a_ino = a.ino;
+        fs.populate_from_listing([("s3/bkt/dir/a.bin", 10u64)]);
+        assert_eq!(fs.lookup(dir.ino, "a.bin").unwrap().ino, a_ino);
     }
 }
