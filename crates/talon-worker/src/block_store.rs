@@ -89,8 +89,8 @@ impl WholeBlockStore {
     /// Scan the cache directory and return the [`BlockMeta`] of every committed
     /// block, reconstructed from the on-disk `.meta` sidecars.
     ///
-    /// Used at worker startup to repopulate the in-memory [`BlockIndex`] so a
-    /// restart does not re-download blocks already resident on local disk. A
+    /// Used at worker startup to repopulate the in-memory [`crate::BlockIndex`]
+    /// so a restart does not re-download blocks already resident on local disk. A
     /// sidecar without a matching `.blk` (or vice versa) is skipped, and a
     /// malformed sidecar is ignored rather than failing the whole scan.
     pub fn scan(&self) -> Result<Vec<BlockMeta>> {
