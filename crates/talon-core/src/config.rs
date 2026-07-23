@@ -212,6 +212,159 @@ impl WorkerConfig {
     }
 }
 
+/// Fully-resolved FUSE client configuration.
+///
+/// Mirrors the layered pattern of [`WorkerConfig`]: a resolved struct plus an
+/// optional-field [`FuseConfigPatch`] folded across defaults < file < env < CLI.
+/// The FUSE client is read-only; these knobs tune where it mounts, which
+/// coordinator it asks for placement, and its client-side caching / readahead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuseConfig {
+    /// Directory to mount the Talon filesystem at.
+    pub mountpoint: PathBuf,
+    /// Address of the coordinator to resolve placement + membership against.
+    pub coordinator: String,
+    /// Logical block size in bytes (must match the cluster's; 256 MiB default).
+    pub block_size: u32,
+    /// Placement-cache entry TTL in milliseconds.
+    ///
+    /// A cached block→owners mapping is treated as a miss once older than this,
+    /// bounding how long a client can act on stale placement before refreshing.
+    pub placement_ttl_ms: u64,
+    /// Number of blocks to prefetch ahead once a sequential read run is detected.
+    ///
+    /// `0` disables readahead entirely.
+    pub readahead_blocks: u32,
+}
+
+impl Default for FuseConfig {
+    fn default() -> Self {
+        Self {
+            mountpoint: PathBuf::from("/mnt/talon"),
+            coordinator: "127.0.0.1:7000".into(),
+            block_size: 256 << 20,
+            placement_ttl_ms: 5_000,
+            readahead_blocks: 4,
+        }
+    }
+}
+
+/// An optional-field overlay for [`FuseConfig`].
+///
+/// Deserialized from the config file, and also assembled from env and CLI
+/// layers. Every field is optional so a layer only overrides what it sets.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct FuseConfigPatch {
+    /// Override for [`FuseConfig::mountpoint`].
+    pub mountpoint: Option<PathBuf>,
+    /// Override for [`FuseConfig::coordinator`].
+    pub coordinator: Option<String>,
+    /// Override for [`FuseConfig::block_size`].
+    pub block_size: Option<u32>,
+    /// Override for [`FuseConfig::placement_ttl_ms`].
+    pub placement_ttl_ms: Option<u64>,
+    /// Override for [`FuseConfig::readahead_blocks`].
+    pub readahead_blocks: Option<u32>,
+}
+
+impl Patch for FuseConfigPatch {
+    fn merge(self, base: Self) -> Self {
+        Self {
+            mountpoint: self.mountpoint.or(base.mountpoint),
+            coordinator: self.coordinator.or(base.coordinator),
+            block_size: self.block_size.or(base.block_size),
+            placement_ttl_ms: self.placement_ttl_ms.or(base.placement_ttl_ms),
+            readahead_blocks: self.readahead_blocks.or(base.readahead_blocks),
+        }
+    }
+}
+
+impl FuseConfigPatch {
+    /// Parse a patch from a TOML config-file string.
+    pub fn from_toml(s: &str) -> Result<Self> {
+        toml::from_str(s).map_err(|e| Error::Other(format!("invalid config file: {e}")))
+    }
+
+    /// Read a patch from a TOML file path. A missing file yields an empty patch.
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Self::from_toml(&s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Assemble a patch from `TALON_FUSE_*` environment variables.
+    ///
+    /// Recognized keys: `TALON_FUSE_MOUNTPOINT`, `TALON_FUSE_COORDINATOR`,
+    /// `TALON_FUSE_BLOCK_SIZE`, `TALON_FUSE_PLACEMENT_TTL_MS`,
+    /// `TALON_FUSE_READAHEAD_BLOCKS`.
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Like [`from_env`](Self::from_env) but with an injectable lookup, for tests.
+    pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let parse_u32 = |v: String, k: &str| {
+            v.parse::<u32>()
+                .map_err(|_| Error::Other(format!("{k}: invalid u32: {v:?}")))
+        };
+        let parse_u64 = |v: String, k: &str| {
+            v.parse::<u64>()
+                .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
+        };
+        Ok(Self {
+            mountpoint: get("TALON_FUSE_MOUNTPOINT").map(PathBuf::from),
+            coordinator: get("TALON_FUSE_COORDINATOR"),
+            block_size: get("TALON_FUSE_BLOCK_SIZE")
+                .map(|v| parse_u32(v, "TALON_FUSE_BLOCK_SIZE"))
+                .transpose()?,
+            placement_ttl_ms: get("TALON_FUSE_PLACEMENT_TTL_MS")
+                .map(|v| parse_u64(v, "TALON_FUSE_PLACEMENT_TTL_MS"))
+                .transpose()?,
+            readahead_blocks: get("TALON_FUSE_READAHEAD_BLOCKS")
+                .map(|v| parse_u32(v, "TALON_FUSE_READAHEAD_BLOCKS"))
+                .transpose()?,
+        })
+    }
+}
+
+impl FuseConfig {
+    /// Resolve config across all layers: defaults < file < env < CLI.
+    pub fn resolve(
+        file: FuseConfigPatch,
+        env: FuseConfigPatch,
+        cli: FuseConfigPatch,
+    ) -> Result<Self> {
+        let merged = cli.merge(env).merge(file);
+        let d = FuseConfig::default();
+        let cfg = FuseConfig {
+            mountpoint: merged.mountpoint.unwrap_or(d.mountpoint),
+            coordinator: merged.coordinator.unwrap_or(d.coordinator),
+            block_size: merged.block_size.unwrap_or(d.block_size),
+            placement_ttl_ms: merged.placement_ttl_ms.unwrap_or(d.placement_ttl_ms),
+            readahead_blocks: merged.readahead_blocks.unwrap_or(d.readahead_blocks),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// Fail fast on invalid configuration with an actionable message.
+    pub fn validate(&self) -> Result<()> {
+        if self.mountpoint.as_os_str().is_empty() {
+            return Err(Error::Other("mountpoint must not be empty".into()));
+        }
+        if self.coordinator.is_empty() {
+            return Err(Error::Other("coordinator address must not be empty".into()));
+        }
+        if self.block_size == 0 {
+            return Err(Error::Other("block_size must be > 0".into()));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -283,5 +436,82 @@ mod tests {
         // capacity < block_size
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("capacity_bytes"));
+    }
+
+    #[test]
+    fn fuse_defaults_are_valid() {
+        FuseConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn fuse_precedence_cli_over_env_over_file_over_default() {
+        let file = FuseConfigPatch {
+            mountpoint: Some(PathBuf::from("/file/mnt")),
+            coordinator: Some("file-coord".into()),
+            block_size: Some(1 << 20),
+            ..Default::default()
+        };
+        let env = FuseConfigPatch {
+            coordinator: Some("env-coord".into()),
+            readahead_blocks: Some(8),
+            ..Default::default()
+        };
+        let cli = FuseConfigPatch {
+            mountpoint: Some(PathBuf::from("/cli/mnt")),
+            ..Default::default()
+        };
+        let cfg = FuseConfig::resolve(file, env, cli).unwrap();
+        assert_eq!(cfg.mountpoint, PathBuf::from("/cli/mnt")); // CLI wins
+        assert_eq!(cfg.coordinator, "env-coord"); // env beats file
+        assert_eq!(cfg.block_size, 1 << 20); // file beats default
+        assert_eq!(cfg.readahead_blocks, 8); // env
+        assert_eq!(cfg.placement_ttl_ms, FuseConfig::default().placement_ttl_ms);
+        // default
+    }
+
+    #[test]
+    fn fuse_from_toml_parses_and_rejects_unknown() {
+        let patch = FuseConfigPatch::from_toml(
+            "mountpoint = \"/mnt/x\"\nreadahead_blocks = 16\nplacement_ttl_ms = 250\n",
+        )
+        .unwrap();
+        assert_eq!(
+            patch.mountpoint.as_deref(),
+            Some(std::path::Path::new("/mnt/x"))
+        );
+        assert_eq!(patch.readahead_blocks, Some(16));
+        assert_eq!(patch.placement_ttl_ms, Some(250));
+        assert!(FuseConfigPatch::from_toml("nope = true").is_err());
+    }
+
+    #[test]
+    fn fuse_from_env_parses_typed_fields() {
+        let map = |k: &str| match k {
+            "TALON_FUSE_BLOCK_SIZE" => Some("1048576".to_string()),
+            "TALON_FUSE_MOUNTPOINT" => Some("/mnt/talon".to_string()),
+            "TALON_FUSE_READAHEAD_BLOCKS" => Some("2".to_string()),
+            _ => None,
+        };
+        let patch = FuseConfigPatch::from_env_with(map).unwrap();
+        assert_eq!(patch.block_size, Some(1 << 20));
+        assert_eq!(
+            patch.mountpoint.as_deref(),
+            Some(std::path::Path::new("/mnt/talon"))
+        );
+        assert_eq!(patch.readahead_blocks, Some(2));
+        assert!(patch.coordinator.is_none());
+
+        let bad = |k: &str| (k == "TALON_FUSE_PLACEMENT_TTL_MS").then(|| "NaN".to_string());
+        assert!(FuseConfigPatch::from_env_with(bad).is_err());
+    }
+
+    #[test]
+    fn fuse_invalid_config_fails_fast() {
+        let cli = FuseConfigPatch {
+            block_size: Some(0),
+            ..Default::default()
+        };
+        let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("block_size"));
     }
 }
