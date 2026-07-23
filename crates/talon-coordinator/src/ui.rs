@@ -181,4 +181,38 @@ mod tests {
         assert!(!APP_JS.contains("webpackJsonp"));
         assert!(!APP_JS.contains("__vite"));
     }
+
+    #[test]
+    fn app_js_is_csp_safe() {
+        // Under `script-src 'self'` and `style-src 'self'` the app must not use
+        // eval-family calls or inline style attributes. Widths are set via the
+        // CSSOM (`.style.width = ...`), which is allowed. A regression here would
+        // silently break the UI in the browser, which cargo tests can't observe,
+        // so lint the source statically.
+        assert!(!APP_JS.contains("eval("), "no eval under CSP");
+        assert!(
+            !APP_JS.contains("new Function"),
+            "no Function constructor under CSP"
+        );
+        // No `style: "..."` attribute passed through the `el()` helper (which
+        // would render an inline style attribute blocked by style-src 'self').
+        assert!(
+            !APP_JS.contains("style:"),
+            "no inline style attributes under CSP"
+        );
+        // innerHTML must never be assigned (XSS + CSP hygiene); the app builds
+        // DOM with textContent only. Match assignment, not the word in a comment.
+        assert!(!APP_JS.contains(".innerHTML ="), "no innerHTML assignment");
+    }
+
+    #[test]
+    fn app_js_exposes_testable_fleet_helpers() {
+        // The pure fleet helpers (filter/sort/format) are the testable core of
+        // the fleet dashboard (#84). Assert they exist and are exported for a
+        // browser/JS harness.
+        for sym in ["filterNodes", "sortNodes", "fmtBytes", "fmtDuration"] {
+            assert!(APP_JS.contains(sym), "missing helper {sym}");
+        }
+        assert!(APP_JS.contains("window.__talon"), "helpers not exported");
+    }
 }

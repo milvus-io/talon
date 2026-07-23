@@ -99,3 +99,57 @@ tbody tr:hover { background: var(--bg-elev); }
   .nav-link { padding: var(--space); }
   .main { padding: var(--space); }
 }
+
+/* --- #84 fleet dashboard components ------------------------------------- */
+.view-header { display: flex; align-items: center; justify-content: space-between; gap: var(--space); }
+.view-actions { display: flex; gap: var(--space); }
+.btn {
+  background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: var(--space) calc(var(--space) * 1.5);
+  cursor: pointer; font: inherit;
+}
+.btn:hover { border-color: var(--accent); }
+
+.stale-banner {
+  background: rgba(210,153,34,0.12); border: 1px solid var(--warn);
+  color: var(--warn); border-radius: var(--radius);
+  padding: var(--space) calc(var(--space) * 1.5); margin-bottom: var(--space);
+}
+
+.stat.ok .value { color: var(--ok); }
+.stat.warn .value { color: var(--warn); }
+.stat.err .value { color: var(--err); }
+
+.cap { margin-top: calc(var(--space) * 2); }
+.cap-label { display: flex; justify-content: space-between; margin-bottom: 4px; }
+.cap-track { height: 10px; background: var(--bg-elev); border-radius: 6px; overflow: hidden; }
+.cap-fill { height: 100%; background: var(--ok); border-radius: 6px; transition: width 0.3s ease; }
+.cap-fill.warm { background: var(--warn); }
+.cap-fill.hot { background: var(--err); }
+@media (prefers-reduced-motion: reduce) { .cap-fill { transition: none; } }
+
+.controls { display: flex; flex-wrap: wrap; gap: var(--space); align-items: center; margin-bottom: calc(var(--space) * 1.5); }
+.input {
+  background: var(--bg-elev); color: var(--text); border: 1px solid var(--border);
+  border-radius: var(--radius); padding: var(--space); font: inherit; min-width: 0;
+}
+.input[type="search"] { flex: 1; min-width: 180px; }
+.select-wrap { display: inline-flex; align-items: center; gap: 6px; }
+.select-label { color: var(--text-muted); font-size: 12px; }
+.count { margin: 0 0 var(--space); }
+
+/* Fixed layout so columns/rows don't shift width during refresh. */
+table.fleet { table-layout: fixed; }
+table.fleet td { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.th-sort {
+  background: none; border: 0; color: var(--text-muted); font: inherit;
+  cursor: pointer; padding: 0; text-transform: uppercase; font-size: 12px; font-weight: 500;
+}
+.th-sort:hover { color: var(--text); }
+.sort-ind { color: var(--accent); }
+
+dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px calc(var(--space) * 2); margin: 0; }
+dl.kv dt { color: var(--text-muted); }
+dl.kv dd { margin: 0; }
+
