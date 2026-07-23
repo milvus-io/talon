@@ -10,7 +10,9 @@
 //! [`CodecError`] rather than panicking.
 
 use serde::{Deserialize, Serialize};
-use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
+use talon_core::{
+    BlockId, NodeId, NodeInfo, NodeStatus, NodeStatusError, ObjectId, MAX_NODE_STATUS_BYTES,
+};
 
 use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 
@@ -19,7 +21,10 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 /// Bumped when [`ControlMessage`] changes in an incompatible way. Carried in
 /// the envelope so a peer can reject a mismatched schema instead of
 /// misinterpreting bytes.
-pub const CONTROL_SCHEMA_VERSION: u16 = 1;
+pub const CONTROL_SCHEMA_VERSION: u16 = 2;
+
+/// Oldest control schema this build can decode.
+pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
 
 /// A single control-plane message.
 ///
@@ -86,6 +91,24 @@ pub enum ControlMessage {
         /// Optional human-readable detail (error text).
         detail: Option<String>,
     },
+    /// Node → coordinator: complete runtime status and metric snapshot.
+    ///
+    /// This is the first schema-v2 message. The legacy [`Heartbeat`](Self::Heartbeat)
+    /// remains available during rolling upgrades.
+    NodeStatusHeartbeat {
+        /// Bounded, versioned status snapshot.
+        status: Box<NodeStatus>,
+    },
+}
+
+impl ControlMessage {
+    /// Oldest control schema that can represent this message.
+    pub fn minimum_schema(&self) -> u16 {
+        match self {
+            Self::NodeStatusHeartbeat { .. } => 2,
+            _ => MIN_CONTROL_SCHEMA_VERSION,
+        }
+    }
 }
 
 /// The framed control envelope actually written to the wire.
@@ -123,6 +146,25 @@ pub enum CodecError {
         /// Schema version this build supports.
         ours: u16,
     },
+    /// The selected schema predates the requested message.
+    #[error("control message requires schema {required}, but schema {selected} was selected")]
+    MessageRequiresSchema {
+        /// Oldest schema that supports the message.
+        required: u16,
+        /// Schema selected by the caller or envelope.
+        selected: u16,
+    },
+    /// A node status failed its bounded-field validation.
+    #[error("invalid node status: {0}")]
+    InvalidNodeStatus(#[from] NodeStatusError),
+    /// A valid node status exceeded the encoded-value limit.
+    #[error("encoded node status is {got} bytes; maximum is {max}")]
+    NodeStatusTooLarge {
+        /// Encoded status size.
+        got: usize,
+        /// Maximum encoded status size.
+        max: usize,
+    },
     /// bincode failed to (de)serialize the message body.
     #[error("bincode error: {0}")]
     Bincode(#[from] bincode::Error),
@@ -130,8 +172,22 @@ pub enum CodecError {
 
 /// Encode a control message into `header || bincode(envelope)`.
 pub fn encode(request_id: u32, message: &ControlMessage) -> Result<Vec<u8>, CodecError> {
+    encode_for_schema(request_id, message, message.minimum_schema())
+}
+
+/// Encode with an explicitly selected supported schema.
+///
+/// Existing v1 messages can be forced to v1 or v2. A v2-only message returns
+/// [`CodecError::MessageRequiresSchema`] when v1 is selected.
+pub fn encode_for_schema(
+    request_id: u32,
+    message: &ControlMessage,
+    schema: u16,
+) -> Result<Vec<u8>, CodecError> {
+    validate_schema(schema, CONTROL_SCHEMA_VERSION)?;
+    validate_message(message, schema)?;
     let env = Envelope {
-        schema: CONTROL_SCHEMA_VERSION,
+        schema,
         message: message.clone(),
     };
     let body = bincode::serialize(&env)?;
@@ -148,6 +204,13 @@ pub fn encode(request_id: u32, message: &ControlMessage) -> Result<Vec<u8>, Code
 /// frame is [`MsgType::Control`], checks the declared payload length against the
 /// bytes present, and rejects an unknown schema version.
 pub fn decode(buf: &[u8]) -> Result<(FrameHeader, ControlMessage), CodecError> {
+    decode_with_max_schema(buf, CONTROL_SCHEMA_VERSION)
+}
+
+fn decode_with_max_schema(
+    buf: &[u8],
+    max_schema: u16,
+) -> Result<(FrameHeader, ControlMessage), CodecError> {
     let header = FrameHeader::decode(buf)?;
     if header.msg_type != MsgType::Control {
         return Err(CodecError::NotControl(header.msg_type));
@@ -160,20 +223,87 @@ pub fn decode(buf: &[u8]) -> Result<(FrameHeader, ControlMessage), CodecError> {
             actual: body.len(),
         });
     }
+    // The schema is the first field in the fixed-int bincode envelope. Check it
+    // before deserializing the message so an older peer rejects a newer enum
+    // shape cleanly rather than reporting a misleading bincode failure.
+    let schema = peek_schema(body)?;
+    validate_schema(schema, max_schema)?;
     let env: Envelope = bincode::deserialize(body)?;
-    if env.schema != CONTROL_SCHEMA_VERSION {
+    validate_message(&env.message, env.schema)?;
+    Ok((header, env.message))
+}
+
+fn peek_schema(body: &[u8]) -> Result<u16, CodecError> {
+    if body.len() < std::mem::size_of::<u16>() {
+        // Preserve the established bincode error classification for a
+        // truncated envelope.
+        let _: Envelope = bincode::deserialize(body)?;
+        unreachable!("deserializing a truncated envelope cannot succeed");
+    }
+    Ok(u16::from_le_bytes([body[0], body[1]]))
+}
+
+fn validate_schema(schema: u16, max_schema: u16) -> Result<(), CodecError> {
+    if !(MIN_CONTROL_SCHEMA_VERSION..=max_schema).contains(&schema) {
         return Err(CodecError::UnsupportedSchema {
-            got: env.schema,
-            ours: CONTROL_SCHEMA_VERSION,
+            got: schema,
+            ours: max_schema,
         });
     }
-    Ok((header, env.message))
+    Ok(())
+}
+
+fn validate_message(message: &ControlMessage, schema: u16) -> Result<(), CodecError> {
+    let required = message.minimum_schema();
+    if schema < required {
+        return Err(CodecError::MessageRequiresSchema {
+            required,
+            selected: schema,
+        });
+    }
+    if let ControlMessage::NodeStatusHeartbeat { status } = message {
+        status.validate()?;
+        let got = bincode::serialized_size(status)? as usize;
+        if got > MAX_NODE_STATUS_BYTES {
+            return Err(CodecError::NodeStatusTooLarge {
+                got,
+                max: MAX_NODE_STATUS_BYTES,
+            });
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use talon_core::{Backend, NodeRole, Version};
+    use std::collections::BTreeMap;
+    use talon_core::{
+        Backend, NodeHealth, NodeMetricsSnapshot, NodeRole, Version, NODE_STATUS_SCHEMA_VERSION,
+    };
+
+    fn sample_status(node: NodeInfo) -> NodeStatus {
+        NodeStatus {
+            schema_version: NODE_STATUS_SCHEMA_VERSION,
+            cluster_id: "cluster-a".into(),
+            node,
+            incarnation_id: "incarnation-1".into(),
+            admin_address: Some("10.0.0.1:8001".into()),
+            build_version: "0.1.0".into(),
+            started_at_unix_ms: 1_000,
+            reported_at_unix_ms: 2_000,
+            heartbeat_seq: 3,
+            health: NodeHealth::Healthy,
+            ready: true,
+            metrics: NodeMetricsSnapshot {
+                block_count: 42,
+                resident_bytes: 1024,
+                capacity_bytes: 4096,
+                ..Default::default()
+            },
+            labels: BTreeMap::from([("zone".into(), "us-west-1a".into())]),
+        }
+    }
 
     fn sample_messages() -> Vec<ControlMessage> {
         let node = NodeInfo {
@@ -215,6 +345,9 @@ mod tests {
                 ok: false,
                 detail: Some("nope".into()),
             },
+            ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(sample_status(node)),
+            },
         ]
     }
 
@@ -228,6 +361,125 @@ mod tests {
             assert_eq!(header.length as usize, buf.len() - HEADER_LEN);
             assert_eq!(back, msg);
         }
+    }
+
+    #[test]
+    fn existing_messages_default_to_v1_during_rolling_upgrade() {
+        let msg = ControlMessage::Heartbeat {
+            node: NodeId::new("worker-1"),
+            block_count: 42,
+        };
+        let buf = encode(1, &msg).unwrap();
+        assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 1);
+        assert_eq!(decode_with_max_schema(&buf, 1).unwrap().1, msg);
+    }
+
+    #[test]
+    fn new_status_heartbeat_uses_v2_and_old_peer_rejects_cleanly() {
+        let node = NodeInfo {
+            id: NodeId::new("worker-1"),
+            address: "10.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let msg = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(sample_status(node)),
+        };
+        let buf = encode(1, &msg).unwrap();
+        assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 2);
+        assert!(matches!(
+            decode_with_max_schema(&buf, 1),
+            Err(CodecError::UnsupportedSchema { got: 2, ours: 1 })
+        ));
+        assert_eq!(decode(&buf).unwrap().1, msg);
+    }
+
+    #[test]
+    fn v2_message_cannot_be_mislabeled_as_v1() {
+        let node = NodeInfo {
+            id: NodeId::new("worker-1"),
+            address: "10.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let msg = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(sample_status(node)),
+        };
+        assert!(matches!(
+            encode_for_schema(1, &msg, 1),
+            Err(CodecError::MessageRequiresSchema {
+                required: 2,
+                selected: 1
+            })
+        ));
+    }
+
+    #[test]
+    fn malformed_node_status_is_rejected_on_encode_and_decode() {
+        let node = NodeInfo {
+            id: NodeId::new("worker-1"),
+            address: "10.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let mut status = sample_status(node);
+        status.cluster_id.clear();
+        let msg = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(status),
+        };
+        assert!(matches!(
+            encode(1, &msg),
+            Err(CodecError::InvalidNodeStatus(NodeStatusError::EmptyField {
+                field: "cluster_id"
+            }))
+        ));
+
+        let body = bincode::serialize(&Envelope {
+            schema: 2,
+            message: msg,
+        })
+        .unwrap();
+        let mut buf = FrameHeader::new(MsgType::Control, 1, body.len() as u32)
+            .encode()
+            .to_vec();
+        buf.extend_from_slice(&body);
+        assert!(matches!(
+            decode(&buf),
+            Err(CodecError::InvalidNodeStatus(_))
+        ));
+    }
+
+    #[test]
+    fn maximal_bounded_status_fits_the_wire_limit() {
+        let node = NodeInfo {
+            id: NodeId::new("n".repeat(talon_core::MAX_STATUS_FIELD_BYTES)),
+            address: "a".repeat(talon_core::MAX_STATUS_FIELD_BYTES),
+            role: NodeRole::Worker,
+        };
+        let mut status = sample_status(node);
+        status.cluster_id = "c".repeat(talon_core::MAX_STATUS_FIELD_BYTES);
+        status.incarnation_id = "i".repeat(talon_core::MAX_STATUS_FIELD_BYTES);
+        status.admin_address = Some("m".repeat(talon_core::MAX_STATUS_FIELD_BYTES));
+        status.build_version = "v".repeat(talon_core::MAX_STATUS_FIELD_BYTES);
+        status.labels = (0..talon_core::MAX_STATUS_LABELS)
+            .map(|i| {
+                (
+                    format!(
+                        "{i:02}{}",
+                        "k".repeat(talon_core::MAX_STATUS_LABEL_KEY_BYTES - 2)
+                    ),
+                    "x".repeat(talon_core::MAX_STATUS_LABEL_VALUE_BYTES),
+                )
+            })
+            .collect();
+
+        status.validate().unwrap();
+        let encoded_size = bincode::serialized_size(&status).unwrap() as usize;
+        assert!(
+            encoded_size <= MAX_NODE_STATUS_BYTES,
+            "{encoded_size} exceeds {MAX_NODE_STATUS_BYTES}"
+        );
+        let msg = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(status),
+        };
+        assert_eq!(decode(&encode(1, &msg).unwrap()).unwrap().1, msg);
     }
 
     #[test]
@@ -272,7 +524,7 @@ mod tests {
         buf.extend_from_slice(&body);
         assert!(matches!(
             decode(&buf),
-            Err(CodecError::UnsupportedSchema { got: 999, ours: 1 })
+            Err(CodecError::UnsupportedSchema { got: 999, ours: 2 })
         ));
     }
 
