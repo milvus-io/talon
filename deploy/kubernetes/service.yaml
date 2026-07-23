@@ -1,0 +1,43 @@
+# Stable Service fronting the active-active coordinator replicas, plus a
+# PodDisruptionBudget that preserves quorum during voluntary disruptions.
+#
+# Any replica can serve any control/API/UI request, so this is a plain
+# round-robin ClusterIP — no session affinity. Workers and FUSE clients connect
+# to `talon-coordinator:7000`; operators reach the API/UI at `:8000`.
+apiVersion: v1
+kind: Service
+metadata:
+  name: talon-coordinator
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: coordinator
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: coordinator
+  ports:
+    - name: control
+      port: 7000
+      targetPort: control
+    - name: admin
+      port: 8000
+      targetPort: admin
+---
+# Keep at least two coordinators available so a drain/upgrade never collapses to
+# a single replica (the Deployment runs three).
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: talon-coordinator
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: coordinator
+spec:
+  minAvailable: 2
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: talon
+      app.kubernetes.io/component: coordinator

@@ -1,0 +1,25 @@
+# Prometheus Operator ServiceMonitor for scraping the coordinator fleet.
+#
+# Requires the Prometheus Operator CRDs. If you run vanilla Prometheus instead,
+# the pod annotations (prometheus.io/scrape) on the Deployment support
+# annotation-based discovery — use one or the other.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: talon-coordinator
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: coordinator
+spec:
+  namespaceSelector:
+    matchNames: [talon]
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: talon
+      app.kubernetes.io/component: coordinator
+  endpoints:
+    - port: admin
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

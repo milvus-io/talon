@@ -1,0 +1,166 @@
+# Talon coordinator — active-active HA Deployment using an EXTERNAL etcd state
+# backend. Use this variant instead of coordinator-kubernetes.yaml; deploy
+# exactly one backend.
+#
+# etcd endpoints, credentials, and TLS material come from a Secret
+# (talon-etcd, see etcd-secret.example.yaml) mounted as env/files — never baked
+# into the image or logged. Apply with service.yaml:
+#   kubectl apply -n talon -f service.yaml -f coordinator-etcd.yaml
+#
+# The Kubernetes Lease RBAC (rbac.yaml) is NOT needed for the etcd backend; the
+# ServiceAccount here carries no cluster permissions.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: talon-coordinator-etcd
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: coordinator
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: talon-coordinator
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: coordinator
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: talon
+      app.kubernetes.io/component: coordinator
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: talon
+        app.kubernetes.io/component: coordinator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: talon-coordinator-etcd
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        fsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: talon
+              app.kubernetes.io/component: coordinator
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: talon
+                    app.kubernetes.io/component: coordinator
+      volumes:
+        # etcd client TLS material, mounted read-only from a Secret.
+        - name: etcd-tls
+          secret:
+            secretName: talon-etcd
+            items:
+              - key: ca.crt
+                path: ca.crt
+              - key: client.crt
+                path: client.crt
+              - key: client.key
+                path: client.key
+            optional: true
+      containers:
+        - name: coordinator
+          image: ghcr.io/milvus-io/talon-coordinator:latest
+          imagePullPolicy: IfNotPresent
+          args: ["--listen", "0.0.0.0:7000", "--admin-listen", "0.0.0.0:8000"]
+          ports:
+            - name: control
+              containerPort: 7000
+            - name: admin
+              containerPort: 8000
+          env:
+            - name: TALON_COORDINATOR_STATE_BACKEND
+              value: "etcd"
+            - name: TALON_COORDINATOR_HA_ENABLED
+              value: "true"
+            - name: TALON_COORDINATOR_REPLICAS
+              value: "3"
+            - name: TALON_COORDINATOR_CLUSTER_ID
+              value: "talon"
+            - name: TALON_COORDINATOR_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # etcd endpoints (comma-separated) from the Secret.
+            - name: TALON_COORDINATOR_ETCD_ENDPOINTS
+              valueFrom:
+                secretKeyRef:
+                  name: talon-etcd
+                  key: endpoints
+            # etcd auth credentials from the Secret — never logged by the backend.
+            - name: TALON_COORDINATOR_ETCD_USERNAME
+              valueFrom:
+                secretKeyRef:
+                  name: talon-etcd
+                  key: username
+                  optional: true
+            - name: TALON_COORDINATOR_ETCD_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: talon-etcd
+                  key: password
+                  optional: true
+            - name: TALON_COORDINATOR_ETCD_CA_CERT_PATH
+              value: /etc/talon/etcd/ca.crt
+            - name: TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH
+              value: /etc/talon/etcd/client.crt
+            - name: TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH
+              value: /etc/talon/etcd/client.key
+            - name: TALON_COORDINATOR_AUTH_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: talon-management-auth
+                  key: token
+                  optional: true
+          volumeMounts:
+            - name: etcd-tls
+              mountPath: /etc/talon/etcd
+              readOnly: true
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: "100m"
+              memory: "128Mi"
+            limits:
+              cpu: "1"
+              memory: "512Mi"
