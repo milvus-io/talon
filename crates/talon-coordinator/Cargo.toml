@@ -11,6 +11,9 @@ description = "Cluster coordinator: metadata, membership, and object placement f
 name = "talon-coordinator"
 path = "src/main.rs"
 
+[features]
+state-store-testkit = []
+
 [dependencies]
 talon-core.workspace = true
 talon-transport.workspace = true
@@ -21,6 +24,7 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 clap.workspace = true
 async-trait.workspace = true
+thiserror.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
