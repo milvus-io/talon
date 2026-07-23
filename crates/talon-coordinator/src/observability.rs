@@ -90,6 +90,9 @@ pub struct CoordinatorMetrics {
     state_readiness_duration: Histogram,
     state_snapshot_duration: Histogram,
     state_upsert_duration: Histogram,
+    api_requests: Counter,
+    api_errors: Counter,
+    api_duration: Histogram,
     active_count: Arc<AtomicU64>,
     active_connections: Gauge,
     ready: Gauge,
@@ -233,6 +236,21 @@ impl CoordinatorMetrics {
                 "Shared-state operation latency in seconds.",
                 labels(&[("operation", "upsert")]),
             ),
+            api_requests: registry.counter(
+                "talon_coordinator_api_requests_total",
+                "Management API requests served.",
+                BTreeMap::new(),
+            ),
+            api_errors: registry.counter(
+                "talon_coordinator_api_errors_total",
+                "Management API requests returning an error.",
+                BTreeMap::new(),
+            ),
+            api_duration: registry.histogram(
+                "talon_coordinator_api_duration_seconds",
+                "Management API request latency in seconds.",
+                BTreeMap::new(),
+            ),
             registry,
             operations: Arc::new(operations),
             active_count: Arc::new(AtomicU64::new(0)),
@@ -288,6 +306,15 @@ impl CoordinatorMetrics {
             self.placement_errors.inc();
         }
         self.placement_duration.observe(elapsed.as_secs_f64());
+    }
+
+    /// Record a management-API request's latency and outcome.
+    pub fn record_api(&self, error: bool, elapsed: Duration) {
+        self.api_requests.inc();
+        if error {
+            self.api_errors.inc();
+        }
+        self.api_duration.observe(elapsed.as_secs_f64());
     }
 
     /// Track one active control connection.
@@ -558,6 +585,32 @@ impl CoordinatorObservability {
         }
     }
 
+    /// Fetch a linearizable snapshot for the management API, updating freshness
+    /// gauges and readiness. Unlike [`refresh_snapshot`](Self::refresh_snapshot)
+    /// this returns the snapshot so a handler can render it.
+    pub async fn snapshot_for_api(&self) -> StateStoreResult<ClusterSnapshot> {
+        let started = Instant::now();
+        let result =
+            match tokio::time::timeout(self.request_timeout, self.store.snapshot(&self.cluster_id))
+                .await
+            {
+                Ok(result) => result,
+                Err(_) => Err(StateStoreError::Timeout {
+                    backend: self.store.backend(),
+                }),
+            };
+        self.metrics
+            .record_state("snapshot", &result, started.elapsed());
+        match &result {
+            Ok(snapshot) => {
+                self.metrics.update_snapshot(snapshot);
+                self.ready.store(true, Ordering::Release);
+            }
+            Err(_) => self.ready.store(false, Ordering::Release),
+        }
+        result
+    }
+
     /// Begin graceful shutdown: mark this coordinator not-live/not-ready so new
     /// authoritative reads fail closed while in-flight ones drain.
     pub fn begin_shutdown(&self) {
@@ -628,7 +681,9 @@ pub async fn serve_admin(
             .route("/metrics", get(metrics_handler))
             .route("/healthz", get(health_handler))
             .route("/readyz", get(readiness_handler))
-            .with_state(state),
+            .with_state(Arc::clone(&state))
+            // Read-only versioned management API under /api/v1 (issue #82).
+            .merge(crate::api::router(state)),
     )
     .await
 }

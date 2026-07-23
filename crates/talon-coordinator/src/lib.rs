@@ -3,6 +3,7 @@
 //! The coordinator tracks cluster membership and decides which worker holds
 //! each object. It exposes a routing layer that clients use to locate data.
 
+pub mod api;
 pub mod config;
 pub mod heartbeat;
 pub mod load;
