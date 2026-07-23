@@ -1336,6 +1336,7 @@ dependencies = [
  "async-trait",
  "clap",
  "fuser",
+ "libc",
  "talon-core",
  "talon-transport",
  "thiserror",
