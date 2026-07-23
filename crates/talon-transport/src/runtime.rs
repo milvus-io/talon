@@ -20,11 +20,11 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Notify;
 
-use crate::frame::{FrameHeader, HEADER_LEN};
+use crate::frame::FrameHeader;
 
 /// A per-connection request handler.
 ///
@@ -151,19 +151,23 @@ pub async fn bind(addr: &str) -> std::io::Result<(TcpListener, std::net::SocketA
 }
 
 async fn handle_conn<H: Handler>(mut stream: TcpStream, handler: Arc<H>) -> std::io::Result<()> {
-    let mut header_buf = [0u8; HEADER_LEN];
     loop {
-        // Read exactly one header; clean EOF ends the connection.
-        match stream.read_exact(&mut header_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e),
-        }
-        let header = FrameHeader::decode(&header_buf)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
-
-        let mut payload = vec![0u8; header.length as usize];
-        stream.read_exact(&mut payload).await?;
+        // Read one frame with the per-message-type size cap enforced before
+        // allocation and a read timeout, so a peer cannot pin a large buffer by
+        // advertising a huge length and stalling (issue #111).
+        let (header, payload) =
+            match crate::limits::read_frame(&mut stream, crate::limits::DEFAULT_READ_TIMEOUT).await
+            {
+                Ok(frame) => frame,
+                Err(crate::limits::ReadFrameError::Eof) => return Ok(()),
+                Err(crate::limits::ReadFrameError::Timeout) => return Ok(()),
+                Err(e) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        e.to_string(),
+                    ))
+                }
+            };
 
         if let Some(resp) = handler.handle(header, payload) {
             stream.write_all(&resp).await?;
@@ -190,8 +194,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::MsgType;
+    use crate::frame::{MsgType, HEADER_LEN};
     use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::AsyncReadExt;
 
     #[tokio::test]
     async fn accepts_and_echoes_a_control_frame() {

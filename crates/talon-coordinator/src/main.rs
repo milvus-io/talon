@@ -13,8 +13,12 @@ use talon_coordinator::{
 use talon_core::{NodeInfo, NodeRole};
 use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::net::{TcpListener, TcpStream};
+
+/// Upper bound on concurrent control-plane connections (issue #111). Beyond
+/// this, new peers wait for an in-flight connection to finish.
+const MAX_CONTROL_CONNECTIONS: usize = 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "talon-coordinator", version, about)]
@@ -271,12 +275,17 @@ async fn main() -> anyhow::Result<()> {
 
     let listener = TcpListener::bind(&config.listen).await?;
     tracing::info!(listen = %config.listen, "coordinator serving control plane");
+    // Bound concurrent control connections so a flood of idle peers cannot
+    // exhaust memory/FDs (issue #111).
+    let conn_limit = talon_transport::ConnectionLimit::new(MAX_CONTROL_CONNECTIONS);
     loop {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
+                let permit = conn_limit.acquire().await;
                 let state = Arc::clone(&state);
                 tokio::spawn(async move {
+                    let _permit = permit;
                     if let Err(error) = handle_conn(stream, state).await {
                         tracing::debug!(%peer, %error, "coordinator connection ended");
                     }
@@ -397,17 +406,18 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<Coordinator>) -> anyhow::
 async fn read_control(
     stream: &mut TcpStream,
 ) -> anyhow::Result<Option<(FrameHeader, ControlMessage)>> {
-    let mut header_buffer = [0u8; HEADER_LEN];
-    match stream.read_exact(&mut header_buffer).await {
-        Ok(_) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-        Err(error) => return Err(error.into()),
-    }
-    let header = FrameHeader::decode(&header_buffer)?;
-    let mut payload = vec![0u8; header.length as usize];
-    stream.read_exact(&mut payload).await?;
+    // Read one frame with the per-type size cap (control frames are capped at
+    // 1 MiB, far below the 320 MiB data-plane max) enforced before allocation,
+    // plus a read timeout, so a peer cannot pin a large buffer by advertising a
+    // huge length and stalling (issue #111).
+    let (header, payload) =
+        match talon_transport::read_frame(stream, talon_transport::DEFAULT_READ_TIMEOUT).await {
+            Ok(frame) => frame,
+            Err(talon_transport::ReadFrameError::Eof) => return Ok(None),
+            Err(error) => return Err(anyhow::anyhow!(error)),
+        };
     let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
-    full.extend_from_slice(&header_buffer);
+    full.extend_from_slice(&header.encode());
     full.extend_from_slice(&payload);
     let (header, message) = codec::decode(&full)?;
     Ok(Some((header, message)))

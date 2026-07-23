@@ -38,6 +38,11 @@ use tokio::net::{TcpListener, TcpStream};
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// Upper bound on concurrent data-plane connections. Beyond this, new peers wait
+/// for an in-flight connection to finish rather than each spawning an unbounded
+/// task that could pin a payload buffer (issue #111).
+const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
+
 /// Command-line arguments for a Talon worker.
 #[derive(Debug, Parser)]
 #[command(name = "talon-worker", version, about)]
@@ -185,11 +190,17 @@ async fn main() -> anyhow::Result<()> {
     // Serve the data plane.
     let listener = TcpListener::bind(&cfg.listen).await?;
     tracing::info!(listen = %cfg.listen, "worker serving data plane");
+    // Bound concurrent connections so a flood of idle peers cannot exhaust
+    // memory/FDs (issue #111).
+    let conn_limit = talon_transport::ConnectionLimit::new(MAX_DATA_PLANE_CONNECTIONS);
     loop {
+        let permit = conn_limit.acquire().await;
         let (stream, peer) = listener.accept().await?;
         let worker = Arc::clone(&worker);
         let observability = Arc::clone(&observability);
         tokio::spawn(async move {
+            // Hold the permit for the connection's lifetime.
+            let _permit = permit;
             if let Err(e) = handle_conn(stream, worker, observability).await {
                 tracing::debug!(%peer, error = %e, "worker: connection ended");
             }
@@ -308,16 +319,24 @@ async fn handle_conn(
     let _active_connection = observability.metrics().track_connection();
     loop {
         let request_started = Instant::now();
-        let mut header_buf = [0u8; HEADER_LEN];
-        match stream.read_exact(&mut header_buf).await {
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(()),
-            Err(e) => return Err(e.into()),
-        }
-        let header = FrameHeader::decode(&header_buf)?;
-        let mut payload = vec![0u8; header.length as usize];
-        stream.read_exact(&mut payload).await?;
+        // Read one frame with a per-type size cap enforced BEFORE allocation and
+        // a read timeout, so a peer cannot pin a 320 MiB buffer by advertising a
+        // huge length and stalling (issue #111).
+        let (header, payload) =
+            match talon_transport::read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT)
+                .await
+            {
+                Ok(frame) => frame,
+                Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
+                Err(talon_transport::ReadFrameError::Timeout) => {
+                    tracing::debug!("worker: connection read timed out");
+                    return Ok(());
+                }
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            };
 
+        // Type check BEFORE any per-request work; a data listener only serves
+        // GetRange, and non-data frames are already capped tightly by read_frame.
         if header.msg_type != MsgType::GetRange {
             let err = data::encode_error(header.request_id, "worker only serves GetRange");
             stream.write_all(&err).await?;
@@ -329,7 +348,7 @@ async fn handle_conn(
         }
 
         let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
-        full.extend_from_slice(&header_buf);
+        full.extend_from_slice(&header.encode());
         full.extend_from_slice(&payload);
         let (h, req) = match data::decode_request(&full) {
             Ok(v) => v,
