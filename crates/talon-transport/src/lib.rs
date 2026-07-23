@@ -13,6 +13,7 @@
 pub mod codec;
 pub mod data;
 pub mod frame;
+pub mod limits;
 pub mod pool;
 pub mod runtime;
 
@@ -24,5 +25,9 @@ pub use data::{
     decode_request, encode_error, encode_request, response_header_ok, DataError, RangeRequest,
 };
 pub use frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
+pub use limits::{
+    max_payload_for, read_frame, ConnectionLimit, ReadFrameError, DEFAULT_READ_TIMEOUT,
+    MAX_CONTROL_PAYLOAD_LEN,
+};
 pub use pool::{Channel, CheckoutError, Connector, Pool, PoolConfig};
 pub use runtime::{spawn_blocking, Handler, Server, Shutdown};
