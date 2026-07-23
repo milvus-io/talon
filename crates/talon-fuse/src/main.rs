@@ -106,6 +106,7 @@ async fn run_mount(
 
     let version = talon_core::Version::new("v1");
     let handle = tokio::runtime::Handle::current();
+    let stats = reader.stats().clone();
     let adapter = TalonFuse::new(fs, reader, handle, cfg.block_size, version);
 
     let options = vec![
@@ -123,6 +124,17 @@ async fn run_mount(
     tracing::info!("SIGINT received; unmounting");
     // Dropping the BackgroundSession unmounts and joins the session thread.
     drop(session);
+    let s = stats.snapshot();
+    tracing::info!(
+        cache_hits = s.cache_hits,
+        cache_misses = s.cache_misses,
+        hit_ratio = s.hit_ratio(),
+        worker_fetches = s.worker_fetches,
+        worker_failures = s.worker_failures,
+        coordinator_refreshes = s.coordinator_refreshes,
+        bytes_served = s.bytes_served,
+        "read-path metrics at unmount"
+    );
     Ok(())
 }
 

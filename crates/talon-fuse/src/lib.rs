@@ -9,6 +9,7 @@ pub mod bridge;
 pub mod coordinator_client;
 pub mod fs;
 pub mod mapping;
+pub mod metrics;
 #[cfg(feature = "mount")]
 pub mod mount;
 pub mod ops;
@@ -25,6 +26,7 @@ pub use coordinator_client::{
 };
 pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
+pub use metrics::{ReadStats, ReadStatsSnapshot};
 #[cfg(feature = "mount")]
 pub use mount::TalonFuse;
 pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
