@@ -25,6 +25,9 @@ pub const ALERT_RULES_YAML: &str =
 pub const DASHBOARD_JSON: &str =
     include_str!("../../../deploy/observability/grafana/talon-cluster-overview.json");
 
+/// The operator runbook that every alert `runbook_url` anchor links into.
+pub const RUNBOOK_MD: &str = include_str!("../../../docs/operations/runbook.md");
+
 /// A Prometheus rule group file (`groups:` at the top level).
 #[derive(Debug, Clone, Deserialize)]
 pub struct RuleFile {
@@ -292,6 +295,47 @@ mod tests {
                 "alert {alert} runbook_url {runbook:?} lacks a stable anchor"
             );
         }
+    }
+
+    #[test]
+    fn every_alert_runbook_anchor_exists_in_the_runbook() {
+        // Each alert's runbook_url ends in #<anchor>; the operator runbook must
+        // contain a heading that GitHub renders to that anchor, so no alert
+        // links to a dangling section (#90).
+        let anchors_in_runbook: BTreeSet<String> = RUNBOOK_MD
+            .lines()
+            .filter_map(|line| line.strip_prefix("### "))
+            .map(github_anchor)
+            .collect();
+        for rule in alert_rules().iter_rules() {
+            let url = &rule.annotations["runbook_url"];
+            let anchor = url.rsplit('#').next().unwrap_or("").to_string();
+            assert!(
+                anchors_in_runbook.contains(&anchor),
+                "alert {:?} links to runbook anchor #{anchor} which has no matching heading",
+                rule.alert
+            );
+        }
+    }
+
+    /// Reproduce GitHub's heading-to-anchor slug: lowercase, spaces to dashes,
+    /// drop characters that are not alphanumeric/dash. Sufficient for our
+    /// simple headings.
+    fn github_anchor(heading: &str) -> String {
+        heading
+            .trim()
+            .to_lowercase()
+            .chars()
+            .filter_map(|c| {
+                if c.is_ascii_alphanumeric() {
+                    Some(c)
+                } else if c == ' ' || c == '-' {
+                    Some('-')
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     #[test]
