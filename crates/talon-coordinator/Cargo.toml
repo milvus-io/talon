@@ -25,6 +25,9 @@ serde.workspace = true
 clap.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+axum.workspace = true
 
 [dev-dependencies]
 divan.workspace = true

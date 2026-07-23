@@ -1272,13 +1272,16 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "clap",
  "divan",
  "serde",
+ "serde_json",
  "talon-core",
  "talon-transport",
  "thiserror",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
 ]
