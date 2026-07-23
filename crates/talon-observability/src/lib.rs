@@ -11,6 +11,8 @@
 
 use serde::Deserialize;
 
+pub mod deploy;
+
 /// Raw Prometheus recording-rules YAML.
 pub const RECORDING_RULES_YAML: &str =
     include_str!("../../../deploy/observability/prometheus/talon.rules.yml");
