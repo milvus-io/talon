@@ -73,9 +73,10 @@ jobs:
     name: etcd backend contract
     runs-on: ubuntu-latest
     # Exercises the production etcd ClusterStateStore backend against a real
-    # ephemeral etcd, as required by the state-store contract. etcd is launched
-    # explicitly rather than as a service container because that image's
-    # healthcheck is unreliable on GitHub-hosted runners.
+    # ephemeral etcd, as required by the state-store contract, plus the
+    # end-to-end HA/fault-injection suite (#89) against the same etcd. etcd is
+    # launched explicitly rather than as a service container because that
+    # image's healthcheck is unreliable on GitHub-hosted runners.
     env:
       ETCD_VERSION: v3.5.16
       TALON_ETCD_TEST_ENDPOINT: 127.0.0.1:2379
@@ -107,6 +108,11 @@ jobs:
           cargo test -p talon-coordinator
           --features etcd,state-store-testkit
           --test etcd_contract --locked
+      - name: Run end-to-end HA and fault-injection suite
+        run: >-
+          cargo test -p talon-coordinator
+          --features etcd,state-store-testkit
+          --test ha_failover --locked
 
   bench:
     name: bench (informational)
