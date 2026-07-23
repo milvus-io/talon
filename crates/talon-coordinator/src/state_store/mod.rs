@@ -6,6 +6,8 @@
 //! ordered by clients.
 
 mod config;
+#[cfg(feature = "kubernetes")]
+mod kubernetes;
 mod memory;
 
 #[cfg(any(test, feature = "state-store-testkit"))]
@@ -19,6 +21,10 @@ use async_trait::async_trait;
 use talon_core::{NodeId, NodeStatus, NodeStatusError};
 
 pub use config::{ClusterStateConfig, ConfigError, StateBackend};
+#[cfg(feature = "kubernetes")]
+pub use kubernetes::{
+    KubernetesConfig, KubernetesConfigError, KubernetesStateStore, DEFAULT_LEASE_LABEL_PREFIX,
+};
 pub use memory::{MemoryStateStore, TimeSource};
 
 /// Result alias for cluster-state operations.

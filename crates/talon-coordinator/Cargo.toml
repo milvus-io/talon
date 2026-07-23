@@ -13,6 +13,9 @@ path = "src/main.rs"
 
 [features]
 state-store-testkit = []
+# Production Kubernetes Lease ClusterStateStore backend. Off by default so
+# non-Kubernetes builds do not pull in the kube/k8s-openapi client stack.
+kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:futures"]
 
 [dependencies]
 talon-core.workspace = true
@@ -29,9 +32,13 @@ serde_json.workspace = true
 toml.workspace = true
 axum.workspace = true
 xxhash-rust.workspace = true
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
+futures = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan.workspace = true
+tokio.workspace = true
 
 [[bench]]
 name = "placement_benches"

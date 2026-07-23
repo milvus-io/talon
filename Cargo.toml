@@ -40,3 +40,9 @@ clap = { version = "4", features = ["derive"] }
 divan = "0.1"
 axum = "0.8"
 serde_yaml = "0.9"
+# Kubernetes client for the Lease-based ClusterStateStore backend (feature
+# "kubernetes"). rustls avoids a system OpenSSL build dependency. k8s-openapi is
+# pinned to a single API version per its compile-time version-feature contract.
+kube = { version = "0.97", default-features = false, features = ["client", "config", "rustls-tls", "runtime"] }
+k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30"] }
+futures = "0.3"
