@@ -20,8 +20,18 @@ The self-contained web console every coordinator serves under `/ui`.
 | File | Purpose |
 |------|---------|
 | `index.html` | App shell: top bar, nav, main region, no-JS fallback. |
-| `assets/app.css` | Design tokens (dark/light) and shell/table/stat styles. |
-| `assets/app.js` | Hash router, `/api/v1` data client, loading/error/empty boundaries, 5s poll. |
+| `assets/app.css` | Design tokens (dark/light) and shell/table/stat/fleet styles. |
+| `assets/app.js` | Hash router, `/api/v1` client, boundaries, fleet table (search/sort/filter), node detail, capacity viz, stale-data retention, 5s poll. |
+| `tests/fleet.test.js` | Node-runnable unit tests for the pure fleet helpers. |
+
+## Views
+
+- **Overview** (`#/overview`) — cluster counts, healthy/unhealthy split, cache utilization bar.
+- **Fleet** (`#/nodes`) — dense sortable/filterable/searchable node table; fixed layout so refresh never shifts columns.
+- **Node detail** (`#/node/{id}`) — endpoints, version, uptime, heartbeat age, and (workers) capacity, inventory, traffic, cache hit rate, error rate; labels.
+- **Backend** (`#/backend`) — state backend, readiness, snapshot age/revision.
+
+A failed refresh keeps the last known data on screen, marked **STALE**, rather than blanking.
 
 ## Serving
 
