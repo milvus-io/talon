@@ -75,6 +75,9 @@ impl Args {
             unhealthy_after_ms: self.unhealthy_after_ms,
             lease_ttl_ms: self.lease_ttl_ms,
             request_timeout_ms: self.request_timeout_ms,
+            // Backend blocks come from the config file / environment, not CLI
+            // flags. Feature-gated fields default to None here.
+            ..Default::default()
         }
     }
 }
@@ -193,12 +196,6 @@ async fn main() -> anyhow::Result<()> {
     };
     let config =
         CoordinatorConfig::resolve(file, CoordinatorConfigPatch::from_env()?, args.into_patch())?;
-    if config.state.backend != StateBackend::Memory {
-        anyhow::bail!(
-            "{} state backend is configured but its implementation is not installed",
-            config.state.backend
-        );
-    }
 
     tracing::info!(
         listen = %config.listen,
@@ -210,7 +207,7 @@ async fn main() -> anyhow::Result<()> {
         "starting talon-coordinator"
     );
 
-    let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+    let store: Arc<dyn ClusterStateStore> = build_store(&config).await?;
     let node = NodeInfo {
         id: talon_core::NodeId::new(config.node_id.clone()),
         address: config.listen.clone(),
@@ -292,6 +289,60 @@ async fn main() -> anyhow::Result<()> {
                 }
                 return Ok(());
             }
+        }
+    }
+}
+
+/// Construct the shared cluster-state store selected by configuration.
+///
+/// The memory backend is always available for development. The etcd and
+/// Kubernetes backends are compiled in only when their features are enabled;
+/// selecting one in a binary built without the matching feature is rejected at
+/// configuration validation time, so the `not(feature)` arms here are
+/// unreachable in practice and exist only to keep the match total.
+async fn build_store(config: &CoordinatorConfig) -> anyhow::Result<Arc<dyn ClusterStateStore>> {
+    // Only the production backends consume the request timeout; suppress the
+    // unused-binding warning in builds without either feature.
+    #[cfg_attr(
+        not(any(feature = "etcd", feature = "kubernetes")),
+        allow(unused_variables)
+    )]
+    let request_timeout = Duration::from_millis(config.state.request_timeout_ms);
+    match config.state.backend {
+        StateBackend::Memory => Ok(Arc::new(MemoryStateStore::new())),
+        StateBackend::Etcd => {
+            #[cfg(feature = "etcd")]
+            {
+                let etcd = config.etcd.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("etcd backend selected without [etcd] config")
+                })?;
+                let lease_ttl = Duration::from_millis(config.state.lease_ttl_ms);
+                let store =
+                    talon_coordinator::EtcdStateStore::connect(etcd, lease_ttl, request_timeout)
+                        .await?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "etcd"))]
+            anyhow::bail!(
+                "etcd backend selected but this binary was built without the etcd feature"
+            )
+        }
+        StateBackend::Kubernetes => {
+            #[cfg(feature = "kubernetes")]
+            {
+                let kubernetes = config.kubernetes.as_ref().ok_or_else(|| {
+                    anyhow::anyhow!("kubernetes backend selected without [kubernetes] config")
+                })?;
+                let store =
+                    talon_coordinator::KubernetesStateStore::connect(kubernetes, request_timeout)
+                        .await?;
+                Ok(Arc::new(store))
+            }
+            #[cfg(not(feature = "kubernetes"))]
+            anyhow::bail!(
+                "kubernetes backend selected but this binary was built without the kubernetes \
+                 feature"
+            )
         }
     }
 }
