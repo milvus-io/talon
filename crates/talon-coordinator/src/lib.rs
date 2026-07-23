@@ -10,6 +10,7 @@ pub mod load;
 pub mod membership;
 pub mod observability;
 pub mod placement;
+pub mod security;
 pub mod service;
 pub mod state_store;
 pub mod ui;
