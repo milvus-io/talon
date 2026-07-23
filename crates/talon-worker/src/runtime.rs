@@ -12,9 +12,6 @@ use crate::{
     Admission, BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics,
 };
 
-/// Placeholder source version used until coordinator metadata includes etags.
-const PLACEHOLDER_VERSION: &str = "e2e-v1";
-
 /// Shared state required to serve instrumented data-plane range requests.
 pub struct WorkerRuntime {
     store: WholeBlockStore,
@@ -45,15 +42,16 @@ impl WorkerRuntime {
         }
     }
 
-    /// The block-aligned [`BlockId`] containing `offset` of `object`.
-    fn block_for(&self, object: &ObjectId, offset: u64) -> BlockId {
+    /// The block-aligned [`BlockId`] containing `offset` of `object` at a given
+    /// object `version`.
+    fn block_for(&self, object: &ObjectId, offset: u64, version: &Version) -> BlockId {
         let block_size = self.block_size as u64;
         let block_start = (offset / block_size) * block_size;
         BlockId::new(
             object.clone(),
             block_start,
             self.block_size,
-            Version::new(PLACEHOLDER_VERSION),
+            version.clone(),
         )
     }
 
@@ -64,6 +62,12 @@ impl WorkerRuntime {
     /// stitched into one contiguous buffer. Previously only the block containing
     /// the *start* offset was read and the result clamped to that block's end,
     /// silently truncating cross-block reads (issue #112).
+    ///
+    /// The object's real version (ETag/generation) is resolved once per request
+    /// via a backend `head()` and folded into every `BlockId`, so an overwrite
+    /// at the source produces distinct keys and the stale cached block is no
+    /// longer served (issue #119). A missing/empty version is refused rather than
+    /// cached under a placeholder.
     pub async fn serve_range(&self, request: &RangeRequest) -> anyhow::Result<bytes::Bytes> {
         if request.len == 0 {
             return Ok(bytes::Bytes::new());
@@ -74,11 +78,15 @@ impl WorkerRuntime {
             .checked_add(request.len)
             .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
 
+        // Resolve the object's real version once for this request. Blocks are
+        // keyed by it, so a later overwrite (new ETag) misses the stale cache.
+        let version = self.resolve_version(&request.object).await?;
+
         // Fast path: the whole range lies within a single block. Keeps the
         // common case allocation-free (returns the per-block slice directly).
         let start_block = (request.offset / block_size) * block_size;
         if end <= start_block + block_size {
-            let block = self.block_for(&request.object, request.offset);
+            let block = self.block_for(&request.object, request.offset, &version);
             let offset_in_block = request.offset - block.offset;
             let bytes = self.block_bytes(request, &block).await?;
             return slice(&bytes, offset_in_block, request.len);
@@ -88,7 +96,7 @@ impl WorkerRuntime {
         let mut out = bytes::BytesMut::with_capacity(request.len as usize);
         let mut cursor = request.offset;
         while cursor < end {
-            let block = self.block_for(&request.object, cursor);
+            let block = self.block_for(&request.object, cursor, &version);
             let offset_in_block = cursor - block.offset;
             let block_end = block.offset + block_size;
             let take = block_end.min(end) - cursor;
@@ -104,6 +112,22 @@ impl WorkerRuntime {
             cursor += take;
         }
         Ok(out.freeze())
+    }
+
+    /// Resolve the object's current version via a backend `head()`, refusing an
+    /// empty/missing version rather than caching under a placeholder (#119).
+    async fn resolve_version(&self, object: &ObjectId) -> anyhow::Result<Version> {
+        let stat = self
+            .backend
+            .head(object)
+            .await
+            .map_err(|error| anyhow::anyhow!("resolve object version (HEAD): {error}"))?;
+        if stat.version.0.trim().is_empty() {
+            anyhow::bail!(
+                "backend returned no version/etag for {object}; refusing to cache without a version"
+            );
+        }
+        Ok(stat.version)
     }
 
     /// Return the full committed/fetched bytes of a single block, using the
@@ -506,5 +530,83 @@ mod tests {
             std::process::id(),
             hasher.finish()
         ))
+    }
+
+    /// A backend whose reported version and body are swappable at runtime, and
+    /// which counts fetches, so a source "overwrite" can be simulated.
+    struct VersionedBackend {
+        version: std::sync::Mutex<String>,
+        body: std::sync::Mutex<Bytes>,
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for VersionedBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.body.lock().unwrap().clone())
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: self.body.lock().unwrap().len() as u64,
+                version: Version::new(self.version.lock().unwrap().clone()),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn overwrite_at_source_invalidates_stale_cache() {
+        // First read caches under version "v1". The source is then overwritten
+        // (new etag "v2" + new bytes); the next read must resolve the new
+        // version, miss the stale block, and serve the fresh bytes (issue #119).
+        let root = tmp_root();
+        let backend = Arc::new(VersionedBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-data")),
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with(Arc::clone(&backend), WorkerMetrics::new(1024), &root, 8);
+
+        let first = runtime.serve_range(&request("obj")).await.unwrap();
+        assert_eq!(first, Bytes::from_static(b"old-"));
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+
+        // A second read of the same version is a cache hit (no new fetch).
+        let _ = runtime.serve_range(&request("obj")).await.unwrap();
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+
+        // Overwrite the source: new version + new content.
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-data");
+
+        let after = runtime.serve_range(&request("obj")).await.unwrap();
+        assert_eq!(after, Bytes::from_static(b"new-"), "must serve fresh bytes");
+        assert_eq!(
+            backend.fetches.load(Ordering::SeqCst),
+            2,
+            "overwrite must trigger a fresh backend fetch, not serve the stale block"
+        );
+        // Both versions are cached under distinct keys.
+        assert_eq!(runtime.block_count(), 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn missing_version_is_refused_not_cached_under_placeholder() {
+        let root = tmp_root();
+        let backend = Arc::new(VersionedBackend {
+            version: std::sync::Mutex::new("   ".into()), // blank/whitespace etag
+            body: std::sync::Mutex::new(Bytes::from_static(b"data")),
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with(Arc::clone(&backend), WorkerMetrics::new(1024), &root, 8);
+
+        let err = runtime.serve_range(&request("obj")).await.unwrap_err();
+        assert!(err.to_string().contains("no version"), "{err}");
+        // Nothing was fetched or cached without a version.
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.block_count(), 0);
+        std::fs::remove_dir_all(root).ok();
     }
 }
