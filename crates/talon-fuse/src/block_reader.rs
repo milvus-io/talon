@@ -17,7 +17,7 @@
 //! On a fetch failure the reader walks the cached replicas in order; if all are
 //! exhausted it invalidates the entry and performs one coordinator refresh
 //! before giving up. [`BlockReader::observe_epoch`] reconciles the cache when a
-//! newer placement epoch is seen. Multi-block splitting is handled by
+//! different placement version is seen. Multi-block splitting is handled by
 //! [`crate::read_plan`] and readahead by [`crate::prefetch`].
 
 use std::sync::Arc;
@@ -218,12 +218,15 @@ impl BlockReader {
         Err(last)
     }
 
-    /// Reconcile the cache against an observed epoch.
+    /// Reconcile the cache against an observed placement version.
     ///
-    /// When a response (placement or otherwise) carries a newer epoch than a
-    /// cached entry, that entry is dropped so the next read re-looks-up. This is
-    /// the client half of the coordinator's epoch bump: a membership change
-    /// advances the epoch, and any client holding an older placement refreshes.
+    /// When a response (placement or otherwise) carries a version token that
+    /// differs from a cached entry's, that entry is dropped so the next read
+    /// re-looks-up. This is the client half of the coordinator's placement
+    /// versioning: a membership change changes the deterministic version token,
+    /// and any client holding a placement computed against a different set
+    /// refreshes. The token is a content hash, not an ordered counter, so any
+    /// difference triggers a refresh (see [`crate::PlacementCache::observe_epoch`]).
     /// Returns `true` if the entry was invalidated.
     pub fn observe_epoch(&self, block: &BlockId, observed_epoch: u64) -> bool {
         self.cache.observe_epoch(block, observed_epoch)
@@ -619,10 +622,10 @@ mod tests {
         // Warm the cache (mock_coordinator answers epoch=3).
         let _ = reader.read_block(&block(), 0, 8, 0).await.unwrap();
         assert_eq!(cache.len(), 1);
-        // An older/equal epoch does not invalidate.
+        // The identical version token does not invalidate.
         assert!(!reader.observe_epoch(&block(), 3));
         assert_eq!(cache.len(), 1);
-        // A newer epoch drops the entry so the next read re-looks-up.
+        // A different token drops the entry so the next read re-looks-up.
         assert!(reader.observe_epoch(&block(), 4));
         assert_eq!(cache.len(), 0);
     }

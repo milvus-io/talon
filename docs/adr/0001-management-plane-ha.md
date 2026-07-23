@@ -223,8 +223,23 @@ Clients must not assume a version is numerically greater or lower. Connect
 failure, wrong owner, not found, and TTL expiry remain independent refresh
 triggers.
 
-The exact wire representation and rolling-upgrade transition are delivered by
-#80.
+**Wire representation (delivered by #80).** The version stays the existing
+`u64` field on `PlacementResponse`/`EpochBump`, so the transition is
+wire-compatible — no new message or schema bump is required. What changes is how
+the value is *produced* and *interpreted*: the coordinator now fills it with a
+64-bit xxh3 hash of the canonical, id-sorted worker set (each node's id,
+address, and role, length-delimited), and clients compare it for equality rather
+than magnitude. An all-zero value is reserved for the empty node set.
+
+**Rolling upgrade.** During a mixed-version window some coordinators emit the
+old wall-clock-seeded epoch and some emit the new hash. A client that caches a
+placement from one and then observes a different value from the other simply
+invalidates and refreshes — the worst case is an extra lookup, never a stale
+pin, because the new equality rule treats *any* difference as a refresh trigger
+(the old "strictly greater" rule was the only thing that could ignore a peer's
+value). Once all coordinators run the new code, two of them observing the same
+membership emit the identical token and the spurious refreshes stop. No operator
+action or flag day is required.
 
 ### 8. Backend failure is fail-closed for new authoritative reads
 

@@ -103,9 +103,7 @@ mod tests {
     }
 
     fn svc(ids: &[&str]) -> PlacementService<RendezvousPlacement> {
-        // Pin a deterministic epoch base so exact-value assertions below hold;
-        // production seeds from the wall clock (see Epoch::seeded_now).
-        let m = Membership::with_epoch_base(Epoch(0));
+        let m = Membership::new();
         for id in ids {
             m.register(NodeInfo {
                 id: NodeId::new(*id),
@@ -117,11 +115,12 @@ mod tests {
     }
 
     #[test]
-    fn lookup_returns_owners_and_epoch() {
+    fn lookup_returns_owners_and_version() {
         let s = svc(&["a", "b", "c"]);
         let res = s.lookup(&block(1), 2);
         assert_eq!(res.owners.len(), 2);
-        assert_eq!(res.epoch, Epoch(3)); // three registrations
+        // The version is the deterministic hash of the node set.
+        assert_eq!(res.epoch, Epoch::for_nodes(&s.membership().snapshot()));
 
         // Matches the raw placement's top-K ordering.
         let nodes = s.membership().snapshot();
@@ -134,7 +133,7 @@ mod tests {
     }
 
     #[test]
-    fn epoch_advances_and_is_visible_to_clients() {
+    fn version_changes_on_membership_change() {
         let s = svc(&["a", "b"]);
         let e0 = s.lookup(&block(9), 1).epoch;
         s.membership().register(NodeInfo {
@@ -143,12 +142,13 @@ mod tests {
             role: NodeRole::Worker,
         });
         let e1 = s.lookup(&block(9), 1).epoch;
-        assert!(e1 > e0, "epoch must advance on membership change");
+        assert_ne!(e1, e0, "version must change on membership change");
     }
 
     #[test]
     fn handle_placement_lookup_message() {
         let s = svc(&["a", "b", "c"]);
+        let expected = s.lookup(&block(2), 1).epoch.0;
         let req = ControlMessage::PlacementLookup {
             block: block(2),
             k: 1,
@@ -156,7 +156,7 @@ mod tests {
         match s.handle(req) {
             ControlMessage::PlacementResponse { owners, epoch } => {
                 assert_eq!(owners.len(), 1);
-                assert_eq!(epoch, 3);
+                assert_eq!(epoch, expected);
             }
             other => panic!("expected PlacementResponse, got {other:?}"),
         }
@@ -174,6 +174,6 @@ mod tests {
         let s = svc(&[]);
         let res = s.lookup(&block(1), 3);
         assert!(res.owners.is_empty());
-        assert_eq!(res.epoch, Epoch(0));
+        assert_eq!(res.epoch, Epoch::EMPTY);
     }
 }
