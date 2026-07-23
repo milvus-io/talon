@@ -70,6 +70,9 @@ struct Node {
     kind: FileKind,
     size: u64,
     children: Vec<u64>,
+    /// Full mount-relative path for a file leaf (e.g. `s3/bkt/o.bin`); empty for
+    /// directories. Lets a data callback recover the object from an inode.
+    path: String,
 }
 
 /// A read-only view over the backend namespace, addressed by inode.
@@ -109,6 +112,7 @@ impl ReadOnlyFs {
                 kind: FileKind::Directory,
                 size: 0,
                 children: Vec::new(),
+                path: String::new(),
             },
         );
         Self {
@@ -148,6 +152,11 @@ impl ReadOnlyFs {
                 kind,
                 size: if is_leaf { size } else { 0 },
                 children: Vec::new(),
+                path: if is_leaf {
+                    path.trim_start_matches('/').to_string()
+                } else {
+                    String::new()
+                },
             };
             g.nodes.insert(ino, node);
             g.index.insert(key, ino);
@@ -257,6 +266,22 @@ impl ReadOnlyFs {
     pub fn release(&self, fh: u64) -> Result<(), FsError> {
         let mut g = self.inner.lock().unwrap();
         g.handles.remove(&fh).map(|_| ()).ok_or(FsError::BadHandle)
+    }
+
+    /// The mount-relative object path + size for an open file handle.
+    ///
+    /// Lets a data callback recover the backend object (via
+    /// [`crate::mapping::path_to_object`]) and clamp reads to the file size.
+    /// Errors with [`FsError::BadHandle`] for an unknown handle or
+    /// [`FsError::Unsupported`] if the handle somehow references a directory.
+    pub fn file_meta(&self, fh: u64) -> Result<(String, u64), FsError> {
+        let g = self.inner.lock().unwrap();
+        let ino = *g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::File {
+            return Err(FsError::Unsupported);
+        }
+        Ok((node.path.clone(), node.size))
     }
 
     /// Any mutating operation (write/create/unlink/rename/chmod/…): always
@@ -380,5 +405,23 @@ mod tests {
         let a_ino = a.ino;
         fs.populate_from_listing([("s3/bkt/dir/a.bin", 10u64)]);
         assert_eq!(fs.lookup(dir.ino, "a.bin").unwrap().ino, a_ino);
+    }
+
+    #[test]
+    fn file_meta_recovers_path_and_size() {
+        let fs = ReadOnlyFs::new();
+        fs.insert_object("s3/bkt/dir/a.bin", 4096);
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bkt = fs.lookup(s3.ino, "bkt").unwrap();
+        let dir = fs.lookup(bkt.ino, "dir").unwrap();
+        let a = fs.lookup(dir.ino, "a.bin").unwrap();
+
+        let fh = fs.open(a.ino).unwrap();
+        let (path, size) = fs.file_meta(fh).unwrap();
+        assert_eq!(path, "s3/bkt/dir/a.bin");
+        assert_eq!(size, 4096);
+
+        // Unknown handle → BadHandle; directory open is rejected upstream.
+        assert_eq!(fs.file_meta(9999), Err(FsError::BadHandle));
     }
 }
