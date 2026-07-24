@@ -1,0 +1,19 @@
+[book]
+title = "Talon"
+authors = ["The Talon authors"]
+description = "A distributed object-store cache written in Rust."
+src = "src"
+language = "en"
+
+[output.html]
+git-repository-url = "https://github.com/milvus-io/talon"
+edit-url-template = "https://github.com/milvus-io/talon/edit/main/docs/book/{path}"
+default-theme = "navy"
+preferred-dark-theme = "navy"
+
+[output.html.search]
+enable = true
+
+[output.html.fold]
+enable = true
+level = 1

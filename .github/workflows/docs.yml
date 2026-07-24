@@ -1,0 +1,63 @@
+name: Docs
+
+# Build and publish the mdBook documentation site to GitHub Pages on merge to
+# main. Pull requests only build the book (see the docs-book job in ci.yml);
+# this workflow is the deploy path.
+#
+# NOTE: deployment requires GitHub Pages to be enabled with "GitHub Actions" as
+# the source (repository Settings -> Pages). Until then this workflow's deploy
+# step will fail, but that does not affect PR merges — PRs never run it.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "docs/book/**"
+      - "docs/**/*.md"
+      - "*.md"
+      - ".github/workflows/docs.yml"
+  workflow_dispatch:
+
+# Least-privilege: only the Pages deploy needs write + id-token.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# Serialize deployments; never cancel an in-progress publish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  MDBOOK_VERSION: "0.4.52"
+
+jobs:
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        run: cargo install mdbook --version ${MDBOOK_VERSION} --locked
+      - name: Build the book
+        run: mdbook build docs/book
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: docs/book/book
+
+  deploy:
+    name: deploy
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
