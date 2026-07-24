@@ -48,6 +48,14 @@ check-api-docs:
     cargo run -q -p talon-coordinator --bin talon-gen-api-docs > /tmp/talon-api-ref.md
     diff -u docs/reference/rest-api.md /tmp/talon-api-ref.md
 
+# Spell-check the repo (install: cargo install typos-cli). Config: typos.toml.
+spell:
+    typos
+
+# Link-check the docs (install: cargo install lychee). Config: lychee.toml.
+linkcheck:
+    lychee --no-progress README.md DESIGN.md CONTRIBUTING.md BENCHMARKS.md 'docs/**/*.md' '.github/**/*.md'
+
 # --- benchmarks (performance feedback loop) ---
 
 # Run all microbenchmarks and write bench/results/latest.json.

@@ -1,0 +1,19 @@
+# Spell-check configuration for the `typos` CI gate.
+# See https://github.com/crate-ci/typos
+#
+# `extend-words` entries below are legitimate terms `typos` would otherwise
+# flag: hyphenated prefixes and accepted spellings that appear in comments and
+# prose. Add real project vocabulary here rather than disabling the check.
+
+[default.extend-words]
+# "mis-configured", "mis-bucket" — a valid hyphenated prefix, not "miss".
+mis = "mis"
+# Accepted English spelling used in doc comments.
+clonable = "clonable"
+
+[files]
+# Generated and vendored content should not be spell-checked.
+extend-exclude = [
+    "docs/book/book/",
+    "target/",
+]

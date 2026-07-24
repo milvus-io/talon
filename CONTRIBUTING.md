@@ -99,6 +99,25 @@ cargo doc --workspace --no-deps             # doc build (RUSTDOCFLAGS=-D warning
 CI denies all warnings (`RUSTFLAGS=-D warnings`), so a clean local `just ci` is
 required for a green PR. Run `just fmt` to auto-format.
 
+### Documentation checks
+
+Docs are gated too. If you touch documentation, mirror the CI docs checks
+locally:
+
+```sh
+just spell        # spelling (typos); config in typos.toml
+just linkcheck    # links (lychee); config in lychee.toml
+```
+
+Install the tools once with `cargo install typos-cli lychee`. When you change a
+config knob or the management API, also regenerate the references so the drift
+gate stays green:
+
+```sh
+just gen-config-docs   # from the ConfigVar schemas
+just gen-api-docs      # from openapi.json
+```
+
 ## Performance feedback loop
 
 Talon has a microbenchmark harness for fast, machine-readable perf signal. If
