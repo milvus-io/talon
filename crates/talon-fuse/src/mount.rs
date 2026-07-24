@@ -25,9 +25,17 @@ use crate::ops::{Attr, FileKind, FsError, ReadOnlyFs};
 /// How long the kernel may cache a metadata reply before re-asking.
 ///
 /// The namespace is populated from coordinator listings and is effectively
-/// immutable for a mount session (read-only v1), so a modest TTL avoids a
-/// callback per stat without risking staleness.
-const ATTR_TTL: Duration = Duration::from_secs(1);
+/// immutable for a mount session (read-only v1), so a generous TTL avoids a
+/// callback per stat/lookup without risking staleness.
+const ATTR_TTL: Duration = Duration::from_secs(60);
+
+/// Target maximum size of a single kernel read/write, in bytes.
+///
+/// The kernel default caps a FUSE read at 128 KiB; raising it to 1 MiB (via
+/// `FUSE_CAP_MAX_PAGES`, kernel ≥4.20) lets one `read` callback carry 8× the
+/// data, amortizing the per-request `/dev/fuse` round-trip on sequential reads
+/// (issue #180). The kernel/`fuser` clamps to what it supports.
+const TARGET_MAX_IO: u32 = 1 << 20;
 
 /// Map a read-op [`FsError`] to a POSIX errno for a `fuser` reply.
 pub(crate) fn errno(err: FsError) -> i32 {
@@ -133,6 +141,38 @@ impl TalonFuse {
 }
 
 impl fuser::Filesystem for TalonFuse {
+    /// Negotiate kernel FUSE parameters at mount time.
+    ///
+    /// Raises the maximum read size to 1 MiB (`TARGET_MAX_IO`) so a single
+    /// `read` callback carries up to 8× the 128 KiB default, and matches
+    /// readahead to it — both pure throughput wins for a read-only mount serving
+    /// large objects (issue #180). `fuser`/the kernel clamp each request to what
+    /// they support; the granted values are logged.
+    fn init(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        match config.set_max_write(TARGET_MAX_IO) {
+            Ok(granted) => tracing::info!(max_write = granted, "negotiated FUSE max_write"),
+            Err(cap) => {
+                let granted = config.set_max_write(cap).unwrap_or(cap);
+                tracing::info!(max_write = granted, "FUSE max_write clamped by kernel");
+            }
+        }
+        match config.set_max_readahead(TARGET_MAX_IO) {
+            Ok(granted) => tracing::info!(max_readahead = granted, "negotiated FUSE max_readahead"),
+            Err(cap) => {
+                let granted = config.set_max_readahead(cap).unwrap_or(cap);
+                tracing::info!(
+                    max_readahead = granted,
+                    "FUSE max_readahead clamped by kernel"
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Resolve a child `name` under directory `parent` to its attributes.
     fn lookup(
         &mut self,
@@ -212,9 +252,14 @@ impl fuser::Filesystem for TalonFuse {
     /// Directories are rejected with `EISDIR`-equivalent `ENOSYS` semantics via
     /// the op layer (`FsError::Unsupported`). The handle indexes into the
     /// namespace so the `read` callback can recover the object.
+    ///
+    /// Replies with `FOPEN_KEEP_CACHE` so the kernel retains this file's page
+    /// cache across opens: the namespace is read-only and immutable for a mount
+    /// session, so repeated reads and `mmap` can serve from RAM without a FUSE
+    /// round-trip (issue #180).
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
         match self.fs.open(ino) {
-            Ok(fh) => reply.opened(fh, 0),
+            Ok(fh) => reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE),
             Err(e) => reply.error(errno(e)),
         }
     }
