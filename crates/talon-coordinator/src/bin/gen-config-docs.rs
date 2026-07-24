@@ -7,8 +7,11 @@
 //! `config-docs` job); run `just gen-config-docs` (or this binary) to refresh.
 //!
 //! Usage:
-//!   talon-gen-config-docs           # print to stdout
-//!   talon-gen-config-docs <path>    # write to a file
+//!
+//! ```text
+//! talon-gen-config-docs           # print to stdout
+//! talon-gen-config-docs <path>    # write to a file
+//! ```
 
 use std::io::Write;
 
