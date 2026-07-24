@@ -27,6 +27,7 @@ use talon_core::{BlockId, ObjectId, Version};
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::metrics::ReadStats;
 use crate::placement_cache::{Cached, PlacementCache, RefreshReason};
+use crate::pool::ConnectionPool;
 use crate::read_plan::plan_read;
 use crate::worker_client::{WorkerClient, WorkerError};
 
@@ -76,6 +77,9 @@ pub struct BlockReader {
     replicas_k: u8,
     /// Read-path counters (cache hit/miss, worker fetches, bytes served).
     stats: ReadStats,
+    /// Shared pool of worker connections, so warm fetches skip the TCP handshake
+    /// (issue #181).
+    worker_pool: Arc<ConnectionPool>,
 }
 
 impl BlockReader {
@@ -103,6 +107,7 @@ impl BlockReader {
             cache,
             replicas_k: replicas_k.max(1),
             stats,
+            worker_pool: Arc::new(ConnectionPool::new()),
         }
     }
 
@@ -197,7 +202,7 @@ impl BlockReader {
         }
         let mut last = RefreshReason::WrongOwner;
         for addr in replicas {
-            let worker = WorkerClient::new(addr.clone());
+            let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
             self.stats.record_worker_fetch();
             match worker
                 .fetch_range(&block.object, abs_offset, len as u64)

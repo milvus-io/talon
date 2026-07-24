@@ -10,19 +10,22 @@
 //!
 //! Both are single request/response round-trips over the control plane: write
 //! one [`MsgType::Control`] frame carrying a bincode [`ControlMessage`], read
-//! one framed [`ControlMessage`] back. A fresh TCP connection is opened per
-//! call for simplicity; a pooled variant can wrap this later without changing
-//! the surface. The transport framing/codec is reused verbatim
+//! one framed [`ControlMessage`] back. Connections are reused from a shared
+//! [`ConnectionPool`] so warm lookups skip the TCP handshake (issue #181). The
+//! transport framing/codec is reused verbatim
 //! ([`talon_transport::encode`]/[`decode`](talon_transport::decode)), so this
 //! module only owns the connect + read-a-frame glue and the response matching.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::ControlMessage;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use crate::pool::ConnectionPool;
 
 /// Placement answer for a block: ordered owners + the epoch they hold at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -62,15 +65,30 @@ pub enum CoordinatorError {
 }
 
 /// A thin control-plane client bound to one coordinator address.
+///
+/// Reuses connections from a shared [`ConnectionPool`] so warm lookups skip the
+/// TCP handshake (issue #181). Cloneable — clones share the same pool.
 #[derive(Debug, Clone)]
 pub struct CoordinatorClient {
     addr: String,
+    pool: Arc<ConnectionPool>,
 }
 
 impl CoordinatorClient {
-    /// Create a client that dials `addr` (`host:port`) per request.
+    /// Create a client that dials `addr` (`host:port`), with its own pool.
     pub fn new(addr: impl Into<String>) -> Self {
-        Self { addr: addr.into() }
+        Self {
+            addr: addr.into(),
+            pool: Arc::new(ConnectionPool::new()),
+        }
+    }
+
+    /// Create a client that reuses connections from the shared `pool`.
+    pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
+        Self {
+            addr: addr.into(),
+            pool,
+        }
     }
 
     /// The coordinator address this client talks to.
@@ -178,17 +196,57 @@ impl CoordinatorClient {
     }
 
     /// Send one control message and read exactly one control reply.
+    ///
+    /// Uses a pooled connection when warm; a reused connection that fails (the
+    /// peer may have closed it while idle) is retried once on a fresh dial, so a
+    /// stale pooled socket never turns a healthy coordinator into a spurious
+    /// failure. The connection is returned to the pool only after a fully
+    /// successful exchange.
     async fn round_trip(
         &self,
         msg: ControlMessage,
         expected: &'static str,
     ) -> Result<ControlMessage, CoordinatorError> {
-        let mut stream = TcpStream::connect(&self.addr).await?;
         let out = talon_transport::encode(0, &msg)?;
-        stream.write_all(&out).await?;
-        stream.flush().await?;
-        let reply = read_control_frame(&mut stream, expected).await?;
-        Ok(reply)
+        match self.exchange(&out, expected).await {
+            Ok(reply) => Ok(reply),
+            Err((true, _stale)) => {
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                stream.write_all(&out).await?;
+                stream.flush().await?;
+                let reply = read_control_frame(&mut stream, expected).await?;
+                self.pool.release(&self.addr, stream);
+                Ok(reply)
+            }
+            Err((false, err)) => Err(err),
+        }
+    }
+
+    /// One request/response over a pooled-or-fresh connection; returns
+    /// `(was_reused, err)` on failure so the caller can retry a stale pooled one.
+    async fn exchange(
+        &self,
+        out: &[u8],
+        expected: &'static str,
+    ) -> Result<ControlMessage, (bool, CoordinatorError)> {
+        let (mut stream, reused) = self
+            .pool
+            .checkout(&self.addr)
+            .await
+            .map_err(|e| (false, CoordinatorError::from(e)))?;
+        let result: Result<ControlMessage, CoordinatorError> = async {
+            stream.write_all(out).await?;
+            stream.flush().await?;
+            read_control_frame(&mut stream, expected).await
+        }
+        .await;
+        match result {
+            Ok(reply) => {
+                self.pool.release(&self.addr, stream);
+                Ok(reply)
+            }
+            Err(err) => Err((reused, err)),
+        }
     }
 }
 
