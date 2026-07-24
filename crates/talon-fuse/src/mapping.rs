@@ -12,7 +12,10 @@
 //! [`path_to_object`] parses such a path into an [`ObjectId`]; [`object_to_path`]
 //! is its inverse. For an open file, [`resolve_read`] maps a byte `offset` to
 //! the [`BlockId`] that contains it plus the offset *within* that block, given
-//! the file's block size and version (supplied by a coordinator `HEAD`).
+//! the file's block size and version. On the mount path the version is a
+//! canonical placeholder, not a per-object ETag: placement is version-
+//! independent and the worker owns freshness (see `mount::CANONICAL_MOUNT_VERSION`,
+//! issue #182).
 //!
 //! Parsing rejects ambiguous paths (empty components, `.`/`..`, absolute object
 //! keys) so odd object names cannot escape their namespace.

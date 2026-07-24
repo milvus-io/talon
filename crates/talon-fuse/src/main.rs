@@ -102,9 +102,12 @@ async fn run_mount(
     reader: BlockReader,
 ) -> anyhow::Result<()> {
     use fuser::MountOption;
-    use talon_fuse::mount::TalonFuse;
+    use talon_fuse::mount::{TalonFuse, CANONICAL_MOUNT_VERSION};
 
-    let version = talon_core::Version::new("v1");
+    // The mount path is version-independent by design: the worker is the sole
+    // authority on freshness (#119/#163) and the client never sends a version to
+    // it, so every block is addressed under one canonical token (#182).
+    let version = talon_core::Version::new(CANONICAL_MOUNT_VERSION);
     let handle = tokio::runtime::Handle::current();
     let stats = reader.stats().clone();
     let adapter = TalonFuse::new(fs, reader, handle, cfg.block_size, version);

@@ -144,7 +144,7 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
         reader,
         tokio::runtime::Handle::current(),
         block_size,
-        talon_core::Version::new("v1"),
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
     );
 
     // Mount at a temp dir. Skip (don't fail) if /dev/fuse is unavailable.
