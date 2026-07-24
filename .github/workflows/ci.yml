@@ -84,6 +84,25 @@ jobs:
       - name: Build the book
         run: mdbook build docs/book
 
+  config-docs:
+    name: config reference drift
+    runs-on: ubuntu-latest
+    # The configuration reference is generated from the ConfigVar schemas.
+    # Fail if the committed copy is stale so docs cannot drift from the code.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Regenerate and diff
+        run: |
+          cargo run -q -p talon-coordinator --features etcd,kubernetes \
+            --bin talon-gen-config-docs > /tmp/config-ref.md
+          if ! diff -u docs/reference/configuration.md /tmp/config-ref.md; then
+            echo "::error::docs/reference/configuration.md is stale; run 'just gen-config-docs'"
+            exit 1
+          fi
+
   etcd-contract:
     name: etcd backend contract
     runs-on: ubuntu-latest

@@ -389,12 +389,13 @@ async fn build_store(config: &CoordinatorConfig) -> anyhow::Result<Arc<dyn Clust
 /// `TALON_COORDINATOR_TRUST_FORWARDED=1` honors `X-Forwarded-For` for audit
 /// attribution behind a trusted proxy. TLS is reverse-proxy terminated.
 fn build_security_config() -> anyhow::Result<talon_coordinator::security::SecurityConfig> {
+    use talon_coordinator::config::env_names;
     use talon_coordinator::security::{AuthMode, SecurityConfig};
-    let auth = match std::env::var("TALON_COORDINATOR_AUTH_TOKEN") {
+    let auth = match std::env::var(env_names::AUTH_TOKEN) {
         Ok(token) if !token.is_empty() => AuthMode::BearerToken { token },
         _ => AuthMode::Disabled,
     };
-    let trust_forwarded_headers = std::env::var("TALON_COORDINATOR_TRUST_FORWARDED")
+    let trust_forwarded_headers = std::env::var(env_names::TRUST_FORWARDED)
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
         .unwrap_or(false);
     let config = SecurityConfig {

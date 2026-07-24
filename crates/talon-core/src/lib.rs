@@ -17,7 +17,8 @@ pub mod trace;
 pub use backend::{BackendStore, ObjectStat};
 pub use block::{BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{
-    azure_sas_from_env, FuseConfig, FuseConfigPatch, Patch, WorkerConfig, WorkerConfigPatch,
+    azure_sas_from_env, ConfigVar, FuseConfig, FuseConfigPatch, Patch, WorkerConfig,
+    WorkerConfigPatch, FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA,
 };
 pub use error::{Error, Result};
 pub use key::{Backend, BlockId, ObjectId, PageIndex, Version};

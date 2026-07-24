@@ -73,26 +73,17 @@ within one heartbeat interval.
 
 ## 3. Configuration reference
 
-All values are settable by CLI flag, `TALON_COORDINATOR_*` env var, or TOML
-file (precedence: flag > env > file > default). Backend-specific blocks
-(`[etcd]`, `[kubernetes]`) come from the TOML file or the env vars listed under
-"Backend-specific configuration" below, not from CLI flags.
+Every setting is resolved from four layers, highest precedence first: **CLI
+flag** > **environment variable** > **config file (TOML)** > **default**.
+Backend-specific blocks (`[etcd]`, `[kubernetes]`) come from the TOML file or
+environment variables, not from CLI flags.
 
-| Setting | Env var | Default | Units / notes |
-|---------|---------|---------|---------------|
-| Control listen | `TALON_COORDINATOR_LISTEN` | `127.0.0.1:7000` | worker/client control plane |
-| Admin listen | `TALON_COORDINATOR_ADMIN_LISTEN` | `127.0.0.1:8000` | metrics/health/API/UI |
-| Cluster id | `TALON_COORDINATOR_CLUSTER_ID` | `default` | logical cluster |
-| Node id | `TALON_COORDINATOR_NODE_ID` | control address | stable per replica |
-| Backend | `TALON_COORDINATOR_STATE_BACKEND` | `memory` | `memory` \| `etcd` \| `kubernetes` |
-| HA enabled | `TALON_COORDINATOR_HA_ENABLED` | `false` | rejects memory backend when true |
-| Replicas | `TALON_COORDINATOR_REPLICAS` | `1` | expected coordinator count |
-| Heartbeat interval | `TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS` | `5000` | ms |
-| Unhealthy after | `TALON_COORDINATOR_UNHEALTHY_AFTER_MS` | `15000` | ms; must be > heartbeat |
-| Lease TTL | `TALON_COORDINATOR_LEASE_TTL_MS` | `30000` | ms; must be > unhealthy_after |
-| Request timeout | `TALON_COORDINATOR_REQUEST_TIMEOUT_MS` | `3000` | ms; per backend op |
-| Auth token | `TALON_COORDINATOR_AUTH_TOKEN` | unset | ≥16 chars enables API/UI auth |
-| Trust proxy | `TALON_COORDINATOR_TRUST_FORWARDED` | `false` | honor `X-Forwarded-For` |
+The complete, authoritative list of every key, environment variable, default,
+and description — for the coordinator, worker, and FUSE client — is
+**generated from the code** and lives in the
+[configuration reference](../reference/configuration.md). It cannot drift from
+the parser. The operational notes below cover validation rules and backend
+setup that the table does not.
 
 **Validation** requires `heartbeat_interval < unhealthy_after < lease_ttl` and a
 non-zero request timeout; the memory backend is rejected under HA. Secrets
@@ -102,22 +93,13 @@ exported in metrics.
 ### Backend-specific configuration
 
 Selecting `etcd` or `kubernetes` requires a matching configuration block. The
-block is provided as a TOML table under `--config`, or, for the fields below, by
-environment variable (env wins over the file). Binaries must be built with the
-matching feature (`--features etcd` / `--features kubernetes`); selecting a
-backend whose feature is absent fails fast at startup with an actionable error.
+block is provided as a TOML table under `--config`, or, for the fields in the
+[configuration reference](../reference/configuration.md), by environment
+variable (env wins over the file). Binaries must be built with the matching
+feature (`--features etcd` / `--features kubernetes`); selecting a backend whose
+feature is absent fails fast at startup with an actionable error.
 
-**etcd** — TOML `[etcd]` table or env:
-
-| Setting | Env var | Notes |
-|---------|---------|-------|
-| Endpoints | `TALON_COORDINATOR_ETCD_ENDPOINTS` | comma-separated `host:port` list |
-| Username | `TALON_COORDINATOR_ETCD_USERNAME` | optional; requires password |
-| Password | `TALON_COORDINATOR_ETCD_PASSWORD` | optional; keep in a Secret, not the file |
-| CA cert path | `TALON_COORDINATOR_ETCD_CA_CERT_PATH` | PEM; enables TLS |
-| Client cert path | `TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH` | PEM; mutual TLS |
-| Client key path | `TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH` | PEM; mutual TLS |
-| Prefix | (TOML `prefix` only) | keyspace prefix; default `/talon` |
+**etcd** example:
 
 ```toml
 state_backend = "etcd"
@@ -132,13 +114,7 @@ client_cert_path = "/etc/talon/etcd/client.crt"
 client_key_path = "/etc/talon/etcd/client.key"
 ```
 
-**Kubernetes** — TOML `[kubernetes]` table or env:
-
-| Setting | Env var | Notes |
-|---------|---------|-------|
-| Namespace | `TALON_COORDINATOR_K8S_NAMESPACE` | namespace holding Talon Lease objects |
-| Cluster id | (TOML `cluster_id` only) | defaults to the coordinator `cluster_id` |
-| Context | (TOML `context` only) | kubeconfig context; unset uses in-cluster config |
+**Kubernetes** example:
 
 ```toml
 state_backend = "kubernetes"
