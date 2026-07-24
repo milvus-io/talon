@@ -27,7 +27,7 @@ pub use memory_store::MemoryStore;
 pub use miss::{touched_pages, Admission, InFlightGuard, InFlightLoads, LoadKey};
 pub use observability::{serve_admin, WorkerMetrics, WorkerObservability, WorkerReadiness};
 pub use paged_store::PagedBlockStore;
-pub use runtime::WorkerRuntime;
+pub use runtime::{ServeOutcome, WorkerRuntime};
 pub use sendfile::{send_file_range, DEFAULT_CHUNK};
 pub use splice::{ingest_put, splice_to_file};
 pub use staging::{Checksum, Stager};
