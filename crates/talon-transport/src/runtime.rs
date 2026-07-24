@@ -87,6 +87,10 @@ impl Shutdown {
 /// The single-ring server: accept + frame-dispatch loop.
 pub struct Server<H: Handler> {
     handler: Arc<H>,
+    /// Optional cap on concurrent connections. When set, each accepted
+    /// connection acquires a permit (held for its lifetime) before it is
+    /// handled, so a flood of peers cannot spawn unbounded tasks/FDs (#167).
+    conn_limit: Option<crate::limits::ConnectionLimit>,
 }
 
 impl<H: Handler> Server<H> {
@@ -94,7 +98,16 @@ impl<H: Handler> Server<H> {
     pub fn new(handler: H) -> Self {
         Self {
             handler: Arc::new(handler),
+            conn_limit: None,
         }
+    }
+
+    /// Bound concurrent connections to `max`, mirroring the live worker/
+    /// coordinator accept loops. Without this a service built on the shared
+    /// `Server` would accept unboundedly (#167).
+    pub fn with_connection_limit(mut self, max: usize) -> Self {
+        self.conn_limit = Some(crate::limits::ConnectionLimit::new(max));
+        self
     }
 
     /// Bind `addr` and run the accept loop until `shutdown` is triggered.
@@ -105,6 +118,11 @@ impl<H: Handler> Server<H> {
     /// header decoder's `MAX_PAYLOAD_LEN` guard.
     pub async fn serve(&self, addr: &str, shutdown: Shutdown) -> std::io::Result<()> {
         let listener = TcpListener::bind(addr).await?;
+        self.serve_on(listener, shutdown).await
+    }
+
+    /// Run the accept loop over an already-bound listener (used with [`bind`]).
+    pub async fn serve_on(&self, listener: TcpListener, shutdown: Shutdown) -> std::io::Result<()> {
         loop {
             tokio::select! {
                 _ = shutdown.wait() => {
@@ -114,26 +132,17 @@ impl<H: Handler> Server<H> {
                 accepted = listener.accept() => {
                     let (stream, _peer) = accepted?;
                     let handler = Arc::clone(&self.handler);
+                    let conn_limit = self.conn_limit.clone();
                     tokio::spawn(async move {
+                        // Acquire the permit inside the task so the accept loop
+                        // stays responsive to shutdown even at the limit (#167).
+                        let _permit = match conn_limit {
+                            Some(limit) => Some(limit.acquire().await),
+                            None => None,
+                        };
                         if let Err(e) = handle_conn(stream, handler).await {
                             tracing::debug!(error = %e, "runtime: connection ended");
                         }
-                    });
-                }
-            }
-        }
-    }
-
-    /// Run the accept loop over an already-bound listener (used with [`bind`]).
-    pub async fn serve_on(&self, listener: TcpListener, shutdown: Shutdown) -> std::io::Result<()> {
-        loop {
-            tokio::select! {
-                _ = shutdown.wait() => return Ok(()),
-                accepted = listener.accept() => {
-                    let (stream, _peer) = accepted?;
-                    let handler = Arc::clone(&self.handler);
-                    tokio::spawn(async move {
-                        let _ = handle_conn(stream, handler).await;
                     });
                 }
             }
@@ -229,6 +238,40 @@ mod tests {
 
         shutdown.trigger();
         // Accept loop returns cleanly after shutdown.
+        let _ = handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connection_limit_still_serves_within_capacity() {
+        // A Server built with a connection limit acquires+releases a permit per
+        // connection and still serves normally within capacity (#167).
+        let server = Server::new(|header: FrameHeader, payload: Vec<u8>| {
+            let mut out = header.encode().to_vec();
+            out.extend_from_slice(&payload);
+            Some(out)
+        })
+        .with_connection_limit(2);
+        let (listener, addr) = bind("127.0.0.1:0").await.unwrap();
+        let shutdown = Shutdown::new();
+        let sd = shutdown.clone();
+        let handle = tokio::spawn(async move { server.serve_on(listener, sd).await });
+
+        // Two sequential connections both succeed (the first's permit is released
+        // on drop before the second acquires).
+        for _ in 0..2 {
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let body = b"hi";
+            let hdr = FrameHeader::new(MsgType::Control, 1, body.len() as u32);
+            client.write_all(&hdr.encode()).await.unwrap();
+            client.write_all(body).await.unwrap();
+            let mut echoed_hdr = [0u8; HEADER_LEN];
+            client.read_exact(&mut echoed_hdr).await.unwrap();
+            let mut echoed_body = vec![0u8; body.len()];
+            client.read_exact(&mut echoed_body).await.unwrap();
+            assert_eq!(echoed_body, body);
+        }
+
+        shutdown.trigger();
         let _ = handle.await.unwrap();
     }
 

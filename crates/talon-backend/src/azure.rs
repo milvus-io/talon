@@ -75,8 +75,14 @@ impl AzureBackend {
     }
 
     /// Format the Azure `x-ms-range` header value for `[offset, offset+len)`.
+    ///
+    /// `len` is expected `> 0` (guarded in `fetch_range`); a zero/overflowing
+    /// `len` is clamped with checked arithmetic so this public helper never
+    /// under/overflows into a bogus range (#167).
     pub fn range_header(offset: u64, len: u64) -> String {
-        format!("bytes={offset}-{}", offset + len - 1)
+        let span = len.saturating_sub(1);
+        let end = offset.saturating_add(span);
+        format!("bytes={offset}-{end}")
     }
 
     /// The API version header Azure requires on every request.

@@ -107,7 +107,16 @@ pub struct Histogram {
 }
 
 impl Histogram {
-    fn new(bounds: Vec<f64>) -> Self {
+    fn new(mut bounds: Vec<f64>) -> Self {
+        // Prometheus requires strictly ascending, finite bucket bounds so the
+        // cumulative `_bucket` output is monotonic. `histogram_with` accepts
+        // caller-supplied bounds, so normalize defensively: drop non-finite
+        // values, sort ascending, and dedup. Without this, unsorted bounds
+        // render non-monotonic buckets that violate the exposition contract
+        // (#167).
+        bounds.retain(|b| b.is_finite());
+        bounds.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        bounds.dedup();
         let n = bounds.len() + 1; // +Inf bucket
         Self {
             bounds: Arc::new(bounds),
@@ -119,6 +128,12 @@ impl Histogram {
 
     /// Record an observation `v`.
     pub fn observe(&self, v: f64) {
+        // A non-finite observation (NaN/±Inf) would poison `_sum` and, for NaN,
+        // never satisfy `v <= bound`, silently landing in the +Inf bucket. Drop
+        // it rather than corrupt the series (#167).
+        if !v.is_finite() {
+            return;
+        }
         let idx = self
             .bounds
             .iter()
@@ -314,8 +329,12 @@ impl Metrics {
 }
 
 fn fmt_f64(v: f64) -> String {
-    if v == f64::INFINITY {
+    if v.is_nan() {
+        "NaN".to_string()
+    } else if v == f64::INFINITY {
         "+Inf".to_string()
+    } else if v == f64::NEG_INFINITY {
+        "-Inf".to_string()
     } else {
         format!("{v}")
     }
@@ -413,5 +432,46 @@ mod tests {
         let m = Metrics::new();
         m.counter("x", "h", labels(&[("k", "a\"b")])).inc();
         assert!(m.render().contains("k=\"a\\\"b\""));
+    }
+
+    #[test]
+    fn histogram_normalizes_unsorted_and_nonfinite_bounds() {
+        // Unsorted + non-finite bounds must be normalized so `_bucket` output is
+        // still cumulative/monotonic (#167).
+        let m = Metrics::new();
+        let h = m.histogram_with(
+            "lat",
+            "latency",
+            Labels::new(),
+            vec![1.0, f64::NAN, 0.1, f64::INFINITY, 0.1],
+        );
+        h.observe(0.05);
+        h.observe(0.5);
+        let out = m.render();
+        // Bounds became [0.1, 1.0] (sorted, deduped, finite-only).
+        assert!(out.contains("lat_bucket{le=\"0.1\"} 1"), "{out}");
+        assert!(out.contains("lat_bucket{le=\"1\"} 2"), "{out}");
+        assert!(out.contains("lat_bucket{le=\"+Inf\"} 2"), "{out}");
+    }
+
+    #[test]
+    fn histogram_drops_nonfinite_observations() {
+        // NaN/±Inf observations would poison _sum and mis-bucket; they are
+        // dropped (#167).
+        let m = Metrics::new();
+        let h = m.histogram_with("lat", "latency", Labels::new(), vec![1.0]);
+        h.observe(f64::NAN);
+        h.observe(f64::INFINITY);
+        h.observe(0.5);
+        assert_eq!(h.count(), 1);
+        assert!((h.sum() - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fmt_f64_renders_nonfinite() {
+        assert_eq!(fmt_f64(f64::NAN), "NaN");
+        assert_eq!(fmt_f64(f64::INFINITY), "+Inf");
+        assert_eq!(fmt_f64(f64::NEG_INFINITY), "-Inf");
+        assert_eq!(fmt_f64(1.5), "1.5");
     }
 }

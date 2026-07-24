@@ -45,7 +45,13 @@ use xxhash_rust::xxh3::xxh3_64;
 /// design invariant) while remaining backend-neutral: a future revision can map
 /// an opaque Kubernetes `resourceVersion` or etcd revision onto the same token
 /// type without changing clients.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+/// `Ord`/`PartialOrd` are intentionally NOT derived: the epoch is an
+/// equality-only content hash, so magnitude comparison is meaningless (there is
+/// no "newer > older" since the #80 monotonic→hash change). Omitting the derives
+/// makes a stray `>`/`<` on an epoch fail to compile rather than silently do the
+/// wrong thing; clients compare with `==`/`!=` only. `StoreRevision` models the
+/// same constraint by not deriving `Ord` (#167).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct Epoch(pub u64);
 
 impl Epoch {

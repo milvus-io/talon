@@ -104,8 +104,21 @@ impl Coordinator {
     async fn dispatch(&self, message: ControlMessage) -> ControlMessage {
         match message {
             ControlMessage::Register { node } => {
-                tracing::info!(id = %node.id, address = %node.address, "worker registered");
-                self.service.membership().register(node);
+                // Legacy control-plane path. It used to call
+                // `membership().register(node)` directly, which writes only this
+                // coordinator's in-memory set — no ClusterStateStore write, no
+                // is_ready()/health gate. In active-active that makes the node
+                // visible on just the receiving coordinator, and the very next
+                // reconcile_membership tick (which replaces the whole set from the
+                // store snapshot) deletes it. That local-only, self-erasing insert
+                // is misleading, so make Register a no-op for membership: workers
+                // use NodeStatusHeartbeat, which persists through the store (#167).
+                tracing::info!(
+                    id = %node.id,
+                    address = %node.address,
+                    "legacy Register received; membership is store-authoritative, \
+                     use NodeStatusHeartbeat"
+                );
                 self.observability.metrics().record_registration(true);
                 ControlMessage::Ack {
                     ok: true,
@@ -287,10 +300,15 @@ async fn main() -> anyhow::Result<()> {
         tokio::select! {
             accepted = listener.accept() => {
                 let (stream, peer) = accepted?;
-                let permit = conn_limit.acquire().await;
+                let conn_limit = conn_limit.clone();
                 let state = Arc::clone(&state);
+                // Acquire the connection permit *inside* the spawned task, not in
+                // the select! arm: at MAX_CONTROL_CONNECTIONS a blocking
+                // acquire().await here would stall the accept loop and starve the
+                // ctrl_c shutdown branch until a permit frees (#167). The task
+                // waits for a slot instead, keeping the select! responsive.
                 tokio::spawn(async move {
-                    let _permit = permit;
+                    let _permit = conn_limit.acquire().await;
                     if let Err(error) = handle_conn(stream, state).await {
                         tracing::debug!(%peer, %error, "coordinator connection ended");
                     }

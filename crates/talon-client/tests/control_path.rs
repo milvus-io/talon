@@ -1,15 +1,20 @@
 //! Integration test: the coordinator serve loop over real TCP.
 //!
 //! Launches the built `talon-coordinator` binary, registers a mock worker via
-//! the real control protocol, then exercises the two client-side lookups
-//! (`PlacementLookup` + `MembershipQuery`) and asserts the owner id resolves
-//! back to the worker's address. This covers the whole control path end-to-end
-//! without needing Azure credentials or a running worker/data plane.
+//! the real control protocol (`NodeStatusHeartbeat`, the store-authoritative
+//! path), then exercises the two client-side lookups (`PlacementLookup` +
+//! `MembershipQuery`) and asserts the owner id resolves back to the worker's
+//! address. This covers the whole control path end-to-end without needing Azure
+//! credentials or a running worker/data plane.
 
+use std::collections::BTreeMap;
 use std::process::{Child, Command};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
+use talon_core::{
+    Backend, BlockId, NodeHealth, NodeId, NodeInfo, NodeMetricsSnapshot, NodeRole, NodeStatus,
+    ObjectId, Version, NODE_STATUS_SCHEMA_VERSION,
+};
 use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -75,13 +80,40 @@ async fn control_path_register_lookup_resolve() {
     }
     assert!(connected, "coordinator did not start listening");
 
-    // A mock worker registers itself.
+    // A mock worker registers itself via the store-authoritative heartbeat
+    // (the legacy Register path is now a membership no-op, #167).
     let node = NodeInfo {
         id: NodeId::new("127.0.0.1:9999"),
         address: "127.0.0.1:9999".into(),
         role: NodeRole::Worker,
     };
-    let ack = round_trip(addr, &ControlMessage::Register { node: node.clone() }).await;
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let status = NodeStatus {
+        schema_version: NODE_STATUS_SCHEMA_VERSION,
+        // The coordinator binary defaults to cluster_id "default".
+        cluster_id: "default".into(),
+        node: node.clone(),
+        incarnation_id: "e2e-incarnation".into(),
+        admin_address: Some("127.0.0.1:8999".into()),
+        build_version: "test".into(),
+        started_at_unix_ms: now,
+        reported_at_unix_ms: now,
+        heartbeat_seq: 0,
+        health: NodeHealth::Healthy,
+        ready: true,
+        metrics: NodeMetricsSnapshot::default(),
+        labels: BTreeMap::new(),
+    };
+    let ack = round_trip(
+        addr,
+        &ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(status),
+        },
+    )
+    .await;
     assert!(matches!(ack, ControlMessage::Ack { ok: true, .. }));
 
     // Placement lookup should now name our worker as the owner.
