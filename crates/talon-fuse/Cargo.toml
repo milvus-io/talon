@@ -42,3 +42,7 @@ divan.workspace = true
 name = "read_path_benches"
 harness = false
 
+[[bench]]
+name = "conn_pool_benches"
+harness = false
+

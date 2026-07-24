@@ -15,6 +15,10 @@ path = "src/main.rs"
 name = "observability_benches"
 harness = false
 
+[[bench]]
+name = "serve_path_benches"
+harness = false
+
 [dependencies]
 talon-core.workspace = true
 talon-transport.workspace = true

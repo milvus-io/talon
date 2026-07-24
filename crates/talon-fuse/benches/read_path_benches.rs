@@ -6,10 +6,12 @@
 //! ([`ReadaheadState::on_read`]). They are deterministic (no network, no disk)
 //! so they can be committed as a baseline and diffed by `scripts/bench.py`.
 //!
-//! The end-to-end read *throughput* number (which the sendfile and
-//! connection-pooling work will move) is measured by the gated real-kernel
-//! mount test, not here — a divan microbench over loopback would mostly time
-//! the OS TCP stack, not our code.
+//! The end-to-end read *throughput* wins from sendfile (#179) and connection
+//! pooling (#181) are measured separately by real-loopback comparison benches
+//! (`talon-worker`'s `serve_path_benches` and this crate's `conn_pool_benches`),
+//! which pair the old and new paths so the delta is the payoff. Those are
+//! informational (timing-sensitive real TCP) and not committed to the baseline;
+//! the deterministic planning benches here are.
 
 use talon_core::{Backend, ObjectId, Version};
 use talon_fuse::{plan_read, ReadaheadConfig, ReadaheadState};
