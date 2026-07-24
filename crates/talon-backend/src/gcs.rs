@@ -141,7 +141,13 @@ impl BackendStore for GcsBackend {
             .header("x-goog-generation")
             .or_else(|| resp.header("etag"))
             .map(|v| Version::new(v.trim_matches('"').to_string()))
-            .unwrap_or_else(|| Version::new(""));
+            .filter(|v| !v.0.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "GCS HEAD {} returned no generation/ETag; refusing to cache without a version",
+                    obj.to_path()
+                ))
+            })?;
         Ok(ObjectStat { len, version })
     }
 }
