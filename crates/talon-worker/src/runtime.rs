@@ -8,9 +8,7 @@ use talon_core::{
 };
 use talon_transport::data::RangeRequest;
 
-use crate::{
-    Admission, BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics,
-};
+use crate::{BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics};
 
 /// Shared state required to serve instrumented data-plane range requests.
 pub struct WorkerRuntime {
@@ -134,9 +132,11 @@ impl WorkerRuntime {
     /// cache-hit path when resident and the backend-miss path otherwise.
     ///
     /// Concurrent misses for the same block are deduplicated: the first caller
-    /// (`Admission::Started`) performs the backend fetch; the rest wait for it
-    /// and then serve from the now-warm cache, so N concurrent misses trigger a
-    /// single backend fetch instead of N (issue #113).
+    /// (the leader, holding an `InFlightGuard`) performs the backend fetch; the
+    /// rest wait for it and then serve from the now-warm cache, so N concurrent
+    /// misses trigger a single backend fetch instead of N (issue #113). The
+    /// guard clears the in-flight marker on drop, so a cancelled or panicking
+    /// leader can never orphan the key and hang the waiters (issue #162).
     async fn block_bytes(
         &self,
         request: &RangeRequest,
@@ -148,34 +148,40 @@ impl WorkerRuntime {
 
         self.metrics.record_cache_miss();
         let key = LoadKey::Whole(block.clone());
-        match self.inflight.admit(key.clone()) {
-            Admission::AlreadyLoading => {
+        match self.inflight.admit_owned(key.clone()) {
+            Some(guard) => {
+                // Leader: fetch and commit; the guard wakes waiters on drop
+                // (including on cancellation/panic).
+                let result = self.fetch_and_commit(request, block).await;
+                drop(guard);
+                result
+            }
+            None => {
                 // A peer is already fetching this block; wait for it and serve
                 // from cache rather than issuing a duplicate backend fetch.
                 self.inflight.wait(&key).await;
                 if let Some(bytes) = self.cached_block(block).await? {
                     return Ok(bytes);
                 }
-                // The leader's load failed (key cleared, block still absent).
-                // Fall through and fetch ourselves, admitting a fresh load.
-                if self.inflight.admit(key.clone()) == Admission::AlreadyLoading {
-                    // Another peer already restarted; wait once more, then, if
-                    // still absent, fetch without holding admission to avoid an
-                    // unbounded wait loop.
-                    self.inflight.wait(&key).await;
-                    if let Some(bytes) = self.cached_block(block).await? {
-                        return Ok(bytes);
+                // The leader's load failed (marker cleared, block still absent).
+                // Try to become the leader ourselves.
+                match self.inflight.admit_owned(key.clone()) {
+                    Some(guard) => {
+                        let result = self.fetch_and_commit(request, block).await;
+                        drop(guard);
+                        result
                     }
-                    return self.fetch_and_commit(request, block).await;
+                    None => {
+                        // Another peer already restarted the load; wait once
+                        // more, then, if still absent, fetch without holding
+                        // admission to avoid an unbounded wait loop.
+                        self.inflight.wait(&key).await;
+                        if let Some(bytes) = self.cached_block(block).await? {
+                            return Ok(bytes);
+                        }
+                        self.fetch_and_commit(request, block).await
+                    }
                 }
-                let result = self.fetch_and_commit(request, block).await;
-                self.inflight.complete(&key);
-                result
-            }
-            Admission::Started => {
-                let result = self.fetch_and_commit(request, block).await;
-                self.inflight.complete(&key);
-                result
             }
         }
     }
