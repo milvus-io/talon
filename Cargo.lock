@@ -2287,6 +2287,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "clap",
+ "divan",
  "fuser",
  "libc",
  "talon-core",
