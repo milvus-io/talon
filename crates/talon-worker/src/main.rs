@@ -197,6 +197,7 @@ async fn main() -> anyhow::Result<()> {
         inflight,
         backend,
         cfg.block_size,
+        cfg.capacity_bytes,
         observability.metrics().clone(),
     ));
 
@@ -621,6 +622,7 @@ mod tests {
             inflight,
             backend,
             8,
+            0,
             observability.metrics().clone(),
         ));
         (worker, observability, node, root)

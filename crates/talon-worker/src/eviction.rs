@@ -135,6 +135,41 @@ impl Lru {
         Some(e.bytes)
     }
 
+    /// Evict and return every *superseded* whole-block unit for the same
+    /// `(object, offset, block_size)` as `keep` but a different version.
+    ///
+    /// When an object is overwritten its new ETag yields a new [`BlockId`] and a
+    /// new `.blk` file, while the old version's file would otherwise stay
+    /// resident forever (issue #159, compounding #119). Called on commit of a
+    /// fresh version, this reclaims the stale sibling(s) immediately. Pinned
+    /// units (an in-flight reader still serving the old bytes) are left alone.
+    pub fn evict_superseded(&self, keep: &BlockId) -> Vec<CacheUnit> {
+        let mut g = self.inner.lock().unwrap();
+        let victims: Vec<CacheUnit> = g
+            .entries
+            .iter()
+            .filter(|(unit, e)| {
+                e.pins == 0
+                    && match unit {
+                        CacheUnit::Whole(id) => {
+                            id.object == keep.object
+                                && id.offset == keep.offset
+                                && id.block_size == keep.block_size
+                                && id.version != keep.version
+                        }
+                        CacheUnit::Page(..) => false,
+                    }
+            })
+            .map(|(unit, _)| unit.clone())
+            .collect();
+        for unit in &victims {
+            if let Some(e) = g.entries.remove(unit) {
+                g.total_bytes -= e.bytes;
+            }
+        }
+        victims
+    }
+
     /// Evict coldest unpinned units until `total_bytes <= capacity`.
     ///
     /// Returns the evicted units (coldest first) so the caller can unlink files
@@ -251,5 +286,60 @@ mod tests {
         let evicted = lru.evict_to_fit(64);
         assert_eq!(evicted, vec![CacheUnit::Page(b.clone(), PageIndex(0))]);
         assert_eq!(lru.total_bytes(), 64);
+    }
+
+    #[test]
+    fn evict_superseded_reclaims_only_other_versions() {
+        // Two versions of the same (object, offset), a different offset of the
+        // same object, and a pinned old version.
+        let obj = ObjectId::new(Backend::S3, "b", "same");
+        let v1 = CacheUnit::Whole(BlockId::new(obj.clone(), 0, 256 << 20, Version::new("v1")));
+        let v2 = CacheUnit::Whole(BlockId::new(obj.clone(), 0, 256 << 20, Version::new("v2")));
+        let other_offset = CacheUnit::Whole(BlockId::new(
+            obj.clone(),
+            256 << 20,
+            256 << 20,
+            Version::new("v1"),
+        ));
+        let other_obj = whole(42);
+        let lru = Lru::new();
+        for (u, b) in [
+            (&v1, 100),
+            (&v2, 100),
+            (&other_offset, 100),
+            (&other_obj, 100),
+        ] {
+            lru.insert(u.clone(), b);
+        }
+
+        let CacheUnit::Whole(keep) = v2.clone() else {
+            unreachable!()
+        };
+        let evicted = lru.evict_superseded(&keep);
+        // Only v1 (same object+offset+block_size, different version) is reclaimed.
+        assert_eq!(evicted, vec![v1.clone()]);
+        assert_eq!(lru.total_bytes(), 300);
+        assert!(lru.remove(&v2).is_some());
+        assert!(lru.remove(&other_offset).is_some());
+        assert!(lru.remove(&other_obj).is_some());
+        assert!(lru.remove(&v1).is_none());
+    }
+
+    #[test]
+    fn evict_superseded_skips_pinned_old_version() {
+        let obj = ObjectId::new(Backend::S3, "b", "same");
+        let v1 = CacheUnit::Whole(BlockId::new(obj.clone(), 0, 256 << 20, Version::new("v1")));
+        let v2 = CacheUnit::Whole(BlockId::new(obj.clone(), 0, 256 << 20, Version::new("v2")));
+        let lru = Lru::new();
+        lru.insert(v1.clone(), 100);
+        lru.insert(v2.clone(), 100);
+        // An in-flight reader still serving the old bytes pins v1.
+        assert!(lru.pin(&v1));
+
+        let CacheUnit::Whole(keep) = v2.clone() else {
+            unreachable!()
+        };
+        assert!(lru.evict_superseded(&keep).is_empty());
+        assert_eq!(lru.total_bytes(), 200);
     }
 }
