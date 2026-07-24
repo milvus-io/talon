@@ -16,6 +16,10 @@
 //! to finish and then serve from the now-warm cache, so N concurrent misses for
 //! the same block trigger exactly **one** backend fetch. When a load completes,
 //! [`InFlightLoads::complete`] clears the key and wakes all waiters.
+//!
+//! Prefer [`InFlightLoads::admit_owned`], which hands the leader an
+//! [`InFlightGuard`] that clears the marker on drop — so a cancelled or
+//! panicking leader can never orphan the key and hang the waiters (#162).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -72,6 +76,30 @@ impl InFlightLoads {
             Entry::Vacant(slot) => {
                 slot.insert(Arc::new(Notify::new()));
                 Admission::Started
+            }
+        }
+    }
+
+    /// Like [`admit`](Self::admit) but, when this caller becomes the leader,
+    /// returns an RAII [`InFlightGuard`] that calls [`complete`](Self::complete)
+    /// on drop.
+    ///
+    /// This is cancellation- and panic-safe: if the leader's fetch task is
+    /// dropped (client disconnect) or panics, the guard's `Drop` still clears
+    /// the in-flight marker and wakes waiters, so a followers' [`wait`] can never
+    /// hang forever on an orphaned key (issue #162). `None` means a load is
+    /// already in flight (the caller should [`wait`](Self::wait)).
+    pub fn admit_owned(self: &Arc<Self>, key: LoadKey) -> Option<InFlightGuard> {
+        use std::collections::hash_map::Entry;
+        let mut g = self.inner.lock().unwrap();
+        match g.entry(key.clone()) {
+            Entry::Occupied(_) => None,
+            Entry::Vacant(slot) => {
+                slot.insert(Arc::new(Notify::new()));
+                Some(InFlightGuard {
+                    inflight: Arc::clone(self),
+                    key: Some(key),
+                })
             }
         }
     }
@@ -135,6 +163,24 @@ impl InFlightLoads {
     /// Whether no loads are in flight.
     pub fn is_empty(&self) -> bool {
         self.inner.lock().unwrap().is_empty()
+    }
+}
+
+/// RAII marker for an in-flight load owned by the leader caller.
+///
+/// Dropping the guard calls [`InFlightLoads::complete`], clearing the key and
+/// waking any waiters — even if the owning task is cancelled or panics — so an
+/// interrupted fetch can never orphan the key and hang future readers (#162).
+pub struct InFlightGuard {
+    inflight: Arc<InFlightLoads>,
+    key: Option<LoadKey>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if let Some(key) = self.key.take() {
+            self.inflight.complete(&key);
+        }
     }
 }
 
@@ -246,6 +292,42 @@ mod tests {
         for w in waiters {
             w.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn guard_drop_clears_marker_and_wakes_waiters() {
+        // The RAII guard must clear the in-flight key and wake waiters when it is
+        // dropped WITHOUT an explicit complete() -- e.g. the leader task was
+        // cancelled or panicked mid-fetch (issue #162). Otherwise waiters hang
+        // forever on an orphaned key.
+        use std::sync::Arc;
+        let f = Arc::new(InFlightLoads::new());
+        let key = LoadKey::Whole(block(12));
+        let guard = f
+            .admit_owned(key.clone())
+            .expect("first caller is the leader");
+        // A second caller is not the leader.
+        assert!(f.admit_owned(key.clone()).is_none());
+        assert!(f.is_in_flight(&key));
+
+        let waiter = {
+            let f = Arc::clone(&f);
+            let key = key.clone();
+            tokio::spawn(async move {
+                f.wait(&key).await;
+                assert!(!f.is_in_flight(&key));
+            })
+        };
+        tokio::task::yield_now().await;
+
+        // Simulate the leader being dropped (cancellation/panic) with no explicit
+        // complete(): the guard's Drop must release the marker and wake waiters.
+        drop(guard);
+        assert!(!f.is_in_flight(&key));
+        waiter.await.unwrap();
+
+        // After release a fresh caller can become the leader again.
+        assert!(f.admit_owned(key).is_some());
     }
 
     #[test]
