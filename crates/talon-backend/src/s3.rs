@@ -90,9 +90,18 @@ impl S3Backend {
     }
 
     /// Format an HTTP `Range` header value for `[offset, offset+len)`.
+    ///
+    /// `len` must be `> 0` (callers guard this in `fetch_range`). A zero or
+    /// overflowing `len` is clamped with checked arithmetic so this public
+    /// helper can never underflow/overflow into a bogus `bytes=` range (#167):
+    /// a zero `len` yields the single byte at `offset`, and an overflowing end
+    /// saturates at `u64::MAX`.
     pub fn range_header(offset: u64, len: u64) -> String {
-        // HTTP ranges are inclusive on both ends.
-        let end = offset + len - 1;
+        // Inclusive end = offset + len - 1, guarded against under/overflow: a
+        // zero len yields the single byte at `offset`, and an overflowing end
+        // saturates at u64::MAX.
+        let span = len.saturating_sub(1);
+        let end = offset.saturating_add(span);
         format!("bytes={offset}-{end}")
     }
 
@@ -278,6 +287,18 @@ mod tests {
     fn range_header_is_inclusive() {
         assert_eq!(S3Backend::range_header(0, 100), "bytes=0-99");
         assert_eq!(S3Backend::range_header(256, 256), "bytes=256-511");
+    }
+
+    #[test]
+    fn range_header_clamps_zero_and_overflow() {
+        // len == 0 must not underflow (would panic in debug / wrap in release).
+        assert_eq!(S3Backend::range_header(10, 0), "bytes=10-10");
+        // offset + len overflowing u64 saturates the inclusive end at u64::MAX
+        // instead of wrapping to a bogus small range (#167).
+        assert_eq!(
+            S3Backend::range_header(u64::MAX - 1, u64::MAX),
+            format!("bytes={}-{}", u64::MAX - 1, u64::MAX)
+        );
     }
 
     #[test]

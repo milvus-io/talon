@@ -267,12 +267,21 @@ impl WorkerConfig {
         if self.advertise_addr.is_empty() {
             return Err(Error::Other("advertise_addr must not be empty".into()));
         }
-        if self.advertise_addr.starts_with("0.0.0.0:") || self.advertise_addr.starts_with("[::]:") {
-            return Err(Error::Other(format!(
-                "advertise_addr {:?} is a wildcard bind and is unreachable by clients; \
-                 set advertise_addr (or TALON_WORKER_ADVERTISE_ADDR) to a routable address",
-                self.advertise_addr
-            )));
+        // The advertised address is handed to clients to dial, so a wildcard
+        // bind is unreachable. When it parses as an IP socket address, reject an
+        // unspecified IP so every spelling of the wildcard is caught (`0.0.0.0`,
+        // `::`, `[::]`, `[::0]`, `0:0:0:0:0:0:0:0`, ...), not just two string
+        // prefixes (issue #118, hardened per #167). A non-IP form (hostname:port)
+        // does not parse as SocketAddr and is left to DNS — it is never a
+        // wildcard, so it is permitted as before.
+        if let Ok(addr) = self.advertise_addr.parse::<std::net::SocketAddr>() {
+            if addr.ip().is_unspecified() {
+                return Err(Error::Other(format!(
+                    "advertise_addr {:?} is a wildcard bind and is unreachable by clients; \
+                     set advertise_addr (or TALON_WORKER_ADVERTISE_ADDR) to a routable address",
+                    self.advertise_addr
+                )));
+            }
         }
         if self.heartbeat_interval_ms == 0 {
             return Err(Error::Other(
@@ -595,6 +604,36 @@ mod tests {
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("advertise_addr"));
+
+        // Every spelling of the unspecified address is rejected, not just the
+        // two string prefixes the old check matched (issue #167).
+        for wildcard in [
+            "[::]:7001",
+            "[::0]:7001",
+            "[0:0:0:0:0:0:0:0]:7001",
+            "[0000:0000:0000:0000:0000:0000:0000:0000]:7001",
+        ] {
+            let cli = WorkerConfigPatch {
+                advertise_addr: Some(wildcard.into()),
+                ..Default::default()
+            };
+            let err =
+                WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+            assert!(
+                err.to_string().contains("advertise_addr"),
+                "{wildcard} must be rejected as a wildcard"
+            );
+        }
+
+        // A routable IPv6 address and a hostname:port form are both accepted.
+        for ok in ["[2001:db8::1]:7001", "worker-0.svc:7001"] {
+            let cli = WorkerConfigPatch {
+                advertise_addr: Some(ok.into()),
+                ..Default::default()
+            };
+            let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+            assert_eq!(cfg.advertise_addr, ok);
+        }
     }
 
     #[test]
