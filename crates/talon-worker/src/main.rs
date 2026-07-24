@@ -14,9 +14,12 @@
 //! - Backend fetch is the real [`AzureBackend`] over [`ReqwestClient`]; the SAS
 //!   token is read from the environment and **never logged**.
 //!
-//! The response returns bytes inline for simplicity; the production hot path
-//! serves them zero-copy via `sendfile` from the committed block file
-//! ([`send_file_range`](talon_worker::send_file_range)).
+//! The hot path serves cached blocks **zero-copy** via `sendfile(2)`
+//! ([`send_file_range`](talon_worker::send_file_range)) straight from the
+//! committed block file's descriptor into the client socket — the bytes never
+//! enter user space and no per-request block buffer is allocated (issue #179). A
+//! cache miss (bytes just fetched into memory) or a boundary-spanning read falls
+//! back to writing the in-memory bytes inline.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -31,7 +34,8 @@ use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
 use talon_worker::{
-    serve_admin, BlockIndex, InFlightLoads, WholeBlockStore, WorkerObservability, WorkerRuntime,
+    send_file_range, serve_admin, BlockIndex, InFlightLoads, ServeOutcome, WholeBlockStore,
+    WorkerObservability, WorkerRuntime, DEFAULT_CHUNK,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -404,8 +408,34 @@ async fn handle_conn(
             continue;
         }
 
-        match worker.serve_range(&req).await {
-            Ok(bytes) => {
+        match worker.serve(&req).await {
+            Ok(ServeOutcome::Sendfile(handle)) => {
+                // Zero-copy hit: write the frame header async, then stream the
+                // block file's fd straight into the socket with sendfile(2) on
+                // the blocking pool. The header's advertised length equals the
+                // handle length, so a short read can never desync the client.
+                let len = handle.len;
+                let hdr = data::response_header_ok(h.request_id, len as u32);
+                stream.write_all(&hdr).await?;
+                stream.flush().await?;
+                match sendfile_payload(stream, handle).await {
+                    Ok(returned) => {
+                        stream = returned;
+                        observability
+                            .metrics()
+                            .record_request_success(len, request_started.elapsed());
+                    }
+                    Err(error) => {
+                        // The header is already on the wire, so we cannot send an
+                        // error frame; the connection is desynced. Drop it.
+                        observability
+                            .metrics()
+                            .record_request_error(request_started.elapsed());
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(ServeOutcome::Bytes(bytes)) => {
                 let hdr = data::response_header_ok(h.request_id, bytes.len() as u32);
                 stream.write_all(&hdr).await?;
                 stream.write_all(&bytes).await?;
@@ -424,6 +454,48 @@ async fn handle_conn(
             }
         }
     }
+}
+
+/// Stream a resident block's bytes to the client with `sendfile(2)`.
+///
+/// `sendfile` is blocking and Linux-specific, and the tokio [`TcpStream`] is
+/// non-blocking (a blocking `sendfile` on it would spuriously `EAGAIN`). So we
+/// take the stream out of tokio ([`into_std`]), put the socket in blocking mode,
+/// run the chunked [`send_file_range`] loop on the blocking helper pool
+/// ([`spawn_blocking`]) — never on the async reactor, per DESIGN.md — then
+/// restore non-blocking mode and hand the stream back for the next request.
+///
+/// [`into_std`]: tokio::net::TcpStream::into_std
+/// [`spawn_blocking`]: tokio::task::spawn_blocking
+async fn sendfile_payload(
+    stream: TcpStream,
+    handle: talon_core::BlockHandle,
+) -> anyhow::Result<TcpStream> {
+    let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(false)?;
+    let (std_stream, result) = tokio::task::spawn_blocking(move || {
+        let res = send_file_range(
+            &std_stream,
+            &handle.fd,
+            handle.offset,
+            handle.len,
+            DEFAULT_CHUNK,
+        );
+        (std_stream, res)
+    })
+    .await?;
+    let sent = result?;
+    if sent != handle.len {
+        // sendfile hit EOF before the advertised length: the block file is
+        // shorter than the index claimed. The header already promised `len`
+        // bytes, so the connection is desynced — surface an error to drop it.
+        anyhow::bail!(
+            "sendfile short read: sent {sent} of {} bytes; block file truncated",
+            handle.len
+        );
+    }
+    std_stream.set_nonblocking(true)?;
+    Ok(TcpStream::from_std(std_stream)?)
 }
 
 /// Read one framed control message (header + payload). `Ok(None)` on clean EOF.
@@ -585,6 +657,117 @@ mod tests {
         assert!(!observability.is_ready());
 
         control.abort();
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A backend that serves deterministic bytes so a block can be committed and
+    /// then re-served on a hit — used to exercise the end-to-end sendfile path.
+    struct RampBackend;
+
+    #[async_trait]
+    impl BackendStore for RampBackend {
+        async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            Ok(Bytes::from(
+                (0..len)
+                    .map(|i| ((offset + i) % 251) as u8)
+                    .collect::<Vec<u8>>(),
+            ))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: u64::MAX,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_conn_serves_a_hit_via_sendfile_byte_exact() {
+        use talon_transport::data::{encode_request, RangeRequest};
+
+        // Build a worker over a ramp backend so the first request commits a block
+        // and the second is a resident hit served with sendfile.
+        let root = tmp_root();
+        let index = Arc::new(BlockIndex::new());
+        let inflight = Arc::new(InFlightLoads::new());
+        let node = NodeInfo {
+            id: NodeId::new("w"),
+            address: "127.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let observability = Arc::new(
+            WorkerObservability::new(
+                "c".into(),
+                node,
+                "127.0.0.1:8001".into(),
+                1024,
+                Arc::clone(&index),
+                Arc::clone(&inflight),
+            )
+            .unwrap(),
+        );
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        observability.readiness().set_control_registered(true);
+        let backend: Arc<dyn BackendStore> = Arc::new(RampBackend);
+        let worker = Arc::new(WorkerRuntime::new(
+            WholeBlockStore::open(&root).unwrap(),
+            index,
+            inflight,
+            backend,
+            16, // block_size
+            0,
+            observability.metrics().clone(),
+        ));
+
+        // Serve the connection loop in the background.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_worker = Arc::clone(&worker);
+        let srv_obs = Arc::clone(&observability);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, srv_worker, srv_obs).await;
+        });
+
+        // A client that issues two identical range requests on one connection:
+        // the first is a miss (Bytes path), the second a hit (sendfile path).
+        let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+        let req = RangeRequest {
+            object: obj,
+            offset: 3,
+            len: 8,
+        };
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let expected: Vec<u8> = (0..8u64).map(|i| ((3 + i) % 251) as u8).collect();
+
+        for _ in 0..2 {
+            let out = encode_request(0, &req).unwrap();
+            client.write_all(&out).await.unwrap();
+            client.flush().await.unwrap();
+
+            let mut hdr = [0u8; HEADER_LEN];
+            client.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            assert!(
+                !header.flags.contains(talon_transport::Flags::ERROR),
+                "worker returned an error frame"
+            );
+            // The response body is the raw range bytes (no envelope), so a worker
+            // can sendfile them straight from the block file.
+            let mut body = vec![0u8; header.length as usize];
+            client.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, expected, "range bytes must match on miss and hit");
+        }
+
+        drop(client);
+        server.await.unwrap();
+        // A hit was recorded (the sendfile path bumps the cache-hit counter).
+        assert!(observability
+            .metrics()
+            .render()
+            .contains("talon_worker_cache_hits_total{form=\"whole\"} 1"));
         std::fs::remove_dir_all(root).ok();
     }
 

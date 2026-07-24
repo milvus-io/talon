@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use talon_core::{
-    BackendStore, BlockForm, BlockId, BlockMeta, Error, ObjectId, ObjectStore, PageIndex, Version,
+    BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId, ObjectStore,
+    PageIndex, Version,
 };
 use talon_transport::data::RangeRequest;
 
@@ -25,6 +26,22 @@ const DEFAULT_VERSION_TTL: Duration = Duration::from_secs(3);
 struct CachedVersion {
     version: Version,
     resolved_at: Instant,
+}
+
+/// How the serve loop should transmit a range's bytes to the client.
+///
+/// The whole point is to avoid pulling a resident block through user space: when
+/// the request lies entirely within a single already-cached block, the runtime
+/// hands back an open file descriptor over the exact sub-range so the caller can
+/// stream it with `sendfile(2)` (zero-copy, no per-request allocation). Every
+/// other shape — a cache miss, or a request spanning block boundaries — falls
+/// back to the in-memory byte path.
+pub enum ServeOutcome {
+    /// Serve these bytes with `sendfile` straight from the block file's fd.
+    Sendfile(BlockHandle),
+    /// Serve these already-in-memory bytes (miss just fetched, or a stitched
+    /// multi-block read).
+    Bytes(bytes::Bytes),
 }
 
 /// Shared state required to serve instrumented data-plane range requests.
@@ -140,6 +157,92 @@ impl WorkerRuntime {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Serve `[offset, offset + len)`, choosing a zero-copy `sendfile` path when
+    /// the whole range lies within a single already-resident block.
+    ///
+    /// This is the preferred entry point for the data plane: for the common case
+    /// (a sub-range read of a cached block) it returns a [`ServeOutcome::Sendfile`]
+    /// carrying an open fd over the exact bytes, so the caller streams them with
+    /// `sendfile(2)` without ever reading the block into user space or allocating
+    /// (issue #179). A cache miss, a boundary-spanning read, or a lost open race
+    /// falls back to [`ServeOutcome::Bytes`] via the existing in-memory path.
+    ///
+    /// Version resolution and the precondition retry mirror [`serve_range`](Self::serve_range):
+    /// blocks are keyed by the resolved ETag, and a `412`/`VersionMismatch` inside
+    /// the version-cache window re-resolves once (issues #119, #163).
+    pub async fn serve(&self, request: &RangeRequest) -> anyhow::Result<ServeOutcome> {
+        if request.len == 0 {
+            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
+        }
+        let version = self.resolve_version(&request.object, false).await?;
+        match self.serve_at(request, &version).await {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if is_version_mismatch(&error) => {
+                self.invalidate_version(&request.object);
+                let version = self.resolve_version(&request.object, true).await?;
+                self.serve_at(request, &version).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// The single-resolved-version body of [`serve`](Self::serve).
+    ///
+    /// Tries the zero-copy fast path: if the request lies within one block and
+    /// that block is already resident, open an fd over the exact sub-range and
+    /// return [`ServeOutcome::Sendfile`]. Anything else (miss, boundary span)
+    /// falls through to [`serve_range_at`](Self::serve_range_at) and returns [`ServeOutcome::Bytes`].
+    async fn serve_at(
+        &self,
+        request: &RangeRequest,
+        version: &Version,
+    ) -> anyhow::Result<ServeOutcome> {
+        let block_size = self.block_size as u64;
+        let end = request
+            .offset
+            .checked_add(request.len)
+            .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
+        let start_block = (request.offset / block_size) * block_size;
+
+        // Zero-copy fast path: whole range within one block that is resident.
+        if end <= start_block + block_size {
+            let block = self.block_for(&request.object, request.offset, version);
+            if matches!(
+                self.index.presence(&block, PageIndex(0), PageIndex(1)),
+                Presence::Whole
+            ) {
+                let offset_in_block = request.offset - block.offset;
+                // Open an fd over exactly the requested window. This can fail if
+                // the block was evicted between the presence check and the open
+                // (a benign race); fall through to the byte path in that case.
+                match self
+                    .store
+                    .get_range(&block, offset_in_block, request.len)
+                    .await
+                {
+                    // The whole-block store returns exactly one handle spanning
+                    // the requested window.
+                    Ok(mut handles) if handles.len() == 1 => {
+                        let handle = handles.pop().expect("one handle");
+                        self.metrics.record_cache_hit();
+                        self.lru.touch(&CacheUnit::Whole(block.clone()));
+                        tracing::info!(block = %block, "HIT (sendfile)");
+                        return Ok(ServeOutcome::Sendfile(handle));
+                    }
+                    Ok(_) | Err(_) => {
+                        // Lost the race with eviction, or an unexpected multi-handle
+                        // result; serve via the byte path (which re-fetches if
+                        // still absent).
+                    }
+                }
+            }
+        }
+
+        // Fallback: miss or boundary-spanning read → in-memory bytes.
+        let bytes = self.serve_range_at(request, version).await?;
+        Ok(ServeOutcome::Bytes(bytes))
     }
 
     /// Serve `[offset, offset + len)` against an already-resolved `version`.
@@ -538,12 +641,98 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Read the bytes a `Sendfile` outcome would transmit, straight from its fd.
+    fn read_handle(outcome: ServeOutcome) -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        match outcome {
+            ServeOutcome::Sendfile(handle) => {
+                let mut f = std::fs::File::from(handle.fd);
+                f.seek(SeekFrom::Start(handle.offset)).unwrap();
+                let mut buf = vec![0u8; handle.len as usize];
+                f.read_exact(&mut buf).unwrap();
+                buf
+            }
+            ServeOutcome::Bytes(_) => panic!("expected Sendfile, got Bytes"),
+        }
+    }
+
+    #[tokio::test]
+    async fn serve_uses_sendfile_on_a_resident_hit() {
+        // First serve is a miss → in-memory Bytes (block just fetched). The
+        // second serve of the same resident block returns a Sendfile handle over
+        // exactly the requested sub-range, byte-for-byte (issue #179).
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime(Arc::clone(&backend), WorkerMetrics::new(1024), &root);
+
+        // Miss: bytes path.
+        match runtime.serve(&request("ok")).await.unwrap() {
+            ServeOutcome::Bytes(b) => assert_eq!(b, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("first serve (miss) must be Bytes"),
+        }
+
+        // Hit: sendfile path, exact sub-range.
+        let outcome = runtime.serve(&request("ok")).await.unwrap();
+        assert_eq!(read_handle(outcome), b"abcd");
+        // No second backend fetch.
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn serve_sendfile_serves_a_mid_block_subrange() {
+        // A sub-range that does not start at 0 must open an fd at the right
+        // offset, so the handle covers exactly [offset, offset+len).
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime(Arc::clone(&backend), WorkerMetrics::new(1024), &root);
+
+        // Warm the block (returns b"abcdefgh").
+        let _ = runtime.serve(&request("ok")).await.unwrap();
+        // Request bytes [3, 7) of the same block: "defg".
+        let req = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "ok"),
+            offset: 3,
+            len: 4,
+        };
+        let outcome = runtime.serve(&req).await.unwrap();
+        assert_eq!(read_handle(outcome), b"defg");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn serve_falls_back_to_bytes_across_block_boundary() {
+        // A read spanning two blocks cannot be a single-fd sendfile; it must
+        // stitch in memory and return Bytes even when both blocks are resident.
+        let root = tmp_root();
+        let runtime = runtime_with(
+            Arc::new(RampBackend { block_size: 8 }),
+            WorkerMetrics::new(1024),
+            &root,
+            8,
+        );
+        // [6, 14) spans block0 [0,8) and block1 [8,16).
+        let req = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "ramp"),
+            offset: 6,
+            len: 8,
+        };
+        match runtime.serve(&req).await.unwrap() {
+            ServeOutcome::Bytes(b) => assert_eq!(b, expected(6, 8)),
+            ServeOutcome::Sendfile(_) => panic!("boundary-spanning read must be Bytes"),
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// A backend whose block content is deterministic per absolute offset, so a
     /// stitched multi-block read can be verified byte-for-byte.
     struct RampBackend {
         block_size: u64,
     }
-
     #[async_trait]
     impl BackendStore for RampBackend {
         async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
