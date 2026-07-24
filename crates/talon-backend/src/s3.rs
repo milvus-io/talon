@@ -172,7 +172,13 @@ impl BackendStore for S3Backend {
         let version = resp
             .header("etag")
             .map(etag_to_version)
-            .unwrap_or_else(|| Version::new(""));
+            .filter(|v| !v.0.trim().is_empty())
+            .ok_or_else(|| {
+                Error::Backend(format!(
+                    "S3 HEAD {} returned no usable ETag; refusing to cache without a version",
+                    obj.to_path()
+                ))
+            })?;
         Ok(ObjectStat { len, version })
     }
 }
@@ -317,6 +323,31 @@ mod tests {
         let http = MockHttp::new(HttpResponse {
             status: 200,
             headers: vec![("ETag".into(), "\"x\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http);
+        assert!(matches!(s3.head(&obj()).await, Err(Error::Backend(_))));
+    }
+
+    #[tokio::test]
+    async fn head_missing_or_empty_etag_errors_not_empty_version() {
+        // No ETag at all -> error (an empty version would collapse all object
+        // generations onto one cache key and serve stale data, issue #160).
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![("Content-Length".into(), "4096".into())],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        assert!(matches!(s3.head(&obj()).await, Err(Error::Backend(_))));
+
+        // A present-but-empty ETag is likewise refused.
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![
+                ("Content-Length".into(), "4096".into()),
+                ("ETag".into(), "\"\"".into()),
+            ],
             body: bytes::Bytes::new(),
         });
         let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http);
