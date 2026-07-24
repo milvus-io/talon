@@ -81,6 +81,21 @@ impl BlockIndex {
         self.inner.read().unwrap().map.get(id).cloned()
     }
 
+    /// Snapshot the `(BlockId, len)` of every currently-tracked block.
+    ///
+    /// Used to seed the eviction tracker at startup from the index rebuilt off
+    /// on-disk cache, so already-resident blocks count against capacity from the
+    /// first request (issue #159).
+    pub fn snapshot_lens(&self) -> Vec<(BlockId, u64)> {
+        self.inner
+            .read()
+            .unwrap()
+            .map
+            .values()
+            .map(|meta| (meta.id.clone(), meta.len))
+            .collect()
+    }
+
     /// Commit a fully-materialized block (whole or a complete paged set).
     ///
     /// Called by PUT and by loader completion. Replaces any existing entry;

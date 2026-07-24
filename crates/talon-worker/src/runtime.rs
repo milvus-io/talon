@@ -9,7 +9,9 @@ use talon_core::{
 };
 use talon_transport::data::RangeRequest;
 
-use crate::{BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics};
+use crate::{
+    BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, Presence, WholeBlockStore, WorkerMetrics,
+};
 
 /// Default lifetime of a cached resolved object version.
 ///
@@ -33,6 +35,11 @@ pub struct WorkerRuntime {
     backend: Arc<dyn BackendStore>,
     block_size: u32,
     metrics: WorkerMetrics,
+    /// Byte-accounted LRU driving capacity enforcement/eviction (issue #159).
+    lru: Arc<Lru>,
+    /// Maximum resident cache bytes before eviction reclaims the coldest blocks.
+    /// `0` disables capacity enforcement (unbounded — tests/dev only).
+    capacity_bytes: u64,
     /// Short-TTL cache of resolved object versions, so a warm read does not pay
     /// a backend `HEAD` per request (issue #163).
     version_cache: Mutex<HashMap<ObjectId, CachedVersion>>,
@@ -41,14 +48,25 @@ pub struct WorkerRuntime {
 
 impl WorkerRuntime {
     /// Create a request runtime over an initialized cache and backend.
+    ///
+    /// `capacity_bytes` bounds resident cache bytes; on each commit the runtime
+    /// evicts the coldest unpinned blocks back under the cap (issue #159). A
+    /// `capacity_bytes` of `0` disables enforcement (unbounded). The eviction
+    /// tracker is seeded from `index` so blocks already resident from an on-disk
+    /// scan count against capacity immediately.
     pub fn new(
         store: WholeBlockStore,
         index: Arc<BlockIndex>,
         inflight: Arc<InFlightLoads>,
         backend: Arc<dyn BackendStore>,
         block_size: u32,
+        capacity_bytes: u64,
         metrics: WorkerMetrics,
     ) -> Self {
+        let lru = Arc::new(Lru::new());
+        for (id, len) in index.snapshot_lens() {
+            lru.insert(CacheUnit::Whole(id), len);
+        }
         Self {
             store,
             index,
@@ -56,6 +74,8 @@ impl WorkerRuntime {
             backend,
             block_size,
             metrics,
+            lru,
+            capacity_bytes,
             version_cache: Mutex::new(HashMap::new()),
             version_ttl: DEFAULT_VERSION_TTL,
         }
@@ -291,6 +311,9 @@ impl WorkerRuntime {
             Presence::Whole
         ) {
             self.metrics.record_cache_hit();
+            // Mark the block most-recently-used so a hot block is not the eviction
+            // victim under pressure (issue #159).
+            self.lru.touch(&CacheUnit::Whole(block.clone()));
             tracing::info!(block = %block, "HIT");
             let bytes = self
                 .store
@@ -335,6 +358,7 @@ impl WorkerRuntime {
             }
         };
 
+        let len = bytes.len() as u64;
         self.store
             .put(block, bytes.clone())
             .await
@@ -342,15 +366,61 @@ impl WorkerRuntime {
         self.index.commit(BlockMeta {
             id: block.clone(),
             form: BlockForm::Whole,
-            len: bytes.len() as u64,
+            len,
         });
-        tracing::info!(block = %block, bytes = bytes.len(), "committed block");
+        // Track the freshly-committed block for eviction, then reclaim space:
+        // first any superseded version of the same (object, offset) — version
+        // churn would otherwise accumulate stale .blk files forever (issue #159,
+        // #119) — then the coldest blocks until we are back under capacity. The
+        // block just committed is pinned for the duration so it is never the
+        // victim of its own commit.
+        self.lru.insert(CacheUnit::Whole(block.clone()), len);
+        self.lru.pin(&CacheUnit::Whole(block.clone()));
+        let superseded = self.lru.evict_superseded(block);
+        self.unlink_units(superseded).await;
+        self.enforce_capacity().await;
+        self.lru.unpin(&CacheUnit::Whole(block.clone()));
+        tracing::info!(block = %block, bytes = len, "committed block");
         Ok(bytes)
+    }
+
+    /// Evict the coldest unpinned blocks until resident bytes are back under the
+    /// configured capacity, unlinking each evicted block's file and index entry.
+    /// A `capacity_bytes` of `0` disables enforcement.
+    async fn enforce_capacity(&self) {
+        if self.capacity_bytes == 0 {
+            return;
+        }
+        let evicted = self.lru.evict_to_fit(self.capacity_bytes);
+        self.unlink_units(evicted).await;
+    }
+
+    /// Unlink each evicted cache unit: delete its on-disk file, drop it from the
+    /// index, and count the eviction. Best-effort — a failed unlink is logged
+    /// but does not abort the serve path (the space is reclaimed on the next
+    /// pass or restart scan).
+    async fn unlink_units(&self, units: Vec<CacheUnit>) {
+        for unit in units {
+            let CacheUnit::Whole(id) = unit else {
+                continue;
+            };
+            if let Err(error) = self.store.delete(&id).await {
+                tracing::warn!(block = %id, %error, "failed to unlink evicted block");
+            }
+            self.index.remove(&id);
+            self.metrics.record_eviction();
+            tracing::info!(block = %id, "evicted block");
+        }
     }
 
     /// Number of blocks currently indexed.
     pub fn block_count(&self) -> u64 {
         self.index.len() as u64
+    }
+
+    /// Total resident cache bytes across all indexed blocks.
+    pub fn resident_bytes(&self) -> u64 {
+        self.index.resident_bytes()
     }
 
     /// Number of backend loads currently in flight.
@@ -433,6 +503,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             8,
+            0,
             metrics,
         )
         // Most tests assert version-sensitivity per read; a zero TTL keeps the
@@ -511,6 +582,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             block_size,
+            0,
             metrics,
         )
         // Default to always-resolve so version-sensitivity assertions are not
@@ -717,8 +789,10 @@ mod tests {
             2,
             "overwrite must trigger a fresh backend fetch, not serve the stale block"
         );
-        // Both versions are cached under distinct keys.
-        assert_eq!(runtime.block_count(), 2);
+        // The superseded v1 block is evicted on commit of v2, so only the fresh
+        // version remains resident — version churn no longer accumulates stale
+        // .blk files (issue #159).
+        assert_eq!(runtime.block_count(), 1);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -795,6 +869,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend as Arc<dyn BackendStore>,
             8,
+            0,
             WorkerMetrics::new(1024),
         )
         .with_version_ttl(ttl)
@@ -867,6 +942,67 @@ mod tests {
             Bytes::from_static(b"new-"),
             "must re-resolve and serve fresh bytes after a precondition failure"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn capacity_enforcement_evicts_coldest_blocks() {
+        // Each distinct object is one 8-byte block. With a 16-byte cap, reading
+        // three distinct objects must leave only two resident: committing the
+        // third evicts the coldest block back under capacity (issue #159).
+        let root = tmp_root();
+        let backend = Arc::new(RampBackend { block_size: 8 });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = WorkerRuntime::new(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            8,
+            16, // capacity: two 8-byte blocks
+            metrics.clone(),
+        );
+
+        let read = |name: &str| RangeRequest {
+            object: ObjectId::new(Backend::Azure, "c", name),
+            offset: 0,
+            len: 8,
+        };
+        // Read three distinct objects; the working set (24 bytes) exceeds the cap.
+        for name in ["a", "b", "c"] {
+            let _ = runtime.serve_range(&read(name)).await.unwrap();
+        }
+        // Only two blocks fit under the 16-byte cap.
+        assert_eq!(runtime.block_count(), 2, "cache must stay under capacity");
+        assert!(runtime.resident_bytes() <= 16);
+        // At least one eviction was recorded.
+        assert!(metrics.render().contains("talon_worker_evictions_total 1"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn zero_capacity_disables_eviction() {
+        // capacity_bytes == 0 means unbounded: no block is ever evicted.
+        let root = tmp_root();
+        let backend = Arc::new(RampBackend { block_size: 8 });
+        let runtime = WorkerRuntime::new(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            8,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        for name in ["a", "b", "c", "d"] {
+            let req = RangeRequest {
+                object: ObjectId::new(Backend::Azure, "c", name),
+                offset: 0,
+                len: 8,
+            };
+            let _ = runtime.serve_range(&req).await.unwrap();
+        }
+        assert_eq!(runtime.block_count(), 4, "no eviction with zero capacity");
         std::fs::remove_dir_all(root).ok();
     }
 }
