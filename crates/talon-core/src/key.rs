@@ -133,6 +133,17 @@ impl ObjectId {
             .next()
             .filter(|s| !s.is_empty())
             .ok_or_else(|| Error::Other(format!("missing object path in path: {path}")))?;
+        // Reject `.`/`..`/empty components so an object name cannot traverse out
+        // of its namespace when interpolated into a backend URL (issue #166).
+        // Mirrors the FUSE `mapping::path_to_object` invariant.
+        if object_path
+            .split('/')
+            .any(|c| c.is_empty() || c == "." || c == "..")
+        {
+            return Err(Error::Other(format!(
+                "invalid or ambiguous object path: {path}"
+            )));
+        }
         Ok(ObjectId::new(
             prefix.parse::<Backend>()?,
             bucket,
@@ -236,6 +247,20 @@ mod tests {
         assert!(ObjectId::from_path("/s3/only-bucket").is_err());
         assert!(ObjectId::from_path("/unknown/b/o").is_err());
         assert!(ObjectId::from_path("/").is_err());
+    }
+
+    #[test]
+    fn from_path_rejects_dot_dot_traversal() {
+        // `.`/`..`/empty components in the object path must be rejected so an
+        // object name can't traverse out of its namespace in a backend URL
+        // (issue #166), matching the FUSE mapping invariant.
+        assert!(ObjectId::from_path("/s3/bucket/../../secret").is_err());
+        assert!(ObjectId::from_path("/s3/bucket/a/../b").is_err());
+        assert!(ObjectId::from_path("/s3/bucket/./a").is_err());
+        assert!(ObjectId::from_path("/s3/bucket/a//b").is_err());
+        assert!(ObjectId::from_path("/s3/bucket/..").is_err());
+        // A normal nested path is still accepted.
+        assert!(ObjectId::from_path("/s3/bucket/a/b/c.bin").is_ok());
     }
 
     #[test]
