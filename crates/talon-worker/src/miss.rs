@@ -86,9 +86,10 @@ impl InFlightLoads {
     ///
     /// This is cancellation- and panic-safe: if the leader's fetch task is
     /// dropped (client disconnect) or panics, the guard's `Drop` still clears
-    /// the in-flight marker and wakes waiters, so a followers' [`wait`] can never
-    /// hang forever on an orphaned key (issue #162). `None` means a load is
-    /// already in flight (the caller should [`wait`](Self::wait)).
+    /// the in-flight marker and wakes waiters, so a follower's
+    /// [`wait`](Self::wait) can never hang forever on an orphaned key (issue
+    /// #162). `None` means a load is already in flight (the caller should
+    /// [`wait`](Self::wait)).
     pub fn admit_owned(self: &Arc<Self>, key: LoadKey) -> Option<InFlightGuard> {
         use std::collections::hash_map::Entry;
         let mut g = self.inner.lock().unwrap();
