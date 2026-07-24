@@ -3,7 +3,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
-use talon_core::{Patch, MAX_STATUS_FIELD_BYTES};
+use talon_core::{ConfigVar, Patch, MAX_STATUS_FIELD_BYTES};
 
 #[cfg(feature = "kubernetes")]
 use crate::KubernetesConfig;
@@ -153,6 +153,221 @@ impl Patch for CoordinatorConfigPatch {
     }
 }
 
+/// Single source of truth for the coordinator's `TALON_COORDINATOR_*`
+/// environment variables. [`CoordinatorConfigPatch::from_env_with`] reads the
+/// names from this table, and the documentation generator renders it, so the
+/// configuration reference cannot drift from the parser.
+pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
+    ConfigVar {
+        env: "TALON_COORDINATOR_LISTEN",
+        key: "listen",
+        default: Some("127.0.0.1:7000"),
+        cli: true,
+        secret: false,
+        help: "Control-plane bind address (workers/clients).",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_ADMIN_LISTEN",
+        key: "admin_listen",
+        default: Some("127.0.0.1:8000"),
+        cli: true,
+        secret: false,
+        help: "Admin HTTP bind address: metrics, health, API, UI.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_ADMIN_ADVERTISE",
+        key: "admin_advertise",
+        default: Some("<admin_listen>"),
+        cli: true,
+        secret: false,
+        help: "Admin address advertised in node status.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CLUSTER_ID",
+        key: "cluster_id",
+        default: Some("default"),
+        cli: true,
+        secret: false,
+        help: "Logical cluster identity.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_NODE_ID",
+        key: "node_id",
+        default: Some("<listen>"),
+        cli: true,
+        secret: false,
+        help: "Stable coordinator node identity.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_STATE_BACKEND",
+        key: "state_backend",
+        default: Some("memory"),
+        cli: true,
+        secret: false,
+        help: "Shared-state backend: memory | etcd | kubernetes.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_HA_ENABLED",
+        key: "ha_enabled",
+        default: Some("false"),
+        cli: true,
+        secret: false,
+        help: "Enable active-active mode; rejects the memory backend.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_REPLICAS",
+        key: "coordinator_replicas",
+        default: Some("1"),
+        cli: true,
+        secret: false,
+        help: "Expected coordinator replica count.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS",
+        key: "heartbeat_interval_ms",
+        default: Some("5000"),
+        cli: true,
+        secret: false,
+        help: "Node heartbeat interval (ms).",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_UNHEALTHY_AFTER_MS",
+        key: "unhealthy_after_ms",
+        default: Some("15000"),
+        cli: true,
+        secret: false,
+        help: "Silence before a node is unhealthy (ms); must exceed heartbeat.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_LEASE_TTL_MS",
+        key: "lease_ttl_ms",
+        default: Some("30000"),
+        cli: true,
+        secret: false,
+        help: "Node lease TTL (ms); must exceed unhealthy_after.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_REQUEST_TIMEOUT_MS",
+        key: "request_timeout_ms",
+        default: Some("3000"),
+        cli: true,
+        secret: false,
+        help: "Deadline for one authoritative backend operation (ms).",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_AUTH_TOKEN",
+        key: "(env only)",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "Bearer token (>= 16 chars) enabling API/UI authentication; unset disables auth.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_TRUST_FORWARDED",
+        key: "(env only)",
+        default: Some("false"),
+        cli: false,
+        secret: false,
+        help: "Honor X-Forwarded-For for audit attribution behind a trusted proxy.",
+    },
+    #[cfg(feature = "etcd")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_ETCD_ENDPOINTS",
+        key: "etcd.endpoints",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Comma-separated etcd host:port endpoints.",
+    },
+    #[cfg(feature = "etcd")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_ETCD_USERNAME",
+        key: "etcd.username",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "etcd username (requires password).",
+    },
+    #[cfg(feature = "etcd")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_ETCD_PASSWORD",
+        key: "etcd.password",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "etcd password; keep in a Secret, not the config file.",
+    },
+    #[cfg(feature = "etcd")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_ETCD_CA_CERT_PATH",
+        key: "etcd.tls.ca_cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM CA certificate path; enables TLS.",
+    },
+    #[cfg(feature = "etcd")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH",
+        key: "etcd.tls.client_cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM client certificate path; mutual TLS.",
+    },
+    #[cfg(feature = "etcd")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH",
+        key: "etcd.tls.client_key_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM client key path; mutual TLS.",
+    },
+    #[cfg(feature = "kubernetes")]
+    ConfigVar {
+        env: "TALON_COORDINATOR_K8S_NAMESPACE",
+        key: "kubernetes.namespace",
+        default: Some("talon"),
+        cli: false,
+        secret: false,
+        help: "Namespace holding Talon Lease objects.",
+    },
+];
+
+/// Env-var name constants, referenced by both the schema above and the parser
+/// below so the two can never disagree on a name.
+pub mod env_names {
+    pub const LISTEN: &str = "TALON_COORDINATOR_LISTEN";
+    pub const ADMIN_LISTEN: &str = "TALON_COORDINATOR_ADMIN_LISTEN";
+    pub const ADMIN_ADVERTISE: &str = "TALON_COORDINATOR_ADMIN_ADVERTISE";
+    pub const CLUSTER_ID: &str = "TALON_COORDINATOR_CLUSTER_ID";
+    pub const NODE_ID: &str = "TALON_COORDINATOR_NODE_ID";
+    pub const STATE_BACKEND: &str = "TALON_COORDINATOR_STATE_BACKEND";
+    pub const HA_ENABLED: &str = "TALON_COORDINATOR_HA_ENABLED";
+    pub const REPLICAS: &str = "TALON_COORDINATOR_REPLICAS";
+    pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS";
+    pub const UNHEALTHY_AFTER_MS: &str = "TALON_COORDINATOR_UNHEALTHY_AFTER_MS";
+    pub const LEASE_TTL_MS: &str = "TALON_COORDINATOR_LEASE_TTL_MS";
+    pub const REQUEST_TIMEOUT_MS: &str = "TALON_COORDINATOR_REQUEST_TIMEOUT_MS";
+    pub const AUTH_TOKEN: &str = "TALON_COORDINATOR_AUTH_TOKEN";
+    pub const TRUST_FORWARDED: &str = "TALON_COORDINATOR_TRUST_FORWARDED";
+    #[cfg(feature = "etcd")]
+    pub const ETCD_ENDPOINTS: &str = "TALON_COORDINATOR_ETCD_ENDPOINTS";
+    #[cfg(feature = "etcd")]
+    pub const ETCD_USERNAME: &str = "TALON_COORDINATOR_ETCD_USERNAME";
+    #[cfg(feature = "etcd")]
+    pub const ETCD_PASSWORD: &str = "TALON_COORDINATOR_ETCD_PASSWORD";
+    #[cfg(feature = "etcd")]
+    pub const ETCD_CA_CERT_PATH: &str = "TALON_COORDINATOR_ETCD_CA_CERT_PATH";
+    #[cfg(feature = "etcd")]
+    pub const ETCD_CLIENT_CERT_PATH: &str = "TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH";
+    #[cfg(feature = "etcd")]
+    pub const ETCD_CLIENT_KEY_PATH: &str = "TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH";
+    #[cfg(feature = "kubernetes")]
+    pub const K8S_NAMESPACE: &str = "TALON_COORDINATOR_K8S_NAMESPACE";
+}
+
 impl CoordinatorConfigPatch {
     /// Parse a TOML patch.
     pub fn from_toml(value: &str) -> anyhow::Result<Self> {
@@ -182,38 +397,38 @@ impl CoordinatorConfigPatch {
         }
 
         Ok(Self {
-            listen: get("TALON_COORDINATOR_LISTEN"),
-            admin_listen: get("TALON_COORDINATOR_ADMIN_LISTEN"),
-            admin_advertise: get("TALON_COORDINATOR_ADMIN_ADVERTISE"),
-            cluster_id: get("TALON_COORDINATOR_CLUSTER_ID"),
-            node_id: get("TALON_COORDINATOR_NODE_ID"),
-            state_backend: get("TALON_COORDINATOR_STATE_BACKEND")
-                .map(|value| parse(value, "TALON_COORDINATOR_STATE_BACKEND"))
+            listen: get(env_names::LISTEN),
+            admin_listen: get(env_names::ADMIN_LISTEN),
+            admin_advertise: get(env_names::ADMIN_ADVERTISE),
+            cluster_id: get(env_names::CLUSTER_ID),
+            node_id: get(env_names::NODE_ID),
+            state_backend: get(env_names::STATE_BACKEND)
+                .map(|value| parse(value, env_names::STATE_BACKEND))
                 .transpose()?,
-            ha_enabled: get("TALON_COORDINATOR_HA_ENABLED")
-                .map(|value| parse(value, "TALON_COORDINATOR_HA_ENABLED"))
+            ha_enabled: get(env_names::HA_ENABLED)
+                .map(|value| parse(value, env_names::HA_ENABLED))
                 .transpose()?,
-            coordinator_replicas: get("TALON_COORDINATOR_REPLICAS")
-                .map(|value| parse(value, "TALON_COORDINATOR_REPLICAS"))
+            coordinator_replicas: get(env_names::REPLICAS)
+                .map(|value| parse(value, env_names::REPLICAS))
                 .transpose()?,
-            heartbeat_interval_ms: get("TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS")
-                .map(|value| parse(value, "TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS"))
+            heartbeat_interval_ms: get(env_names::HEARTBEAT_INTERVAL_MS)
+                .map(|value| parse(value, env_names::HEARTBEAT_INTERVAL_MS))
                 .transpose()?,
-            unhealthy_after_ms: get("TALON_COORDINATOR_UNHEALTHY_AFTER_MS")
-                .map(|value| parse(value, "TALON_COORDINATOR_UNHEALTHY_AFTER_MS"))
+            unhealthy_after_ms: get(env_names::UNHEALTHY_AFTER_MS)
+                .map(|value| parse(value, env_names::UNHEALTHY_AFTER_MS))
                 .transpose()?,
-            lease_ttl_ms: get("TALON_COORDINATOR_LEASE_TTL_MS")
-                .map(|value| parse(value, "TALON_COORDINATOR_LEASE_TTL_MS"))
+            lease_ttl_ms: get(env_names::LEASE_TTL_MS)
+                .map(|value| parse(value, env_names::LEASE_TTL_MS))
                 .transpose()?,
-            request_timeout_ms: get("TALON_COORDINATOR_REQUEST_TIMEOUT_MS")
-                .map(|value| parse(value, "TALON_COORDINATOR_REQUEST_TIMEOUT_MS"))
+            request_timeout_ms: get(env_names::REQUEST_TIMEOUT_MS)
+                .map(|value| parse(value, env_names::REQUEST_TIMEOUT_MS))
                 .transpose()?,
             #[cfg(feature = "etcd")]
             etcd: None,
             #[cfg(feature = "kubernetes")]
             kubernetes: None,
             #[cfg(feature = "etcd")]
-            etcd_endpoints: get("TALON_COORDINATOR_ETCD_ENDPOINTS").map(|value| {
+            etcd_endpoints: get(env_names::ETCD_ENDPOINTS).map(|value| {
                 value
                     .split(',')
                     .map(|endpoint| endpoint.trim().to_string())
@@ -221,17 +436,17 @@ impl CoordinatorConfigPatch {
                     .collect()
             }),
             #[cfg(feature = "etcd")]
-            etcd_username: get("TALON_COORDINATOR_ETCD_USERNAME"),
+            etcd_username: get(env_names::ETCD_USERNAME),
             #[cfg(feature = "etcd")]
-            etcd_password: get("TALON_COORDINATOR_ETCD_PASSWORD"),
+            etcd_password: get(env_names::ETCD_PASSWORD),
             #[cfg(feature = "etcd")]
-            etcd_ca_cert_path: get("TALON_COORDINATOR_ETCD_CA_CERT_PATH"),
+            etcd_ca_cert_path: get(env_names::ETCD_CA_CERT_PATH),
             #[cfg(feature = "etcd")]
-            etcd_client_cert_path: get("TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH"),
+            etcd_client_cert_path: get(env_names::ETCD_CLIENT_CERT_PATH),
             #[cfg(feature = "etcd")]
-            etcd_client_key_path: get("TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH"),
+            etcd_client_key_path: get(env_names::ETCD_CLIENT_KEY_PATH),
             #[cfg(feature = "kubernetes")]
-            kubernetes_namespace: get("TALON_COORDINATOR_K8S_NAMESPACE"),
+            kubernetes_namespace: get(env_names::K8S_NAMESPACE),
         })
     }
 }

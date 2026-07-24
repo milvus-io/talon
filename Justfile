@@ -26,6 +26,19 @@ test:
 # Everything CI checks, in order.
 ci: fmt-check clippy test
 
+# --- documentation ---
+
+# Regenerate the configuration reference from the ConfigVar schemas.
+gen-config-docs:
+    cargo run -q -p talon-coordinator --features etcd,kubernetes \
+      --bin talon-gen-config-docs -- docs/reference/configuration.md
+
+# Fail if the committed configuration reference is stale vs. the schemas.
+check-config-docs:
+    cargo run -q -p talon-coordinator --features etcd,kubernetes \
+      --bin talon-gen-config-docs > /tmp/talon-config-ref.md
+    diff -u docs/reference/configuration.md /tmp/talon-config-ref.md
+
 # --- benchmarks (performance feedback loop) ---
 
 # Run all microbenchmarks and write bench/results/latest.json.

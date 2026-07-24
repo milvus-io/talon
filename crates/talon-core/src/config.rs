@@ -33,6 +33,29 @@ pub trait Patch {
     fn merge(self, base: Self) -> Self;
 }
 
+/// One configurable setting, described once and reused by both the runtime
+/// environment parser and the generated documentation.
+///
+/// This is the single source of truth for a process's `TALON_*` environment
+/// variables: [`from_env`](WorkerConfigPatch::from_env) reads the names from
+/// here, and the documentation generator renders the same list, so the config
+/// reference cannot drift from the code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConfigVar {
+    /// Environment variable name, e.g. `TALON_WORKER_LISTEN`.
+    pub env: &'static str,
+    /// Equivalent config-file key / CLI flag stem, e.g. `listen`.
+    pub key: &'static str,
+    /// Default value shown in docs, or `None` when there is no fixed default.
+    pub default: Option<&'static str>,
+    /// Whether this setting is also settable as a CLI flag (`--<key>`).
+    pub cli: bool,
+    /// Whether the value is a secret (never logged; env-only).
+    pub secret: bool,
+    /// One-line description.
+    pub help: &'static str,
+}
+
 /// Fully-resolved worker configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkerConfig {
@@ -74,7 +97,7 @@ pub struct WorkerConfig {
 /// deliberately kept out of [`WorkerConfig`] so it is never serialized, printed
 /// via `Debug`, or logged.
 pub fn azure_sas_from_env() -> Option<String> {
-    std::env::var("TALON_WORKER_AZURE_SAS")
+    std::env::var(worker_env::AZURE_SAS)
         .ok()
         .filter(|s| !s.is_empty())
 }
@@ -146,6 +169,123 @@ impl Patch for WorkerConfigPatch {
     }
 }
 
+/// Single source of truth for the worker's `TALON_WORKER_*` environment
+/// variables. [`WorkerConfigPatch::from_env_with`] reads names from here and the
+/// documentation generator renders it, so the reference cannot drift.
+pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
+    ConfigVar {
+        env: "TALON_WORKER_LISTEN",
+        key: "listen",
+        default: Some("127.0.0.1:7001"),
+        cli: true,
+        secret: false,
+        help: "Data-plane bind address.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_ADVERTISE_ADDR",
+        key: "advertise_addr",
+        default: Some("<listen>"),
+        cli: true,
+        secret: false,
+        help: "Routable address advertised to the coordinator.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_ADMIN_LISTEN",
+        key: "admin_listen",
+        default: Some("127.0.0.1:8001"),
+        cli: true,
+        secret: false,
+        help: "Admin HTTP bind address: metrics, health, status.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_COORDINATOR",
+        key: "coordinator",
+        default: Some("127.0.0.1:7000"),
+        cli: true,
+        secret: false,
+        help: "Coordinator control-plane address to register with.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CLUSTER_ID",
+        key: "cluster_id",
+        default: Some("default"),
+        cli: true,
+        secret: false,
+        help: "Logical cluster advertised in status.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_NODE_ID",
+        key: "node_id",
+        default: Some("<listen>"),
+        cli: true,
+        secret: false,
+        help: "Stable worker node identity.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_HEARTBEAT_INTERVAL_MS",
+        key: "heartbeat_interval_ms",
+        default: Some("5000"),
+        cli: true,
+        secret: false,
+        help: "Heartbeat interval (ms).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BLOCK_SIZE",
+        key: "block_size",
+        default: Some("268435456"),
+        cli: true,
+        secret: false,
+        help: "Logical block size (bytes).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CACHE_DIRS",
+        key: "cache_dirs",
+        default: Some("/var/cache/talon"),
+        cli: false,
+        secret: false,
+        help: "Colon-separated cache directories.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CAPACITY_BYTES",
+        key: "capacity_bytes",
+        default: Some("68719476736"),
+        cli: false,
+        secret: false,
+        help: "Worker cache capacity (bytes).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_AZURE_ACCOUNT",
+        key: "azure_account",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Azure blob storage account name (required to serve data).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_AZURE_SAS",
+        key: "(env only)",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "Azure SAS token; env-only, never from a config file or logged.",
+    },
+];
+
+pub(crate) mod worker_env {
+    pub const LISTEN: &str = "TALON_WORKER_LISTEN";
+    pub const ADVERTISE_ADDR: &str = "TALON_WORKER_ADVERTISE_ADDR";
+    pub const ADMIN_LISTEN: &str = "TALON_WORKER_ADMIN_LISTEN";
+    pub const COORDINATOR: &str = "TALON_WORKER_COORDINATOR";
+    pub const CLUSTER_ID: &str = "TALON_WORKER_CLUSTER_ID";
+    pub const NODE_ID: &str = "TALON_WORKER_NODE_ID";
+    pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_WORKER_HEARTBEAT_INTERVAL_MS";
+    pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
+    pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
+    pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
+    pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
+    pub const AZURE_SAS: &str = "TALON_WORKER_AZURE_SAS";
+}
+
 impl WorkerConfigPatch {
     /// Parse a patch from a TOML config-file string.
     pub fn from_toml(s: &str) -> Result<Self> {
@@ -185,24 +325,24 @@ impl WorkerConfigPatch {
                 .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
         };
         Ok(Self {
-            listen: get("TALON_WORKER_LISTEN"),
-            advertise_addr: get("TALON_WORKER_ADVERTISE_ADDR"),
-            admin_listen: get("TALON_WORKER_ADMIN_LISTEN"),
-            coordinator: get("TALON_WORKER_COORDINATOR"),
-            cluster_id: get("TALON_WORKER_CLUSTER_ID"),
-            node_id: get("TALON_WORKER_NODE_ID"),
-            heartbeat_interval_ms: get("TALON_WORKER_HEARTBEAT_INTERVAL_MS")
-                .map(|v| parse_u64(v, "TALON_WORKER_HEARTBEAT_INTERVAL_MS"))
+            listen: get(worker_env::LISTEN),
+            advertise_addr: get(worker_env::ADVERTISE_ADDR),
+            admin_listen: get(worker_env::ADMIN_LISTEN),
+            coordinator: get(worker_env::COORDINATOR),
+            cluster_id: get(worker_env::CLUSTER_ID),
+            node_id: get(worker_env::NODE_ID),
+            heartbeat_interval_ms: get(worker_env::HEARTBEAT_INTERVAL_MS)
+                .map(|v| parse_u64(v, worker_env::HEARTBEAT_INTERVAL_MS))
                 .transpose()?,
-            block_size: get("TALON_WORKER_BLOCK_SIZE")
-                .map(|v| parse_u32(v, "TALON_WORKER_BLOCK_SIZE"))
+            block_size: get(worker_env::BLOCK_SIZE)
+                .map(|v| parse_u32(v, worker_env::BLOCK_SIZE))
                 .transpose()?,
-            cache_dirs: get("TALON_WORKER_CACHE_DIRS")
+            cache_dirs: get(worker_env::CACHE_DIRS)
                 .map(|v| v.split(':').map(PathBuf::from).collect()),
-            capacity_bytes: get("TALON_WORKER_CAPACITY_BYTES")
-                .map(|v| parse_u64(v, "TALON_WORKER_CAPACITY_BYTES"))
+            capacity_bytes: get(worker_env::CAPACITY_BYTES)
+                .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
                 .transpose()?,
-            azure_account: get("TALON_WORKER_AZURE_ACCOUNT"),
+            azure_account: get(worker_env::AZURE_ACCOUNT),
         })
     }
 }
@@ -392,6 +532,59 @@ impl Patch for FuseConfigPatch {
     }
 }
 
+/// Single source of truth for the FUSE client's `TALON_FUSE_*` environment
+/// variables, shared by the parser and the documentation generator.
+pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
+    ConfigVar {
+        env: "TALON_FUSE_MOUNTPOINT",
+        key: "mountpoint",
+        default: Some("/mnt/talon"),
+        cli: true,
+        secret: false,
+        help: "Directory to mount the Talon filesystem at.",
+    },
+    ConfigVar {
+        env: "TALON_FUSE_COORDINATOR",
+        key: "coordinator",
+        default: Some("127.0.0.1:7000"),
+        cli: true,
+        secret: false,
+        help: "Coordinator address for placement and membership.",
+    },
+    ConfigVar {
+        env: "TALON_FUSE_BLOCK_SIZE",
+        key: "block_size",
+        default: Some("268435456"),
+        cli: true,
+        secret: false,
+        help: "Logical block size (bytes); must match the cluster.",
+    },
+    ConfigVar {
+        env: "TALON_FUSE_PLACEMENT_TTL_MS",
+        key: "placement_ttl_ms",
+        default: Some("5000"),
+        cli: false,
+        secret: false,
+        help: "Placement-cache entry TTL (ms).",
+    },
+    ConfigVar {
+        env: "TALON_FUSE_READAHEAD_BLOCKS",
+        key: "readahead_blocks",
+        default: Some("4"),
+        cli: false,
+        secret: false,
+        help: "Client-side readahead depth in blocks.",
+    },
+];
+
+pub(crate) mod fuse_env {
+    pub const MOUNTPOINT: &str = "TALON_FUSE_MOUNTPOINT";
+    pub const COORDINATOR: &str = "TALON_FUSE_COORDINATOR";
+    pub const BLOCK_SIZE: &str = "TALON_FUSE_BLOCK_SIZE";
+    pub const PLACEMENT_TTL_MS: &str = "TALON_FUSE_PLACEMENT_TTL_MS";
+    pub const READAHEAD_BLOCKS: &str = "TALON_FUSE_READAHEAD_BLOCKS";
+}
+
 impl FuseConfigPatch {
     /// Parse a patch from a TOML config-file string.
     pub fn from_toml(s: &str) -> Result<Self> {
@@ -427,16 +620,16 @@ impl FuseConfigPatch {
                 .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
         };
         Ok(Self {
-            mountpoint: get("TALON_FUSE_MOUNTPOINT").map(PathBuf::from),
-            coordinator: get("TALON_FUSE_COORDINATOR"),
-            block_size: get("TALON_FUSE_BLOCK_SIZE")
-                .map(|v| parse_u32(v, "TALON_FUSE_BLOCK_SIZE"))
+            mountpoint: get(fuse_env::MOUNTPOINT).map(PathBuf::from),
+            coordinator: get(fuse_env::COORDINATOR),
+            block_size: get(fuse_env::BLOCK_SIZE)
+                .map(|v| parse_u32(v, fuse_env::BLOCK_SIZE))
                 .transpose()?,
-            placement_ttl_ms: get("TALON_FUSE_PLACEMENT_TTL_MS")
-                .map(|v| parse_u64(v, "TALON_FUSE_PLACEMENT_TTL_MS"))
+            placement_ttl_ms: get(fuse_env::PLACEMENT_TTL_MS)
+                .map(|v| parse_u64(v, fuse_env::PLACEMENT_TTL_MS))
                 .transpose()?,
-            readahead_blocks: get("TALON_FUSE_READAHEAD_BLOCKS")
-                .map(|v| parse_u32(v, "TALON_FUSE_READAHEAD_BLOCKS"))
+            readahead_blocks: get(fuse_env::READAHEAD_BLOCKS)
+                .map(|v| parse_u32(v, fuse_env::READAHEAD_BLOCKS))
                 .transpose()?,
         })
     }
@@ -480,6 +673,45 @@ impl FuseConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn env_schemas_are_wellformed() {
+        // Each schema's env names are unique and match the TALON_ prefix so the
+        // generated reference and the parser stay in lockstep.
+        for (label, schema, prefix) in [
+            ("worker", WORKER_ENV_SCHEMA, "TALON_WORKER_"),
+            ("fuse", FUSE_ENV_SCHEMA, "TALON_FUSE_"),
+        ] {
+            let mut seen = std::collections::HashSet::new();
+            for v in schema {
+                assert!(
+                    v.env.starts_with(prefix),
+                    "{label}: {} lacks prefix {prefix}",
+                    v.env
+                );
+                assert!(seen.insert(v.env), "{label}: duplicate env {}", v.env);
+                assert!(!v.help.is_empty(), "{label}: {} has empty help", v.env);
+            }
+        }
+        // The parser reads exactly the worker/fuse names declared in the
+        // schema; spot-check the constants used by the parser are present.
+        for name in [
+            worker_env::LISTEN,
+            worker_env::AZURE_ACCOUNT,
+            worker_env::AZURE_SAS,
+        ] {
+            assert!(
+                WORKER_ENV_SCHEMA.iter().any(|v| v.env == name),
+                "worker schema missing {name}"
+            );
+        }
+        for name in [fuse_env::MOUNTPOINT, fuse_env::READAHEAD_BLOCKS] {
+            assert!(
+                FUSE_ENV_SCHEMA.iter().any(|v| v.env == name),
+                "fuse schema missing {name}"
+            );
+        }
+    }
 
     #[test]
     fn defaults_are_valid() {

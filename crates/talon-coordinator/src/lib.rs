@@ -15,7 +15,7 @@ pub mod service;
 pub mod state_store;
 pub mod ui;
 
-pub use config::{CoordinatorConfig, CoordinatorConfigPatch};
+pub use config::{CoordinatorConfig, CoordinatorConfigPatch, COORDINATOR_ENV_SCHEMA};
 pub use heartbeat::{HeartbeatConfig, HeartbeatTracker, Inventory};
 pub use load::{plan_load, split_into_blocks, LoadAssignment, LoadProgress};
 pub use membership::{K8sSelector, KubernetesMembership, Membership, MembershipSource};
