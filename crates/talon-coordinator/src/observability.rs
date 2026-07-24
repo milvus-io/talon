@@ -740,7 +740,11 @@ pub fn secured_admin_router(
 }
 
 async fn metrics_handler(State(state): State<Arc<CoordinatorObservability>>) -> impl IntoResponse {
-    let _ = state.refresh_snapshot().await;
+    // Do NOT hit the state store here. The snapshot-age and live-node gauges are
+    // refreshed on the reconcile timer (see reconcile_membership -> update_snapshot),
+    // so /metrics can render the last reconciled values without its own backend
+    // RPC. This keeps the public, unauthenticated /metrics endpoint from
+    // amplifying scrape traffic into authoritative etcd/Kubernetes load (#164).
     state.metrics.refresh(state.started, state.is_ready());
     (
         [(
@@ -990,6 +994,30 @@ mod tests {
         let ready = request(address, "/readyz").await;
         assert!(ready.starts_with("HTTP/1.1 503 Service Unavailable"));
         assert!(ready.contains("\"reason\":\"unavailable\""));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn metrics_does_not_hit_the_state_store() {
+        // /metrics must render from the reconcile-timer-maintained gauges without
+        // its own store snapshot RPC, so a public scrape cannot amplify into
+        // backend load (#164). With the store injected-unavailable from the
+        // start, a handler that called snapshot() would surface an error; here
+        // /metrics must still respond 200 with the static series.
+        let (observability, store) = observability();
+        store.set_available(false);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_admin(listener, Arc::clone(&observability)));
+
+        let metrics = request(address, "/metrics").await;
+        assert!(metrics.starts_with("HTTP/1.1 200 OK"));
+        assert!(metrics.contains("talon_coordinator_build_info{version=\"0.1.0\"} 1"));
+        // Crucially, scraping /metrics recorded no state-store operation: a
+        // snapshot RPC would have incremented the state-store error counter
+        // (the store is unavailable), so its absence proves no store call.
+        assert!(!metrics.contains("talon_coordinator_state_store_errors_total"));
 
         server.abort();
     }
