@@ -120,7 +120,15 @@ impl BackendStore for AzureBackend {
             .map_err(Error::Backend)?;
         match resp.status {
             200 | 206 => {
-                crate::http::range_body(resp.status, resp.body, offset, len).map_err(Error::Backend)
+                let content_range = resp.header("content-range").map(str::to_owned);
+                crate::http::range_body(
+                    resp.status,
+                    resp.body,
+                    offset,
+                    len,
+                    content_range.as_deref(),
+                )
+                .map_err(Error::Backend)
             }
             404 => Err(Error::NotFound(obj.to_path())),
             s => Err(Error::Backend(format!(

@@ -106,7 +106,15 @@ impl BackendStore for GcsBackend {
             .map_err(Error::Backend)?;
         match resp.status {
             200 | 206 => {
-                crate::http::range_body(resp.status, resp.body, offset, len).map_err(Error::Backend)
+                let content_range = resp.header("content-range").map(str::to_owned);
+                crate::http::range_body(
+                    resp.status,
+                    resp.body,
+                    offset,
+                    len,
+                    content_range.as_deref(),
+                )
+                .map_err(Error::Backend)
             }
             404 => Err(Error::NotFound(obj.to_path())),
             s => Err(Error::Backend(format!(
@@ -205,11 +213,11 @@ mod tests {
         let http = MockHttp::new(HttpResponse {
             status: 206,
             headers: vec![],
-            body: bytes::Bytes::from_static(b"gcs-bytes"),
+            body: bytes::Bytes::from_static(b"gcsby"),
         });
         let g = GcsBackend::new(GcsConfig::default(), Some("tok".into()), http.clone());
         let got = g.fetch_range(&obj(), 4, 5).await.unwrap();
-        assert_eq!(got, bytes::Bytes::from_static(b"gcs-bytes"));
+        assert_eq!(got, bytes::Bytes::from_static(b"gcsby"));
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.header("Authorization"), Some("Bearer tok"));
         assert_eq!(req.header("Range"), Some("bytes=4-8"));

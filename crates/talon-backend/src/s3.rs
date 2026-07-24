@@ -138,9 +138,18 @@ impl BackendStore for S3Backend {
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 206 (range honored) or 200 (server ignored Range, returned the whole
         // object). `range_body` yields exactly the requested window in both
-        // cases and rejects a short 206 (issue #117).
+        // cases, validates the 206 Content-Range, and accepts an object-end
+        // short 206 (issues #117, #161).
         if resp.status == 206 || resp.status == 200 {
-            crate::http::range_body(resp.status, resp.body, offset, len).map_err(Error::Backend)
+            let content_range = resp.header("content-range").map(str::to_owned);
+            crate::http::range_body(
+                resp.status,
+                resp.body,
+                offset,
+                len,
+                content_range.as_deref(),
+            )
+            .map_err(Error::Backend)
         } else if resp.status == 404 {
             Err(Error::NotFound(obj.to_path()))
         } else {
