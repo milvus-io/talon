@@ -49,7 +49,8 @@ curl -s http://127.0.0.1:8000/api/v1/cluster    # cluster summary JSON
 
 Start with the section that matches what you're doing:
 
-- **Using Talon** — the Quick start above gets a cluster running;
+- **Using Talon** — the [Getting started tutorial](docs/tutorials/getting-started.md)
+  builds the workspace, runs a cluster, and opens the management console;
   [DESIGN.md](DESIGN.md) explains what each component does.
 - **Operating Talon** — [Operator runbook](docs/operations/runbook.md) (HA,
   etcd/Kubernetes backends, configuration, upgrades, alerts) and
