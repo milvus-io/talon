@@ -16,7 +16,53 @@
   // previous data (marked stale) instead of blanking the screen (#84).
   const lastGood = { overview: null, nodes: null, backend: null };
   // Fleet table UI state (search / filters / sort), preserved across refreshes.
-  const fleet = { q: "", role: "", health: "", sort: "node_id", dir: 1 };
+  const fleet = { q: "", role: "", health: "", sort: "node_id", dir: 1, group: "" };
+
+  // In-memory rate history for the overview sparklines. Each successful cluster
+  // poll appends one sample; the derived per-interval rates are recomputed from
+  // adjacent cumulative samples. Bounded to HISTORY_MAX (~10 min at 5s). This is
+  // client-only: a page reload starts a fresh window (the backend keeps no
+  // time series), which is an acceptable tradeoff for a zero-dependency console.
+  const HISTORY_MAX = 120;
+  const rawSamples = []; // cumulative {t, requests, errors, hits, misses, bytes}
+  const rateSeries = { qps: [], errorRate: [], hitRate: [], bytesPerSec: [] };
+
+  /** Fold fresh node data into the rate history (aggregated cluster counters). */
+  function recordSample(nodes, tsMs) {
+    const w = aggregateCounters(nodes, tsMs);
+    if (!w) return;
+    const prev = rawSamples[rawSamples.length - 1];
+    rawSamples.push(w);
+    while (rawSamples.length > HISTORY_MAX + 1) rawSamples.shift();
+    const rates = computeRates(prev, w);
+    if (!rates) return;
+    rateSeries.qps.push(rates.qps);
+    rateSeries.errorRate.push(rates.errorRate);
+    rateSeries.hitRate.push(rates.hitRate);
+    rateSeries.bytesPerSec.push(rates.bytesPerSec);
+    for (const k in rateSeries) {
+      while (rateSeries[k].length > HISTORY_MAX) rateSeries[k].shift();
+    }
+  }
+
+  /**
+   * Sum cumulative worker counters into one cluster-wide sample. The /cluster
+   * summary intentionally does not expose request/cache totals, so the console
+   * aggregates them from the per-node payloads. Missing fields default to 0.
+   */
+  function aggregateCounters(nodes, tsMs) {
+    if (!nodes) return null;
+    const w = { t: tsMs || Date.now(), requests: 0, errors: 0, hits: 0, misses: 0, bytes: 0 };
+    for (const n of nodes) {
+      w.requests += num(n.requests_total);
+      w.errors += num(n.errors_total);
+      w.hits += num(n.cache_hits_total);
+      w.misses += num(n.cache_misses_total);
+      w.bytes += num(n.bytes_served_total);
+    }
+    return w;
+  }
+  function num(v) { return typeof v === "number" && isFinite(v) ? v : 0; }
 
   /** Minimal fetch wrapper that normalizes errors to {ok,data,error}. */
   async function apiGet(path) {
@@ -49,6 +95,36 @@
     if (kind === "loading") box.appendChild(el("div", { class: "spinner", "aria-hidden": "true" }));
     box.appendChild(el("p", kind === "error" ? { class: "error", text: msg } : { text: msg }));
     return box;
+  }
+  // SVG element builder (SVG needs a namespace; createElement would be inert).
+  const SVGNS = "http://www.w3.org/2000/svg";
+  function svg(tag, attrs, children) {
+    const node = document.createElementNS(SVGNS, tag);
+    if (attrs) for (const k in attrs) node.setAttribute(k, attrs[k]);
+    if (children) for (const c of children) node.appendChild(c);
+    return node;
+  }
+  /**
+   * Build a labeled sparkline card: title, current value, and an SVG trend of
+   * `series`. `fmt` formats the latest value for display.
+   */
+  function sparkCard(title, series, fmt, tone) {
+    const W = 240, H = 40;
+    const latest = series.length ? series[series.length - 1] : null;
+    const card = el("div", { class: "spark" + (tone ? " " + tone : "") });
+    const head = el("div", { class: "spark-head" }, [
+      el("span", { class: "spark-title", text: title }),
+      el("span", { class: "spark-val", text: latest == null ? "—" : fmt(latest) }),
+    ]);
+    card.appendChild(head);
+    const points = sparklinePoints(series, W, H);
+    const box = svg("svg", { class: "spark-svg", viewBox: "0 0 " + W + " " + H, preserveAspectRatio: "none", "aria-hidden": "true" });
+    if (points) {
+      box.appendChild(svg("polyline", { points: points, fill: "none", "stroke-width": "1.5", "vector-effect": "non-scaling-stroke" }));
+    }
+    card.appendChild(box);
+    if (series.length < 2) card.appendChild(el("div", { class: "spark-note muted", text: "collecting…" }));
+    return card;
   }
   function fmtBytes(n) {
     if (!n) return "0 B";
@@ -90,8 +166,127 @@
     });
     return copy;
   }
+  // --- derived-metric + visualization pure helpers -------------------------
+  // The backend exposes cumulative counters and a current snapshot only; the
+  // console derives interval rates and short in-memory history client-side so
+  // operators see trends, not just raw totals. All functions below are pure and
+  // exported on window.__talon for the Node test harness.
+
+  /**
+   * Interval rates between two cluster samples. Each sample is
+   * {t, requests, errors, hits, misses, bytes} where counters are cumulative.
+   * Returns per-second rates and ratios, or null if the delta is not usable
+   * (no elapsed time, or a counter reset — e.g. a coordinator restart).
+   */
+  function computeRates(prev, cur) {
+    if (!prev || !cur) return null;
+    const dt = (cur.t - prev.t) / 1000;
+    if (dt <= 0) return null;
+    const dReq = cur.requests - prev.requests;
+    const dErr = cur.errors - prev.errors;
+    const dHit = cur.hits - prev.hits;
+    const dMiss = cur.misses - prev.misses;
+    const dBytes = cur.bytes - prev.bytes;
+    // A negative delta means a counter reset; treat the interval as undefined.
+    if (dReq < 0 || dErr < 0 || dHit < 0 || dMiss < 0 || dBytes < 0) return null;
+    const lookups = dHit + dMiss;
+    return {
+      qps: dReq / dt,
+      errorRate: dReq > 0 ? dErr / dReq : 0,
+      hitRate: lookups > 0 ? dHit / lookups : 0,
+      bytesPerSec: dBytes / dt,
+    };
+  }
+
+  /**
+   * Map a numeric series to an SVG polyline "points" string within a w×h box.
+   * The series is normalized to [min,max]; a flat series sits on the midline.
+   * Returns "" for an empty series so callers can skip rendering.
+   */
+  function sparklinePoints(series, w, h) {
+    const n = series.length;
+    if (n === 0) return "";
+    if (n === 1) return "0," + (h / 2).toFixed(1) + " " + w + "," + (h / 2).toFixed(1);
+    let min = Infinity, max = -Infinity;
+    for (const v of series) { if (v < min) min = v; if (v > max) max = v; }
+    const span = max - min;
+    const pad = 1; // keep the stroke off the exact edge
+    const pts = [];
+    for (let i = 0; i < n; i++) {
+      const x = (i / (n - 1)) * w;
+      const norm = span > 0 ? (series[i] - min) / span : 0.5;
+      // SVG y grows downward: invert so larger values sit higher.
+      const y = pad + (1 - norm) * (h - 2 * pad);
+      pts.push(x.toFixed(1) + "," + y.toFixed(1));
+    }
+    return pts.join(" ");
+  }
+
+  /**
+   * Classify HA consistency across coordinator snapshots. Each entry is
+   * {node_id, ok, revision, age_ms}. `ok:false` means that coordinator's
+   * snapshot could not be read. Returns {state, detail} where state is one of
+   * "sync" | "lagging" | "diverged" | "degraded" | "unknown".
+   */
+  function haStatus(snaps, maxAgeMs) {
+    const maxAge = maxAgeMs || 30000;
+    if (!snaps || snaps.length === 0) return { state: "unknown", detail: "no coordinators" };
+    const reachable = snaps.filter((s) => s.ok);
+    if (reachable.length === 0) return { state: "unknown", detail: "no coordinator reachable" };
+    const revisions = new Set(reachable.map((s) => String(s.revision)));
+    const anyUnreachable = reachable.length < snaps.length;
+    const anyStale = reachable.some((s) => s.age_ms > maxAge);
+    if (revisions.size > 1) {
+      return { state: "diverged", detail: revisions.size + " distinct revisions" };
+    }
+    if (anyStale) {
+      return { state: "lagging", detail: "a coordinator snapshot is stale" };
+    }
+    if (anyUnreachable) {
+      return { state: "degraded", detail: (snaps.length - reachable.length) + " coordinator unreachable" };
+    }
+    return { state: "sync", detail: "all coordinators in sync" };
+  }
+
+  /** Group nodes by a label key (or "role"); returns [ [groupValue, nodes] ] sorted. */
+  function groupNodes(nodes, key) {
+    const groups = new Map();
+    for (const n of nodes) {
+      let g;
+      if (key === "role") g = n.role;
+      else g = (n.labels && n.labels[key] != null) ? n.labels[key] : "—";
+      if (!groups.has(g)) groups.set(g, []);
+      groups.get(g).push(n);
+    }
+    return Array.from(groups.entries()).sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+  }
+
+  /** Per-worker capacity rows sorted by resident bytes desc, with utilization. */
+  function capacityRows(nodes) {
+    return nodes
+      .filter((n) => n.role === "worker")
+      .map((n) => {
+        const cap = n.capacity_bytes || 0;
+        const used = n.resident_bytes || 0;
+        const pct = cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0;
+        return { node_id: n.node_id, resident_bytes: used, capacity_bytes: cap, block_count: n.block_count || 0, pct, hot: hotspotFlag(n) };
+      })
+      .sort((a, b) => b.resident_bytes - a.resident_bytes || (a.node_id < b.node_id ? -1 : 1));
+  }
+
+  /** True when a worker is near capacity (>85%) and should be flagged. */
+  function hotspotFlag(n) {
+    if (n.role !== "worker") return false;
+    const cap = n.capacity_bytes || 0;
+    if (cap <= 0) return false;
+    return (n.resident_bytes || 0) / cap > 0.85;
+  }
+
   // Expose pure helpers for potential test harnesses without leaking to CSP.
-  window.__talon = { filterNodes, sortNodes, fmtBytes, fmtDuration };
+  window.__talon = {
+    filterNodes, sortNodes, fmtBytes, fmtDuration,
+    computeRates, sparklinePoints, haStatus, groupNodes, capacityRows, hotspotFlag,
+  };
 
   // --- indicators -----------------------------------------------------------
   function setConn(state, text) {
@@ -138,10 +333,30 @@
       const stale = !r.ok && !!lastGood.overview;
       if (r.ok) lastGood.overview = r.data;
       const d = r.ok ? r.data : lastGood.overview;
+      // Fleet payload feeds trends (aggregate counters), HA panel, and capacity.
+      const rn = await apiGet("/nodes?limit=500");
+      if (rn.ok) lastGood.nodes = rn.data;
+      const nodesData = rn.ok ? rn.data : lastGood.nodes;
+      const nodes = (nodesData && nodesData.nodes) || [];
+      if (r.ok && nodes.length) {
+        recordSample(nodes, (d.meta && d.meta.generated_at_unix_ms) || Date.now());
+      }
       root.textContent = "";
       if (!d) return renderError(root, r);
       setMeta(d.meta, stale);
-      root.appendChild(viewHeader("Cluster: " + d.cluster_id, { stale }));
+      const header = viewHeader("Cluster: " + d.cluster_id, { stale });
+      // Operator tool: export the current cluster + fleet snapshot as JSON.
+      const exportBtn = el("button", { class: "btn", type: "button", "aria-label": "Export snapshot as JSON" }, [
+        el("span", { text: "⭳ Export JSON" }),
+      ]);
+      exportBtn.addEventListener("click", function () {
+        exportSnapshot(d, nodesData);
+      });
+      const actions = header.querySelector(".view-actions");
+      if (actions) actions.insertBefore(exportBtn, actions.firstChild);
+      root.appendChild(header);
+
+      // --- summary stats + cluster capacity bar ---
       const panel = el("section", { class: "panel" });
       const grid = el("div", { class: "stat-grid" });
       const stat = (label, value, tone) =>
@@ -156,7 +371,6 @@
       grid.appendChild(stat("Unhealthy/stale", unhealthy, unhealthy > 0 ? "warn" : null));
       grid.appendChild(stat("Blocks", d.total_block_count));
       panel.appendChild(grid);
-      // Capacity utilization bar.
       const used = d.total_resident_bytes;
       const cap = d.total_capacity_bytes;
       const pct = cap > 0 ? Math.min(100, Math.round((used / cap) * 100)) : 0;
@@ -167,13 +381,30 @@
       ]));
       const track = el("div", { class: "cap-track", role: "progressbar", "aria-valuenow": String(pct), "aria-valuemin": "0", "aria-valuemax": "100" });
       const fill = el("div", { class: "cap-fill" + (pct > 90 ? " hot" : pct > 75 ? " warm" : "") });
-      // Set width via the CSSOM (allowed under a strict CSP) rather than an
-      // inline style attribute, which style-src 'self' would block.
       fill.style.width = pct + "%";
       track.appendChild(fill);
       capBox.appendChild(track);
       panel.appendChild(capBox);
       root.appendChild(panel);
+
+      // --- traffic trends (client-derived rates) ---
+      const trends = el("section", { class: "panel" });
+      trends.appendChild(el("h2", { text: "Traffic trends" }));
+      const spark = el("div", { class: "spark-grid" });
+      spark.appendChild(sparkCard("Requests/s", rateSeries.qps, (v) => v.toFixed(v < 10 ? 2 : 0)));
+      spark.appendChild(sparkCard("Error rate", rateSeries.errorRate, (v) => (v * 100).toFixed(1) + "%", "err"));
+      spark.appendChild(sparkCard("Cache hit rate", rateSeries.hitRate, (v) => Math.round(v * 100) + "%", "ok"));
+      spark.appendChild(sparkCard("Egress", rateSeries.bytesPerSec, (v) => fmtBytes(v) + "/s"));
+      trends.appendChild(spark);
+      root.appendChild(trends);
+
+      // --- HA topology / consistency ---
+      const coords = nodes.filter((n) => n.role === "coordinator");
+      if (coords.length) root.appendChild(await haPanel(coords, d.meta));
+
+      // --- per-worker capacity + hotspots ---
+      const rows = capacityRows(nodes);
+      if (rows.length) root.appendChild(hotspotPanel(rows));
     },
 
     async nodes(root) {
@@ -198,7 +429,7 @@
         root.appendChild(panel);
         return;
       }
-      panel.appendChild(fleetTable(shown));
+      appendFleetTables(panel, shown);
       root.appendChild(panel);
     },
 
@@ -264,6 +495,18 @@
       row("Uptime", fmtDuration(uptime));
       row("Heartbeat age", fmtDuration(hbAge));
       panel.appendChild(kv);
+      // Operator tools: direct links to the node's own admin endpoints and a
+      // one-click diagnostics copy.
+      const tools = el("div", { class: "node-tools" });
+      if (n.admin_address) {
+        const base = window.location.protocol + "//" + n.admin_address;
+        tools.appendChild(el("a", { class: "btn", href: base + "/metrics", target: "_blank", rel: "noopener", text: "↗ /metrics" }));
+        tools.appendChild(el("a", { class: "btn", href: base + "/readyz", target: "_blank", rel: "noopener", text: "↗ /readyz" }));
+      }
+      const copyBtn = el("button", { class: "btn", type: "button" }, [el("span", { text: "⧉ Copy diagnostics" })]);
+      copyBtn.addEventListener("click", function () { copyDiagnostics(n, copyBtn); });
+      tools.appendChild(copyBtn);
+      panel.appendChild(tools);
       root.appendChild(panel);
 
       if (n.role === "worker") {
@@ -301,6 +544,188 @@
     },
   };
 
+  // --- HA topology panel ----------------------------------------------------
+  /**
+   * Render multi-coordinator consistency. Best-effort: try each coordinator's
+   * own admin /api/v1/cluster to compare snapshot revisions; if cross-origin or
+   * proxy rules block that (common behind a single-port dev proxy), degrade to
+   * the load-balancer view plus each coordinator's ready state from the fleet.
+   */
+  async function haPanel(coords, lbMeta) {
+    const panel = el("section", { class: "panel" });
+    const snaps = await Promise.all(coords.map(probeCoordinator));
+    const reachableCount = snaps.filter((s) => s.ok).length;
+    // The strict same-origin CSP (connect-src 'self') blocks probing peer
+    // coordinators from the browser, so cross-revision comparison is a
+    // best-effort enrichment. When unavailable we fall back to the fleet-derived
+    // view: each coordinator's ready state and heartbeat age, which already
+    // surfaces a wedged or departed master.
+    let status;
+    if (reachableCount > 0) {
+      status = haStatus(snaps);
+    } else {
+      const notReady = coords.filter((n) => !n.ready).length;
+      status = notReady > 0
+        ? { state: "degraded", detail: notReady + " coordinator(s) not ready" }
+        : { state: "sync", detail: "all coordinators ready (revision compare unavailable under CSP)" };
+    }
+
+    const head = el("div", { class: "view-header" }, [
+      el("h2", { text: "HA topology (" + coords.length + " coordinators)" }),
+      el("span", { class: "ha-badge " + status.state, text: haLabel(status.state) }),
+    ]);
+    panel.appendChild(head);
+    panel.appendChild(el("p", { class: "muted", text: status.detail }));
+
+    const table = el("table", { class: "fleet" });
+    table.appendChild(el("thead", null, [el("tr", null, [
+      el("th", { scope: "col", text: "Coordinator" }),
+      el("th", { scope: "col", text: "Ready" }),
+      el("th", { scope: "col", text: "Revision" }),
+      el("th", { scope: "col", text: "Snapshot age" }),
+      el("th", { scope: "col", text: "Heartbeat age" }),
+    ])]));
+    const body = el("tbody");
+    const now = Date.now();
+    for (let i = 0; i < coords.length; i++) {
+      const n = coords[i];
+      const s = snaps[i];
+      const hbAge = Math.max(0, now - n.reported_at_unix_ms);
+      const link = el("a", { href: "#/node/" + encodeURIComponent(n.node_id), text: n.node_id });
+      body.appendChild(el("tr", null, [
+        el("td", null, [link]),
+        el("td", null, [el("span", { class: "badge " + (n.health || "unknown"), text: n.ready ? "yes" : "no" })]),
+        el("td", null, [el("code", { text: s.ok ? String(s.revision) : "—" })]),
+        el("td", { class: "num", text: s.ok ? fmtDuration(s.age_ms) : "—" }),
+        el("td", { class: "num", text: fmtDuration(hbAge) }),
+      ]));
+    }
+    table.appendChild(body);
+    panel.appendChild(table);
+    return panel;
+  }
+
+  function haLabel(state) {
+    return { sync: "in sync", lagging: "lagging", diverged: "DIVERGED", degraded: "degraded", unknown: "unknown" }[state] || state;
+  }
+
+  /**
+   * Probe one coordinator's own snapshot via its admin address. Returns
+   * {ok, revision, age_ms}. On any failure returns {ok:false} so the panel
+   * degrades rather than erroring.
+   */
+  async function probeCoordinator(n) {
+    const addr = n.admin_address;
+    if (!addr) return { ok: false };
+    // Build an absolute URL to the coordinator's own admin API. Reuse the
+    // current page scheme; the host is the advertised admin address.
+    let url;
+    try {
+      url = window.location.protocol + "//" + addr + "/api/v1/cluster";
+    } catch (_) { return { ok: false }; }
+    try {
+      const res = await fetch(url, { headers: { accept: "application/json" }, mode: "cors" });
+      if (!res.ok) return { ok: false };
+      const j = await res.json();
+      return { ok: true, revision: j.meta ? j.meta.snapshot_revision : "?", age_ms: j.meta ? j.meta.snapshot_age_ms : 0 };
+    } catch (_) {
+      return { ok: false };
+    }
+  }
+
+  // --- capacity / hotspot panel ---------------------------------------------
+  function hotspotPanel(rows) {
+    const panel = el("section", { class: "panel" });
+    panel.appendChild(el("h2", { text: "Worker capacity & hotspots" }));
+    const maxResident = rows.reduce((m, r) => Math.max(m, r.resident_bytes), 0);
+    const maxBlocks = rows.reduce((m, r) => Math.max(m, r.block_count), 0);
+    const list = el("div", { class: "hot-list" });
+    for (const row of rows) {
+      const item = el("div", { class: "hot-row" + (row.hot ? " hot" : "") });
+      const idLine = el("div", { class: "hot-id" }, [
+        el("a", { href: "#/node/" + encodeURIComponent(row.node_id), text: row.node_id }),
+        el("span", { class: "muted", text: fmtBytes(row.resident_bytes) + " / " + fmtBytes(row.capacity_bytes) + " (" + row.pct + "%)" }),
+      ]);
+      item.appendChild(idLine);
+      // Resident bar (relative to configured capacity).
+      const track = el("div", { class: "cap-track" });
+      const fill = el("div", { class: "cap-fill" + (row.pct > 90 ? " hot" : row.pct > 75 ? " warm" : "") });
+      fill.style.width = row.pct + "%";
+      track.appendChild(fill);
+      item.appendChild(track);
+      // Block-count skew bar (relative to the busiest worker).
+      const bpct = maxBlocks > 0 ? Math.round((row.block_count / maxBlocks) * 100) : 0;
+      const blk = el("div", { class: "hot-blocks" }, [
+        el("span", { class: "muted", text: row.block_count + " blocks" }),
+      ]);
+      const btrack = el("div", { class: "cap-track thin" });
+      const bfill = el("div", { class: "cap-fill accent" });
+      bfill.style.width = bpct + "%";
+      btrack.appendChild(bfill);
+      blk.appendChild(btrack);
+      item.appendChild(blk);
+      list.appendChild(item);
+    }
+    panel.appendChild(list);
+    return panel;
+  }
+
+  // --- operator tools -------------------------------------------------------
+  /** Download the current cluster + fleet snapshot as a JSON file. */
+  function exportSnapshot(cluster, nodes) {
+    const payload = {
+      exported_at: new Date().toISOString(),
+      cluster: cluster || null,
+      nodes: (nodes && nodes.nodes) || [],
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = el("a", { href: url, download: "talon-snapshot-" + Date.now() + ".json" });
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+  }
+
+  /** Copy a node's key diagnostics to the clipboard as readable text. */
+  function copyDiagnostics(n, btn) {
+    const now = Date.now();
+    const lines = [
+      "node_id: " + n.node_id,
+      "role: " + n.role,
+      "health: " + n.health + (n.ready ? " (ready)" : " (not ready)"),
+      "address: " + n.address,
+      "admin_address: " + (n.admin_address || "—"),
+      "build: " + n.build_version,
+      "uptime: " + fmtDuration(Math.max(0, now - n.started_at_unix_ms)),
+      "heartbeat_age: " + fmtDuration(Math.max(0, now - n.reported_at_unix_ms)),
+    ];
+    if (n.role === "worker") {
+      const total = n.cache_hits_total + n.cache_misses_total;
+      const hitRate = total > 0 ? Math.round((n.cache_hits_total / total) * 100) : 0;
+      lines.push(
+        "blocks: " + n.block_count,
+        "resident: " + fmtBytes(n.resident_bytes) + " / " + fmtBytes(n.capacity_bytes),
+        "cache_hit_rate: " + hitRate + "%",
+        "requests_total: " + n.requests_total,
+        "errors_total: " + n.errors_total,
+        "bytes_served_total: " + n.bytes_served_total,
+      );
+    }
+    if (n.labels) for (const k of Object.keys(n.labels).sort()) lines.push("label." + k + ": " + n.labels[k]);
+    const text = lines.join("\n");
+    const done = function () {
+      if (!btn) return;
+      const span = btn.querySelector("span");
+      if (span) { const old = span.textContent; span.textContent = "✓ Copied"; setTimeout(function () { span.textContent = old; }, 1500); }
+    };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, done);
+    } else {
+      done();
+    }
+  }
+
   function fleetControls(allNodes) {
     const bar = el("div", { class: "controls" });
     const search = el("input", {
@@ -318,6 +743,12 @@
     const healthSel = selectControl("Health", ["", "healthy", "degraded", "unhealthy", "unknown"], fleet.health, function (v) { fleet.health = v; rerenderFleet(); });
     bar.appendChild(roleSel);
     bar.appendChild(healthSel);
+    // Group-by: "role" plus any label key present on the fleet.
+    const labelKeys = new Set();
+    for (const n of allNodes) if (n.labels) for (const k of Object.keys(n.labels)) labelKeys.add(k);
+    const groupOpts = ["", "role"].concat(Array.from(labelKeys).sort());
+    const groupSel = selectControl("Group by", groupOpts, fleet.group, function (v) { fleet.group = v; rerenderFleet(); });
+    bar.appendChild(groupSel);
     return bar;
   }
 
@@ -344,6 +775,18 @@
     { key: "resident_bytes", label: "Resident" },
     { key: "address", label: "Address" },
   ];
+
+  /** Append either one table, or one table per group when Group by is active. */
+  function appendFleetTables(panel, nodes) {
+    if (!fleet.group) {
+      panel.appendChild(fleetTable(nodes));
+      return;
+    }
+    for (const [group, groupNodesList] of groupNodes(nodes, fleet.group)) {
+      panel.appendChild(el("h2", { class: "group-head", text: fleet.group + ": " + group + " (" + groupNodesList.length + ")" }));
+      panel.appendChild(fleetTable(groupNodesList));
+    }
+  }
 
   function fleetTable(nodes) {
     const table = el("table", { class: "fleet" });
@@ -452,7 +895,7 @@
     panel.appendChild(fleetControls(data.nodes));
     const shown = sortNodes(filterNodes(data.nodes, fleet), fleet.sort, fleet.dir);
     panel.appendChild(el("p", { class: "muted count", text: shown.length + " of " + data.total + " nodes" }));
-    if (shown.length) panel.appendChild(fleetTable(shown));
+    if (shown.length) appendFleetTables(panel, shown);
     else panel.appendChild(el("div", { class: "boundary" }, [el("p", { text: "No nodes match the current filters." })]));
     view.appendChild(panel);
     if (wasSearch) {
