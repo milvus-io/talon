@@ -153,3 +153,37 @@ dl.kv { display: grid; grid-template-columns: max-content 1fr; gap: 6px calc(var
 dl.kv dt { color: var(--text-muted); }
 dl.kv dd { margin: 0; }
 
+/* --- trends / sparklines ------------------------------------------------- */
+.spark-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: calc(var(--space) * 2); }
+.spark { background: var(--bg-elev); border-radius: var(--radius); padding: calc(var(--space) * 1.5); }
+.spark-head { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 6px; }
+.spark-title { color: var(--text-muted); font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; }
+.spark-val { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; }
+.spark-svg { display: block; width: 100%; height: 40px; }
+.spark-svg polyline { stroke: var(--accent); }
+.spark.ok .spark-svg polyline { stroke: var(--ok); }
+.spark.err .spark-svg polyline { stroke: var(--err); }
+.spark-note { font-size: 11px; margin-top: 4px; }
+
+/* --- HA topology panel --------------------------------------------------- */
+.ha-badge { display: inline-block; padding: 2px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; }
+.ha-badge.sync { background: rgba(63,185,80,0.15); color: var(--ok); }
+.ha-badge.lagging, .ha-badge.degraded { background: rgba(210,153,34,0.15); color: var(--warn); }
+.ha-badge.diverged { background: rgba(248,81,73,0.15); color: var(--err); }
+.ha-badge.unknown { background: var(--bg-elev); color: var(--text-muted); }
+
+/* --- worker capacity / hotspots ------------------------------------------ */
+.hot-list { display: grid; gap: calc(var(--space) * 1.5); }
+.hot-row { padding: var(--space); border-radius: var(--radius); background: var(--bg-elev); }
+.hot-row.hot { outline: 1px solid var(--err); }
+.hot-id { display: flex; justify-content: space-between; gap: var(--space); margin-bottom: 6px; }
+.hot-blocks { margin-top: 6px; display: grid; gap: 4px; }
+.cap-track.thin { height: 6px; }
+.cap-fill.accent { background: var(--accent); }
+.group-head { margin-top: calc(var(--space) * 2); font-size: 14px; color: var(--text-muted); }
+
+/* --- node detail tools --------------------------------------------------- */
+.node-tools { display: flex; flex-wrap: wrap; gap: var(--space); margin-top: calc(var(--space) * 2); }
+.node-tools .btn { text-decoration: none; }
+
+

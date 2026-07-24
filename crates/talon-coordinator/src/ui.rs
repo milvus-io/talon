@@ -209,8 +209,20 @@ mod tests {
     fn app_js_exposes_testable_fleet_helpers() {
         // The pure fleet helpers (filter/sort/format) are the testable core of
         // the fleet dashboard (#84). Assert they exist and are exported for a
-        // browser/JS harness.
-        for sym in ["filterNodes", "sortNodes", "fmtBytes", "fmtDuration"] {
+        // browser/JS harness. The overview enhancements add derived-metric and
+        // visualization helpers exercised by ui/tests/fleet.test.js.
+        for sym in [
+            "filterNodes",
+            "sortNodes",
+            "fmtBytes",
+            "fmtDuration",
+            "computeRates",
+            "sparklinePoints",
+            "haStatus",
+            "groupNodes",
+            "capacityRows",
+            "hotspotFlag",
+        ] {
             assert!(APP_JS.contains(sym), "missing helper {sym}");
         }
         assert!(APP_JS.contains("window.__talon"), "helpers not exported");
