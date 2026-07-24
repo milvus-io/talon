@@ -29,7 +29,7 @@ pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
 pub use metrics::{ReadStats, ReadStatsSnapshot};
 #[cfg(feature = "mount")]
-pub use mount::TalonFuse;
+pub use mount::{TalonFuse, CANONICAL_MOUNT_VERSION};
 pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use pool::ConnectionPool;

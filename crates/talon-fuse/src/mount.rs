@@ -78,6 +78,26 @@ pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
     }
 }
 
+/// The canonical placeholder version the mount path uses to address blocks.
+///
+/// **Placement is version-independent on the mount path in v1, by design.** The
+/// coordinator locates a block by hashing the [`BlockId`](talon_core::BlockId) the client sends
+/// (rendezvous/HRW), and the worker is the sole authority on *freshness*: it
+/// resolves each object's real ETag itself and refuses to serve stale bytes
+/// (issues #119, #163). The client never transmits a version to the worker —
+/// [`RangeRequest`](talon_transport::RangeRequest) carries only `object` +
+/// `[offset, len)` — so the version in a client-side [`BlockId`](talon_core::BlockId) affects only the
+/// client's own placement-cache key, never the bytes returned.
+///
+/// Rather than fabricate a per-object `"v1"` that looks meaningful but isn't,
+/// every mount-path block is addressed under this single canonical token. This
+/// keeps client and coordinator trivially consistent (both hash the same value)
+/// and makes the "no per-object version negotiation here" contract explicit. A
+/// future revision that wants version-aware placement would resolve the real
+/// version on both sides and revisit the mount's page-cache retention
+/// (`FOPEN_KEEP_CACHE`), which currently relies on session immutability.
+pub const CANONICAL_MOUNT_VERSION: &str = "talon-mount-v1";
+
 /// A mountable Talon filesystem: the `fuser` adapter over the read path.
 ///
 /// Holds the namespace tree ([`ReadOnlyFs`]) that answers metadata ops and the
@@ -93,11 +113,12 @@ pub struct TalonFuse {
     runtime: tokio::runtime::Handle,
     /// Logical block size used to split reads into per-block fetches.
     block_size: u32,
-    /// Source version/etag used to address blocks.
+    /// Canonical placeholder version used to address blocks.
     ///
-    /// v1 has no per-object version negotiation on the mount path, so a single
-    /// placeholder version is used cluster-wide (client and worker agree by
-    /// construction); a future revision resolves it from a coordinator `HEAD`.
+    /// The mount path is version-independent by design (see
+    /// [`CANONICAL_MOUNT_VERSION`]): this value only keys the client's placement
+    /// cache and feeds the HRW hash, never the bytes the worker returns. It is
+    /// normally [`CANONICAL_MOUNT_VERSION`].
     version: talon_core::Version,
 }
 
@@ -354,11 +375,21 @@ mod tests {
             reader,
             tokio::runtime::Handle::current(),
             256 << 20,
-            talon_core::Version::new("v1"),
+            talon_core::Version::new(CANONICAL_MOUNT_VERSION),
         );
         // The adapter exposes its components for the callbacks to use.
         assert_eq!(mounted.namespace().getattr(1).unwrap().ino, 1);
         assert_eq!(mounted.reader().coordinator_addr(), "127.0.0.1:7000");
+    }
+
+    #[test]
+    fn canonical_mount_version_is_a_stable_nonempty_token() {
+        // The mount path is version-independent (issue #182): placement hashes
+        // this token on both client and coordinator, and the worker owns
+        // freshness. It must be non-empty (an empty version is refused by the
+        // worker) and stable, so this guards against an accidental change.
+        assert!(!CANONICAL_MOUNT_VERSION.is_empty());
+        assert_eq!(CANONICAL_MOUNT_VERSION, "talon-mount-v1");
     }
 
     #[test]
