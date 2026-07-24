@@ -69,6 +69,21 @@ jobs:
       - name: Build docs
         run: cargo doc --workspace --no-deps --all-features
 
+  docs-book:
+    name: mdbook build
+    runs-on: ubuntu-latest
+    # Ensures the mdBook documentation site always builds. Deployment to GitHub
+    # Pages happens separately (docs.yml) only on merge to main.
+    env:
+      MDBOOK_VERSION: "0.4.52"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: Install mdBook
+        run: cargo install mdbook --version ${MDBOOK_VERSION} --locked
+      - name: Build the book
+        run: mdbook build docs/book
+
   etcd-contract:
     name: etcd backend contract
     runs-on: ubuntu-latest
