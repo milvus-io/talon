@@ -4,7 +4,8 @@
 //! The Lease's own fields carry liveness — `holderIdentity` is the process
 //! incarnation, `leaseDurationSeconds` is the TTL, and `renewTime` is the last
 //! accepted heartbeat — so a crashed process's record is judged expired once
-//! `renewTime + leaseDurationSeconds` passes, without any Talon-side sweeper.
+//! `renewTime + leaseDurationSeconds` (plus a grace margin, see
+//! [`lease_expired`]) passes, without any Talon-side sweeper.
 //! The full bounded [`NodeStatus`] rides along as JSON in a Talon-owned
 //! annotation on the same object (ADR 0001 §6), keeping the record to a single
 //! API object.
@@ -586,15 +587,31 @@ fn decode_status(lease: &Lease) -> StateStoreResult<Option<NodeStatus>> {
         })
 }
 
-/// Whether a Lease is past `renewTime + leaseDurationSeconds`.
+/// Whether a Lease is past `renewTime + leaseDurationSeconds + grace`.
+///
+/// Kubernetes has no server-side Lease expiry, so each coordinator judges expiry
+/// against its own wall clock. Without a margin the decision is razor-thin at
+/// `renew + ttl`: two coordinators a few hundred ms of clock skew apart can
+/// disagree about a lease right at the boundary, producing divergent membership
+/// snapshots and therefore divergent [`Epoch::for_nodes`] placement (issue #165).
+///
+/// We add a grace margin of a quarter of the lease TTL (roughly one heartbeat
+/// window, since the TTL spans several missed heartbeats) before treating a
+/// lease as expired. This biases toward *inclusion* at the boundary: a node is
+/// dropped only once every reasonably-skewed coordinator agrees it is gone, so
+/// they converge on the same membership set. The margin only delays eviction of
+/// an already-silent node by one heartbeat window — well within the health
+/// grading that separately marks such a node unhealthy.
 fn lease_expired(lease: &Lease, now_unix_ms: u64) -> bool {
     let Some(spec) = &lease.spec else { return true };
     let Some(MicroTime(renew)) = spec.renew_time.as_ref().map(|t| MicroTime(t.0)) else {
         return true;
     };
-    let ttl = spec.lease_duration_seconds.unwrap_or(0).max(0) as u64;
+    let ttl_ms = (spec.lease_duration_seconds.unwrap_or(0).max(0) as u64).saturating_mul(1_000);
+    let grace_ms = ttl_ms / 4;
     let renew_ms = renew.timestamp_millis().max(0) as u64;
-    now_unix_ms > renew_ms.saturating_add(ttl.saturating_mul(1_000))
+    let deadline = renew_ms.saturating_add(ttl_ms).saturating_add(grace_ms);
+    now_unix_ms > deadline
 }
 
 fn sanitize_label(value: &str) -> String {
@@ -717,9 +734,39 @@ mod tests {
     }
 
     #[test]
+    fn lease_expired_applies_a_grace_margin() {
+        use k8s_openapi::chrono::TimeZone;
+        // Build a Lease whose renewTime is at t=0 with a 40s TTL, so the grace
+        // margin (TTL/4 = 10s) pushes the expiry deadline out to 50s.
+        fn lease_with(renew_ms: i64, ttl_seconds: i32) -> Lease {
+            let renew = Utc.timestamp_millis_opt(renew_ms).single().unwrap();
+            Lease {
+                spec: Some(LeaseSpec {
+                    renew_time: Some(MicroTime(renew)),
+                    lease_duration_seconds: Some(ttl_seconds),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        }
+        let lease = lease_with(0, 40);
+        // Well inside the TTL: live.
+        assert!(!lease_expired(&lease, 30_000));
+        // Just past the bare TTL but inside the grace window: still live, so a
+        // skewed coordinator near the boundary keeps the node in membership.
+        assert!(!lease_expired(&lease, 45_000));
+        // Exactly at the graced deadline: not yet expired (strict `>`).
+        assert!(!lease_expired(&lease, 50_000));
+        // Past renew + ttl + grace: expired.
+        assert!(lease_expired(&lease, 50_001));
+        // A lease with no spec or no renewTime is treated as expired.
+        assert!(lease_expired(&Lease::default(), 0));
+        assert!(lease_expired(&lease_with(0, 0), 1));
+    }
+
+    #[test]
     fn revision_is_prefixed_and_never_empty() {
         assert_eq!(revision("12345").unwrap().as_str(), "k8s:12345");
-        // Even an empty server version yields a valid non-empty token.
         assert_eq!(revision("").unwrap().as_str(), "k8s:");
     }
 
