@@ -17,6 +17,11 @@ path = "src/main.rs"
 name = "talon-gen-config-docs"
 path = "src/bin/gen-config-docs.rs"
 
+# Documentation generator: renders the REST API reference from openapi.json.
+[[bin]]
+name = "talon-gen-api-docs"
+path = "src/bin/gen-api-docs.rs"
+
 [features]
 state-store-testkit = []
 # Production Kubernetes Lease ClusterStateStore backend. Off by default so

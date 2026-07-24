@@ -85,21 +85,28 @@ jobs:
         run: mdbook build docs/book
 
   config-docs:
-    name: config reference drift
+    name: reference docs drift
     runs-on: ubuntu-latest
-    # The configuration reference is generated from the ConfigVar schemas.
-    # Fail if the committed copy is stale so docs cannot drift from the code.
+    # The configuration and REST API references are generated from the code /
+    # OpenAPI spec. Fail if a committed copy is stale so docs cannot drift.
     steps:
       - uses: actions/checkout@v4
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
-      - name: Regenerate and diff
+      - name: Configuration reference drift
         run: |
           cargo run -q -p talon-coordinator --features etcd,kubernetes \
             --bin talon-gen-config-docs > /tmp/config-ref.md
           if ! diff -u docs/reference/configuration.md /tmp/config-ref.md; then
             echo "::error::docs/reference/configuration.md is stale; run 'just gen-config-docs'"
+            exit 1
+          fi
+      - name: REST API reference drift
+        run: |
+          cargo run -q -p talon-coordinator --bin talon-gen-api-docs > /tmp/api-ref.md
+          if ! diff -u docs/reference/rest-api.md /tmp/api-ref.md; then
+            echo "::error::docs/reference/rest-api.md is stale; run 'just gen-api-docs'"
             exit 1
           fi
 
