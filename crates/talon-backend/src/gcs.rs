@@ -74,8 +74,32 @@ impl GcsBackend {
 
     /// Build the ranged GET request (exposed for testing).
     pub fn build_get(&self, obj: &ObjectId, offset: u64, len: u64) -> HttpRequest {
+        self.build_get_if_match(obj, offset, len, None)
+    }
+
+    /// Build the ranged GET request with an optional generation/ETag precondition.
+    ///
+    /// A numeric version is treated as an object generation and sent as
+    /// `x-goog-if-generation-match`; a non-numeric version (ETag fallback) is
+    /// sent as `If-Match`. Either makes GCS return `412` if the object changed
+    /// since the version was resolved (issue #163).
+    pub fn build_get_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
         let mut headers = self.auth_headers();
         headers.push(("Range".to_string(), Self::range_header(offset, len)));
+        if let Some(version) = if_match {
+            let v = version.as_str();
+            if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+                headers.push(("x-goog-if-generation-match".to_string(), v.to_string()));
+            } else {
+                headers.push(("If-Match".to_string(), format!("\"{v}\"")));
+            }
+        }
         HttpRequest {
             method: Method::Get,
             url: self.object_url(obj),
@@ -96,12 +120,22 @@ impl GcsBackend {
 #[async_trait]
 impl BackendStore for GcsBackend {
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<bytes::Bytes> {
+        self.fetch_range_if_match(obj, offset, len, None).await
+    }
+
+    async fn fetch_range_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<bytes::Bytes> {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
         let resp = self
             .http
-            .execute(self.build_get(obj, offset, len))
+            .execute(self.build_get_if_match(obj, offset, len, if_match))
             .await
             .map_err(Error::Backend)?;
         match resp.status {
@@ -117,6 +151,16 @@ impl BackendStore for GcsBackend {
                 .map_err(Error::Backend)
             }
             404 => Err(Error::NotFound(obj.to_path())),
+            // Precondition failed: the object changed since the version was
+            // resolved (issue #163). Report the new generation/ETag if present.
+            412 => Err(Error::VersionMismatch {
+                expected: if_match.map(|v| v.0.clone()).unwrap_or_default(),
+                found: resp
+                    .header("x-goog-generation")
+                    .or_else(|| resp.header("etag"))
+                    .map(|e| e.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+            }),
             s => Err(Error::Backend(format!(
                 "GCS GET {} -> HTTP {s}",
                 obj.to_path()
@@ -221,6 +265,61 @@ mod tests {
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.header("Authorization"), Some("Bearer tok"));
         assert_eq!(req.header("Range"), Some("bytes=4-8"));
+    }
+
+    #[tokio::test]
+    async fn fetch_range_if_match_numeric_uses_generation_precondition() {
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"gcsby"),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), Some("tok".into()), http.clone());
+        let _ = g
+            .fetch_range_if_match(&obj(), 4, 5, Some(&Version::new("1699999999")))
+            .await
+            .unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        // A numeric version is an object generation.
+        assert_eq!(req.header("x-goog-if-generation-match"), Some("1699999999"));
+        assert_eq!(req.header("If-Match"), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_if_match_nonnumeric_uses_if_match() {
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"gcsby"),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), None, http.clone());
+        let _ = g
+            .fetch_range_if_match(&obj(), 4, 5, Some(&Version::new("etagxyz")))
+            .await
+            .unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.header("If-Match"), Some("\"etagxyz\""));
+        assert_eq!(req.header("x-goog-if-generation-match"), None);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_maps_412_to_version_mismatch() {
+        let http = MockHttp::new(HttpResponse {
+            status: 412,
+            headers: vec![("x-goog-generation".into(), "1700000001".into())],
+            body: bytes::Bytes::new(),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), None, http);
+        match g
+            .fetch_range_if_match(&obj(), 0, 8, Some(&Version::new("1699999999")))
+            .await
+        {
+            Err(Error::VersionMismatch { expected, found }) => {
+                assert_eq!(expected, "1699999999");
+                assert_eq!(found, "1700000001");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

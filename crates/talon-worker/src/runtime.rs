@@ -1,14 +1,29 @@
 //! Instrumented worker cache request runtime.
 
-use std::sync::Arc;
-use std::time::Instant;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use talon_core::{
-    BackendStore, BlockForm, BlockId, BlockMeta, ObjectId, ObjectStore, PageIndex, Version,
+    BackendStore, BlockForm, BlockId, BlockMeta, Error, ObjectId, ObjectStore, PageIndex, Version,
 };
 use talon_transport::data::RangeRequest;
 
 use crate::{BlockIndex, InFlightLoads, LoadKey, Presence, WholeBlockStore, WorkerMetrics};
+
+/// Default lifetime of a cached resolved object version.
+///
+/// A short TTL keeps warm cache hits from paying a backend `HEAD` per read
+/// while still bounding how long a source overwrite can go unnoticed on the
+/// read path; the conditional GET (`If-Match`) is the hard correctness guard
+/// that catches an overwrite inside the window (issue #163).
+const DEFAULT_VERSION_TTL: Duration = Duration::from_secs(3);
+
+/// A per-object resolved version with the instant it was resolved.
+struct CachedVersion {
+    version: Version,
+    resolved_at: Instant,
+}
 
 /// Shared state required to serve instrumented data-plane range requests.
 pub struct WorkerRuntime {
@@ -18,6 +33,10 @@ pub struct WorkerRuntime {
     backend: Arc<dyn BackendStore>,
     block_size: u32,
     metrics: WorkerMetrics,
+    /// Short-TTL cache of resolved object versions, so a warm read does not pay
+    /// a backend `HEAD` per request (issue #163).
+    version_cache: Mutex<HashMap<ObjectId, CachedVersion>>,
+    version_ttl: Duration,
 }
 
 impl WorkerRuntime {
@@ -37,7 +56,16 @@ impl WorkerRuntime {
             backend,
             block_size,
             metrics,
+            version_cache: Mutex::new(HashMap::new()),
+            version_ttl: DEFAULT_VERSION_TTL,
         }
+    }
+
+    /// Override the resolved-version cache TTL (test hook).
+    #[cfg(test)]
+    fn with_version_ttl(mut self, ttl: Duration) -> Self {
+        self.version_ttl = ttl;
+        self
     }
 
     /// The block-aligned [`BlockId`] containing `offset` of `object` at a given
@@ -61,30 +89,62 @@ impl WorkerRuntime {
     /// the *start* offset was read and the result clamped to that block's end,
     /// silently truncating cross-block reads (issue #112).
     ///
-    /// The object's real version (ETag/generation) is resolved once per request
-    /// via a backend `head()` and folded into every `BlockId`, so an overwrite
-    /// at the source produces distinct keys and the stale cached block is no
-    /// longer served (issue #119). A missing/empty version is refused rather than
-    /// cached under a placeholder.
+    /// The object's real version (ETag/generation) is resolved via a backend
+    /// `head()` and folded into every `BlockId`, so an overwrite at the source
+    /// produces distinct keys and the stale cached block is no longer served
+    /// (issue #119). A missing/empty version is refused rather than cached under
+    /// a placeholder.
+    ///
+    /// The resolved version is cached per object with a short TTL so a warm read
+    /// does not pay a `HEAD` per request, and it is carried as an `If-Match`
+    /// precondition into the miss GET so an overwrite inside the TTL window is
+    /// caught (`412` → [`Error::VersionMismatch`]) rather than silently commits
+    /// newer bytes under the older version's key. On a mismatch the cache is
+    /// invalidated and the request is retried once against the freshly-resolved
+    /// version (issue #163).
     pub async fn serve_range(&self, request: &RangeRequest) -> anyhow::Result<bytes::Bytes> {
         if request.len == 0 {
             return Ok(bytes::Bytes::new());
         }
+
+        // Resolve using the cache first; on a precondition failure (the object
+        // was overwritten within the version-cache window) drop the stale entry
+        // and retry once against a force-resolved version.
+        let version = self.resolve_version(&request.object, false).await?;
+        match self.serve_range_at(request, &version).await {
+            Ok(bytes) => Ok(bytes),
+            Err(error) if is_version_mismatch(&error) => {
+                self.invalidate_version(&request.object);
+                let version = self.resolve_version(&request.object, true).await?;
+                self.serve_range_at(request, &version).await
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Serve `[offset, offset + len)` against an already-resolved `version`.
+    ///
+    /// A request whose range crosses one or more block boundaries is split into
+    /// per-block reads (each a cache hit or a backend miss) and the pieces are
+    /// stitched into one contiguous buffer. Previously only the block containing
+    /// the *start* offset was read and the result clamped to that block's end,
+    /// silently truncating cross-block reads (issue #112).
+    async fn serve_range_at(
+        &self,
+        request: &RangeRequest,
+        version: &Version,
+    ) -> anyhow::Result<bytes::Bytes> {
         let block_size = self.block_size as u64;
         let end = request
             .offset
             .checked_add(request.len)
             .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
 
-        // Resolve the object's real version once for this request. Blocks are
-        // keyed by it, so a later overwrite (new ETag) misses the stale cache.
-        let version = self.resolve_version(&request.object).await?;
-
         // Fast path: the whole range lies within a single block. Keeps the
         // common case allocation-free (returns the per-block slice directly).
         let start_block = (request.offset / block_size) * block_size;
         if end <= start_block + block_size {
-            let block = self.block_for(&request.object, request.offset, &version);
+            let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
             let bytes = self.block_bytes(request, &block).await?;
             return slice(&bytes, offset_in_block, request.len);
@@ -94,7 +154,7 @@ impl WorkerRuntime {
         let mut out = bytes::BytesMut::with_capacity(request.len as usize);
         let mut cursor = request.offset;
         while cursor < end {
-            let block = self.block_for(&request.object, cursor, &version);
+            let block = self.block_for(&request.object, cursor, version);
             let offset_in_block = cursor - block.offset;
             let block_end = block.offset + block_size;
             let take = block_end.min(end) - cursor;
@@ -112,9 +172,19 @@ impl WorkerRuntime {
         Ok(out.freeze())
     }
 
-    /// Resolve the object's current version via a backend `head()`, refusing an
-    /// empty/missing version rather than caching under a placeholder (#119).
-    async fn resolve_version(&self, object: &ObjectId) -> anyhow::Result<Version> {
+    /// Resolve the object's current version, refusing an empty/missing version
+    /// rather than caching under a placeholder (#119).
+    ///
+    /// Returns a fresh cached value when one is within the TTL and `force` is
+    /// false; otherwise issues a backend `head()`, caches the result, and
+    /// returns it. `force` bypasses the cache (used after a precondition
+    /// failure) so the retry always sees the newest version (#163).
+    async fn resolve_version(&self, object: &ObjectId, force: bool) -> anyhow::Result<Version> {
+        if !force {
+            if let Some(version) = self.cached_version(object) {
+                return Ok(version);
+            }
+        }
         let stat = self
             .backend
             .head(object)
@@ -125,7 +195,35 @@ impl WorkerRuntime {
                 "backend returned no version/etag for {object}; refusing to cache without a version"
             );
         }
+        self.store_version(object, &stat.version);
         Ok(stat.version)
+    }
+
+    /// Return a cached version for `object` if one is within the TTL.
+    fn cached_version(&self, object: &ObjectId) -> Option<Version> {
+        let cache = self.version_cache.lock().unwrap();
+        let entry = cache.get(object)?;
+        if entry.resolved_at.elapsed() < self.version_ttl {
+            Some(entry.version.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Record a freshly-resolved version for `object`.
+    fn store_version(&self, object: &ObjectId, version: &Version) {
+        self.version_cache.lock().unwrap().insert(
+            object.clone(),
+            CachedVersion {
+                version: version.clone(),
+                resolved_at: Instant::now(),
+            },
+        );
+    }
+
+    /// Drop any cached version for `object` (after a precondition failure).
+    fn invalidate_version(&self, object: &ObjectId) {
+        self.version_cache.lock().unwrap().remove(object);
     }
 
     /// Return the full committed/fetched bytes of a single block, using the
@@ -213,9 +311,17 @@ impl WorkerRuntime {
     ) -> anyhow::Result<bytes::Bytes> {
         tracing::info!(block = %block, "MISS -> backend fetch");
         let started = Instant::now();
+        // Carry the resolved version as an If-Match precondition so an overwrite
+        // between version resolution and this GET is rejected (412) rather than
+        // committing newer bytes under the older version's key (issue #163).
         let fetched = self
             .backend
-            .fetch_range(&request.object, block.offset, self.block_size as u64)
+            .fetch_range_if_match(
+                &request.object,
+                block.offset,
+                self.block_size as u64,
+                Some(&block.version),
+            )
             .await;
         let bytes = match fetched {
             Ok(bytes) => {
@@ -261,6 +367,18 @@ fn slice(buffer: &[u8], offset: u64, len: u64) -> anyhow::Result<bytes::Bytes> {
     let requested = usize::try_from(len).unwrap_or(usize::MAX);
     let end = start.saturating_add(requested).min(buffer.len());
     Ok(bytes::Bytes::copy_from_slice(&buffer[start..end]))
+}
+
+/// Whether an error chain carries a backend [`Error::VersionMismatch`], i.e. an
+/// `If-Match` precondition failed because the object was overwritten (issue
+/// #163). Used to trigger a single re-resolve-and-retry.
+fn is_version_mismatch(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<Error>(),
+            Some(Error::VersionMismatch { .. })
+        )
+    })
 }
 
 #[cfg(test)]
@@ -317,6 +435,9 @@ mod tests {
             8,
             metrics,
         )
+        // Most tests assert version-sensitivity per read; a zero TTL keeps the
+        // resolved-version cache from masking a source overwrite between reads.
+        .with_version_ttl(Duration::ZERO)
     }
 
     #[tokio::test]
@@ -392,6 +513,9 @@ mod tests {
             block_size,
             metrics,
         )
+        // Default to always-resolve so version-sensitivity assertions are not
+        // masked by the version cache; caching is exercised explicitly below.
+        .with_version_ttl(Duration::ZERO)
     }
 
     #[tokio::test]
@@ -613,6 +737,136 @@ mod tests {
         // Nothing was fetched or cached without a version.
         assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
         assert_eq!(runtime.block_count(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A backend that counts HEADs and, when `enforce_precondition` is set, fails
+    /// a fetch carrying a stale `If-Match` with [`Error::VersionMismatch`] — the
+    /// 412 the real backends map — so the retry-on-mismatch path is exercised.
+    struct CondBackend {
+        version: std::sync::Mutex<String>,
+        body: std::sync::Mutex<Bytes>,
+        heads: AtomicUsize,
+        fetches: AtomicUsize,
+        enforce_precondition: bool,
+    }
+
+    #[async_trait]
+    impl BackendStore for CondBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(self.body.lock().unwrap().clone())
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if self.enforce_precondition {
+                if let Some(expected) = if_match {
+                    let current = self.version.lock().unwrap().clone();
+                    if expected.as_str() != current {
+                        return Err(Error::VersionMismatch {
+                            expected: expected.0.clone(),
+                            found: current,
+                        });
+                    }
+                }
+            }
+            self.fetch_range(object, offset, len).await
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            self.heads.fetch_add(1, Ordering::SeqCst);
+            Ok(ObjectStat {
+                len: self.body.lock().unwrap().len() as u64,
+                version: Version::new(self.version.lock().unwrap().clone()),
+            })
+        }
+    }
+
+    fn cond_runtime(backend: Arc<CondBackend>, root: &PathBuf, ttl: Duration) -> WorkerRuntime {
+        WorkerRuntime::new(
+            WholeBlockStore::open(root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend as Arc<dyn BackendStore>,
+            8,
+            WorkerMetrics::new(1024),
+        )
+        .with_version_ttl(ttl)
+    }
+
+    #[tokio::test]
+    async fn warm_read_within_ttl_skips_the_head() {
+        // With a live version-cache TTL, a warm cache hit must not pay a backend
+        // HEAD per read — only the first read resolves the version (issue #163).
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"abcdefgh")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: false,
+        });
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+
+        for _ in 0..3 {
+            let _ = runtime.serve_range(&request("obj")).await.unwrap();
+        }
+        assert_eq!(
+            backend.heads.load(Ordering::SeqCst),
+            1,
+            "warm reads within the TTL must reuse the cached version, not re-HEAD"
+        );
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn precondition_failure_reresolves_and_retries_once() {
+        // Read block0 first: resolves+caches version v1 and caches block0. The
+        // source is then overwritten to v2 while the version cache still holds
+        // v1. A read of block1 (not yet cached) is a miss that issues an
+        // If-Match(v1) GET, which fails the precondition (412 -> VersionMismatch)
+        // because the object is now v2. The runtime must invalidate the cached
+        // version, re-resolve v2, and retry so it commits the fresh bytes under
+        // the v2 key rather than surfacing the error (issue #163 TOCTOU).
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-data-old-data")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: true,
+        });
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+
+        // block0 (offset 0): resolves v1, caches block0 under v1.
+        let obj = ObjectId::new(Backend::Azure, "container", "obj");
+        let read = |offset| RangeRequest {
+            object: obj.clone(),
+            offset,
+            len: 4,
+        };
+        let first = runtime.serve_range(&read(0)).await.unwrap();
+        assert_eq!(first, Bytes::from_static(b"old-"));
+
+        // Overwrite the source; the version cache still holds v1.
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-data-new-data");
+
+        // block1 (offset 8): a miss under the stale cached v1 -> If-Match(v1)
+        // 412 -> re-resolve v2 -> refetch. Must serve the fresh v2 bytes.
+        let after = runtime.serve_range(&read(8)).await.unwrap();
+        assert_eq!(
+            after,
+            Bytes::from_static(b"new-"),
+            "must re-resolve and serve fresh bytes after a precondition failure"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

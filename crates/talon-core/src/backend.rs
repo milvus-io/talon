@@ -29,6 +29,32 @@ pub trait BackendStore: Send + Sync {
     /// checksum can be computed here.
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<Bytes>;
 
+    /// Fetch a byte range, optionally guarded by an `If-Match` precondition.
+    ///
+    /// When `if_match` is `Some`, the fetch is conditioned on the object still
+    /// being at that version (S3/Azure `If-Match`, GCS `x-goog-if-generation-match`),
+    /// so a source overwrite between the version resolution and the GET is
+    /// rejected with [`Error::VersionMismatch`](crate::Error::VersionMismatch)
+    /// instead of silently committing
+    /// the newer bytes under the older version's key (the HEAD→GET TOCTOU,
+    /// issue #163). The worker keys cache blocks by the resolved version, so a
+    /// precondition failure means the caller must re-resolve and refetch.
+    ///
+    /// The default implementation ignores the precondition and delegates to
+    /// [`fetch_range`](Self::fetch_range); real backends override it to carry the
+    /// precondition into the request. This keeps in-memory/test backends that
+    /// have no notion of preconditions working unchanged.
+    async fn fetch_range_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<Bytes> {
+        let _ = if_match;
+        self.fetch_range(obj, offset, len).await
+    }
+
     /// Fetch object metadata (size + version) without transferring data.
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat>;
 }
