@@ -39,6 +39,15 @@ check-config-docs:
       --bin talon-gen-config-docs > /tmp/talon-config-ref.md
     diff -u docs/reference/configuration.md /tmp/talon-config-ref.md
 
+# Regenerate the REST API reference from openapi.json.
+gen-api-docs:
+    cargo run -q -p talon-coordinator --bin talon-gen-api-docs -- docs/reference/rest-api.md
+
+# Fail if the committed REST API reference is stale vs. openapi.json.
+check-api-docs:
+    cargo run -q -p talon-coordinator --bin talon-gen-api-docs > /tmp/talon-api-ref.md
+    diff -u docs/reference/rest-api.md /tmp/talon-api-ref.md
+
 # --- benchmarks (performance feedback loop) ---
 
 # Run all microbenchmarks and write bench/results/latest.json.
