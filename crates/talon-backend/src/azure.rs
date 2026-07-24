@@ -88,8 +88,26 @@ impl AzureBackend {
 
     /// Build the ranged GET request (exposed for testing).
     pub fn build_get(&self, obj: &ObjectId, offset: u64, len: u64) -> HttpRequest {
+        self.build_get_if_match(obj, offset, len, None)
+    }
+
+    /// Build the ranged GET request with an optional `If-Match` precondition.
+    ///
+    /// When set, Azure returns `412 Precondition Failed` if the blob's ETag no
+    /// longer matches, i.e. it was overwritten since the version was resolved
+    /// (issue #163).
+    pub fn build_get_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
         let mut headers = self.common_headers();
         headers.push(("x-ms-range".to_string(), Self::range_header(offset, len)));
+        if let Some(version) = if_match {
+            headers.push(("If-Match".to_string(), format!("\"{}\"", version.as_str())));
+        }
         HttpRequest {
             method: Method::Get,
             url: self.blob_url(obj),
@@ -110,12 +128,22 @@ impl AzureBackend {
 #[async_trait]
 impl BackendStore for AzureBackend {
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<bytes::Bytes> {
+        self.fetch_range_if_match(obj, offset, len, None).await
+    }
+
+    async fn fetch_range_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<bytes::Bytes> {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
         let resp = self
             .http
-            .execute(self.build_get(obj, offset, len))
+            .execute(self.build_get_if_match(obj, offset, len, if_match))
             .await
             .map_err(Error::Backend)?;
         match resp.status {
@@ -131,6 +159,15 @@ impl BackendStore for AzureBackend {
                 .map_err(Error::Backend)
             }
             404 => Err(Error::NotFound(obj.to_path())),
+            // Precondition failed: the blob changed since the version was
+            // resolved (issue #163). Report the new ETag if present.
+            412 => Err(Error::VersionMismatch {
+                expected: if_match.map(|v| v.0.clone()).unwrap_or_default(),
+                found: resp
+                    .header("etag")
+                    .map(|e| e.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+            }),
             s => Err(Error::Backend(format!(
                 "Azure GET {} -> HTTP {s}",
                 obj.to_path()
@@ -242,6 +279,42 @@ mod tests {
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.header("x-ms-range"), Some("bytes=8-15"));
         assert_eq!(req.header("x-ms-version"), Some("2021-12-02"));
+    }
+
+    #[tokio::test]
+    async fn fetch_range_if_match_sends_quoted_precondition() {
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"az-bytes"),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), None, http.clone());
+        let _ = a
+            .fetch_range_if_match(&obj(), 8, 8, Some(&Version::new("0x8DABCDEF")))
+            .await
+            .unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.header("If-Match"), Some("\"0x8DABCDEF\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_range_maps_412_to_version_mismatch() {
+        let http = MockHttp::new(HttpResponse {
+            status: 412,
+            headers: vec![("ETag".into(), "\"0xNEW\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), None, http);
+        match a
+            .fetch_range_if_match(&obj(), 0, 8, Some(&Version::new("0xOLD")))
+            .await
+        {
+            Err(Error::VersionMismatch { expected, found }) => {
+                assert_eq!(expected, "0xOLD");
+                assert_eq!(found, "0xNEW");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]

@@ -97,10 +97,29 @@ impl S3Backend {
     }
 
     /// Build the ranged GET request for a fetch (exposed for testing).
+    ///
+    /// When `if_match` is set, adds an `If-Match` header so the origin returns
+    /// `412 Precondition Failed` if the object was overwritten since the version
+    /// was resolved (issue #163).
     pub fn build_get(&self, obj: &ObjectId, offset: u64, len: u64) -> HttpRequest {
+        self.build_get_if_match(obj, offset, len, None)
+    }
+
+    /// Build the ranged GET request with an optional `If-Match` precondition.
+    pub fn build_get_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
         let mut headers = vec![("Range".to_string(), Self::range_header(offset, len))];
         if let Some(tok) = &self.creds.session_token {
             headers.push(("x-amz-security-token".to_string(), tok.clone()));
+        }
+        if let Some(version) = if_match {
+            // S3 echoes the ETag with surrounding quotes; send it quoted.
+            headers.push(("If-Match".to_string(), format!("\"{}\"", version.as_str())));
         }
         HttpRequest {
             method: Method::Get,
@@ -131,10 +150,20 @@ fn etag_to_version(etag: &str) -> Version {
 #[async_trait]
 impl BackendStore for S3Backend {
     async fn fetch_range(&self, obj: &ObjectId, offset: u64, len: u64) -> Result<bytes::Bytes> {
+        self.fetch_range_if_match(obj, offset, len, None).await
+    }
+
+    async fn fetch_range_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<bytes::Bytes> {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
-        let req = self.build_get(obj, offset, len);
+        let req = self.build_get_if_match(obj, offset, len, if_match);
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 206 (range honored) or 200 (server ignored Range, returned the whole
         // object). `range_body` yields exactly the requested window in both
@@ -152,6 +181,17 @@ impl BackendStore for S3Backend {
             .map_err(Error::Backend)
         } else if resp.status == 404 {
             Err(Error::NotFound(obj.to_path()))
+        } else if resp.status == 412 {
+            // The If-Match precondition failed: the object was overwritten since
+            // the version was resolved (issue #163). The ETag now on the object
+            // (if returned) is the new version.
+            Err(Error::VersionMismatch {
+                expected: if_match.map(|v| v.0.clone()).unwrap_or_default(),
+                found: resp
+                    .header("etag")
+                    .map(|e| e.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+            })
         } else {
             Err(Error::Backend(format!(
                 "S3 GET {} -> HTTP {}",
@@ -308,6 +348,45 @@ mod tests {
             s3.fetch_range(&obj(), 0, 8).await,
             Err(Error::NotFound(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn fetch_range_if_match_sends_quoted_precondition() {
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"partial-bytes"),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        let _ = s3
+            .fetch_range_if_match(&obj(), 10, 13, Some(&Version::new("abc123")))
+            .await
+            .unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        // S3 expects the ETag quoted in If-Match.
+        assert_eq!(req.header("If-Match"), Some("\"abc123\""));
+    }
+
+    #[tokio::test]
+    async fn fetch_range_maps_412_to_version_mismatch() {
+        // The If-Match precondition failed: the object was overwritten since the
+        // version was resolved (issue #163). The new ETag rides on the response.
+        let http = MockHttp::new(HttpResponse {
+            status: 412,
+            headers: vec![("ETag".into(), "\"v2\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http);
+        match s3
+            .fetch_range_if_match(&obj(), 0, 8, Some(&Version::new("v1")))
+            .await
+        {
+            Err(Error::VersionMismatch { expected, found }) => {
+                assert_eq!(expected, "v1");
+                assert_eq!(found, "v2");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
     }
 
     #[tokio::test]
