@@ -34,3 +34,11 @@ libc = { version = "0.2", optional = true }
 [features]
 # Compile the kernel FUSE mount adapter (requires fuser).
 mount = ["dep:fuser", "dep:libc"]
+
+[dev-dependencies]
+divan.workspace = true
+
+[[bench]]
+name = "read_path_benches"
+harness = false
+
