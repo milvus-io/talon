@@ -15,6 +15,7 @@ pub mod data;
 pub mod frame;
 pub mod limits;
 pub mod pool;
+pub mod uring;
 
 pub use codec::{
     decode, encode, encode_for_schema, CodecError, ControlMessage, ObjectEntry,

@@ -38,6 +38,10 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 divan = "0.1"
+# Thread-per-core io_uring runtime for the data plane (#273, #285). The "sync"
+# feature provides spawn_blocking, which the zero-copy sendfile/splice path
+# needs to stay off the ring; it requires an explicitly attached thread pool.
+monoio = { version = "0.2.4", features = ["sync"] }
 axum = "0.8"
 serde_yaml = "0.9"
 # Kubernetes client for the Lease-based ClusterStateStore backend (feature
