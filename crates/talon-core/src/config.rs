@@ -1078,7 +1078,7 @@ mod tests {
             |k: &str| (k == "TALON_WORKER_BACKEND_DELAY_MS").then(|| "soon".to_string());
         assert!(WorkerConfigPatch::from_env_with(bad_delay).is_err());
 
-        // An unparseable bool for s3_path_style is a hard error too.
+        // An invalid bool for s3_path_style is a hard error too.
         let bad_bool = |k: &str| (k == "TALON_WORKER_S3_PATH_STYLE").then(|| "maybe".to_string());
         assert!(WorkerConfigPatch::from_env_with(bad_bool).is_err());
     }
