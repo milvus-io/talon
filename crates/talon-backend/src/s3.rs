@@ -134,6 +134,7 @@ impl S3Backend {
             method: Method::Get,
             url: self.object_url(obj),
             headers,
+            body: bytes::Bytes::new(),
         }
     }
 
@@ -147,6 +148,46 @@ impl S3Backend {
             method: Method::Head,
             url: self.object_url(obj),
             headers,
+            body: bytes::Bytes::new(),
+        }
+    }
+
+    /// Build the whole-object PUT request (exposed for testing).
+    ///
+    /// When `if_match` is set, adds an `If-Match` header so the origin rejects the
+    /// write with `412` if the object changed since it was read (#226).
+    pub fn build_put(
+        &self,
+        obj: &ObjectId,
+        body: bytes::Bytes,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
+        let mut headers = vec![("Content-Length".to_string(), body.len().to_string())];
+        if let Some(tok) = &self.creds.session_token {
+            headers.push(("x-amz-security-token".to_string(), tok.clone()));
+        }
+        if let Some(version) = if_match {
+            headers.push(("If-Match".to_string(), format!("\"{}\"", version.as_str())));
+        }
+        HttpRequest {
+            method: Method::Put,
+            url: self.object_url(obj),
+            headers,
+            body,
+        }
+    }
+
+    /// Build the DELETE request (exposed for testing).
+    pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
+        let mut headers = Vec::new();
+        if let Some(tok) = &self.creds.session_token {
+            headers.push(("x-amz-security-token".to_string(), tok.clone()));
+        }
+        HttpRequest {
+            method: Method::Delete,
+            url: self.object_url(obj),
+            headers,
+            body: bytes::Bytes::new(),
         }
     }
 }
@@ -238,6 +279,63 @@ impl BackendStore for S3Backend {
                 ))
             })?;
         Ok(ObjectStat { len, version })
+    }
+
+    async fn put(&self, obj: &ObjectId, body: bytes::Bytes) -> Result<Version> {
+        self.put_if_match(obj, body, None).await
+    }
+
+    async fn put_if_match(
+        &self,
+        obj: &ObjectId,
+        body: bytes::Bytes,
+        if_match: Option<&Version>,
+    ) -> Result<Version> {
+        let req = self.build_put(obj, body, if_match);
+        let resp = self.http.execute(req).await.map_err(Error::Backend)?;
+        if resp.status == 412 {
+            // The If-Match precondition failed: the object changed since it was
+            // read (#226). Report the new ETag if present.
+            return Err(Error::VersionMismatch {
+                expected: if_match.map(|v| v.0.clone()).unwrap_or_default(),
+                found: resp
+                    .header("etag")
+                    .map(|e| e.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+            });
+        }
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "S3 PUT {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )));
+        }
+        // The PUT response's ETag is the committed object version. Fall back to a
+        // HEAD only if the PUT response didn't carry one.
+        match resp
+            .header("etag")
+            .map(etag_to_version)
+            .filter(|v| !v.0.trim().is_empty())
+        {
+            Some(version) => Ok(version),
+            None => Ok(self.head(obj).await?.version),
+        }
+    }
+
+    async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        let req = self.build_delete(obj);
+        let resp = self.http.execute(req).await.map_err(Error::Backend)?;
+        // 2xx or 404 are both success (delete is idempotent).
+        if resp.is_success() || resp.status == 404 {
+            Ok(())
+        } else {
+            Err(Error::Backend(format!(
+                "S3 DELETE {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )))
+        }
     }
 }
 
@@ -476,5 +574,74 @@ mod tests {
         let _ = s3.fetch_range(&obj(), 0, 8).await.unwrap();
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.header("x-amz-security-token"), Some("token123"));
+    }
+
+    #[tokio::test]
+    async fn put_sends_body_and_returns_committed_version() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![("ETag".into(), "\"newetag\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        let body = bytes::Bytes::from_static(b"hello object");
+        let version = s3.put(&obj(), body.clone()).await.unwrap();
+        // Committed version is parsed from the PUT response ETag (quotes stripped).
+        assert_eq!(version, Version::new("newetag"));
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.method, Method::Put);
+        assert_eq!(req.body, body);
+        assert_eq!(req.header("Content-Length"), Some("12"));
+    }
+
+    #[tokio::test]
+    async fn put_if_match_sends_precondition_and_maps_412() {
+        let http = MockHttp::new(HttpResponse {
+            status: 412,
+            headers: vec![("ETag".into(), "\"v2\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        match s3
+            .put_if_match(
+                &obj(),
+                bytes::Bytes::from_static(b"x"),
+                Some(&Version::new("v1")),
+            )
+            .await
+        {
+            Err(Error::VersionMismatch { expected, found }) => {
+                assert_eq!(expected, "v1");
+                assert_eq!(found, "v2");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.header("If-Match"), Some("\"v1\""));
+    }
+
+    #[tokio::test]
+    async fn delete_sends_delete_and_is_idempotent() {
+        // 2xx -> Ok.
+        let http = MockHttp::new(HttpResponse {
+            status: 204,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        s3.delete(&obj()).await.unwrap();
+        assert_eq!(
+            http.last.lock().unwrap().clone().unwrap().method,
+            Method::Delete
+        );
+
+        // 404 -> also Ok (idempotent).
+        let http404 = MockHttp::new(HttpResponse {
+            status: 404,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http404);
+        s3.delete(&obj()).await.unwrap();
     }
 }

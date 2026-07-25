@@ -16,6 +16,10 @@ pub enum Method {
     Get,
     /// HEAD, used to fetch size + etag without the body.
     Head,
+    /// PUT, used to upload a whole object (write-through, #226).
+    Put,
+    /// DELETE, used to remove an object.
+    Delete,
 }
 
 /// An outgoing HTTP request built by a backend.
@@ -27,9 +31,36 @@ pub struct HttpRequest {
     pub url: String,
     /// Header name/value pairs (in insertion order).
     pub headers: Vec<(String, String)>,
+    /// Request body. Empty for GET/HEAD/DELETE; carries the object bytes for PUT.
+    pub body: bytes::Bytes,
 }
 
 impl HttpRequest {
+    /// Build a request with no body (GET/HEAD/DELETE).
+    pub fn new(method: Method, url: String, headers: Vec<(String, String)>) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            body: bytes::Bytes::new(),
+        }
+    }
+
+    /// Build a request carrying a body (PUT).
+    pub fn with_body(
+        method: Method,
+        url: String,
+        headers: Vec<(String, String)>,
+        body: bytes::Bytes,
+    ) -> Self {
+        Self {
+            method,
+            url,
+            headers,
+            body,
+        }
+    }
+
     /// Look up the first header value with a case-insensitive name match.
     pub fn header(&self, name: &str) -> Option<&str> {
         self.headers

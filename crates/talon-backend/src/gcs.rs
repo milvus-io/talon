@@ -110,6 +110,7 @@ impl GcsBackend {
             method: Method::Get,
             url: self.object_url(obj),
             headers,
+            body: bytes::Bytes::new(),
         }
     }
 
@@ -119,6 +120,46 @@ impl GcsBackend {
             method: Method::Head,
             url: self.object_url(obj),
             headers: self.auth_headers(),
+            body: bytes::Bytes::new(),
+        }
+    }
+
+    /// Build the whole-object PUT request (exposed for testing).
+    ///
+    /// A numeric `if_match` is an object generation (`x-goog-if-generation-match`);
+    /// a non-numeric one is an ETag (`If-Match`). Either makes GCS reject the
+    /// write with `412` if the object changed since it was read (#226).
+    pub fn build_put(
+        &self,
+        obj: &ObjectId,
+        body: bytes::Bytes,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
+        let mut headers = self.auth_headers();
+        headers.push(("Content-Length".to_string(), body.len().to_string()));
+        if let Some(version) = if_match {
+            let v = version.as_str();
+            if !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) {
+                headers.push(("x-goog-if-generation-match".to_string(), v.to_string()));
+            } else {
+                headers.push(("If-Match".to_string(), format!("\"{v}\"")));
+            }
+        }
+        HttpRequest {
+            method: Method::Put,
+            url: self.object_url(obj),
+            headers,
+            body,
+        }
+    }
+
+    /// Build the DELETE request (exposed for testing).
+    pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
+        HttpRequest {
+            method: Method::Delete,
+            url: self.object_url(obj),
+            headers: self.auth_headers(),
+            body: bytes::Bytes::new(),
         }
     }
 }
@@ -207,6 +248,66 @@ impl BackendStore for GcsBackend {
                 ))
             })?;
         Ok(ObjectStat { len, version })
+    }
+
+    async fn put(&self, obj: &ObjectId, body: bytes::Bytes) -> Result<Version> {
+        self.put_if_match(obj, body, None).await
+    }
+
+    async fn put_if_match(
+        &self,
+        obj: &ObjectId,
+        body: bytes::Bytes,
+        if_match: Option<&Version>,
+    ) -> Result<Version> {
+        let resp = self
+            .http
+            .execute(self.build_put(obj, body, if_match))
+            .await
+            .map_err(Error::Backend)?;
+        if resp.status == 412 {
+            return Err(Error::VersionMismatch {
+                expected: if_match.map(|v| v.0.clone()).unwrap_or_default(),
+                found: resp
+                    .header("x-goog-generation")
+                    .or_else(|| resp.header("etag"))
+                    .map(|e| e.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+            });
+        }
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "GCS PUT {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )));
+        }
+        match resp
+            .header("x-goog-generation")
+            .or_else(|| resp.header("etag"))
+            .map(|v| Version::new(v.trim_matches('"').to_string()))
+            .filter(|v| !v.0.trim().is_empty())
+        {
+            Some(version) => Ok(version),
+            None => Ok(self.head(obj).await?.version),
+        }
+    }
+
+    async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        let resp = self
+            .http
+            .execute(self.build_delete(obj))
+            .await
+            .map_err(Error::Backend)?;
+        if resp.is_success() || resp.status == 404 {
+            Ok(())
+        } else {
+            Err(Error::Backend(format!(
+                "GCS DELETE {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )))
+        }
     }
 }
 
@@ -372,5 +473,63 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         assert!(matches!(g.head(&obj()).await, Err(Error::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn put_sends_body_and_returns_generation() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![("x-goog-generation".into(), "1700000009".into())],
+            body: bytes::Bytes::new(),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), Some("tok".into()), http.clone());
+        let body = bytes::Bytes::from_static(b"gcs-object");
+        let version = g.put(&obj(), body.clone()).await.unwrap();
+        assert_eq!(version, Version::new("1700000009"));
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.method, Method::Put);
+        assert_eq!(req.body, body);
+        assert_eq!(req.header("Authorization"), Some("Bearer tok"));
+    }
+
+    #[tokio::test]
+    async fn put_if_match_numeric_uses_generation_precondition_and_maps_412() {
+        let http = MockHttp::new(HttpResponse {
+            status: 412,
+            headers: vec![("x-goog-generation".into(), "1700000010".into())],
+            body: bytes::Bytes::new(),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), None, http.clone());
+        match g
+            .put_if_match(
+                &obj(),
+                bytes::Bytes::from_static(b"x"),
+                Some(&Version::new("1700000009")),
+            )
+            .await
+        {
+            Err(Error::VersionMismatch { expected, found }) => {
+                assert_eq!(expected, "1700000009");
+                assert_eq!(found, "1700000010");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.header("x-goog-if-generation-match"), Some("1700000009"));
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent() {
+        let http = MockHttp::new(HttpResponse {
+            status: 204,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), None, http.clone());
+        g.delete(&obj()).await.unwrap();
+        assert_eq!(
+            http.last.lock().unwrap().clone().unwrap().method,
+            Method::Delete
+        );
     }
 }

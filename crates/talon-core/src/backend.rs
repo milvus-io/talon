@@ -57,4 +57,54 @@ pub trait BackendStore: Send + Sync {
 
     /// Fetch object metadata (size + version) without transferring data.
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat>;
+
+    /// Upload the whole object, replacing any existing one.
+    ///
+    /// Returns the version/etag the store assigns to the newly-written object, so
+    /// the caller (the write-through worker) can cache the bytes under the same
+    /// version the read path would resolve via [`head`](Self::head), keeping
+    /// read-after-write consistent with the #163 versioning.
+    ///
+    /// The default implementation refuses with [`Error::Backend`](crate::Error::Backend); real backends
+    /// (S3/GCS/Azure) override it. This keeps in-memory/test backends that only
+    /// serve reads compiling unchanged (write support, #226/#227).
+    async fn put(&self, obj: &ObjectId, body: Bytes) -> Result<Version> {
+        let _ = body;
+        Err(crate::Error::Backend(format!(
+            "backend does not support PUT for {}",
+            obj.to_path()
+        )))
+    }
+
+    /// Upload the whole object, optionally guarded by an `If-Match` precondition.
+    ///
+    /// When `if_match` is `Some`, the write is conditioned on the object still
+    /// being at that version (S3/Azure `If-Match`, GCS `x-goog-if-generation-match`),
+    /// so a concurrent overwrite between the client's read and this write is
+    /// rejected with [`Error::VersionMismatch`](crate::Error::VersionMismatch)
+    /// rather than clobbering newer bytes (the write analogue of
+    /// [`fetch_range_if_match`](Self::fetch_range_if_match)).
+    ///
+    /// The default implementation ignores the precondition and delegates to
+    /// [`put`](Self::put).
+    async fn put_if_match(
+        &self,
+        obj: &ObjectId,
+        body: Bytes,
+        if_match: Option<&Version>,
+    ) -> Result<Version> {
+        let _ = if_match;
+        self.put(obj, body).await
+    }
+
+    /// Delete the object. Idempotent: a missing object is `Ok(())`.
+    ///
+    /// The default implementation refuses with [`Error::Backend`](crate::Error::Backend); real backends
+    /// override it.
+    async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        Err(crate::Error::Backend(format!(
+            "backend does not support DELETE for {}",
+            obj.to_path()
+        )))
+    }
 }
