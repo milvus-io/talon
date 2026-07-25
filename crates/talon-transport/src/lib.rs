@@ -15,7 +15,6 @@ pub mod data;
 pub mod frame;
 pub mod limits;
 pub mod pool;
-pub mod runtime;
 
 pub use codec::{
     decode, encode, encode_for_schema, CodecError, ControlMessage, ObjectEntry,
@@ -32,4 +31,3 @@ pub use limits::{
     MAX_CONTROL_PAYLOAD_LEN,
 };
 pub use pool::{Channel, CheckoutError, Connector, Pool, PoolConfig};
-pub use runtime::{spawn_blocking, Handler, Server, Shutdown};
