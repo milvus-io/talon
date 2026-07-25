@@ -7,10 +7,9 @@
 //! response parsing are all unit-testable without network access; a real client
 //! is injected in production.
 //!
-//! Authentication is intentionally pluggable via [`S3Credentials`]: this v1 cut
-//! wires the pieces and formats the request (including the `Range` header and
-//! optional session token), leaving live SigV4 wire-signing to the concrete
-//! networked client. Endpoints are configurable so MinIO/Ceph and other
+//! Authentication is AWS Signature v4 (see [`crate::sigv4`]): every request is
+//! signed just before execution with the configured [`S3Credentials`], region,
+//! and the `s3` service. Endpoints are configurable so MinIO/Ceph and other
 //! S3-compatible stores work.
 
 use std::sync::Arc;
@@ -62,7 +61,6 @@ pub struct S3Credentials {
 /// An S3 `BackendStore` over a pluggable HTTP client.
 pub struct S3Backend {
     config: S3Config,
-    #[allow(dead_code)]
     creds: S3Credentials,
     http: Arc<dyn HttpClient>,
 }
@@ -190,6 +188,14 @@ impl S3Backend {
             body: bytes::Bytes::new(),
         }
     }
+
+    /// Sign `req` with AWS SigV4 for this backend's region, stamping the current
+    /// wall-clock time. Called on every request just before it is executed.
+    fn signed(&self, mut req: HttpRequest) -> HttpRequest {
+        let date = crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now());
+        crate::sigv4::sign_request(&mut req, &self.creds, &self.config.region, "s3", &date);
+        req
+    }
 }
 
 /// Normalize an S3 ETag into a [`Version`] (strip surrounding quotes).
@@ -213,7 +219,7 @@ impl BackendStore for S3Backend {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
-        let req = self.build_get_if_match(obj, offset, len, if_match);
+        let req = self.signed(self.build_get_if_match(obj, offset, len, if_match));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 206 (range honored) or 200 (server ignored Range, returned the whole
         // object). `range_body` yields exactly the requested window in both
@@ -252,7 +258,7 @@ impl BackendStore for S3Backend {
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
-        let req = self.build_head(obj);
+        let req = self.signed(self.build_head(obj));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 404 {
             return Err(Error::NotFound(obj.to_path()));
@@ -291,7 +297,7 @@ impl BackendStore for S3Backend {
         body: bytes::Bytes,
         if_match: Option<&Version>,
     ) -> Result<Version> {
-        let req = self.build_put(obj, body, if_match);
+        let req = self.signed(self.build_put(obj, body, if_match));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 412 {
             // The If-Match precondition failed: the object changed since it was
@@ -324,7 +330,7 @@ impl BackendStore for S3Backend {
     }
 
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
-        let req = self.build_delete(obj);
+        let req = self.signed(self.build_delete(obj));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 2xx or 404 are both success (delete is idempotent).
         if resp.is_success() || resp.status == 404 {

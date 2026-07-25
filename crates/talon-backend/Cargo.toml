@@ -13,6 +13,8 @@ async-trait.workspace = true
 bytes.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tokio = { workspace = true, features = ["time"] }
+sha2 = "0.10"
+hmac = "0.12"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
