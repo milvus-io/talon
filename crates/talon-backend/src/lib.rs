@@ -7,6 +7,7 @@
 //! networked client is injected in production.
 
 pub mod azure;
+pub mod azure_sharedkey;
 pub mod delay;
 pub mod gcs;
 pub mod http;
