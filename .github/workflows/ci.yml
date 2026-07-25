@@ -238,6 +238,47 @@ jobs:
           cache-from: type=gha,scope=fuse
           cache-to: type=gha,scope=fuse,mode=max
 
+  helm:
+    name: helm chart
+    runs-on: ubuntu-latest
+    # Lint and render the Talon chart across every state backend so a broken
+    # template or invalid values fails CI. No cluster is required — helm renders
+    # locally and we structurally validate the output.
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.16.3
+      - name: Lint (all backends)
+        run: |
+          for be in memory kubernetes etcd; do
+            rp=3; [ "$be" = memory ] && rp=1
+            echo "::group::lint $be"
+            helm lint deploy/helm/talon --strict \
+              --set coordinator.backend="$be" --set coordinator.replicas="$rp"
+            echo "::endgroup::"
+          done
+      - name: Render (all backends) and validate YAML
+        run: |
+          for be in memory kubernetes etcd; do
+            rp=3; [ "$be" = memory ] && rp=1
+            echo "::group::template $be"
+            helm template t deploy/helm/talon \
+              --set coordinator.backend="$be" --set coordinator.replicas="$rp" \
+              | python3 -c "import sys,yaml; list(yaml.safe_load_all(sys.stdin))"
+            echo "::endgroup::"
+          done
+      - name: Reject invalid configurations
+        run: |
+          if helm template t deploy/helm/talon --set coordinator.backend=redis >/dev/null 2>&1; then
+            echo "::error::unknown backend should have failed"; exit 1
+          fi
+          if helm template t deploy/helm/talon \
+              --set coordinator.backend=memory --set coordinator.replicas=3 >/dev/null 2>&1; then
+            echo "::error::memory backend with HA should have failed"; exit 1
+          fi
+
   bench:
     name: bench (informational)
     runs-on: ubuntu-latest

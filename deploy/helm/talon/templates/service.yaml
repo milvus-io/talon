@@ -1,0 +1,33 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-coordinator
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  type: {{ .Values.service.type }}
+  selector:
+    {{- include "talon.selectorLabels" (dict "component" "coordinator") | nindent 4 }}
+  ports:
+    - name: control
+      port: 7000
+      targetPort: control
+    - name: admin
+      port: 8000
+      targetPort: admin
+{{- if and .Values.podDisruptionBudget.enabled (ne .Values.coordinator.backend "memory") }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ .Release.Name }}-coordinator
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: coordinator
+spec:
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  selector:
+    matchLabels:
+      {{- include "talon.selectorLabels" (dict "component" "coordinator") | nindent 6 }}
+{{- end }}

@@ -57,8 +57,15 @@ spell:
 linkcheck:
     lychee --offline --no-progress README.md DESIGN.md CONTRIBUTING.md BENCHMARKS.md 'docs/**/*.md' '.github/**/*.md'
 
-# --- benchmarks (performance feedback loop) ---
+# Lint + render the Helm chart across every backend (install: helm v3).
+helm-check:
+    for be in memory kubernetes etcd; do \
+      rp=3; [ "$be" = memory ] && rp=1; \
+      helm lint deploy/helm/talon --strict --set coordinator.backend=$be --set coordinator.replicas=$rp; \
+      helm template t deploy/helm/talon --set coordinator.backend=$be --set coordinator.replicas=$rp >/dev/null; \
+    done
 
+# --- benchmarks (performance feedback loop) ---
 # Run all microbenchmarks and write bench/results/latest.json.
 bench *ARGS:
     python3 scripts/bench.py run {{ARGS}}
