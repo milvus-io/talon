@@ -426,6 +426,18 @@ impl ReadOnlyFs {
         g.nodes.get(&ino).map(|n| n.path.clone())
     }
 
+    /// The mount-relative object path of file `name` under `parent_ino`, without
+    /// removing it. `None` if the name doesn't resolve to a file.
+    pub fn file_path(&self, parent_ino: u64, name: &str) -> Option<String> {
+        let g = self.inner.lock().unwrap();
+        let ino = *g.index.get(&(parent_ino, name.to_string()))?;
+        let node = g.nodes.get(&ino)?;
+        if node.kind != FileKind::File {
+            return None;
+        }
+        Some(node.path.clone())
+    }
+
     /// `unlink`: remove file `name` under directory `parent_ino` from the
     /// namespace. Returns the removed file's mount-relative path so the caller
     /// can delete the backend object. Directories are not removed here.

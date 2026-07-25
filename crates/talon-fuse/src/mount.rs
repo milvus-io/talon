@@ -58,6 +58,14 @@ pub(crate) fn errno(err: FsError) -> i32 {
     }
 }
 
+/// A monotonic-ish millisecond timestamp for the placement cache TTL.
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 /// Convert a synthesized [`Attr`] into a `fuser::FileAttr`.
 ///
 /// Times are fixed to the UNIX epoch (the namespace is synthetic and read-only,
@@ -139,6 +147,14 @@ pub struct TalonFuse {
     /// and removed on `release`. Each detects a sequential run and warms the
     /// next blocks on the owning worker ahead of the cursor (issue #206).
     prefetchers: Mutex<HashMap<u64, Prefetcher>>,
+    /// When `true`, the mount is read-write: the write callbacks
+    /// (create/write/setattr/unlink/flush) are active. When `false` (the safe
+    /// default), writes are rejected with `EROFS`. Set via
+    /// [`with_read_write`](Self::with_read_write) (#226/#232).
+    read_write: bool,
+    /// Shared pool for write/delete connections to workers (mirrors the read
+    /// pool). Reused across write handles.
+    write_pool: Arc<crate::pool::ConnectionPool>,
 }
 
 impl TalonFuse {
@@ -165,7 +181,16 @@ impl TalonFuse {
             version,
             readahead: ReadaheadConfig::default(),
             prefetchers: Mutex::new(HashMap::new()),
+            read_write: false,
+            write_pool: Arc::new(crate::pool::ConnectionPool::new()),
         }
+    }
+
+    /// Enable the write path (create/write/setattr/unlink/flush). When disabled
+    /// (the default), those callbacks reject with `EROFS` (#232).
+    pub fn with_read_write(mut self, enabled: bool) -> Self {
+        self.read_write = enabled;
+        self
     }
 
     /// Set the readahead prefetch window (number of blocks to prefetch ahead of
@@ -215,6 +240,48 @@ impl TalonFuse {
         // have a reactor even though we may be on a sync FUSE thread.
         let _guard = self.runtime.enter();
         prefetcher.on_read(block_index, now_ms)
+    }
+
+    /// Write `bytes` back to the object at mount-relative `path` through its
+    /// owning worker (resolve owner → `WriteClient::put_object`). Returns `Ok` on
+    /// a committed write, `Err` for any resolution/transport/backend failure.
+    ///
+    /// Runs the async write path on the runtime; called from the synchronous
+    /// FUSE `flush`/`fsync` callback so a write error surfaces to the app's
+    /// `close(2)`/`fsync(2)` (#232).
+    fn writeback_object(&self, path: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        let object = path_to_object(path)?;
+        let reader = self.reader.clone();
+        let pool = Arc::clone(&self.write_pool);
+        let block_size = self.block_size;
+        let version = self.version.clone();
+        let now_ms = now_ms();
+        self.runtime.block_on(async move {
+            let addr = reader
+                .resolve_owner(&object, block_size, &version, now_ms)
+                .await?;
+            let client = crate::worker_client::WriteClient::with_pool(addr, pool);
+            client.put_object(&object, &bytes).await?;
+            Ok::<(), anyhow::Error>(())
+        })
+    }
+
+    /// Delete the object at mount-relative `path` through its owning worker.
+    fn delete_backend_object(&self, path: &str) -> anyhow::Result<()> {
+        let object = path_to_object(path)?;
+        let reader = self.reader.clone();
+        let pool = Arc::clone(&self.write_pool);
+        let block_size = self.block_size;
+        let version = self.version.clone();
+        let now_ms = now_ms();
+        self.runtime.block_on(async move {
+            let addr = reader
+                .resolve_owner(&object, block_size, &version, now_ms)
+                .await?;
+            let client = crate::worker_client::WriteClient::with_pool(addr, pool);
+            client.delete_object(&object).await?;
+            Ok::<(), anyhow::Error>(())
+        })
     }
 
     /// The namespace tree backing metadata ops.
@@ -350,10 +417,25 @@ impl fuser::Filesystem for TalonFuse {
     /// cache across opens: the namespace is read-only and immutable for a mount
     /// session, so repeated reads and `mmap` can serve from RAM without a FUSE
     /// round-trip (issue #180).
-    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, _flags: i32, reply: fuser::ReplyOpen) {
-        match self.fs.open(ino) {
-            Ok(fh) => reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE),
-            Err(e) => reply.error(errno(e)),
+    fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
+        // A write/read-write open (O_WRONLY / O_RDWR) starts a dirty buffer for
+        // whole-object rewrite (#232); a read-only open uses the read handle.
+        let accmode = flags & libc::O_ACCMODE;
+        let wants_write = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
+        if wants_write {
+            if !self.read_write {
+                return reply.error(libc::EROFS);
+            }
+            match self.fs.open_write(ino) {
+                // No FOPEN_KEEP_CACHE for a write handle: contents are changing.
+                Ok(fh) => reply.opened(fh, 0),
+                Err(e) => reply.error(errno(e)),
+            }
+        } else {
+            match self.fs.open(ino) {
+                Ok(fh) => reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE),
+                Err(e) => reply.error(errno(e)),
+            }
         }
     }
 
@@ -420,6 +502,175 @@ impl fuser::Filesystem for TalonFuse {
         match result {
             Ok(bytes) => reply.data(&bytes),
             Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    /// Create and open a new file for writing (`O_CREAT`).
+    fn create(
+        &mut self,
+        req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: fuser::ReplyCreate,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
+        };
+        match self.fs.create(parent, name) {
+            Ok((attr, fh)) => {
+                let fa = to_file_attr(attr, req.uid(), req.gid());
+                reply.created(&ATTR_TTL, &fa, 0, fh, 0);
+            }
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Write `data` at `offset` into an open write handle's dirty buffer.
+    #[allow(clippy::too_many_arguments)]
+    fn write(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        offset: i64,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: fuser::ReplyWrite,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        match self.fs.write(fh, offset.max(0) as u64, data) {
+            Ok(n) => reply.written(n),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Set attributes; only a size change (truncate) is meaningful for a write
+    /// handle. Other attribute sets are accepted as a no-op so `chmod`/`touch`
+    /// don't fail the write flow.
+    #[allow(clippy::too_many_arguments)]
+    fn setattr(
+        &mut self,
+        req: &fuser::Request<'_>,
+        ino: u64,
+        _mode: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
+        size: Option<u64>,
+        _atime: Option<fuser::TimeOrNow>,
+        _mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<std::time::SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<std::time::SystemTime>,
+        _chgtime: Option<std::time::SystemTime>,
+        _bkuptime: Option<std::time::SystemTime>,
+        _flags: Option<u32>,
+        reply: fuser::ReplyAttr,
+    ) {
+        if let Some(new_size) = size {
+            if !self.read_write {
+                return reply.error(libc::EROFS);
+            }
+            if let Some(fh) = fh {
+                if let Err(e) = self.fs.truncate(fh, new_size) {
+                    return reply.error(errno(e));
+                }
+            }
+        }
+        // Reply with the current attributes.
+        match self.fs.getattr(ino) {
+            Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid())),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Flush a write handle: write its assembled object through to the backend.
+    ///
+    /// Object stores commit on a whole-object PUT, so the write is reported here
+    /// (called on `close(2)`) rather than per `write`. A backend failure surfaces
+    /// as the `close`/`flush` error. A read handle (no dirty buffer) is a no-op.
+    fn flush(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let (path, bytes) = match (self.fs.dirty_path(fh), self.fs.dirty_bytes(fh)) {
+            (Some(p), Some(b)) => (p, b),
+            // Not a write handle → nothing to flush.
+            _ => return reply.ok(),
+        };
+        match self.writeback_object(&path, bytes) {
+            Ok(()) => reply.ok(),
+            Err(error) => {
+                tracing::warn!(%path, %error, "flush writeback failed");
+                reply.error(libc::EIO);
+            }
+        }
+    }
+
+    /// `fsync`: same durability point as flush — PUT the dirty buffer through.
+    fn fsync(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        fh: u64,
+        _datasync: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        let (path, bytes) = match (self.fs.dirty_path(fh), self.fs.dirty_bytes(fh)) {
+            (Some(p), Some(b)) => (p, b),
+            _ => return reply.ok(),
+        };
+        match self.writeback_object(&path, bytes) {
+            Ok(()) => reply.ok(),
+            Err(_) => reply.error(libc::EIO),
+        }
+    }
+
+    /// Remove a file: delete the backend object, then drop the namespace node.
+    fn unlink(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let name = match name.to_str() {
+            Some(s) => s,
+            None => return reply.error(libc::EINVAL),
+        };
+        // Look up the path first (without removing) so a backend delete failure
+        // leaves the namespace entry intact.
+        let path = match self.fs.lookup(parent, name) {
+            Ok(_) => match self.fs.file_path(parent, name) {
+                Some(p) => p,
+                None => return reply.error(libc::ENOENT),
+            },
+            Err(e) => return reply.error(errno(e)),
+        };
+        if let Err(error) = self.delete_backend_object(&path) {
+            tracing::warn!(%path, %error, "unlink backend delete failed");
+            return reply.error(libc::EIO);
+        }
+        match self.fs.unlink(parent, name) {
+            Ok(_) => reply.ok(),
+            Err(e) => reply.error(errno(e)),
         }
     }
 
@@ -600,5 +851,16 @@ mod tests {
         assert_eq!(fa.size, 1000);
         assert_eq!(fa.blocks, 2);
         assert_eq!(fa.blksize, 512);
+    }
+
+    #[tokio::test]
+    async fn read_write_defaults_off_and_builder_enables_it() {
+        // Write support is opt-in: a plain adapter is read-only (so mounts stay
+        // safe unless a caller — the mount binary — explicitly enables writes),
+        // and `with_read_write(true)` flips it on (#232).
+        let ro = adapter_with_readahead(4);
+        assert!(!ro.read_write, "adapter must default to read-only");
+        let rw = adapter_with_readahead(4).with_read_write(true);
+        assert!(rw.read_write, "with_read_write(true) enables writes");
     }
 }

@@ -270,6 +270,32 @@ impl BlockReader {
         Ok(out)
     }
 
+    /// Resolve the worker address that owns `object` (for a write/delete).
+    ///
+    /// Placement is by `BlockId`; a write addresses the object's first block
+    /// under `version` (the mount uses a canonical version, #182), so this
+    /// resolves the primary owner of block 0 through the same coordinator +
+    /// placement path reads use, reusing the placement cache. Returns the
+    /// dialable `host:port` of the primary owner.
+    pub async fn resolve_owner(
+        &self,
+        object: &ObjectId,
+        block_size: u32,
+        version: &Version,
+        now_ms: u64,
+    ) -> Result<String, BlockReadError> {
+        let block = BlockId::new(object.clone(), 0, block_size, version.clone());
+        let cached = match self.cache.get(&block, now_ms) {
+            Some(c) => c,
+            None => self.resolve_and_cache(&block, now_ms).await?,
+        };
+        cached
+            .replicas
+            .first()
+            .cloned()
+            .ok_or(BlockReadError::UnresolvedOwner)
+    }
+
     /// Look the block up via the coordinator and insert the resolved,
     /// address-ordered placement into the cache.
     async fn resolve_and_cache(
