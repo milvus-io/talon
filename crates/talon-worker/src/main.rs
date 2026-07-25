@@ -78,6 +78,12 @@ struct Args {
     /// Logical block size in bytes.
     #[arg(long)]
     block_size: Option<u32>,
+    /// Serve the data plane on N io_uring rings (thread-per-core).
+    ///
+    /// `0` means one ring per available core. Omit to use the portable Tokio
+    /// data plane, which remains the default (#285).
+    #[arg(long)]
+    data_plane_rings: Option<usize>,
 }
 
 impl Args {
@@ -91,6 +97,7 @@ impl Args {
             node_id: self.node_id,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             block_size: self.block_size,
+            data_plane_rings: self.data_plane_rings,
             cache_dirs: None,
             capacity_bytes: None,
             azure_account: None,
