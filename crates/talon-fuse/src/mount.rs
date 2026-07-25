@@ -546,7 +546,8 @@ mod tests {
         let o = Some(obj());
         for i in 0..6u64 {
             assert!(
-                fuse.drive_readahead(1, i * 8, size, o.clone(), 0).is_empty(),
+                fuse.drive_readahead(1, i * 8, size, o.clone(), 0)
+                    .is_empty(),
                 "window 0 must never prefetch"
             );
         }
