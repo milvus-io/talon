@@ -26,9 +26,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::Parser;
-use talon_backend::{AzureBackend, AzureConfig, ReqwestClient};
+use talon_backend::{
+    AzureBackend, AzureConfig, GcsBackend, GcsConfig, ReqwestClient, S3Backend, S3Config,
+    S3Credentials,
+};
 use talon_core::{
-    azure_sas_from_env, BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
+    azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
+    BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
 };
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
@@ -106,13 +110,104 @@ impl Args {
             data_plane_rings: self.data_plane_rings,
             cache_dirs: None,
             capacity_bytes: None,
+            backend: None,
             azure_account: None,
             azure_endpoint: None,
             backend_delay_ms: None,
             backend_jitter_ms: None,
             backend_throughput_bytes: None,
+            s3_region: None,
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_path_style: None,
+            gcs_endpoint: None,
         }
     }
+}
+
+/// Split an endpoint URL into `(host, tls)`: an `http://` scheme selects
+/// plaintext, `https://` or a bare host keeps TLS.
+fn split_scheme(endpoint: &str) -> (String, bool) {
+    match endpoint.strip_prefix("http://") {
+        Some(rest) => (rest.to_string(), false),
+        None => (
+            endpoint
+                .strip_prefix("https://")
+                .unwrap_or(endpoint)
+                .to_string(),
+            true,
+        ),
+    }
+}
+
+/// Build the Azure backend from account (config/env) + SAS (env only), honoring
+/// an optional endpoint override (Azurite/proxy).
+fn build_azure_backend(
+    cfg: &WorkerConfig,
+    http: Arc<dyn talon_backend::http::HttpClient>,
+) -> anyhow::Result<AzureBackend> {
+    let account = cfg.azure_account.clone().ok_or_else(|| {
+        anyhow::anyhow!("azure_account is required (set TALON_WORKER_AZURE_ACCOUNT)")
+    })?;
+    let sas = azure_sas_from_env()
+        .ok_or_else(|| anyhow::anyhow!("TALON_WORKER_AZURE_SAS must be set (SAS token)"))?;
+    let azure_config = match cfg.azure_endpoint.clone() {
+        Some(endpoint) => {
+            let (host, tls) = split_scheme(&endpoint);
+            AzureConfig::emulator(account, host, tls)
+        }
+        None => AzureConfig::new(account),
+    };
+    Ok(AzureBackend::new(azure_config, Some(sas), http))
+}
+
+/// Build the S3 backend from region/endpoint/access-key (config) + secret key
+/// and optional session token (env only).
+fn build_s3_backend(
+    cfg: &WorkerConfig,
+    http: Arc<dyn talon_backend::http::HttpClient>,
+) -> anyhow::Result<S3Backend> {
+    let region = cfg
+        .s3_region
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("s3_region is required (set TALON_WORKER_S3_REGION)"))?;
+    let access_key_id = cfg.s3_access_key_id.clone().ok_or_else(|| {
+        anyhow::anyhow!("s3_access_key_id is required (set TALON_WORKER_S3_ACCESS_KEY_ID)")
+    })?;
+    let secret_access_key = s3_secret_key_from_env().ok_or_else(|| {
+        anyhow::anyhow!("TALON_WORKER_S3_SECRET_ACCESS_KEY must be set (secret key)")
+    })?;
+    let mut config = S3Config::aws(&region);
+    if let Some(endpoint) = cfg.s3_endpoint.clone() {
+        let (host, tls) = split_scheme(&endpoint);
+        config.endpoint = host;
+        config.tls = tls;
+    }
+    if let Some(path_style) = cfg.s3_path_style {
+        config.path_style = path_style;
+    }
+    let creds = S3Credentials {
+        access_key_id,
+        secret_access_key,
+        session_token: s3_session_token_from_env(),
+    };
+    Ok(S3Backend::new(config, creds, http))
+}
+
+/// Build the GCS backend from an optional endpoint override (fake-gcs-server) +
+/// bearer token (env only).
+fn build_gcs_backend(
+    cfg: &WorkerConfig,
+    http: Arc<dyn talon_backend::http::HttpClient>,
+) -> anyhow::Result<GcsBackend> {
+    let config = match cfg.gcs_endpoint.clone() {
+        Some(endpoint) => {
+            let (host, tls) = split_scheme(&endpoint);
+            GcsConfig::emulator(host, tls)
+        }
+        None => GcsConfig::default(),
+    };
+    Ok(GcsBackend::new(config, gcs_bearer_from_env(), http))
 }
 
 #[tokio::main]
@@ -147,35 +242,9 @@ async fn main() -> anyhow::Result<()> {
         "starting talon-worker"
     );
 
-    // Build the Azure backend from account (config/env) + SAS (env only).
-    let account = cfg.azure_account.clone().ok_or_else(|| {
-        anyhow::anyhow!("azure_account is required (set TALON_WORKER_AZURE_ACCOUNT)")
-    })?;
-    let sas = azure_sas_from_env()
-        .ok_or_else(|| anyhow::anyhow!("TALON_WORKER_AZURE_SAS must be set (SAS token)"))?;
-
-    // Endpoint override: point at an emulator (Azurite) or a latency proxy. An
-    // `http://` scheme selects plaintext + path-style; `https://` or a bare host
-    // keeps TLS. Default (unset) is the public-cloud virtual-host endpoint.
-    let azure_config = match cfg.azure_endpoint.clone() {
-        Some(endpoint) => {
-            let (host, tls) = match endpoint.strip_prefix("http://") {
-                Some(rest) => (rest.to_string(), false),
-                None => (
-                    endpoint
-                        .strip_prefix("https://")
-                        .unwrap_or(&endpoint)
-                        .to_string(),
-                    true,
-                ),
-            };
-            AzureConfig::emulator(account, host, tls)
-        }
-        None => AzureConfig::new(account),
-    };
-
-    // Optionally wrap the networked client in a latency decorator (test/latency
-    // lab). Inert unless a delay/jitter/throughput knob is set.
+    // The networked HTTP client, shared by whichever backend is selected. It is
+    // optionally wrapped in a latency decorator (test/latency lab); inert unless
+    // a delay/jitter/throughput knob is set.
     let http: Arc<dyn talon_backend::http::HttpClient> = {
         let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(ReqwestClient::new());
         let delay = talon_backend::DelayConfig {
@@ -203,7 +272,19 @@ async fn main() -> anyhow::Result<()> {
             base
         }
     };
-    let backend: Arc<dyn BackendStore> = Arc::new(AzureBackend::new(azure_config, Some(sas), http));
+
+    // Select the object-store backend from config (default: azure). Each backend
+    // reads its endpoint from config and its secret from the environment only.
+    let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
+    let backend: Arc<dyn BackendStore> = match backend_kind {
+        "azure" => Arc::new(build_azure_backend(&cfg, http)?),
+        "s3" => Arc::new(build_s3_backend(&cfg, http)?),
+        "gcs" => Arc::new(build_gcs_backend(&cfg, http)?),
+        other => {
+            anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
+        }
+    };
+    tracing::info!(backend = backend_kind, "object-store backend ready");
 
     // Local store stack rooted at the first cache dir.
     let root = cfg
