@@ -63,9 +63,14 @@ Start with the section that matches what you're doing:
 - **Installing Talon** — [Docker](docs/installation/docker.md) (fastest),
   [Kubernetes](docs/installation/kubernetes.md) (production), or
   [from source](docs/installation/source.md) (contributors).
+- **Deciding if Talon fits** — [Use cases](docs/use-cases/overview.md): model
+  training, checkpointing, notebooks and data sharing, cross-cloud reads, and
+  analytics — including where it does *not* help.
 - **Using Talon** — the [Getting started tutorial](docs/tutorials/getting-started.md)
   builds the workspace, runs a cluster, and opens the management console;
-  [DESIGN.md](DESIGN.md) explains what each component does.
+  [DESIGN.md](DESIGN.md) explains what each component does, and
+  [Data-plane runtime](docs/explanation/data-plane-runtime.md) covers the
+  zero-copy path and the io_uring measurements.
 - **Operating Talon** — [Operator runbook](docs/operations/runbook.md) (HA,
   etcd/Kubernetes backends, configuration, upgrades, alerts) and
   [security hardening](docs/operations/security.md).
