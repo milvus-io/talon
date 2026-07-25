@@ -298,6 +298,14 @@ Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `data_plane_rings`
+
+io_uring rings for the data plane; 0 = one per core, unset = Tokio path.
+
+- **Environment variable:** `TALON_WORKER_DATA_PLANE_RINGS`
+- **Default:** none
+- **CLI flag:** `--data_plane_rings`
+
 ### `(env only)` 🔒
 
 Azure SAS token; env-only, never from a config file or logged.

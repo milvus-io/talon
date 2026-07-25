@@ -103,6 +103,15 @@ pub struct WorkerConfig {
     pub backend_jitter_ms: Option<u64>,
     /// Optional bandwidth ceiling (bytes/second) modeled by the delay decorator.
     pub backend_throughput_bytes: Option<u64>,
+    /// Number of io_uring rings serving the data plane, or `None` for the
+    /// portable Tokio path.
+    ///
+    /// `Some(n)` runs the thread-per-core data plane: `n` threads, each with its
+    /// own `monoio` ring pinned to a core, all binding the listen address with
+    /// `SO_REUSEPORT` so the kernel distributes accepts. `Some(0)` means one
+    /// ring per available core. Defaults to `None` while the Tokio path remains
+    /// the shipped default (#285).
+    pub data_plane_rings: Option<usize>,
 }
 
 /// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
@@ -134,6 +143,7 @@ impl Default for WorkerConfig {
             backend_delay_ms: None,
             backend_jitter_ms: None,
             backend_throughput_bytes: None,
+            data_plane_rings: None,
         }
     }
 }
@@ -175,6 +185,8 @@ pub struct WorkerConfigPatch {
     pub backend_jitter_ms: Option<u64>,
     /// Override for [`WorkerConfig::backend_throughput_bytes`].
     pub backend_throughput_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::data_plane_rings`].
+    pub data_plane_rings: Option<usize>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -197,6 +209,7 @@ impl Patch for WorkerConfigPatch {
             backend_throughput_bytes: self
                 .backend_throughput_bytes
                 .or(base.backend_throughput_bytes),
+            data_plane_rings: self.data_plane_rings.or(base.data_plane_rings),
         }
     }
 }
@@ -326,6 +339,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).",
     },
     ConfigVar {
+        env: "TALON_WORKER_DATA_PLANE_RINGS",
+        key: "data_plane_rings",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "io_uring rings for the data plane; 0 = one per core, unset = Tokio path.",
+    },
+    ConfigVar {
         env: "TALON_WORKER_AZURE_SAS",
         key: "(env only)",
         default: None,
@@ -351,6 +372,7 @@ pub(crate) mod worker_env {
     pub const BACKEND_DELAY_MS: &str = "TALON_WORKER_BACKEND_DELAY_MS";
     pub const BACKEND_JITTER_MS: &str = "TALON_WORKER_BACKEND_JITTER_MS";
     pub const BACKEND_THROUGHPUT_BYTES: &str = "TALON_WORKER_BACKEND_THROUGHPUT_BYTES";
+    pub const DATA_PLANE_RINGS: &str = "TALON_WORKER_DATA_PLANE_RINGS";
     pub const AZURE_SAS: &str = "TALON_WORKER_AZURE_SAS";
 }
 
@@ -392,6 +414,10 @@ impl WorkerConfigPatch {
             v.parse::<u64>()
                 .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
         };
+        let parse_usize = |v: String, k: &str| {
+            v.parse::<usize>()
+                .map_err(|_| Error::Other(format!("{k}: invalid usize: {v:?}")))
+        };
         Ok(Self {
             listen: get(worker_env::LISTEN),
             advertise_addr: get(worker_env::ADVERTISE_ADDR),
@@ -417,6 +443,9 @@ impl WorkerConfigPatch {
                 .transpose()?,
             backend_jitter_ms: get(worker_env::BACKEND_JITTER_MS)
                 .map(|v| parse_u64(v, worker_env::BACKEND_JITTER_MS))
+                .transpose()?,
+            data_plane_rings: get(worker_env::DATA_PLANE_RINGS)
+                .map(|v| parse_usize(v, worker_env::DATA_PLANE_RINGS))
                 .transpose()?,
             backend_throughput_bytes: get(worker_env::BACKEND_THROUGHPUT_BYTES)
                 .map(|v| parse_u64(v, worker_env::BACKEND_THROUGHPUT_BYTES))
@@ -462,6 +491,7 @@ impl WorkerConfig {
             backend_throughput_bytes: merged
                 .backend_throughput_bytes
                 .or(d.backend_throughput_bytes),
+            data_plane_rings: merged.data_plane_rings.or(d.data_plane_rings),
         };
         cfg.validate()?;
         Ok(cfg)
