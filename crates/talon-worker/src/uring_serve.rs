@@ -65,6 +65,20 @@ pub trait RingHandler: Clone + 'static {
 ///
 /// `handler` is cloned per ring; share state through an `Arc` inside it.
 ///
+/// # Tokio coexistence
+///
+/// `tokio_handle` is entered on every ring thread before the ring runs. This is
+/// required, not optional: `WorkerRuntime` reaches Tokio internally —
+/// `block_store` runs filesystem I/O on `tokio::task::spawn_blocking` so a large
+/// read or write-plus-fsync never stalls the reactor (#115), and parts of the
+/// miss path use Tokio timers and sync primitives. Without an entered handle
+/// those calls panic with *"there is no reactor running"*.
+///
+/// The split is deliberate: the ring owns protocol scheduling and hands
+/// `sendfile` to its own blocking pool, while Tokio's blocking pool absorbs
+/// filesystem work that belongs on neither. Note this means two blocking pools
+/// coexist, so size them with the pinned ring count in mind.
+///
 /// # Errors
 ///
 /// Returns an error if a ring thread fails to bind. A bind failure on *any*
@@ -75,6 +89,7 @@ pub fn serve<H>(
     rings: usize,
     blocking_threads: usize,
     handler: H,
+    tokio_handle: tokio::runtime::Handle,
 ) -> anyhow::Result<()>
 where
     H: RingHandler + Send,
@@ -86,10 +101,15 @@ where
         let addr = addr.clone();
         let handler = handler.clone();
         let ready = Arc::clone(&ready);
+        let tokio_handle = tokio_handle.clone();
         threads.push(
             std::thread::Builder::new()
                 .name(format!("talon-ring-{ring_id}"))
                 .spawn(move || {
+                    // Required before the ring runs: WorkerRuntime reaches Tokio
+                    // internally. See "Tokio coexistence" on this function.
+                    let _tokio_guard = tokio_handle.enter();
+
                     // Pin before building the ring so its memory is allocated on the
                     // node this thread will actually run on. A failure here is not
                     // fatal — pinning is an optimization, not a correctness
@@ -249,7 +269,8 @@ mod tests {
 
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
-            let _ = serve(serve_addr, 4, 2, handler);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _ = serve(serve_addr, 4, 2, handler, rt.handle().clone());
         });
 
         // Wait for at least one ring to bind.
@@ -293,7 +314,8 @@ mod tests {
         };
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
-            let _ = serve(serve_addr, 2, 1, handler);
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            let _ = serve(serve_addr, 2, 1, handler, rt.handle().clone());
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
