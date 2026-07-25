@@ -35,6 +35,18 @@ impl Default for GcsConfig {
     }
 }
 
+impl GcsConfig {
+    /// Point at an emulator (e.g. fake-gcs-server): a literal `host[:port]` and a
+    /// TLS flag. Plaintext (`tls = false`) is typical for a local emulator. The
+    /// default public-cloud config is [`GcsConfig::default`].
+    pub fn emulator(endpoint: impl Into<String>, tls: bool) -> Self {
+        Self {
+            endpoint: endpoint.into(),
+            tls,
+        }
+    }
+}
+
 /// A GCS `BackendStore` over a pluggable HTTP client.
 pub struct GcsBackend {
     config: GcsConfig,
@@ -357,6 +369,21 @@ mod tests {
             "https://storage.googleapis.com/my-bucket/data/checkpoint.bin"
         );
         assert_eq!(GcsBackend::range_header(0, 64), "bytes=0-63");
+    }
+
+    #[test]
+    fn emulator_config_targets_a_literal_host_over_http() {
+        // fake-gcs-server: plaintext, literal host:port, object addressed under it.
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let g = GcsBackend::new(GcsConfig::emulator("127.0.0.1:4443", false), None, http);
+        assert_eq!(
+            g.object_url(&obj()),
+            "http://127.0.0.1:4443/my-bucket/data/checkpoint.bin"
+        );
     }
 
     #[tokio::test]
