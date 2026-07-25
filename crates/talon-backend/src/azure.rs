@@ -118,6 +118,7 @@ impl AzureBackend {
             method: Method::Get,
             url: self.blob_url(obj),
             headers,
+            body: bytes::Bytes::new(),
         }
     }
 
@@ -127,6 +128,42 @@ impl AzureBackend {
             method: Method::Head,
             url: self.blob_url(obj),
             headers: self.common_headers(),
+            body: bytes::Bytes::new(),
+        }
+    }
+
+    /// Build the whole-blob PUT request (exposed for testing).
+    ///
+    /// Azure block-blob upload requires `x-ms-blob-type: BlockBlob`. When
+    /// `if_match` is set, adds `If-Match` so the blob is only replaced if its ETag
+    /// still matches (`412` otherwise, #226).
+    pub fn build_put(
+        &self,
+        obj: &ObjectId,
+        body: bytes::Bytes,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
+        let mut headers = self.common_headers();
+        headers.push(("x-ms-blob-type".to_string(), "BlockBlob".to_string()));
+        headers.push(("Content-Length".to_string(), body.len().to_string()));
+        if let Some(version) = if_match {
+            headers.push(("If-Match".to_string(), format!("\"{}\"", version.as_str())));
+        }
+        HttpRequest {
+            method: Method::Put,
+            url: self.blob_url(obj),
+            headers,
+            body,
+        }
+    }
+
+    /// Build the DELETE request (exposed for testing).
+    pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
+        HttpRequest {
+            method: Method::Delete,
+            url: self.blob_url(obj),
+            headers: self.common_headers(),
+            body: bytes::Bytes::new(),
         }
     }
 }
@@ -212,6 +249,64 @@ impl BackendStore for AzureBackend {
                 ))
             })?;
         Ok(ObjectStat { len, version })
+    }
+
+    async fn put(&self, obj: &ObjectId, body: bytes::Bytes) -> Result<Version> {
+        self.put_if_match(obj, body, None).await
+    }
+
+    async fn put_if_match(
+        &self,
+        obj: &ObjectId,
+        body: bytes::Bytes,
+        if_match: Option<&Version>,
+    ) -> Result<Version> {
+        let resp = self
+            .http
+            .execute(self.build_put(obj, body, if_match))
+            .await
+            .map_err(Error::Backend)?;
+        if resp.status == 412 {
+            return Err(Error::VersionMismatch {
+                expected: if_match.map(|v| v.0.clone()).unwrap_or_default(),
+                found: resp
+                    .header("etag")
+                    .map(|e| e.trim_matches('"').to_string())
+                    .unwrap_or_default(),
+            });
+        }
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "Azure PUT {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )));
+        }
+        match resp
+            .header("etag")
+            .map(|v| Version::new(v.trim_matches('"').to_string()))
+            .filter(|v| !v.0.trim().is_empty())
+        {
+            Some(version) => Ok(version),
+            None => Ok(self.head(obj).await?.version),
+        }
+    }
+
+    async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        let resp = self
+            .http
+            .execute(self.build_delete(obj))
+            .await
+            .map_err(Error::Backend)?;
+        if resp.is_success() || resp.status == 404 {
+            Ok(())
+        } else {
+            Err(Error::Backend(format!(
+                "Azure DELETE {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )))
+        }
     }
 }
 
@@ -352,5 +447,70 @@ mod tests {
             Err(Error::NotFound(_))
         ));
         assert!(matches!(a.head(&obj()).await, Err(Error::NotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn put_sends_block_blob_body_and_returns_etag() {
+        let http = MockHttp::new(HttpResponse {
+            status: 201,
+            headers: vec![("ETag".into(), "\"0xNEW\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), None, http.clone());
+        let body = bytes::Bytes::from_static(b"az-object");
+        let version = a.put(&obj(), body.clone()).await.unwrap();
+        assert_eq!(version, Version::new("0xNEW"));
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.method, Method::Put);
+        assert_eq!(req.body, body);
+        assert_eq!(req.header("x-ms-blob-type"), Some("BlockBlob"));
+    }
+
+    #[tokio::test]
+    async fn put_if_match_maps_412() {
+        let http = MockHttp::new(HttpResponse {
+            status: 412,
+            headers: vec![("ETag".into(), "\"0xB\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), None, http.clone());
+        match a
+            .put_if_match(
+                &obj(),
+                bytes::Bytes::from_static(b"x"),
+                Some(&Version::new("0xA")),
+            )
+            .await
+        {
+            Err(Error::VersionMismatch { expected, found }) => {
+                assert_eq!(expected, "0xA");
+                assert_eq!(found, "0xB");
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+        assert_eq!(
+            http.last
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap()
+                .header("If-Match"),
+            Some("\"0xA\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_is_idempotent() {
+        let http = MockHttp::new(HttpResponse {
+            status: 202,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), None, http.clone());
+        a.delete(&obj()).await.unwrap();
+        assert_eq!(
+            http.last.lock().unwrap().clone().unwrap().method,
+            Method::Delete
+        );
     }
 }

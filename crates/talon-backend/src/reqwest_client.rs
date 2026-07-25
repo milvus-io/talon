@@ -46,10 +46,16 @@ impl HttpClient for ReqwestClient {
         let method = match req.method {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
+            Method::Put => reqwest::Method::PUT,
+            Method::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self.inner.request(method, &req.url);
         for (k, v) in &req.headers {
             builder = builder.header(k.as_str(), v.as_str());
+        }
+        // Attach the request body for PUT (empty for the other verbs).
+        if !req.body.is_empty() {
+            builder = builder.body(req.body.clone());
         }
         let resp = builder.send().await.map_err(sanitize_error)?;
         let status = resp.status().as_u16();
@@ -95,6 +101,7 @@ mod tests {
                 method: Method::Get,
                 url,
                 headers: Vec::new(),
+                body: bytes::Bytes::new(),
             })
             .await
             .expect_err("request to an unresolvable host must fail");
