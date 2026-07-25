@@ -1,0 +1,32 @@
+# S3 backend e2e against LocalStack (manual).
+#
+# Brings up LocalStack (S3 emulator) so you can exercise the real S3Backend
+# (SigV4 signing + path-style endpoint) end to end, mirroring the CI `s3-e2e`
+# job. The dev credentials below are LocalStack's well-known test values — not
+# secrets.
+#
+#   docker compose -f deploy/testenv/s3-localstack.yml up -d
+#   # seed a deterministic 4096-byte object (byte i == i % 251):
+#   python3 -c "open('/tmp/object.bin','wb').write(bytes(i%251 for i in range(4096)))"
+#   aws --endpoint-url http://127.0.0.1:4566 s3 mb s3://talon-e2e
+#   aws --endpoint-url http://127.0.0.1:4566 s3 cp /tmp/object.bin s3://talon-e2e/e2e/object.bin
+#   # run the gated test:
+#   AWS_ACCESS_KEY_ID=test AWS_SECRET_ACCESS_KEY=test \
+#     TALON_S3_TEST_ENDPOINT=http://127.0.0.1:4566 \
+#     TALON_S3_TEST_BUCKET=talon-e2e TALON_S3_TEST_KEY=e2e/object.bin \
+#     cargo test -p talon-backend --test s3_e2e -- --nocapture
+
+name: talon-s3-e2e
+
+services:
+  localstack:
+    image: localstack/localstack:3.8
+    ports:
+      - "4566:4566"
+    environment:
+      SERVICES: s3
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:4566/_localstack/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 20

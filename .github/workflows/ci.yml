@@ -282,6 +282,47 @@ jobs:
             echo "::error::memory backend with HA should have failed"; exit 1
           fi
 
+  s3-e2e:
+    name: s3 backend e2e (localstack)
+    runs-on: ubuntu-latest
+    # Exercises the real S3Backend (SigV4 signing + path-style endpoint) against
+    # LocalStack, reading bytes an object actually contains. The test skips when
+    # TALON_S3_TEST_ENDPOINT is unset; this job sets it after seeding the bucket.
+    services:
+      localstack:
+        image: localstack/localstack:3.8
+        ports:
+          - 4566:4566
+        env:
+          SERVICES: s3
+        options: >-
+          --health-cmd "curl -sf http://localhost:4566/_localstack/health || exit 1"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+    env:
+      AWS_ACCESS_KEY_ID: test
+      AWS_SECRET_ACCESS_KEY: test
+      AWS_DEFAULT_REGION: us-east-1
+      TALON_S3_TEST_ENDPOINT: http://127.0.0.1:4566
+      TALON_S3_TEST_BUCKET: talon-e2e
+      TALON_S3_TEST_KEY: e2e/object.bin
+      TALON_S3_TEST_REGION: us-east-1
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Seed the bucket with a deterministic object
+        run: |
+          # 4096 bytes where byte i == i % 251 (matches the test's expectation).
+          python3 - <<'PY'
+          data = bytes((i % 251) for i in range(4096))
+          open("/tmp/object.bin", "wb").write(data)
+          PY
+          aws --endpoint-url http://127.0.0.1:4566 s3 mb s3://talon-e2e
+          aws --endpoint-url http://127.0.0.1:4566 s3 cp /tmp/object.bin s3://talon-e2e/e2e/object.bin
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the S3 e2e test
+        run: cargo test -p talon-backend --test s3_e2e --locked -- --nocapture
+
   bench:
     name: bench (informational)
     runs-on: ubuntu-latest
