@@ -120,18 +120,15 @@ pub fn authorization_header(
         .map(|(k, v)| format!("{k}:{v}\n"))
         .collect::<String>();
 
-    // Canonicalized resource: /<account>/<path-within-account>. For virtual-host
-    // addressing the URL path is /<container>/<blob>, so we prefix the account.
-    // For path-style/emulator addressing the path already begins with
-    // /<account>/..., so prefixing again would double the account — detect that
-    // and use the path as-is.
+    // Canonicalized resource: `/<account>` + the URI path, per the Shared Key
+    // algorithm (the Azure SDKs and Azurite both compute it this way). For
+    // virtual-host addressing the path is /<container>/<blob>. For path-style /
+    // emulator addressing the path already begins with /<account>/..., so the
+    // result deliberately repeats the account (/devstoreaccount1/devstoreaccount1
+    // /...) — that is exactly what Azurite signs against, so it must NOT be
+    // stripped.
     let (_host, path) = host_and_path(&req.url);
-    let account_prefix = format!("/{account}/");
-    let canonical_resource = if path.starts_with(&account_prefix) || path == format!("/{account}") {
-        path
-    } else {
-        format!("/{account}{path}")
-    };
+    let canonical_resource = format!("/{account}{path}");
 
     // The 20-line StringToSign (verb + standard headers + canonical headers +
     // canonical resource). Empty standard headers are blank lines.
@@ -270,10 +267,13 @@ mod tests {
     }
 
     #[test]
-    fn path_style_and_virtual_host_sign_the_same_canonical_resource() {
-        // The canonical resource must be /<account>/<container>/<blob> for both
-        // addressing styles — path-style must NOT double the account
-        // (/devstoreaccount1/devstoreaccount1/...), which would break Azurite.
+    fn path_style_signs_with_account_prefixed_resource() {
+        // The Shared Key algorithm always prefixes the account to the URI path.
+        // For a path-style/emulator URL the path already begins with the account,
+        // so the canonical resource repeats it (/devstoreaccount1/devstoreaccount1
+        // /...) — this is what Azurite signs against. The two addressing styles
+        // therefore produce DIFFERENT signatures for the same logical object,
+        // and each must be deterministic.
         let vhost = req(
             Method::Get,
             "https://devstoreaccount1.blob.core.windows.net/c/b",
@@ -290,10 +290,13 @@ mod tests {
                 ("x-ms-version", "2021-12-02"),
             ],
         );
-        // Same account + same canonical resource ⇒ identical signature.
+        let a = authorization_header(&vhost, "devstoreaccount1", KEY).unwrap();
+        let b = authorization_header(&path_style, "devstoreaccount1", KEY).unwrap();
+        assert_ne!(a, b, "vhost and path-style canonical resources differ");
+        // Deterministic.
         assert_eq!(
-            authorization_header(&vhost, "devstoreaccount1", KEY).unwrap(),
-            authorization_header(&path_style, "devstoreaccount1", KEY).unwrap(),
+            b,
+            authorization_header(&path_style, "devstoreaccount1", KEY).unwrap()
         );
     }
 }
