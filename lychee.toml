@@ -1,26 +1,14 @@
 # Link-check configuration for the `lychee` CI gate.
 # See https://github.com/lycheeverse/lychee
-
-# Example URLs in docs are illustrative, not real endpoints: local dev
-# addresses, example etcd hosts, and placeholder hostnames. Exclude them so the
-# gate flags only genuinely broken links.
-exclude = [
-    # Local development endpoints shown in the quick start / tutorial.
-    "^https?://127\\.0\\.0\\.1",
-    "^https?://localhost",
-    "^https?://0\\.0\\.0\\.0",
-    # Example etcd/host placeholders in the operator runbook.
-    "^https?://etcd-[0-9]",
-]
+#
+# The gate runs lychee with `--offline` (see the docs-quality job in ci.yml and
+# `just linkcheck`): it validates only internal / relative links, which we
+# control, and never fetches external URLs. This keeps the gate deterministic —
+# a slow or rate-limited third-party site can't produce a false failure — while
+# still catching broken links between our own docs.
 
 # Do not check generated book output or vendored trees.
 exclude_path = [
     "docs/book/book",
     "target",
 ]
-
-# Treat these as success even if a server rate-limits HEAD requests.
-accept = [200, 206, 429]
-
-# GitHub can rate-limit anonymous requests; retry politely.
-max_retries = 2
