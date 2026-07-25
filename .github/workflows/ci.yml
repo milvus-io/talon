@@ -367,11 +367,9 @@ jobs:
     # Exercises the real AzureBackend (Shared Key signing + path-style endpoint)
     # against Azurite, reading bytes an object actually contains. The test skips
     # when TALON_AZURE_TEST_ENDPOINT is unset; this job sets it after seeding.
-    services:
-      azurite:
-        image: mcr.microsoft.com/azure-storage/azurite:3.33.0
-        ports:
-          - 10000:10000
+    # Azurite is launched explicitly (docker run) so we can pass
+    # --skipApiVersionCheck: the runner's az CLI sends a newer API version than
+    # the pinned Azurite supports, which is only relevant to seeding.
     env:
       TALON_AZURE_TEST_ENDPOINT: http://127.0.0.1:10000
       TALON_AZURE_TEST_CONTAINER: talon-e2e
@@ -382,8 +380,16 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
-      - name: Seed the container with a deterministic object
+      - name: Start Azurite and seed a deterministic object
         run: |
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.33.0 \
+            azurite-blob --blobHost 0.0.0.0 --blobPort 10000 --skipApiVersionCheck
+          # Wait for the blob endpoint to answer.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:10000/devstoreaccount1 >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
           # 4096 bytes where byte i == i % 251 (matches the test's expectation).
           python3 -c "open('/tmp/object.bin','wb').write(bytes(i%251 for i in range(4096)))"
           az storage container create --name talon-e2e
