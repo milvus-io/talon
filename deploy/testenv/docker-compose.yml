@@ -1,0 +1,125 @@
+# Talon object-store latency lab.
+#
+# A self-contained stack that serves real object bytes from Azurite (the Azure
+# Blob emulator) and lets you reproduce the *latency pattern* of a real object
+# store through two composable layers:
+#
+#   1. Toxiproxy in front of Azurite — network-layer latency+jitter, bandwidth
+#      throttling, slow-close, timeout, reset-peer (added at runtime via toxics).
+#   2. The worker's in-process delay decorator — precise per-request first-byte
+#      latency and a bandwidth ceiling (TALON_WORKER_BACKEND_* below).
+#
+# Bring it up, seed sample objects, then dial latency:
+#   docker compose -f deploy/testenv/docker-compose.yml up -d
+#   docker compose -f deploy/testenv/docker-compose.yml run --rm seed
+#   ./deploy/testenv/toxics.sh s3-cold-longtail       # add network latency
+#   # UI: http://127.0.0.1:8000/ui  — watch backend fetch duration rise
+#
+# The Azurite dev account name/key below are Microsoft's well-known public
+# emulator credentials — NOT secrets. Never use this stack with real data.
+
+name: talon-latency-lab
+
+services:
+  # --- origin: Azure Blob emulator -----------------------------------------
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.33.0
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000"]
+    expose:
+      - "10000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('net').connect(10000,'127.0.0.1').on('connect',()=>process.exit(0)).on('error',()=>process.exit(1))"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # --- latency proxy: sits between the worker and Azurite -------------------
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.11.0
+    ports:
+      - "8474:8474" # Toxiproxy admin API (add/remove toxics at runtime)
+    expose:
+      - "10000" # the proxied Azurite blob endpoint the worker dials
+    depends_on:
+      azurite:
+        condition: service_healthy
+    # The image is FROM scratch (no shell), so preload the azurite proxy from a
+    # config file rather than scripting the admin API. toxics.sh then attaches
+    # latency/bandwidth toxics to this proxy at runtime.
+    command: ["-host=0.0.0.0", "-config=/config/toxiproxy.json"]
+    volumes:
+      - ./toxiproxy.json:/config/toxiproxy.json:ro
+
+  # --- control plane -------------------------------------------------------
+  coordinator:
+    image: ghcr.io/milvus-io/talon-coordinator:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/coordinator.Dockerfile
+    command: ["--cluster-id", "lab", "--node-id", "coord-0"]
+    environment:
+      TALON_COORDINATOR_STATE_BACKEND: memory
+    ports:
+      - "7000:7000"
+      - "8000:8000" # UI + API: http://127.0.0.1:8000/ui
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  # --- cache worker: reads from Azurite THROUGH the proxy ------------------
+  worker:
+    image: ghcr.io/milvus-io/talon-worker:latest
+    build:
+      context: ../..
+      dockerfile: deploy/docker/worker.Dockerfile
+    command:
+      - "--coordinator"
+      - "coordinator:7000"
+      - "--cluster-id"
+      - "lab"
+      - "--node-id"
+      - "worker-0"
+    environment:
+      # Azurite well-known dev account (public, not a secret).
+      TALON_WORKER_AZURE_ACCOUNT: devstoreaccount1
+      TALON_WORKER_AZURE_SAS: "sv=lab&sig=lab"
+      # Target the emulator THROUGH the proxy: http -> plaintext + path-style.
+      TALON_WORKER_AZURE_ENDPOINT: "http://toxiproxy:10000"
+      # In-process latency layer (independent of the proxy). Off by default —
+      # uncomment to model first-byte latency + a bandwidth ceiling in the worker.
+      # TALON_WORKER_BACKEND_DELAY_MS: "200"
+      # TALON_WORKER_BACKEND_JITTER_MS: "80"
+      # TALON_WORKER_BACKEND_THROUGHPUT_BYTES: "104857600"  # 100 MB/s
+    ports:
+      - "8001:8001" # worker admin (metrics/health/status)
+    depends_on:
+      coordinator:
+        condition: service_healthy
+      toxiproxy:
+        condition: service_started
+
+  # --- one-shot: create a container + upload sample objects into Azurite ----
+  # Run explicitly: docker compose -f ... run --rm seed
+  seed:
+    image: mcr.microsoft.com/azure-cli:2.64.0
+    profiles: ["tools"]
+    depends_on:
+      azurite:
+        condition: service_healthy
+    environment:
+      # Full well-known Azurite connection string (public emulator credentials).
+      AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://azurite:10000/devstoreaccount1;"
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        az storage container create --name cache-demo
+        for i in 1 2 3; do
+          head -c 8388608 /dev/urandom > /tmp/obj-$i.bin
+          az storage blob upload --container-name cache-demo \
+            --name "obj-$i.bin" --file /tmp/obj-$i.bin --overwrite
+        done
+        echo "seeded cache-demo with 3x 8MiB objects"
