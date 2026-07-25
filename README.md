@@ -13,36 +13,39 @@ applications.
 
 ## Quick start
 
-Requirements: the Rust toolchain (pinned in `rust-toolchain.toml`; `rustup`
-picks it up automatically) and a Linux host for the FUSE client.
+The fastest way to run Talon is with Docker — one command starts a coordinator,
+a worker, and the management UI:
 
 ```sh
-git clone https://github.com/milvus-io/talon.git
-cd talon
-cargo build --workspace
+docker compose up
 ```
 
-Run a single-node cluster with the development **memory** backend — one
-coordinator and one worker:
-
-```sh
-# Coordinator: control plane on :7000, admin API + management UI on :8000.
-cargo run -p talon-coordinator -- \
-  --listen 127.0.0.1:7000 --admin-listen 127.0.0.1:8000 \
-  --cluster-id demo --node-id coord-0
-
-# Worker (in another shell): registers with the coordinator above.
-cargo run -p talon-worker -- \
-  --listen 127.0.0.1:7001 --admin-listen 127.0.0.1:8001 \
-  --coordinator 127.0.0.1:7000 --cluster-id demo --node-id worker-0
-```
-
-Check the cluster is healthy:
+Then open the management console at **http://127.0.0.1:8000/ui**, or check health:
 
 ```sh
 curl -s http://127.0.0.1:8000/readyz           # {"ready":true}
 curl -s http://127.0.0.1:8000/api/v1/cluster    # cluster summary JSON
 ```
+
+This runs a single-node cluster with the development **memory** backend. For the
+active-active HA topology (etcd, three coordinators), use `docker compose
+--profile ha up`. Full details: [install with Docker](docs/installation/docker.md).
+
+### Kubernetes
+
+For production, deploy with the Helm chart — active-active coordinators, scalable
+workers, and a choice of state backend:
+
+```sh
+helm install talon deploy/helm/talon -n talon --create-namespace
+```
+
+See [install with Kubernetes](docs/installation/kubernetes.md).
+
+### From source
+
+Building from source (Rust toolchain) is the contributor path — see
+[installing from source](docs/installation/source.md).
 
 ### Management console
 
@@ -57,6 +60,9 @@ panel, and a searchable fleet table.
 
 Start with the section that matches what you're doing:
 
+- **Installing Talon** — [Docker](docs/installation/docker.md) (fastest),
+  [Kubernetes](docs/installation/kubernetes.md) (production), or
+  [from source](docs/installation/source.md) (contributors).
 - **Using Talon** — the [Getting started tutorial](docs/tutorials/getting-started.md)
   builds the workspace, runs a cluster, and opens the management console;
   [DESIGN.md](DESIGN.md) explains what each component does.
