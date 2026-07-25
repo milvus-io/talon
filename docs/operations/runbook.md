@@ -51,18 +51,41 @@ kubectl apply -n talon \
 
 ---
 
-## 2. Backend decision table
+## 2. Backend decision
 
-| Aspect | Memory | Kubernetes Lease | External etcd |
-|--------|--------|------------------|---------------|
-| Use case | dev/test only | Kubernetes-native clusters | non-K8s or shared etcd fleets |
-| Consistency | single process | linearizable (API server) | linearizable (etcd) |
-| HA supported | no | yes | yes |
-| Operational owner | — | your Kubernetes control plane | your etcd operators |
-| Credentials | none | pod ServiceAccount token | Secret (user/pass and/or mTLS) |
-| Liveness authority | in-process | Lease `renewTime`+TTL | etcd lease TTL |
-| Failure mode | process death = total loss | API-server outage → coordinators fail closed | etcd outage → coordinators fail closed |
-| Migration | → K8s/etcd by redeploying with a new backend | ↔ etcd requires a drain + redeploy (records are rebuildable) | ↔ K8s likewise |
+Three backends, compared across the aspects that matter for an operator.
+
+### Memory (development / test only)
+
+- **Use case:** dev/test only.
+- **Consistency:** single process.
+- **HA supported:** no.
+- **Credentials:** none.
+- **Liveness authority:** in-process.
+- **Failure mode:** process death = total loss.
+- **Migration:** move to Kubernetes or etcd by redeploying with a new backend.
+
+### Kubernetes Lease
+
+- **Use case:** Kubernetes-native clusters.
+- **Consistency:** linearizable (API server).
+- **HA supported:** yes.
+- **Operational owner:** your Kubernetes control plane.
+- **Credentials:** pod ServiceAccount token.
+- **Liveness authority:** Lease `renewTime` + TTL.
+- **Failure mode:** API-server outage → coordinators fail closed.
+- **Migration:** ↔ etcd requires a drain + redeploy (records are rebuildable).
+
+### External etcd
+
+- **Use case:** non-Kubernetes deployments or shared etcd fleets.
+- **Consistency:** linearizable (etcd).
+- **HA supported:** yes.
+- **Operational owner:** your etcd operators.
+- **Credentials:** Secret (user/pass and/or mTLS).
+- **Liveness authority:** etcd lease TTL.
+- **Failure mode:** etcd outage → coordinators fail closed.
+- **Migration:** ↔ Kubernetes requires a drain + redeploy (records are rebuildable).
 
 Records in the shared store are **ephemeral and rebuildable** from live process
 heartbeats, so switching backends is a redeploy, not a data migration: drain the

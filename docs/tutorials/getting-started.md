@@ -134,10 +134,27 @@ The coordinator serves a web UI from its admin port:
 http://127.0.0.1:8000/ui
 ```
 
-The overview shows the cluster summary, live traffic trends, an HA topology
-panel (more interesting once you run multiple coordinators), per-worker capacity,
-and a searchable fleet table. The worker you started appears as `healthy` and
-refreshes on its heartbeat.
+The **overview** shows the cluster summary, live traffic trends, an HA topology
+panel (more interesting once you run multiple coordinators), per-worker capacity
+and hotspots, and cache utilization. The worker you started appears as `healthy`
+and refreshes on its heartbeat.
+
+![Overview: cluster summary, traffic trends, HA topology, and capacity](../assets/ui/overview.png)
+
+The **Fleet** view is a dense, sortable, and filterable table of every node —
+search by id or address, filter by role or health, and group by any label:
+
+![Fleet: sortable, filterable node table](../assets/ui/fleet.png)
+
+Click any node for its **detail** view: identity, uptime, heartbeat age, and —
+for workers — capacity and traffic, plus direct links to that node's `/metrics`
+and `/readyz` and a one-click diagnostics copy:
+
+![Node detail: capacity, traffic, and operator tools](../assets/ui/node-detail.png)
+
+> The screenshots above show a three-coordinator HA cluster (the HA topology
+> panel lists all three); your single-node tutorial cluster shows one
+> coordinator and one worker.
 
 ## 6. Set up the FUSE client
 

@@ -308,11 +308,15 @@ labels.
 
 The minimum process metric inventory is:
 
-| Process | Required metric groups |
-| --- | --- |
-| All | build info, uptime, accepted requests, errors, request duration, active connections, readiness |
-| Worker | hit/miss, bytes served, backend fetch duration/errors, in-flight loads, blocks/pages, resident bytes, capacity, evictions, heartbeat outcomes |
-| Coordinator | registration/heartbeat outcomes, state-store operation duration/errors, snapshot age, live nodes by role/health, placement duration/errors |
+Required metric groups by process:
+
+- **All processes:** build info, uptime, accepted requests, errors, request
+  duration, active connections, readiness.
+- **Worker:** hit/miss, bytes served, backend fetch duration/errors, in-flight
+  loads, blocks/pages, resident bytes, capacity, evictions, heartbeat outcomes.
+- **Coordinator:** registration/heartbeat outcomes, state-store operation
+  duration/errors, snapshot age, live nodes by role/health, placement
+  duration/errors.
 
 The bounded status record carries the latest cumulative totals and gauges needed
 for the built-in UI: requests, errors, hit/miss, bytes served, backend errors,

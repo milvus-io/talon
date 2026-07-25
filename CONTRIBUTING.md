@@ -45,12 +45,12 @@ Good first contributions are small, self-contained, and touch one crate.
 
 Talon is a Cargo workspace:
 
-| Crate | Role |
-|---|---|
-| `talon-core` | Shared types, keys, block forms, and the `ObjectStore` / `BackendStore` traits. Everything depends on it. |
-| `talon-coordinator` | Cluster membership and object placement (rendezvous hashing). |
-| `talon-worker` | Cache storage: block index and the local object store. |
-| `talon-fuse` | Read-only FUSE client exposing the cache as a filesystem. |
+- **`talon-core`** — shared types, keys, block forms, and the `ObjectStore` /
+  `BackendStore` traits. Everything depends on it.
+- **`talon-coordinator`** — cluster membership and object placement (rendezvous
+  hashing).
+- **`talon-worker`** — cache storage: block index and the local object store.
+- **`talon-fuse`** — read-only FUSE client exposing the cache as a filesystem.
 
 Supporting files: `DESIGN.md` (architecture), `BENCHMARKS.md` (perf harness),
 `scripts/bench.py` (harness), `Justfile` (task runner).
