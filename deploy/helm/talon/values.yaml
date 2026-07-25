@@ -1,0 +1,92 @@
+# Default values for the Talon chart.
+#
+# The most important choice is the coordinator state backend:
+#   memory     — single replica, no HA (dev/demo only)
+#   kubernetes — Lease backend, no external datastore (adds RBAC)
+#   etcd       — external etcd, credentials from a Secret
+# See values.schema.json for the full contract.
+
+# -- Image registry/repository/tag applied to every component. The tag defaults
+# to the chart appVersion when left empty.
+image:
+  registry: ghcr.io/milvus-io
+  # Per-component repository names appended to the registry.
+  coordinator: talon-coordinator
+  worker: talon-worker
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# -- Extra labels merged onto every rendered object.
+commonLabels: {}
+
+coordinator:
+  # -- State backend: memory | kubernetes | etcd.
+  backend: kubernetes
+  clusterId: talon
+  # -- Coordinator replica count. Forced to 1 for the memory backend (no HA).
+  replicas: 3
+  resources:
+    requests:
+      cpu: 100m
+      memory: 128Mi
+    limits:
+      cpu: "1"
+      memory: 512Mi
+  # -- etcd backend settings. endpoints/credentials/TLS come from a Secret you
+  # create out-of-band (see deploy/kubernetes/etcd-secret.example.yaml); set the
+  # name here. Leave existingSecret empty for memory/kubernetes backends.
+  etcd:
+    existingSecret: talon-etcd
+    # Keys within the Secret.
+    endpointsKey: endpoints
+    usernameKey: username
+    passwordKey: password
+    # Mounted TLS material (optional). Set to false for a plaintext etcd.
+    tls:
+      enabled: true
+      caKey: ca.crt
+      certKey: client.crt
+      keyKey: client.key
+  # -- Optional management API/UI bearer token from an existing Secret.
+  auth:
+    existingSecret: ""
+    tokenKey: token
+
+worker:
+  # -- Deploy cache workers alongside the coordinator.
+  enabled: true
+  replicas: 3
+  # -- Cache capacity in bytes the worker is allowed to fill.
+  capacityBytes: 8589934592
+  # -- Object-store credentials. Reference a Secret you create out-of-band (see
+  # deploy/kubernetes/worker-secret.example.yaml).
+  backend:
+    existingSecret: talon-worker-backend
+    azureAccountKey: azure-account
+    azureSasKey: azure-sas
+  # -- Cache volume. When persistence is disabled an emptyDir is used.
+  persistence:
+    enabled: false
+    size: 20Gi
+    storageClass: ""
+  resources:
+    requests:
+      cpu: 250m
+      memory: 256Mi
+    limits:
+      cpu: "2"
+      memory: 1Gi
+
+service:
+  type: ClusterIP
+
+# -- PodDisruptionBudget for the coordinator (HA backends only).
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 2
+
+# -- Prometheus Operator ServiceMonitor. Requires the monitoring.coreos.com CRDs.
+serviceMonitor:
+  enabled: false
+  interval: 30s
+  scrapeTimeout: 10s

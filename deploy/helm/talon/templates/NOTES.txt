@@ -1,0 +1,22 @@
+Talon has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Coordinator backend: {{ .Values.coordinator.backend }}
+Coordinator replicas: {{ include "talon.coordinatorReplicas" . }}
+Worker enabled: {{ .Values.worker.enabled }}
+
+{{- if eq .Values.coordinator.backend "etcd" }}
+
+NOTE: the etcd backend expects a Secret named "{{ .Values.coordinator.etcd.existingSecret }}"
+with the etcd endpoints/credentials/TLS. Create it before the pods start — see
+deploy/kubernetes/etcd-secret.example.yaml.
+{{- end }}
+{{- if .Values.worker.enabled }}
+
+NOTE: workers expect a Secret named "{{ .Values.worker.backend.existingSecret }}"
+with the object-store credentials. Create it before the pods start — see
+deploy/kubernetes/worker-secret.example.yaml.
+{{- end }}
+
+Reach the management API/UI via the coordinator Service:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ .Release.Name }}-coordinator 8000:8000
+  # then open http://127.0.0.1:8000/ui

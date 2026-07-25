@@ -1,0 +1,128 @@
+{{- if .Values.worker.enabled }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  replicas: {{ .Values.worker.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "talon.labels" . | nindent 8 }}
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-worker
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 14 }}
+      volumes:
+        - name: cache
+        {{- if .Values.worker.persistence.enabled }}
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                {{- with .Values.worker.persistence.storageClass }}
+                storageClassName: {{ . }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ .Values.worker.persistence.size }}
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
+      containers:
+        - name: worker
+          image: {{ include "talon.workerImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--coordinator"
+            - "{{ .Release.Name }}-coordinator:7000"
+            - "--listen"
+            - "0.0.0.0:7001"
+            - "--admin-listen"
+            - "0.0.0.0:8001"
+          ports:
+            - name: data
+              containerPort: 7001
+            - name: admin
+              containerPort: 8001
+          env:
+            - name: TALON_WORKER_CLUSTER_ID
+              value: {{ .Values.coordinator.clusterId | quote }}
+            - name: TALON_WORKER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TALON_WORKER_ADVERTISE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: TALON_WORKER_CACHE_DIRS
+              value: /var/cache/talon
+            - name: TALON_WORKER_CAPACITY_BYTES
+              value: {{ .Values.worker.capacityBytes | quote }}
+            - name: TALON_WORKER_AZURE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.worker.backend.existingSecret }}
+                  key: {{ .Values.worker.backend.azureAccountKey }}
+            - name: TALON_WORKER_AZURE_SAS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.worker.backend.existingSecret }}
+                  key: {{ .Values.worker.backend.azureSasKey }}
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/talon
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.worker.resources | nindent 12 }}
+{{- end }}

@@ -1,0 +1,17 @@
+apiVersion: v2
+name: talon
+description: Distributed object-store cache — active-active coordinators and horizontally scalable cache workers.
+type: application
+# Chart version — bump on chart changes. appVersion tracks the container images.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/milvus-io/talon
+sources:
+  - https://github.com/milvus-io/talon
+keywords:
+  - cache
+  - object-store
+  - milvus
+maintainers:
+  - name: Talon maintainers
+    url: https://github.com/milvus-io/talon
