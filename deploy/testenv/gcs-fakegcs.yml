@@ -22,7 +22,7 @@ services:
     image: fsouza/fake-gcs-server:1.49
     ports:
       - "4443:4443"
-    command: ["-scheme", "http", "-port", "4443"]
+    command: ["-scheme", "http", "-port", "4443", "-public-host", "127.0.0.1:4443"]
     healthcheck:
       test: ["CMD", "wget", "-q", "-O-", "http://localhost:4443/storage/v1/b"]
       interval: 5s

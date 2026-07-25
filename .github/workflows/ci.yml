@@ -342,7 +342,8 @@ jobs:
       - name: Start fake-gcs-server and seed a deterministic object
         run: |
           docker run -d --name fake-gcs -p 4443:4443 \
-            fsouza/fake-gcs-server:1.49 -scheme http -port 4443
+            fsouza/fake-gcs-server:1.49 \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443
           # Wait for it to answer.
           for i in $(seq 1 30); do
             if curl -sf http://127.0.0.1:4443/storage/v1/b >/dev/null 2>&1; then break; fi

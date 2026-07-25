@@ -47,14 +47,21 @@ async fn gcs_backend_reads_real_object_end_to_end() {
         .to_string();
     let tls = !endpoint.starts_with("http://");
     let config = GcsConfig::emulator(host, tls);
-    let backend = GcsBackend::new(config, env("TALON_GCS_TEST_BEARER"), Arc::new(ReqwestClient::new()));
+    let backend = GcsBackend::new(
+        config,
+        env("TALON_GCS_TEST_BEARER"),
+        Arc::new(ReqwestClient::new()),
+    );
 
     let obj = ObjectId::new(Backend::Gcs, bucket, key);
 
     // HEAD resolves size + generation/ETag (the version).
     let stat = backend.head(&obj).await.expect("HEAD should succeed");
     assert_eq!(stat.len, 4096, "unexpected object size");
-    assert!(!stat.version.as_str().is_empty(), "HEAD returned no version");
+    assert!(
+        !stat.version.as_str().is_empty(),
+        "HEAD returned no version"
+    );
 
     // A ranged GET in the middle of the object returns exactly those bytes.
     let got = backend
