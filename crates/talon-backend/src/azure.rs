@@ -8,8 +8,9 @@
 //!
 //! The `ObjectId::bucket` field carries the **container** name for Azure (the
 //! account is part of the endpoint host). Like the other backends this is
-//! generic over an [`HttpClient`] and unit-testable offline; live shared-key /
-//! SAS signing is left to the concrete networked client.
+//! generic over an [`HttpClient`] and unit-testable offline. Authentication is
+//! either a SAS token (in the URL query) or Shared Key (see
+//! [`crate::azure_sharedkey`]), signed just before each request executes.
 
 use std::sync::Arc;
 
@@ -72,9 +73,11 @@ impl AzureConfig {
 /// An Azure Blob `BackendStore` over a pluggable HTTP client.
 pub struct AzureBackend {
     config: AzureConfig,
-    /// Optional SAS token query string (without leading `?`), or None for
-    /// shared-key auth handled by the networked client.
+    /// Optional SAS token query string (without leading `?`).
     sas_token: Option<String>,
+    /// Optional base64 account key for Shared Key authorization (an alternative
+    /// to SAS). When set, every request is signed just before execution.
+    shared_key: Option<String>,
     http: Arc<dyn HttpClient>,
 }
 
@@ -84,6 +87,22 @@ impl AzureBackend {
         Self {
             config,
             sas_token,
+            shared_key: None,
+            http,
+        }
+    }
+
+    /// Construct with a Shared Key (base64 account key) instead of a SAS token.
+    /// Every request is signed with `Authorization: SharedKey` before execution.
+    pub fn with_shared_key(
+        config: AzureConfig,
+        shared_key: impl Into<String>,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
+        Self {
+            config,
+            sas_token: None,
+            shared_key: Some(shared_key.into()),
             http,
         }
     }
@@ -130,6 +149,26 @@ impl AzureBackend {
 
     fn common_headers(&self) -> Vec<(String, String)> {
         vec![("x-ms-version".to_string(), Self::API_VERSION.to_string())]
+    }
+
+    /// Apply Shared Key authorization to `req` when a shared key is configured:
+    /// stamp `x-ms-date` (RFC 1123 GMT) and add the `Authorization: SharedKey`
+    /// header. A SAS-only backend (no shared key) returns the request unchanged
+    /// (the SAS travels in the URL query).
+    fn authorized(&self, mut req: HttpRequest) -> HttpRequest {
+        let Some(key) = &self.shared_key else {
+            return req;
+        };
+        let date = crate::azure_sharedkey::rfc1123_date(std::time::SystemTime::now());
+        req.headers.push(("x-ms-date".to_string(), date));
+        // A misconfigured key surfaces as an auth failure at the server; we still
+        // send the request rather than panic.
+        if let Ok(auth) =
+            crate::azure_sharedkey::authorization_header(&req, &self.config.account, key)
+        {
+            req.headers.push(("Authorization".to_string(), auth));
+        }
+        req
     }
 
     /// Build the ranged GET request (exposed for testing).
@@ -226,7 +265,7 @@ impl BackendStore for AzureBackend {
         }
         let resp = self
             .http
-            .execute(self.build_get_if_match(obj, offset, len, if_match))
+            .execute(self.authorized(self.build_get_if_match(obj, offset, len, if_match)))
             .await
             .map_err(Error::Backend)?;
         match resp.status {
@@ -261,7 +300,7 @@ impl BackendStore for AzureBackend {
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
         let resp = self
             .http
-            .execute(self.build_head(obj))
+            .execute(self.authorized(self.build_head(obj)))
             .await
             .map_err(Error::Backend)?;
         if resp.status == 404 {
@@ -303,7 +342,7 @@ impl BackendStore for AzureBackend {
     ) -> Result<Version> {
         let resp = self
             .http
-            .execute(self.build_put(obj, body, if_match))
+            .execute(self.authorized(self.build_put(obj, body, if_match)))
             .await
             .map_err(Error::Backend)?;
         if resp.status == 412 {
@@ -335,7 +374,7 @@ impl BackendStore for AzureBackend {
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
         let resp = self
             .http
-            .execute(self.build_delete(obj))
+            .execute(self.authorized(self.build_delete(obj)))
             .await
             .map_err(Error::Backend)?;
         if resp.is_success() || resp.status == 404 {
@@ -468,6 +507,42 @@ mod tests {
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.header("x-ms-range"), Some("bytes=8-15"));
         assert_eq!(req.header("x-ms-version"), Some("2021-12-02"));
+    }
+
+    #[tokio::test]
+    async fn shared_key_backend_signs_requests() {
+        // A base64 account key (32 bytes). With a shared key configured, every
+        // request must carry x-ms-date and an Authorization: SharedKey header.
+        let key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"az-bytes"),
+        });
+        let a = AzureBackend::with_shared_key(AzureConfig::new("acct"), key, http.clone());
+        a.fetch_range(&obj(), 0, 8).await.unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert!(
+            req.header("x-ms-date").is_some(),
+            "x-ms-date must be stamped"
+        );
+        let auth = req.header("Authorization").expect("Authorization header");
+        assert!(auth.starts_with("SharedKey acct:"), "got {auth}");
+    }
+
+    #[tokio::test]
+    async fn sas_backend_does_not_add_authorization_header() {
+        // Without a shared key (SAS-only), no Authorization header is added — the
+        // SAS travels in the URL query.
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"az-bytes"),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), Some("sig=x".into()), http.clone());
+        a.fetch_range(&obj(), 0, 8).await.unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.header("Authorization"), None);
     }
 
     #[tokio::test]
