@@ -1,0 +1,78 @@
+# Capability probe: does the CI runner support io_uring?
+#
+# DESIGN.md targets a thread-per-core io_uring (monoio) data plane (#273). Before
+# any migration lands, we need to know whether GitHub-hosted runners can execute
+# io_uring at all — kernel support, the io_uring_disabled sysctl, and seccomp
+# filtering are all independent gates, and a container can satisfy the first two
+# while still blocking the syscall.
+#
+# This job is informational (continue-on-error) and reports to the job summary.
+# It never gates a merge; its purpose is to answer a design question with data.
+name: io_uring probe
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - '.github/workflows/iouring-probe.yml'
+      - 'crates/talon-transport/**'
+      - 'crates/talon-worker/**'
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    name: io_uring capability
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Kernel and sysctl surface
+        run: |
+          {
+            echo "## io_uring capability probe"
+            echo
+            echo '### Environment'
+            echo '```'
+            echo "kernel:  $(uname -r)"
+            echo "arch:    $(uname -m)"
+            echo "nproc:   $(nproc)"
+            if [ -r /proc/sys/kernel/io_uring_disabled ]; then
+              echo "io_uring_disabled: $(cat /proc/sys/kernel/io_uring_disabled)  (0=enabled 1=restricted 2=disabled)"
+            else
+              echo "io_uring_disabled: (knob absent — kernel predates it, syscall likely allowed)"
+            fi
+            echo "seccomp: $(grep -E '^Seccomp:' /proc/self/status || echo unknown)"
+            echo "container: $([ -f /.dockerenv ] && echo yes || echo no)"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Probe io_uring from Rust (monoio)
+        id: probe
+        run: |
+          set +e
+          out=$(cargo run --quiet --release --manifest-path .github/probe/Cargo.toml 2>&1)
+          code=$?
+          echo "$out"
+          {
+            echo
+            echo '### Probe output'
+            echo '```'
+            echo "$out"
+            echo '```'
+            echo
+            if echo "$out" | grep -q 'PROBE_RESULT=SUPPORTED'; then
+              echo '**Result: io_uring is SUPPORTED on this runner.**'
+              echo
+              echo 'A monoio data-plane migration can be exercised directly in CI.'
+            else
+              echo '**Result: io_uring is NOT usable on this runner** (exit code '"$code"').'
+              echo
+              echo 'A monoio data plane would need to be feature-gated, with CI'
+              echo 'compiling but not executing it, and correctness verified on'
+              echo 'self-hosted or production hardware.'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+          exit 0

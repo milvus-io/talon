@@ -1,0 +1,17 @@
+# Standalone manifest for the io_uring capability probe (see
+# .github/workflows/iouring-probe.yml). Kept out of the workspace so the probe
+# never pulls monoio into a normal `cargo build --workspace`.
+[package]
+name = "iouring-probe"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "iouring-probe"
+path = "iouring_probe.rs"
+
+[dependencies]
+monoio = { version = "0.2.4", features = ["sync"] }
+
+[workspace]
