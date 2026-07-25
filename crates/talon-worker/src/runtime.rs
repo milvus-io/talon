@@ -487,6 +487,93 @@ impl WorkerRuntime {
         Ok(bytes)
     }
 
+    /// Write a whole object through to the backend, then cache it (#226/#229).
+    ///
+    /// Uploads `body` to the origin (`backend.put`) and, on success, commits the
+    /// bytes to the local cache under the version the store assigned, so an
+    /// immediate read-after-write is a cache hit. If the backend PUT fails,
+    /// nothing is cached and the error propagates — a failed write is never
+    /// silently cached.
+    ///
+    /// v1 handles single-block objects (`body.len() <= block_size`); a larger
+    /// object is rejected with a clear error (multi-block write is future work).
+    /// Returns the committed version.
+    pub async fn write_object(
+        &self,
+        object: &ObjectId,
+        body: bytes::Bytes,
+    ) -> anyhow::Result<Version> {
+        if body.len() as u64 > self.block_size as u64 {
+            anyhow::bail!(
+                "object {} is {} bytes; v1 write supports at most one block ({} bytes)",
+                object.to_path(),
+                body.len(),
+                self.block_size
+            );
+        }
+        // Write through to the origin first; the backend PUT is the durability
+        // point. Only cache after it succeeds.
+        let version = match self.backend.put(object, body.clone()).await {
+            Ok(v) => {
+                self.metrics.record_backend_write_success(body.len() as u64);
+                v
+            }
+            Err(error) => {
+                self.metrics.record_backend_write_error();
+                return Err(error.into());
+            }
+        };
+        // Refresh the version cache so a subsequent read resolves the new version
+        // without a HEAD, and addresses the just-written block correctly (#163).
+        self.store_version(object, &version);
+        // Commit the written bytes to the local cache under the new version, so
+        // read-after-write is a hit. Mirrors the miss-commit path.
+        let block = self.block_for(object, 0, &version);
+        let len = body.len() as u64;
+        self.store
+            .put(&block, body)
+            .await
+            .map_err(|error| anyhow::anyhow!("commit written block failed: {error}"))?;
+        self.index.commit(BlockMeta {
+            id: block.clone(),
+            form: BlockForm::Whole,
+            len,
+        });
+        self.lru.insert(CacheUnit::Whole(block.clone()), len);
+        self.lru.pin(&CacheUnit::Whole(block.clone()));
+        // Drop any superseded prior version of this object from the cache.
+        let superseded = self.lru.evict_superseded(&block);
+        self.unlink_units(superseded).await;
+        self.enforce_capacity().await;
+        self.lru.unpin(&CacheUnit::Whole(block.clone()));
+        tracing::info!(object = %object.to_path(), bytes = len, version = %version, "wrote object");
+        Ok(version)
+    }
+
+    /// Delete an object from the backend and evict it locally (#226/#229).
+    ///
+    /// Deletes at the origin (`backend.delete`, idempotent), then invalidates the
+    /// cached version so a subsequent read re-resolves (and sees the object gone).
+    /// Best-effort evicts the object's currently-cached block.
+    pub async fn delete_object(&self, object: &ObjectId) -> anyhow::Result<()> {
+        match self.backend.delete(object).await {
+            Ok(()) => self.metrics.record_backend_delete_success(),
+            Err(error) => {
+                self.metrics.record_backend_delete_error();
+                return Err(error.into());
+            }
+        }
+        // Evict the locally-cached block for the last-known version, if any, and
+        // drop the cached version so the next read re-resolves.
+        if let Some(version) = self.cached_version(object) {
+            let block = self.block_for(object, 0, &version);
+            self.unlink_units(vec![CacheUnit::Whole(block)]).await;
+        }
+        self.invalidate_version(object);
+        tracing::info!(object = %object.to_path(), "deleted object");
+        Ok(())
+    }
+
     /// Evict the coldest unpinned blocks until resident bytes are back under the
     /// configured capacity, unlinking each evicted block's file and index entry.
     /// A `capacity_bytes` of `0` disables enforcement.
