@@ -1,5 +1,7 @@
 # Build artifacts
 /target
+# Build output of the standalone io_uring probe crate (.github/probe).
+.github/probe/target/
 
 # mdBook rendered output (source lives in docs/book/src)
 /docs/book/book/
