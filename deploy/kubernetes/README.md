@@ -12,6 +12,8 @@ external etcd); deploying both is a misconfiguration.
 | `service.yaml` | ClusterIP Service + PodDisruptionBudget (`minAvailable: 2`). Apply for either backend. |
 | `coordinator-kubernetes.yaml` | Coordinator Deployment using the Kubernetes Lease backend (no external creds). |
 | `coordinator-etcd.yaml` | Coordinator Deployment using an external etcd backend (Secret-mounted creds/TLS). |
+| `worker.yaml` | Worker Deployment (cache nodes) + ServiceAccount. Shared by both coordinator backends. |
+| `worker-secret.example.yaml` | Template Secret for the worker's object-store (Azure account/SAS) credentials. |
 | `rbac.yaml` | Least-privilege namespaced Lease RBAC. **Kubernetes backend only.** |
 | `etcd-secret.example.yaml` | Template Secret for etcd endpoints/credentials/TLS and the optional management token. **etcd backend only.** |
 | `servicemonitor.yaml` | Prometheus Operator ServiceMonitor (or use the pod scrape annotations). |
@@ -25,6 +27,22 @@ kubectl apply -n talon -f rbac.yaml -f service.yaml -f coordinator-kubernetes.ya
 
 The pods authenticate to the API server with their mounted ServiceAccount token
 and write one Lease per node. No external datastore is required.
+
+## Workers
+
+Cache nodes register with the coordinator Service and serve object ranges. Apply
+`worker.yaml` alongside whichever coordinator you chose, after creating the
+object-store Secret (never commit it) — see `worker-secret.example.yaml`:
+
+```sh
+kubectl create secret generic talon-worker-backend -n talon \
+  --from-literal=azure-account="$ACCOUNT" --from-literal=azure-sas="$SAS"
+kubectl apply -n talon -f worker.yaml
+```
+
+The workers are horizontally scalable (`kubectl scale deployment/talon-worker
+--replicas=N`) and independent of the coordinator's HA backend. The cache is an
+`emptyDir`; swap in a PVC for a node-local SSD in production.
 
 ## Quick start — external etcd backend
 
@@ -72,4 +90,5 @@ coordinator Deployments run ≥3 replicas with all three probes and a quorum-saf
 rollout, exactly one backend is selected per Deployment, the RBAC is a
 namespaced Lease-only Role (no ClusterRole, no secrets), etcd credentials are
 `secretKeyRef`s (never inline), and the example Secret contains only
-placeholders.
+placeholders. The worker Deployment is validated too: it runs non-root with all
+three probes and takes its object-store credentials from a Secret, never inline.

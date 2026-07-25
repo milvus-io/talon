@@ -1,0 +1,141 @@
+# Talon worker Deployment — cache nodes that register with the coordinator
+# Service and serve object ranges from a local cache backed by an object store.
+#
+# Workers are horizontally scalable and independent of the coordinator's HA
+# backend, so this manifest is shared by BOTH coordinator variants
+# (coordinator-kubernetes.yaml and coordinator-etcd.yaml). Apply it alongside
+# whichever coordinator you chose:
+#   kubectl apply -n talon -f service.yaml -f coordinator-etcd.yaml -f worker.yaml
+#
+# Object-store credentials (Azure account + SAS) come from a Secret
+# (talon-worker-backend, see worker-secret.example.yaml) — never baked into the
+# image or committed. The cache is an emptyDir here; swap in a PVC for a
+# node-local SSD in production.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: talon-worker
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: talon-worker
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: worker
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: talon
+      app.kubernetes.io/component: worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: talon
+        app.kubernetes.io/component: worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: talon-worker
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: talon
+              app.kubernetes.io/component: worker
+      volumes:
+        # Local cache. Swap this emptyDir for a PVC (node-local SSD) in
+        # production; the worker rebuilds its cache on restart either way.
+        - name: cache
+          emptyDir: {}
+      containers:
+        - name: worker
+          image: ghcr.io/milvus-io/talon-worker:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--coordinator"
+            - "talon-coordinator:7000"
+            - "--listen"
+            - "0.0.0.0:7001"
+            - "--admin-listen"
+            - "0.0.0.0:8001"
+          ports:
+            - name: data
+              containerPort: 7001
+            - name: admin
+              containerPort: 8001
+          env:
+            - name: TALON_WORKER_CLUSTER_ID
+              value: "talon"
+            - name: TALON_WORKER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Advertise the pod IP so the coordinator routes peers to this pod.
+            - name: TALON_WORKER_ADVERTISE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: TALON_WORKER_CACHE_DIRS
+              value: /var/cache/talon
+            # Cache capacity the worker is allowed to fill (8 GiB). Keep this
+            # below the emptyDir/PVC size and the container memory limit.
+            - name: TALON_WORKER_CAPACITY_BYTES
+              value: "8589934592"
+            # Object-store backend credentials from the Secret — never logged.
+            - name: TALON_WORKER_AZURE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: talon-worker-backend
+                  key: azure-account
+            - name: TALON_WORKER_AZURE_SAS
+              valueFrom:
+                secretKeyRef:
+                  name: talon-worker-backend
+                  key: azure-sas
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/talon
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"

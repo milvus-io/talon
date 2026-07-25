@@ -17,6 +17,11 @@ pub const COORDINATOR_KUBERNETES_YAML: &str =
 /// etcd-backend coordinator Deployment.
 pub const COORDINATOR_ETCD_YAML: &str =
     include_str!("../../../deploy/kubernetes/coordinator-etcd.yaml");
+/// Worker Deployment (cache nodes), shared by both coordinator backends.
+pub const WORKER_YAML: &str = include_str!("../../../deploy/kubernetes/worker.yaml");
+/// Example Secret template for the worker's object-store credentials.
+pub const WORKER_SECRET_EXAMPLE_YAML: &str =
+    include_str!("../../../deploy/kubernetes/worker-secret.example.yaml");
 /// Service + PodDisruptionBudget.
 pub const SERVICE_YAML: &str = include_str!("../../../deploy/kubernetes/service.yaml");
 /// Least-privilege RBAC for the Kubernetes backend.
@@ -51,6 +56,8 @@ mod tests {
         for (name, yaml) in [
             ("coordinator-kubernetes", COORDINATOR_KUBERNETES_YAML),
             ("coordinator-etcd", COORDINATOR_ETCD_YAML),
+            ("worker", WORKER_YAML),
+            ("worker-secret.example", WORKER_SECRET_EXAMPLE_YAML),
             ("service", SERVICE_YAML),
             ("rbac", RBAC_YAML),
             ("etcd-secret.example", ETCD_SECRET_EXAMPLE_YAML),
@@ -170,27 +177,66 @@ mod tests {
     }
 
     #[test]
+    fn worker_deployment_is_valid_and_uses_secret_credentials() {
+        let docs = parse_documents(WORKER_YAML);
+        let dep = docs
+            .iter()
+            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
+            .expect("a worker Deployment");
+        // Horizontally scalable.
+        assert!(dep["spec"]["replicas"].as_u64().unwrap() >= 1);
+        let spec = &dep["spec"]["template"]["spec"];
+        assert!(spec["terminationGracePeriodSeconds"].as_u64().unwrap() >= 20);
+        // Runs as the image's non-root user.
+        assert_eq!(
+            spec["securityContext"]["runAsNonRoot"].as_bool(),
+            Some(true)
+        );
+        let c = &spec["containers"][0];
+        for probe in ["startupProbe", "livenessProbe", "readinessProbe"] {
+            assert!(!c[probe].is_null(), "worker missing {probe}");
+        }
+        let envs = c["env"].as_sequence().unwrap();
+        // Object-store credentials must be secretKeyRefs, never inline.
+        for key in ["TALON_WORKER_AZURE_ACCOUNT", "TALON_WORKER_AZURE_SAS"] {
+            let e = envs
+                .iter()
+                .find(|e| e["name"].as_str() == Some(key))
+                .unwrap_or_else(|| panic!("worker env {key}"));
+            assert!(e.get("value").is_none(), "{key} must not be inline");
+            assert!(!e["valueFrom"]["secretKeyRef"].is_null());
+        }
+        // The worker must point at the coordinator Service.
+        let args = c["args"].as_sequence().unwrap();
+        assert!(args
+            .iter()
+            .any(|a| a.as_str() == Some("talon-coordinator:7000")));
+    }
+
+    #[test]
     fn example_secret_contains_no_real_looking_values() {
         // The committed example must be an obvious placeholder, never a real
         // credential. Every non-endpoint secret value is REPLACE_ME.
-        let docs = parse_documents(ETCD_SECRET_EXAMPLE_YAML);
-        for doc in docs {
-            if doc.get("kind").and_then(|k| k.as_str()) != Some("Secret") {
-                continue;
-            }
-            if let Some(data) = doc.get("stringData").and_then(|d| d.as_mapping()) {
-                for (k, v) in data {
-                    let key = k.as_str().unwrap_or("");
-                    let val = v.as_str().unwrap_or("");
-                    // Only credential/material keys must be placeholders;
-                    // endpoints and username are not sensitive.
-                    if matches!(key, "endpoints" | "username") {
-                        continue;
+        for yaml in [ETCD_SECRET_EXAMPLE_YAML, WORKER_SECRET_EXAMPLE_YAML] {
+            let docs = parse_documents(yaml);
+            for doc in docs {
+                if doc.get("kind").and_then(|k| k.as_str()) != Some("Secret") {
+                    continue;
+                }
+                if let Some(data) = doc.get("stringData").and_then(|d| d.as_mapping()) {
+                    for (k, v) in data {
+                        let key = k.as_str().unwrap_or("");
+                        let val = v.as_str().unwrap_or("");
+                        // Only credential/material keys must be placeholders;
+                        // endpoints and username are not sensitive.
+                        if matches!(key, "endpoints" | "username") {
+                            continue;
+                        }
+                        assert!(
+                            val.contains("REPLACE_ME"),
+                            "example secret key {key} must be a placeholder"
+                        );
                     }
-                    assert!(
-                        val.contains("REPLACE_ME"),
-                        "example secret key {key} must be a placeholder"
-                    );
                 }
             }
         }
