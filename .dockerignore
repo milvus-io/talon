@@ -1,0 +1,25 @@
+# Keep the Docker build context small and reproducible: ship only what `cargo
+# build` needs (Cargo manifests, sources, toolchain pin). Everything below is
+# irrelevant to the build and would bloat the context or bust layer caching.
+
+# Rust build output — by far the largest directory.
+/target
+**/target
+
+# Version control and CI.
+/.git
+/.github
+
+# Documentation, deploy assets, and screenshots.
+/docs
+/deploy
+*.md
+/bench
+
+# Editor / OS cruft and local secrets.
+*.swp
+.DS_Store
+.env
+.env.*
+*.pem
+*.key
