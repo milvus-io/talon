@@ -53,8 +53,9 @@ spell:
     typos
 
 # Link-check the docs (install: cargo install lychee). Config: lychee.toml.
+# Offline: internal/relative links only, matching the CI gate.
 linkcheck:
-    lychee --no-progress README.md DESIGN.md CONTRIBUTING.md BENCHMARKS.md 'docs/**/*.md' '.github/**/*.md'
+    lychee --offline --no-progress README.md DESIGN.md CONTRIBUTING.md BENCHMARKS.md 'docs/**/*.md' '.github/**/*.md'
 
 # --- benchmarks (performance feedback loop) ---
 

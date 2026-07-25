@@ -151,10 +151,13 @@ jobs:
       - name: Spell check
         uses: crate-ci/typos@master
       - name: Link check
+        # Offline: validate internal / relative links only. External URLs are
+        # not fetched, so a slow or rate-limited third-party site (e.g. a
+        # timeout to etcd.io) can never turn the gate red on a false negative.
         uses: lycheeverse/lychee-action@v2
         with:
           args: >-
-            --no-progress
+            --offline --no-progress
             README.md DESIGN.md CONTRIBUTING.md BENCHMARKS.md
             'docs/**/*.md' '.github/**/*.md'
           fail: true
