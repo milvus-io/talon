@@ -120,9 +120,18 @@ pub fn authorization_header(
         .map(|(k, v)| format!("{k}:{v}\n"))
         .collect::<String>();
 
-    // Canonicalized resource: /<account><path>. No query params today.
+    // Canonicalized resource: /<account>/<path-within-account>. For virtual-host
+    // addressing the URL path is /<container>/<blob>, so we prefix the account.
+    // For path-style/emulator addressing the path already begins with
+    // /<account>/..., so prefixing again would double the account — detect that
+    // and use the path as-is.
     let (_host, path) = host_and_path(&req.url);
-    let canonical_resource = format!("/{account}{path}");
+    let account_prefix = format!("/{account}/");
+    let canonical_resource = if path.starts_with(&account_prefix) || path == format!("/{account}") {
+        path
+    } else {
+        format!("/{account}{path}")
+    };
 
     // The 20-line StringToSign (verb + standard headers + canonical headers +
     // canonical resource). Empty standard headers are blank lines.
@@ -258,5 +267,33 @@ mod tests {
         let (host, path) = host_and_path("http://127.0.0.1:10000/devstoreaccount1/c/b");
         assert_eq!(host, "127.0.0.1:10000");
         assert_eq!(path, "/devstoreaccount1/c/b");
+    }
+
+    #[test]
+    fn path_style_and_virtual_host_sign_the_same_canonical_resource() {
+        // The canonical resource must be /<account>/<container>/<blob> for both
+        // addressing styles — path-style must NOT double the account
+        // (/devstoreaccount1/devstoreaccount1/...), which would break Azurite.
+        let vhost = req(
+            Method::Get,
+            "https://devstoreaccount1.blob.core.windows.net/c/b",
+            vec![
+                ("x-ms-date", "Fri, 26 Jun 2015 23:39:12 GMT"),
+                ("x-ms-version", "2021-12-02"),
+            ],
+        );
+        let path_style = req(
+            Method::Get,
+            "http://127.0.0.1:10000/devstoreaccount1/c/b",
+            vec![
+                ("x-ms-date", "Fri, 26 Jun 2015 23:39:12 GMT"),
+                ("x-ms-version", "2021-12-02"),
+            ],
+        );
+        // Same account + same canonical resource ⇒ identical signature.
+        assert_eq!(
+            authorization_header(&vhost, "devstoreaccount1", KEY).unwrap(),
+            authorization_header(&path_style, "devstoreaccount1", KEY).unwrap(),
+        );
     }
 }
