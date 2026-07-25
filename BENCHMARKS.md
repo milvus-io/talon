@@ -46,6 +46,23 @@ detection):
 The zero-copy data plane (`sendfile`/`splice`) is I/O-bound and higher-variance;
 those benches are added in a separate tier when the transport layer lands.
 
+- `talon-worker` (`dataplane_benches`): the Tokio and io_uring data planes
+  serving the same resident block over real loopback TCP (#285).
+
+  **Read this one with care.** It drives a single client serially, so it
+  measures a per-request latency floor, not scaling. At concurrency 1 the two
+  planes are statistically indistinguishable — across seven runs the medians
+  overlapped and the sign of the difference flipped run to run. That is
+  expected: io_uring amortizes syscalls across many in-flight operations, and
+  with one request in flight there is nothing to amortize, while the bulk bytes
+  bypass the ring via `sendfile` on both paths. The 35% win measured in #273 was
+  at 1024 concurrent connections.
+
+  A Divan harness cannot model that concurrency honestly — a synthetic fan-out
+  inside `bench()` would mostly measure the harness's own scheduling. So this
+  bench is a **regression floor**, not the evidence for changing which data
+  plane ships by default. That decision needs a concurrent load test.
+
 ## For coding agents
 
 - One command surface: `just bench`, `just bench-save`, `just bench-check`.
