@@ -96,4 +96,7 @@ docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
 - **Production on Kubernetes** — [install with Kubernetes](./kubernetes.md).
 - **Understand the cluster** — the [getting started tutorial](../tutorials/getting-started.md)
   walks through the API, UI, and FUSE client in detail.
+- **Simulate object-store latency** — the [latency lab](../testing/latency-lab.md)
+  runs a local emulator behind a latency proxy to see the cache mask backend
+  latency.
 - **Build from source** — [installing from source](./source.md) (contributors).

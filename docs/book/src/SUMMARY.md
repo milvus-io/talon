@@ -16,6 +16,7 @@
 
 - [Operator runbook](./operations/runbook.md)
 - [Security hardening](./operations/security.md)
+- [Latency lab](./testing/latency-lab.md)
 
 # Reference
 
