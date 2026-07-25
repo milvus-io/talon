@@ -49,5 +49,5 @@ async fn azure_backend_conformance_end_to_end() {
     // Azure's ObjectId::bucket carries the container name.
     let present = ObjectId::new(Backend::Azure, container.clone(), key);
     let missing = ObjectId::new(Backend::Azure, container, "e2e/does-not-exist.bin");
-    conformance::run(backend, &present, &missing).await;
+    conformance::run(backend, &present, &missing, true).await;
 }

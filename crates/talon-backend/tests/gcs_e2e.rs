@@ -42,5 +42,5 @@ async fn gcs_backend_conformance_end_to_end() {
 
     let present = ObjectId::new(Backend::Gcs, bucket.clone(), key);
     let missing = ObjectId::new(Backend::Gcs, bucket, "e2e/does-not-exist.bin");
-    conformance::run(backend, &present, &missing).await;
+    conformance::run(backend, &present, &missing, false).await;
 }

@@ -22,15 +22,26 @@ pub fn content_byte(i: u64) -> u8 {
 
 /// Run the full conformance suite against `backend`:
 /// - `present` is a seeded object of [`OBJECT_LEN`] bytes,
-/// - `missing` is an object key that does not exist (for the 404 path).
-pub async fn run(backend: Arc<dyn BackendStore>, present: &ObjectId, missing: &ObjectId) {
+/// - `missing` is an object key that does not exist (for the 404 path),
+/// - `check_preconditions` runs the If-Match precondition assertions; disable it
+///   for emulators that do not enforce preconditions (fake-gcs-server ignores
+///   them, so a stale precondition is not rejected there — a limitation of the
+///   emulator, not the backend).
+pub async fn run(
+    backend: Arc<dyn BackendStore>,
+    present: &ObjectId,
+    missing: &ObjectId,
+    check_preconditions: bool,
+) {
     head_reports_size_and_version(&*backend, present).await;
-    let version = backend.head(present).await.unwrap().version;
     ranges_return_exact_bytes(&*backend, present).await;
     whole_object_read(&*backend, present).await;
     tail_read_past_eof_clamps(&*backend, present).await;
-    matching_precondition_succeeds(&*backend, present, &version).await;
-    stale_precondition_is_rejected(&*backend, present).await;
+    if check_preconditions {
+        let version = backend.head(present).await.unwrap().version;
+        matching_precondition_succeeds(&*backend, present, &version).await;
+        stale_precondition_is_rejected(&*backend, present).await;
+    }
     missing_object_is_not_found(&*backend, missing).await;
 }
 
@@ -78,6 +89,9 @@ async fn tail_read_past_eof_clamps(backend: &dyn BackendStore, obj: &ObjectId) {
     assert_eq!(&got[..], &expected[..]);
 }
 
+// Only invoked when preconditions are checked; the gcs binary compiles this
+// module without calling them, so silence its per-binary dead-code warning.
+#[allow(dead_code)]
 async fn matching_precondition_succeeds(
     backend: &dyn BackendStore,
     obj: &ObjectId,
@@ -91,6 +105,7 @@ async fn matching_precondition_succeeds(
     assert_eq!(&got[..], &expected[..]);
 }
 
+#[allow(dead_code)]
 async fn stale_precondition_is_rejected(backend: &dyn BackendStore, obj: &ObjectId) {
     // A wrong version must be rejected as a VersionMismatch, not silently served.
     let bogus = Version::new("0xDEADBEEFDEADBEEF");

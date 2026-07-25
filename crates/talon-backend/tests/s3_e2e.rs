@@ -57,5 +57,5 @@ async fn s3_backend_conformance_end_to_end() {
 
     let present = ObjectId::new(Backend::S3, bucket.clone(), key);
     let missing = ObjectId::new(Backend::S3, bucket, "e2e/does-not-exist.bin");
-    conformance::run(backend, &present, &missing).await;
+    conformance::run(backend, &present, &missing, true).await;
 }
