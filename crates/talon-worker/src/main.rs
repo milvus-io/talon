@@ -370,10 +370,39 @@ async fn handle_conn(
                 Err(e) => return Err(anyhow::anyhow!(e)),
             };
 
+        // A write (Put) or delete (Delete) is handled here and loops; only a
+        // GetRange falls through to the read-serve path below.
+        if header.msg_type == MsgType::Put {
+            handle_put(
+                &mut stream,
+                &header,
+                &payload,
+                &worker,
+                &observability,
+                request_started,
+            )
+            .await?;
+            continue;
+        }
+        if header.msg_type == MsgType::Delete {
+            handle_delete(
+                &mut stream,
+                &header,
+                &payload,
+                &worker,
+                &observability,
+                request_started,
+            )
+            .await?;
+            continue;
+        }
+
         // Type check BEFORE any per-request work; a data listener only serves
-        // GetRange, and non-data frames are already capped tightly by read_frame.
+        // GetRange (plus the Put/Delete handled above); other frames are capped
+        // tightly by read_frame.
         if header.msg_type != MsgType::GetRange {
-            let err = data::encode_error(header.request_id, "worker only serves GetRange");
+            let err =
+                data::encode_error(header.request_id, "worker only serves GetRange/Put/Delete");
             stream.write_all(&err).await?;
             stream.flush().await?;
             observability
@@ -454,6 +483,125 @@ async fn handle_conn(
             }
         }
     }
+}
+
+/// Handle a `Put` frame: read the whole object body, write it through to the
+/// backend, and cache it (#229).
+///
+/// The frame `payload` is the small bincode [`PutRequest`] header; the raw object
+/// bytes (`body_len` of them) follow on the stream, so we read exactly that many
+/// into memory (v1 objects are single-block) and hand them to
+/// [`WorkerRuntime::write_object`], which PUTs to the origin then caches the
+/// bytes. Replies OK with the committed version, or an `ERROR` frame.
+async fn handle_put(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<()> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+    let (h, req) = match data::decode_put_header(&full) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = data::encode_error(header.request_id, &format!("bad put: {e}"));
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+    if !observability.is_ready() {
+        let err = data::encode_error(h.request_id, "worker is not ready");
+        stream.write_all(&err).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+    // Read exactly body_len raw object bytes that follow the header on the wire.
+    let mut body = vec![0u8; req.body_len as usize];
+    stream.read_exact(&mut body).await?;
+    match worker
+        .write_object(&req.object, bytes::Bytes::from(body))
+        .await
+    {
+        Ok(version) => {
+            // Reply OK; the body carries the committed version so the client can
+            // record read-after-write consistency.
+            let vbytes = version.as_str().as_bytes();
+            let hdr = data::response_header_ok(h.request_id, vbytes.len() as u32);
+            stream.write_all(&hdr).await?;
+            stream.write_all(vbytes).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_success(req.body_len, request_started.elapsed());
+        }
+        Err(error) => {
+            let err = data::encode_error(h.request_id, &error.to_string());
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(())
+}
+
+/// Handle a `Delete` frame: delete the object at the backend and evict locally.
+async fn handle_delete(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<()> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+    let (h, req) = match data::decode_delete(&full) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = data::encode_error(header.request_id, &format!("bad delete: {e}"));
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+    if !observability.is_ready() {
+        let err = data::encode_error(h.request_id, "worker is not ready");
+        stream.write_all(&err).await?;
+        stream.flush().await?;
+        return Ok(());
+    }
+    match worker.delete_object(&req.object).await {
+        Ok(()) => {
+            let hdr = data::response_header_ok(h.request_id, 0);
+            stream.write_all(&hdr).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_success(0, request_started.elapsed());
+        }
+        Err(error) => {
+            let err = data::encode_error(h.request_id, &error.to_string());
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(())
 }
 
 /// Stream a resident block's bytes to the client with `sendfile(2)`.
@@ -768,6 +916,142 @@ mod tests {
             .metrics()
             .render()
             .contains("talon_worker_cache_hits_total{form=\"whole\"} 1"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A backend that stores whole-object PUTs in memory so a write-through can be
+    /// read back, and records deletes.
+    #[derive(Default)]
+    struct StoringBackend {
+        objects: std::sync::Mutex<std::collections::HashMap<String, Bytes>>,
+    }
+
+    #[async_trait]
+    impl BackendStore for StoringBackend {
+        async fn fetch_range(&self, object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            let objs = self.objects.lock().unwrap();
+            let full = objs
+                .get(&object.to_path())
+                .ok_or_else(|| Error::NotFound(object.to_path()))?;
+            let start = offset as usize;
+            let end = (start + len as usize).min(full.len());
+            Ok(full.slice(start..end))
+        }
+        async fn head(&self, object: &ObjectId) -> Result<ObjectStat> {
+            let objs = self.objects.lock().unwrap();
+            let full = objs
+                .get(&object.to_path())
+                .ok_or_else(|| Error::NotFound(object.to_path()))?;
+            Ok(ObjectStat {
+                len: full.len() as u64,
+                version: Version::new("stored-v1"),
+            })
+        }
+        async fn put(&self, object: &ObjectId, body: Bytes) -> Result<Version> {
+            self.objects.lock().unwrap().insert(object.to_path(), body);
+            Ok(Version::new("stored-v1"))
+        }
+        async fn delete(&self, object: &ObjectId) -> Result<()> {
+            self.objects.lock().unwrap().remove(&object.to_path());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_conn_write_through_then_read_back() {
+        use talon_transport::data::{encode_put_header, encode_request, PutRequest, RangeRequest};
+
+        let root = tmp_root();
+        let index = Arc::new(BlockIndex::new());
+        let inflight = Arc::new(InFlightLoads::new());
+        let node = NodeInfo {
+            id: NodeId::new("w"),
+            address: "127.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let observability = Arc::new(
+            WorkerObservability::new(
+                "c".into(),
+                node,
+                "127.0.0.1:8001".into(),
+                1024,
+                Arc::clone(&index),
+                Arc::clone(&inflight),
+            )
+            .unwrap(),
+        );
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        observability.readiness().set_control_registered(true);
+        let backend = Arc::new(StoringBackend::default());
+        let worker = Arc::new(WorkerRuntime::new(
+            WholeBlockStore::open(&root).unwrap(),
+            index,
+            inflight,
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            256 << 20, // block_size big enough for the object
+            0,
+            observability.metrics().clone(),
+        ));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_worker = Arc::clone(&worker);
+        let srv_obs = Arc::clone(&observability);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, srv_worker, srv_obs).await;
+        });
+
+        let obj = ObjectId::new(talon_core::Backend::Azure, "c", "written.bin");
+        let object_bytes = bytes::Bytes::from_static(b"hello written object");
+        let mut client = TcpStream::connect(addr).await.unwrap();
+
+        // 1) PUT: header frame (object + body_len) then the raw object bytes.
+        let put = PutRequest {
+            object: obj.clone(),
+            body_len: object_bytes.len() as u64,
+        };
+        let hdr = encode_put_header(0, &put).unwrap();
+        client.write_all(&hdr).await.unwrap();
+        client.write_all(&object_bytes).await.unwrap();
+        client.flush().await.unwrap();
+        // Reply OK carrying the committed version.
+        let mut rhdr = [0u8; HEADER_LEN];
+        client.read_exact(&mut rhdr).await.unwrap();
+        let rheader = FrameHeader::decode(&rhdr).unwrap();
+        assert!(!rheader.flags.contains(talon_transport::Flags::ERROR));
+        let mut vbody = vec![0u8; rheader.length as usize];
+        client.read_exact(&mut vbody).await.unwrap();
+        assert_eq!(&vbody, b"stored-v1");
+        // The backend received the exact object bytes (write-through).
+        assert_eq!(
+            backend.objects.lock().unwrap().get(&obj.to_path()).unwrap(),
+            &object_bytes
+        );
+
+        // 2) GetRange the same object: served from cache (read-after-write).
+        let req = RangeRequest {
+            object: obj.clone(),
+            offset: 0,
+            len: object_bytes.len() as u64,
+        };
+        let out = encode_request(0, &req).unwrap();
+        client.write_all(&out).await.unwrap();
+        client.flush().await.unwrap();
+        let mut ghdr = [0u8; HEADER_LEN];
+        client.read_exact(&mut ghdr).await.unwrap();
+        let gheader = FrameHeader::decode(&ghdr).unwrap();
+        assert!(!gheader.flags.contains(talon_transport::Flags::ERROR));
+        let mut gbody = vec![0u8; gheader.length as usize];
+        client.read_exact(&mut gbody).await.unwrap();
+        assert_eq!(
+            gbody, object_bytes,
+            "read-after-write returns written bytes"
+        );
+
+        drop(client);
+        server.await.unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 

@@ -37,6 +37,10 @@ pub struct WorkerMetrics {
     cache_misses_total: Counter,
     backend_fetch_bytes_total: Counter,
     backend_fetch_errors_total: Counter,
+    backend_write_bytes_total: Counter,
+    backend_write_errors_total: Counter,
+    backend_delete_total: Counter,
+    backend_delete_errors_total: Counter,
     evictions_total: Counter,
     heartbeat_success_total: Counter,
     heartbeat_failure_total: Counter,
@@ -107,6 +111,26 @@ impl WorkerMetrics {
         let backend_fetch_errors_total = registry.counter(
             "talon_worker_backend_fetch_errors_total",
             "Origin backend range fetch failures.",
+            labels(BACKEND_LABELS),
+        );
+        let backend_write_bytes_total = registry.counter(
+            "talon_worker_backend_write_bytes_total",
+            "Bytes written through to the origin backend.",
+            labels(BACKEND_LABELS),
+        );
+        let backend_write_errors_total = registry.counter(
+            "talon_worker_backend_write_errors_total",
+            "Origin backend object PUT failures.",
+            labels(BACKEND_LABELS),
+        );
+        let backend_delete_total = registry.counter(
+            "talon_worker_backend_delete_total",
+            "Objects deleted from the origin backend.",
+            labels(BACKEND_LABELS),
+        );
+        let backend_delete_errors_total = registry.counter(
+            "talon_worker_backend_delete_errors_total",
+            "Origin backend object DELETE failures.",
             labels(BACKEND_LABELS),
         );
         let evictions_total = registry.counter(
@@ -187,6 +211,10 @@ impl WorkerMetrics {
             cache_misses_total,
             backend_fetch_bytes_total,
             backend_fetch_errors_total,
+            backend_write_bytes_total,
+            backend_write_errors_total,
+            backend_delete_total,
+            backend_delete_errors_total,
             evictions_total,
             heartbeat_success_total,
             heartbeat_failure_total,
@@ -238,6 +266,26 @@ impl WorkerMetrics {
         self.backend_fetch_errors_total.inc();
         self.backend_fetch_duration_seconds
             .observe(elapsed.as_secs_f64());
+    }
+
+    /// Record a successful write-through PUT of `bytes` to the origin backend.
+    pub fn record_backend_write_success(&self, bytes: u64) {
+        self.backend_write_bytes_total.add(bytes);
+    }
+
+    /// Record a failed write-through PUT.
+    pub fn record_backend_write_error(&self) {
+        self.backend_write_errors_total.inc();
+    }
+
+    /// Record a successful object DELETE at the origin backend.
+    pub fn record_backend_delete_success(&self) {
+        self.backend_delete_total.inc();
+    }
+
+    /// Record a failed object DELETE.
+    pub fn record_backend_delete_error(&self) {
+        self.backend_delete_errors_total.inc();
     }
 
     /// Record a successful control-plane heartbeat cycle.
