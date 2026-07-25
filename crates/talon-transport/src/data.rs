@@ -27,6 +27,27 @@ pub struct RangeRequest {
     pub len: u64,
 }
 
+/// A client→worker request to write a whole object (write-through, #226).
+///
+/// This is the framed **header**; the raw object bytes (`body_len` of them)
+/// follow the frame on the wire, so the worker can `splice` them straight to a
+/// staging file without buffering them through the codec. `object` names the
+/// destination and `body_len` is the exact number of trailing raw bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PutRequest {
+    /// The destination object to (over)write.
+    pub object: ObjectId,
+    /// Number of raw object bytes that follow this header on the wire.
+    pub body_len: u64,
+}
+
+/// A client→worker request to delete an object (#226). No body follows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeleteRequest {
+    /// The object to delete.
+    pub object: ObjectId,
+}
+
 /// Errors from data-plane range encode/decode.
 #[derive(Debug, thiserror::Error)]
 pub enum DataError {
@@ -36,6 +57,12 @@ pub enum DataError {
     /// A non-`GetRange` frame was handed to the data codec.
     #[error("expected a GetRange frame, got {0:?}")]
     NotGetRange(MsgType),
+    /// A non-`Put` frame was handed to the put codec.
+    #[error("expected a Put frame, got {0:?}")]
+    NotPut(MsgType),
+    /// A non-`Delete` frame was handed to the delete codec.
+    #[error("expected a Delete frame, got {0:?}")]
+    NotDelete(MsgType),
     /// The header's declared length did not match the available payload bytes.
     #[error("length mismatch: header says {declared}, have {actual}")]
     LengthMismatch {
@@ -74,6 +101,71 @@ pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, RangeRequest), DataErr
         });
     }
     let req: RangeRequest = bincode::deserialize(body)?;
+    Ok((header, req))
+}
+
+/// Encode a [`PutRequest`] header into `header || bincode(req)`.
+///
+/// The caller then writes exactly `req.body_len` raw object bytes after this
+/// buffer (streamed, not buffered here). The frame header's `length` covers only
+/// the small bincode header, so the receiver reads the header first and then
+/// streams the trailing body.
+pub fn encode_put_header(request_id: u32, req: &PutRequest) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(req)?;
+    let header = FrameHeader::new(MsgType::Put, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a framed [`PutRequest`] header (header + bincode, no body).
+///
+/// `buf` must contain exactly the header frame (16-byte header + the bincode
+/// `PutRequest`); the raw object body is read separately from the stream using
+/// the returned `body_len`.
+pub fn decode_put_header(buf: &[u8]) -> Result<(FrameHeader, PutRequest), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::Put {
+        return Err(DataError::NotPut(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let req: PutRequest = bincode::deserialize(body)?;
+    Ok((header, req))
+}
+
+/// Encode a [`DeleteRequest`] into `header || bincode(req)` (no body follows).
+pub fn encode_delete(request_id: u32, req: &DeleteRequest) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(req)?;
+    let header = FrameHeader::new(MsgType::Delete, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a framed [`DeleteRequest`] buffer into its header and request.
+pub fn decode_delete(buf: &[u8]) -> Result<(FrameHeader, DeleteRequest), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::Delete {
+        return Err(DataError::NotDelete(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let req: DeleteRequest = bincode::deserialize(body)?;
     Ok((header, req))
 }
 
@@ -153,5 +245,73 @@ mod tests {
         let header = FrameHeader::decode(&h).unwrap();
         assert_eq!(header.length, 8192);
         assert!(!header.flags.contains(Flags::ERROR));
+    }
+
+    fn obj() -> ObjectId {
+        ObjectId::new(Backend::S3, "bucket", "path/to/object.bin")
+    }
+
+    #[test]
+    fn put_header_round_trips() {
+        let req = PutRequest {
+            object: obj(),
+            body_len: 1 << 30, // 1 GiB body streamed separately
+        };
+        let buf = encode_put_header(42, &req).unwrap();
+        let (header, back) = decode_put_header(&buf).unwrap();
+        assert_eq!(header.msg_type, MsgType::Put);
+        assert_eq!(header.request_id, 42);
+        assert_eq!(back, req);
+        // The frame length covers only the small header, NOT the body.
+        assert!((header.length as usize) < 1024);
+    }
+
+    #[test]
+    fn delete_round_trips() {
+        let req = DeleteRequest { object: obj() };
+        let buf = encode_delete(9, &req).unwrap();
+        let (header, back) = decode_delete(&buf).unwrap();
+        assert_eq!(header.msg_type, MsgType::Delete);
+        assert_eq!(header.request_id, 9);
+        assert_eq!(back, req);
+    }
+
+    #[test]
+    fn put_codec_rejects_wrong_frame_type() {
+        // A Delete frame handed to the put decoder is rejected, and vice versa.
+        let del = encode_delete(1, &DeleteRequest { object: obj() }).unwrap();
+        assert!(matches!(
+            decode_put_header(&del),
+            Err(DataError::NotPut(MsgType::Delete))
+        ));
+        let put = encode_put_header(
+            1,
+            &PutRequest {
+                object: obj(),
+                body_len: 0,
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            decode_delete(&put),
+            Err(DataError::NotDelete(MsgType::Put))
+        ));
+    }
+
+    #[test]
+    fn put_header_truncated_body_rejected() {
+        let mut buf = encode_put_header(
+            1,
+            &PutRequest {
+                object: obj(),
+                body_len: 10,
+            },
+        )
+        .unwrap();
+        buf.pop();
+        assert!(matches!(
+            decode_put_header(&buf),
+            Err(DataError::LengthMismatch { .. })
+        ));
     }
 }
