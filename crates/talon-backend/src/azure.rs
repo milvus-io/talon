@@ -27,15 +27,44 @@ pub struct AzureConfig {
     pub endpoint_suffix: String,
     /// `https` when true.
     pub tls: bool,
+    /// Optional literal endpoint host (`host` or `host:port`) that overrides the
+    /// default `{account}.{endpoint_suffix}`. Set for emulators (Azurite) or a
+    /// latency proxy in front of one. `None` uses the public-cloud host.
+    pub endpoint_host: Option<String>,
+    /// Use path-style addressing (`{host}/{account}/{container}/{blob}`) instead
+    /// of virtual-host style (`{account}.{suffix}/{container}/{blob}`). Azurite
+    /// and most non-Azure emulators require path-style.
+    pub path_style: bool,
 }
 
 impl AzureConfig {
-    /// Default public-cloud config for an account.
+    /// Default public-cloud config for an account (virtual-host, HTTPS).
     pub fn new(account: impl Into<String>) -> Self {
         Self {
             account: account.into(),
             endpoint_suffix: "blob.core.windows.net".into(),
             tls: true,
+            endpoint_host: None,
+            path_style: false,
+        }
+    }
+
+    /// Point at an emulator/proxy: literal `host[:port]`, path-style addressing.
+    ///
+    /// `tls` selects the scheme (Azurite speaks plain HTTP by default). The
+    /// account name is kept for the path segment and any shared-key signing done
+    /// by a networked client.
+    pub fn emulator(
+        account: impl Into<String>,
+        endpoint_host: impl Into<String>,
+        tls: bool,
+    ) -> Self {
+        Self {
+            account: account.into(),
+            endpoint_suffix: "blob.core.windows.net".into(),
+            tls,
+            endpoint_host: Some(endpoint_host.into()),
+            path_style: true,
         }
     }
 }
@@ -59,15 +88,26 @@ impl AzureBackend {
         }
     }
 
-    /// Build the blob URL: `scheme://<account>.<suffix>/<container>/<blob>`
-    /// with the SAS query appended when present.
+    /// Build the blob URL with the SAS query appended when present.
+    ///
+    /// Virtual-host style (default): `scheme://{account}.{suffix}/{container}/{blob}`.
+    /// Path-style (emulator): `scheme://{host}/{account}/{container}/{blob}`, using
+    /// `endpoint_host` as the literal host.
     pub fn blob_url(&self, obj: &ObjectId) -> String {
         let scheme = if self.config.tls { "https" } else { "http" };
         let blob = obj.object_path.trim_start_matches('/');
-        let base = format!(
-            "{scheme}://{}.{}/{}/{}",
-            self.config.account, self.config.endpoint_suffix, obj.bucket, blob
-        );
+        let host =
+            self.config.endpoint_host.clone().unwrap_or_else(|| {
+                format!("{}.{}", self.config.account, self.config.endpoint_suffix)
+            });
+        let base = if self.config.path_style {
+            format!(
+                "{scheme}://{host}/{}/{}/{}",
+                self.config.account, obj.bucket, blob
+            )
+        } else {
+            format!("{scheme}://{host}/{}/{}", obj.bucket, blob)
+        };
         match &self.sas_token {
             Some(sas) => format!("{base}?{sas}"),
             None => base,
@@ -364,6 +404,54 @@ mod tests {
         assert_eq!(
             with_sas.blob_url(&obj()),
             "https://myacct.blob.core.windows.net/my-container/data/checkpoint.bin?sig=abc&se=x"
+        );
+    }
+
+    #[test]
+    fn blob_url_path_style_targets_emulator_host() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        // Azurite/proxy: plain HTTP, literal host:port, account in the path.
+        let a = AzureBackend::new(
+            AzureConfig::emulator("devstoreaccount1", "127.0.0.1:10000", false),
+            None,
+            http.clone(),
+        );
+        assert_eq!(
+            a.blob_url(&obj()),
+            "http://127.0.0.1:10000/devstoreaccount1/my-container/data/checkpoint.bin"
+        );
+        // SAS still appends in path-style.
+        let with_sas = AzureBackend::new(
+            AzureConfig::emulator("devstoreaccount1", "toxiproxy:10000", false),
+            Some("sig=abc".into()),
+            http,
+        );
+        assert_eq!(
+            with_sas.blob_url(&obj()),
+            "http://toxiproxy:10000/devstoreaccount1/my-container/data/checkpoint.bin?sig=abc"
+        );
+    }
+
+    #[test]
+    fn virtual_host_default_is_unchanged_by_new_fields() {
+        // A default AzureConfig must produce the exact public-cloud URL — the new
+        // endpoint_host/path_style fields are opt-in and inert by default.
+        let cfg = AzureConfig::new("acct");
+        assert!(cfg.endpoint_host.is_none());
+        assert!(!cfg.path_style);
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let a = AzureBackend::new(cfg, None, http);
+        assert_eq!(
+            a.blob_url(&obj()),
+            "https://acct.blob.core.windows.net/my-container/data/checkpoint.bin"
         );
     }
 
