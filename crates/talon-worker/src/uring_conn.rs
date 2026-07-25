@@ -336,7 +336,8 @@ async fn handle_delete(
     Ok(())
 }
 
-/// Adapts [`handle_conn`] to the ring runtime's [`RingHandler`] trait.
+/// Adapts [`handle_conn`] to the ring runtime's [`crate::uring_serve::RingHandler`]
+/// trait.
 ///
 /// Carries the shared worker state and enforces the same connection cap as the
 /// Tokio path (#111). The cap is **per ring**, not global: each ring owns an
