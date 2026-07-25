@@ -5,9 +5,7 @@
 //! into object store operations against the cluster.
 
 pub mod block_reader;
-pub mod bridge;
 pub mod coordinator_client;
-pub mod fs;
 pub mod mapping;
 pub mod metrics;
 #[cfg(feature = "mount")]
@@ -21,11 +19,9 @@ pub mod readahead;
 pub mod worker_client;
 
 pub use block_reader::{BlockReadError, BlockReader, FileView};
-pub use bridge::{spawn_bridge, BridgeClient, BridgeError};
 pub use coordinator_client::{
     CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
 };
-pub use fs::TalonFs;
 pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
 pub use metrics::{ReadStats, ReadStatsSnapshot};
 #[cfg(feature = "mount")]
