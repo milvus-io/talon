@@ -15,9 +15,12 @@
 
 use std::sync::Arc;
 
-use talon_core::ObjectId;
+use talon_core::{ObjectId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
-use talon_transport::{encode_request, Flags, RangeRequest};
+use talon_transport::{
+    encode_delete, encode_put_header, encode_request, DeleteRequest, Flags, PutRequest,
+    RangeRequest,
+};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -146,6 +149,161 @@ impl WorkerClient {
     }
 }
 
+/// Data-plane client for **writing** and **deleting** objects on a worker.
+///
+/// The write analogue of [`WorkerClient`]: it streams a whole object to the
+/// owning worker over a [`MsgType::Put`] frame (a small `PutRequest` header, then
+/// the raw object bytes), or removes it with a [`MsgType::Delete`] frame. The
+/// worker writes through to the backend and replies with the committed
+/// [`Version`] (or an `ERROR`-flagged frame). Reuses the shared
+/// [`ConnectionPool`] like the read path (issue #181, #226/#230).
+#[derive(Debug, Clone)]
+pub struct WriteClient {
+    addr: String,
+    pool: Arc<ConnectionPool>,
+}
+
+impl WriteClient {
+    /// Create a client that dials `addr`, with its own pool.
+    pub fn new(addr: impl Into<String>) -> Self {
+        Self::with_pool(addr, Arc::new(ConnectionPool::new()))
+    }
+
+    /// Create a client that reuses connections from the shared `pool`.
+    pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
+        Self {
+            addr: addr.into(),
+            pool,
+        }
+    }
+
+    /// The worker address this client talks to.
+    pub fn addr(&self) -> &str {
+        &self.addr
+    }
+
+    /// Write the whole `object` through the worker to the backend.
+    ///
+    /// Sends a `Put` header naming the object + body length, then streams the
+    /// `body` bytes, and returns the backend-committed [`Version`]. A worker- or
+    /// backend-side failure surfaces as [`WorkerError::Remote`].
+    ///
+    /// Retries once on a *stale pooled* connection (the peer may have closed it
+    /// while idle): because a retry re-sends the full header+body on a fresh
+    /// connection, it is safe — the first attempt sent nothing the backend
+    /// committed (a mid-stream failure is not retried, it propagates).
+    pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
+        let header = encode_put_header(
+            0,
+            &PutRequest {
+                object: object.clone(),
+                body_len: body.len() as u64,
+            },
+        )?;
+        match self.put_exchange(&header, body).await {
+            Ok(version) => Ok(version),
+            Err((true, _stale)) => {
+                // Stale pooled connection: retry once on a fresh dial.
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                stream.write_all(&header).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                let version = read_version_reply(&mut stream).await?;
+                self.pool.release(&self.addr, stream);
+                Ok(version)
+            }
+            Err((false, err)) => Err(err),
+        }
+    }
+
+    /// One PUT exchange over a pooled-or-fresh connection; on error returns
+    /// `(was_reused, err)` so a stale pooled connection can be retried.
+    async fn put_exchange(
+        &self,
+        header: &[u8],
+        body: &[u8],
+    ) -> Result<Version, (bool, WorkerError)> {
+        let (mut stream, reused) = self
+            .pool
+            .checkout(&self.addr)
+            .await
+            .map_err(|e| (false, WorkerError::from(e)))?;
+        let result: Result<Version, WorkerError> = async {
+            stream.write_all(header).await?;
+            stream.write_all(body).await?;
+            stream.flush().await?;
+            read_version_reply(&mut stream).await
+        }
+        .await;
+        match result {
+            Ok(version) => {
+                self.pool.release(&self.addr, stream);
+                Ok(version)
+            }
+            Err(err) => Err((reused, err)),
+        }
+    }
+
+    /// Delete `object` at the worker (which deletes it at the backend).
+    pub async fn delete_object(&self, object: &ObjectId) -> Result<(), WorkerError> {
+        let frame = encode_delete(
+            0,
+            &DeleteRequest {
+                object: object.clone(),
+            },
+        )?;
+        match self.delete_exchange(&frame).await {
+            Ok(()) => Ok(()),
+            Err((true, _stale)) => {
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                stream.write_all(&frame).await?;
+                stream.flush().await?;
+                let _ = read_version_reply(&mut stream).await?;
+                self.pool.release(&self.addr, stream);
+                Ok(())
+            }
+            Err((false, err)) => Err(err),
+        }
+    }
+
+    async fn delete_exchange(&self, frame: &[u8]) -> Result<(), (bool, WorkerError)> {
+        let (mut stream, reused) = self
+            .pool
+            .checkout(&self.addr)
+            .await
+            .map_err(|e| (false, WorkerError::from(e)))?;
+        let result: Result<(), WorkerError> = async {
+            stream.write_all(frame).await?;
+            stream.flush().await?;
+            read_version_reply(&mut stream).await.map(|_| ())
+        }
+        .await;
+        match result {
+            Ok(()) => {
+                self.pool.release(&self.addr, stream);
+                Ok(())
+            }
+            Err(err) => Err((reused, err)),
+        }
+    }
+}
+
+/// Read a framed write/delete reply: OK carries the committed version bytes (a
+/// UTF-8 [`Version`]); an `ERROR`-flagged frame carries a message.
+async fn read_version_reply(stream: &mut TcpStream) -> Result<Version, WorkerError> {
+    let mut header_buf = [0u8; HEADER_LEN];
+    stream.read_exact(&mut header_buf).await?;
+    let header = FrameHeader::decode(&header_buf)?;
+    let mut body = vec![0u8; header.length as usize];
+    stream.read_exact(&mut body).await?;
+    if header.flags.contains(Flags::ERROR) {
+        return Err(WorkerError::Remote(
+            String::from_utf8_lossy(&body).into_owned(),
+        ));
+    }
+    Ok(Version::new(String::from_utf8_lossy(&body).into_owned()))
+}
+
 /// Read one framed data-plane reply: header, then exactly `length` bytes.
 ///
 /// If the header carries [`Flags::ERROR`], the body is a UTF-8 message and is
@@ -176,6 +334,9 @@ mod tests {
     fn object() -> ObjectId {
         ObjectId::new(Backend::Azure, "container", "path/to/blob.bin")
     }
+
+    /// What a mock write-worker records: the object and body it received.
+    type RecordedPut = Arc<std::sync::Mutex<Option<(ObjectId, Vec<u8>)>>>;
 
     /// Spawn a mock worker: reads one RangeRequest, then replies with the bytes
     /// produced by `respond(req)`.
@@ -357,6 +518,111 @@ mod tests {
     async fn connect_failure_is_io_error() {
         let client = WorkerClient::new("127.0.0.1:1");
         let err = client.fetch_range(&object(), 0, 16).await.unwrap_err();
+        assert!(matches!(err, WorkerError::Io(_)));
+    }
+
+    /// Spawn a mock write-worker: reads one Put header + its body, hands the
+    /// (object, body) to `on_put`, and replies OK with `version` bytes.
+    async fn mock_write_worker(version: &'static str, recorded: RecordedPut) -> String {
+        use talon_transport::decode_put_header;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            let mut hbody = vec![0u8; header.length as usize];
+            sock.read_exact(&mut hbody).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&hbody);
+            let (_h, req) = decode_put_header(&full).unwrap();
+            // Read the raw object body that follows the header.
+            let mut body = vec![0u8; req.body_len as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            *recorded.lock().unwrap() = Some((req.object.clone(), body));
+            let mut out = response_header_ok(0, version.len() as u32).to_vec();
+            out.extend_from_slice(version.as_bytes());
+            sock.write_all(&out).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        addr
+    }
+
+    #[tokio::test]
+    async fn put_object_sends_header_and_body_and_returns_version() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let addr = mock_write_worker("committed-v9", Arc::clone(&recorded)).await;
+        let client = WriteClient::new(addr);
+        let body = b"the whole object contents";
+        let version = client.put_object(&object(), body).await.unwrap();
+        assert_eq!(version, talon_core::Version::new("committed-v9"));
+        let (obj, got) = recorded.lock().unwrap().take().unwrap();
+        assert_eq!(obj, object());
+        assert_eq!(got, body, "worker received the exact object bytes");
+    }
+
+    #[tokio::test]
+    async fn put_object_error_frame_becomes_remote() {
+        use talon_transport::decode_put_header;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            let mut hbody = vec![0u8; header.length as usize];
+            sock.read_exact(&mut hbody).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&hbody);
+            let (_h, req) = decode_put_header(&full).unwrap();
+            let mut body = vec![0u8; req.body_len as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            sock.write_all(&encode_error(0, "backend PUT failed"))
+                .await
+                .unwrap();
+            sock.flush().await.unwrap();
+        });
+        let client = WriteClient::new(addr);
+        let err = client.put_object(&object(), b"x").await.unwrap_err();
+        match err {
+            WorkerError::Remote(m) => assert_eq!(m, "backend PUT failed"),
+            other => panic!("expected Remote, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_object_sends_delete_frame() {
+        use talon_transport::decode_delete;
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let rec = Arc::clone(&recorded);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            let mut hbody = vec![0u8; header.length as usize];
+            sock.read_exact(&mut hbody).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&hbody);
+            let (_h, req) = decode_delete(&full).unwrap();
+            *rec.lock().unwrap() = Some(req.object);
+            let out = response_header_ok(0, 0).to_vec();
+            sock.write_all(&out).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+        let client = WriteClient::new(addr);
+        client.delete_object(&object()).await.unwrap();
+        assert_eq!(recorded.lock().unwrap().take().unwrap(), object());
+    }
+
+    #[tokio::test]
+    async fn put_connect_failure_is_io_error() {
+        let client = WriteClient::new("127.0.0.1:1");
+        let err = client.put_object(&object(), b"x").await.unwrap_err();
         assert!(matches!(err, WorkerError::Io(_)));
     }
 }

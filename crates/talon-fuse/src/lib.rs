@@ -32,4 +32,4 @@ pub use pool::ConnectionPool;
 pub use prefetch::Prefetcher;
 pub use read_plan::{plan_read, BlockSegment};
 pub use readahead::{ReadaheadConfig, ReadaheadState};
-pub use worker_client::{WorkerClient, WorkerError};
+pub use worker_client::{WorkerClient, WorkerError, WriteClient};
