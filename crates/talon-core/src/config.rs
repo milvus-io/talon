@@ -89,6 +89,20 @@ pub struct WorkerConfig {
     /// **not** stored here — it is read from the environment at use time (see
     /// [`azure_sas_from_env`]) so a secret never lands in a config struct or log.
     pub azure_account: Option<String>,
+    /// Optional Azure endpoint host (`host` or `host:port`) overriding the public
+    /// cloud `{account}.blob.core.windows.net`. Set to target an emulator
+    /// (Azurite) or a latency proxy; enables path-style addressing. A value with
+    /// an `http://` scheme selects plaintext; `https://` or a bare host keeps TLS.
+    pub azure_endpoint: Option<String>,
+    /// Optional synthetic backend latency knobs for the test/latency lab. All
+    /// default to `None` (no injected latency); set any to wrap the backend HTTP
+    /// client in a delay decorator.
+    pub backend_delay_ms: Option<u64>,
+    /// Upper bound of uniform per-request jitter (ms) added on top of the base
+    /// delay. Requires the delay decorator (any latency knob set).
+    pub backend_jitter_ms: Option<u64>,
+    /// Optional bandwidth ceiling (bytes/second) modeled by the delay decorator.
+    pub backend_throughput_bytes: Option<u64>,
 }
 
 /// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
@@ -116,6 +130,10 @@ impl Default for WorkerConfig {
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
             azure_account: None,
+            azure_endpoint: None,
+            backend_delay_ms: None,
+            backend_jitter_ms: None,
+            backend_throughput_bytes: None,
         }
     }
 }
@@ -149,6 +167,14 @@ pub struct WorkerConfigPatch {
     pub capacity_bytes: Option<u64>,
     /// Override for [`WorkerConfig::azure_account`].
     pub azure_account: Option<String>,
+    /// Override for [`WorkerConfig::azure_endpoint`].
+    pub azure_endpoint: Option<String>,
+    /// Override for [`WorkerConfig::backend_delay_ms`].
+    pub backend_delay_ms: Option<u64>,
+    /// Override for [`WorkerConfig::backend_jitter_ms`].
+    pub backend_jitter_ms: Option<u64>,
+    /// Override for [`WorkerConfig::backend_throughput_bytes`].
+    pub backend_throughput_bytes: Option<u64>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -165,6 +191,12 @@ impl Patch for WorkerConfigPatch {
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
             azure_account: self.azure_account.or(base.azure_account),
+            azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
+            backend_delay_ms: self.backend_delay_ms.or(base.backend_delay_ms),
+            backend_jitter_ms: self.backend_jitter_ms.or(base.backend_jitter_ms),
+            backend_throughput_bytes: self
+                .backend_throughput_bytes
+                .or(base.backend_throughput_bytes),
         }
     }
 }
@@ -262,6 +294,38 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Azure blob storage account name (required to serve data).",
     },
     ConfigVar {
+        env: "TALON_WORKER_AZURE_ENDPOINT",
+        key: "azure_endpoint",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Azure endpoint host override (emulator/proxy); enables path-style addressing.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_DELAY_MS",
+        key: "backend_delay_ms",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Synthetic base backend latency in ms (test/latency lab).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_JITTER_MS",
+        key: "backend_jitter_ms",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Synthetic per-request latency jitter upper bound in ms (test/latency lab).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_THROUGHPUT_BYTES",
+        key: "backend_throughput_bytes",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).",
+    },
+    ConfigVar {
         env: "TALON_WORKER_AZURE_SAS",
         key: "(env only)",
         default: None,
@@ -283,6 +347,10 @@ pub(crate) mod worker_env {
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
+    pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
+    pub const BACKEND_DELAY_MS: &str = "TALON_WORKER_BACKEND_DELAY_MS";
+    pub const BACKEND_JITTER_MS: &str = "TALON_WORKER_BACKEND_JITTER_MS";
+    pub const BACKEND_THROUGHPUT_BYTES: &str = "TALON_WORKER_BACKEND_THROUGHPUT_BYTES";
     pub const AZURE_SAS: &str = "TALON_WORKER_AZURE_SAS";
 }
 
@@ -343,6 +411,16 @@ impl WorkerConfigPatch {
                 .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
                 .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
+            azure_endpoint: get(worker_env::AZURE_ENDPOINT),
+            backend_delay_ms: get(worker_env::BACKEND_DELAY_MS)
+                .map(|v| parse_u64(v, worker_env::BACKEND_DELAY_MS))
+                .transpose()?,
+            backend_jitter_ms: get(worker_env::BACKEND_JITTER_MS)
+                .map(|v| parse_u64(v, worker_env::BACKEND_JITTER_MS))
+                .transpose()?,
+            backend_throughput_bytes: get(worker_env::BACKEND_THROUGHPUT_BYTES)
+                .map(|v| parse_u64(v, worker_env::BACKEND_THROUGHPUT_BYTES))
+                .transpose()?,
         })
     }
 }
@@ -378,6 +456,12 @@ impl WorkerConfig {
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
             azure_account: merged.azure_account.or(d.azure_account),
+            azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
+            backend_delay_ms: merged.backend_delay_ms.or(d.backend_delay_ms),
+            backend_jitter_ms: merged.backend_jitter_ms.or(d.backend_jitter_ms),
+            backend_throughput_bytes: merged
+                .backend_throughput_bytes
+                .or(d.backend_throughput_bytes),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -762,6 +846,10 @@ mod tests {
             "TALON_WORKER_CACHE_DIRS" => Some("/x:/y:/z".to_string()),
             "TALON_WORKER_ADMIN_LISTEN" => Some("0.0.0.0:9001".to_string()),
             "TALON_WORKER_HEARTBEAT_INTERVAL_MS" => Some("2500".to_string()),
+            "TALON_WORKER_AZURE_ENDPOINT" => Some("http://toxiproxy:10000".to_string()),
+            "TALON_WORKER_BACKEND_DELAY_MS" => Some("300".to_string()),
+            "TALON_WORKER_BACKEND_JITTER_MS" => Some("50".to_string()),
+            "TALON_WORKER_BACKEND_THROUGHPUT_BYTES" => Some("1048576".to_string()),
             _ => None,
         };
         let patch = WorkerConfigPatch::from_env_with(map).unwrap();
@@ -769,10 +857,22 @@ mod tests {
         assert_eq!(patch.cache_dirs.as_ref().unwrap().len(), 3);
         assert_eq!(patch.admin_listen.as_deref(), Some("0.0.0.0:9001"));
         assert_eq!(patch.heartbeat_interval_ms, Some(2_500));
+        assert_eq!(
+            patch.azure_endpoint.as_deref(),
+            Some("http://toxiproxy:10000")
+        );
+        assert_eq!(patch.backend_delay_ms, Some(300));
+        assert_eq!(patch.backend_jitter_ms, Some(50));
+        assert_eq!(patch.backend_throughput_bytes, Some(1 << 20));
         assert!(patch.listen.is_none());
 
         let bad = |k: &str| (k == "TALON_WORKER_BLOCK_SIZE").then(|| "notanum".to_string());
         assert!(WorkerConfigPatch::from_env_with(bad).is_err());
+
+        // A non-numeric latency knob is a hard error, not silently ignored.
+        let bad_delay =
+            |k: &str| (k == "TALON_WORKER_BACKEND_DELAY_MS").then(|| "soon".to_string());
+        assert!(WorkerConfigPatch::from_env_with(bad_delay).is_err());
     }
 
     #[test]

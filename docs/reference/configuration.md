@@ -266,6 +266,38 @@ Azure blob storage account name (required to serve data).
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `azure_endpoint`
+
+Azure endpoint host override (emulator/proxy); enables path-style addressing.
+
+- **Environment variable:** `TALON_WORKER_AZURE_ENDPOINT`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_delay_ms`
+
+Synthetic base backend latency in ms (test/latency lab).
+
+- **Environment variable:** `TALON_WORKER_BACKEND_DELAY_MS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_jitter_ms`
+
+Synthetic per-request latency jitter upper bound in ms (test/latency lab).
+
+- **Environment variable:** `TALON_WORKER_BACKEND_JITTER_MS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_throughput_bytes`
+
+Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).
+
+- **Environment variable:** `TALON_WORKER_BACKEND_THROUGHPUT_BYTES`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `(env only)` 🔒
 
 Azure SAS token; env-only, never from a config file or logged.

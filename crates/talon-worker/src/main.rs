@@ -94,6 +94,10 @@ impl Args {
             cache_dirs: None,
             capacity_bytes: None,
             azure_account: None,
+            azure_endpoint: None,
+            backend_delay_ms: None,
+            backend_jitter_ms: None,
+            backend_throughput_bytes: None,
         }
     }
 }
@@ -126,6 +130,7 @@ async fn main() -> anyhow::Result<()> {
         cache_dirs = ?cfg.cache_dirs,
         capacity_bytes = cfg.capacity_bytes,
         azure_account = ?cfg.azure_account,
+        azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
     );
 
@@ -135,12 +140,57 @@ async fn main() -> anyhow::Result<()> {
     })?;
     let sas = azure_sas_from_env()
         .ok_or_else(|| anyhow::anyhow!("TALON_WORKER_AZURE_SAS must be set (SAS token)"))?;
-    let http = Arc::new(ReqwestClient::new());
-    let backend: Arc<dyn BackendStore> = Arc::new(AzureBackend::new(
-        AzureConfig::new(account),
-        Some(sas),
-        http,
-    ));
+
+    // Endpoint override: point at an emulator (Azurite) or a latency proxy. An
+    // `http://` scheme selects plaintext + path-style; `https://` or a bare host
+    // keeps TLS. Default (unset) is the public-cloud virtual-host endpoint.
+    let azure_config = match cfg.azure_endpoint.clone() {
+        Some(endpoint) => {
+            let (host, tls) = match endpoint.strip_prefix("http://") {
+                Some(rest) => (rest.to_string(), false),
+                None => (
+                    endpoint
+                        .strip_prefix("https://")
+                        .unwrap_or(&endpoint)
+                        .to_string(),
+                    true,
+                ),
+            };
+            AzureConfig::emulator(account, host, tls)
+        }
+        None => AzureConfig::new(account),
+    };
+
+    // Optionally wrap the networked client in a latency decorator (test/latency
+    // lab). Inert unless a delay/jitter/throughput knob is set.
+    let http: Arc<dyn talon_backend::http::HttpClient> = {
+        let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(ReqwestClient::new());
+        let delay = talon_backend::DelayConfig {
+            base: Duration::from_millis(cfg.backend_delay_ms.unwrap_or(0)),
+            jitter: Duration::from_millis(cfg.backend_jitter_ms.unwrap_or(0)),
+            throughput_bytes_per_sec: cfg.backend_throughput_bytes.filter(|&b| b > 0),
+        };
+        if delay.is_active() {
+            tracing::info!(
+                base_ms = cfg.backend_delay_ms.unwrap_or(0),
+                jitter_ms = cfg.backend_jitter_ms.unwrap_or(0),
+                throughput_bytes = ?cfg.backend_throughput_bytes,
+                "synthetic backend latency enabled"
+            );
+            // Seed from the node identity so each worker's jitter is distinct yet
+            // reproducible across restarts.
+            let seed = cfg
+                .node_id
+                .as_deref()
+                .unwrap_or(&cfg.advertise_addr)
+                .bytes()
+                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+            Arc::new(talon_backend::DelayingHttpClient::new(base, delay, seed))
+        } else {
+            base
+        }
+    };
+    let backend: Arc<dyn BackendStore> = Arc::new(AzureBackend::new(azure_config, Some(sas), http));
 
     // Local store stack rooted at the first cache dir.
     let root = cfg
