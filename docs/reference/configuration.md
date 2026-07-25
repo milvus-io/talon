@@ -258,6 +258,14 @@ Worker cache capacity (bytes).
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `backend`
+
+Object-store backend: azure (default), s3, or gcs.
+
+- **Environment variable:** `TALON_WORKER_BACKEND`
+- **Default:** `azure`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `azure_account`
 
 Azure blob storage account name (required to serve data).
@@ -305,6 +313,73 @@ io_uring rings for the data plane; 0 = one per core, unset = Tokio path.
 - **Environment variable:** `TALON_WORKER_DATA_PLANE_RINGS`
 - **Default:** none
 - **CLI flag:** `--data_plane_rings`
+
+### `s3_region`
+
+S3 region (required when backend=s3).
+
+- **Environment variable:** `TALON_WORKER_S3_REGION`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `s3_endpoint`
+
+S3 endpoint host override (MinIO/LocalStack); http:// selects plaintext.
+
+- **Environment variable:** `TALON_WORKER_S3_ENDPOINT`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `s3_access_key_id`
+
+S3 access key id (the secret key is env-only).
+
+- **Environment variable:** `TALON_WORKER_S3_ACCESS_KEY_ID`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `s3_path_style`
+
+S3 path-style addressing (true for most S3-compatible emulators).
+
+- **Environment variable:** `TALON_WORKER_S3_PATH_STYLE`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `gcs_endpoint`
+
+GCS endpoint host override (fake-gcs-server); http:// selects plaintext.
+
+- **Environment variable:** `TALON_WORKER_GCS_ENDPOINT`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `(env only)` 🔒
+
+S3 secret access key; env-only, never from a config file or logged.
+
+- **Environment variable:** `TALON_WORKER_S3_SECRET_ACCESS_KEY`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `(env only)` 🔒
+
+S3 STS session token; env-only, never from a config file or logged.
+
+- **Environment variable:** `TALON_WORKER_S3_SESSION_TOKEN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `(env only)` 🔒
+
+GCS OAuth2 bearer token; env-only, never from a config file or logged.
+
+- **Environment variable:** `TALON_WORKER_GCS_BEARER_TOKEN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
 
 ### `(env only)` 🔒
 

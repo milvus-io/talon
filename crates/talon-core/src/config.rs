@@ -83,6 +83,9 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
+    /// per-backend endpoint/credential fields below apply to the selected one.
+    pub backend: Option<String>,
     /// Azure Blob storage account for the backend origin (`None` if unset).
     ///
     /// The container is taken per-object from the request path; the SAS token is
@@ -103,6 +106,20 @@ pub struct WorkerConfig {
     pub backend_jitter_ms: Option<u64>,
     /// Optional bandwidth ceiling (bytes/second) modeled by the delay decorator.
     pub backend_throughput_bytes: Option<u64>,
+    /// S3 region (e.g. `us-east-1`). Required when `backend = s3`.
+    pub s3_region: Option<String>,
+    /// S3 endpoint host override (e.g. a MinIO/LocalStack host). Defaults to the
+    /// AWS regional endpoint. A value with an `http://` scheme selects plaintext.
+    pub s3_endpoint: Option<String>,
+    /// S3 access key id (not secret; the secret key is env-only, see
+    /// [`s3_secret_key_from_env`]).
+    pub s3_access_key_id: Option<String>,
+    /// Use S3 path-style addressing (`endpoint/bucket/key`). Required by most
+    /// S3-compatible emulators (LocalStack, MinIO).
+    pub s3_path_style: Option<bool>,
+    /// GCS endpoint host override (e.g. a fake-gcs-server host). Defaults to
+    /// `storage.googleapis.com`. A value with an `http://` scheme is plaintext.
+    pub gcs_endpoint: Option<String>,
     /// Number of io_uring rings serving the data plane, or `None` for the
     /// portable Tokio path.
     ///
@@ -125,6 +142,31 @@ pub fn azure_sas_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// Read the S3 secret access key from the environment
+/// (`TALON_WORKER_S3_SECRET_ACCESS_KEY`). Kept out of [`WorkerConfig`] so the
+/// secret is never serialized or logged.
+pub fn s3_secret_key_from_env() -> Option<String> {
+    std::env::var(worker_env::S3_SECRET_ACCESS_KEY)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the S3 session token from the environment
+/// (`TALON_WORKER_S3_SESSION_TOKEN`), for STS credentials. Env-only.
+pub fn s3_session_token_from_env() -> Option<String> {
+    std::env::var(worker_env::S3_SESSION_TOKEN)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the GCS OAuth2 bearer token from the environment
+/// (`TALON_WORKER_GCS_BEARER_TOKEN`). Env-only; never serialized or logged.
+pub fn gcs_bearer_from_env() -> Option<String> {
+    std::env::var(worker_env::GCS_BEARER_TOKEN)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
         Self {
@@ -138,11 +180,17 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            backend: None,
             azure_account: None,
             azure_endpoint: None,
             backend_delay_ms: None,
             backend_jitter_ms: None,
             backend_throughput_bytes: None,
+            s3_region: None,
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_path_style: None,
+            gcs_endpoint: None,
             data_plane_rings: None,
         }
     }
@@ -175,6 +223,8 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::backend`].
+    pub backend: Option<String>,
     /// Override for [`WorkerConfig::azure_account`].
     pub azure_account: Option<String>,
     /// Override for [`WorkerConfig::azure_endpoint`].
@@ -185,6 +235,16 @@ pub struct WorkerConfigPatch {
     pub backend_jitter_ms: Option<u64>,
     /// Override for [`WorkerConfig::backend_throughput_bytes`].
     pub backend_throughput_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::s3_region`].
+    pub s3_region: Option<String>,
+    /// Override for [`WorkerConfig::s3_endpoint`].
+    pub s3_endpoint: Option<String>,
+    /// Override for [`WorkerConfig::s3_access_key_id`].
+    pub s3_access_key_id: Option<String>,
+    /// Override for [`WorkerConfig::s3_path_style`].
+    pub s3_path_style: Option<bool>,
+    /// Override for [`WorkerConfig::gcs_endpoint`].
+    pub gcs_endpoint: Option<String>,
     /// Override for [`WorkerConfig::data_plane_rings`].
     pub data_plane_rings: Option<usize>,
 }
@@ -202,6 +262,7 @@ impl Patch for WorkerConfigPatch {
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
             backend_delay_ms: self.backend_delay_ms.or(base.backend_delay_ms),
@@ -209,6 +270,11 @@ impl Patch for WorkerConfigPatch {
             backend_throughput_bytes: self
                 .backend_throughput_bytes
                 .or(base.backend_throughput_bytes),
+            s3_region: self.s3_region.or(base.s3_region),
+            s3_endpoint: self.s3_endpoint.or(base.s3_endpoint),
+            s3_access_key_id: self.s3_access_key_id.or(base.s3_access_key_id),
+            s3_path_style: self.s3_path_style.or(base.s3_path_style),
+            gcs_endpoint: self.gcs_endpoint.or(base.gcs_endpoint),
             data_plane_rings: self.data_plane_rings.or(base.data_plane_rings),
         }
     }
@@ -299,6 +365,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Worker cache capacity (bytes).",
     },
     ConfigVar {
+        env: "TALON_WORKER_BACKEND",
+        key: "backend",
+        default: Some("azure"),
+        cli: false,
+        secret: false,
+        help: "Object-store backend: azure (default), s3, or gcs.",
+    },
+    ConfigVar {
         env: "TALON_WORKER_AZURE_ACCOUNT",
         key: "azure_account",
         default: None,
@@ -347,6 +421,70 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "io_uring rings for the data plane; 0 = one per core, unset = Tokio path.",
     },
     ConfigVar {
+        env: "TALON_WORKER_S3_REGION",
+        key: "s3_region",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "S3 region (required when backend=s3).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_S3_ENDPOINT",
+        key: "s3_endpoint",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "S3 endpoint host override (MinIO/LocalStack); http:// selects plaintext.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_S3_ACCESS_KEY_ID",
+        key: "s3_access_key_id",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "S3 access key id (the secret key is env-only).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_S3_PATH_STYLE",
+        key: "s3_path_style",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "S3 path-style addressing (true for most S3-compatible emulators).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_GCS_ENDPOINT",
+        key: "gcs_endpoint",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "GCS endpoint host override (fake-gcs-server); http:// selects plaintext.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_S3_SECRET_ACCESS_KEY",
+        key: "(env only)",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "S3 secret access key; env-only, never from a config file or logged.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_S3_SESSION_TOKEN",
+        key: "(env only)",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "S3 STS session token; env-only, never from a config file or logged.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_GCS_BEARER_TOKEN",
+        key: "(env only)",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "GCS OAuth2 bearer token; env-only, never from a config file or logged.",
+    },
+    ConfigVar {
         env: "TALON_WORKER_AZURE_SAS",
         key: "(env only)",
         default: None,
@@ -367,12 +505,21 @@ pub(crate) mod worker_env {
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
+    pub const BACKEND: &str = "TALON_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
     pub const BACKEND_DELAY_MS: &str = "TALON_WORKER_BACKEND_DELAY_MS";
     pub const BACKEND_JITTER_MS: &str = "TALON_WORKER_BACKEND_JITTER_MS";
     pub const BACKEND_THROUGHPUT_BYTES: &str = "TALON_WORKER_BACKEND_THROUGHPUT_BYTES";
     pub const DATA_PLANE_RINGS: &str = "TALON_WORKER_DATA_PLANE_RINGS";
+    pub const S3_REGION: &str = "TALON_WORKER_S3_REGION";
+    pub const S3_ENDPOINT: &str = "TALON_WORKER_S3_ENDPOINT";
+    pub const S3_ACCESS_KEY_ID: &str = "TALON_WORKER_S3_ACCESS_KEY_ID";
+    pub const S3_PATH_STYLE: &str = "TALON_WORKER_S3_PATH_STYLE";
+    pub const S3_SECRET_ACCESS_KEY: &str = "TALON_WORKER_S3_SECRET_ACCESS_KEY";
+    pub const S3_SESSION_TOKEN: &str = "TALON_WORKER_S3_SESSION_TOKEN";
+    pub const GCS_ENDPOINT: &str = "TALON_WORKER_GCS_ENDPOINT";
+    pub const GCS_BEARER_TOKEN: &str = "TALON_WORKER_GCS_BEARER_TOKEN";
     pub const AZURE_SAS: &str = "TALON_WORKER_AZURE_SAS";
 }
 
@@ -418,6 +565,11 @@ impl WorkerConfigPatch {
             v.parse::<usize>()
                 .map_err(|_| Error::Other(format!("{k}: invalid usize: {v:?}")))
         };
+        let parse_bool = |v: String, k: &str| match v.to_ascii_lowercase().as_str() {
+            "true" | "1" | "yes" => Ok(true),
+            "false" | "0" | "no" => Ok(false),
+            _ => Err(Error::Other(format!("{k}: invalid bool: {v:?}"))),
+        };
         Ok(Self {
             listen: get(worker_env::LISTEN),
             advertise_addr: get(worker_env::ADVERTISE_ADDR),
@@ -438,6 +590,14 @@ impl WorkerConfigPatch {
                 .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
+            backend: get(worker_env::BACKEND),
+            s3_region: get(worker_env::S3_REGION),
+            s3_endpoint: get(worker_env::S3_ENDPOINT),
+            s3_access_key_id: get(worker_env::S3_ACCESS_KEY_ID),
+            s3_path_style: get(worker_env::S3_PATH_STYLE)
+                .map(|v| parse_bool(v, worker_env::S3_PATH_STYLE))
+                .transpose()?,
+            gcs_endpoint: get(worker_env::GCS_ENDPOINT),
             backend_delay_ms: get(worker_env::BACKEND_DELAY_MS)
                 .map(|v| parse_u64(v, worker_env::BACKEND_DELAY_MS))
                 .transpose()?,
@@ -486,6 +646,12 @@ impl WorkerConfig {
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
+            backend: merged.backend.or(d.backend),
+            s3_region: merged.s3_region.or(d.s3_region),
+            s3_endpoint: merged.s3_endpoint.or(d.s3_endpoint),
+            s3_access_key_id: merged.s3_access_key_id.or(d.s3_access_key_id),
+            s3_path_style: merged.s3_path_style.or(d.s3_path_style),
+            gcs_endpoint: merged.gcs_endpoint.or(d.gcs_endpoint),
             backend_delay_ms: merged.backend_delay_ms.or(d.backend_delay_ms),
             backend_jitter_ms: merged.backend_jitter_ms.or(d.backend_jitter_ms),
             backend_throughput_bytes: merged
@@ -880,6 +1046,10 @@ mod tests {
             "TALON_WORKER_BACKEND_DELAY_MS" => Some("300".to_string()),
             "TALON_WORKER_BACKEND_JITTER_MS" => Some("50".to_string()),
             "TALON_WORKER_BACKEND_THROUGHPUT_BYTES" => Some("1048576".to_string()),
+            "TALON_WORKER_BACKEND" => Some("s3".to_string()),
+            "TALON_WORKER_S3_REGION" => Some("us-east-1".to_string()),
+            "TALON_WORKER_S3_PATH_STYLE" => Some("true".to_string()),
+            "TALON_WORKER_GCS_ENDPOINT" => Some("http://fake-gcs:4443".to_string()),
             _ => None,
         };
         let patch = WorkerConfigPatch::from_env_with(map).unwrap();
@@ -894,6 +1064,10 @@ mod tests {
         assert_eq!(patch.backend_delay_ms, Some(300));
         assert_eq!(patch.backend_jitter_ms, Some(50));
         assert_eq!(patch.backend_throughput_bytes, Some(1 << 20));
+        assert_eq!(patch.backend.as_deref(), Some("s3"));
+        assert_eq!(patch.s3_region.as_deref(), Some("us-east-1"));
+        assert_eq!(patch.s3_path_style, Some(true));
+        assert_eq!(patch.gcs_endpoint.as_deref(), Some("http://fake-gcs:4443"));
         assert!(patch.listen.is_none());
 
         let bad = |k: &str| (k == "TALON_WORKER_BLOCK_SIZE").then(|| "notanum".to_string());
@@ -903,6 +1077,10 @@ mod tests {
         let bad_delay =
             |k: &str| (k == "TALON_WORKER_BACKEND_DELAY_MS").then(|| "soon".to_string());
         assert!(WorkerConfigPatch::from_env_with(bad_delay).is_err());
+
+        // An unparseable bool for s3_path_style is a hard error too.
+        let bad_bool = |k: &str| (k == "TALON_WORKER_S3_PATH_STYLE").then(|| "maybe".to_string());
+        assert!(WorkerConfigPatch::from_env_with(bad_bool).is_err());
     }
 
     #[test]
