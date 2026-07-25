@@ -1,41 +1,26 @@
 //! S3 backend end-to-end test against a real S3-compatible emulator (LocalStack).
 //!
-//! Unlike the offline unit tests (which inject a mock `HttpClient`), this drives
-//! the real [`S3Backend`] over [`ReqwestClient`] against a live endpoint: it
-//! exercises **AWS SigV4 request signing** (#264) and the path-style endpoint
-//! wiring end to end, reading bytes an object actually contains.
+//! Builds the real [`S3Backend`] over [`ReqwestClient`] against a live endpoint
+//! (exercising AWS SigV4 signing #264 + path-style wiring) and runs the shared
+//! backend-conformance suite against it, so S3 is held to the same contract as
+//! GCS and Azure.
 //!
-//! The test is **skipped** unless `TALON_S3_TEST_ENDPOINT` points at a reachable
-//! S3 endpoint (e.g. `http://127.0.0.1:4566` for LocalStack). CI launches
-//! LocalStack, creates a bucket, uploads a known object, and sets the env vars;
-//! locally you can do the same with the AWS CLI against LocalStack.
-//!
-//! Required env:
-//!   TALON_S3_TEST_ENDPOINT     e.g. http://127.0.0.1:4566
-//!   TALON_S3_TEST_BUCKET       bucket that already contains the object
-//!   TALON_S3_TEST_KEY          object key (defaults to "e2e/object.bin")
-//!   AWS_ACCESS_KEY_ID          credentials the emulator accepts (test/test)
-//!   AWS_SECRET_ACCESS_KEY
-//!   TALON_S3_TEST_REGION       defaults to us-east-1
-//!
-//! The uploaded object is expected to be 4096 bytes where byte i == (i % 251).
+//! Skipped unless `TALON_S3_TEST_ENDPOINT` is set. See CI's `s3-e2e` job for the
+//! required env and the seeded object (4096 bytes, byte i == i % 251).
+
+mod conformance;
 
 use std::sync::Arc;
 
 use talon_backend::{ReqwestClient, S3Backend, S3Config, S3Credentials};
-use talon_core::{Backend, BackendStore, ObjectId};
-
-/// Deterministic content byte for absolute offset `i` — matches what CI uploads.
-fn content_byte(i: u64) -> u8 {
-    (i % 251) as u8
-}
+use talon_core::{Backend, ObjectId};
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|s| !s.is_empty())
 }
 
 #[tokio::test]
-async fn s3_backend_reads_real_object_end_to_end() {
+async fn s3_backend_conformance_end_to_end() {
     let Some(endpoint) = env("TALON_S3_TEST_ENDPOINT") else {
         eprintln!("skipping S3 e2e: TALON_S3_TEST_ENDPOINT is not set");
         return;
@@ -47,7 +32,6 @@ async fn s3_backend_reads_real_object_end_to_end() {
     let secret_access_key =
         env("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
 
-    // Point at the emulator: http:// selects plaintext, path-style for LocalStack.
     let host = endpoint
         .strip_prefix("http://")
         .or_else(|| endpoint.strip_prefix("https://"))
@@ -65,26 +49,13 @@ async fn s3_backend_reads_real_object_end_to_end() {
         secret_access_key,
         session_token: None,
     };
-    let backend = S3Backend::new(config, creds, Arc::new(ReqwestClient::new()));
+    let backend = Arc::new(S3Backend::new(
+        config,
+        creds,
+        Arc::new(ReqwestClient::new()),
+    ));
 
-    let obj = ObjectId::new(Backend::S3, bucket, key);
-
-    // HEAD resolves size + ETag (the version). SigV4 must sign this correctly.
-    let stat = backend.head(&obj).await.expect("HEAD should succeed");
-    assert_eq!(stat.len, 4096, "unexpected object size");
-    assert!(!stat.version.as_str().is_empty(), "HEAD returned no ETag");
-
-    // A ranged GET in the middle of the object returns exactly those bytes.
-    let got = backend
-        .fetch_range(&obj, 1000, 256)
-        .await
-        .expect("ranged GET should succeed");
-    assert_eq!(got.len(), 256, "unexpected range length");
-    let expected: Vec<u8> = (1000..1256).map(content_byte).collect();
-    assert_eq!(&got[..], &expected[..], "range bytes mismatch");
-
-    // A read of the first bytes too, to cover offset 0.
-    let head_bytes = backend.fetch_range(&obj, 0, 16).await.expect("GET head");
-    let expected_head: Vec<u8> = (0..16).map(content_byte).collect();
-    assert_eq!(&head_bytes[..], &expected_head[..]);
+    let present = ObjectId::new(Backend::S3, bucket.clone(), key);
+    let missing = ObjectId::new(Backend::S3, bucket, "e2e/does-not-exist.bin");
+    conformance::run(backend, &present, &missing, true).await;
 }
