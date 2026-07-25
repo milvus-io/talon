@@ -336,6 +336,49 @@ async fn handle_delete(
     Ok(())
 }
 
+/// Adapts [`handle_conn`] to the ring runtime's [`RingHandler`] trait.
+///
+/// Carries the shared worker state and enforces the same connection cap as the
+/// Tokio path (#111). The cap is **per ring**, not global: each ring owns an
+/// independent semaphore, so N rings admit `N * max_connections` in total.
+/// Callers should divide the global budget by the ring count.
+#[derive(Clone)]
+pub struct RingConnHandler {
+    worker: Arc<WorkerRuntime>,
+    observability: Arc<WorkerObservability>,
+    limit: Arc<tokio::sync::Semaphore>,
+}
+
+impl RingConnHandler {
+    /// Build a handler admitting at most `max_connections` concurrent
+    /// connections on the ring that owns it.
+    pub fn new(
+        worker: Arc<WorkerRuntime>,
+        observability: Arc<WorkerObservability>,
+        max_connections: usize,
+    ) -> Self {
+        Self {
+            worker,
+            observability,
+            limit: Arc::new(tokio::sync::Semaphore::new(max_connections)),
+        }
+    }
+}
+
+impl crate::uring_serve::RingHandler for RingConnHandler {
+    async fn handle(&self, stream: TcpStream) -> anyhow::Result<()> {
+        // Acquire before serving and hold for the connection's lifetime, so a
+        // flood of idle peers cannot exhaust memory or file descriptors.
+        let _permit = self.limit.clone().acquire_owned().await?;
+        handle_conn(
+            stream,
+            Arc::clone(&self.worker),
+            Arc::clone(&self.observability),
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +803,63 @@ mod tests {
             drop(c);
             assert!(served.await.is_ok());
         });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The RingConnHandler admits up to its cap and serves real traffic through
+    /// the ring runtime — the wiring main.rs uses.
+    #[test]
+    fn ring_handler_serves_through_the_ring_runtime() {
+        use crate::uring_serve::serve;
+        let root = tmp_root("ringwire");
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        let (worker, obs) = {
+            let _g = tokio_rt.enter();
+            build(&root, Arc::new(RampBackend), 16)
+        };
+
+        // Reserve then release a port so the rings can SO_REUSEPORT bind it.
+        let probe = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = probe.local_addr().unwrap().to_string();
+        drop(probe);
+
+        let handler = RingConnHandler::new(worker, obs, 8);
+        let handle = tokio_rt.handle().clone();
+        let serve_addr = addr.clone();
+        std::thread::spawn(move || {
+            let _ = serve(serve_addr, 2, 2, handler, handle);
+        });
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while std::net::TcpStream::connect(&addr).is_err() {
+            assert!(std::time::Instant::now() < deadline, "rings never bound");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        // Drive a real request/response with a plain std client, proving a
+        // Tokio-side client interoperates with the ring data plane unchanged.
+        use std::io::{Read, Write};
+        let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+        let req = RangeRequest {
+            object: obj,
+            offset: 3,
+            len: 8,
+        };
+        let expected: Vec<u8> = (0..8u64).map(|i| ((3 + i) % 251) as u8).collect();
+        let mut c = std::net::TcpStream::connect(&addr).unwrap();
+        c.write_all(&encode_request(0, &req).unwrap()).unwrap();
+        let mut hdr = [0u8; HEADER_LEN];
+        c.read_exact(&mut hdr).unwrap();
+        let header = FrameHeader::decode(&hdr).unwrap();
+        assert!(!header.flags.contains(Flags::ERROR));
+        let mut body = vec![0u8; header.length as usize];
+        c.read_exact(&mut body).unwrap();
+        assert_eq!(body, expected);
+
         std::fs::remove_dir_all(root).ok();
     }
 }

@@ -33,6 +33,7 @@ use talon_core::{
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
+use talon_worker::uring_conn;
 use talon_worker::{
     send_file_range, serve_admin, BlockIndex, InFlightLoads, ServeOutcome, WholeBlockStore,
     WorkerObservability, WorkerRuntime, DEFAULT_CHUNK,
@@ -46,6 +47,11 @@ const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 /// for an in-flight connection to finish rather than each spawning an unbounded
 /// task that could pin a payload buffer (issue #111).
 const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
+
+/// Blocking helper threads per io_uring ring, for the zero-copy `sendfile`
+/// path. Kept small because every ring has its own pool and the rings are
+/// pinned: a large pool per ring would oversubscribe the cores they sit on.
+const URING_BLOCKING_THREADS_PER_RING: usize = 4;
 
 /// Command-line arguments for a Talon worker.
 #[derive(Debug, Parser)]
@@ -279,7 +285,42 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
-    // Serve the data plane.
+    // Serve the data plane, on io_uring rings if configured (#285) or on the
+    // portable Tokio path otherwise.
+    if let Some(configured) = cfg.data_plane_rings {
+        let rings = talon_worker::uring_serve::resolve_ring_count(configured);
+        tracing::info!(
+            listen = %cfg.listen,
+            rings,
+            "worker serving data plane on io_uring rings"
+        );
+        // `serve` blocks until the ring threads exit, and it must run off the
+        // Tokio worker threads it is handing out — so drive it on a dedicated
+        // thread and park this task on the join.
+        let addr = cfg.listen.clone();
+        // The cap is per ring, so divide the global budget across them; the
+        // total admitted stays MAX_DATA_PLANE_CONNECTIONS regardless of how many
+        // rings are configured (#111).
+        let per_ring_connections = MAX_DATA_PLANE_CONNECTIONS.div_ceil(rings).max(1);
+        let handler = uring_conn::RingConnHandler::new(
+            Arc::clone(&worker),
+            Arc::clone(&observability),
+            per_ring_connections,
+        );
+        let tokio_handle = tokio::runtime::Handle::current();
+        let joined = tokio::task::spawn_blocking(move || {
+            talon_worker::uring_serve::serve(
+                addr,
+                rings,
+                URING_BLOCKING_THREADS_PER_RING,
+                handler,
+                tokio_handle,
+            )
+        })
+        .await?;
+        return joined;
+    }
+
     let listener = TcpListener::bind(&cfg.listen).await?;
     tracing::info!(listen = %cfg.listen, "worker serving data plane");
     // Bound concurrent connections so a flood of idle peers cannot exhaust
