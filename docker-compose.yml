@@ -1,0 +1,139 @@
+# Talon local development cluster.
+#
+# Default (memory backend, single coordinator + worker):
+#   docker compose up
+#   # UI + API: http://127.0.0.1:8000/ui
+#
+# HA (etcd backend, 3 coordinators + worker):
+#   docker compose --profile ha up
+#   # UI + API (any coordinator): http://127.0.0.1:8000/ui
+#
+# Images default to the published GHCR builds. To build locally instead:
+#   docker compose build          # uses the deploy/docker/*.Dockerfile
+#   docker compose up --build
+#
+# The worker requires an object-store backend to be *configured* to start; the
+# Azure account/SAS below are placeholders so the control plane, API, and UI
+# work for exploration. Reading real objects needs real credentials.
+
+name: talon
+
+services:
+  # --- default: single-node memory backend ---------------------------------
+  coordinator:
+    image: ghcr.io/milvus-io/talon-coordinator:latest
+    build:
+      context: .
+      dockerfile: deploy/docker/coordinator.Dockerfile
+    command: ["--cluster-id", "demo", "--node-id", "coord-0"]
+    environment:
+      TALON_COORDINATOR_STATE_BACKEND: memory
+    ports:
+      - "7000:7000" # control plane
+      - "8000:8000" # admin API + UI
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  worker:
+    image: ghcr.io/milvus-io/talon-worker:latest
+    build:
+      context: .
+      dockerfile: deploy/docker/worker.Dockerfile
+    command:
+      - "--coordinator"
+      - "coordinator:7000"
+      - "--cluster-id"
+      - "demo"
+      - "--node-id"
+      - "worker-0"
+    environment:
+      # Placeholder object-store credentials so the worker starts; the control
+      # plane / UI work, but reading real objects needs real credentials.
+      TALON_WORKER_AZURE_ACCOUNT: demo
+      TALON_WORKER_AZURE_SAS: "sv=demo&sig=demo"
+    ports:
+      - "8001:8001" # worker admin (metrics/health/status)
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  # --- HA profile: etcd backend, 3 coordinators ----------------------------
+  etcd:
+    image: gcr.io/etcd-development/etcd:v3.5.16
+    profiles: ["ha"]
+    command:
+      - etcd
+      - --data-dir=/etcd-data
+      - --listen-client-urls=http://0.0.0.0:2379
+      - --advertise-client-urls=http://etcd:2379
+    healthcheck:
+      test: ["CMD", "etcdctl", "--endpoints=http://127.0.0.1:2379", "endpoint", "health"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Three explicit coordinators (distinct node ids) share one etcd, active-active.
+  # Only coord-ha-0 publishes its UI; the others are reachable on the compose
+  # network. This mirrors the HA topology shown in the management console.
+  coord-ha-0: &coord-ha
+    image: ghcr.io/milvus-io/talon-coordinator:latest
+    build:
+      context: .
+      dockerfile: deploy/docker/coordinator.Dockerfile
+    profiles: ["ha"]
+    command: ["--node-id", "coord-ha-0"]
+    environment: &coord-ha-env
+      TALON_COORDINATOR_STATE_BACKEND: etcd
+      TALON_COORDINATOR_HA_ENABLED: "true"
+      TALON_COORDINATOR_REPLICAS: "3"
+      TALON_COORDINATOR_CLUSTER_ID: demo-ha
+      TALON_COORDINATOR_ETCD_ENDPOINTS: etcd:2379
+    ports:
+      - "8000:8000" # admin API + UI (published from this coordinator)
+    depends_on:
+      etcd:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8000/healthz"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  coord-ha-1:
+    <<: *coord-ha
+    profiles: ["ha"]
+    command: ["--node-id", "coord-ha-1"]
+    environment: *coord-ha-env
+    ports: []
+
+  coord-ha-2:
+    <<: *coord-ha
+    profiles: ["ha"]
+    command: ["--node-id", "coord-ha-2"]
+    environment: *coord-ha-env
+    ports: []
+
+  worker-ha:
+    image: ghcr.io/milvus-io/talon-worker:latest
+    build:
+      context: .
+      dockerfile: deploy/docker/worker.Dockerfile
+    profiles: ["ha"]
+    command:
+      - "--coordinator"
+      - "coord-ha-0:7000"
+      - "--cluster-id"
+      - "demo-ha"
+      - "--node-id"
+      - "worker-0"
+    environment:
+      TALON_WORKER_AZURE_ACCOUNT: demo
+      TALON_WORKER_AZURE_SAS: "sv=demo&sig=demo"
+    ports:
+      - "8001:8001"
+    depends_on:
+      coord-ha-0:
+        condition: service_healthy
