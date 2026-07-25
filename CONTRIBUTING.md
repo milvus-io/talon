@@ -141,6 +141,23 @@ See [`BENCHMARKS.md`](BENCHMARKS.md) for details. CI runs the check
 informationally (it never blocks a merge — shared runners are too noisy for
 absolute-time gating).
 
+## Latency lab
+
+To test how the cache behaves against a realistic object-store latency pattern
+(first-byte latency, tail jitter, bandwidth ceilings) without a cloud account,
+use the latency lab under [`deploy/testenv/`](deploy/testenv/): a local Azurite
+origin behind Toxiproxy, with the worker's in-process delay decorator as a
+second, precise layer.
+
+```sh
+docker compose -f deploy/testenv/docker-compose.yml up -d --build
+docker compose -f deploy/testenv/docker-compose.yml run --rm seed
+./deploy/testenv/toxics.sh s3-cold-longtail
+```
+
+See [`docs/testing/latency-lab.md`](docs/testing/latency-lab.md) for the full
+guide.
+
 ## Coding standards
 
 - **Formatting:** `rustfmt` per `rustfmt.toml` (stable options, `max_width = 100`).
