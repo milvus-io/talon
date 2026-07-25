@@ -39,3 +39,7 @@ axum.workspace = true
 [dev-dependencies]
 divan.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[[bench]]
+name = "dataplane_benches"
+harness = false
