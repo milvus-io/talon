@@ -111,10 +111,15 @@ async fn run_mount(
     let handle = tokio::runtime::Handle::current();
     let stats = reader.stats().clone();
     let adapter = TalonFuse::new(fs, reader, handle, cfg.block_size, version)
-        .with_readahead(cfg.readahead_blocks);
+        .with_readahead(cfg.readahead_blocks)
+        // Write-through is enabled for the mount binary (opt-in via the `mount`
+        // feature). A future config flag can gate this per-mount (#232).
+        .with_read_write(true);
 
+    // Mounted read-write (write-through to the backend, #226/#232); FSName tags
+    // the mount and DefaultPermissions lets the kernel enforce the synthesized
+    // perms.
     let options = vec![
-        MountOption::RO,
         MountOption::FSName("talon".to_string()),
         MountOption::DefaultPermissions,
     ];
