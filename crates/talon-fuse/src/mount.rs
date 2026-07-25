@@ -15,12 +15,16 @@
 //!
 //! [#100]: https://github.com/milvus-io/talon/issues/100
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::block_reader::{BlockReader, FileView};
 use crate::mapping::path_to_object;
 use crate::ops::{Attr, FileKind, FsError, ReadOnlyFs};
+use crate::prefetch::Prefetcher;
+use crate::readahead::ReadaheadConfig;
+use talon_core::ObjectId;
 
 /// How long the kernel may cache a metadata reply before re-asking.
 ///
@@ -36,6 +40,13 @@ const ATTR_TTL: Duration = Duration::from_secs(60);
 /// data, amortizing the per-request `/dev/fuse` round-trip on sequential reads
 /// (issue #180). The kernel/`fuser` clamps to what it supports.
 const TARGET_MAX_IO: u32 = 1 << 20;
+
+/// Max concurrent speculative prefetch fetches per open file handle.
+///
+/// Prefetch is fire-and-forget and bounded (see [`Prefetcher`]); this caps how
+/// many upcoming blocks can be warming at once so readahead never floods a
+/// worker or the client's task pool. Excess prefetches are dropped, not queued.
+const PREFETCH_MAX_INFLIGHT: usize = 4;
 
 /// Map a read-op [`FsError`] to a POSIX errno for a `fuser` reply.
 pub(crate) fn errno(err: FsError) -> i32 {
@@ -120,6 +131,14 @@ pub struct TalonFuse {
     /// cache and feeds the HRW hash, never the bytes the worker returns. It is
     /// normally [`CANONICAL_MOUNT_VERSION`].
     version: talon_core::Version,
+    /// Readahead tuning (sequential-run trigger + prefetch window). The window
+    /// comes from `FuseConfig::readahead_blocks`.
+    readahead: ReadaheadConfig,
+    /// Per-open-handle prefetch drivers, keyed by FUSE file handle. Created
+    /// lazily on the first `read` of a handle (when the object/size are known)
+    /// and removed on `release`. Each detects a sequential run and warms the
+    /// next blocks on the owning worker ahead of the cursor (issue #206).
+    prefetchers: Mutex<HashMap<u64, Prefetcher>>,
 }
 
 impl TalonFuse {
@@ -128,7 +147,9 @@ impl TalonFuse {
     /// `runtime` is the handle the synchronous FUSE callbacks use to run async
     /// work; typically `tokio::runtime::Handle::current()` on the mounting
     /// thread. `block_size` and `version` address the objects' blocks (see the
-    /// field docs on `version`).
+    /// field docs on `version`). Uses the default [`ReadaheadConfig`]; call
+    /// [`with_readahead`](Self::with_readahead) to set the prefetch window from
+    /// config.
     pub fn new(
         fs: Arc<ReadOnlyFs>,
         reader: BlockReader,
@@ -142,7 +163,58 @@ impl TalonFuse {
             runtime,
             block_size,
             version,
+            readahead: ReadaheadConfig::default(),
+            prefetchers: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Set the readahead prefetch window (number of blocks to prefetch ahead of
+    /// the cursor once a sequential run is detected), typically from
+    /// `FuseConfig::readahead_blocks`. A window of `0` disables prefetch.
+    pub fn with_readahead(mut self, window_blocks: u32) -> Self {
+        self.readahead.window = window_blocks;
+        self
+    }
+
+    /// Feed a read at `offset` on handle `fh` to that handle's prefetcher,
+    /// lazily creating it, and return the block indices a prefetch was spawned
+    /// for (empty until a sequential run is detected, or if readahead is off).
+    ///
+    /// Split out of the `read` callback so the wiring is unit-testable without a
+    /// kernel mount: the prefetcher only fires after `trigger_run` consecutive
+    /// in-order reads and never for random access (issue #206).
+    fn drive_readahead(
+        &self,
+        fh: u64,
+        offset: u64,
+        file_size: u64,
+        object: Option<ObjectId>,
+        now_ms: u64,
+    ) -> Vec<u64> {
+        if self.readahead.window == 0 {
+            return Vec::new();
+        }
+        let object = match object {
+            Some(o) => o,
+            None => return Vec::new(),
+        };
+        let block_index = offset / self.block_size as u64;
+        let mut prefetchers = self.prefetchers.lock().unwrap();
+        let prefetcher = prefetchers.entry(fh).or_insert_with(|| {
+            Prefetcher::new(
+                self.reader.clone(),
+                self.readahead,
+                PREFETCH_MAX_INFLIGHT,
+                object,
+                self.block_size,
+                self.version.clone(),
+                file_size,
+            )
+        });
+        // The prefetcher spawns fetches on the runtime; enter it so the spawns
+        // have a reactor even though we may be on a sync FUSE thread.
+        let _guard = self.runtime.enter();
+        prefetcher.on_read(block_index, now_ms)
     }
 
     /// The namespace tree backing metadata ops.
@@ -316,6 +388,13 @@ impl fuser::Filesystem for TalonFuse {
         let block_size = self.block_size;
         let version = self.version.clone();
         let offset = offset.max(0) as u64;
+        // Clone the object id for the prefetcher before `object` is moved into
+        // the foreground read future below (only needed when readahead is on).
+        let object_for_prefetch = if self.readahead.window > 0 {
+            Some(object.clone())
+        } else {
+            None
+        };
         // A monotonic-ish millisecond stamp for the placement cache TTL.
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -331,6 +410,13 @@ impl fuser::Filesystem for TalonFuse {
             };
             reader.read(&view, offset, size as u64, now_ms).await
         });
+
+        // Drive client-side readahead: feed this read's starting block index to
+        // the per-handle prefetcher, which warms the next blocks on the owning
+        // worker only once a sequential run is detected (issue #206). Prefetch is
+        // fire-and-forget and bounded, so this never delays the reply.
+        self.drive_readahead(fh, offset, file_size, object_for_prefetch, now_ms);
+
         match result {
             Ok(bytes) => reply.data(&bytes),
             Err(_) => reply.error(libc::EIO),
@@ -348,6 +434,9 @@ impl fuser::Filesystem for TalonFuse {
         _flush: bool,
         reply: fuser::ReplyEmpty,
     ) {
+        // Drop this handle's prefetch state (and its readahead cursor); any
+        // in-flight speculative fetches finish on their own detached tasks.
+        self.prefetchers.lock().unwrap().remove(&fh);
         match self.fs.release(fh) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(e)),
@@ -390,6 +479,91 @@ mod tests {
         // worker) and stable, so this guards against an accidental change.
         assert!(!CANONICAL_MOUNT_VERSION.is_empty());
         assert_eq!(CANONICAL_MOUNT_VERSION, "talon-mount-v1");
+    }
+
+    /// Build a `TalonFuse` over a `BlockReader` pointed at an unused address. The
+    /// readahead *decision* (which block indices to prefetch) is independent of
+    /// whether the speculative fetches succeed — they are fire-and-forget — so
+    /// this exercises the mount→prefetcher wiring without any live server.
+    fn adapter_with_readahead(window: u32) -> TalonFuse {
+        let fs = Arc::new(ReadOnlyFs::new());
+        let reader = BlockReader::new(
+            CoordinatorClient::new("127.0.0.1:9"), // unused; prefetch fetches just fail
+            Arc::new(PlacementCache::new(1000)),
+            1,
+        );
+        TalonFuse::new(
+            fs,
+            reader,
+            tokio::runtime::Handle::current(),
+            8, // block_size
+            talon_core::Version::new(CANONICAL_MOUNT_VERSION),
+        )
+        .with_readahead(window)
+    }
+
+    fn obj() -> ObjectId {
+        ObjectId::new(talon_core::Backend::S3, "b", "o.bin")
+    }
+
+    #[tokio::test]
+    async fn readahead_fires_only_after_a_sequential_run() {
+        // Default trigger_run is 3 (issue #206): the first two in-order reads
+        // establish the run but prefetch nothing; the third and onward prefetch
+        // the window ahead of the cursor.
+        let fuse = adapter_with_readahead(4);
+        let size = 64 * 8; // 64 blocks of 8 bytes
+        let o = Some(obj());
+        // Reads at block 0,1 (offsets 0,8): run building, no prefetch yet.
+        assert!(fuse.drive_readahead(1, 0, size, o.clone(), 0).is_empty());
+        assert!(fuse.drive_readahead(1, 8, size, o.clone(), 0).is_empty());
+        // Block 2: run reaches trigger_run=3 → prefetch the next blocks.
+        let spawned = fuse.drive_readahead(1, 16, size, o.clone(), 0);
+        assert!(!spawned.is_empty(), "sequential run must prefetch");
+        assert_eq!(spawned, vec![3, 4, 5, 6], "window of 4 ahead of block 2");
+    }
+
+    #[tokio::test]
+    async fn readahead_never_fires_for_random_access() {
+        let fuse = adapter_with_readahead(4);
+        let size = 64 * 8;
+        let o = Some(obj());
+        // Jumping around (0, 5, 2, 9) is never a sequential run → no prefetch.
+        for off in [0u64, 40, 16, 72] {
+            assert!(
+                fuse.drive_readahead(1, off, size, o.clone(), 0).is_empty(),
+                "random access must not prefetch (offset {off})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn readahead_window_zero_disables_prefetch() {
+        // A window of 0 (readahead_blocks = 0) turns prefetch off entirely, even
+        // for a clean sequential run.
+        let fuse = adapter_with_readahead(0);
+        let size = 64 * 8;
+        let o = Some(obj());
+        for i in 0..6u64 {
+            assert!(
+                fuse.drive_readahead(1, i * 8, size, o.clone(), 0).is_empty(),
+                "window 0 must never prefetch"
+            );
+        }
+        // No per-handle state was even created.
+        assert!(fuse.prefetchers.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn release_drops_the_handle_prefetch_state() {
+        let fuse = adapter_with_readahead(4);
+        let size = 64 * 8;
+        let o = Some(obj());
+        let _ = fuse.drive_readahead(7, 0, size, o.clone(), 0);
+        assert!(fuse.prefetchers.lock().unwrap().contains_key(&7));
+        // Simulate the release callback's cleanup.
+        fuse.prefetchers.lock().unwrap().remove(&7);
+        assert!(!fuse.prefetchers.lock().unwrap().contains_key(&7));
     }
 
     #[test]

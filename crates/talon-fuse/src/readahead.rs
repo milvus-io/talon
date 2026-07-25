@@ -23,7 +23,11 @@ pub struct ReadaheadConfig {
 impl Default for ReadaheadConfig {
     fn default() -> Self {
         Self {
-            trigger_run: 2,
+            // Require several consecutive in-order reads before prefetching, so a
+            // couple of incidentally-adjacent reads are not mistaken for a
+            // sequential scan and do not trigger speculative fetches. Random or
+            // strided access therefore never prefetches.
+            trigger_run: 3,
             window: 4,
         }
     }

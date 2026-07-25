@@ -110,7 +110,8 @@ async fn run_mount(
     let version = talon_core::Version::new(CANONICAL_MOUNT_VERSION);
     let handle = tokio::runtime::Handle::current();
     let stats = reader.stats().clone();
-    let adapter = TalonFuse::new(fs, reader, handle, cfg.block_size, version);
+    let adapter = TalonFuse::new(fs, reader, handle, cfg.block_size, version)
+        .with_readahead(cfg.readahead_blocks);
 
     let options = vec![
         MountOption::RO,
