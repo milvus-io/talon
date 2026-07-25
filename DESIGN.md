@@ -67,37 +67,111 @@ Three planes:
   revisit RDMA only if TCP + NVMe is proven insufficient in a fast rack network.
 - **Zero-copy:** `bytes::Bytes` for small messages and in-memory buffer sharing;
   `sendfile`/`splice` for disk-block transfer.
-- **Runtime:** two-layer model (control ring + zero-copy syscalls) — see
+- **Runtime:** two-layer model (control/protocol scheduling + zero-copy
+  syscalls). Layer 2 is built; Layer 1 currently runs on Tokio — see
   *Runtime & I/O model* below.
 
 ## Runtime & I/O model
 
-Reference design (validated in the sibling `spiro-cache` prototype). Each
-`master` / `worker` / `client` process splits I/O into two layers.
+Each `coordinator` / `worker` / `client` process splits I/O into two layers: one
+for control and protocol scheduling, one for bulk data movement. **Layer 2 is
+built and runtime-neutral. Layer 1 currently runs on Tokio**, not on the
+io_uring runtime this section originally specified; the gap and the measured
+case for closing it are described under *Layer 1 target* below.
 
-### Layer 1 — control & protocol scheduling (io_uring)
+### Layer 1 — control & protocol scheduling
 
-Each process runs a `monoio::Runtime<IoUringDriver>` (single-threaded ring in
-v1). The ring owns: `accept`, read/write of protocol headers, small messages,
-task spawning, timers, and metrics. All connection management and scheduling
-lives here. Large object bytes never enter userspace through this ring.
+The layer owns `accept`, read/write of protocol headers, small control
+messages, task spawning, timers, and metrics. All connection management and
+scheduling lives here. **Large object bytes never enter userspace through this
+layer** — that invariant is what makes Layer 2 possible, and it holds under any
+runtime.
 
-### Layer 2 — bulk data movement (Linux zero-copy syscalls)
+**As built (v1): Tokio.** `talon_transport::runtime::Server` is a
+multi-threaded Tokio accept loop. This was a deliberate portability choice:
+io_uring is unavailable on many CI runners and container sandboxes, and a
+portable backend keeps the entire read path buildable and testable everywhere.
+
+**Target: thread-per-core io_uring (monoio).** Benchmarked against the Tokio
+implementation on a full-integration harness (real framed protocol, real
+`sendfile`, real loopback TCP, connection reuse) — see issue #273 for method and
+raw data:
+
+| comparison | throughput | per-core | p50 | p99 | RSS |
+|---|---|---|---|---|---|
+| 1 ring vs 1 Tokio worker | +85% | +23–35% | −46% | −44% | −15% |
+| 8 rings vs 4 Tokio workers | +15% | +26% | −11% | −5% | +11% |
+| 16 rings vs full Tokio | +35% | +34% | −19% | −26% | −34% |
+
+monoio has no work-stealing scheduler; it scales by running N independent
+runtimes, one pinned per core (`bind_to_cpu_set`), each binding the same address
+with `SO_REUSEPORT` so the kernel hash-distributes accepts. Measured scaling is
+**8.05× at 8 rings** (this host has 8 physical cores; 16 rings falls off to
+8.81× as the extra rings land on SMT siblings). Per-core throughput stays flat
+from 1 to 16 rings — there is no cross-ring contention to amortize.
+
+**Migration is not a drop-in swap.** The real surface, in rough cost order:
+
+- **`!Send` task model.** `Handler: Send + Sync + 'static` and `tokio::spawn`
+  are baked into `Server`. monoio is thread-per-core with `!Send` futures.
+- **Buffer-ownership I/O traits.** Tokio borrows buffers
+  (`read_exact(&mut buf)`); monoio's `AsyncReadRent`/`AsyncWriteRent` move
+  ownership in and back out, because io_uring is completion-based and the kernel
+  holds the buffer for the duration. Every socket read/write site is rewritten,
+  not re-imported.
+- **Ecosystem lock-in.** `axum`, `reqwest`, `kube`, `etcd-client`, and `tonic`
+  are Tokio-bound. Any migration yields ring + Tokio *coexistence*, not
+  replacement.
+- **Not a blocker:** fd ownership across the ring/blocking boundary. A
+  ring-owned monoio `TcpStream` fd can be handed straight to a blocking
+  `sendfile` and the ring resumes on the same stream afterwards — none of the
+  `into_std` → `set_nonblocking` → `from_std` round-trip the current Tokio path
+  pays per transfer is needed. Migrating *removes* that code.
+
+Scope, if taken: `transport::Server`, the worker connection loop, and
+`fuse::worker_client`. Everything else stays on Tokio by design (see
+*Runtime split* below).
+
+### Layer 2 — bulk data movement (Linux zero-copy syscalls) — built
 
 Large payloads move via kernel zero-copy, not through Rust heap buffers:
 
 - **GET / cache read:** `sendfile(block_file_fd → socket_fd)`.
 - **PUT / ingest:** `splice(socket ↔ pipe ↔ file)`.
 
-These blocking libc syscalls run on a `spawn_blocking` thread pool so they never
-stall the monoio ring. Default chunk size **1 MiB**, block size **64 MiB**
-(our v1 default is 256 MiB — see §3 chunking; treat block size as configurable).
+These blocking libc syscalls run on a `spawn_blocking` pool, off the reactor, so
+a slow client cannot stall protocol scheduling. (Under Tokio this parks one
+worker thread of many; under a single-threaded ring it would stall the ring
+outright — the isolation matters more, not less, after a monoio migration.)
+Default chunk size **1 MiB**, block size **64 MiB** (our v1 default is 256 MiB —
+see §3 chunking; treat block size as configurable).
+
+This layer is **runtime-neutral**: `send_file_range` and `splice_to_file` take
+`&impl AsRawFd` and depend on no runtime types, so they survive a Layer 1
+change untouched.
+
+### Runtime split
+
+Which runtime each component targets, and why. Five of the seven already match
+today; only the data-plane TCP scheduling layer diverges.
+
+| component | target | today | rationale |
+|---|---|---|---|
+| worker data plane | monoio + `sendfile`/`splice` | Tokio + `sendfile`/`splice` | hot path; per-core efficiency and tail latency |
+| client ↔ worker data plane | monoio | Tokio | same hot path, client side |
+| coordinator ↔ worker control | either | Tokio | low volume; bincode over framed TCP |
+| coordinator admin / UI / etcd / k8s | **Tokio** | Tokio ✅ | axum/kube/etcd-client are Tokio-bound |
+| worker miss loader | Tokio or blocking pool, **off-ring** | Tokio + semaphore ✅ | TLS/HTTP breaks zero-copy anyway; slow path |
+| FUSE client | either | Tokio ✅ | `fuser` callbacks are synchronous regardless |
+| metrics / health | Tokio | Tokio ✅ | ecosystem-driven, not a data path |
 
 ### Data-plane paths
 
 **L1 memory hit** (optional, default off; for very hot small blocks): decode
 header + key → `mem_cache` lookup → send header → plain async socket write from
-an `Rc<Vec<u8>>`. No disk, no `sendfile`.
+a shared buffer (`Arc<Vec<u8>>` on the current Tokio runtime; `Rc<Vec<u8>>`
+under a thread-per-core ring, where the buffer never leaves its core). No disk,
+no `sendfile`.
 
 **L2 NVMe hit** (primary hot path): decode header + key → `BlockIndex` lookup →
 open cached `.blk` fd → write response header → `sendfile(cached_fd → socket)` in
@@ -144,17 +218,43 @@ via jump hash, and sends `LoadBlobs`. Workers' loader threads download the range
 and commit into cache. Workers pull from the backend themselves; no
 client→worker zero-copy involved.
 
-### Why not pure io_uring for all data movement
+### Why not one mechanism for all data movement
 
-- **monoio / io_uring:** async TCP, small messages, scheduling, timers, metrics.
+The division of labour, independent of which Layer 1 runtime is in use:
+
+- **Protocol scheduling** (Tokio today, monoio targeted): async TCP, small
+  messages, scheduling, timers, metrics.
 - **sendfile / splice:** the actual large-block zero-copy movement.
-- **spawn_blocking:** isolates the blocking libc zero-copy syscalls off the ring.
+- **spawn_blocking:** isolates the blocking libc zero-copy syscalls off the
+  reactor, so a slow client cannot stall protocol scheduling.
 
-Future optimizations (drive by benchmarks, not speculation): thread-per-core
-runtimes (one ring per core), hash-partitioned request affinity to a ring, fd
-registration, pipelined double-buffer splice, and evaluating
-`IORING_OP_SPLICE` / send-zero-copy. Current `sendfile`/`splice` is the simpler,
-stable Linux fast path.
+Future optimizations (drive by benchmarks, not speculation): fd registration,
+pipelined double-buffer splice, and evaluating `IORING_OP_SPLICE` /
+send-zero-copy. Current `sendfile`/`splice` is the simpler, stable Linux fast
+path.
+
+Two items that were previously listed here have since been measured (#273):
+
+- **Thread-per-core (one ring per core): validated.** 8.05× scaling at 8 rings
+  via `SO_REUSEPORT` + CPU pinning. This is the shape a monoio migration should
+  take — not a single ring, which caps at ~13k rps/core.
+- **Hash-partitioned request affinity: rejected.** Sharding `BlockIndex` per
+  ring sounds like the natural companion to thread-per-core, but it loses on
+  both axes. `SO_REUSEPORT` hashes connections by TCP 4-tuple while shards key
+  on `block_id`, so only 1/N of requests land on the owning ring — measured
+  75–87% forwarding at 8 shards, costing **30–67% throughput**. Separately,
+  giving each shard its own eviction budget wastes capacity: with 256 MiB blocks
+  and 64 GiB per worker there are only ~256 block slots (32/shard at 8 shards),
+  far too few for hash uniformity, so some shards evict while others sit below
+  capacity — up to **5.1pt hit-rate loss** when the working set is near
+  capacity. Sharding the eviction *policy* is free; sharding the *budget* is
+  not.
+
+The measured conclusion is to keep worker state **shared with lock-free reads**
+(`BlockIndex` is read-mostly), a per-ring buffer for LRU access marking, a
+**global** byte account for eviction, and a global `InFlightLoads` for miss
+dedup (a correctness requirement — per-shard dedup would refetch the same
+256 MiB block once per ring).
 
 ## 2. Coordinator
 
