@@ -13,9 +13,13 @@
 //! - marked `#[ignore]`, so even with the feature it runs only when explicitly
 //!   requested: `cargo test -p talon-fuse --features mount --test mount_e2e -- --ignored`.
 //!
-//! Running it requires a working `/dev/fuse` (present in most Linux dev boxes
-//! and CI runners with `--privileged`, absent in restricted sandboxes), which
-//! is why it is not part of the default suite.
+//! Running it requires a working `/dev/fuse` (present on GitHub's Linux runners
+//! and most Linux dev boxes, absent on macOS and in restricted sandboxes), which
+//! is why it is not part of the default suite. By default a missing `/dev/fuse`
+//! makes the test skip (pass as a no-op). Set `TALON_REQUIRE_FUSE=1` — as the CI
+//! `fuse-mount` job does — to turn a mount failure into a hard error instead, so
+//! a runner that unexpectedly lacks FUSE fails the job rather than passing
+//! without exercising the kernel path.
 #![cfg(feature = "mount")]
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -147,7 +151,12 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
         talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
     );
 
-    // Mount at a temp dir. Skip (don't fail) if /dev/fuse is unavailable.
+    // Mount at a temp dir. If /dev/fuse is unavailable this normally skips, so
+    // the test is a no-op on machines without FUSE. In CI, set
+    // TALON_REQUIRE_FUSE=1 so a mount failure is a hard error instead — that way
+    // a runner that silently lacks /dev/fuse turns the job red rather than
+    // passing without exercising the kernel path (a false green).
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
     let mountpoint = std::env::temp_dir().join(format!("talon-mount-e2e-{}", std::process::id()));
     std::fs::create_dir_all(&mountpoint).unwrap();
     let options = vec![MountOption::RO, MountOption::FSName("talon".into())];
@@ -155,6 +164,12 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
         Ok(s) => s,
         Err(e) => {
             std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {e}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
             eprintln!("skipping: /dev/fuse unavailable: {e}");
             return;
         }
