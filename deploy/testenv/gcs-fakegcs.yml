@@ -1,0 +1,30 @@
+# GCS backend e2e against fake-gcs-server (manual).
+#
+# Brings up fake-gcs-server (GCS emulator) so you can exercise the real
+# GcsBackend (bearer auth + endpoint override) end to end, mirroring the CI
+# `gcs-e2e` job.
+#
+#   docker compose -f deploy/testenv/gcs-fakegcs.yml up -d
+#   python3 -c "open('/tmp/object.bin','wb').write(bytes(i%251 for i in range(4096)))"
+#   curl -X POST 'http://127.0.0.1:4443/storage/v1/b?project=talon' \
+#     -H 'Content-Type: application/json' -d '{"name":"talon-e2e"}'
+#   curl -X POST \
+#     'http://127.0.0.1:4443/upload/storage/v1/b/talon-e2e/o?uploadType=media&name=e2e/object.bin' \
+#     -H 'Content-Type: application/octet-stream' --data-binary @/tmp/object.bin
+#   TALON_GCS_TEST_ENDPOINT=http://127.0.0.1:4443 \
+#     TALON_GCS_TEST_BUCKET=talon-e2e TALON_GCS_TEST_KEY=e2e/object.bin \
+#     cargo test -p talon-backend --test gcs_e2e -- --nocapture
+
+name: talon-gcs-e2e
+
+services:
+  fake-gcs:
+    image: fsouza/fake-gcs-server:1.49
+    ports:
+      - "4443:4443"
+    command: ["-scheme", "http", "-port", "4443", "-public-host", "127.0.0.1:4443"]
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:4443/storage/v1/b"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
