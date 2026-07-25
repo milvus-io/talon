@@ -37,13 +37,21 @@ cargo run -p talon-worker -- \
   --coordinator 127.0.0.1:7000 --cluster-id demo --node-id worker-0
 ```
 
-Check the cluster is healthy and open the management console:
+Check the cluster is healthy:
 
 ```sh
 curl -s http://127.0.0.1:8000/readyz           # {"ready":true}
 curl -s http://127.0.0.1:8000/api/v1/cluster    # cluster summary JSON
-# Management UI: http://127.0.0.1:8000/ui
 ```
+
+### Management console
+
+Every coordinator serves a built-in web console at **http://127.0.0.1:8000/ui**
+— no external assets, no separate deploy. It shows live cluster health, traffic
+trends, per-worker capacity and hotspots, an active-active coordinator topology
+panel, and a searchable fleet table.
+
+![Talon management console — cluster overview](docs/assets/ui/overview.png)
 
 ## Documentation
 

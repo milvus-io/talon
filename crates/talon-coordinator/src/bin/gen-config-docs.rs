@@ -43,9 +43,9 @@ change it, edit the schema next to the parser and regenerate.\n\n",
     s.push_str(
         "Every setting is resolved from four layers, highest precedence first: \
 **CLI flag** > **environment variable** > **config file (TOML)** > **default**. \
-A ✓ in the *CLI* column means the setting also has a `--<key>` flag; \
-environment variables always apply. Secrets are read only from the environment \
-and are never written to a config file or logged.\n\n",
+Each setting below lists its environment variable, default, and CLI flag (when \
+it has one); environment variables always apply. Secrets are read only from the \
+environment and are never written to a config file or logged.\n\n",
     );
 
     section(&mut s, "Coordinator", COORDINATOR_ENV_SCHEMA);
@@ -56,19 +56,26 @@ and are never written to a config file or logged.\n\n",
 
 fn section(s: &mut String, title: &str, schema: &[ConfigVar]) {
     s.push_str(&format!("## {title}\n\n"));
-    s.push_str("| Key | Environment variable | Default | CLI | Description |\n");
-    s.push_str("|-----|----------------------|---------|-----|-------------|\n");
     for v in schema {
-        let default = match v.default {
-            Some(d) => format!("`{d}`"),
-            None => "—".to_string(),
-        };
-        let cli = if v.cli { "✓" } else { "" };
         let secret = if v.secret { " 🔒" } else { "" };
+        s.push_str(&format!("### `{}`{}\n\n", v.key, secret));
+        s.push_str(&format!("{}\n\n", v.help));
+        s.push_str(&format!("- **Environment variable:** `{}`\n", v.env));
+        match v.default {
+            Some(d) => s.push_str(&format!("- **Default:** `{d}`\n")),
+            None => s.push_str("- **Default:** none\n"),
+        }
         s.push_str(&format!(
-            "| `{}` | `{}`{} | {} | {} | {} |\n",
-            v.key, v.env, secret, default, cli, v.help
+            "- **CLI flag:** {}\n",
+            if v.cli {
+                format!("`--{}`", v.key)
+            } else {
+                "not settable via CLI (config file or environment only)".to_string()
+            }
         ));
+        if v.secret {
+            s.push_str("- **Secret:** read only from the environment; never written to a config file or logged\n");
+        }
+        s.push('\n');
     }
-    s.push('\n');
 }
