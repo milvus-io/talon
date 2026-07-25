@@ -247,21 +247,6 @@ impl ReadOnlyFs {
         Ok(fh)
     }
 
-    /// Resolve which inode + size a `read` on handle `fh` targets, clamping
-    /// `[offset, offset+size)` to the file length.
-    ///
-    /// Returns `(ino, clamped_len)`; the caller performs the actual GET/GET_RANGE
-    /// on the owning worker for that inode's object. A zero `clamped_len` means
-    /// the read is entirely past EOF.
-    pub fn read_plan(&self, fh: u64, offset: u64, size: u32) -> Result<(u64, u64), FsError> {
-        let g = self.inner.lock().unwrap();
-        let ino = *g.handles.get(&fh).ok_or(FsError::BadHandle)?;
-        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
-        let end = offset.saturating_add(size as u64).min(node.size);
-        let clamped = end.saturating_sub(offset);
-        Ok((ino, clamped))
-    }
-
     /// `release`: drop a previously opened handle.
     pub fn release(&self, fh: u64) -> Result<(), FsError> {
         let mut g = self.inner.lock().unwrap();
@@ -282,12 +267,6 @@ impl ReadOnlyFs {
             return Err(FsError::Unsupported);
         }
         Ok((node.path.clone(), node.size))
-    }
-
-    /// Any mutating operation (write/create/unlink/rename/chmod/…): always
-    /// rejected on the read-only filesystem.
-    pub fn mutate(&self) -> FsError {
-        FsError::ReadOnly
     }
 }
 
@@ -336,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn open_read_plan_release_flow() {
+    fn open_file_meta_release_flow() {
         let fs = fs();
         let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
         let bucket = fs.lookup(s3.ino, "bucket").unwrap();
@@ -347,23 +326,15 @@ mod tests {
         assert_eq!(fs.open(data.ino), Err(FsError::Unsupported));
 
         let fh = fs.open(a.ino).unwrap();
-        // Full read within bounds.
-        assert_eq!(fs.read_plan(fh, 0, 256).unwrap(), (a.ino, 256));
-        // Partial read near EOF (footer): clamp to file size.
-        assert_eq!(fs.read_plan(fh, 900, 256).unwrap(), (a.ino, 100));
-        // Entirely past EOF.
-        assert_eq!(fs.read_plan(fh, 2000, 10).unwrap(), (a.ino, 0));
+        // file_meta yields the object path + size for the open handle.
+        let (path, size) = fs.file_meta(fh).unwrap();
+        assert_eq!(path, "s3/bucket/data/a.bin");
+        assert_eq!(size, 1000);
 
         fs.release(fh).unwrap();
         // Handle no longer valid.
-        assert_eq!(fs.read_plan(fh, 0, 1), Err(FsError::BadHandle));
+        assert_eq!(fs.file_meta(fh), Err(FsError::BadHandle));
         assert_eq!(fs.release(fh), Err(FsError::BadHandle));
-    }
-
-    #[test]
-    fn mutating_ops_are_read_only() {
-        let fs = fs();
-        assert_eq!(fs.mutate(), FsError::ReadOnly);
     }
 
     #[test]

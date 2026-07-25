@@ -128,6 +128,13 @@ impl CoordinatorClient {
     }
 
     /// Fetch an object's size + version for `getattr` / block addressing.
+    ///
+    /// Forward-surface: the mount currently sizes files from the coordinator
+    /// listing (`list_objects`) and addresses blocks under a canonical version
+    /// (the worker owns freshness, #182), so this per-object `StatObject` RPC is
+    /// not yet on the hot path. It is the natural entry point for real per-object
+    /// version resolution if the mount ever becomes version-aware; kept for that
+    /// and covered by its own test.
     pub async fn stat_object(&self, object: &ObjectId) -> Result<ObjectStat, CoordinatorError> {
         let req = ControlMessage::StatObject {
             object: object.clone(),

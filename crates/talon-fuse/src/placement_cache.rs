@@ -9,9 +9,9 @@
 //! - **Wrong owner / NOT_FOUND** — the contacted worker doesn't have the block.
 //! - **Connect failure** — the contacted worker is unreachable.
 //!
-//! On `LOADING` / unavailable, the client walks the ordered replica list via
-//! [`Cached::next_replica`] before giving up and refreshing. Time is injected as
-//! a monotonic millisecond value for deterministic tests.
+//! On `LOADING` / unavailable, the client walks the cached entry's ordered
+//! [`Cached::replicas`] list before giving up and refreshing. Time is injected
+//! as a monotonic millisecond value for deterministic tests.
 
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -42,21 +42,6 @@ pub struct Cached {
     /// set), **not** a monotonically increasing counter. Clients compare it for
     /// equality only — see [`PlacementCache::observe_epoch`].
     pub epoch: u64,
-}
-
-impl Cached {
-    /// The primary (first) replica, if any.
-    pub fn primary(&self) -> Option<&str> {
-        self.replicas.first().map(String::as_str)
-    }
-
-    /// The replica after `current` in the ordered list, for fallback.
-    ///
-    /// Returns `None` once the list is exhausted (caller should refresh).
-    pub fn next_replica(&self, current: &str) -> Option<&str> {
-        let pos = self.replicas.iter().position(|r| r == current)?;
-        self.replicas.get(pos + 1).map(String::as_str)
-    }
 }
 
 struct Entry {
@@ -177,20 +162,17 @@ mod tests {
     fn hit_within_ttl_miss_after() {
         let c = PlacementCache::new(1000);
         c.insert(block(1), cached(1, &["a", "b"]), 0);
-        assert_eq!(c.get(&block(1), 500).unwrap().primary(), Some("a"));
+        assert_eq!(
+            c.get(&block(1), 500)
+                .unwrap()
+                .replicas
+                .first()
+                .map(String::as_str),
+            Some("a")
+        );
         // Past TTL -> miss, and the stale entry is dropped.
         assert!(c.get(&block(1), 1001).is_none());
         assert!(c.is_empty());
-    }
-
-    #[test]
-    fn replica_fallback_walks_ordered_list() {
-        let cc = cached(1, &["a", "b", "c"]);
-        assert_eq!(cc.primary(), Some("a"));
-        assert_eq!(cc.next_replica("a"), Some("b"));
-        assert_eq!(cc.next_replica("b"), Some("c"));
-        assert_eq!(cc.next_replica("c"), None); // exhausted -> refresh
-        assert_eq!(cc.next_replica("unknown"), None);
     }
 
     #[test]

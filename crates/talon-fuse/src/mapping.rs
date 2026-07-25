@@ -9,8 +9,9 @@
 //! /az/<account-or-container>/<object key...>
 //! ```
 //!
-//! [`path_to_object`] parses such a path into an [`ObjectId`]; [`object_to_path`]
-//! is its inverse. For an open file, [`resolve_read`] maps a byte `offset` to
+//! [`path_to_object`] parses such a path into an [`ObjectId`] (the reverse,
+//! [`ObjectId::to_path`], renders it back). For an open file, [`resolve_read`]
+//! maps a byte `offset` to
 //! the [`BlockId`] that contains it plus the offset *within* that block, given
 //! the file's block size and version. On the mount path the version is a
 //! canonical placeholder, not a per-object ETag: placement is version-
@@ -62,12 +63,6 @@ pub fn path_to_object(path: &str) -> Result<ObjectId> {
     Ok(ObjectId::new(backend, bucket, object_path))
 }
 
-/// Render an [`ObjectId`] back into its mount-relative path. Inverse of
-/// [`path_to_object`].
-pub fn object_to_path(obj: &ObjectId) -> String {
-    obj.to_path()
-}
-
 /// Resolve a read at `offset` into the block that holds it.
 ///
 /// `block_size` is the file's logical block size and `version` its current
@@ -105,7 +100,7 @@ mod tests {
         ] {
             let obj = path_to_object(path).unwrap();
             assert_eq!(obj.backend, backend);
-            assert_eq!(object_to_path(&obj), path);
+            assert_eq!(obj.to_path(), path);
         }
     }
 
@@ -131,7 +126,7 @@ mod tests {
         let path = "/s3/bucket/weird name (v2)/日本語.bin";
         let obj = path_to_object(path).unwrap();
         assert_eq!(obj.object_path, "weird name (v2)/日本語.bin");
-        assert_eq!(object_to_path(&obj), path);
+        assert_eq!(obj.to_path(), path);
     }
 
     #[test]
