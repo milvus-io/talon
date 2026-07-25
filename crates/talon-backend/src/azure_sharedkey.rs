@@ -120,7 +120,13 @@ pub fn authorization_header(
         .map(|(k, v)| format!("{k}:{v}\n"))
         .collect::<String>();
 
-    // Canonicalized resource: /<account><path>. No query params today.
+    // Canonicalized resource: `/<account>` + the URI path, per the Shared Key
+    // algorithm (the Azure SDKs and Azurite both compute it this way). For
+    // virtual-host addressing the path is /<container>/<blob>. For path-style /
+    // emulator addressing the path already begins with /<account>/..., so the
+    // result deliberately repeats the account (/devstoreaccount1/devstoreaccount1
+    // /...) — that is exactly what Azurite signs against, so it must NOT be
+    // stripped.
     let (_host, path) = host_and_path(&req.url);
     let canonical_resource = format!("/{account}{path}");
 
@@ -258,5 +264,39 @@ mod tests {
         let (host, path) = host_and_path("http://127.0.0.1:10000/devstoreaccount1/c/b");
         assert_eq!(host, "127.0.0.1:10000");
         assert_eq!(path, "/devstoreaccount1/c/b");
+    }
+
+    #[test]
+    fn path_style_signs_with_account_prefixed_resource() {
+        // The Shared Key algorithm always prefixes the account to the URI path.
+        // For a path-style/emulator URL the path already begins with the account,
+        // so the canonical resource repeats it (/devstoreaccount1/devstoreaccount1
+        // /...) — this is what Azurite signs against. The two addressing styles
+        // therefore produce DIFFERENT signatures for the same logical object,
+        // and each must be deterministic.
+        let vhost = req(
+            Method::Get,
+            "https://devstoreaccount1.blob.core.windows.net/c/b",
+            vec![
+                ("x-ms-date", "Fri, 26 Jun 2015 23:39:12 GMT"),
+                ("x-ms-version", "2021-12-02"),
+            ],
+        );
+        let path_style = req(
+            Method::Get,
+            "http://127.0.0.1:10000/devstoreaccount1/c/b",
+            vec![
+                ("x-ms-date", "Fri, 26 Jun 2015 23:39:12 GMT"),
+                ("x-ms-version", "2021-12-02"),
+            ],
+        );
+        let a = authorization_header(&vhost, "devstoreaccount1", KEY).unwrap();
+        let b = authorization_header(&path_style, "devstoreaccount1", KEY).unwrap();
+        assert_ne!(a, b, "vhost and path-style canonical resources differ");
+        // Deterministic.
+        assert_eq!(
+            b,
+            authorization_header(&path_style, "devstoreaccount1", KEY).unwrap()
+        );
     }
 }
