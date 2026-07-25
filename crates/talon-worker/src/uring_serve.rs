@@ -204,6 +204,24 @@ mod tests {
         }
     }
 
+    /// Wait for `counter` to reach `want`, or panic after a deadline.
+    ///
+    /// The handler increments *after* writing its response, so a client can
+    /// observe its echo before the server-side increment is visible. Asserting
+    /// the count immediately is therefore racy — poll instead.
+    fn await_count(counter: &AtomicUsize, want: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while counter.load(Ordering::Relaxed) < want {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "counter reached {} of {want}",
+                counter.load(Ordering::Relaxed)
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(counter.load(Ordering::Relaxed), want);
+    }
+
     fn client_roundtrip(addr: &str, payload: &[u8; 4]) -> Vec<u8> {
         use std::io::{Read, Write};
         let mut s = std::net::TcpStream::connect(addr).unwrap();
@@ -248,7 +266,7 @@ mod tests {
             assert_eq!(client_roundtrip(&addr, b"ping"), b"ping");
         }
 
-        assert_eq!(served.load(Ordering::Relaxed), 40, "all requests served");
+        await_count(&served, 40);
         // The kernel hashes by 4-tuple, so distribution is not guaranteed to be
         // even — but with 40 distinct ephemeral ports across 4 rings it must
         // land on more than one thread. This is what proves the accepts really
@@ -291,6 +309,6 @@ mod tests {
             client_roundtrip(&addr, b"ping");
         }
         // One shared counter, incremented from whichever ring served.
-        assert_eq!(served.load(Ordering::Relaxed), 10);
+        await_count(&served, 10);
     }
 }
