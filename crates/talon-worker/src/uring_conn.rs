@@ -1,0 +1,765 @@
+//! Data-plane connection handling on an io_uring ring (#285).
+//!
+//! This is the completion-based counterpart to the Tokio `handle_conn` in
+//! `main.rs`. It serves the identical protocol — same frames, same limits, same
+//! error semantics — over monoio's owned-buffer I/O.
+//!
+//! # Why the sendfile path gets simpler
+//!
+//! The Tokio path cannot `sendfile` directly onto its socket: a Tokio
+//! `TcpStream` is non-blocking, so a blocking `sendfile` on it would spuriously
+//! `EAGAIN`. It therefore round-trips the socket out of and back into the
+//! runtime on **every transfer** — `into_std`, `set_nonblocking(false)`, move to
+//! a blocking thread, move back, `set_nonblocking(true)`, `from_std`.
+//!
+//! A ring-owned fd needs none of that. It is handed straight to the blocking
+//! pool, and the ring resumes on the same stream afterwards. Measured working
+//! in #273; the round-trip disappears entirely.
+//!
+//! # What is preserved exactly
+//!
+//! - per-message-type payload caps enforced *before* allocation, and read
+//!   timeouts (#111) — via [`talon_transport::uring::read_frame`];
+//! - `GetRange`/`Put`/`Delete` dispatch, with any other type rejected before
+//!   per-request work is done;
+//! - readiness gating, so an unready worker returns an error frame rather than
+//!   serving;
+//! - the desync rule: once a response header promising `len` bytes is on the
+//!   wire, a short `sendfile` cannot be reported as an error frame, so the
+//!   connection is dropped instead.
+//!
+//! # A Tokio context is still required on the ring thread
+//!
+//! This handler is monoio-native, but the worker *below* it is not.
+//! [`WorkerRuntime`] reaches Tokio internally: `block_store` runs its
+//! filesystem I/O on `tokio::task::spawn_blocking` so a large read or
+//! write-plus-fsync never stalls the reactor (#115), and parts of the miss path
+//! use Tokio timers and sync primitives. On a bare monoio ring those calls
+//! panic with *"there is no reactor running"*.
+//!
+//! So a ring thread must enter a Tokio runtime handle before driving these
+//! futures:
+//!
+//! ```ignore
+//! let _guard = tokio_handle.enter();   // makes spawn_blocking/timers work
+//! monoio_runtime.block_on(handle_conn(stream, worker, observability));
+//! ```
+//!
+//! This is coexistence, not a layering violation: the ring owns protocol
+//! scheduling and the zero-copy path, while Tokio's blocking pool absorbs
+//! filesystem work that must not run on either. Removing the dependency would
+//! mean porting `block_store` and the miss path to monoio's own blocking pool —
+//! worth doing eventually, but a separate change from the data plane itself.
+
+use std::os::fd::AsRawFd;
+use std::sync::Arc;
+use std::time::Instant;
+
+use monoio::net::TcpStream;
+use talon_core::BlockHandle;
+use talon_transport::data;
+use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
+use talon_transport::uring::{read_frame, write_all};
+
+use crate::observability::WorkerObservability;
+use crate::runtime::{ServeOutcome, WorkerRuntime};
+use crate::{send_file_range, DEFAULT_CHUNK};
+
+/// Serve one accepted data-plane connection until EOF or a fatal error.
+pub async fn handle_conn(
+    mut stream: TcpStream,
+    worker: Arc<WorkerRuntime>,
+    observability: Arc<WorkerObservability>,
+) -> anyhow::Result<()> {
+    let _active_connection = observability.metrics().track_connection();
+    loop {
+        let request_started = Instant::now();
+        let (header, payload) =
+            match read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT).await {
+                Ok(frame) => frame,
+                Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
+                Err(talon_transport::ReadFrameError::Timeout) => {
+                    tracing::debug!("worker: connection read timed out");
+                    return Ok(());
+                }
+                Err(e) => return Err(anyhow::anyhow!(e)),
+            };
+
+        match header.msg_type {
+            MsgType::Put => {
+                handle_put(
+                    &mut stream,
+                    &header,
+                    &payload,
+                    &worker,
+                    &observability,
+                    request_started,
+                )
+                .await?;
+                continue;
+            }
+            MsgType::Delete => {
+                handle_delete(
+                    &mut stream,
+                    &header,
+                    &payload,
+                    &worker,
+                    &observability,
+                    request_started,
+                )
+                .await?;
+                continue;
+            }
+            MsgType::GetRange => {}
+            // A data listener serves only GetRange/Put/Delete; anything else is
+            // rejected before any per-request work.
+            _ => {
+                let err =
+                    data::encode_error(header.request_id, "worker only serves GetRange/Put/Delete");
+                write_all(&mut stream, err).await?;
+                observability
+                    .metrics()
+                    .record_request_error(request_started.elapsed());
+                continue;
+            }
+        }
+
+        let (h, req) = match data::decode_request(&rejoin(&header, &payload)) {
+            Ok(v) => v,
+            Err(e) => {
+                let err = data::encode_error(header.request_id, &format!("bad request: {e}"));
+                write_all(&mut stream, err).await?;
+                observability
+                    .metrics()
+                    .record_request_error(request_started.elapsed());
+                continue;
+            }
+        };
+
+        if !observability.is_ready() {
+            let err = data::encode_error(h.request_id, "worker is not ready");
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
+
+        match worker.serve(&req).await {
+            Ok(ServeOutcome::Sendfile(handle)) => {
+                let len = handle.len;
+                let hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
+                write_all(&mut stream, hdr).await?;
+                match sendfile_payload(&stream, handle).await {
+                    Ok(()) => observability
+                        .metrics()
+                        .record_request_success(len, request_started.elapsed()),
+                    Err(error) => {
+                        // The header is already on the wire, so an error frame
+                        // would be read as payload. The connection is desynced;
+                        // drop it.
+                        observability
+                            .metrics()
+                            .record_request_error(request_started.elapsed());
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(ServeOutcome::Bytes(bytes)) => {
+                let hdr = data::response_header_ok(h.request_id, bytes.len() as u32).to_vec();
+                write_all(&mut stream, hdr).await?;
+                let n = bytes.len() as u64;
+                write_all(&mut stream, bytes.to_vec()).await?;
+                observability
+                    .metrics()
+                    .record_request_success(n, request_started.elapsed());
+            }
+            Err(e) => {
+                let err = data::encode_error(h.request_id, &e.to_string());
+                write_all(&mut stream, err).await?;
+                observability
+                    .metrics()
+                    .record_request_error(request_started.elapsed());
+            }
+        }
+    }
+}
+
+/// Rebuild the contiguous `header || payload` buffer the `data` decoders expect.
+fn rejoin(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+    full
+}
+
+/// Stream a resident block to the client with `sendfile(2)` from the blocking
+/// pool.
+///
+/// The ring keeps ownership of the socket throughout: only the raw fd crosses
+/// to the blocking thread, so there is no `into_std`/`from_std` round-trip and
+/// no non-blocking-mode toggling. `sendfile` must not run on the ring — it is
+/// blocking, and a slow client would stall every connection this ring owns.
+async fn sendfile_payload(stream: &TcpStream, handle: BlockHandle) -> anyhow::Result<()> {
+    let sock_fd = stream.as_raw_fd();
+    let len = handle.len;
+    let sent = monoio::spawn_blocking(move || {
+        // SAFETY-adjacent note: the fd outlives this call because `stream` is
+        // borrowed for the duration of the await, and the connection task is the
+        // only owner.
+        send_file_range(
+            &FdRef(sock_fd),
+            &handle.fd,
+            handle.offset,
+            handle.len,
+            DEFAULT_CHUNK,
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
+
+    if sent != len {
+        // sendfile hit EOF before the advertised length: the block file is
+        // shorter than the index claimed. The header already promised `len`
+        // bytes, so the connection is desynced.
+        anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; block file truncated");
+    }
+    Ok(())
+}
+
+/// A borrowed raw fd that satisfies [`AsRawFd`] without owning or closing it.
+struct FdRef(std::os::fd::RawFd);
+
+impl AsRawFd for FdRef {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.0
+    }
+}
+
+/// Handle a `Put`: read the object body off the wire, write through to the
+/// backend, cache it, and reply with the committed version.
+async fn handle_put(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<()> {
+    let (h, req) = match data::decode_put_header(&rejoin(header, payload)) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = data::encode_error(header.request_id, &format!("bad put: {e}"));
+            write_all(stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+    if !observability.is_ready() {
+        let err = data::encode_error(h.request_id, "worker is not ready");
+        write_all(stream, err).await?;
+        return Ok(());
+    }
+
+    // Read exactly body_len raw object bytes following the header.
+    use monoio::io::AsyncReadRentExt;
+    let (res, body) = stream.read_exact(vec![0u8; req.body_len as usize]).await;
+    res?;
+
+    match worker
+        .write_object(&req.object, bytes::Bytes::from(body))
+        .await
+    {
+        Ok(version) => {
+            let vbytes = version.as_str().as_bytes().to_vec();
+            let hdr = data::response_header_ok(h.request_id, vbytes.len() as u32).to_vec();
+            write_all(stream, hdr).await?;
+            write_all(stream, vbytes).await?;
+            observability
+                .metrics()
+                .record_request_success(req.body_len, request_started.elapsed());
+        }
+        Err(error) => {
+            let err = data::encode_error(h.request_id, &error.to_string());
+            write_all(stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(())
+}
+
+/// Handle a `Delete`: delete at the backend and evict locally.
+async fn handle_delete(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<()> {
+    let (h, req) = match data::decode_delete(&rejoin(header, payload)) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = data::encode_error(header.request_id, &format!("bad delete: {e}"));
+            write_all(stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+    if !observability.is_ready() {
+        let err = data::encode_error(h.request_id, "worker is not ready");
+        write_all(stream, err).await?;
+        return Ok(());
+    }
+    match worker.delete_object(&req.object).await {
+        Ok(()) => {
+            let hdr = data::response_header_ok(h.request_id, 0).to_vec();
+            write_all(stream, hdr).await?;
+            observability
+                .metrics()
+                .record_request_success(0, request_started.elapsed());
+        }
+        Err(error) => {
+            let err = data::encode_error(h.request_id, &error.to_string());
+            write_all(stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{BlockIndex, InFlightLoads, WholeBlockStore};
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use monoio::io::{AsyncReadRentExt, AsyncWriteRentExt};
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use talon_core::{
+        BackendStore, NodeId, NodeInfo, NodeRole, ObjectId, ObjectStat, Result, Version,
+    };
+    use talon_transport::data::{
+        encode_delete, encode_put_header, encode_request, DeleteRequest, PutRequest, RangeRequest,
+    };
+    use talon_transport::Flags;
+
+    fn tmp_root(tag: &str) -> std::path::PathBuf {
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        std::env::temp_dir().join(format!("talon-uring-conn-{tag}-{}-{n}", std::process::id()))
+    }
+
+    /// Deterministic ramp bytes so a range's expected content is computable.
+    struct RampBackend;
+
+    #[async_trait]
+    impl BackendStore for RampBackend {
+        async fn fetch_range(&self, _o: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            Ok(Bytes::from(
+                (0..len)
+                    .map(|i| ((offset + i) % 251) as u8)
+                    .collect::<Vec<u8>>(),
+            ))
+        }
+        async fn head(&self, _o: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: u64::MAX,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    /// Stores whole-object PUTs so a write-through can be read back.
+    #[derive(Default)]
+    struct StoringBackend {
+        objects: Mutex<HashMap<String, Bytes>>,
+        deleted: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl BackendStore for StoringBackend {
+        async fn fetch_range(&self, o: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            let objs = self.objects.lock().unwrap();
+            let full = objs
+                .get(&o.to_path())
+                .cloned()
+                .unwrap_or_else(|| Bytes::from_static(b""));
+            let start = (offset as usize).min(full.len());
+            let end = (start + len as usize).min(full.len());
+            Ok(full.slice(start..end))
+        }
+        async fn head(&self, o: &ObjectId) -> Result<ObjectStat> {
+            let objs = self.objects.lock().unwrap();
+            let len = objs.get(&o.to_path()).map(|b| b.len()).unwrap_or(0) as u64;
+            Ok(ObjectStat {
+                len,
+                version: Version::new("v1"),
+            })
+        }
+        async fn put(&self, o: &ObjectId, body: Bytes) -> Result<Version> {
+            self.objects.lock().unwrap().insert(o.to_path(), body);
+            Ok(Version::new("v2"))
+        }
+        async fn delete(&self, o: &ObjectId) -> Result<()> {
+            self.objects.lock().unwrap().remove(&o.to_path());
+            self.deleted.lock().unwrap().push(o.to_path());
+            Ok(())
+        }
+    }
+
+    fn build(
+        root: &std::path::Path,
+        backend: Arc<dyn BackendStore>,
+        block_size: u32,
+    ) -> (Arc<WorkerRuntime>, Arc<WorkerObservability>) {
+        let index = Arc::new(BlockIndex::new());
+        let inflight = Arc::new(InFlightLoads::new());
+        let node = NodeInfo {
+            id: NodeId::new("w"),
+            address: "127.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let obs = Arc::new(
+            WorkerObservability::new(
+                "c".into(),
+                node,
+                "127.0.0.1:8001".into(),
+                1024,
+                Arc::clone(&index),
+                Arc::clone(&inflight),
+            )
+            .unwrap(),
+        );
+        obs.readiness().set_backend_ready(true);
+        obs.readiness().set_store_ready(true);
+        obs.readiness().set_control_registered(true);
+        let worker = Arc::new(WorkerRuntime::new(
+            WholeBlockStore::open(root).unwrap(),
+            index,
+            inflight,
+            backend,
+            block_size,
+            0,
+            obs.metrics().clone(),
+        ));
+        (worker, obs)
+    }
+
+    /// Drive `fut` on an io_uring ring with a Tokio context entered.
+    ///
+    /// `WorkerRuntime` reaches Tokio internally — `block_store` runs its
+    /// filesystem I/O on `tokio::task::spawn_blocking` (#115), and parts of the
+    /// miss path use Tokio timers and sync primitives. A bare monoio ring has
+    /// no Tokio reactor, so those calls panic with "there is no reactor
+    /// running". Entering a Tokio handle on the ring thread makes both
+    /// available, which is what the production runtime does too.
+    fn run<F: std::future::Future>(fut: F) -> F::Output {
+        let tokio_rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let _guard = tokio_rt.enter();
+        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .attach_thread_pool(Box::new(monoio::blocking::DefaultThreadPool::new(4)))
+            .enable_timer()
+            .build()
+            .expect("io_uring runtime")
+            .block_on(fut)
+    }
+
+    /// Read one framed response: header then exactly `length` body bytes.
+    async fn read_response(c: &mut TcpStream) -> (FrameHeader, Vec<u8>) {
+        let (r, hdr) = c.read_exact(vec![0u8; HEADER_LEN]).await;
+        r.unwrap();
+        let header = FrameHeader::decode(&hdr).unwrap();
+        let body = if header.length > 0 {
+            let (r, b) = c.read_exact(vec![0u8; header.length as usize]).await;
+            r.unwrap();
+            b
+        } else {
+            Vec::new()
+        };
+        (header, body)
+    }
+
+    /// The core guarantee: a miss (Bytes path) and a subsequent hit (sendfile
+    /// path) return byte-identical ranges. This mirrors the Tokio test in
+    /// main.rs assertion-for-assertion, so any divergence between the two data
+    /// planes shows up here.
+    #[test]
+    fn serves_a_hit_via_sendfile_byte_exact() {
+        let root = tmp_root("hit");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 16);
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+            let req = RangeRequest {
+                object: obj,
+                offset: 3,
+                len: 8,
+            };
+            let expected: Vec<u8> = (0..8u64).map(|i| ((3 + i) % 251) as u8).collect();
+            let mut c = TcpStream::connect(addr).await.unwrap();
+
+            // First is a miss (Bytes), second a resident hit (sendfile).
+            for pass in 0..2 {
+                let (r, _) = c.write_all(encode_request(0, &req).unwrap()).await;
+                r.unwrap();
+                let (header, body) = read_response(&mut c).await;
+                assert!(
+                    !header.flags.contains(Flags::ERROR),
+                    "pass {pass}: worker returned an error frame"
+                );
+                assert_eq!(body, expected, "pass {pass}: range bytes must match");
+            }
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A range spanning more than one chunk exercises the sendfile loop rather
+    /// than a single syscall.
+    #[test]
+    fn sendfile_streams_a_multi_chunk_range() {
+        let root = tmp_root("multi");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 1 << 20);
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "big");
+            let len = 300 * 1024u64;
+            let req = RangeRequest {
+                object: obj,
+                offset: 0,
+                len,
+            };
+            let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            for _ in 0..2 {
+                let (r, _) = c.write_all(encode_request(0, &req).unwrap()).await;
+                r.unwrap();
+                let (header, body) = read_response(&mut c).await;
+                assert!(!header.flags.contains(Flags::ERROR));
+                assert_eq!(body.len(), len as usize);
+                assert_eq!(body, expected);
+            }
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A frame type the data plane does not serve is rejected with an error
+    /// frame, and the connection stays usable for the next request.
+    #[test]
+    fn rejects_unsupported_frame_type_and_keeps_serving() {
+        let root = tmp_root("badtype");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 16);
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            // A Ping is valid on the wire but not served by the data plane.
+            let ping = FrameHeader::new(MsgType::Ping, 1, 0).encode().to_vec();
+            let (r, _) = c.write_all(ping).await;
+            r.unwrap();
+            let (header, _) = read_response(&mut c).await;
+            assert!(header.flags.contains(Flags::ERROR));
+
+            // The connection must still serve a valid request afterwards.
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+            let req = RangeRequest {
+                object: obj,
+                offset: 0,
+                len: 4,
+            };
+            let (r, _) = c.write_all(encode_request(2, &req).unwrap()).await;
+            r.unwrap();
+            let (header, body) = read_response(&mut c).await;
+            assert!(!header.flags.contains(Flags::ERROR));
+            assert_eq!(body, vec![0, 1, 2, 3]);
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Write-through: a Put stores at the backend and the bytes read back.
+    #[test]
+    fn put_writes_through_and_reads_back() {
+        let root = tmp_root("put");
+        run(async {
+            let backend = Arc::new(StoringBackend::default());
+            let (worker, obs) = build(
+                &root,
+                Arc::clone(&backend) as Arc<dyn BackendStore>,
+                1 << 20,
+            );
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "written");
+            let body = b"hello uring data plane".to_vec();
+            let mut c = TcpStream::connect(addr).await.unwrap();
+
+            let put = encode_put_header(
+                1,
+                &PutRequest {
+                    object: obj.clone(),
+                    body_len: body.len() as u64,
+                },
+            )
+            .unwrap();
+            let (r, _) = c.write_all(put).await;
+            r.unwrap();
+            let (r, _) = c.write_all(body.clone()).await;
+            r.unwrap();
+            let (header, version) = read_response(&mut c).await;
+            assert!(!header.flags.contains(Flags::ERROR));
+            assert_eq!(String::from_utf8(version).unwrap(), "v2");
+
+            // Read the object back through the same connection.
+            let req = RangeRequest {
+                object: obj.clone(),
+                offset: 0,
+                len: body.len() as u64,
+            };
+            let (r, _) = c.write_all(encode_request(2, &req).unwrap()).await;
+            r.unwrap();
+            let (header, got) = read_response(&mut c).await;
+            assert!(!header.flags.contains(Flags::ERROR));
+            assert_eq!(got, body);
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Delete removes the object at the backend.
+    #[test]
+    fn delete_removes_the_object() {
+        let root = tmp_root("del");
+        run(async {
+            let backend = Arc::new(StoringBackend::default());
+            let (worker, obs) = build(
+                &root,
+                Arc::clone(&backend) as Arc<dyn BackendStore>,
+                1 << 20,
+            );
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "doomed");
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            let put = encode_put_header(
+                1,
+                &PutRequest {
+                    object: obj.clone(),
+                    body_len: 3,
+                },
+            )
+            .unwrap();
+            let (r, _) = c.write_all(put).await;
+            r.unwrap();
+            let (r, _) = c.write_all(b"abc".to_vec()).await;
+            r.unwrap();
+            let _ = read_response(&mut c).await;
+
+            let (r, _) = c
+                .write_all(
+                    encode_delete(
+                        2,
+                        &DeleteRequest {
+                            object: obj.clone(),
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await;
+            r.unwrap();
+            let (header, _) = read_response(&mut c).await;
+            assert!(!header.flags.contains(Flags::ERROR));
+            assert_eq!(backend.deleted.lock().unwrap().len(), 1);
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// An unready worker refuses to serve rather than returning stale or empty
+    /// data.
+    #[test]
+    fn unready_worker_returns_an_error_frame() {
+        let root = tmp_root("unready");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 16);
+            obs.readiness().set_backend_ready(false);
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+            let req = RangeRequest {
+                object: obj,
+                offset: 0,
+                len: 4,
+            };
+            let mut c = TcpStream::connect(addr).await.unwrap();
+            let (r, _) = c.write_all(encode_request(0, &req).unwrap()).await;
+            r.unwrap();
+            let (header, _) = read_response(&mut c).await;
+            assert!(header.flags.contains(Flags::ERROR));
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A clean disconnect ends the loop without an error.
+    #[test]
+    fn clean_disconnect_ends_the_connection() {
+        let root = tmp_root("eof");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 16);
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            let served = monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                handle_conn(s, worker, obs).await
+            });
+            let c = TcpStream::connect(addr).await.unwrap();
+            drop(c);
+            assert!(served.await.is_ok());
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+}
