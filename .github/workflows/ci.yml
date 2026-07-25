@@ -213,6 +213,9 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose --profile ha config --quiet
+          # The latency lab is a standalone stack; validate it parses too.
+          docker compose -f deploy/testenv/docker-compose.yml config --quiet
+          docker compose -f deploy/testenv/docker-compose.yml --profile tools config --quiet
       - name: Build coordinator image
         uses: docker/build-push-action@v6
         with:
