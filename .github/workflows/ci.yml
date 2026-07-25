@@ -58,6 +58,36 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-features --locked
 
+  fuse-mount:
+    name: fuse mount e2e
+    runs-on: ubuntu-latest
+    # The read-path unit/integration tests never touch the kernel (they use mock
+    # TCP servers). This job mounts a real TalonFuse on /dev/fuse and reads a
+    # file back through the kernel, asserting byte-exactness end to end — the one
+    # layer only a real mount can cover. GitHub's Linux runners provide an
+    # accessible /dev/fuse; macOS and restricted sandboxes do not, which is why
+    # the test is #[ignore]d and gated behind the `mount` feature by default.
+    env:
+      # Turn a missing/unusable /dev/fuse into a hard failure here, so this job
+      # can never pass without actually exercising the kernel mount path.
+      TALON_REQUIRE_FUSE: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify /dev/fuse is available
+        run: |
+          if [ ! -e /dev/fuse ]; then
+            echo "::error::/dev/fuse is missing on this runner; the FUSE mount test cannot run"
+            exit 1
+          fi
+          ls -l /dev/fuse
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the real-kernel mount test
+        run: >-
+          cargo test -p talon-fuse --features mount --test mount_e2e --locked
+          -- --ignored --nocapture
+
   docs:
     name: doc
     runs-on: ubuntu-latest
