@@ -37,3 +37,4 @@ axum.workspace = true
 
 [dev-dependencies]
 divan.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
