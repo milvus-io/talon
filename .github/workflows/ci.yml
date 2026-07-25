@@ -323,6 +323,43 @@ jobs:
       - name: Run the S3 e2e test
         run: cargo test -p talon-backend --test s3_e2e --locked -- --nocapture
 
+  gcs-e2e:
+    name: gcs backend e2e (fake-gcs)
+    runs-on: ubuntu-latest
+    # Exercises the real GcsBackend (bearer auth + endpoint override) against
+    # fake-gcs-server, reading bytes an object actually contains. The test skips
+    # when TALON_GCS_TEST_ENDPOINT is unset; this job sets it after seeding.
+    # fake-gcs is launched explicitly (docker run) rather than as a service
+    # container so we can pass `-scheme http` for a plaintext endpoint.
+    env:
+      TALON_GCS_TEST_ENDPOINT: http://127.0.0.1:4443
+      TALON_GCS_TEST_BUCKET: talon-e2e
+      TALON_GCS_TEST_KEY: e2e/object.bin
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Start fake-gcs-server and seed a deterministic object
+        run: |
+          docker run -d --name fake-gcs -p 4443:4443 \
+            fsouza/fake-gcs-server:1.49 -scheme http -port 4443
+          # Wait for it to answer.
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:4443/storage/v1/b >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          # 4096 bytes where byte i == i % 251 (matches the test's expectation).
+          python3 -c "open('/tmp/object.bin','wb').write(bytes(i%251 for i in range(4096)))"
+          curl -sf -X POST "http://127.0.0.1:4443/storage/v1/b?project=talon" \
+            -H 'Content-Type: application/json' -d '{"name":"talon-e2e"}' || true
+          curl -sf -X POST \
+            "http://127.0.0.1:4443/upload/storage/v1/b/talon-e2e/o?uploadType=media&name=e2e/object.bin" \
+            -H 'Content-Type: application/octet-stream' \
+            --data-binary @/tmp/object.bin
+      - uses: Swatinem/rust-cache@v2
+      - name: Run the GCS e2e test
+        run: cargo test -p talon-backend --test gcs_e2e --locked -- --nocapture
+
   bench:
     name: bench (informational)
     runs-on: ubuntu-latest
