@@ -12,6 +12,7 @@ talon-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tokio = { workspace = true, features = ["time"] }
 
 [dev-dependencies]
-tokio.workspace = true
+tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
