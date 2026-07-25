@@ -2,6 +2,15 @@
 
 [Introduction](./introduction.md)
 
+# Use cases
+
+- [Overview](./use-cases/overview.md)
+- [Model training](./use-cases/training.md)
+- [Checkpointing](./use-cases/checkpointing.md)
+- [Notebooks and data sharing](./use-cases/notebooks.md)
+- [Cross-cloud and remote data](./use-cases/cross-cloud.md)
+- [Analytics and shuffle](./use-cases/analytics.md)
+
 # Installation
 
 - [Docker](./installation/docker.md)
@@ -26,6 +35,7 @@
 # Explanation
 
 - [Design (v1)](./explanation/design.md)
+- [Data-plane runtime: choosing io_uring](./explanation/data-plane-runtime.md)
 - [ADR 0001: Management-plane HA](./explanation/adr-0001-management-plane-ha.md)
 
 # Contributing
