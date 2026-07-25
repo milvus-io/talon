@@ -22,7 +22,7 @@ pub use block_reader::{BlockReadError, BlockReader, FileView};
 pub use coordinator_client::{
     CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
 };
-pub use mapping::{object_to_path, path_to_object, resolve_read, ReadTarget};
+pub use mapping::{path_to_object, resolve_read, ReadTarget};
 pub use metrics::{ReadStats, ReadStatsSnapshot};
 #[cfg(feature = "mount")]
 pub use mount::{TalonFuse, CANONICAL_MOUNT_VERSION};
