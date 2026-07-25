@@ -49,10 +49,15 @@ pub enum MsgType {
     Get = 1,
     /// Data-plane sub-range fetch.
     GetRange = 2,
-    /// Data-plane ingest.
+    /// Data-plane ingest (whole-object write-through, #226): a bincode
+    /// [`PutRequest`](crate::data::PutRequest) header followed by the raw object
+    /// bytes.
     Put = 3,
     /// Ping/keepalive; no payload.
     Ping = 4,
+    /// Data-plane delete (#226): a bincode
+    /// [`DeleteRequest`](crate::data::DeleteRequest) header, no body.
+    Delete = 5,
 }
 
 impl MsgType {
@@ -64,6 +69,7 @@ impl MsgType {
             2 => MsgType::GetRange,
             3 => MsgType::Put,
             4 => MsgType::Ping,
+            5 => MsgType::Delete,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }

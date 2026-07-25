@@ -39,13 +39,17 @@ pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The maximum accepted payload length for a given message type.
 ///
-/// Data-plane frames (`Get`/`GetRange`/`Put`) may be large (a block), so they
-/// keep the transport maximum; control and ping frames are capped tightly.
+/// `Get`/`GetRange` data frames may be large (a block), so they keep the
+/// transport maximum. A `Put`/`Delete` *frame* only carries a small bincode
+/// header (the raw object body for a Put streams separately and is length-capped
+/// by the worker, not by this frame limit), so they are capped tightly like
+/// control frames. Ping frames are capped tightly too.
 pub fn max_payload_for(msg_type: MsgType) -> u32 {
     match msg_type {
         MsgType::Control => MAX_CONTROL_PAYLOAD_LEN,
         MsgType::Ping => MAX_PING_PAYLOAD_LEN,
-        MsgType::Get | MsgType::GetRange | MsgType::Put => MAX_PAYLOAD_LEN,
+        MsgType::Put | MsgType::Delete => MAX_CONTROL_PAYLOAD_LEN,
+        MsgType::Get | MsgType::GetRange => MAX_PAYLOAD_LEN,
     }
 }
 
