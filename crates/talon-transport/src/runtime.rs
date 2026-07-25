@@ -1,19 +1,26 @@
-//! Per-process runtime scaffolding for the master/worker/client.
+//! Per-process runtime scaffolding for the coordinator/worker/client.
 //!
-//! DESIGN.md's Layer-1 design runs each process on a single-threaded
-//! `monoio::Runtime<IoUringDriver>` that owns accept, frame-header read/write,
+//! This is DESIGN.md's **Layer 1**: it owns accept, frame-header read/write,
 //! small control messages, scheduling, timers, and metrics — while **large
-//! payload bytes never traverse this ring** (they move via `sendfile`/`splice`
-//! in the blocking helper pool).
+//! payload bytes never traverse it** (they move via `sendfile`/`splice` in the
+//! blocking helper pool, which is Layer 2 and runtime-neutral).
 //!
-//! This module provides that shape on a portable Tokio backend so it builds and
-//! is testable everywhere (io_uring is not always available in CI/sandboxes);
-//! the monoio driver is a drop-in swap behind the same [`Server`] API. It gives:
+//! Layer 1 runs on **Tokio**. DESIGN.md targets a thread-per-core io_uring
+//! runtime (monoio) here, which benchmarks better on latency, per-core
+//! throughput, and memory (see issue #273). That migration is **not** a
+//! drop-in swap behind this [`Server`] API: monoio's futures are `!Send` (the
+//! [`Handler`] bound and `tokio::spawn` both assume otherwise) and its I/O
+//! traits move buffer ownership in and out per operation rather than borrowing,
+//! so every socket read/write site is rewritten. Tokio is used here because
+//! io_uring is unavailable on many CI runners and sandboxes, and a portable
+//! backend keeps the whole read path buildable and testable everywhere.
+//!
+//! It gives:
 //!
 //! - an **accept loop** ([`Server::serve`]) that reads a [`FrameHeader`] per
 //!   connection and dispatches to a [`Handler`],
-//! - an **off-ring blocking pool** ([`spawn_blocking`]) for the zero-copy
-//!   syscalls, so no `sendfile`/`splice` ever blocks the ring, and
+//! - an **off-reactor blocking pool** ([`spawn_blocking`]) for the zero-copy
+//!   syscalls, so no `sendfile`/`splice` ever blocks protocol scheduling, and
 //! - **graceful shutdown** via a [`Shutdown`] handle that stops the accept loop
 //!   and lets in-flight connections drain.
 
