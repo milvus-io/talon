@@ -2,6 +2,12 @@
 
 [Introduction](./introduction.md)
 
+# Installation
+
+- [Docker](./installation/docker.md)
+- [Kubernetes](./installation/kubernetes.md)
+- [From source](./installation/source.md)
+
 # Tutorials
 
 - [Getting started](./tutorials/getting-started.md)
