@@ -87,8 +87,9 @@ scheduling lives here. **Large object bytes never enter userspace through this
 layer** — that invariant is what makes Layer 2 possible, and it holds under any
 runtime.
 
-**As built (v1): Tokio.** `talon_transport::runtime::Server` is a
-multi-threaded Tokio accept loop. This was a deliberate portability choice:
+**As built (v1): Tokio.** `worker/main.rs` and `coordinator/main.rs` each run
+their own multi-threaded Tokio accept loop. This was a deliberate portability
+choice:
 io_uring is unavailable on many CI runners and container sandboxes, and a
 portable backend keeps the entire read path buildable and testable everywhere.
 
@@ -112,8 +113,9 @@ from 1 to 16 rings — there is no cross-ring contention to amortize.
 
 **Migration is not a drop-in swap.** The real surface, in rough cost order:
 
-- **`!Send` task model.** `Handler: Send + Sync + 'static` and `tokio::spawn`
-  are baked into `Server`. monoio is thread-per-core with `!Send` futures.
+- **`!Send` task model.** The accept loops spawn each connection with
+  `tokio::spawn`, which requires `Send` futures. monoio is thread-per-core with
+  `!Send` futures, so connection state may not cross threads.
 - **Buffer-ownership I/O traits.** Tokio borrows buffers
   (`read_exact(&mut buf)`); monoio's `AsyncReadRent`/`AsyncWriteRent` move
   ownership in and back out, because io_uring is completion-based and the kernel
@@ -128,9 +130,13 @@ from 1 to 16 rings — there is no cross-ring contention to amortize.
   `into_std` → `set_nonblocking` → `from_std` round-trip the current Tokio path
   pays per transfer is needed. Migrating *removes* that code.
 
-Scope, if taken: `transport::Server`, the worker connection loop, and
-`fuse::worker_client`. Everything else stays on Tokio by design (see
-*Runtime split* below).
+Scope, if taken: the `worker/main.rs` accept loop and `handle_conn` (including
+`handle_put`/`handle_delete`), `transport::read_frame` (generic over Tokio's
+`AsyncRead`), and `fuse::worker_client` as the client side of the same
+protocol. `WorkerRuntime::serve` and everything below it is unaffected —
+`Arc<dyn BackendStore>` is fine, since the `!Send` constraint applies to
+futures crossing threads, not to shared state within a ring. Everything else
+stays on Tokio by design (see *Runtime split* below).
 
 ### Layer 2 — bulk data movement (Linux zero-copy syscalls) — built
 
