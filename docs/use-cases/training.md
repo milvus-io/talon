@@ -38,6 +38,11 @@ misses.
 **Requires no application change.** Training code opens files under the FUSE
 mount; the framework's existing data loader works unmodified.
 
+**Runs on the training node without competing for it.** A worker can sit on the
+same host as the job: one CPU and ~7 MB of RSS serves ~49k range reads per
+second, and its CPU cost is pinned rather than elastic. See
+[Colocated and sidecar deployment](./colocated.md).
+
 ## Practical notes
 
 - **Block size matters.** The 256 MiB default suits large shard files. Datasets

@@ -43,3 +43,5 @@ saves disappointment:
 - [Notebooks and data sharing](./notebooks.md) — interactive access to shared data.
 - [Cross-cloud transfer](./cross-cloud.md) — reading data that lives in another cloud.
 - [Analytics and shuffle](./analytics.md) — columnar scans and intermediate data.
+- [Colocated and sidecar deployment](./colocated.md) — running next to the compute
+  it serves, on a bounded CPU and memory budget.
