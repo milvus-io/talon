@@ -10,6 +10,7 @@
 - [Notebooks and data sharing](./use-cases/notebooks.md)
 - [Cross-cloud and remote data](./use-cases/cross-cloud.md)
 - [Analytics and shuffle](./use-cases/analytics.md)
+- [Colocated and sidecar deployment](./use-cases/colocated.md)
 
 # Installation
 
