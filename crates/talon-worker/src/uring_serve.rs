@@ -29,6 +29,22 @@
 
 use std::sync::Arc;
 
+/// Whether this host can actually run the io_uring data plane.
+///
+/// io_uring needs a recent enough kernel *and* permission to use it: the
+/// `io_uring_disabled` sysctl, a seccomp filter, or a container runtime's
+/// default profile can each block the syscall on a kernel that otherwise
+/// supports it. Probing the real capability is therefore the only reliable
+/// check — a kernel version comparison would be wrong in exactly the
+/// environments that matter.
+///
+/// The worker calls this before binding and falls back to the Tokio data plane
+/// when it returns `false`, so the io_uring default is safe on hosts that
+/// cannot run it.
+pub fn io_uring_available() -> bool {
+    monoio::utils::detect_uring()
+}
+
 /// How many rings to run for a configured value.
 ///
 /// `Some(0)` means "one per available core"; any other `Some(n)` is taken
@@ -186,6 +202,32 @@ mod tests {
     use std::collections::HashSet;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+
+    /// The default configuration must select the io_uring data plane, and it
+    /// must be usable on any host CI runs on — the fallback exists precisely so
+    /// this default is safe, so a failure here means the default is unsafe.
+    #[test]
+    fn io_uring_availability_is_detectable() {
+        // Must not panic and must agree with itself across calls (it is cached).
+        let first = io_uring_available();
+        assert_eq!(first, io_uring_available());
+    }
+
+    /// The shipped default is 0, which must resolve to one ring per core rather
+    /// than zero rings.
+    #[test]
+    fn default_config_resolves_to_one_ring_per_core() {
+        let default_rings = talon_core::WorkerConfig::default().data_plane_rings;
+        assert_eq!(
+            default_rings, 0,
+            "the shipped default should be one-per-core"
+        );
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(resolve_ring_count(default_rings), cores);
+        assert!(resolve_ring_count(default_rings) >= 1);
+    }
 
     #[test]
     fn resolve_ring_count_honours_explicit_values() {

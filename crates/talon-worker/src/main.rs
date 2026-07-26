@@ -57,6 +57,12 @@ const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
 /// pinned: a large pool per ring would oversubscribe the cores they sit on.
 const URING_BLOCKING_THREADS_PER_RING: usize = 4;
 
+/// Set to `1` to pin the legacy Tokio data plane regardless of io_uring
+/// availability. An escape hatch for operators who hit a regression; the
+/// io_uring path is the default because it wins decisively under the
+/// connection counts a cache fleet actually produces (see #285).
+const FORCE_TOKIO_ENV: &str = "TALON_WORKER_FORCE_TOKIO_DATA_PLANE";
+
 /// Command-line arguments for a Talon worker.
 #[derive(Debug, Parser)]
 #[command(name = "talon-worker", version, about)]
@@ -90,8 +96,9 @@ struct Args {
     block_size: Option<u32>,
     /// Serve the data plane on N io_uring rings (thread-per-core).
     ///
-    /// `0` means one ring per available core. Omit to use the portable Tokio
-    /// data plane, which remains the default (#285).
+    /// `0` (the default) means one ring per available core. The worker falls
+    /// back to the Tokio data plane automatically if io_uring is unavailable;
+    /// set TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 to pin it explicitly.
     #[arg(long)]
     data_plane_rings: Option<usize>,
 }
@@ -368,8 +375,23 @@ async fn main() -> anyhow::Result<()> {
 
     // Serve the data plane, on io_uring rings if configured (#285) or on the
     // portable Tokio path otherwise.
-    if let Some(configured) = cfg.data_plane_rings {
-        let rings = talon_worker::uring_serve::resolve_ring_count(configured);
+    // The io_uring data plane is the default. Fall back to the portable Tokio
+    // path when the host cannot run it (older kernel, restrictive seccomp, some
+    // container runtimes) or when an operator pins the legacy path explicitly.
+    let force_tokio = std::env::var(FORCE_TOKIO_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let uring_available = talon_worker::uring_serve::io_uring_available();
+    if force_tokio {
+        tracing::info!("{FORCE_TOKIO_ENV} is set; serving the data plane on the Tokio path");
+    } else if !uring_available {
+        tracing::warn!(
+            "io_uring is unavailable on this host; falling back to the Tokio \
+             data plane. Performance will be lower under high connection counts."
+        );
+    }
+    if !force_tokio && uring_available {
+        let rings = talon_worker::uring_serve::resolve_ring_count(cfg.data_plane_rings);
         tracing::info!(
             listen = %cfg.listen,
             rings,

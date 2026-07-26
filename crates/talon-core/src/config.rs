@@ -120,15 +120,21 @@ pub struct WorkerConfig {
     /// GCS endpoint host override (e.g. a fake-gcs-server host). Defaults to
     /// `storage.googleapis.com`. A value with an `http://` scheme is plaintext.
     pub gcs_endpoint: Option<String>,
-    /// Number of io_uring rings serving the data plane, or `None` for the
-    /// portable Tokio path.
+    /// Number of io_uring rings serving the data plane.
     ///
-    /// `Some(n)` runs the thread-per-core data plane: `n` threads, each with its
-    /// own `monoio` ring pinned to a core, all binding the listen address with
-    /// `SO_REUSEPORT` so the kernel distributes accepts. `Some(0)` means one
-    /// ring per available core. Defaults to `None` while the Tokio path remains
-    /// the shipped default (#285).
-    pub data_plane_rings: Option<usize>,
+    /// Runs the thread-per-core data plane: `n` threads, each with its own
+    /// `monoio` ring pinned to a core, all binding the listen address with
+    /// `SO_REUSEPORT` so the kernel distributes accepts.
+    ///
+    /// - `0` (the default) means **one ring per available core**.
+    /// - `n > 0` runs exactly `n` rings.
+    ///
+    /// The worker falls back to the portable Tokio data plane automatically
+    /// when io_uring is unavailable (older kernels, restrictive seccomp, some
+    /// container runtimes), so this default is safe everywhere. Set
+    /// `data_plane_rings = 1` with `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` to
+    /// pin the legacy path explicitly.
+    pub data_plane_rings: usize,
 }
 
 /// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
@@ -191,7 +197,7 @@ impl Default for WorkerConfig {
             s3_access_key_id: None,
             s3_path_style: None,
             gcs_endpoint: None,
-            data_plane_rings: None,
+            data_plane_rings: 0,
         }
     }
 }
@@ -415,10 +421,10 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar {
         env: "TALON_WORKER_DATA_PLANE_RINGS",
         key: "data_plane_rings",
-        default: None,
+        default: Some("0 (one ring per core)"),
         cli: true,
         secret: false,
-        help: "io_uring rings for the data plane; 0 = one per core, unset = Tokio path.",
+        help: "io_uring rings for the data plane; 0 = one per core. Falls back to Tokio if io_uring is unavailable.",
     },
     ConfigVar {
         env: "TALON_WORKER_S3_REGION",
@@ -657,7 +663,7 @@ impl WorkerConfig {
             backend_throughput_bytes: merged
                 .backend_throughput_bytes
                 .or(d.backend_throughput_bytes),
-            data_plane_rings: merged.data_plane_rings.or(d.data_plane_rings),
+            data_plane_rings: merged.data_plane_rings.unwrap_or(d.data_plane_rings),
         };
         cfg.validate()?;
         Ok(cfg)

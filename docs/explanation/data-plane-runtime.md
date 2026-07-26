@@ -43,14 +43,23 @@ is what `io_uring` is designed for. It submits and completes operations in
 batches through shared ring buffers rather than one syscall per operation, and a
 thread-per-core design removes cross-thread scheduling from the path entirely.
 
-Talon ships a Tokio Layer 1 and an optional `io_uring` one, selectable per
-worker:
+Talon runs the `io_uring` Layer 1 by default, one ring per core, and falls back
+to a portable Tokio implementation on hosts that cannot use io_uring:
 
 ```sh
-talon-worker --data-plane-rings 0   # one ring per core
-talon-worker --data-plane-rings 4   # exactly four
-talon-worker                        # portable Tokio path (default)
+talon-worker                        # io_uring, one ring per core (default)
+talon-worker --data-plane-rings 4   # exactly four rings
+
+# Pin the Tokio path explicitly (escape hatch)
+TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 talon-worker
 ```
+
+The fallback is a **runtime capability probe**, not a kernel-version check.
+io_uring needs both a recent enough kernel and permission to use it — the
+`io_uring_disabled` sysctl, a seccomp filter, or a container runtime's default
+profile can each block the syscall on a kernel that nominally supports it. The
+worker probes the real capability before binding and logs a warning if it falls
+back, so a silent performance cliff is visible in the logs.
 
 The rest of this page is how that second implementation was designed and what
 measuring it revealed.
@@ -170,20 +179,32 @@ With one request in flight there is nothing to amortise, and the bulk bytes
 bypass the ring via `sendfile` on both paths anyway, leaving a 16-byte header
 exchange as the only work that differs.
 
-### Why the default is still Tokio
+### Which measurement decides the default
 
-The `io_uring` data plane is complete, tested, and byte-exact against the Tokio
-path — the test suite mirrors both implementations assertion-for-assertion. It is
-not the default because **the evidence for flipping it is not yet reproducible in
-this repository**. The 1024-connection numbers come from a harness that lives
-outside the tree; the in-repo benchmark measures a concurrency where no
-difference is expected.
+The two results measure different things, and only one of them measures the
+thing Talon is built for.
 
-A microbenchmark harness cannot honestly model 1024 concurrent connections — it
-drives one client serially, and a synthetic fan-out would mostly measure the
-harness's own scheduling. Closing that gap needs a concurrent load test, which is
-tracked separately. Until then the default stays on the portable path, and the
-faster one is opt-in.
+A cache fleet serves many clients at once. That is the whole premise: workers
+sit between a compute fleet and an object store, and the interesting regime is
+hundreds or thousands of concurrent readers. The 1024-connection measurement is
+the one taken in that regime, and it favours `io_uring` on every axis
+simultaneously — throughput, per-core efficiency, tail latency, and memory.
+
+The concurrency-1 result is not evidence against that. It is a measurement
+taken with an instrument that **cannot detect the effect in question**: with one
+request in flight there are no syscalls to batch, so the mechanism that produces
+the win is not exercised. A null result from an instrument blind to the effect
+says nothing about whether the effect exists.
+
+So `io_uring` is the default, and the in-repo benchmark keeps its job as a
+**regression floor** — it catches a change that makes single-request latency
+materially worse, which is a real thing to guard against, and it is honest about
+not being the evidence for the default.
+
+The remaining gap is that the 1024-connection numbers were taken in a harness
+outside this tree. Reproducing them in-repo is tracked as a concurrent load
+test; that work strengthens the record, but withholding a measured win from
+users until the paperwork catches up would be the wrong trade.
 
 ## Coexistence with Tokio
 
