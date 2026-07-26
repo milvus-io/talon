@@ -60,8 +60,54 @@ those benches are added in a separate tier when the transport layer lands.
 
   A Divan harness cannot model that concurrency honestly — a synthetic fan-out
   inside `bench()` would mostly measure the harness's own scheduling. So this
-  bench is a **regression floor**, not the evidence for changing which data
-  plane ships by default. That decision needs a concurrent load test.
+  bench is a **regression floor**, not the evidence for how the planes compare
+  under load. That question is answered by the load test below.
+
+## Concurrent load test
+
+`scripts/dataplane_loadtest.sh` drives a real worker with many connections in
+flight and reports the latency distribution. This is the measurement Divan
+cannot make, and the evidence behind the io_uring default.
+
+```sh
+scripts/dataplane_loadtest.sh                        # sweep 1/64/256/1024
+CONNS=1,512 SECONDS_PER=30 scripts/dataplane_loadtest.sh
+```
+
+It starts a coordinator, a local blob origin, and a worker on each data plane in
+turn, then sweeps connection counts against each. Results on a 16-core EPYC
+7763, 64 KiB ranges, 10 s measured after a 3 s warmup:
+
+| conns | io_uring rps | tokio rps | io_uring p50 | tokio p50 | io_uring p99 | tokio p99 |
+|---|---|---|---|---|---|---|
+| 1 | 5,636 | 4,837 | 161 µs | 191 µs | 259 µs | 293 µs |
+| 64 | 54,755 | 55,191 | 900 µs | 1,057 µs | 5,371 µs | 2,853 µs |
+| 256 | 42,417 | 56,999 | 1,243 µs | 3,835 µs | 7,423 µs | 10,283 µs |
+| **1024** | **51,668** | 41,060 | **1,175 µs** | 19,905 µs | **4,781 µs** | 72,911 µs |
+
+At 1024 connections io_uring delivers **26% more throughput at 17× lower p50 and
+15× lower p99**, using comparable CPU and 19% less memory.
+
+**The middle of the sweep is not monotonic, and that is worth knowing.** At 64
+and 256 connections Tokio sometimes wins — work-stealing balances a moderate
+load well, while rings can sit idle. The advantage becomes decisive at high
+connection counts, which is the regime a cache fleet actually runs in. Do not
+read a single row as the whole picture.
+
+Notes on running it:
+
+- **Manual, not CI.** Shared runners are too noisy for absolute-time
+  comparison, the same reason the bench job is informational.
+- **Percentiles, not means.** The difference lives in the tail; a mean hides it.
+- **Warmup is excluded** from recorded samples, so the numbers describe the
+  serve path rather than the first-fetch miss path.
+- **`talon-loadgen` can drive an existing worker** directly:
+  `talon-loadgen --addr host:7001 --conns 1024 --server-pid <pid>`. With
+  `--server-pid` it samples the worker's CPU and RSS from `/proc` across the
+  measured window; `--json` emits JSON Lines for scripted comparison.
+- A run that reports **no samples** is a failed run, not a fast one — the tool
+  refuses to turn error frames into latency numbers and prints the first error
+  verbatim.
 
 ## For coding agents
 

@@ -155,17 +155,33 @@ the point.
 Two independent measurements exist, at different concurrency levels, and they
 disagree in an instructive way.
 
-**At 1024 concurrent connections**, measured in a standalone harness against a
-full-integration setup (real framed protocol, real `sendfile`, real loopback TCP,
-connection reuse):
+**Under concurrent load**, measured in-repo by `scripts/dataplane_loadtest.sh`
+against a real worker — real `WorkerRuntime`, real `sendfile`, real block store,
+64 KiB ranges, 10 s per point after a 3 s warmup:
 
-| comparison | throughput | per-core | p50 | p99 | RSS |
-|---|---|---|---|---|---|
-| 1 ring vs 1 Tokio worker | +85% | +23–35% | −46% | −44% | −15% |
-| 16 rings vs full Tokio | +35% | +34% | −19% | −26% | −34% |
+| conns | io_uring rps | tokio rps | io_uring p50 | tokio p50 | io_uring p99 | tokio p99 |
+|---|---|---|---|---|---|---|
+| 1 | 5,636 | 4,837 | 161 µs | 191 µs | 259 µs | 293 µs |
+| 64 | 54,755 | 55,191 | 900 µs | 1,057 µs | 5,371 µs | 2,853 µs |
+| 256 | 42,417 | 56,999 | 1,243 µs | 3,835 µs | 7,423 µs | 10,283 µs |
+| **1024** | **51,668** | 41,060 | **1,175 µs** | 19,905 µs | **4,781 µs** | 72,911 µs |
 
-Latency, CPU efficiency, and memory all improve together — there is no trade
-being made.
+At 1024 connections io_uring delivers **26% more throughput at 17× lower p50 and
+15× lower p99**, on comparable CPU and 19% less memory. Throughput, tail
+latency, and memory improve together — there is no trade being made.
+
+**The sweep is not monotonic, which is worth stating plainly.** At 64 and 256
+connections Tokio sometimes wins: work-stealing balances a moderate load well,
+while thread-per-core rings can sit idle. The advantage becomes decisive only at
+high connection counts. A cache fleet fronting a compute cluster lives at the
+right-hand end of that table, which is why the default follows it — but a
+deployment that will only ever see a hundred concurrent readers should measure
+rather than assume.
+
+An earlier standalone harness, using a simplified protocol outside the tree,
+measured +35% throughput and −26% p99 at the same connection count. The in-repo
+figures supersede it: same direction, larger effect, and reproducible with one
+command.
 
 **At concurrency 1**, measured by the in-repo benchmark
 (`cargo bench -p talon-worker --bench dataplane_benches`), the two runtimes are
@@ -196,15 +212,17 @@ request in flight there are no syscalls to batch, so the mechanism that produces
 the win is not exercised. A null result from an instrument blind to the effect
 says nothing about whether the effect exists.
 
-So `io_uring` is the default, and the in-repo benchmark keeps its job as a
+So `io_uring` is the default, and the Divan benchmark keeps its job as a
 **regression floor** — it catches a change that makes single-request latency
 materially worse, which is a real thing to guard against, and it is honest about
 not being the evidence for the default.
 
-The remaining gap is that the 1024-connection numbers were taken in a harness
-outside this tree. Reproducing them in-repo is tracked as a concurrent load
-test; that work strengthens the record, but withholding a measured win from
-users until the paperwork catches up would be the wrong trade.
+Both measurements now live in the tree and can be re-run:
+
+```sh
+cargo bench -p talon-worker --bench dataplane_benches   # latency floor
+scripts/dataplane_loadtest.sh                           # concurrent sweep
+```
 
 ## Coexistence with Tokio
 
@@ -229,10 +247,17 @@ measurable.
 ## Reproducing this
 
 ```sh
-# Both data planes, same block, real loopback TCP
+# The table above: both planes, sweeping connection counts against a real worker
+scripts/dataplane_loadtest.sh
+CONNS=1,512,2048 SECONDS_PER=30 scripts/dataplane_loadtest.sh
+
+# Single-request latency floor, both planes, same block over loopback TCP
 cargo bench -p talon-worker --bench dataplane_benches
 
-# Run a worker on rings and confirm SO_REUSEPORT: N listeners, one port
+# Drive an already-running worker, sampling its CPU and RSS
+talon-loadgen --addr 127.0.0.1:7001 --conns 1024 --server-pid "$(pgrep -x talon-worker)"
+
+# Confirm SO_REUSEPORT: N listeners on one port
 talon-worker --data-plane-rings 2 --listen 127.0.0.1:7001
 ss -ltn | grep 7001
 ```
