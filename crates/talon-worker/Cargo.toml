@@ -19,6 +19,12 @@ harness = false
 name = "serve_path_benches"
 harness = false
 
+# Concurrent load generator for the data plane (#291). A manual tool for
+# comparing runtimes at realistic connection counts; not a CI gate.
+[[bin]]
+name = "talon-loadgen"
+path = "src/bin/loadgen.rs"
+
 [dependencies]
 talon-core.workspace = true
 talon-transport.workspace = true
