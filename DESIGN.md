@@ -68,16 +68,18 @@ Three planes:
 - **Zero-copy:** `bytes::Bytes` for small messages and in-memory buffer sharing;
   `sendfile`/`splice` for disk-block transfer.
 - **Runtime:** two-layer model (control/protocol scheduling + zero-copy
-  syscalls). Layer 2 is built; Layer 1 currently runs on Tokio — see
-  *Runtime & I/O model* below.
+  syscalls). Layer 2 is built and runtime-neutral; the worker data plane's
+  Layer 1 runs on a thread-per-core io_uring runtime by default, with a Tokio
+  fallback — see *Runtime & I/O model* below.
 
 ## Runtime & I/O model
 
 Each `coordinator` / `worker` / `client` process splits I/O into two layers: one
 for control and protocol scheduling, one for bulk data movement. **Layer 2 is
-built and runtime-neutral. Layer 1 currently runs on Tokio**, not on the
-io_uring runtime this section originally specified; the gap and the measured
-case for closing it are described under *Layer 1 target* below.
+built and runtime-neutral.** Layer 1 on the **worker data plane** runs on a
+thread-per-core io_uring runtime by default, falling back to Tokio where
+io_uring is unavailable; every other plane stays on Tokio deliberately (see
+*Runtime split*).
 
 ### Layer 1 — control & protocol scheduling
 
@@ -87,16 +89,21 @@ scheduling lives here. **Large object bytes never enter userspace through this
 layer** — that invariant is what makes Layer 2 possible, and it holds under any
 runtime.
 
-**As built (v1): Tokio.** `worker/main.rs` and `coordinator/main.rs` each run
-their own multi-threaded Tokio accept loop. This was a deliberate portability
-choice:
-io_uring is unavailable on many CI runners and container sandboxes, and a
-portable backend keeps the entire read path buildable and testable everywhere.
+**Worker data plane: thread-per-core io_uring (default).** `worker/main.rs`
+probes io_uring at startup and, when available, serves on N rings — one per core
+by default — each pinned and binding the listen address with `SO_REUSEPORT`.
+When the probe fails (older kernel, restrictive seccomp, some container
+runtimes) it falls back to the Tokio accept loop and logs the fallback, so the
+default is safe everywhere without a version check.
 
-**Target: thread-per-core io_uring (monoio).** Benchmarked against the Tokio
+**Control plane and coordinator: Tokio.** `coordinator/main.rs` runs a
+multi-threaded Tokio accept loop, as do the admin/UI/metrics endpoints. These
+are not the hot path and their ecosystems are Tokio-bound.
+
+**Why io_uring on the data plane.** Benchmarked against the Tokio
 implementation on a full-integration harness (real framed protocol, real
-`sendfile`, real loopback TCP, connection reuse) — see issue #273 for method and
-raw data:
+`sendfile`, real loopback TCP, connection reuse) at the connection counts a
+cache fleet actually produces — see issue #273 for method and raw data:
 
 | comparison | throughput | per-core | p50 | p99 | RSS |
 |---|---|---|---|---|---|
@@ -111,7 +118,8 @@ with `SO_REUSEPORT` so the kernel hash-distributes accepts. Measured scaling is
 8.81× as the extra rings land on SMT siblings). Per-core throughput stays flat
 from 1 to 16 rings — there is no cross-ring contention to amortize.
 
-**Migration is not a drop-in swap.** The real surface, in rough cost order:
+**What the migration required.** Recorded because "swap the runtime" understates
+it, and the same constraints apply to any further porting:
 
 - **`!Send` task model.** The accept loops spawn each connection with
   `tokio::spawn`, which requires `Send` futures. monoio is thread-per-core with
@@ -127,16 +135,21 @@ from 1 to 16 rings — there is no cross-ring contention to amortize.
 - **Not a blocker:** fd ownership across the ring/blocking boundary. A
   ring-owned monoio `TcpStream` fd can be handed straight to a blocking
   `sendfile` and the ring resumes on the same stream afterwards — none of the
-  `into_std` → `set_nonblocking` → `from_std` round-trip the current Tokio path
-  pays per transfer is needed. Migrating *removes* that code.
+  `into_std` → `set_nonblocking` → `from_std` round-trip the Tokio path pays
+  per transfer is needed. The io_uring implementation is *smaller*.
 
-Scope, if taken: the `worker/main.rs` accept loop and `handle_conn` (including
-`handle_put`/`handle_delete`), `transport::read_frame` (generic over Tokio's
-`AsyncRead`), and `fuse::worker_client` as the client side of the same
-protocol. `WorkerRuntime::serve` and everything below it is unaffected —
-`Arc<dyn BackendStore>` is fine, since the `!Send` constraint applies to
-futures crossing threads, not to shared state within a ring. Everything else
-stays on Tokio by design (see *Runtime split* below).
+Ported: the `worker/main.rs` accept loop and `handle_conn` (including
+`handle_put`/`handle_delete`), plus a completion-based frame reader in
+`transport::uring`. `WorkerRuntime::serve` and everything below it was
+unaffected — `Arc<dyn BackendStore>` is fine, since `!Send` constrains futures
+crossing threads, not shared state within a ring. It does still reach Tokio
+internally (`block_store` uses `spawn_blocking`, the miss path uses Tokio
+timers), so ring threads enter a Tokio handle: coexistence, as predicted.
+
+Still on Tokio: `fuse::worker_client`, the client side of the same protocol.
+The wire format is plain framed TCP, so a Tokio client interoperates with a
+ring server unchanged — porting it is a client-side optimization, not a
+correctness requirement.
 
 ### Layer 2 — bulk data movement (Linux zero-copy syscalls) — built
 
@@ -163,7 +176,7 @@ today; only the data-plane TCP scheduling layer diverges.
 
 | component | target | today | rationale |
 |---|---|---|---|
-| worker data plane | monoio + `sendfile`/`splice` | Tokio + `sendfile`/`splice` | hot path; per-core efficiency and tail latency |
+| worker data plane | monoio + `sendfile`/`splice` | **monoio (default), Tokio fallback** ✅ | hot path; per-core efficiency and tail latency |
 | client ↔ worker data plane | monoio | Tokio | same hot path, client side |
 | coordinator ↔ worker control | either | Tokio | low volume; bincode over framed TCP |
 | coordinator admin / UI / etcd / k8s | **Tokio** | Tokio ✅ | axum/kube/etcd-client are Tokio-bound |

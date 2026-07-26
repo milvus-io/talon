@@ -308,10 +308,10 @@ Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).
 
 ### `data_plane_rings`
 
-io_uring rings for the data plane; 0 = one per core, unset = Tokio path.
+io_uring rings for the data plane; 0 = one per core. Falls back to Tokio if io_uring is unavailable.
 
 - **Environment variable:** `TALON_WORKER_DATA_PLANE_RINGS`
-- **Default:** none
+- **Default:** `0 (one ring per core)`
 - **CLI flag:** `--data_plane_rings`
 
 ### `s3_region`
