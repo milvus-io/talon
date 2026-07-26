@@ -29,6 +29,34 @@
 
 use std::sync::Arc;
 
+/// The CPUs this process is actually allowed to run on, in ascending order.
+///
+/// Reads the thread's affinity mask rather than assuming CPUs are numbered
+/// `0..N`. Under a restrictive cpuset — a Kubernetes pod with a CPU manager
+/// policy, a `taskset`, or a container pinned to a NUMA node — the allowed CPUs
+/// can be an arbitrary subset such as `[8, 9, 10]`. Pinning ring *i* to CPU *i*
+/// in that environment is wrong twice over: `sched_setaffinity` succeeds and
+/// silently moves the thread **outside** its cpuset, stealing time from
+/// whatever the orchestrator placed on that CPU (a colocated training job, say),
+/// and the rings stop being one-per-core because several may land on the same
+/// CPU.
+///
+/// Returns an empty vector if the mask cannot be read, which callers treat as
+/// "do not pin".
+pub fn allowed_cpus() -> Vec<usize> {
+    // SAFETY: `set` is zero-initialised and its size is passed explicitly;
+    // `sched_getaffinity` only writes within that size.
+    unsafe {
+        let mut set: libc::cpu_set_t = std::mem::zeroed();
+        if libc::sched_getaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &mut set) != 0 {
+            return Vec::new();
+        }
+        (0..libc::CPU_SETSIZE as usize)
+            .filter(|cpu| libc::CPU_ISSET(*cpu, &set))
+            .collect()
+    }
+}
+
 /// Whether this host can actually run the io_uring data plane.
 ///
 /// io_uring needs a recent enough kernel *and* permission to use it: the
@@ -53,9 +81,27 @@ pub fn resolve_ring_count(configured: usize) -> usize {
     if configured > 0 {
         return configured;
     }
-    std::thread::available_parallelism()
+    // One ring per unit of CPU we may actually consume.
+    //
+    // Two limits apply and they are not the same number. The affinity mask says
+    // *which* CPUs we may run on; a cgroup CPU quota says *how much* CPU time we
+    // may consume. A pod with `cpu.max = 1500000/100000` on a 16-CPU node is
+    // allowed on all 16 CPUs but is only entitled to 15 CPUs' worth of time.
+    // Sizing to the affinity mask there would start 16 rings competing for 15
+    // CPUs of quota, so they would throttle each other — exactly the
+    // unpredictable behaviour thread-per-core exists to avoid.
+    //
+    // `available_parallelism` accounts for both, so it decides the count. The
+    // affinity list decides *where* each ring pins (see `allowed_cpus`), which
+    // is a separate question.
+    let by_quota = std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1)
+        .unwrap_or(1);
+    let by_affinity = allowed_cpus().len();
+    if by_affinity == 0 {
+        return by_quota;
+    }
+    by_quota.min(by_affinity).max(1)
 }
 
 /// A per-ring connection handler.
@@ -113,11 +159,24 @@ where
     let ready = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let mut threads = Vec::with_capacity(rings);
 
+    // Resolved once: every ring pins into this set. Fewer allowed CPUs than
+    // rings means rings share CPUs, which is a legitimate (if suboptimal)
+    // configuration rather than an error.
+    let allowed = Arc::new(allowed_cpus());
+    if allowed.len() < rings {
+        tracing::warn!(
+            rings,
+            allowed_cpus = allowed.len(),
+            "more rings than allowed CPUs; rings will share CPUs"
+        );
+    }
+
     for ring_id in 0..rings {
         let addr = addr.clone();
         let handler = handler.clone();
         let ready = Arc::clone(&ready);
         let tokio_handle = tokio_handle.clone();
+        let allowed = Arc::clone(&allowed);
         threads.push(
             std::thread::Builder::new()
                 .name(format!("talon-ring-{ring_id}"))
@@ -126,12 +185,30 @@ where
                     // internally. See "Tokio coexistence" on this function.
                     let _tokio_guard = tokio_handle.enter();
 
-                    // Pin before building the ring so its memory is allocated on the
-                    // node this thread will actually run on. A failure here is not
-                    // fatal — pinning is an optimization, not a correctness
+                    // Pin before building the ring so its memory is allocated on
+                    // the node this thread will actually run on. Pin to a CPU
+                    // from the *allowed* set rather than to `ring_id`, so a
+                    // restricted cpuset (Kubernetes CPU manager, taskset, NUMA
+                    // pinning) is respected instead of escaped. A failure here is
+                    // not fatal — pinning is an optimization, not a correctness
                     // requirement — but it is worth surfacing.
-                    if let Err(e) = monoio::utils::bind_to_cpu_set(vec![ring_id]) {
-                        tracing::warn!(ring = ring_id, error = ?e, "could not pin ring to core");
+                    match allowed.get(ring_id % allowed.len().max(1)) {
+                        Some(&cpu) => {
+                            if let Err(e) = monoio::utils::bind_to_cpu_set(vec![cpu]) {
+                                tracing::warn!(
+                                    ring = ring_id,
+                                    cpu,
+                                    error = ?e,
+                                    "could not pin ring to cpu"
+                                );
+                            }
+                        }
+                        // Affinity unreadable: leave the thread unpinned rather
+                        // than guess a CPU that may not be ours.
+                        None => tracing::warn!(
+                            ring = ring_id,
+                            "cpu affinity unavailable; ring left unpinned"
+                        ),
                     }
 
                     // The blocking pool is what keeps sendfile off the ring. monoio
@@ -206,6 +283,70 @@ mod tests {
     /// The default configuration must select the io_uring data plane, and it
     /// must be usable on any host CI runs on — the fallback exists precisely so
     /// this default is safe, so a failure here means the default is unsafe.
+    /// The allowed-CPU list must be non-empty and within the kernel's range on
+    /// any host the tests run on.
+    #[test]
+    fn allowed_cpus_is_readable_and_sane() {
+        let cpus = allowed_cpus();
+        assert!(!cpus.is_empty(), "affinity mask should be readable");
+        assert!(cpus.windows(2).all(|w| w[0] < w[1]), "must be ascending");
+        assert!(cpus.iter().all(|&c| c < libc::CPU_SETSIZE as usize));
+    }
+
+    /// The regression this module's pinning logic exists to prevent.
+    ///
+    /// Under a restricted cpuset the allowed CPUs may be an arbitrary subset
+    /// (e.g. `[8, 9]`). Pinning ring *i* to CPU *i* would silently escape the
+    /// cpuset — `sched_setaffinity` succeeds — and steal time from whatever the
+    /// orchestrator placed on CPU 0. Every CPU a ring pins to must come from
+    /// the allowed set.
+    #[test]
+    fn rings_pin_only_within_the_allowed_cpu_set() {
+        let allowed = allowed_cpus();
+        assert!(!allowed.is_empty());
+
+        // The mapping used by `serve`, for more rings than CPUs and fewer.
+        for rings in [1usize, allowed.len(), allowed.len() * 2 + 1] {
+            for ring_id in 0..rings {
+                let cpu = allowed[ring_id % allowed.len()];
+                assert!(
+                    allowed.contains(&cpu),
+                    "ring {ring_id} of {rings} pinned to cpu {cpu}, outside the allowed set {allowed:?}"
+                );
+            }
+        }
+    }
+
+    /// With at least as many CPUs as rings, each ring gets a distinct CPU —
+    /// otherwise thread-per-core degenerates into threads sharing cores.
+    #[test]
+    fn rings_get_distinct_cpus_when_available() {
+        let allowed = allowed_cpus();
+        let rings = resolve_ring_count(0).min(allowed.len());
+        let assigned: std::collections::HashSet<usize> =
+            (0..rings).map(|i| allowed[i % allowed.len()]).collect();
+        assert_eq!(assigned.len(), rings, "each ring should get its own cpu");
+    }
+
+    /// The default ring count must respect **both** limits: how many CPUs we
+    /// may run on (affinity) and how much CPU time we may consume (cgroup
+    /// quota). These differ — this host allows 16 CPUs but grants 15 CPUs of
+    /// quota — and starting a ring per allowed CPU would have them throttling
+    /// each other. This is what makes the default safe in a limited container.
+    #[test]
+    fn default_ring_count_respects_quota_and_affinity() {
+        let rings = resolve_ring_count(0);
+        let by_quota = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let by_affinity = allowed_cpus().len();
+        assert!(rings >= 1);
+        assert!(rings <= by_quota, "must not exceed the cpu-time quota");
+        if by_affinity > 0 {
+            assert!(rings <= by_affinity, "must not exceed the affinity mask");
+        }
+    }
+
     #[test]
     fn io_uring_availability_is_detectable() {
         // Must not panic and must agree with itself across calls (it is cached).
@@ -225,7 +366,10 @@ mod tests {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        assert_eq!(resolve_ring_count(default_rings), cores);
+        assert_eq!(
+            resolve_ring_count(default_rings),
+            cores.min(allowed_cpus().len().max(1))
+        );
         assert!(resolve_ring_count(default_rings) >= 1);
     }
 
@@ -236,11 +380,14 @@ mod tests {
     }
 
     #[test]
-    fn resolve_ring_count_zero_means_one_per_core() {
+    fn resolve_ring_count_zero_means_one_per_usable_cpu() {
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1);
-        assert_eq!(resolve_ring_count(0), cores);
+        assert_eq!(
+            resolve_ring_count(0),
+            cores.min(allowed_cpus().len().max(1))
+        );
     }
 
     /// Echo handler that records which OS thread served each connection and
