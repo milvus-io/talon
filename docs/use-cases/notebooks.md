@@ -16,6 +16,10 @@ Interactive analysis has a different profile from batch compute:
 
 ## What Talon does
 
+**Or skips the filesystem entirely.** The [Python client](../clients/python.md)
+reads objects and byte ranges directly, which suits a notebook that already
+thinks in those terms and avoids needing a privileged mount.
+
 **Presents object storage as a POSIX filesystem.** The FUSE mount maps backend
 namespaces to paths — `/s3/<bucket>/<key>`, `/gcs/...`, `/az/...` — so
 `open()`, `read()`, and `ls` work against object storage with no client library

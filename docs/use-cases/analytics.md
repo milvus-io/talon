@@ -25,6 +25,10 @@ fetch rather than one per reader.
 **Caches by object version.** Blocks are keyed by the origin's ETag, so
 republishing a partition at the same key does not serve stale data to a query.
 
+**Reachable from a JVM engine without a mount.** The
+[Java client](../clients/java.md) is a native-free jar, so a query engine can
+read ranges directly rather than through a privileged FUSE mount.
+
 ## Shuffle: read the caveat
 
 Shuffle intermediates are a **partial fit**, and it is worth being direct about
