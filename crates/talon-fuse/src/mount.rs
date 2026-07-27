@@ -25,7 +25,7 @@ use crate::lock::MutexExt;
 use crate::mapping::path_to_object;
 use crate::ops::{
     Attr, DirectoryRenameEntry, DirectoryRenamePlan, FileKind, FsError, OpenOptions, ReadOnlyFs,
-    ReadSource,
+    ReadSource, WritebackSource,
 };
 use crate::prefetch::Prefetcher;
 use crate::readahead::ReadaheadConfig;
@@ -71,6 +71,7 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::OperationNotPermitted => libc::EPERM,
         FsError::CrossDevice => libc::EXDEV,
         FsError::PermissionDenied => libc::EACCES,
+        FsError::Io => libc::EIO,
     }
 }
 
@@ -303,11 +304,23 @@ impl TalonFuse {
     /// FUSE `flush`/`fsync` callback so a write error surfaces to the app's
     /// `close(2)`/`fsync(2)` (#232).
     fn writeback_object(&self, path: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.writeback_object_source(path, WritebackSource::Memory(bytes))
+    }
+
+    fn writeback_object_source(&self, path: &str, source: WritebackSource) -> anyhow::Result<()> {
         let object = path_to_object(path)?;
-        self.writeback_object_id(object, bytes)
+        self.writeback_object_source_id(object, source)
     }
 
     fn writeback_object_id(&self, object: ObjectId, bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.writeback_object_source_id(object, WritebackSource::Memory(bytes))
+    }
+
+    fn writeback_object_source_id(
+        &self,
+        object: ObjectId,
+        source: WritebackSource,
+    ) -> anyhow::Result<()> {
         let reader = self.reader.clone();
         let pool = Arc::clone(&self.write_pool);
         let block_size = self.block_size;
@@ -318,18 +331,33 @@ impl TalonFuse {
                 .resolve_owner(&object, block_size, &version, now_ms)
                 .await?;
             let client = crate::worker_client::WriteClient::with_pool(addr, pool);
-            client.put_object(&object, &bytes).await?;
+            match source {
+                WritebackSource::Memory(bytes) => {
+                    client.put_object(&object, &bytes).await?;
+                }
+                WritebackSource::File { path, len } => {
+                    client.put_object_file(&object, &path, len).await?;
+                }
+            }
             Ok::<(), anyhow::Error>(())
         })
     }
 
     fn writeback_object_paths(&self, paths: &[String], bytes: Vec<u8>) -> anyhow::Result<()> {
+        self.writeback_object_source_paths(paths, WritebackSource::Memory(bytes))
+    }
+
+    fn writeback_object_source_paths(
+        &self,
+        paths: &[String],
+        source: WritebackSource,
+    ) -> anyhow::Result<()> {
         if paths.is_empty() {
             anyhow::bail!("inode has no backend object paths");
         }
         let mut first_error = None;
         for path in paths {
-            if let Err(error) = self.writeback_object(path, bytes.clone()) {
+            if let Err(error) = self.writeback_object_source(path, source.clone()) {
                 first_error.get_or_insert(error);
             }
         }
@@ -899,11 +927,11 @@ impl fuser::Filesystem for TalonFuse {
         let contents = match &plan.buffered_contents {
             Some(contents) => contents.clone(),
             None => match self.read_committed_object(&plan.source_path, plan.source_size) {
-                Ok(contents) => contents,
+                Ok(contents) => WritebackSource::Memory(contents),
                 Err(error) => return reply.error(error),
             },
         };
-        if let Err(error) = self.writeback_object(&plan.target_path, contents) {
+        if let Err(error) = self.writeback_object_source(&plan.target_path, contents) {
             tracing::warn!(
                 source = %plan.source_path,
                 target = %plan.target_path,
@@ -1183,15 +1211,15 @@ impl fuser::Filesystem for TalonFuse {
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        let bytes = match self.fs.dirty_bytes(fh) {
-            Some(bytes) => bytes,
+        let source = match self.fs.dirty_source(fh) {
+            Some(source) => source,
             None => return reply.ok(),
         };
         let paths = match self.fs.dirty_paths(fh) {
             Ok(paths) => paths,
             Err(error) => return reply.error(errno(error)),
         };
-        match self.writeback_object_paths(&paths, bytes) {
+        match self.writeback_object_source_paths(&paths, source) {
             Ok(()) => reply.ok(),
             Err(error) => {
                 tracing::warn!(?paths, %error, "flush writeback failed");
@@ -1209,15 +1237,15 @@ impl fuser::Filesystem for TalonFuse {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let bytes = match self.fs.dirty_bytes(fh) {
-            Some(bytes) => bytes,
+        let source = match self.fs.dirty_source(fh) {
+            Some(source) => source,
             None => return reply.ok(),
         };
         let paths = match self.fs.dirty_paths(fh) {
             Ok(paths) => paths,
             Err(error) => return reply.error(errno(error)),
         };
-        match self.writeback_object_paths(&paths, bytes) {
+        match self.writeback_object_source_paths(&paths, source) {
             Ok(()) => reply.ok(),
             Err(_) => reply.error(libc::EIO),
         }
@@ -1400,11 +1428,11 @@ impl fuser::Filesystem for TalonFuse {
             let contents = match &plan.buffered_contents {
                 Some(contents) => contents.clone(),
                 None => match self.read_committed_object(&plan.source_path, plan.source_size) {
-                    Ok(contents) => contents,
+                    Ok(contents) => WritebackSource::Memory(contents),
                     Err(error) => return reply.error(error),
                 },
             };
-            if let Err(error) = self.writeback_object(orphan_path, contents.clone()) {
+            if let Err(error) = self.writeback_object_source(orphan_path, contents.clone()) {
                 tracing::warn!(
                     source = %plan.source_path,
                     orphan = %orphan_path,
@@ -1426,7 +1454,7 @@ impl fuser::Filesystem for TalonFuse {
             }
             if let Err(error) = self.fs.commit_unlink(&plan) {
                 if let Err(rollback_error) =
-                    self.writeback_object(&plan.source_path, contents.clone())
+                    self.writeback_object_source(&plan.source_path, contents.clone())
                 {
                     tracing::error!(
                         path = %plan.source_path,

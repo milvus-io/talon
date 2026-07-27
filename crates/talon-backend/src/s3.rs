@@ -12,9 +12,12 @@
 //! and the `s3` service. Endpoints are configurable so MinIO/Ceph and other
 //! S3-compatible stores work.
 
+use std::io::{Read, Take};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use sha2::{Digest, Sha256};
 use talon_core::{BackendStore, Error, ObjectId, ObjectStat, Result, Version};
 
 use crate::http::{HttpClient, HttpRequest, Method};
@@ -196,6 +199,62 @@ impl S3Backend {
         crate::sigv4::sign_request(&mut req, &self.creds, &self.config.region, "s3", &date);
         req
     }
+
+    fn signed_with_payload_hash(&self, mut req: HttpRequest, payload_hash: &str) -> HttpRequest {
+        let date = crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now());
+        crate::sigv4::sign_request_with_payload_hash(
+            &mut req,
+            &self.creds,
+            &self.config.region,
+            "s3",
+            &date,
+            payload_hash,
+        );
+        req
+    }
+
+    fn build_streamed_put(
+        &self,
+        obj: &ObjectId,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> HttpRequest {
+        let mut request = self.build_put(obj, bytes::Bytes::new(), if_match);
+        if let Some((_, value)) = request
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
+            *value = len.to_string();
+        }
+        request
+    }
+}
+
+fn hash_file(path: PathBuf, len: u64) -> Result<String> {
+    let file = std::fs::File::open(&path)
+        .map_err(|error| Error::Backend(format!("open {} for hashing: {error}", path.display())))?;
+    let mut reader: Take<std::fs::File> = file.take(len);
+    let mut hasher = Sha256::new();
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut read_len = 0u64;
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| Error::Backend(format!("hash {}: {error}", path.display())))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+        read_len += count as u64;
+    }
+    if read_len != len {
+        return Err(Error::Backend(format!(
+            "{} ended after {read_len} bytes while hashing {len} bytes",
+            path.display()
+        )));
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Normalize an S3 ETag into a [`Version`] (strip surrounding quotes).
@@ -329,6 +388,37 @@ impl BackendStore for S3Backend {
         }
     }
 
+    async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        let payload_hash = tokio::task::spawn_blocking({
+            let path = path.to_path_buf();
+            move || hash_file(path, len)
+        })
+        .await
+        .map_err(|error| Error::Backend(format!("S3 payload hashing task failed: {error}")))??;
+        let request =
+            self.signed_with_payload_hash(self.build_streamed_put(obj, len, None), &payload_hash);
+        let resp = self
+            .http
+            .execute_file(request, path, len)
+            .await
+            .map_err(Error::Backend)?;
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "S3 streamed PUT {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )));
+        }
+        match resp
+            .header("etag")
+            .map(etag_to_version)
+            .filter(|version| !version.0.trim().is_empty())
+        {
+            Some(version) => Ok(version),
+            None => Ok(self.head(obj).await?.version),
+        }
+    }
+
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
         let req = self.signed(self.build_delete(obj));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
@@ -355,6 +445,7 @@ mod tests {
     /// A mock client that records the last request and returns a canned response.
     struct MockHttp {
         last: Mutex<Option<HttpRequest>>,
+        last_file: Mutex<Option<(HttpRequest, PathBuf, u64)>>,
         response: HttpResponse,
     }
 
@@ -362,6 +453,7 @@ mod tests {
         fn new(response: HttpResponse) -> Arc<Self> {
             Arc::new(Self {
                 last: Mutex::new(None),
+                last_file: Mutex::new(None),
                 response,
             })
         }
@@ -371,6 +463,16 @@ mod tests {
     impl HttpClient for MockHttp {
         async fn execute(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
             *self.last.lock().unwrap() = Some(req);
+            Ok(self.response.clone())
+        }
+
+        async fn execute_file(
+            &self,
+            req: HttpRequest,
+            path: &Path,
+            len: u64,
+        ) -> std::result::Result<HttpResponse, String> {
+            *self.last_file.lock().unwrap() = Some((req, path.to_path_buf(), len));
             Ok(self.response.clone())
         }
     }
@@ -598,6 +700,33 @@ mod tests {
         assert_eq!(req.method, Method::Put);
         assert_eq!(req.body, body);
         assert_eq!(req.header("Content-Length"), Some("12"));
+    }
+
+    #[tokio::test]
+    async fn put_file_streams_signed_body_and_returns_committed_version() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![("ETag".into(), "\"stream-etag\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        let mut staged = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut staged, b"sparse-stream-body").unwrap();
+
+        let version = s3.put_file(&obj(), staged.path(), 18).await.unwrap();
+
+        assert_eq!(version, Version::new("stream-etag"));
+        let (req, path, len) = http.last_file.lock().unwrap().clone().unwrap();
+        assert_eq!(path, staged.path());
+        assert_eq!(len, 18);
+        assert_eq!(req.method, Method::Put);
+        assert!(req.body.is_empty());
+        assert_eq!(req.header("Content-Length"), Some("18"));
+        assert!(req.header("Authorization").is_some());
+        assert_eq!(
+            req.header("x-amz-content-sha256"),
+            Some("324d3410a4267a26d985db5fb545b6df76b89c53268056ff4eacbb719bdec330")
+        );
     }
 
     #[tokio::test]

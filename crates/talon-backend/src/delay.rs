@@ -11,6 +11,7 @@
 //! jitter is a deterministic LCG seeded per client, so behavior is reproducible
 //! in tests without pulling in an RNG dependency and without wall-clock flake.
 
+use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -127,6 +128,20 @@ impl HttpClient for DelayingHttpClient {
         }
         Ok(resp)
     }
+
+    async fn execute_file(
+        &self,
+        req: HttpRequest,
+        path: &Path,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        let resp = self.inner.execute_file(req, path, len).await?;
+        let delay = self.delay_for(resp.body.len());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(resp)
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +152,7 @@ mod tests {
     struct MockHttp {
         body_len: usize,
         calls: Mutex<u32>,
+        file_calls: Mutex<Vec<(std::path::PathBuf, u64)>>,
     }
 
     impl MockHttp {
@@ -144,6 +160,7 @@ mod tests {
             Arc::new(Self {
                 body_len,
                 calls: Mutex::new(0),
+                file_calls: Mutex::new(Vec::new()),
             })
         }
     }
@@ -152,6 +169,23 @@ mod tests {
     impl HttpClient for MockHttp {
         async fn execute(&self, _req: HttpRequest) -> Result<HttpResponse, String> {
             *self.calls.lock().unwrap() += 1;
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![],
+                body: bytes::Bytes::from(vec![0u8; self.body_len]),
+            })
+        }
+
+        async fn execute_file(
+            &self,
+            _req: HttpRequest,
+            path: &Path,
+            len: u64,
+        ) -> Result<HttpResponse, String> {
+            self.file_calls
+                .lock()
+                .unwrap()
+                .push((path.to_path_buf(), len));
             Ok(HttpResponse {
                 status: 200,
                 headers: vec![],
@@ -255,6 +289,28 @@ mod tests {
         let resp = c.execute(req()).await.unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(*inner.calls.lock().unwrap(), 1);
+        assert!(start.elapsed() >= Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn execute_file_forwards_stream_metadata_and_sleeps() {
+        let inner = MockHttp::new(0);
+        let cfg = DelayConfig {
+            base: Duration::from_secs(2),
+            jitter: Duration::ZERO,
+            throughput_bytes_per_sec: None,
+        };
+        let client = DelayingHttpClient::new(inner.clone(), cfg, 1);
+        let path = Path::new("/tmp/staged-object");
+        let start = tokio::time::Instant::now();
+
+        let response = client.execute_file(req(), path, 4096).await.unwrap();
+
+        assert_eq!(response.status, 200);
+        assert_eq!(
+            inner.file_calls.lock().unwrap().as_slice(),
+            &[(path.to_path_buf(), 4096)]
+        );
         assert!(start.elapsed() >= Duration::from_secs(2));
     }
 

@@ -42,7 +42,7 @@ use talon_worker::{
     send_file_range, serve_admin, BlockIndex, InFlightLoads, ServeOutcome, WholeBlockStore,
     WorkerObservability, WorkerRuntime, DEFAULT_CHUNK,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
@@ -823,13 +823,37 @@ async fn handle_put(
         stream.flush().await?;
         return Ok(());
     }
-    // Read exactly body_len raw object bytes that follow the header on the wire.
-    let mut body = vec![0u8; req.body_len as usize];
-    stream.read_exact(&mut body).await?;
-    match worker
-        .write_object(&req.object, bytes::Bytes::from(body))
-        .await
-    {
+    let write_result = if req.body_len <= worker.max_inline_write_bytes() {
+        let body_len = usize::try_from(req.body_len)
+            .map_err(|_| anyhow::anyhow!("PUT body length is not representable"))?;
+        let mut body = vec![0u8; body_len];
+        stream.read_exact(&mut body).await?;
+        worker
+            .write_object(&req.object, bytes::Bytes::from(body))
+            .await
+    } else {
+        let staged = tempfile::NamedTempFile::new()?;
+        let file = staged.reopen()?;
+        let mut file = tokio::fs::File::from_std(file);
+        let mut remaining = req.body_len;
+        let mut buffer = vec![0u8; 8 * 1024 * 1024];
+        while remaining > 0 {
+            let count = remaining.min(buffer.len() as u64) as usize;
+            stream.read_exact(&mut buffer[..count]).await?;
+            if buffer[..count].iter().all(|byte| *byte == 0) {
+                file.seek(std::io::SeekFrom::Current(count as i64)).await?;
+            } else {
+                file.write_all(&buffer[..count]).await?;
+            }
+            remaining -= count as u64;
+        }
+        file.set_len(req.body_len).await?;
+        file.flush().await?;
+        worker
+            .write_object_file(&req.object, staged.path(), req.body_len)
+            .await
+    };
+    match write_result {
         Ok(version) => {
             // Reply OK; the body carries the committed version so the client can
             // record read-after-write consistency.

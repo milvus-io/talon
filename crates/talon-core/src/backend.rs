@@ -9,6 +9,7 @@
 use crate::{ObjectId, Result, Version};
 use async_trait::async_trait;
 use bytes::Bytes;
+use std::path::Path;
 
 /// Metadata about a source object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,6 +96,19 @@ pub trait BackendStore: Send + Sync {
     ) -> Result<Version> {
         let _ = if_match;
         self.put(obj, body).await
+    }
+
+    /// Upload a file as a whole object without materializing it in memory.
+    ///
+    /// `len` is the exact number of bytes to read from `path`. Real backends
+    /// override this with a streaming request. The default returns an explicit
+    /// error so unsupported backends cannot silently allocate the whole file.
+    async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        let _ = (path, len);
+        Err(crate::Error::Backend(format!(
+            "backend does not support streamed PUT for {}",
+            obj.to_path()
+        )))
     }
 
     /// Delete the object. Idempotent: a missing object is `Ok(())`.

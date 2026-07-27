@@ -1,6 +1,7 @@
 //! Instrumented worker cache request runtime.
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -577,6 +578,58 @@ impl WorkerRuntime {
         Ok(version)
     }
 
+    /// Write a staged file through to the backend with bounded memory.
+    ///
+    /// Small files retain the existing cache-populating path. Larger files are
+    /// streamed to the origin and intentionally left out of the single-block
+    /// cache; subsequent reads resolve the new version and load ranges normally.
+    pub async fn write_object_file(
+        &self,
+        object: &ObjectId,
+        path: &Path,
+        len: u64,
+    ) -> anyhow::Result<Version> {
+        if len <= self.block_size as u64 {
+            let body = tokio::fs::read(path).await?;
+            if body.len() as u64 != len {
+                anyhow::bail!(
+                    "staged object {} changed size: expected {len}, found {}",
+                    object.to_path(),
+                    body.len()
+                );
+            }
+            return self.write_object(object, bytes::Bytes::from(body)).await;
+        }
+        let old_version = self.cached_version(object);
+        let version = match self.backend.put_file(object, path, len).await {
+            Ok(version) => {
+                self.metrics.record_backend_write_success(len);
+                version
+            }
+            Err(error) => {
+                self.metrics.record_backend_write_error();
+                return Err(error.into());
+            }
+        };
+        if let Some(old_version) = old_version {
+            let old_block = self.block_for(object, 0, &old_version);
+            self.unlink_units(vec![CacheUnit::Whole(old_block)]).await;
+        }
+        self.store_version(object, &version);
+        tracing::info!(
+            object = %object.to_path(),
+            bytes = len,
+            version = %version,
+            "streamed object"
+        );
+        Ok(version)
+    }
+
+    /// Maximum PUT body retained in memory and cached as one block.
+    pub fn max_inline_write_bytes(&self) -> u64 {
+        self.block_size as u64
+    }
+
     /// Delete an object from the backend and evict it locally (#226/#229).
     ///
     /// Deletes at the origin (`backend.delete`, idempotent), then invalidates the
@@ -672,7 +725,8 @@ fn is_version_mismatch(error: &anyhow::Error) -> bool {
 mod tests {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
-    use std::path::PathBuf;
+    use std::os::unix::fs::FileExt;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::SystemTime;
 
@@ -891,6 +945,59 @@ mod tests {
         // Default to always-resolve so version-sensitivity assertions are not
         // masked by the version cache; caching is exercised explicitly below.
         .with_version_ttl(Duration::ZERO)
+    }
+
+    struct StreamPutBackend {
+        uploaded: std::sync::Mutex<Option<(u64, u8)>>,
+    }
+
+    #[async_trait]
+    impl BackendStore for StreamPutBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            Ok(Bytes::new())
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 0,
+                version: Version::new("stream-v1"),
+            })
+        }
+
+        async fn put_file(&self, _object: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+            let file = std::fs::File::open(path).unwrap();
+            let mut tail = [0u8; 1];
+            file.read_exact_at(&mut tail, len - 1).unwrap();
+            *self.uploaded.lock().unwrap() = Some((len, tail[0]));
+            Ok(Version::new("stream-v1"))
+        }
+    }
+
+    #[tokio::test]
+    async fn large_staged_write_streams_without_entering_single_block_cache() {
+        let root = tmp_root();
+        let backend = Arc::new(StreamPutBackend {
+            uploaded: std::sync::Mutex::new(None),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = runtime_with(Arc::clone(&backend), metrics.clone(), &root, 8);
+        let staged = tempfile::NamedTempFile::new().unwrap();
+        staged.as_file().set_len(4097).unwrap();
+        staged.as_file().write_all_at(b"x", 4096).unwrap();
+        let object = ObjectId::new(Backend::S3, "bucket", "large.bin");
+
+        let version = runtime
+            .write_object_file(&object, staged.path(), 4097)
+            .await
+            .unwrap();
+
+        assert_eq!(version, Version::new("stream-v1"));
+        assert_eq!(*backend.uploaded.lock().unwrap(), Some((4097, b'x')));
+        assert_eq!(runtime.block_count(), 0);
+        assert!(metrics
+            .render()
+            .contains("talon_worker_backend_write_bytes_total{backend=\"azure\"} 4097"));
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

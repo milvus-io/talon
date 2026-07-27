@@ -12,6 +12,9 @@
 //! client does no signing of its own.
 
 use async_trait::async_trait;
+use std::path::Path;
+use tokio::io::AsyncReadExt;
+use tokio_util::io::ReaderStream;
 
 use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 
@@ -57,6 +60,52 @@ impl HttpClient for ReqwestClient {
         if !req.body.is_empty() {
             builder = builder.body(req.body.clone());
         }
+        let resp = builder.send().await.map_err(sanitize_error)?;
+        let status = resp.status().as_u16();
+        let headers = resp
+            .headers()
+            .iter()
+            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+            .collect();
+        let body = resp.bytes().await.map_err(sanitize_error)?;
+        Ok(HttpResponse {
+            status,
+            headers,
+            body,
+        })
+    }
+
+    async fn execute_file(
+        &self,
+        req: HttpRequest,
+        path: &Path,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        let method = match req.method {
+            Method::Get => reqwest::Method::GET,
+            Method::Head => reqwest::Method::HEAD,
+            Method::Put => reqwest::Method::PUT,
+            Method::Delete => reqwest::Method::DELETE,
+        };
+        let mut builder = self.inner.request(method, &req.url);
+        for (k, v) in &req.headers {
+            builder = builder.header(k.as_str(), v.as_str());
+        }
+        let file = tokio::fs::File::open(path)
+            .await
+            .map_err(|error| format!("open streamed request body: {error}"))?;
+        let actual_len = file
+            .metadata()
+            .await
+            .map_err(|error| format!("stat streamed request body: {error}"))?
+            .len();
+        if actual_len < len {
+            return Err(format!(
+                "streamed request body is {actual_len} bytes, expected at least {len}"
+            ));
+        }
+        let stream = ReaderStream::new(file.take(len));
+        builder = builder.body(reqwest::Body::wrap_stream(stream));
         let resp = builder.send().await.map_err(sanitize_error)?;
         let status = resp.status().as_u16();
         let headers = resp

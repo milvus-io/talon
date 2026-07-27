@@ -27,7 +27,10 @@ pub use mapping::{path_to_object, resolve_read, ReadTarget};
 pub use metrics::{ReadStats, ReadStatsSnapshot};
 #[cfg(feature = "mount")]
 pub use mount::{TalonFuse, CANONICAL_MOUNT_VERSION};
-pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, DEFAULT_MAX_OBJECT_BYTES, ROOT_INO};
+pub use ops::{
+    Attr, DirEntry, FileKind, FsError, ReadOnlyFs, WritebackSource,
+    DEFAULT_MAX_LOGICAL_OBJECT_BYTES, DEFAULT_MAX_OBJECT_BYTES, ROOT_INO,
+};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use pool::{ConnectionPool, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
 pub use prefetch::Prefetcher;

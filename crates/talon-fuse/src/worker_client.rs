@@ -13,7 +13,9 @@
 //! opened per fetch for simplicity, mirroring
 //! [`CoordinatorClient`](crate::CoordinatorClient).
 
+use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use talon_core::{ObjectId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
@@ -228,6 +230,43 @@ impl WriteClient {
         }
     }
 
+    /// Stream a staged file through the worker without loading it into memory.
+    pub async fn put_object_file(
+        &self,
+        object: &ObjectId,
+        path: &Path,
+        len: u64,
+    ) -> Result<Version, WorkerError> {
+        let header = encode_put_header(
+            0,
+            &PutRequest {
+                object: object.clone(),
+                body_len: len,
+            },
+        )?;
+        match self.put_file_exchange(&header, path, len).await {
+            Ok(version) => Ok(version),
+            Err((true, _stale)) => {
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                let version = self
+                    .pool
+                    .with_deadline(
+                        "worker put_object_file retry",
+                        streamed_put_timeout(len),
+                        async {
+                            stream.write_all(&header).await?;
+                            stream_file(&mut stream, path, len).await?;
+                            read_version_reply(&mut stream).await
+                        },
+                    )
+                    .await?;
+                self.pool.release(&self.addr, stream);
+                Ok(version)
+            }
+            Err((false, error)) => Err(error),
+        }
+    }
+
     /// One PUT exchange over a pooled-or-fresh connection; on error returns
     /// `(was_reused, err)` so a stale pooled connection can be retried.
     async fn put_exchange(
@@ -255,6 +294,34 @@ impl WriteClient {
                 Ok(version)
             }
             Err(err) => Err((reused, err)),
+        }
+    }
+
+    async fn put_file_exchange(
+        &self,
+        header: &[u8],
+        path: &Path,
+        len: u64,
+    ) -> Result<Version, (bool, WorkerError)> {
+        let (mut stream, reused) = self
+            .pool
+            .checkout(&self.addr)
+            .await
+            .map_err(|error| (false, WorkerError::from(error)))?;
+        let result: Result<Version, WorkerError> = self
+            .pool
+            .with_deadline("worker put_object_file", streamed_put_timeout(len), async {
+                stream.write_all(header).await?;
+                stream_file(&mut stream, path, len).await?;
+                read_version_reply(&mut stream).await
+            })
+            .await;
+        match result {
+            Ok(version) => {
+                self.pool.release(&self.addr, stream);
+                Ok(version)
+            }
+            Err(error) => Err((reused, error)),
         }
     }
 
@@ -306,6 +373,34 @@ impl WriteClient {
             Err(err) => Err((reused, err)),
         }
     }
+}
+
+fn streamed_put_timeout(len: u64) -> Duration {
+    const MIN_BYTES_PER_SECOND: u64 = 4 * 1024 * 1024;
+    const MAX_SECONDS: u64 = 30 * 60;
+    let transfer_seconds = len.div_ceil(MIN_BYTES_PER_SECOND);
+    Duration::from_secs((30 + transfer_seconds).min(MAX_SECONDS))
+}
+
+async fn stream_file(stream: &mut TcpStream, path: &Path, len: u64) -> Result<(), WorkerError> {
+    let file = tokio::fs::File::open(path).await?;
+    let actual_len = file.metadata().await?.len();
+    if actual_len < len {
+        return Err(WorkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("staged file is {actual_len} bytes, expected at least {len}"),
+        )));
+    }
+    let mut limited = file.take(len);
+    let copied = tokio::io::copy(&mut limited, stream).await?;
+    if copied != len {
+        return Err(WorkerError::Io(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("streamed {copied} bytes, expected {len}"),
+        )));
+    }
+    stream.flush().await?;
+    Ok(())
 }
 
 /// Read a framed write/delete reply: OK carries the committed version bytes (a
@@ -581,6 +676,24 @@ mod tests {
         let (obj, got) = recorded.lock().unwrap().take().unwrap();
         assert_eq!(obj, object());
         assert_eq!(got, body, "worker received the exact object bytes");
+    }
+
+    #[tokio::test]
+    async fn put_object_file_streams_exact_bytes() {
+        let recorded = Arc::new(std::sync::Mutex::new(None));
+        let addr = mock_write_worker("stream-v1", Arc::clone(&recorded)).await;
+        let client = WriteClient::new(addr);
+        let mut staged = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut staged, b"streamed-file-body").unwrap();
+
+        let version = client
+            .put_object_file(&object(), staged.path(), 18)
+            .await
+            .unwrap();
+        assert_eq!(version, talon_core::Version::new("stream-v1"));
+        let (obj, got) = recorded.lock().unwrap().take().unwrap();
+        assert_eq!(obj, object());
+        assert_eq!(got, b"streamed-file-body");
     }
 
     #[tokio::test]
