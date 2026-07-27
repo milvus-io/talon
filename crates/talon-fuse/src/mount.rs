@@ -20,6 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::block_reader::{BlockReader, FileView};
+use crate::lock::MutexExt;
 use crate::mapping::path_to_object;
 use crate::ops::{Attr, FileKind, FsError, ReadOnlyFs};
 use crate::prefetch::Prefetcher;
@@ -224,7 +225,7 @@ impl TalonFuse {
             None => return Vec::new(),
         };
         let block_index = offset / self.block_size as u64;
-        let mut prefetchers = self.prefetchers.lock().unwrap();
+        let mut prefetchers = self.prefetchers.lock_recover();
         let prefetcher = prefetchers.entry(fh).or_insert_with(|| {
             Prefetcher::new(
                 self.reader.clone(),
@@ -687,7 +688,7 @@ impl fuser::Filesystem for TalonFuse {
     ) {
         // Drop this handle's prefetch state (and its readahead cursor); any
         // in-flight speculative fetches finish on their own detached tasks.
-        self.prefetchers.lock().unwrap().remove(&fh);
+        self.prefetchers.lock_recover().remove(&fh);
         match self.fs.release(fh) {
             Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(e)),

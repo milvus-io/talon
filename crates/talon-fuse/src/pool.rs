@@ -37,6 +37,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+use crate::lock::MutexExt;
 use tokio::net::TcpStream;
 
 /// Default maximum idle connections kept per peer address.
@@ -98,7 +99,7 @@ impl ConnectionPool {
 
     /// Pop a non-stale idle connection for `addr`, discarding expired ones.
     fn take_idle(&self, addr: &str) -> Option<TcpStream> {
-        let mut guard = self.idle.lock().unwrap();
+        let mut guard = self.idle.lock_recover();
         let bucket = guard.get_mut(addr)?;
         while let Some(idle) = bucket.pop() {
             if idle.returned_at.elapsed() < self.idle_ttl {
@@ -114,7 +115,7 @@ impl ConnectionPool {
     /// Call this only after a request/response completed without error. Extra
     /// connections beyond `max_idle_per_addr` are dropped rather than pooled.
     pub fn release(&self, addr: &str, stream: TcpStream) {
-        let mut guard = self.idle.lock().unwrap();
+        let mut guard = self.idle.lock_recover();
         let bucket = guard.entry(addr.to_string()).or_default();
         if bucket.len() < self.max_idle_per_addr {
             bucket.push(Idle {
@@ -145,7 +146,7 @@ impl Default for ConnectionPool {
 impl std::fmt::Debug for ConnectionPool {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // TcpStream is not Debug; summarize the pool without touching sockets.
-        let addrs = self.idle.lock().unwrap().len();
+        let addrs = self.idle.lock_recover().len();
         f.debug_struct("ConnectionPool")
             .field("max_idle_per_addr", &self.max_idle_per_addr)
             .field("idle_ttl", &self.idle_ttl)
