@@ -28,3 +28,9 @@ secrets.*
 *_secret*
 credentials
 credentials.*
+
+# Python client build artifacts.
+clients/python/target/
+clients/python/dist/
+__pycache__/
+.pytest_cache/

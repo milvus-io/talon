@@ -1,0 +1,27 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "talon-client"
+description = "Python client for the Talon distributed object-store cache"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "License :: OSI Approved :: Apache Software License",
+    "Topic :: System :: Distributed Computing",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/milvus-io/talon"
+Documentation = "https://milvus-io.github.io/talon/"
+
+[tool.maturin]
+# One wheel per platform across CPython versions, via the stable ABI.
+features = ["extension-module"]
+module-name = "talon"
+manifest-path = "Cargo.toml"
