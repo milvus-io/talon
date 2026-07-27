@@ -1172,6 +1172,179 @@ async fn mount_symbolic_links_are_written_through() {
     result.expect("exercise symbolic links through mount");
 }
 
+/// Keep hard-link dentries on one inode while writing every linked blob key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_hard_links_share_inode_and_backend_contents() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([
+        ("/s3/bucket/source.bin".to_string(), b"seed".to_vec()),
+        ("/gcs/other/placeholder".to_string(), Vec::new()),
+    ])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/source.bin", 4);
+    fs.insert_object("gcs/other/placeholder", 0);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-hard-link-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bucket = mountpoint.join("s3").join("bucket");
+    let source = bucket.join("source.bin");
+    let linked = bucket.join("linked.bin");
+    let moved = bucket.join("moved.bin");
+    let cross_bucket = mountpoint.join("gcs").join("other").join("linked.bin");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        std::fs::hard_link(&source, &linked)?;
+        let source_metadata = std::fs::metadata(&source)?;
+        let linked_metadata = std::fs::metadata(&linked)?;
+        assert_eq!(source_metadata.ino(), linked_metadata.ino());
+        assert_eq!(source_metadata.nlink(), 2);
+        assert_eq!(linked_metadata.nlink(), 2);
+        {
+            let committed = operation_store.lock().unwrap();
+            assert_eq!(
+                committed.get("/s3/bucket/source.bin"),
+                Some(&b"seed".to_vec())
+            );
+            assert_eq!(
+                committed.get("/s3/bucket/linked.bin"),
+                Some(&b"seed".to_vec())
+            );
+        }
+
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&linked)?;
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(b"next")?;
+        writer.sync_all()?;
+        {
+            let committed = operation_store.lock().unwrap();
+            assert_eq!(
+                committed.get("/s3/bucket/source.bin"),
+                Some(&b"next".to_vec())
+            );
+            assert_eq!(
+                committed.get("/s3/bucket/linked.bin"),
+                Some(&b"next".to_vec())
+            );
+        }
+
+        writer.set_len(2)?;
+        writer.sync_all()?;
+        assert_eq!(std::fs::read(&source)?, b"ne");
+        {
+            let committed = operation_store.lock().unwrap();
+            assert_eq!(
+                committed.get("/s3/bucket/source.bin"),
+                Some(&b"ne".to_vec())
+            );
+            assert_eq!(
+                committed.get("/s3/bucket/linked.bin"),
+                Some(&b"ne".to_vec())
+            );
+        }
+        drop(writer);
+
+        assert_eq!(
+            std::fs::hard_link(&source, &cross_bucket)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+
+        std::fs::rename(&linked, &moved)?;
+        assert_eq!(std::fs::metadata(&source)?.nlink(), 2);
+        assert_eq!(std::fs::metadata(&moved)?.nlink(), 2);
+        {
+            let committed = operation_store.lock().unwrap();
+            assert!(!committed.contains_key("/s3/bucket/linked.bin"));
+            assert_eq!(committed.get("/s3/bucket/moved.bin"), Some(&b"ne".to_vec()));
+        }
+
+        std::fs::rename(&source, &moved)?;
+        assert!(source.exists());
+        assert!(moved.exists());
+        assert_eq!(std::fs::metadata(&source)?.nlink(), 2);
+
+        std::fs::remove_file(&source)?;
+        assert!(!source.exists());
+        assert_eq!(std::fs::metadata(&moved)?.nlink(), 1);
+        assert_eq!(std::fs::read(&moved)?, b"ne");
+
+        let mut final_handle = std::fs::File::open(&moved)?;
+        std::fs::remove_file(&moved)?;
+        assert_eq!(final_handle.metadata()?.nlink(), 0);
+        let mut retained = Vec::new();
+        final_handle.read_to_end(&mut retained)?;
+        assert_eq!(retained, b"ne");
+        drop(final_handle);
+
+        for _ in 0..100 {
+            let has_orphan = operation_store
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|path| path.starts_with("/s3/bucket/.__talon_internal/unlinked/"));
+            if !has_orphan {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !operation_store
+                .lock()
+                .unwrap()
+                .keys()
+                .any(|path| path.starts_with("/s3/bucket/.__talon_internal/unlinked/")),
+            "final release should delete the last-link orphan"
+        );
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise hard links through mount");
+}
+
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
 ///
 /// This is separately gated because the normal real-kernel smoke job runs all

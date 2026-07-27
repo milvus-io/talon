@@ -77,6 +77,10 @@ pub enum FsError {
     NameTooLong,
     /// Too many symbolic links were encountered (`ELOOP`).
     Loop,
+    /// The operation is not permitted for this inode type (`EPERM`).
+    OperationNotPermitted,
+    /// Source and destination are on different backend filesystems (`EXDEV`).
+    CrossDevice,
 }
 
 /// Access and mutation behavior for an open file handle.
@@ -174,6 +178,18 @@ pub struct UnlinkPlan {
     pub(crate) source_size: u64,
     pub(crate) orphan_path: Option<String>,
     pub(crate) buffered_contents: Option<Vec<u8>>,
+}
+
+/// Immutable backend and namespace facts for hard-link creation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HardLinkPlan {
+    pub(crate) source_ino: u64,
+    pub(crate) source_path: String,
+    pub(crate) source_size: u64,
+    pub(crate) buffered_contents: Option<Vec<u8>>,
+    pub(crate) target_parent: u64,
+    pub(crate) target_name: String,
+    pub(crate) target_path: String,
 }
 
 #[derive(Debug, Clone)]
@@ -424,18 +440,26 @@ impl ReadOnlyFs {
         Ok(parent)
     }
 
-    fn attr_of(node: &Node) -> Attr {
+    fn attr_of(g: &Inner, node: &Node) -> Attr {
         let perm = match node.kind {
             FileKind::Directory => 0o555,
             FileKind::File => 0o444,
             FileKind::Symlink => 0o777,
+        };
+        let nlink = if node.kind == FileKind::Directory {
+            1
+        } else {
+            g.index
+                .values()
+                .filter(|candidate| **candidate == node.ino)
+                .count() as u32
         };
         Attr {
             ino: node.ino,
             kind: node.kind,
             size: node.size,
             perm,
-            nlink: u32::from(node.linked),
+            nlink,
         }
     }
 
@@ -447,13 +471,19 @@ impl ReadOnlyFs {
             .index
             .get(&(parent_ino, name.to_string()))
             .ok_or(FsError::NotFound)?;
-        Ok(Self::attr_of(g.nodes.get(&ino).ok_or(FsError::NotFound)?))
+        Ok(Self::attr_of(
+            &g,
+            g.nodes.get(&ino).ok_or(FsError::NotFound)?,
+        ))
     }
 
     /// `getattr`: attributes for an inode.
     pub fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
         let g = self.inner.lock_recover();
-        Ok(Self::attr_of(g.nodes.get(&ino).ok_or(FsError::NotFound)?))
+        Ok(Self::attr_of(
+            &g,
+            g.nodes.get(&ino).ok_or(FsError::NotFound)?,
+        ))
     }
 
     /// `readdir`: list children of a directory inode (excluding `.`/`..`).
@@ -463,14 +493,16 @@ impl ReadOnlyFs {
         if node.kind != FileKind::Directory {
             return Err(FsError::NotDir);
         }
-        let mut entries: Vec<DirEntry> = node
-            .children
+        let mut entries: Vec<DirEntry> = g
+            .index
             .iter()
-            .filter_map(|c| g.nodes.get(c))
-            .map(|c| DirEntry {
-                ino: c.ino,
-                kind: c.kind,
-                name: c.name.clone(),
+            .filter(|((parent, _), _)| *parent == ino)
+            .filter_map(|((_, name), child_ino)| {
+                g.nodes.get(child_ino).map(|child| DirEntry {
+                    ino: child.ino,
+                    kind: child.kind,
+                    name: name.clone(),
+                })
             })
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -708,7 +740,7 @@ impl ReadOnlyFs {
                 buf: Vec::new(),
             },
         );
-        let attr = Self::attr_of(g.nodes.get(&ino).unwrap());
+        let attr = Self::attr_of(&g, g.nodes.get(&ino).unwrap());
         Ok((attr, fh))
     }
 
@@ -851,7 +883,7 @@ impl ReadOnlyFs {
         for dirty in g.dirty.values_mut().filter(|dirty| dirty.ino == ino) {
             dirty.buf.clone_from(&contents);
         }
-        Ok(Self::attr_of(g.nodes.get(&ino).unwrap()))
+        Ok(Self::attr_of(g, g.nodes.get(&ino).unwrap()))
     }
 
     /// Return the assembled object bytes for a write handle (for writeback at
@@ -869,6 +901,19 @@ impl ReadOnlyFs {
         g.nodes.get(&ino).map(|n| n.path.clone())
     }
 
+    /// All backend object paths linked to a write handle's inode.
+    pub fn dirty_paths(&self, fh: u64) -> Result<Vec<String>, FsError> {
+        let g = self.inner.lock_recover();
+        let ino = g.dirty.get(&fh).ok_or(FsError::BadHandle)?.ino;
+        Self::inode_paths_locked(&g, ino)
+    }
+
+    /// All visible backend object paths linked to an inode.
+    pub fn inode_paths(&self, ino: u64) -> Result<Vec<String>, FsError> {
+        let g = self.inner.lock_recover();
+        Self::inode_paths_locked(&g, ino)
+    }
+
     /// The mount-relative object path of file `name` under `parent_ino`, without
     /// removing it. `None` if the name doesn't resolve to a file.
     pub fn file_path(&self, parent_ino: u64, name: &str) -> Option<String> {
@@ -879,6 +924,86 @@ impl ReadOnlyFs {
             return None;
         }
         Some(node.path.clone())
+    }
+
+    /// Validate and describe hard-link creation without mutating namespace.
+    pub fn hard_link_plan(
+        &self,
+        source_ino: u64,
+        target_parent: u64,
+        target_name: &str,
+    ) -> Result<HardLinkPlan, FsError> {
+        Self::validate_component(target_name)?;
+        let g = self.inner.lock_recover();
+        let source = g.nodes.get(&source_ino).ok_or(FsError::NotFound)?;
+        if source.kind == FileKind::Directory {
+            return Err(FsError::OperationNotPermitted);
+        }
+        let target_parent_node = g.nodes.get(&target_parent).ok_or(FsError::NotFound)?;
+        if target_parent_node.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if g.index
+            .contains_key(&(target_parent, target_name.to_string()))
+        {
+            return Err(FsError::Exists);
+        }
+        let target_path = Self::child_path(target_parent_node, target_name);
+        Self::validate_visible_object_path(&target_path)?;
+        let source_object = path_to_object(&source.path).map_err(|_| FsError::Invalid)?;
+        let target_object = path_to_object(&target_path).map_err(|_| FsError::Invalid)?;
+        if source_object.backend != target_object.backend
+            || source_object.bucket != target_object.bucket
+        {
+            return Err(FsError::CrossDevice);
+        }
+        Ok(HardLinkPlan {
+            source_ino,
+            source_path: source.path.clone(),
+            source_size: source.size,
+            buffered_contents: g
+                .dirty
+                .iter()
+                .filter(|(_, dirty)| dirty.ino == source_ino)
+                .max_by_key(|(fh, _)| *fh)
+                .map(|(_, dirty)| dirty.buf.clone()),
+            target_parent,
+            target_name: target_name.to_string(),
+            target_path,
+        })
+    }
+
+    /// Add a hard-link dentry after the destination object is written through.
+    pub fn commit_hard_link(&self, plan: &HardLinkPlan) -> Result<Attr, FsError> {
+        let mut g = self.inner.lock_recover();
+        let source = g.nodes.get(&plan.source_ino).ok_or(FsError::NotFound)?;
+        if source.kind == FileKind::Directory || source.path != plan.source_path {
+            return Err(FsError::Invalid);
+        }
+        if g.index
+            .contains_key(&(plan.target_parent, plan.target_name.clone()))
+        {
+            return Err(FsError::Exists);
+        }
+        let target_parent = g.nodes.get(&plan.target_parent).ok_or(FsError::NotFound)?;
+        if target_parent.kind != FileKind::Directory
+            || Self::child_path(target_parent, &plan.target_name) != plan.target_path
+        {
+            return Err(FsError::NotDir);
+        }
+        g.index.insert(
+            (plan.target_parent, plan.target_name.clone()),
+            plan.source_ino,
+        );
+        g.nodes
+            .get_mut(&plan.target_parent)
+            .ok_or(FsError::NotFound)?
+            .children
+            .push(plan.source_ino);
+        Ok(Self::attr_of(
+            &g,
+            g.nodes.get(&plan.source_ino).ok_or(FsError::NotFound)?,
+        ))
     }
 
     /// Validate and describe a regular-file rename without mutating namespace.
@@ -907,10 +1032,14 @@ impl ReadOnlyFs {
         if source.kind == FileKind::Directory {
             return Err(FsError::IsDir);
         }
-        let target_path = Self::child_path(target_parent_node, target_name);
+        let source_path = Self::child_path(source_parent_node, source_name);
+        let mut target_path = Self::child_path(target_parent_node, target_name);
         Self::validate_visible_object_path(&target_path)?;
         let target = match g.index.get(&(target_parent, target_name.to_string())) {
-            Some(&target_ino) if target_ino == source_ino => None,
+            Some(&target_ino) if target_ino == source_ino => {
+                target_path.clone_from(&source_path);
+                None
+            }
             Some(&target_ino) => {
                 let node = g.nodes.get(&target_ino).ok_or(FsError::NotFound)?;
                 if node.kind == FileKind::Directory {
@@ -924,7 +1053,7 @@ impl ReadOnlyFs {
             source_ino,
             source_parent,
             source_name: source_name.to_string(),
-            source_path: source.path.clone(),
+            source_path,
             source_size: source.size,
             target_parent,
             target_name: target_name.to_string(),
@@ -956,10 +1085,18 @@ impl ReadOnlyFs {
             }
             g.index
                 .remove(&(plan.target_parent, plan.target_name.clone()));
-            if let Some(parent) = g.nodes.get_mut(&plan.target_parent) {
-                parent.children.retain(|child| *child != target_ino);
+            Self::remove_child_once(&mut g, plan.target_parent, target_ino);
+            let remaining_target = Self::inode_dentries_locked(&g, target_ino);
+            if let Some((parent, name, path)) = remaining_target.first() {
+                let target = g.nodes.get_mut(&target_ino).ok_or(FsError::NotFound)?;
+                if target.path == plan.target_path {
+                    target.parent = Some(*parent);
+                    target.name.clone_from(name);
+                    target.path.clone_from(path);
+                }
+            } else {
+                g.nodes.remove(&target_ino);
             }
-            g.nodes.remove(&target_ino);
         } else if g
             .index
             .contains_key(&(plan.target_parent, plan.target_name.clone()))
@@ -969,13 +1106,7 @@ impl ReadOnlyFs {
 
         g.index
             .remove(&(plan.source_parent, plan.source_name.clone()));
-        if let Some(parent) = g.nodes.get_mut(&plan.source_parent) {
-            parent.children.retain(|child| *child != plan.source_ino);
-        }
-        let source = g.nodes.get_mut(&plan.source_ino).ok_or(FsError::NotFound)?;
-        source.parent = Some(plan.target_parent);
-        source.name.clone_from(&plan.target_name);
-        source.path.clone_from(&plan.target_path);
+        Self::remove_child_once(&mut g, plan.source_parent, plan.source_ino);
         g.index.insert(
             (plan.target_parent, plan.target_name.clone()),
             plan.source_ino,
@@ -985,6 +1116,12 @@ impl ReadOnlyFs {
             .ok_or(FsError::NotFound)?
             .children
             .push(plan.source_ino);
+        let source = g.nodes.get_mut(&plan.source_ino).ok_or(FsError::NotFound)?;
+        if source.path == plan.source_path {
+            source.parent = Some(plan.target_parent);
+            source.name.clone_from(&plan.target_name);
+            source.path.clone_from(&plan.target_path);
+        }
         Ok(())
     }
 
@@ -1050,32 +1187,43 @@ impl ReadOnlyFs {
             None => None,
         };
 
-        let mut stack = vec![source_ino];
+        let source_path = Self::child_path(source_parent_node, source_name);
+        let mut stack = vec![(source_ino, source_path.clone(), target_path.clone())];
         let mut entries = Vec::new();
-        while let Some(ino) = stack.pop() {
+        while let Some((ino, current_source_path, current_target_path)) = stack.pop() {
             let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
-            stack.extend(node.children.iter().copied());
-            let suffix = node
-                .path
-                .strip_prefix(&source.path)
-                .ok_or(FsError::Invalid)?;
-            let moved_path = format!("{target_path}{suffix}");
-            match node.kind {
-                FileKind::File | FileKind::Symlink => entries.push(DirectoryRenameEntry {
-                    source_path: node.path.clone(),
-                    target_path: moved_path,
-                    size: node.size,
-                    marker: false,
-                }),
-                FileKind::Directory if node.directory_marker => {
+            if node.kind != FileKind::Directory {
+                return Err(FsError::Invalid);
+            }
+            if node.directory_marker {
+                entries.push(DirectoryRenameEntry {
+                    source_path: format!("{current_source_path}/"),
+                    target_path: format!("{current_target_path}/"),
+                    size: 0,
+                    marker: true,
+                });
+            }
+            let mut children: Vec<(String, u64)> = g
+                .index
+                .iter()
+                .filter(|((parent, _), _)| *parent == ino)
+                .map(|((_, name), child_ino)| (name.clone(), *child_ino))
+                .collect();
+            children.sort_by(|left, right| left.0.cmp(&right.0));
+            for (name, child_ino) in children.into_iter().rev() {
+                let child = g.nodes.get(&child_ino).ok_or(FsError::NotFound)?;
+                let child_source_path = format!("{current_source_path}/{name}");
+                let child_target_path = format!("{current_target_path}/{name}");
+                if child.kind == FileKind::Directory {
+                    stack.push((child_ino, child_source_path, child_target_path));
+                } else {
                     entries.push(DirectoryRenameEntry {
-                        source_path: format!("{}/", node.path),
-                        target_path: format!("{moved_path}/"),
-                        size: 0,
-                        marker: true,
+                        source_path: child_source_path,
+                        target_path: child_target_path,
+                        size: child.size,
+                        marker: false,
                     });
                 }
-                FileKind::Directory => {}
             }
         }
         entries.sort_by(|left, right| left.source_path.cmp(&right.source_path));
@@ -1130,30 +1278,22 @@ impl ReadOnlyFs {
             return Err(FsError::Exists);
         }
 
-        let mut stack = vec![plan.source_ino];
-        let mut subtree = Vec::new();
-        while let Some(ino) = stack.pop() {
-            let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
-            stack.extend(node.children.iter().copied());
-            subtree.push(ino);
-        }
         g.index
             .remove(&(plan.source_parent, plan.source_name.clone()));
         if let Some(parent) = g.nodes.get_mut(&plan.source_parent) {
             parent.children.retain(|child| *child != plan.source_ino);
         }
-        for ino in subtree {
-            let node = g.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
-            let suffix = node
-                .path
-                .strip_prefix(&plan.source_path)
-                .ok_or(FsError::Invalid)?;
-            node.path = format!("{}{}", plan.target_path, suffix);
-            if ino == plan.source_ino {
-                node.parent = Some(plan.target_parent);
-                node.name.clone_from(&plan.target_name);
+        let source_prefix = format!("{}/", plan.source_path);
+        for node in g.nodes.values_mut() {
+            if node.path == plan.source_path {
+                node.path.clone_from(&plan.target_path);
+            } else if let Some(suffix) = node.path.strip_prefix(&source_prefix) {
+                node.path = format!("{}/{suffix}", plan.target_path);
             }
         }
+        let source = g.nodes.get_mut(&plan.source_ino).ok_or(FsError::NotFound)?;
+        source.parent = Some(plan.target_parent);
+        source.name.clone_from(&plan.target_name);
         g.index.insert(
             (plan.target_parent, plan.target_name.clone()),
             plan.source_ino,
@@ -1214,7 +1354,7 @@ impl ReadOnlyFs {
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
         g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
-        Ok(Self::attr_of(g.nodes.get(&ino).unwrap()))
+        Ok(Self::attr_of(&g, g.nodes.get(&ino).unwrap()))
     }
 
     /// Return the raw target bytes for a symbolic-link inode.
@@ -1277,7 +1417,7 @@ impl ReadOnlyFs {
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
         g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
-        Ok(Self::attr_of(g.nodes.get(&ino).unwrap()))
+        Ok(Self::attr_of(&g, g.nodes.get(&ino).unwrap()))
     }
 
     /// Return the marker to delete before removing an empty directory.
@@ -1345,9 +1485,15 @@ impl ReadOnlyFs {
         if node.kind == FileKind::Directory {
             return Err(FsError::IsDir);
         }
+        let source_path = Self::child_path(parent, name);
+        let link_count = g
+            .index
+            .values()
+            .filter(|candidate| **candidate == ino)
+            .count();
         let has_open_handles = g.handles.values().any(|handle| handle.ino == ino);
-        let orphan_path = has_open_handles
-            .then(|| self.orphan_path(&node.path, ino))
+        let orphan_path = (link_count == 1 && has_open_handles)
+            .then(|| self.orphan_path(&source_path, ino))
             .transpose()?;
         let buffered_contents = g
             .dirty
@@ -1359,7 +1505,7 @@ impl ReadOnlyFs {
             ino,
             parent: parent_ino,
             name: name.to_string(),
-            source_path: node.path.clone(),
+            source_path,
             source_size: node.size,
             orphan_path,
             buffered_contents,
@@ -1373,19 +1519,35 @@ impl ReadOnlyFs {
             return Err(FsError::NotFound);
         }
         let node = g.nodes.get(&plan.ino).ok_or(FsError::NotFound)?;
-        if node.path != plan.source_path || node.kind == FileKind::Directory {
+        if node.kind == FileKind::Directory {
             return Err(FsError::Invalid);
         }
+        let parent = g.nodes.get(&plan.parent).ok_or(FsError::NotFound)?;
+        if Self::child_path(parent, &plan.name) != plan.source_path {
+            return Err(FsError::Invalid);
+        }
+        let link_count = g
+            .index
+            .values()
+            .filter(|candidate| **candidate == plan.ino)
+            .count();
         let has_open_handles = g.handles.values().any(|handle| handle.ino == plan.ino);
-        if has_open_handles != plan.orphan_path.is_some() {
+        if (link_count == 1 && has_open_handles) != plan.orphan_path.is_some() {
             return Err(FsError::Invalid);
         }
 
         g.index.remove(&(plan.parent, plan.name.clone()));
-        if let Some(parent) = g.nodes.get_mut(&plan.parent) {
-            parent.children.retain(|child| *child != plan.ino);
-        }
-        if let Some(orphan_path) = &plan.orphan_path {
+        Self::remove_child_once(&mut g, plan.parent, plan.ino);
+        let remaining = Self::inode_dentries_locked(&g, plan.ino);
+        if let Some((parent, name, path)) = remaining.first() {
+            let node = g.nodes.get_mut(&plan.ino).ok_or(FsError::NotFound)?;
+            if node.path == plan.source_path {
+                node.parent = Some(*parent);
+                node.name.clone_from(name);
+                node.path.clone_from(path);
+            }
+            node.linked = true;
+        } else if let Some(orphan_path) = &plan.orphan_path {
             let node = g.nodes.get_mut(&plan.ino).ok_or(FsError::NotFound)?;
             node.parent = None;
             node.path.clone_from(orphan_path);
@@ -1449,6 +1611,50 @@ impl ReadOnlyFs {
             name.to_string()
         } else {
             format!("{}/{}", parent.path, name)
+        }
+    }
+
+    fn inode_paths_locked(g: &Inner, ino: u64) -> Result<Vec<String>, FsError> {
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind == FileKind::Directory {
+            return Err(FsError::IsDir);
+        }
+        let mut paths: Vec<String> = Self::inode_dentries_locked(g, ino)
+            .into_iter()
+            .map(|(_, _, path)| path)
+            .collect();
+        paths.sort();
+        paths.dedup();
+        if paths.is_empty() && !node.linked {
+            paths.push(node.path.clone());
+        }
+        Ok(paths)
+    }
+
+    fn inode_dentries_locked(g: &Inner, ino: u64) -> Vec<(u64, String, String)> {
+        let mut entries: Vec<(u64, String, String)> = g
+            .index
+            .iter()
+            .filter(|(_, child_ino)| **child_ino == ino)
+            .filter_map(|((parent_ino, name), _)| {
+                g.nodes
+                    .get(parent_ino)
+                    .map(|parent| (*parent_ino, name.clone(), Self::child_path(parent, name)))
+            })
+            .collect();
+        entries.sort_by(|left, right| left.2.cmp(&right.2));
+        entries
+    }
+
+    fn remove_child_once(g: &mut Inner, parent_ino: u64, child_ino: u64) {
+        if let Some(parent) = g.nodes.get_mut(&parent_ino) {
+            if let Some(position) = parent
+                .children
+                .iter()
+                .position(|candidate| *candidate == child_ino)
+            {
+                parent.children.remove(position);
+            }
         }
     }
 
@@ -1682,6 +1888,87 @@ mod tests {
         assert_eq!(
             fs.new_symlink_path(parent.ino, &"x".repeat(256), b"target"),
             Err(FsError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn hard_links_share_inode_link_count_and_backend_paths() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let source = fs.lookup(parent.ino, "a.bin").unwrap();
+        let plan = fs
+            .hard_link_plan(source.ino, parent.ino, "linked.bin")
+            .unwrap();
+        assert_eq!(plan.source_path, "s3/bucket/data/a.bin");
+        assert_eq!(plan.target_path, "s3/bucket/data/linked.bin");
+
+        let linked = fs.commit_hard_link(&plan).unwrap();
+        assert_eq!(linked.ino, source.ino);
+        assert_eq!(linked.nlink, 2);
+        assert_eq!(fs.lookup(parent.ino, "linked.bin").unwrap().ino, source.ino);
+        assert_eq!(
+            fs.inode_paths(source.ino).unwrap(),
+            vec![
+                "s3/bucket/data/a.bin".to_string(),
+                "s3/bucket/data/linked.bin".to_string(),
+            ]
+        );
+        let names: Vec<String> = fs
+            .readdir(parent.ino)
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.name)
+            .collect();
+        assert!(names.contains(&"a.bin".to_string()));
+        assert!(names.contains(&"linked.bin".to_string()));
+
+        let same_inode = fs
+            .file_rename_plan(parent.ino, "a.bin", parent.ino, "linked.bin")
+            .unwrap();
+        assert_eq!(same_inode.source_path, same_inode.target_path);
+        fs.commit_file_rename(&same_inode).unwrap();
+        assert_eq!(fs.getattr(source.ino).unwrap().nlink, 2);
+
+        let move_link = fs
+            .file_rename_plan(parent.ino, "linked.bin", parent.ino, "moved.bin")
+            .unwrap();
+        fs.commit_file_rename(&move_link).unwrap();
+        assert_eq!(
+            fs.inode_paths(source.ino).unwrap(),
+            vec![
+                "s3/bucket/data/a.bin".to_string(),
+                "s3/bucket/data/moved.bin".to_string(),
+            ]
+        );
+
+        fs.unlink(parent.ino, "a.bin").unwrap();
+        assert_eq!(fs.lookup(parent.ino, "a.bin"), Err(FsError::NotFound));
+        assert_eq!(fs.lookup(parent.ino, "moved.bin").unwrap().nlink, 1);
+        assert_eq!(
+            fs.inode_paths(source.ino).unwrap(),
+            vec!["s3/bucket/data/moved.bin".to_string()]
+        );
+    }
+
+    #[test]
+    fn hard_links_reject_directories_conflicts_and_cross_bucket_targets() {
+        let fs = fs();
+        let source_parent = data_dir(&fs);
+        let source = fs.lookup(source_parent.ino, "a.bin").unwrap();
+        assert_eq!(
+            fs.hard_link_plan(source.ino, source_parent.ino, "b.bin"),
+            Err(FsError::Exists)
+        );
+        assert_eq!(
+            fs.hard_link_plan(source_parent.ino, source_parent.ino, "dir-link"),
+            Err(FsError::OperationNotPermitted)
+        );
+
+        let gcs = fs.lookup(ROOT_INO, "gcs").unwrap();
+        let other = fs.lookup(gcs.ino, "other").unwrap();
+        assert_eq!(
+            fs.hard_link_plan(source.ino, other.ino, "linked.bin"),
+            Err(FsError::CrossDevice)
         );
     }
 
@@ -1937,6 +2224,43 @@ mod tests {
         assert_eq!(moved.ino, source.ino);
         assert_eq!(fs.lookup(moved.ino, "a.bin").unwrap().ino, file.ino);
         assert_eq!(fs.dirty_path(fh).as_deref(), Some("s3/bucket/moved/a.bin"));
+    }
+
+    #[test]
+    fn directory_rename_moves_only_hard_link_dentries_inside_the_subtree() {
+        let fs = fs();
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+        let source = fs.lookup(bucket.ino, "data").unwrap();
+        let file = fs.lookup(source.ino, "a.bin").unwrap();
+        let external = fs
+            .hard_link_plan(file.ino, bucket.ino, "external.bin")
+            .unwrap();
+        fs.commit_hard_link(&external).unwrap();
+
+        let plan = fs
+            .directory_rename_plan(bucket.ino, "data", bucket.ino, "moved")
+            .unwrap();
+        assert!(plan.entries.iter().any(|entry| {
+            entry.source_path == "s3/bucket/data/a.bin"
+                && entry.target_path == "s3/bucket/moved/a.bin"
+        }));
+        assert!(!plan
+            .entries
+            .iter()
+            .any(|entry| entry.source_path == "s3/bucket/external.bin"));
+        fs.commit_directory_rename(&plan).unwrap();
+
+        let moved = fs.lookup(bucket.ino, "moved").unwrap();
+        assert_eq!(fs.lookup(moved.ino, "a.bin").unwrap().ino, file.ino);
+        assert_eq!(fs.lookup(bucket.ino, "external.bin").unwrap().ino, file.ino);
+        assert_eq!(
+            fs.inode_paths(file.ino).unwrap(),
+            vec![
+                "s3/bucket/external.bin".to_string(),
+                "s3/bucket/moved/a.bin".to_string(),
+            ]
+        );
     }
 
     #[test]
