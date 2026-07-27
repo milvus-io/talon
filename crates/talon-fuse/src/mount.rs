@@ -108,6 +108,10 @@ pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
         FileKind::Directory => fuser::FileType::Directory,
         FileKind::File => fuser::FileType::RegularFile,
         FileKind::Symlink => fuser::FileType::Symlink,
+        FileKind::NamedPipe => fuser::FileType::NamedPipe,
+        FileKind::BlockDevice => fuser::FileType::BlockDevice,
+        FileKind::CharDevice => fuser::FileType::CharDevice,
+        FileKind::Socket => fuser::FileType::Socket,
     };
     fuser::FileAttr {
         ino: attr.ino,
@@ -122,7 +126,7 @@ pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
         nlink: attr.nlink,
         uid,
         gid,
-        rdev: 0,
+        rdev: attr.rdev,
         blksize: 512,
         flags: 0,
     }
@@ -643,6 +647,10 @@ impl fuser::Filesystem for TalonFuse {
                 FileKind::Directory => fuser::FileType::Directory,
                 FileKind::File => fuser::FileType::RegularFile,
                 FileKind::Symlink => fuser::FileType::Symlink,
+                FileKind::NamedPipe => fuser::FileType::NamedPipe,
+                FileKind::BlockDevice => fuser::FileType::BlockDevice,
+                FileKind::CharDevice => fuser::FileType::CharDevice,
+                FileKind::Socket => fuser::FileType::Socket,
             };
             (e.ino, kind, e.name)
         }));
@@ -858,6 +866,12 @@ impl fuser::Filesystem for TalonFuse {
             Ok(plan) => plan,
             Err(error) => return reply.error(errno(error)),
         };
+        if !plan.backend_object {
+            return match self.fs.commit_hard_link(&plan) {
+                Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid()), 0),
+                Err(error) => reply.error(errno(error)),
+            };
+        }
         let contents = match &plan.buffered_contents {
             Some(contents) => contents.clone(),
             None => match self.read_committed_object(&plan.source_path, plan.source_size) {
@@ -886,6 +900,51 @@ impl fuser::Filesystem for TalonFuse {
                         %rollback_error,
                         "hard-link destination rollback failed"
                     );
+                }
+                reply.error(errno(error));
+            }
+        }
+    }
+
+    /// Create a regular file or mount-local POSIX special node.
+    fn mknod(
+        &mut self,
+        req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let name = match name.to_str() {
+            Some(name) => name,
+            None => return reply.error(libc::EINVAL),
+        };
+        let plan = match self.fs.mknod_plan(parent, name, mode, umask, rdev) {
+            Ok(plan) => plan,
+            Err(error) => return reply.error(errno(error)),
+        };
+        if plan.kind.has_backend_object() {
+            if let Err(error) = self.writeback_object(&plan.path, Vec::new()) {
+                tracing::warn!(path = %plan.path, %error, "mknod writeback failed");
+                return reply.error(libc::EIO);
+            }
+        }
+        match self.fs.commit_mknod(&plan) {
+            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid()), 0),
+            Err(error) => {
+                if plan.kind.has_backend_object() {
+                    if let Err(rollback_error) = self.delete_backend_object(&plan.path) {
+                        tracing::error!(
+                            path = %plan.path,
+                            %rollback_error,
+                            "mknod rollback failed"
+                        );
+                    }
                 }
                 reply.error(errno(error));
             }
@@ -1153,16 +1212,53 @@ impl fuser::Filesystem for TalonFuse {
         if plan.source_path == plan.target_path {
             return reply.ok();
         }
+        if !plan.source_backend_object {
+            let target_backup = if plan.target_backend_object {
+                let size = plan.target.map(|(_, size)| size).unwrap_or(0);
+                match self.read_committed_object(&plan.target_path, size) {
+                    Ok(bytes) => Some(bytes),
+                    Err(error) => return reply.error(error),
+                }
+            } else {
+                None
+            };
+            if plan.target_backend_object {
+                if let Err(error) = self.delete_backend_object(&plan.target_path) {
+                    tracing::warn!(
+                        target = %plan.target_path,
+                        %error,
+                        "special-node rename target delete failed"
+                    );
+                    return reply.error(libc::EIO);
+                }
+            }
+            return match self.fs.commit_file_rename(&plan) {
+                Ok(()) => reply.ok(),
+                Err(error) => {
+                    if let Some(bytes) = target_backup {
+                        if let Err(rollback_error) = self.writeback_object(&plan.target_path, bytes)
+                        {
+                            tracing::error!(
+                                target = %plan.target_path,
+                                %rollback_error,
+                                "special-node rename target rollback failed"
+                            );
+                        }
+                    }
+                    reply.error(errno(error));
+                }
+            };
+        }
         let source_bytes = match self.read_committed_object(&plan.source_path, plan.source_size) {
             Ok(bytes) => bytes,
             Err(error) => return reply.error(error),
         };
-        let target_backup = match plan.target {
-            Some((_, size)) => match self.read_committed_object(&plan.target_path, size) {
+        let target_backup = match (plan.target, plan.target_backend_object) {
+            (Some((_, size)), true) => match self.read_committed_object(&plan.target_path, size) {
                 Ok(bytes) => Some(bytes),
                 Err(error) => return reply.error(error),
             },
-            None => None,
+            _ => None,
         };
         if let Err(error) = self.writeback_object(&plan.target_path, source_bytes.clone()) {
             tracing::warn!(
@@ -1237,6 +1333,12 @@ impl fuser::Filesystem for TalonFuse {
             Ok(plan) => plan,
             Err(error) => return reply.error(errno(error)),
         };
+        if !plan.backend_object {
+            return match self.fs.commit_unlink(&plan) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(errno(error)),
+            };
+        }
         if let Some(orphan_path) = &plan.orphan_path {
             let contents = match &plan.buffered_contents {
                 Some(contents) => contents.clone(),
@@ -1558,6 +1660,7 @@ mod tests {
             atime: timestamp,
             mtime: timestamp,
             ctime: timestamp,
+            rdev: 0,
         };
         let fa = to_file_attr(dir, 1000, 1000);
         assert_eq!(fa.kind, fuser::FileType::Directory);
@@ -1577,6 +1680,7 @@ mod tests {
             atime: timestamp,
             mtime: timestamp,
             ctime: timestamp,
+            rdev: 0,
         };
         let fa = to_file_attr(file, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::RegularFile);
@@ -1594,6 +1698,7 @@ mod tests {
             atime: timestamp,
             mtime: timestamp,
             ctime: timestamp,
+            rdev: 0,
         };
         let fa = to_file_attr(symlink, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::Symlink);
