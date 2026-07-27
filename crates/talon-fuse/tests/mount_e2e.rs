@@ -24,6 +24,8 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1343,6 +1345,126 @@ async fn mount_hard_links_share_inode_and_backend_contents() {
     drop(session);
     std::fs::remove_dir_all(&mountpoint).ok();
     result.expect("exercise hard links through mount");
+}
+
+/// Apply explicit, omitted, and current timestamps through kernel setattr.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_timestamp_updates_follow_utimens_semantics() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/placeholder".to_string(),
+        Vec::new(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/placeholder", 0);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-timestamps-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let path = mountpoint.join("s3").join("bucket").join("file.bin");
+    let result = tokio::task::spawn_blocking(move || {
+        std::fs::write(&path, b"seed")?;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+        let explicit_atime = std::time::UNIX_EPOCH + Duration::new(123, 456);
+        let explicit_mtime = std::time::UNIX_EPOCH + Duration::new(789, 123);
+        file.set_times(
+            std::fs::FileTimes::new()
+                .set_accessed(explicit_atime)
+                .set_modified(explicit_mtime),
+        )?;
+        let explicit = file.metadata()?;
+        assert_eq!(explicit.atime(), 123);
+        assert_eq!(explicit.atime_nsec(), 456);
+        assert_eq!(explicit.mtime(), 789);
+        assert_eq!(explicit.mtime_nsec(), 123);
+
+        let later_mtime = libc::timespec {
+            tv_sec: 999,
+            tv_nsec: 321,
+        };
+        let omit_atime = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::UTIME_OMIT,
+        };
+        let times = [omit_atime, later_mtime];
+        let path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::utimensat(libc::AT_FDCWD, path.as_ptr(), times.as_ptr(), 0) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let omitted = file.metadata()?;
+        assert_eq!(omitted.atime(), 123);
+        assert_eq!(omitted.atime_nsec(), 456);
+        assert_eq!(omitted.mtime(), 999);
+        assert_eq!(omitted.mtime_nsec(), 321);
+
+        let now_times = [
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+            libc::timespec {
+                tv_sec: 0,
+                tv_nsec: libc::UTIME_NOW,
+            },
+        ];
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let result = unsafe { libc::futimens(file.as_raw_fd(), now_times.as_ptr()) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let current = file.metadata()?;
+        assert!(current.atime() >= before);
+        assert!(current.mtime() >= before);
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise timestamp updates through mount");
 }
 
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
