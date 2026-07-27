@@ -87,9 +87,22 @@ public final class TalonClient implements AutoCloseable {
      * reassembled in order, each benefiting independently from the placement
      * cache.
      *
-     * <p>{@code version} is the object's source ETag. It is required because no
-     * server implements {@code StatObject} yet (see issue #318), so the client
-     * cannot resolve it.
+     * <p>Resolves the object's version with a {@code stat} first. Use
+     * {@link #read(String, String, long, long)} to supply a known version and
+     * skip that round trip.
+     */
+    public byte[] read(String uri, long offset, long length) throws IOException {
+        ObjectId object = ObjectId.parse(uri);
+        ObjectStat stat = stat(object);
+        return read(object, stat.version(), offset, Math.min(length, Math.max(0, stat.size() - offset)));
+    }
+
+    /**
+     * Read with a known version, skipping the {@code stat} round trip.
+     *
+     * <p>Worth using when reading many ranges of one object: the version is
+     * stable for an object generation, so re-resolving it per read is wasted
+     * work.
      */
     public byte[] read(String uri, String version, long offset, long length) throws IOException {
         return read(ObjectId.parse(uri), version, offset, length);
@@ -113,15 +126,13 @@ public final class TalonClient implements AutoCloseable {
         return out.toByteArray();
     }
 
-    /**
-     * Return an object's size and version.
-     *
-     * <p><b>Not usable yet</b>: no server implements {@code StatObject}
-     * (issue #318). Kept because the client half is correct and starts working
-     * when the server side lands.
-     */
+    /** Return an object's size and version. */
     public ObjectStat stat(String uri) throws IOException {
-        ObjectId object = ObjectId.parse(uri);
+        return stat(ObjectId.parse(uri));
+    }
+
+    /** As {@link #stat(String)}, with a parsed object id. */
+    public ObjectStat stat(ObjectId object) throws IOException {
         int id = requestIds.getAndIncrement();
         Messages.Response resp = controlRoundTrip(Messages.statObject(id, object));
         if (resp.tag == Messages.TAG_OBJECT_STAT) {
@@ -134,7 +145,9 @@ public final class TalonClient implements AutoCloseable {
     /**
      * List objects beneath a mount-relative prefix.
      *
-     * <p><b>Not usable yet</b> — see {@link #stat} and issue #318.
+     * <p><b>Not usable yet</b>: {@code ListObjects} needs a listing capability
+     * on the backends, which they do not yet have (issue #332). {@code stat}
+     * and {@code read} are unaffected.
      */
     public List<ObjectEntry> list(String prefix) throws IOException {
         int id = requestIds.getAndIncrement();

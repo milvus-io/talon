@@ -20,6 +20,10 @@ use tokio::net::{TcpListener, TcpStream};
 /// this, new peers wait for an in-flight connection to finish.
 const MAX_CONTROL_CONNECTIONS: usize = 1024;
 
+/// Bound on a proxied worker round trip (#318). Short: a client is blocked on
+/// this, and trying the next worker beats waiting on an unresponsive one.
+const PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Debug, Parser)]
 #[command(name = "talon-coordinator", version, about)]
 struct Args {
@@ -99,6 +103,73 @@ impl Coordinator {
             observability,
             lease_ttl,
         })
+    }
+
+    /// Forward a message to any healthy worker and return its reply (#318).
+    ///
+    /// `StatObject` needs backend credentials, which only workers hold. Giving
+    /// the coordinator its own credentials would duplicate secret distribution
+    /// for one read-only call, so it proxies instead.
+    ///
+    /// Any worker will do: a stat is independent of where the object's blocks
+    /// live. That is what breaks the circularity a client would otherwise hit —
+    /// it needs a version to compute placement, but placement to pick a worker.
+    ///
+    /// Workers are tried in membership order until one answers, so a single
+    /// unreachable worker does not fail the request.
+    async fn proxy_to_worker(&self, message: ControlMessage) -> ControlMessage {
+        let workers: Vec<_> = self
+            .service
+            .membership()
+            .snapshot()
+            .into_iter()
+            .filter(|node| node.role == NodeRole::Worker)
+            .collect();
+        if workers.is_empty() {
+            return ControlMessage::Ack {
+                ok: false,
+                detail: Some("no worker available to serve the request".into()),
+            };
+        }
+
+        let mut last_error = None;
+        for worker in &workers {
+            match Self::round_trip_worker(&worker.address, &message).await {
+                Ok(reply) => return reply,
+                Err(e) => last_error = Some(format!("{}: {e}", worker.address)),
+            }
+        }
+        ControlMessage::Ack {
+            ok: false,
+            detail: Some(format!(
+                "no worker served the request ({} tried); last error: {}",
+                workers.len(),
+                last_error.unwrap_or_else(|| "unknown".into())
+            )),
+        }
+    }
+
+    /// One request/response against a worker's data-plane port.
+    async fn round_trip_worker(
+        address: &str,
+        message: &ControlMessage,
+    ) -> anyhow::Result<ControlMessage> {
+        let mut stream = tokio::time::timeout(PROXY_TIMEOUT, TcpStream::connect(address)).await??;
+        let buf = codec::encode(0, message)?;
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+
+        let (header, payload) = tokio::time::timeout(
+            PROXY_TIMEOUT,
+            talon_transport::read_frame(&mut stream, PROXY_TIMEOUT),
+        )
+        .await?
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+        full.extend_from_slice(&header.encode());
+        full.extend_from_slice(&payload);
+        let (_, reply) = codec::decode(&full)?;
+        Ok(reply)
     }
 
     async fn dispatch(&self, message: ControlMessage) -> ControlMessage {
@@ -197,6 +268,15 @@ impl Coordinator {
                 ControlMessage::MembershipList {
                     nodes: self.service.membership().snapshot(),
                 }
+            }
+            stat @ ControlMessage::StatObject { .. } => {
+                if !self.observability.is_ready() {
+                    return ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("coordinator not ready: shared state unavailable".into()),
+                    };
+                }
+                self.proxy_to_worker(stat).await
             }
             other => ControlMessage::Ack {
                 ok: false,

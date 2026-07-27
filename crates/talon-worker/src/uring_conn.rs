@@ -110,12 +110,29 @@ pub async fn handle_conn(
                 .await?;
                 continue;
             }
+            // A Control frame on the data plane carries StatObject (#318):
+            // clients already hold this connection, and only a worker has the
+            // backend credentials to resolve a version.
+            MsgType::Control => {
+                handle_control_frame(
+                    &mut stream,
+                    &header,
+                    &payload,
+                    &worker,
+                    &observability,
+                    request_started,
+                )
+                .await?;
+                continue;
+            }
             MsgType::GetRange => {}
             // A data listener serves only GetRange/Put/Delete; anything else is
             // rejected before any per-request work.
             _ => {
-                let err =
-                    data::encode_error(header.request_id, "worker only serves GetRange/Put/Delete");
+                let err = data::encode_error(
+                    header.request_id,
+                    "worker only serves GetRange/Put/Delete/StatObject",
+                );
                 write_all(&mut stream, err).await?;
                 observability
                     .metrics()
@@ -234,6 +251,83 @@ impl AsRawFd for FdRef {
     fn as_raw_fd(&self) -> std::os::fd::RawFd {
         self.0
     }
+}
+
+/// Handle a `Control` frame on the data plane.
+///
+/// Only `StatObject` is served (#318). Mirrors the Tokio path's semantics
+/// exactly — the two data planes must not diverge in what they answer, only in
+/// how they move bytes.
+async fn handle_control_frame(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<()> {
+    let (h, message) = match talon_transport::codec::decode(&rejoin(header, payload)) {
+        Ok(v) => v,
+        Err(e) => {
+            let reply = talon_transport::codec::encode(
+                header.request_id,
+                &talon_transport::ControlMessage::Ack {
+                    ok: false,
+                    detail: Some(format!("bad control message: {e}")),
+                },
+            )?;
+            write_all(stream, reply).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+
+    let reply = match message {
+        talon_transport::ControlMessage::StatObject { object } => {
+            if !observability.is_ready() {
+                talon_transport::ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.stat_object(&object).await {
+                    Ok(stat) => talon_transport::ControlMessage::ObjectStat {
+                        size: stat.len,
+                        version: stat.version.as_str().to_string(),
+                    },
+                    Err(error) => talon_transport::ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
+        other => talon_transport::ControlMessage::Ack {
+            ok: false,
+            detail: Some(format!(
+                "worker serves only StatObject on the data plane, got {other:?}"
+            )),
+        },
+    };
+
+    let is_error = matches!(
+        reply,
+        talon_transport::ControlMessage::Ack { ok: false, .. }
+    );
+    let buf = talon_transport::codec::encode(h.request_id, &reply)?;
+    write_all(stream, buf).await?;
+    if is_error {
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+    } else {
+        observability
+            .metrics()
+            .record_request_success(0, request_started.elapsed());
+    }
+    Ok(())
 }
 
 /// Handle a `Put`: read the object body off the wire, write through to the

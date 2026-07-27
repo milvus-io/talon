@@ -101,6 +101,17 @@ def client(cluster):
         yield c
 
 
+def test_read_resolves_version_automatically(client):
+    """The common case: no version supplied, resolved via stat (#318)."""
+    assert client.read(URI, offset=0, length=4096) == ramp(0, 4096)
+
+
+def test_stat_returns_size_and_version(client):
+    info = client.stat(URI)
+    assert info.version == VERSION
+    assert info.size > 0
+
+
 def test_read_returns_exact_bytes(client):
     assert client.read(URI, version=VERSION, offset=0, length=4096) == ramp(0, 4096)
 

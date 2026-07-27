@@ -598,12 +598,31 @@ async fn handle_conn(
             continue;
         }
 
+        // A Control frame on the data plane carries StatObject (#318). Clients
+        // already hold a data-plane connection, and only a worker has backend
+        // credentials, so answering here avoids a second connection and avoids
+        // giving the coordinator backend access.
+        if header.msg_type == MsgType::Control {
+            handle_control_frame(
+                &mut stream,
+                &header,
+                &payload,
+                &worker,
+                &observability,
+                request_started,
+            )
+            .await?;
+            continue;
+        }
+
         // Type check BEFORE any per-request work; a data listener only serves
-        // GetRange (plus the Put/Delete handled above); other frames are capped
-        // tightly by read_frame.
+        // GetRange (plus the Put/Delete/Control handled above); other frames are
+        // capped tightly by read_frame.
         if header.msg_type != MsgType::GetRange {
-            let err =
-                data::encode_error(header.request_id, "worker only serves GetRange/Put/Delete");
+            let err = data::encode_error(
+                header.request_id,
+                "worker only serves GetRange/Put/Delete/StatObject",
+            );
             stream.write_all(&err).await?;
             stream.flush().await?;
             observability
@@ -684,6 +703,87 @@ async fn handle_conn(
             }
         }
     }
+}
+
+/// Handle a `Control` frame on the data plane.
+///
+/// Only `StatObject` is served here (#318): a client must know an object's
+/// version before it can address any block, and only a worker holds the backend
+/// credentials needed to resolve it. Anything else gets an `Ack` naming what
+/// was rejected, so a client sees the reason rather than a closed connection.
+async fn handle_control_frame(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<()> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+
+    let (h, message) = match codec::decode(&full) {
+        Ok(v) => v,
+        Err(e) => {
+            let reply = codec::encode(
+                header.request_id,
+                &ControlMessage::Ack {
+                    ok: false,
+                    detail: Some(format!("bad control message: {e}")),
+                },
+            )?;
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+
+    let reply = match message {
+        ControlMessage::StatObject { object } => {
+            if !observability.is_ready() {
+                ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.stat_object(&object).await {
+                    Ok(stat) => ControlMessage::ObjectStat {
+                        size: stat.len,
+                        version: stat.version.as_str().to_string(),
+                    },
+                    Err(error) => ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
+        other => ControlMessage::Ack {
+            ok: false,
+            detail: Some(format!(
+                "worker serves only StatObject on the data plane, got {other:?}"
+            )),
+        },
+    };
+
+    let is_error = matches!(reply, ControlMessage::Ack { ok: false, .. });
+    let buf = codec::encode(h.request_id, &reply)?;
+    stream.write_all(&buf).await?;
+    stream.flush().await?;
+    if is_error {
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+    } else {
+        observability
+            .metrics()
+            .record_request_success(0, request_started.elapsed());
+    }
+    Ok(())
 }
 
 /// Handle a `Put` frame: read the whole object body, write it through to the

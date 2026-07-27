@@ -162,37 +162,46 @@ impl Client {
     /// Ranges spanning block boundaries are split and fetched per block, each
     /// benefiting independently from the placement cache.
     ///
-    /// `version` is the object's source ETag, which blocks are keyed by. It is
-    /// required because no server implements `StatObject` yet (#318), so the
-    /// client cannot resolve it. Once that lands this becomes optional and is
-    /// resolved automatically. `size` bounds the read at EOF; when omitted the
-    /// read is not clamped and a past-EOF request fails at the worker rather
-    /// than returning short.
-    #[pyo3(signature = (uri, *, version, offset = 0, length = None, size = None))]
+    /// `version` and `size` are resolved with a `stat` when omitted. Pass them
+    /// to skip that round trip when they are already known — for example when
+    /// reading many ranges of the same object.
+    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None))]
     fn read<'py>(
         &self,
         py: Python<'py>,
         uri: &str,
-        version: &str,
         offset: u64,
         length: Option<u64>,
+        version: Option<&str>,
         size: Option<u64>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let object = parse_uri_inner(uri).map_err(PyValueError::new_err)?;
-        let version = Version::new(version);
+        let known_version = version.map(Version::new);
         let runtime = Arc::clone(&self.runtime);
         let reader = self.reader.clone();
+        let coordinator = self.coordinator.clone();
         let block_size = self.block_size;
-        let file_size = size.unwrap_or(u64::MAX);
-        let len = match length {
-            Some(n) => n,
-            None => file_size.saturating_sub(offset),
-        };
 
         // Release the GIL: this is network I/O, and holding it would serialise
         // every reader thread in the process on one request.
         let bytes = py.allow_threads(move || {
             runtime.block_on(async move {
+                // One stat covers both, so only issue it when something is
+                // actually missing.
+                let (version, file_size) = match (known_version, size) {
+                    (Some(v), Some(s)) => (v, s),
+                    (known, known_size) => {
+                        let stat = coordinator
+                            .stat_object(&object)
+                            .await
+                            .map_err(|e| e.to_string())?;
+                        (
+                            known.unwrap_or_else(|| Version::new(stat.version.as_str())),
+                            known_size.unwrap_or(stat.size),
+                        )
+                    }
+                };
+                let len = length.unwrap_or_else(|| file_size.saturating_sub(offset));
                 let file = FileView {
                     object: &object,
                     block_size,
@@ -210,11 +219,6 @@ impl Client {
     }
 
     /// Return an object's size and version.
-    ///
-    /// **Not usable yet**: no server implements `StatObject` (#318), so this
-    /// currently fails with the coordinator's rejection. It is kept because the
-    /// protocol defines it and the client half is correct; it starts working
-    /// when the server side lands.
     fn stat(&self, py: Python<'_>, uri: &str) -> PyResult<ObjectStat> {
         let object = parse_uri_inner(uri).map_err(PyValueError::new_err)?;
         let runtime = Arc::clone(&self.runtime);
@@ -236,8 +240,9 @@ impl Client {
 
     /// List objects under a mount-relative prefix, e.g. `az/container/dir`.
     ///
-    /// **Not usable yet** for the same reason as [`stat`](Self::stat) — see
-    /// #318.
+    /// **Not usable yet**: `ListObjects` needs a listing capability on
+    /// `BackendStore`, which the S3, GCS, and Azure backends do not yet have
+    /// (#332). `stat` and `read` are unaffected.
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
         let runtime = Arc::clone(&self.runtime);
         let coordinator = self.coordinator.clone();
