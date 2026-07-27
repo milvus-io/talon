@@ -56,6 +56,7 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::ReadOnly => libc::EROFS,
         FsError::Unsupported => libc::ENOSYS,
         FsError::BadHandle => libc::EBADF,
+        FsError::TooLarge => libc::EFBIG,
     }
 }
 
@@ -825,6 +826,7 @@ mod tests {
         assert_eq!(errno(FsError::ReadOnly), libc::EROFS);
         assert_eq!(errno(FsError::Unsupported), libc::ENOSYS);
         assert_eq!(errno(FsError::BadHandle), libc::EBADF);
+        assert_eq!(errno(FsError::TooLarge), libc::EFBIG);
     }
 
     #[test]
