@@ -68,6 +68,8 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::NotEmpty => libc::ENOTEMPTY,
         FsError::NameTooLong => libc::ENAMETOOLONG,
         FsError::Loop => libc::ELOOP,
+        FsError::OperationNotPermitted => libc::EPERM,
+        FsError::CrossDevice => libc::EXDEV,
     }
 }
 
@@ -299,6 +301,22 @@ impl TalonFuse {
             client.put_object(&object, &bytes).await?;
             Ok::<(), anyhow::Error>(())
         })
+    }
+
+    fn writeback_object_paths(&self, paths: &[String], bytes: Vec<u8>) -> anyhow::Result<()> {
+        if paths.is_empty() {
+            anyhow::bail!("inode has no backend object paths");
+        }
+        let mut first_error = None;
+        for path in paths {
+            if let Err(error) = self.writeback_object(path, bytes.clone()) {
+                first_error.get_or_insert(error);
+            }
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// Delete the object at mount-relative `path` through its owning worker.
@@ -822,6 +840,60 @@ impl fuser::Filesystem for TalonFuse {
         }
     }
 
+    /// Create a hard link by materializing the shared inode bytes at a new key.
+    fn link(
+        &mut self,
+        req: &fuser::Request<'_>,
+        ino: u64,
+        newparent: u64,
+        newname: &std::ffi::OsStr,
+        reply: fuser::ReplyEntry,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let newname = match newname.to_str() {
+            Some(name) => name,
+            None => return reply.error(libc::EINVAL),
+        };
+        let plan = match self.fs.hard_link_plan(ino, newparent, newname) {
+            Ok(plan) => plan,
+            Err(error) => return reply.error(errno(error)),
+        };
+        let contents = match &plan.buffered_contents {
+            Some(contents) => contents.clone(),
+            None => match self.read_committed_object(&plan.source_path, plan.source_size) {
+                Ok(contents) => contents,
+                Err(error) => return reply.error(error),
+            },
+        };
+        if let Err(error) = self.writeback_object(&plan.target_path, contents) {
+            tracing::warn!(
+                source = %plan.source_path,
+                target = %plan.target_path,
+                %error,
+                "hard-link destination writeback failed"
+            );
+            return reply.error(libc::EIO);
+        }
+        match self.fs.commit_hard_link(&plan) {
+            Ok(attr) => {
+                let file_attr = to_file_attr(attr, req.uid(), req.gid());
+                reply.entry(&ATTR_TTL, &file_attr, 0);
+            }
+            Err(error) => {
+                if let Err(rollback_error) = self.delete_backend_object(&plan.target_path) {
+                    tracing::error!(
+                        target = %plan.target_path,
+                        %rollback_error,
+                        "hard-link destination rollback failed"
+                    );
+                }
+                reply.error(errno(error));
+            }
+        }
+    }
+
     /// Create a directory and persist it as a trailing-slash blob marker.
     fn mkdir(
         &mut self,
@@ -926,11 +998,16 @@ impl fuser::Filesystem for TalonFuse {
             if new_size > self.fs.max_object_bytes() {
                 return reply.error(libc::EFBIG);
             }
-            let (path, contents) = if let Some(fh) = fh {
-                match self.fs.truncate_handle_plan(fh, new_size) {
+            let (paths, contents) = if let Some(fh) = fh {
+                let (_, contents) = match self.fs.truncate_handle_plan(fh, new_size) {
                     Ok(plan) => plan,
                     Err(e) => return reply.error(errno(e)),
-                }
+                };
+                let paths = match self.fs.dirty_paths(fh) {
+                    Ok(paths) => paths,
+                    Err(e) => return reply.error(errno(e)),
+                };
+                (paths, contents)
             } else {
                 let (path, current_size) = match self.fs.inode_file_meta(ino) {
                     Ok(meta) => meta,
@@ -941,13 +1018,18 @@ impl fuser::Filesystem for TalonFuse {
                     Ok(contents) => contents,
                     Err(error) => return reply.error(error),
                 };
-                match self.fs.truncate_inode_plan(ino, new_size, existing) {
+                let (_, contents) = match self.fs.truncate_inode_plan(ino, new_size, existing) {
                     Ok(plan) => plan,
                     Err(e) => return reply.error(errno(e)),
-                }
+                };
+                let paths = match self.fs.inode_paths(ino) {
+                    Ok(paths) => paths,
+                    Err(e) => return reply.error(errno(e)),
+                };
+                (paths, contents)
             };
-            if let Err(error) = self.writeback_object(&path, contents.clone()) {
-                tracing::warn!(%path, %error, "truncate writeback failed");
+            if let Err(error) = self.writeback_object_paths(&paths, contents.clone()) {
+                tracing::warn!(?paths, %error, "truncate writeback failed");
                 return reply.error(libc::EIO);
             }
             let attr = if let Some(fh) = fh {
@@ -980,15 +1062,18 @@ impl fuser::Filesystem for TalonFuse {
         _lock_owner: u64,
         reply: fuser::ReplyEmpty,
     ) {
-        let (path, bytes) = match (self.fs.dirty_path(fh), self.fs.dirty_bytes(fh)) {
-            (Some(p), Some(b)) => (p, b),
-            // Not a write handle → nothing to flush.
-            _ => return reply.ok(),
+        let bytes = match self.fs.dirty_bytes(fh) {
+            Some(bytes) => bytes,
+            None => return reply.ok(),
         };
-        match self.writeback_object(&path, bytes) {
+        let paths = match self.fs.dirty_paths(fh) {
+            Ok(paths) => paths,
+            Err(error) => return reply.error(errno(error)),
+        };
+        match self.writeback_object_paths(&paths, bytes) {
             Ok(()) => reply.ok(),
             Err(error) => {
-                tracing::warn!(%path, %error, "flush writeback failed");
+                tracing::warn!(?paths, %error, "flush writeback failed");
                 reply.error(libc::EIO);
             }
         }
@@ -1003,11 +1088,15 @@ impl fuser::Filesystem for TalonFuse {
         _datasync: bool,
         reply: fuser::ReplyEmpty,
     ) {
-        let (path, bytes) = match (self.fs.dirty_path(fh), self.fs.dirty_bytes(fh)) {
-            (Some(p), Some(b)) => (p, b),
-            _ => return reply.ok(),
+        let bytes = match self.fs.dirty_bytes(fh) {
+            Some(bytes) => bytes,
+            None => return reply.ok(),
         };
-        match self.writeback_object(&path, bytes) {
+        let paths = match self.fs.dirty_paths(fh) {
+            Ok(paths) => paths,
+            Err(error) => return reply.error(errno(error)),
+        };
+        match self.writeback_object_paths(&paths, bytes) {
             Ok(()) => reply.ok(),
             Err(_) => reply.error(libc::EIO),
         }
@@ -1411,6 +1500,8 @@ mod tests {
         assert_eq!(errno(FsError::NotEmpty), libc::ENOTEMPTY);
         assert_eq!(errno(FsError::NameTooLong), libc::ENAMETOOLONG);
         assert_eq!(errno(FsError::Loop), libc::ELOOP);
+        assert_eq!(errno(FsError::OperationNotPermitted), libc::EPERM);
+        assert_eq!(errno(FsError::CrossDevice), libc::EXDEV);
     }
 
     #[test]
