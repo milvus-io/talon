@@ -34,3 +34,6 @@ clients/python/target/
 clients/python/dist/
 __pycache__/
 .pytest_cache/
+
+# Java client build artifacts.
+clients/java/target/
