@@ -627,9 +627,8 @@ impl ReadOnlyFs {
             return Err(FsError::BadHandle);
         }
         let append = handle.append;
-        let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
         let start = if append {
-            dirty.buf.len() as u64
+            g.dirty.get(&fh).ok_or(FsError::BadHandle)?.buf.len() as u64
         } else {
             offset
         };
@@ -641,6 +640,7 @@ impl ReadOnlyFs {
         }
         let end: usize = end.try_into().map_err(|_| FsError::TooLarge)?;
         let start: usize = start.try_into().map_err(|_| FsError::TooLarge)?;
+        let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
         if dirty.buf.len() < end {
             dirty.buf.resize(end, 0);
         }
@@ -653,13 +653,11 @@ impl ReadOnlyFs {
         Ok(data.len() as u32)
     }
 
-    /// `setattr(size)`: truncate/extend the write handle's buffer to `size`.
-    ///
-    /// Fails with [`FsError::TooLarge`] (`EFBIG`) if `size` exceeds
-    /// [`ReadOnlyFs::max_object_bytes`] — `ftruncate` takes an arbitrary
-    /// user-supplied length and the buffer is zero-filled eagerly.
-    pub fn truncate(&self, fh: u64, size: u64) -> Result<(), FsError> {
-        let mut g = self.inner.lock_recover();
+    /// Build a resized whole-object buffer for `ftruncate` without committing
+    /// the visible size. The caller can write the returned bytes through to the
+    /// backend before calling [`commit_handle_contents`](Self::commit_handle_contents).
+    pub fn truncate_handle_plan(&self, fh: u64, size: u64) -> Result<(String, Vec<u8>), FsError> {
+        let g = self.inner.lock_recover();
         let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
         if !handle.write {
             return Err(FsError::BadHandle);
@@ -668,13 +666,76 @@ impl ReadOnlyFs {
             return Err(FsError::TooLarge);
         }
         let new_len: usize = size.try_into().map_err(|_| FsError::TooLarge)?;
-        let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
-        dirty.buf.resize(new_len, 0);
-        let ino = dirty.ino;
-        if let Some(node) = g.nodes.get_mut(&ino) {
-            node.size = size;
+        let dirty = g.dirty.get(&fh).ok_or(FsError::BadHandle)?;
+        let node = g.nodes.get(&dirty.ino).ok_or(FsError::NotFound)?;
+        let mut contents = dirty.buf.clone();
+        contents.resize(new_len, 0);
+        Ok((node.path.clone(), contents))
+    }
+
+    /// Build a resized whole-object buffer for path-based `truncate`.
+    ///
+    /// `contents` must contain the committed prefix that should survive the
+    /// resize. A shrink may pass only the retained prefix; an extension passes
+    /// the complete existing object.
+    pub fn truncate_inode_plan(
+        &self,
+        ino: u64,
+        size: u64,
+        mut contents: Vec<u8>,
+    ) -> Result<(String, Vec<u8>), FsError> {
+        let g = self.inner.lock_recover();
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::File {
+            return Err(FsError::IsDir);
         }
+        if size > self.max_object_bytes {
+            return Err(FsError::TooLarge);
+        }
+        let new_len: usize = size.try_into().map_err(|_| FsError::TooLarge)?;
+        contents.resize(new_len, 0);
+        Ok((node.path.clone(), contents))
+    }
+
+    /// Commit bytes after a successful handle-based truncate write-through.
+    pub fn commit_handle_contents(&self, fh: u64, contents: Vec<u8>) -> Result<Attr, FsError> {
+        let mut g = self.inner.lock_recover();
+        let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        if !handle.write {
+            return Err(FsError::BadHandle);
+        }
+        let ino = handle.ino;
+        Self::commit_inode_contents_locked(&mut g, ino, contents)
+    }
+
+    /// Commit bytes after a successful path-based truncate write-through.
+    pub fn commit_inode_contents(&self, ino: u64, contents: Vec<u8>) -> Result<Attr, FsError> {
+        let mut g = self.inner.lock_recover();
+        Self::commit_inode_contents_locked(&mut g, ino, contents)
+    }
+
+    /// Resize a handle in memory. The mount adapter uses the plan/commit methods
+    /// above so backend write-through happens before this state change.
+    pub fn truncate(&self, fh: u64, size: u64) -> Result<(), FsError> {
+        let (_, contents) = self.truncate_handle_plan(fh, size)?;
+        self.commit_handle_contents(fh, contents)?;
         Ok(())
+    }
+
+    fn commit_inode_contents_locked(
+        g: &mut Inner,
+        ino: u64,
+        contents: Vec<u8>,
+    ) -> Result<Attr, FsError> {
+        let node = g.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::File {
+            return Err(FsError::IsDir);
+        }
+        node.size = contents.len() as u64;
+        for dirty in g.dirty.values_mut().filter(|dirty| dirty.ino == ino) {
+            dirty.buf.clone_from(&contents);
+        }
+        Ok(Self::attr_of(g.nodes.get(&ino).unwrap()))
     }
 
     /// Return the assembled object bytes for a write handle (for writeback at
@@ -1117,6 +1178,47 @@ mod tests {
         assert_eq!(
             fs.dirty_bytes(fh).unwrap(),
             vec![b'0', b'1', b'2', b'3', 0, 0]
+        );
+    }
+
+    #[test]
+    fn truncate_plans_do_not_change_visible_state_before_commit() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let write_fh = fs
+            .open_with_options(
+                file.ino,
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                Some(b"hello".to_vec()),
+            )
+            .unwrap();
+
+        let (path, planned) = fs.truncate_handle_plan(write_fh, 3).unwrap();
+        assert_eq!(path, "s3/bucket/data/a.bin");
+        assert_eq!(planned, b"hel");
+        assert_eq!(fs.getattr(file.ino).unwrap().size, 5);
+        assert_eq!(fs.dirty_bytes(write_fh).unwrap(), b"hello");
+
+        let committed = fs.commit_handle_contents(write_fh, planned).unwrap();
+        assert_eq!(committed.size, 3);
+        assert_eq!(fs.dirty_bytes(write_fh).unwrap(), b"hel");
+
+        let (path, planned) = fs
+            .truncate_inode_plan(file.ino, 6, b"hel".to_vec())
+            .unwrap();
+        assert_eq!(path, "s3/bucket/data/a.bin");
+        assert_eq!(planned, vec![b'h', b'e', b'l', 0, 0, 0]);
+        assert_eq!(fs.getattr(file.ino).unwrap().size, 3);
+
+        fs.commit_inode_contents(file.ino, planned).unwrap();
+        assert_eq!(fs.getattr(file.ino).unwrap().size, 6);
+        assert_eq!(
+            fs.dirty_bytes(write_fh).unwrap(),
+            vec![b'h', b'e', b'l', 0, 0, 0]
         );
     }
 
