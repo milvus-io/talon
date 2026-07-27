@@ -291,10 +291,19 @@ mod tests {
         assert_eq!(lru.remove(&whole(1)), None);
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic(expected = "LRU byte accounting underflow")]
     fn accounting_underflow_is_detected_in_debug_builds() {
         Lru::subtract_bytes(&mut 0, 1);
+    }
+
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn accounting_underflow_saturates_in_release_builds() {
+        let mut total = 0;
+        Lru::subtract_bytes(&mut total, 1);
+        assert_eq!(total, 0);
     }
 
     #[test]
