@@ -46,6 +46,19 @@ struct Inner {
 }
 
 impl Lru {
+    fn add_bytes(total: &mut u64, bytes: u64) {
+        debug_assert!(
+            total.checked_add(bytes).is_some(),
+            "LRU byte accounting overflow"
+        );
+        *total = total.saturating_add(bytes);
+    }
+
+    fn subtract_bytes(total: &mut u64, bytes: u64) {
+        debug_assert!(*total >= bytes, "LRU byte accounting underflow");
+        *total = total.saturating_sub(bytes);
+    }
+
     /// Create an empty tracker.
     pub fn new() -> Self {
         Self {
@@ -81,9 +94,10 @@ impl Lru {
             let old = e.bytes;
             e.bytes = bytes;
             e.last_used = tick;
-            g.total_bytes = g.total_bytes - old + bytes;
+            Self::subtract_bytes(&mut g.total_bytes, old);
+            Self::add_bytes(&mut g.total_bytes, bytes);
         } else {
-            g.total_bytes += bytes;
+            Self::add_bytes(&mut g.total_bytes, bytes);
             g.entries.insert(
                 unit,
                 Entry {
@@ -131,7 +145,7 @@ impl Lru {
     pub fn remove(&self, unit: &CacheUnit) -> Option<u64> {
         let mut g = self.inner.lock().unwrap();
         let e = g.entries.remove(unit)?;
-        g.total_bytes -= e.bytes;
+        Self::subtract_bytes(&mut g.total_bytes, e.bytes);
         Some(e.bytes)
     }
 
@@ -164,7 +178,7 @@ impl Lru {
             .collect();
         for unit in &victims {
             if let Some(e) = g.entries.remove(unit) {
-                g.total_bytes -= e.bytes;
+                Self::subtract_bytes(&mut g.total_bytes, e.bytes);
             }
         }
         victims
@@ -189,7 +203,7 @@ impl Lru {
             match victim {
                 Some(unit) => {
                     if let Some(e) = g.entries.remove(&unit) {
-                        g.total_bytes -= e.bytes;
+                        Self::subtract_bytes(&mut g.total_bytes, e.bytes);
                     }
                     evicted.push(unit);
                 }
@@ -268,11 +282,19 @@ mod tests {
         lru.insert(whole(1), 100);
         lru.insert(whole(1), 250); // update same unit
         assert_eq!(lru.total_bytes(), 250);
+        lru.insert(whole(1), 50); // shrink same unit
+        assert_eq!(lru.total_bytes(), 50);
         assert_eq!(lru.len(), 1);
 
-        assert_eq!(lru.remove(&whole(1)), Some(250));
+        assert_eq!(lru.remove(&whole(1)), Some(50));
         assert_eq!(lru.total_bytes(), 0);
         assert_eq!(lru.remove(&whole(1)), None);
+    }
+
+    #[test]
+    #[should_panic(expected = "LRU byte accounting underflow")]
+    fn accounting_underflow_is_detected_in_debug_builds() {
+        Lru::subtract_bytes(&mut 0, 1);
     }
 
     #[test]
