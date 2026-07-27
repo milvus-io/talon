@@ -65,6 +65,8 @@ pub enum FsError {
     Exists,
     /// An invalid flag, name, path, or argument was supplied (`EINVAL`).
     Invalid,
+    /// A directory is not empty (`ENOTEMPTY`).
+    NotEmpty,
 }
 
 /// Access and mutation behavior for an open file handle.
@@ -115,13 +117,15 @@ pub struct DirEntry {
 #[derive(Debug, Clone)]
 struct Node {
     ino: u64,
+    parent: Option<u64>,
     name: String,
     kind: FileKind,
     size: u64,
     children: Vec<u64>,
-    /// Full mount-relative path for a file leaf (e.g. `s3/bkt/o.bin`); empty for
-    /// directories. Lets a data callback recover the object from an inode.
+    /// Full mount-relative path, e.g. `s3/bkt/dir` or `s3/bkt/o.bin`.
     path: String,
+    /// Whether this directory is persisted by a trailing-slash blob marker.
+    directory_marker: bool,
 }
 
 /// A read-only view over the backend namespace, addressed by inode.
@@ -182,11 +186,13 @@ impl ReadOnlyFs {
             ROOT_INO,
             Node {
                 ino: ROOT_INO,
+                parent: None,
                 name: "/".to_string(),
                 kind: FileKind::Directory,
                 size: 0,
                 children: Vec::new(),
                 path: String::new(),
+                directory_marker: false,
             },
         );
         Self {
@@ -221,8 +227,13 @@ impl ReadOnlyFs {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
         let mut g = self.inner.lock_recover();
         let mut parent = ROOT_INO;
+        let mut current_path = String::new();
         for (i, comp) in comps.iter().enumerate() {
             let is_leaf = i == comps.len() - 1;
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(comp);
             let key = (parent, comp.to_string());
             if let Some(&existing) = g.index.get(&key) {
                 parent = existing;
@@ -237,15 +248,13 @@ impl ReadOnlyFs {
             };
             let node = Node {
                 ino,
+                parent: Some(parent),
                 name: comp.to_string(),
                 kind,
                 size: if is_leaf { size } else { 0 },
                 children: Vec::new(),
-                path: if is_leaf {
-                    path.trim_start_matches('/').to_string()
-                } else {
-                    String::new()
-                },
+                path: current_path.clone(),
+                directory_marker: false,
             };
             g.nodes.insert(ino, node);
             g.index.insert(key, ino);
@@ -267,10 +276,67 @@ impl ReadOnlyFs {
     {
         let mut n = 0;
         for (path, size) in entries {
-            self.insert_object(path, size);
-            n += 1;
+            if path.ends_with('/') {
+                if self.insert_directory_marker(path).is_ok() {
+                    n += 1;
+                }
+            } else {
+                self.insert_object(path, size);
+                n += 1;
+            }
         }
         n
+    }
+
+    /// Register a directory represented by a trailing-slash blob marker.
+    pub fn insert_directory_marker(&self, marker_path: &str) -> Result<u64, FsError> {
+        let path = marker_path
+            .strip_suffix('/')
+            .filter(|path| !path.is_empty())
+            .ok_or(FsError::Invalid)?;
+        path_to_object(path).map_err(|_| FsError::Invalid)?;
+        let comps: Vec<&str> = path
+            .split('/')
+            .filter(|component| !component.is_empty())
+            .collect();
+        let mut g = self.inner.lock_recover();
+        let mut parent = ROOT_INO;
+        let mut current_path = String::new();
+        for (index, component) in comps.iter().enumerate() {
+            if !current_path.is_empty() {
+                current_path.push('/');
+            }
+            current_path.push_str(component);
+            let key = (parent, component.to_string());
+            if let Some(&existing) = g.index.get(&key) {
+                let node = g.nodes.get_mut(&existing).ok_or(FsError::NotFound)?;
+                if node.kind != FileKind::Directory {
+                    return Err(FsError::NotDir);
+                }
+                if index == comps.len() - 1 {
+                    node.directory_marker = true;
+                }
+                parent = existing;
+                continue;
+            }
+            let ino = g.next_ino;
+            g.next_ino += 1;
+            let node = Node {
+                ino,
+                parent: Some(parent),
+                name: component.to_string(),
+                kind: FileKind::Directory,
+                size: 0,
+                children: Vec::new(),
+                path: current_path.clone(),
+                directory_marker: index == comps.len() - 1,
+            };
+            g.nodes.insert(ino, node);
+            g.index.insert(key, ino);
+            g.nodes.get_mut(&parent).unwrap().children.push(ino);
+            parent = ino;
+        }
+        Ok(parent)
     }
 
     fn attr_of(node: &Node) -> Attr {
@@ -307,7 +373,7 @@ impl ReadOnlyFs {
         let g = self.inner.lock_recover();
         let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
         if node.kind != FileKind::Directory {
-            return Err(FsError::NotFound);
+            return Err(FsError::NotDir);
         }
         let mut entries: Vec<DirEntry> = node
             .children
@@ -321,6 +387,16 @@ impl ReadOnlyFs {
             .collect();
         entries.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(entries)
+    }
+
+    /// Return a directory inode's parent, with root parented to itself.
+    pub fn parent_ino(&self, ino: u64) -> Result<u64, FsError> {
+        let g = self.inner.lock_recover();
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        Ok(node.parent.unwrap_or(ROOT_INO))
     }
 
     /// Open an existing file with the requested access mode.
@@ -482,11 +558,13 @@ impl ReadOnlyFs {
         g.next_ino += 1;
         let node = Node {
             ino,
+            parent: Some(parent_ino),
             name: name.to_string(),
             kind: FileKind::File,
             size: 0,
             children: Vec::new(),
             path,
+            directory_marker: false,
         };
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
@@ -623,6 +701,102 @@ impl ReadOnlyFs {
         Some(node.path.clone())
     }
 
+    /// Validate a new directory and return its trailing-slash marker path.
+    pub fn new_directory_marker_path(
+        &self,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<String, FsError> {
+        Self::validate_component(name)?;
+        let g = self.inner.lock_recover();
+        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+        if parent.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if g.index.contains_key(&(parent_ino, name.to_string())) {
+            return Err(FsError::Exists);
+        }
+        let path = Self::child_path(parent, name);
+        path_to_object(&path).map_err(|_| FsError::Invalid)?;
+        Ok(format!("{path}/"))
+    }
+
+    /// Insert a new explicit directory after its marker has been committed.
+    pub fn mkdir(&self, parent_ino: u64, name: &str) -> Result<Attr, FsError> {
+        Self::validate_component(name)?;
+        let mut g = self.inner.lock_recover();
+        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+        if parent.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if g.index.contains_key(&(parent_ino, name.to_string())) {
+            return Err(FsError::Exists);
+        }
+        let path = Self::child_path(parent, name);
+        path_to_object(&path).map_err(|_| FsError::Invalid)?;
+        let ino = g.next_ino;
+        g.next_ino += 1;
+        let node = Node {
+            ino,
+            parent: Some(parent_ino),
+            name: name.to_string(),
+            kind: FileKind::Directory,
+            size: 0,
+            children: Vec::new(),
+            path,
+            directory_marker: true,
+        };
+        g.nodes.insert(ino, node);
+        g.index.insert((parent_ino, name.to_string()), ino);
+        g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
+        Ok(Self::attr_of(g.nodes.get(&ino).unwrap()))
+    }
+
+    /// Return the marker to delete before removing an empty directory.
+    pub fn rmdir_marker_path(
+        &self,
+        parent_ino: u64,
+        name: &str,
+    ) -> Result<Option<String>, FsError> {
+        Self::validate_component(name)?;
+        let g = self.inner.lock_recover();
+        let ino = *g
+            .index
+            .get(&(parent_ino, name.to_string()))
+            .ok_or(FsError::NotFound)?;
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if !node.children.is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+        Ok(node.directory_marker.then(|| format!("{}/", node.path)))
+    }
+
+    /// Remove an empty directory from the namespace.
+    pub fn rmdir(&self, parent_ino: u64, name: &str) -> Result<(), FsError> {
+        Self::validate_component(name)?;
+        let mut g = self.inner.lock_recover();
+        let ino = *g
+            .index
+            .get(&(parent_ino, name.to_string()))
+            .ok_or(FsError::NotFound)?;
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if !node.children.is_empty() {
+            return Err(FsError::NotEmpty);
+        }
+        g.nodes.remove(&ino);
+        g.index.remove(&(parent_ino, name.to_string()));
+        if let Some(parent) = g.nodes.get_mut(&parent_ino) {
+            parent.children.retain(|child| *child != ino);
+        }
+        Ok(())
+    }
+
     /// `unlink`: remove file `name` under directory `parent_ino` from the
     /// namespace. Returns the removed file's mount-relative path so the caller
     /// can delete the backend object. Directories are not removed here.
@@ -634,7 +808,7 @@ impl ReadOnlyFs {
             .ok_or(FsError::NotFound)?;
         let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
         if node.kind != FileKind::File {
-            return Err(FsError::Unsupported);
+            return Err(FsError::IsDir);
         }
         let path = node.path.clone();
         g.nodes.remove(&ino);
@@ -648,8 +822,6 @@ impl ReadOnlyFs {
     /// Build the ancestry name chain (root-excluded) of `ino`, e.g.
     /// `["s3", "bucket", "data"]`, so a child path can be formed on `create`.
     fn ancestry(g: &Inner, ino: u64) -> Vec<String> {
-        // Walk children from root is O(n); instead find each node's parent by
-        // scanning the index. For the shallow synthetic tree this is fine.
         let mut names = Vec::new();
         let mut cur = ino;
         while cur != ROOT_INO {
@@ -658,19 +830,29 @@ impl ReadOnlyFs {
                 None => break,
             };
             names.push(node.name.clone());
-            // Find the parent whose children contain `cur`.
-            let parent = g
-                .nodes
-                .iter()
-                .find(|(_, n)| n.children.contains(&cur))
-                .map(|(p, _)| *p);
-            match parent {
+            match node.parent {
                 Some(p) => cur = p,
                 None => break,
             }
         }
         names.reverse();
         names
+    }
+
+    fn validate_component(name: &str) -> Result<(), FsError> {
+        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+            Err(FsError::Invalid)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn child_path(parent: &Node, name: &str) -> String {
+        if parent.path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", parent.path, name)
+        }
     }
 }
 
@@ -786,6 +968,59 @@ mod tests {
         let a_ino = a.ino;
         fs.populate_from_listing([("s3/bkt/dir/a.bin", 10u64)]);
         assert_eq!(fs.lookup(dir.ino, "a.bin").unwrap().ino, a_ino);
+    }
+
+    #[test]
+    fn directory_markers_populate_hidden_empty_directories() {
+        let fs = ReadOnlyFs::new();
+        let count =
+            fs.populate_from_listing([("s3/bkt/empty/", 0u64), ("s3/bkt/nonempty/file.bin", 5u64)]);
+        assert_eq!(count, 2);
+
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bkt").unwrap();
+        let entries = fs.readdir(bucket.ino).unwrap();
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+        assert_eq!(names, vec!["empty", "nonempty"]);
+
+        let empty = fs.lookup(bucket.ino, "empty").unwrap();
+        assert_eq!(empty.kind, FileKind::Directory);
+        assert!(fs.readdir(empty.ino).unwrap().is_empty());
+        assert_eq!(fs.parent_ino(empty.ino).unwrap(), bucket.ino);
+        assert_eq!(
+            fs.rmdir_marker_path(bucket.ino, "empty").unwrap(),
+            Some("s3/bkt/empty/".to_string())
+        );
+    }
+
+    #[test]
+    fn mkdir_and_rmdir_enforce_empty_directory_invariants() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        assert_eq!(
+            fs.new_directory_marker_path(parent.ino, "new").unwrap(),
+            "s3/bucket/data/new/"
+        );
+        let directory = fs.mkdir(parent.ino, "new").unwrap();
+        assert_eq!(directory.kind, FileKind::Directory);
+        assert_eq!(fs.parent_ino(directory.ino).unwrap(), parent.ino);
+        assert_eq!(fs.mkdir(parent.ino, "new"), Err(FsError::Exists));
+
+        let (_, fh) = fs.create(directory.ino, "child.bin").unwrap();
+        fs.release(fh).unwrap();
+        assert_eq!(
+            fs.rmdir_marker_path(parent.ino, "new"),
+            Err(FsError::NotEmpty)
+        );
+        assert_eq!(fs.rmdir(parent.ino, "new"), Err(FsError::NotEmpty));
+
+        fs.unlink(directory.ino, "child.bin").unwrap();
+        assert_eq!(
+            fs.rmdir_marker_path(parent.ino, "new").unwrap(),
+            Some("s3/bucket/data/new/".to_string())
+        );
+        fs.rmdir(parent.ino, "new").unwrap();
+        assert_eq!(fs.lookup(parent.ino, "new"), Err(FsError::NotFound));
     }
 
     #[test]

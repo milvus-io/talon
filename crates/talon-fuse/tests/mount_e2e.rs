@@ -507,6 +507,116 @@ async fn mount_open_flags_preserve_and_replace_blob_contents() {
     );
 }
 
+/// Persist empty directories as trailing-slash blobs and rebuild them on listing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_directory_markers_are_written_through() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/placeholder", 0);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-dir-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bucket = mountpoint.join("s3").join("bucket");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        let empty = bucket.join("empty");
+        let nested = empty.join("nested");
+        std::fs::create_dir(&empty)?;
+        assert!(operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/empty/"));
+
+        std::fs::create_dir(&nested)?;
+        assert!(operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/empty/nested/"));
+
+        let not_empty = std::fs::remove_dir(&empty).unwrap_err();
+        assert_eq!(not_empty.raw_os_error(), Some(libc::ENOTEMPTY));
+
+        std::fs::remove_dir(&nested)?;
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/empty/nested/"));
+        std::fs::remove_dir(&empty)?;
+
+        let persisted = bucket.join("persisted");
+        std::fs::create_dir(&persisted)?;
+        let names: Vec<String> = std::fs::read_dir(&bucket)?
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.iter().any(|name| name == "persisted"));
+        assert!(!names.iter().any(|name| name.ends_with('/')));
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise directory markers through mount");
+
+    let listing: Vec<(String, u64)> = store
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(path, bytes)| (path.trim_start_matches('/').to_string(), bytes.len() as u64))
+        .collect();
+    assert_eq!(
+        listing,
+        vec![("s3/bucket/persisted/".to_string(), 0)],
+        "only the retained directory marker should remain"
+    );
+
+    let remounted = ReadOnlyFs::new();
+    remounted.populate_from_listing(listing.iter().map(|(path, size)| (path.as_str(), *size)));
+    let s3 = remounted.lookup(talon_fuse::ops::ROOT_INO, "s3").unwrap();
+    let bucket = remounted.lookup(s3.ino, "bucket").unwrap();
+    let persisted = remounted.lookup(bucket.ino, "persisted").unwrap();
+    assert_eq!(persisted.kind, talon_fuse::FileKind::Directory);
+    assert!(remounted.readdir(persisted.ino).unwrap().is_empty());
+}
+
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
 ///
 /// This is separately gated because the normal real-kernel smoke job runs all
