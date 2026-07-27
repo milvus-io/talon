@@ -1055,6 +1055,123 @@ async fn mount_unlink_preserves_open_descriptors_without_recreating_the_name() {
     result.expect("exercise unlink-while-open through mount");
 }
 
+/// Create, resolve, move, and delete symbolic links through the kernel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_symbolic_links_are_written_through() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/target.bin".to_string(),
+        b"payload".to_vec(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/target.bin", 7);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-symlink-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bucket = mountpoint.join("s3").join("bucket");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        let link = bucket.join("link.bin");
+        std::os::unix::fs::symlink("target.bin", &link)?;
+        assert!(std::fs::symlink_metadata(&link)?.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_link(&link)?,
+            std::path::Path::new("target.bin")
+        );
+        assert_eq!(std::fs::read(&link)?, b"payload");
+        assert_eq!(
+            operation_store.lock().unwrap().get("/s3/bucket/link.bin"),
+            Some(&b"target.bin".to_vec())
+        );
+
+        let moved = bucket.join("moved.bin");
+        std::fs::rename(&link, &moved)?;
+        assert_eq!(
+            std::fs::read_link(&moved)?,
+            std::path::Path::new("target.bin")
+        );
+        assert_eq!(std::fs::read(&moved)?, b"payload");
+        {
+            let committed = operation_store.lock().unwrap();
+            assert!(!committed.contains_key("/s3/bucket/link.bin"));
+            assert_eq!(
+                committed.get("/s3/bucket/moved.bin"),
+                Some(&b"target.bin".to_vec())
+            );
+        }
+
+        let dangling = bucket.join("dangling");
+        std::os::unix::fs::symlink("missing", &dangling)?;
+        assert_eq!(
+            std::fs::read_link(&dangling)?,
+            std::path::Path::new("missing")
+        );
+        assert_eq!(
+            std::fs::read(&dangling).unwrap_err().raw_os_error(),
+            Some(libc::ENOENT)
+        );
+
+        let loop_a = bucket.join("loop-a");
+        let loop_b = bucket.join("loop-b");
+        std::os::unix::fs::symlink("loop-b", &loop_a)?;
+        std::os::unix::fs::symlink("loop-a", &loop_b)?;
+        assert_eq!(
+            std::fs::read(&loop_a).unwrap_err().raw_os_error(),
+            Some(libc::ELOOP)
+        );
+
+        std::fs::remove_file(&moved)?;
+        assert_eq!(std::fs::read(bucket.join("target.bin"))?, b"payload");
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/moved.bin"));
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise symbolic links through mount");
+}
+
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
 ///
 /// This is separately gated because the normal real-kernel smoke job runs all
