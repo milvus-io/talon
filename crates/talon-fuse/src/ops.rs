@@ -16,7 +16,9 @@
 use crate::lock::MutexExt;
 use crate::mapping::path_to_object;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// The root inode number (fixed by FUSE convention).
 pub const ROOT_INO: u64 = 1;
@@ -41,6 +43,8 @@ pub struct Attr {
     pub size: u64,
     /// Read-only permission bits (dirs `0o555`, files `0o444`).
     pub perm: u16,
+    /// Number of namespace links. An open file retained after unlink has zero.
+    pub nlink: u32,
 }
 
 /// Errors returned by the read-only op layer (mapped to errno by the adapter).
@@ -105,6 +109,8 @@ pub enum ReadSource {
 /// [`ReadOnlyFs::with_max_object_bytes`] to tune.
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 1 << 30;
 
+const INTERNAL_OBJECT_PREFIX: &str = ".__talon_internal";
+
 /// A directory entry yielded by `readdir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DirEntry {
@@ -153,6 +159,18 @@ pub struct DirectoryRenamePlan {
     pub(crate) entries: Vec<DirectoryRenameEntry>,
 }
 
+/// Immutable backend and namespace facts for an unlink operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnlinkPlan {
+    pub(crate) ino: u64,
+    pub(crate) parent: u64,
+    pub(crate) name: String,
+    pub(crate) source_path: String,
+    pub(crate) source_size: u64,
+    pub(crate) orphan_path: Option<String>,
+    pub(crate) buffered_contents: Option<Vec<u8>>,
+}
+
 #[derive(Debug, Clone)]
 struct Node {
     ino: u64,
@@ -165,6 +183,8 @@ struct Node {
     path: String,
     /// Whether this directory is persisted by a trailing-slash blob marker.
     directory_marker: bool,
+    /// Whether the inode still has a visible namespace entry.
+    linked: bool,
 }
 
 /// A read-only view over the backend namespace, addressed by inode.
@@ -176,6 +196,8 @@ pub struct ReadOnlyFs {
     inner: Mutex<Inner>,
     /// Cap on the length of any single write handle's in-memory buffer.
     max_object_bytes: u64,
+    /// Mount-scoped backend namespace for open-but-unlinked objects.
+    orphan_namespace: String,
 }
 
 struct Inner {
@@ -211,6 +233,8 @@ struct DirtyFile {
     buf: Vec<u8>,
 }
 
+static NEXT_FS_INSTANCE: AtomicU64 = AtomicU64::new(1);
+
 impl Default for ReadOnlyFs {
     fn default() -> Self {
         Self::new()
@@ -232,8 +256,14 @@ impl ReadOnlyFs {
                 children: Vec::new(),
                 path: String::new(),
                 directory_marker: false,
+                linked: true,
             },
         );
+        let instance = NEXT_FS_INSTANCE.fetch_add(1, Ordering::Relaxed);
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
         Self {
             inner: Mutex::new(Inner {
                 nodes,
@@ -244,6 +274,7 @@ impl ReadOnlyFs {
                 dirty: HashMap::new(),
             }),
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+            orphan_namespace: format!("{:x}-{timestamp:x}-{instance:x}", std::process::id()),
         }
     }
 
@@ -294,6 +325,7 @@ impl ReadOnlyFs {
                 children: Vec::new(),
                 path: current_path.clone(),
                 directory_marker: false,
+                linked: true,
             };
             g.nodes.insert(ino, node);
             g.index.insert(key, ino);
@@ -315,6 +347,9 @@ impl ReadOnlyFs {
     {
         let mut n = 0;
         for (path, size) in entries {
+            if Self::is_internal_object_path(path) {
+                continue;
+            }
             if path.ends_with('/') {
                 if self.insert_directory_marker(path).is_ok() {
                     n += 1;
@@ -333,7 +368,7 @@ impl ReadOnlyFs {
             .strip_suffix('/')
             .filter(|path| !path.is_empty())
             .ok_or(FsError::Invalid)?;
-        path_to_object(path).map_err(|_| FsError::Invalid)?;
+        Self::validate_visible_object_path(path)?;
         let comps: Vec<&str> = path
             .split('/')
             .filter(|component| !component.is_empty())
@@ -369,6 +404,7 @@ impl ReadOnlyFs {
                 children: Vec::new(),
                 path: current_path.clone(),
                 directory_marker: index == comps.len() - 1,
+                linked: true,
             };
             g.nodes.insert(ino, node);
             g.index.insert(key, ino);
@@ -388,6 +424,7 @@ impl ReadOnlyFs {
             kind: node.kind,
             size: node.size,
             perm,
+            nlink: u32::from(node.linked),
         }
     }
 
@@ -493,18 +530,45 @@ impl ReadOnlyFs {
         )
     }
 
+    /// Return the orphan backend path that the final release must delete.
+    pub fn release_cleanup_path(&self, fh: u64) -> Result<Option<String>, FsError> {
+        let g = self.inner.lock_recover();
+        let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
+        let is_last_handle = g
+            .handles
+            .values()
+            .filter(|candidate| candidate.ino == handle.ino)
+            .count()
+            == 1;
+        let Some(node) = g.nodes.get(&handle.ino) else {
+            return Ok(None);
+        };
+        Ok((is_last_handle && !node.linked).then(|| node.path.clone()))
+    }
+
     /// `release`: drop a previously opened handle (read or write), discarding any
     /// write buffer. The caller is expected to have already flushed a dirty write
-    /// handle's contents (writeback happens on flush, #232).
+    /// handle's contents and deleted a final orphan object when requested by
+    /// [`release_cleanup_path`](Self::release_cleanup_path).
     pub fn release(&self, fh: u64) -> Result<(), FsError> {
         let mut g = self.inner.lock_recover();
         let had_dirty = g.dirty.remove(&fh).is_some();
-        let had_handle = g.handles.remove(&fh).is_some();
-        if had_handle || had_dirty {
-            Ok(())
-        } else {
-            Err(FsError::BadHandle)
+        let handle = g.handles.remove(&fh);
+        let Some(handle) = handle else {
+            return if had_dirty {
+                Ok(())
+            } else {
+                Err(FsError::BadHandle)
+            };
+        };
+        let has_remaining_handles = g
+            .handles
+            .values()
+            .any(|candidate| candidate.ino == handle.ino);
+        if !has_remaining_handles && g.nodes.get(&handle.ino).is_some_and(|node| !node.linked) {
+            g.nodes.remove(&handle.ino);
         }
+        Ok(())
     }
 
     /// The mount-relative object path + size for an open file handle.
@@ -593,7 +657,7 @@ impl ReadOnlyFs {
             parts.push(name.to_string());
             parts.join("/")
         };
-        path_to_object(&path).map_err(|_| FsError::Invalid)?;
+        Self::validate_visible_object_path(&path)?;
         let ino = g.next_ino;
         g.next_ino += 1;
         let node = Node {
@@ -605,6 +669,7 @@ impl ReadOnlyFs {
             children: Vec::new(),
             path,
             directory_marker: false,
+            linked: true,
         };
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
@@ -829,7 +894,7 @@ impl ReadOnlyFs {
             return Err(FsError::IsDir);
         }
         let target_path = Self::child_path(target_parent_node, target_name);
-        path_to_object(&target_path).map_err(|_| FsError::Invalid)?;
+        Self::validate_visible_object_path(&target_path)?;
         let target = match g.index.get(&(target_parent, target_name.to_string())) {
             Some(&target_ino) if target_ino == source_ino => None,
             Some(&target_ino) => {
@@ -956,7 +1021,7 @@ impl ReadOnlyFs {
             }
             ancestor = g.nodes.get(&ino).and_then(|node| node.parent);
         }
-        path_to_object(&target_path).map_err(|_| FsError::Invalid)?;
+        Self::validate_visible_object_path(&target_path)?;
         let target = match g.index.get(&(target_parent, target_name.to_string())) {
             Some(&target_ino) => {
                 let node = g.nodes.get(&target_ino).ok_or(FsError::NotFound)?;
@@ -1103,7 +1168,7 @@ impl ReadOnlyFs {
             return Err(FsError::Exists);
         }
         let path = Self::child_path(parent, name);
-        path_to_object(&path).map_err(|_| FsError::Invalid)?;
+        Self::validate_visible_object_path(&path)?;
         Ok(format!("{path}/"))
     }
 
@@ -1119,7 +1184,7 @@ impl ReadOnlyFs {
             return Err(FsError::Exists);
         }
         let path = Self::child_path(parent, name);
-        path_to_object(&path).map_err(|_| FsError::Invalid)?;
+        Self::validate_visible_object_path(&path)?;
         let ino = g.next_ino;
         g.next_ino += 1;
         let node = Node {
@@ -1131,6 +1196,7 @@ impl ReadOnlyFs {
             children: Vec::new(),
             path,
             directory_marker: true,
+            linked: true,
         };
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
@@ -1183,11 +1249,18 @@ impl ReadOnlyFs {
         Ok(())
     }
 
-    /// `unlink`: remove file `name` under directory `parent_ino` from the
-    /// namespace. Returns the removed file's mount-relative path so the caller
-    /// can delete the backend object. Directories are not removed here.
-    pub fn unlink(&self, parent_ino: u64, name: &str) -> Result<String, FsError> {
-        let mut g = self.inner.lock_recover();
+    /// Validate and describe an unlink without mutating the namespace.
+    ///
+    /// Files with open handles move to a mount-scoped internal backend key so
+    /// descriptors can continue to read, write, and fsync after the visible name
+    /// is removed. The final release deletes that orphan object.
+    pub fn unlink_plan(&self, parent_ino: u64, name: &str) -> Result<UnlinkPlan, FsError> {
+        Self::validate_component(name)?;
+        let g = self.inner.lock_recover();
+        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+        if parent.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
         let ino = *g
             .index
             .get(&(parent_ino, name.to_string()))
@@ -1196,12 +1269,65 @@ impl ReadOnlyFs {
         if node.kind != FileKind::File {
             return Err(FsError::IsDir);
         }
-        let path = node.path.clone();
-        g.nodes.remove(&ino);
-        g.index.remove(&(parent_ino, name.to_string()));
-        if let Some(parent) = g.nodes.get_mut(&parent_ino) {
-            parent.children.retain(|c| *c != ino);
+        let has_open_handles = g.handles.values().any(|handle| handle.ino == ino);
+        let orphan_path = has_open_handles
+            .then(|| self.orphan_path(&node.path, ino))
+            .transpose()?;
+        let buffered_contents = g
+            .dirty
+            .iter()
+            .filter(|(_, dirty)| dirty.ino == ino)
+            .max_by_key(|(fh, _)| *fh)
+            .map(|(_, dirty)| dirty.buf.clone());
+        Ok(UnlinkPlan {
+            ino,
+            parent: parent_ino,
+            name: name.to_string(),
+            source_path: node.path.clone(),
+            source_size: node.size,
+            orphan_path,
+            buffered_contents,
+        })
+    }
+
+    /// Commit an unlink after the backend delete or orphan move succeeds.
+    pub fn commit_unlink(&self, plan: &UnlinkPlan) -> Result<(), FsError> {
+        let mut g = self.inner.lock_recover();
+        if g.index.get(&(plan.parent, plan.name.clone())).copied() != Some(plan.ino) {
+            return Err(FsError::NotFound);
         }
+        let node = g.nodes.get(&plan.ino).ok_or(FsError::NotFound)?;
+        if node.path != plan.source_path || node.kind != FileKind::File {
+            return Err(FsError::Invalid);
+        }
+        let has_open_handles = g.handles.values().any(|handle| handle.ino == plan.ino);
+        if has_open_handles != plan.orphan_path.is_some() {
+            return Err(FsError::Invalid);
+        }
+
+        g.index.remove(&(plan.parent, plan.name.clone()));
+        if let Some(parent) = g.nodes.get_mut(&plan.parent) {
+            parent.children.retain(|child| *child != plan.ino);
+        }
+        if let Some(orphan_path) = &plan.orphan_path {
+            let node = g.nodes.get_mut(&plan.ino).ok_or(FsError::NotFound)?;
+            node.parent = None;
+            node.path.clone_from(orphan_path);
+            node.linked = false;
+        } else {
+            g.nodes.remove(&plan.ino);
+        }
+        Ok(())
+    }
+
+    /// Remove a file from the in-memory namespace without backend I/O.
+    ///
+    /// The mount adapter uses [`unlink_plan`](Self::unlink_plan) and
+    /// [`commit_unlink`](Self::commit_unlink) around synchronous backend work.
+    pub fn unlink(&self, parent_ino: u64, name: &str) -> Result<String, FsError> {
+        let plan = self.unlink_plan(parent_ino, name)?;
+        let path = plan.source_path.clone();
+        self.commit_unlink(&plan)?;
         Ok(path)
     }
 
@@ -1248,6 +1374,30 @@ impl ReadOnlyFs {
         } else {
             format!("{}/{}", parent.path, name)
         }
+    }
+
+    fn orphan_path(&self, source_path: &str, ino: u64) -> Result<String, FsError> {
+        let object = path_to_object(source_path).map_err(|_| FsError::Invalid)?;
+        Ok(format!(
+            "{}/{}/{INTERNAL_OBJECT_PREFIX}/unlinked/{}/{ino}",
+            object.backend.prefix(),
+            object.bucket,
+            self.orphan_namespace
+        ))
+    }
+
+    fn validate_visible_object_path(path: &str) -> Result<(), FsError> {
+        let object = path_to_object(path).map_err(|_| FsError::Invalid)?;
+        if object.object_path.split('/').next() == Some(INTERNAL_OBJECT_PREFIX) {
+            return Err(FsError::Invalid);
+        }
+        Ok(())
+    }
+
+    fn is_internal_object_path(path: &str) -> bool {
+        path_to_object(path).is_ok_and(|object| {
+            object.object_path.split('/').next() == Some(INTERNAL_OBJECT_PREFIX)
+        })
     }
 }
 
@@ -1385,6 +1535,31 @@ mod tests {
         assert_eq!(
             fs.rmdir_marker_path(bucket.ino, "empty").unwrap(),
             Some("s3/bkt/empty/".to_string())
+        );
+    }
+
+    #[test]
+    fn internal_orphan_objects_are_hidden_and_reserved() {
+        let fs = ReadOnlyFs::new();
+        let count = fs.populate_from_listing([
+            ("s3/bkt/visible.bin", 1u64),
+            ("s3/bkt/.__talon_internal/unlinked/stale/7", 5u64),
+        ]);
+        assert_eq!(count, 1);
+
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bkt").unwrap();
+        assert_eq!(
+            fs.lookup(bucket.ino, INTERNAL_OBJECT_PREFIX),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs.create(bucket.ino, INTERNAL_OBJECT_PREFIX),
+            Err(FsError::Invalid)
+        );
+        assert_eq!(
+            fs.mkdir(bucket.ino, INTERNAL_OBJECT_PREFIX),
+            Err(FsError::Invalid)
         );
     }
 
@@ -1675,6 +1850,46 @@ mod tests {
         assert_eq!(fs.lookup(dir.ino, "a.bin"), Err(FsError::NotFound));
         // Unlinking a missing name errors.
         assert_eq!(fs.unlink(dir.ino, "a.bin"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn unlink_retains_an_open_inode_under_an_orphan_path() {
+        let fs = fs();
+        let dir = data_dir(&fs);
+        let file = fs.lookup(dir.ino, "a.bin").unwrap();
+        let fh = fs
+            .open_with_options(
+                file.ino,
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                Some(b"contents".to_vec()),
+            )
+            .unwrap();
+
+        let plan = fs.unlink_plan(dir.ino, "a.bin").unwrap();
+        let orphan_path = plan.orphan_path.clone().unwrap();
+        assert!(orphan_path.contains("/.__talon_internal/unlinked/"));
+        assert_eq!(
+            plan.buffered_contents.as_deref(),
+            Some(b"contents".as_slice())
+        );
+
+        fs.commit_unlink(&plan).unwrap();
+        assert_eq!(fs.lookup(dir.ino, "a.bin"), Err(FsError::NotFound));
+        assert_eq!(fs.getattr(file.ino).unwrap().nlink, 0);
+        assert_eq!(fs.dirty_path(fh).as_deref(), Some(orphan_path.as_str()));
+
+        fs.write(fh, 8, b"-tail").unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"contents-tail");
+        assert_eq!(
+            fs.release_cleanup_path(fh).unwrap().as_deref(),
+            Some(orphan_path.as_str())
+        );
+        fs.release(fh).unwrap();
+        assert_eq!(fs.getattr(file.ino), Err(FsError::NotFound));
     }
 
     #[test]
