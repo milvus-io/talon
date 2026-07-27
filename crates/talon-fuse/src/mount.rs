@@ -70,6 +70,7 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::Loop => libc::ELOOP,
         FsError::OperationNotPermitted => libc::EPERM,
         FsError::CrossDevice => libc::EXDEV,
+        FsError::PermissionDenied => libc::EACCES,
     }
 }
 
@@ -91,6 +92,23 @@ fn open_options(flags: i32) -> Result<(OpenOptions, bool), FsError> {
     ))
 }
 
+fn request_groups(req: &fuser::Request<'_>) -> Vec<u32> {
+    let mut groups = vec![req.gid()];
+    let path = format!("/proc/{}/status", req.pid());
+    if let Ok(status) = std::fs::read_to_string(path) {
+        if let Some(line) = status.lines().find(|line| line.starts_with("Groups:")) {
+            groups.extend(
+                line.split_ascii_whitespace()
+                    .skip(1)
+                    .filter_map(|group| group.parse::<u32>().ok()),
+            );
+        }
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    groups
+}
+
 /// A monotonic-ish millisecond timestamp for the placement cache TTL.
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -103,7 +121,7 @@ fn now_ms() -> u64 {
 ///
 /// Ownership is left to the mounting user via `uid`/`gid`. `blocks` is a
 /// 512-byte-unit count as POSIX expects.
-pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
+pub(crate) fn to_file_attr(attr: Attr, _request_uid: u32, _request_gid: u32) -> fuser::FileAttr {
     let kind = match attr.kind {
         FileKind::Directory => fuser::FileType::Directory,
         FileKind::File => fuser::FileType::RegularFile,
@@ -124,8 +142,8 @@ pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
         kind,
         perm: attr.perm,
         nlink: attr.nlink,
-        uid,
-        gid,
+        uid: attr.uid,
+        gid: attr.gid,
         rdev: attr.rdev,
         blksize: 512,
         flags: 0,
@@ -516,7 +534,7 @@ impl TalonFuse {
         };
         let fh = self
             .fs
-            .open_with_options(ino, options, initial_contents)
+            .open_with_options_and_truncate(ino, options, initial_contents, truncate)
             .map_err(errno)?;
         let reply_flags = if mutates {
             0
@@ -762,8 +780,8 @@ impl fuser::Filesystem for TalonFuse {
         req: &fuser::Request<'_>,
         parent: u64,
         name: &std::ffi::OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         flags: i32,
         reply: fuser::ReplyCreate,
     ) {
@@ -794,7 +812,10 @@ impl fuser::Filesystem for TalonFuse {
             Err(FsError::NotFound) => {}
             Err(e) => return reply.error(errno(e)),
         }
-        match self.fs.create_with_options(parent, name, options) {
+        match self
+            .fs
+            .create_with_metadata(parent, name, options, mode, umask, req.uid(), req.gid())
+        {
             Ok((attr, fh)) => {
                 let fa = to_file_attr(attr, req.uid(), req.gid());
                 reply.created(&ATTR_TTL, &fa, 0, fh, 0);
@@ -828,7 +849,10 @@ impl fuser::Filesystem for TalonFuse {
             tracing::warn!(%path, %error, "symlink target writeback failed");
             return reply.error(libc::EIO);
         }
-        match self.fs.symlink(parent, link_name, target) {
+        match self
+            .fs
+            .symlink_with_owner(parent, link_name, target, req.uid(), req.gid())
+        {
             Ok(attr) => {
                 let file_attr = to_file_attr(attr, req.uid(), req.gid());
                 reply.entry(&ATTR_TTL, &file_attr, 0);
@@ -924,7 +948,10 @@ impl fuser::Filesystem for TalonFuse {
             Some(name) => name,
             None => return reply.error(libc::EINVAL),
         };
-        let plan = match self.fs.mknod_plan(parent, name, mode, umask, rdev) {
+        let plan = match self
+            .fs
+            .mknod_plan(parent, name, mode, umask, rdev, req.uid(), req.gid())
+        {
             Ok(plan) => plan,
             Err(error) => return reply.error(errno(error)),
         };
@@ -957,8 +984,8 @@ impl fuser::Filesystem for TalonFuse {
         req: &fuser::Request<'_>,
         parent: u64,
         name: &std::ffi::OsStr,
-        _mode: u32,
-        _umask: u32,
+        mode: u32,
+        umask: u32,
         reply: fuser::ReplyEntry,
     ) {
         if !self.read_write {
@@ -983,7 +1010,10 @@ impl fuser::Filesystem for TalonFuse {
             tracing::warn!(path = %marker.to_path(), %error, "mkdir marker writeback failed");
             return reply.error(libc::EIO);
         }
-        match self.fs.mkdir(parent, name) {
+        match self
+            .fs
+            .mkdir_with_metadata(parent, name, mode, umask, req.uid(), req.gid())
+        {
             Ok(attr) => {
                 let file_attr = to_file_attr(attr, req.uid(), req.gid());
                 reply.entry(&ATTR_TTL, &file_attr, 0);
@@ -1034,12 +1064,12 @@ impl fuser::Filesystem for TalonFuse {
         &mut self,
         req: &fuser::Request<'_>,
         ino: u64,
-        _mode: Option<u32>,
-        _uid: Option<u32>,
-        _gid: Option<u32>,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<fuser::TimeOrNow>,
-        mtime: Option<fuser::TimeOrNow>,
+        atime_request: Option<fuser::TimeOrNow>,
+        mtime_request: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
@@ -1048,10 +1078,17 @@ impl fuser::Filesystem for TalonFuse {
         _flags: Option<u32>,
         reply: fuser::ReplyAttr,
     ) {
+        if !self.read_write
+            && (size.is_some()
+                || mode.is_some()
+                || uid.is_some()
+                || gid.is_some()
+                || atime_request.is_some()
+                || mtime_request.is_some())
+        {
+            return reply.error(libc::EROFS);
+        }
         if let Some(new_size) = size {
-            if !self.read_write {
-                return reply.error(libc::EROFS);
-            }
             if new_size > self.fs.max_object_bytes() {
                 return reply.error(libc::EFBIG);
             }
@@ -1094,22 +1131,42 @@ impl fuser::Filesystem for TalonFuse {
             } else {
                 self.fs.commit_inode_contents(ino, contents)
             };
-            return match attr {
-                Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid())),
-                Err(e) => reply.error(errno(e)),
-            };
+            if let Err(error) = attr {
+                return reply.error(errno(error));
+            }
         }
         let now = std::time::SystemTime::now();
         let resolve_time = |time: fuser::TimeOrNow| match time {
             fuser::TimeOrNow::SpecificTime(time) => time,
             fuser::TimeOrNow::Now => now,
         };
-        match self
-            .fs
-            .set_times(ino, atime.map(resolve_time), mtime.map(resolve_time))
-        {
+        let times_are_now = [atime_request, mtime_request]
+            .into_iter()
+            .flatten()
+            .all(|time| matches!(time, fuser::TimeOrNow::Now));
+        let caller_groups = request_groups(req);
+        match self.fs.set_metadata(
+            ino,
+            req.uid(),
+            req.gid(),
+            &caller_groups,
+            mode,
+            uid,
+            gid,
+            atime_request.map(resolve_time),
+            mtime_request.map(resolve_time),
+            times_are_now,
+        ) {
             Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid())),
             Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Check access explicitly for mounts without `default_permissions`.
+    fn access(&mut self, req: &fuser::Request<'_>, ino: u64, mask: i32, reply: fuser::ReplyEmpty) {
+        match self.fs.check_access(ino, req.uid(), req.gid(), mask) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(errno(error)),
         }
     }
 
@@ -1609,6 +1666,7 @@ mod tests {
         assert_eq!(errno(FsError::Loop), libc::ELOOP);
         assert_eq!(errno(FsError::OperationNotPermitted), libc::EPERM);
         assert_eq!(errno(FsError::CrossDevice), libc::EXDEV);
+        assert_eq!(errno(FsError::PermissionDenied), libc::EACCES);
     }
 
     #[test]
@@ -1661,11 +1719,14 @@ mod tests {
             mtime: timestamp,
             ctime: timestamp,
             rdev: 0,
+            uid: 42,
+            gid: 43,
         };
         let fa = to_file_attr(dir, 1000, 1000);
         assert_eq!(fa.kind, fuser::FileType::Directory);
         assert_eq!(fa.perm, 0o555);
-        assert_eq!(fa.uid, 1000);
+        assert_eq!(fa.uid, 42);
+        assert_eq!(fa.gid, 43);
         assert_eq!(fa.nlink, 1);
         assert_eq!(fa.atime, timestamp);
         assert_eq!(fa.mtime, timestamp);
@@ -1681,6 +1742,8 @@ mod tests {
             mtime: timestamp,
             ctime: timestamp,
             rdev: 0,
+            uid: 0,
+            gid: 0,
         };
         let fa = to_file_attr(file, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::RegularFile);
@@ -1699,6 +1762,8 @@ mod tests {
             mtime: timestamp,
             ctime: timestamp,
             rdev: 0,
+            uid: 0,
+            gid: 0,
         };
         let fa = to_file_attr(symlink, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::Symlink);

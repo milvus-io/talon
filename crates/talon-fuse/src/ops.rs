@@ -69,6 +69,10 @@ pub struct Attr {
     pub ctime: SystemTime,
     /// Device identifier for block and character devices.
     pub rdev: u32,
+    /// Owning user.
+    pub uid: u32,
+    /// Owning group.
+    pub gid: u32,
 }
 
 /// Errors returned by the read-only op layer (mapped to errno by the adapter).
@@ -103,6 +107,8 @@ pub enum FsError {
     OperationNotPermitted,
     /// Source and destination are on different backend filesystems (`EXDEV`).
     CrossDevice,
+    /// Access is denied by inode mode bits (`EACCES`).
+    PermissionDenied,
 }
 
 /// Access and mutation behavior for an open file handle.
@@ -235,6 +241,8 @@ pub struct MknodPlan {
     pub(crate) kind: FileKind,
     pub(crate) perm: u16,
     pub(crate) rdev: u32,
+    pub(crate) uid: u32,
+    pub(crate) gid: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +263,8 @@ struct Node {
     linked: bool,
     perm: u16,
     rdev: u32,
+    uid: u32,
+    gid: u32,
     atime: SystemTime,
     mtime: SystemTime,
     ctime: SystemTime,
@@ -267,6 +277,10 @@ struct Node {
 /// directories is created on demand.
 pub struct ReadOnlyFs {
     inner: Mutex<Inner>,
+    /// Owner assigned to nodes synthesized from backend listings.
+    listing_uid: u32,
+    /// Group assigned to nodes synthesized from backend listings.
+    listing_gid: u32,
     /// Cap on the length of any single write handle's in-memory buffer.
     max_object_bytes: u64,
     /// Mount-scoped backend namespace for open-but-unlinked objects.
@@ -315,8 +329,13 @@ impl Default for ReadOnlyFs {
 }
 
 impl ReadOnlyFs {
-    /// Create a filesystem with just the root directory.
+    /// Create a root-owned filesystem with just the root directory.
     pub fn new() -> Self {
+        Self::new_with_owner(0, 0)
+    }
+
+    /// Create a filesystem whose listed objects belong to `uid` and `gid`.
+    pub fn new_with_owner(uid: u32, gid: u32) -> Self {
         let mut nodes = HashMap::new();
         let now = SystemTime::now();
         nodes.insert(
@@ -334,6 +353,8 @@ impl ReadOnlyFs {
                 linked: true,
                 perm: 0o555,
                 rdev: 0,
+                uid,
+                gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -353,6 +374,8 @@ impl ReadOnlyFs {
                 next_fh: 1,
                 dirty: HashMap::new(),
             }),
+            listing_uid: uid,
+            listing_gid: gid,
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
             orphan_namespace: format!("{:x}-{timestamp:x}-{instance:x}", std::process::id()),
         }
@@ -408,8 +431,10 @@ impl ReadOnlyFs {
                 directory_marker: false,
                 symlink_target: None,
                 linked: true,
-                perm: if is_leaf { 0o444 } else { 0o555 },
+                perm: if is_leaf { 0o644 } else { 0o755 },
                 rdev: 0,
+                uid: self.listing_uid,
+                gid: self.listing_gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -494,8 +519,10 @@ impl ReadOnlyFs {
                 directory_marker: index == comps.len() - 1,
                 symlink_target: None,
                 linked: true,
-                perm: 0o555,
+                perm: 0o755,
                 rdev: 0,
+                uid: self.listing_uid,
+                gid: self.listing_gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -510,7 +537,16 @@ impl ReadOnlyFs {
 
     fn attr_of(g: &Inner, node: &Node) -> Attr {
         let nlink = if node.kind == FileKind::Directory {
-            1
+            2 + g
+                .index
+                .iter()
+                .filter(|((parent, _), child_ino)| {
+                    *parent == node.ino
+                        && g.nodes
+                            .get(child_ino)
+                            .is_some_and(|child| child.kind == FileKind::Directory)
+                })
+                .count() as u32
         } else {
             g.index
                 .values()
@@ -527,6 +563,8 @@ impl ReadOnlyFs {
             mtime: node.mtime,
             ctime: node.ctime,
             rdev: node.rdev,
+            uid: node.uid,
+            gid: node.gid,
         }
     }
 
@@ -578,6 +616,115 @@ impl ReadOnlyFs {
         ))
     }
 
+    /// Apply chmod, chown, and timestamp changes with POSIX ownership checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_metadata(
+        &self,
+        ino: u64,
+        caller_uid: u32,
+        caller_gid: u32,
+        caller_groups: &[u32],
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+        times_are_now: bool,
+    ) -> Result<Attr, FsError> {
+        let mut g = self.inner.lock_recover();
+        let node = g.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let is_root = caller_uid == 0;
+        let is_owner = caller_uid == node.uid;
+
+        if let Some(mode) = mode {
+            let requested = (mode & 0o7777) as u16;
+            let automatic_write_clear = requested == node.perm & !0o6000
+                && Self::access_allowed_with_groups(
+                    node,
+                    caller_uid,
+                    caller_gid,
+                    caller_groups,
+                    0o2,
+                );
+            if !is_root && !is_owner && !automatic_write_clear {
+                return Err(FsError::OperationNotPermitted);
+            }
+        }
+        if (uid.is_some() || gid.is_some()) && !is_root && !is_owner {
+            return Err(FsError::OperationNotPermitted);
+        }
+        if let Some(new_uid) = uid {
+            if !is_root && new_uid != node.uid {
+                return Err(FsError::OperationNotPermitted);
+            }
+        }
+        if let Some(new_gid) = gid {
+            if !is_root
+                && new_gid != node.gid
+                && new_gid != caller_gid
+                && !caller_groups.contains(&new_gid)
+            {
+                return Err(FsError::OperationNotPermitted);
+            }
+        }
+        if atime.is_some() || mtime.is_some() {
+            let can_write =
+                Self::access_allowed_with_groups(node, caller_uid, caller_gid, caller_groups, 0o2);
+            if !(is_root || is_owner || times_are_now && can_write) {
+                return Err(FsError::OperationNotPermitted);
+            }
+        }
+
+        let mut changed = false;
+        if let Some(mode) = mode {
+            let mut perm = (mode & 0o7777) as u16;
+            if !is_root && caller_gid != node.gid && !caller_groups.contains(&node.gid) {
+                perm &= !0o2000;
+            }
+            node.perm = perm;
+            changed = true;
+        }
+        let ownership_changed = uid.is_some_and(|new_uid| new_uid != node.uid)
+            || gid.is_some_and(|new_gid| new_gid != node.gid);
+        if let Some(uid) = uid {
+            node.uid = uid;
+            changed = true;
+        }
+        if let Some(gid) = gid {
+            node.gid = gid;
+            changed = true;
+        }
+        if ownership_changed && node.kind == FileKind::File {
+            node.perm &= !0o6000;
+        }
+        if let Some(atime) = atime {
+            node.atime = atime;
+            changed = true;
+        }
+        if let Some(mtime) = mtime {
+            node.mtime = mtime;
+            changed = true;
+        }
+        if changed {
+            node.ctime = SystemTime::now();
+        }
+        Ok(Self::attr_of(
+            &g,
+            g.nodes.get(&ino).ok_or(FsError::NotFound)?,
+        ))
+    }
+
+    /// Check read, write, and execute access for one primary uid/gid.
+    pub fn check_access(&self, ino: u64, uid: u32, gid: u32, mask: i32) -> Result<(), FsError> {
+        let g = self.inner.lock_recover();
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if Self::access_allowed(node, uid, gid, mask as u16) {
+            Ok(())
+        } else {
+            Err(FsError::PermissionDenied)
+        }
+    }
+
     /// `readdir`: list children of a directory inode (excluding `.`/`..`).
     pub fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>, FsError> {
         let g = self.inner.lock_recover();
@@ -622,6 +769,17 @@ impl ReadOnlyFs {
         options: OpenOptions,
         initial_contents: Option<Vec<u8>>,
     ) -> Result<u64, FsError> {
+        self.open_with_options_and_truncate(ino, options, initial_contents, false)
+    }
+
+    /// Open an existing file and record whether `O_TRUNC` was requested.
+    pub fn open_with_options_and_truncate(
+        &self,
+        ino: u64,
+        options: OpenOptions,
+        initial_contents: Option<Vec<u8>>,
+        truncate: bool,
+    ) -> Result<u64, FsError> {
         if !options.read && !options.write {
             return Err(FsError::Invalid);
         }
@@ -653,7 +811,13 @@ impl ReadOnlyFs {
         if let Some(buf) = initial_contents {
             g.dirty.insert(fh, DirtyFile { ino, buf });
             let size = g.dirty.get(&fh).unwrap().buf.len() as u64;
-            g.nodes.get_mut(&ino).unwrap().size = size;
+            let node = g.nodes.get_mut(&ino).unwrap();
+            node.size = size;
+            if truncate {
+                let now = SystemTime::now();
+                node.mtime = now;
+                node.ctime = now;
+            }
         }
         Ok(fh)
     }
@@ -783,6 +947,21 @@ impl ReadOnlyFs {
         name: &str,
         options: OpenOptions,
     ) -> Result<(Attr, u64), FsError> {
+        self.create_with_metadata(parent_ino, name, options, 0o666, 0, 0, 0)
+    }
+
+    /// Create a file with request ownership, mode, and umask metadata.
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_with_metadata(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        options: OpenOptions,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<(Attr, u64), FsError> {
         if !options.read && !options.write {
             return Err(FsError::Invalid);
         }
@@ -790,10 +969,13 @@ impl ReadOnlyFs {
             return Err(FsError::Invalid);
         }
         let mut g = self.inner.lock_recover();
-        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
-        if parent.kind != FileKind::Directory {
-            return Err(FsError::NotDir);
-        }
+        let (parent_perm, parent_gid) = {
+            let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+            if parent.kind != FileKind::Directory {
+                return Err(FsError::NotDir);
+            }
+            (parent.perm, parent.gid)
+        };
         if g.index.contains_key(&(parent_ino, name.to_string())) {
             return Err(FsError::Exists);
         }
@@ -807,6 +989,11 @@ impl ReadOnlyFs {
         let ino = g.next_ino;
         g.next_ino += 1;
         let now = SystemTime::now();
+        let child_gid = if parent_perm & 0o2000 != 0 {
+            parent_gid
+        } else {
+            gid
+        };
         let node = Node {
             ino,
             parent: Some(parent_ino),
@@ -818,8 +1005,10 @@ impl ReadOnlyFs {
             directory_marker: false,
             symlink_target: None,
             linked: true,
-            perm: 0o444,
+            perm: ((mode & !umask) & 0o7777) as u16,
             rdev: 0,
+            uid,
+            gid: child_gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -866,6 +1055,7 @@ impl ReadOnlyFs {
     }
 
     /// Validate and describe a regular or mount-local special node creation.
+    #[allow(clippy::too_many_arguments)]
     pub fn mknod_plan(
         &self,
         parent_ino: u64,
@@ -873,6 +1063,8 @@ impl ReadOnlyFs {
         mode: u32,
         umask: u32,
         rdev: u32,
+        uid: u32,
+        gid: u32,
     ) -> Result<MknodPlan, FsError> {
         Self::validate_component(name)?;
         let kind = match mode & MODE_TYPE_MASK {
@@ -894,6 +1086,11 @@ impl ReadOnlyFs {
         }
         let path = Self::child_path(parent, name);
         Self::validate_visible_object_path(&path)?;
+        let child_gid = if parent.perm & 0o2000 != 0 {
+            parent.gid
+        } else {
+            gid
+        };
         Ok(MknodPlan {
             parent: parent_ino,
             name: name.to_string(),
@@ -905,6 +1102,8 @@ impl ReadOnlyFs {
             } else {
                 0
             },
+            uid,
+            gid: child_gid,
         })
     }
 
@@ -936,6 +1135,8 @@ impl ReadOnlyFs {
                 linked: true,
                 perm: plan.perm,
                 rdev: plan.rdev,
+                uid: plan.uid,
+                gid: plan.gid,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -1290,6 +1491,7 @@ impl ReadOnlyFs {
         if current_source != Some(plan.source_ino) {
             return Err(FsError::NotFound);
         }
+        let now = SystemTime::now();
         if let Some((target_ino, _)) = plan.target {
             let current_target = g
                 .index
@@ -1309,6 +1511,7 @@ impl ReadOnlyFs {
                     target.name.clone_from(name);
                     target.path.clone_from(path);
                 }
+                target.ctime = now;
             } else {
                 g.nodes.remove(&target_ino);
             }
@@ -1337,7 +1540,6 @@ impl ReadOnlyFs {
             source.name.clone_from(&plan.target_name);
             source.path.clone_from(&plan.target_path);
         }
-        let now = SystemTime::now();
         source.ctime = now;
         Self::mark_directory_changed(&mut g, plan.source_parent, now);
         Self::mark_directory_changed(&mut g, plan.target_parent, now);
@@ -1555,6 +1757,18 @@ impl ReadOnlyFs {
 
     /// Insert a symbolic-link inode after its target bytes are written through.
     pub fn symlink(&self, parent_ino: u64, name: &str, target: Vec<u8>) -> Result<Attr, FsError> {
+        self.symlink_with_owner(parent_ino, name, target, 0, 0)
+    }
+
+    /// Insert a symbolic link owned by the requesting credentials.
+    pub fn symlink_with_owner(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        target: Vec<u8>,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Attr, FsError> {
         let path = self.new_symlink_path(parent_ino, name, &target)?;
         let mut g = self.inner.lock_recover();
         if g.index.contains_key(&(parent_ino, name.to_string())) {
@@ -1563,6 +1777,15 @@ impl ReadOnlyFs {
         let ino = g.next_ino;
         g.next_ino += 1;
         let now = SystemTime::now();
+        let (parent_perm, parent_gid) = {
+            let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+            (parent.perm, parent.gid)
+        };
+        let child_gid = if parent_perm & 0o2000 != 0 {
+            parent_gid
+        } else {
+            gid
+        };
         let node = Node {
             ino,
             parent: Some(parent_ino),
@@ -1576,6 +1799,8 @@ impl ReadOnlyFs {
             linked: true,
             perm: 0o777,
             rdev: 0,
+            uid,
+            gid: child_gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -1619,20 +1844,41 @@ impl ReadOnlyFs {
 
     /// Insert a new explicit directory after its marker has been committed.
     pub fn mkdir(&self, parent_ino: u64, name: &str) -> Result<Attr, FsError> {
+        self.mkdir_with_metadata(parent_ino, name, 0o777, 0, 0, 0)
+    }
+
+    /// Insert a directory with request ownership, mode, and umask metadata.
+    pub fn mkdir_with_metadata(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        uid: u32,
+        gid: u32,
+    ) -> Result<Attr, FsError> {
         Self::validate_component(name)?;
         let mut g = self.inner.lock_recover();
-        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
-        if parent.kind != FileKind::Directory {
-            return Err(FsError::NotDir);
-        }
+        let (path, parent_perm, parent_gid) = {
+            let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+            if parent.kind != FileKind::Directory {
+                return Err(FsError::NotDir);
+            }
+            (Self::child_path(parent, name), parent.perm, parent.gid)
+        };
         if g.index.contains_key(&(parent_ino, name.to_string())) {
             return Err(FsError::Exists);
         }
-        let path = Self::child_path(parent, name);
         Self::validate_visible_object_path(&path)?;
         let ino = g.next_ino;
         g.next_ino += 1;
         let now = SystemTime::now();
+        let child_gid = if parent_perm & 0o2000 != 0 {
+            parent_gid
+        } else {
+            gid
+        };
+        let inherited_setgid = parent_perm & 0o2000;
         let node = Node {
             ino,
             parent: Some(parent_ino),
@@ -1644,8 +1890,10 @@ impl ReadOnlyFs {
             directory_marker: true,
             symlink_target: None,
             linked: true,
-            perm: 0o555,
+            perm: (((mode & !umask) & 0o7777) as u16) | inherited_setgid,
             rdev: 0,
+            uid,
+            gid: child_gid,
             atime: now,
             mtime: now,
             ctime: now,
@@ -1908,6 +2156,33 @@ impl ReadOnlyFs {
         }
     }
 
+    fn access_allowed(node: &Node, uid: u32, gid: u32, mask: u16) -> bool {
+        Self::access_allowed_with_groups(node, uid, gid, &[], mask)
+    }
+
+    fn access_allowed_with_groups(
+        node: &Node,
+        uid: u32,
+        gid: u32,
+        groups: &[u32],
+        mask: u16,
+    ) -> bool {
+        if mask == 0 {
+            return true;
+        }
+        if uid == 0 {
+            return mask & 0o1 == 0 || node.kind == FileKind::Directory || node.perm & 0o111 != 0;
+        }
+        let bits = if uid == node.uid {
+            (node.perm >> 6) & 0o7
+        } else if gid == node.gid || groups.contains(&node.gid) {
+            (node.perm >> 3) & 0o7
+        } else {
+            node.perm & 0o7
+        };
+        bits & mask == mask
+    }
+
     fn orphan_path(&self, source_path: &str, ino: u64) -> Result<String, FsError> {
         let object = path_to_object(source_path).map_err(|_| FsError::Invalid)?;
         Ok(format!(
@@ -1956,13 +2231,17 @@ mod tests {
         let fs = fs();
         let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
         assert_eq!(s3.kind, FileKind::Directory);
-        assert_eq!(s3.perm, 0o555);
+        assert_eq!(s3.perm, 0o755);
+        assert_eq!(fs.getattr(ROOT_INO).unwrap().nlink, 4);
+        assert_eq!(s3.nlink, 3);
         let bucket = fs.lookup(s3.ino, "bucket").unwrap();
         let data = fs.lookup(bucket.ino, "data").unwrap();
+        assert_eq!(bucket.nlink, 3);
+        assert_eq!(data.nlink, 2);
         let a = fs.lookup(data.ino, "a.bin").unwrap();
         assert_eq!(a.kind, FileKind::File);
         assert_eq!(a.size, 1000);
-        assert_eq!(a.perm, 0o444);
+        assert_eq!(a.perm, 0o644);
         assert_eq!(fs.getattr(a.ino).unwrap(), a);
 
         assert_eq!(fs.lookup(ROOT_INO, "nope"), Err(FsError::NotFound));
@@ -2030,6 +2309,32 @@ mod tests {
     }
 
     #[test]
+    fn truncating_open_updates_size_mtime_and_ctime() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let before = fs.getattr(file.ino).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let fh = fs
+            .open_with_options_and_truncate(
+                file.ino,
+                OpenOptions {
+                    read: false,
+                    write: true,
+                    append: false,
+                },
+                Some(Vec::new()),
+                true,
+            )
+            .unwrap();
+        let after = fs.getattr(file.ino).unwrap();
+        assert_eq!(after.size, 0);
+        assert!(after.mtime > before.mtime);
+        assert!(after.ctime > before.ctime);
+        fs.release(fh).unwrap();
+    }
+
+    #[test]
     fn populate_from_listing_builds_tree_and_readdir() {
         let fs = ReadOnlyFs::new();
         let n = fs.populate_from_listing([
@@ -2068,6 +2373,23 @@ mod tests {
         let a_ino = a.ino;
         fs.populate_from_listing([("s3/bkt/dir/a.bin", 10u64)]);
         assert_eq!(fs.lookup(dir.ino, "a.bin").unwrap().ino, a_ino);
+    }
+
+    #[test]
+    fn listed_nodes_use_the_configured_mount_owner() {
+        let fs = ReadOnlyFs::new_with_owner(1000, 100);
+        fs.populate_from_listing([("s3/bucket/file.bin", 4), ("s3/bucket/empty/", 0)]);
+
+        let root = fs.getattr(ROOT_INO).unwrap();
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+        let file = fs.lookup(bucket.ino, "file.bin").unwrap();
+        let empty = fs.lookup(bucket.ino, "empty").unwrap();
+
+        for attr in [root, s3, bucket, file, empty] {
+            assert_eq!(attr.uid, 1000);
+            assert_eq!(attr.gid, 100);
+        }
     }
 
     #[test]
@@ -2260,7 +2582,7 @@ mod tests {
         for (index, (mode, kind, rdev)) in cases.into_iter().enumerate() {
             let name = format!("node-{index}");
             let plan = fs
-                .mknod_plan(parent.ino, &name, mode | 0o666, 0o022, rdev)
+                .mknod_plan(parent.ino, &name, mode | 0o666, 0o022, rdev, 1000, 100)
                 .unwrap();
             assert_eq!(plan.kind, kind);
             assert_eq!(plan.perm, 0o644);
@@ -2281,11 +2603,227 @@ mod tests {
     }
 
     #[test]
+    fn create_metadata_applies_credentials_umask_and_setgid_inheritance() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        fs.set_metadata(
+            parent.ino,
+            0,
+            0,
+            &[],
+            Some(0o2775),
+            None,
+            Some(42),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let (file, _) = fs
+            .create_with_metadata(
+                parent.ino,
+                "owned.bin",
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                0o666,
+                0o027,
+                1000,
+                100,
+            )
+            .unwrap();
+        assert_eq!(file.perm, 0o640);
+        assert_eq!(file.uid, 1000);
+        assert_eq!(file.gid, 42);
+
+        let directory = fs
+            .mkdir_with_metadata(parent.ino, "owned-dir", 0o777, 0o027, 1000, 100)
+            .unwrap();
+        assert_eq!(directory.perm, 0o2750);
+        assert_eq!(directory.uid, 1000);
+        assert_eq!(directory.gid, 42);
+    }
+
+    #[test]
+    fn chmod_chown_and_access_enforce_owner_rules() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let owned = fs
+            .set_metadata(
+                file.ino,
+                0,
+                0,
+                &[],
+                Some(0o6754),
+                Some(1000),
+                Some(100),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(owned.uid, 1000);
+        assert_eq!(owned.gid, 100);
+        assert_eq!(owned.perm, 0o754);
+
+        let chmod = fs
+            .set_metadata(
+                file.ino,
+                1000,
+                100,
+                &[],
+                Some(0o6750),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(chmod.perm, 0o6750);
+        assert_eq!(
+            fs.set_metadata(
+                file.ino,
+                2000,
+                200,
+                &[],
+                Some(0o600),
+                None,
+                None,
+                None,
+                None,
+                false,
+            ),
+            Err(FsError::OperationNotPermitted)
+        );
+
+        let chgrp = fs
+            .set_metadata(
+                file.ino,
+                1000,
+                200,
+                &[],
+                None,
+                None,
+                Some(200),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(chgrp.gid, 200);
+        assert_eq!(chgrp.perm & 0o6000, 0);
+        assert_eq!(
+            fs.set_metadata(
+                file.ino,
+                1000,
+                200,
+                &[],
+                None,
+                Some(2000),
+                None,
+                None,
+                None,
+                false,
+            ),
+            Err(FsError::OperationNotPermitted)
+        );
+
+        assert_eq!(fs.check_access(file.ino, 1000, 200, 0o6), Ok(()));
+        assert_eq!(
+            fs.check_access(file.ino, 3000, 300, 0o2),
+            Err(FsError::PermissionDenied)
+        );
+    }
+
+    #[test]
+    fn supplementary_groups_allow_chgrp_and_preserve_setgid() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        fs.set_metadata(
+            file.ino,
+            0,
+            0,
+            &[],
+            Some(0o750),
+            Some(1000),
+            Some(100),
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+
+        let chgrp = fs
+            .set_metadata(
+                file.ino,
+                1000,
+                200,
+                &[100, 300],
+                None,
+                None,
+                Some(300),
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(chgrp.gid, 300);
+
+        let chmod = fs
+            .set_metadata(
+                file.ino,
+                1000,
+                200,
+                &[300],
+                Some(0o2750),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(chmod.perm, 0o2750);
+
+        fs.set_metadata(
+            file.ino,
+            1000,
+            200,
+            &[300],
+            Some(0o2670),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        let cleared = fs
+            .set_metadata(
+                file.ino,
+                2000,
+                200,
+                &[300],
+                Some(0o670),
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .unwrap();
+        assert_eq!(cleared.perm, 0o670);
+    }
+
+    #[test]
     fn mount_local_special_nodes_link_rename_and_unlink_without_backend_paths() {
         let fs = fs();
         let parent = data_dir(&fs);
         let plan = fs
-            .mknod_plan(parent.ino, "fifo", MODE_NAMED_PIPE | 0o600, 0, 0)
+            .mknod_plan(parent.ino, "fifo", MODE_NAMED_PIPE | 0o600, 0, 0, 1000, 100)
             .unwrap();
         let fifo = fs.commit_mknod(&plan).unwrap();
 
@@ -2527,6 +3065,31 @@ mod tests {
             ),
             Err(FsError::IsDir)
         );
+    }
+
+    #[test]
+    fn file_rename_updates_replaced_inode_ctime_when_links_remain() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let source = fs.lookup(parent.ino, "a.bin").unwrap();
+        let target = fs.lookup(parent.ino, "b.bin").unwrap();
+        let link = fs
+            .hard_link_plan(target.ino, parent.ino, "b-link.bin")
+            .unwrap();
+        fs.commit_hard_link(&link).unwrap();
+        let before = fs.getattr(target.ino).unwrap().ctime;
+        std::thread::sleep(std::time::Duration::from_millis(1));
+
+        let rename = fs
+            .file_rename_plan(parent.ino, "a.bin", parent.ino, "b.bin")
+            .unwrap();
+        fs.commit_file_rename(&rename).unwrap();
+
+        let remaining = fs.lookup(parent.ino, "b-link.bin").unwrap();
+        assert_eq!(remaining.ino, target.ino);
+        assert_eq!(remaining.nlink, 1);
+        assert!(remaining.ctime > before);
+        assert_eq!(fs.lookup(parent.ino, "b.bin").unwrap().ino, source.ino);
     }
 
     #[test]
