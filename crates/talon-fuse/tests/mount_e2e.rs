@@ -23,9 +23,12 @@
 #![cfg(feature = "mount")]
 
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::os::unix::fs::FileExt;
+use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use talon_core::{NodeId, NodeInfo, NodeRole};
 use talon_fuse::mount::TalonFuse;
@@ -362,4 +365,214 @@ async fn mount_write_through_is_visible_in_backend() {
         !final_store.contains_key("s3/bucket/hello.bin"),
         "object should be gone from backend after unlink"
     );
+}
+
+/// Mount the read-write fixture and run the pinned pjdfstest suite against it.
+///
+/// This is separately gated because the normal real-kernel smoke job runs all
+/// ignored tests. Set `TALON_RUN_PJDFSTEST=1` to opt in. A comma-separated
+/// `TALON_PJDFSTEST_TESTS` value selects groups or files; omitting it runs the
+/// complete suite.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse, root, and pjdfstest build dependencies"]
+async fn mount_pjdfstest_compatibility_suite() {
+    use fuser::MountOption;
+
+    if std::env::var_os("TALON_RUN_PJDFSTEST").is_none() {
+        eprintln!("skipping: set TALON_RUN_PJDFSTEST=1 to run pjdfstest");
+        return;
+    }
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let worker = spawn_rw_worker(store).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/placeholder", 0);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let mountpoint = std::env::temp_dir().join(format!("talon-pjdfstest-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
+        .expect("TALON_RUN_PJDFSTEST requires a working /dev/fuse");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let test_dir = mountpoint.join("s3").join("bucket");
+    let runner =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/posix/pjdfstest/run.sh");
+    let selectors = std::env::var("TALON_PJDFSTEST_TESTS").unwrap_or_default();
+
+    let status = tokio::task::spawn_blocking(move || {
+        let mut command = Command::new(runner);
+        command.arg("--mountpoint").arg(test_dir);
+        for selector in selectors
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            command.arg(selector);
+        }
+        command.status()
+    })
+    .await
+    .unwrap()
+    .expect("start pjdfstest runner");
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+
+    assert!(
+        status.success(),
+        "pjdfstest reported compatibility failures"
+    );
+}
+
+/// Measure I/O through a real kernel FUSE mount backed by local protocol mocks.
+///
+/// Set `TALON_RUN_FUSE_BENCH=1` to opt in. The benchmark reports FUSE/Talon
+/// userspace path performance, not object-store or cross-region performance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires /dev/fuse; set TALON_RUN_FUSE_BENCH=1"]
+async fn mount_kernel_io_benchmark() {
+    use fuser::MountOption;
+
+    if std::env::var_os("TALON_RUN_FUSE_BENCH").is_none() {
+        eprintln!("skipping: set TALON_RUN_FUSE_BENCH=1 to run the benchmark");
+        return;
+    }
+
+    let read_mib = env_u64("TALON_FUSE_BENCH_READ_MIB", 128);
+    let write_mib = env_u64("TALON_FUSE_BENCH_WRITE_MIB", 64);
+    let random_ops = env_u64("TALON_FUSE_BENCH_RANDOM_OPS", 4096);
+    let read_size = read_mib * 1024 * 1024;
+    let write_size = write_mib * 1024 * 1024;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/bench-read.bin", read_size);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let mountpoint = std::env::temp_dir().join(format!("talon-fuse-bench-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
+        .expect("TALON_RUN_FUSE_BENCH requires a working /dev/fuse");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let read_path = mountpoint.join("s3").join("bucket").join("bench-read.bin");
+    let write_path = mountpoint.join("s3").join("bucket").join("bench-write.bin");
+
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::File::open(&read_path).expect("open benchmark read file");
+        let mut page = [0u8; 4096];
+        let max_page = (read_size / page.len() as u64).max(1);
+        let mut state = 0x4d595df4d0f33173u64;
+        let random_started = Instant::now();
+        for _ in 0..random_ops {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let offset = (state % max_page) * page.len() as u64;
+            file.read_exact_at(&mut page, offset)
+                .expect("random benchmark read");
+            std::hint::black_box(&page);
+        }
+        let random_elapsed = random_started.elapsed();
+        report_rate(
+            "random_read_4k_iops",
+            random_ops as f64 / random_elapsed.as_secs_f64(),
+            "ops/s",
+        );
+
+        let cold_started = Instant::now();
+        let cold_bytes = stream_file(&read_path);
+        let cold_elapsed = cold_started.elapsed();
+        report_throughput("sequential_read_cold", cold_bytes, cold_elapsed);
+
+        let warm_started = Instant::now();
+        let warm_bytes = stream_file(&read_path);
+        let warm_elapsed = warm_started.elapsed();
+        report_throughput("sequential_read_warm", warm_bytes, warm_elapsed);
+
+        let payload = vec![0x5au8; write_size as usize];
+        let write_started = Instant::now();
+        {
+            let mut output =
+                std::fs::File::create(&write_path).expect("create benchmark write file");
+            output.write_all(&payload).expect("write benchmark payload");
+        }
+        let write_elapsed = write_started.elapsed();
+        report_throughput("write_through", write_size, write_elapsed);
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get("/s3/bucket/bench-write.bin")
+            .map(Vec::len),
+        Some(write_size as usize),
+        "benchmark write must reach the mock backend"
+    );
+}
+
+fn env_u64(name: &str, default: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(default)
+}
+
+fn stream_file(path: &std::path::Path) -> u64 {
+    let mut file = std::fs::File::open(path).expect("open sequential benchmark file");
+    let mut buffer = vec![0u8; 1024 * 1024];
+    let mut total = 0u64;
+    loop {
+        let read = file.read(&mut buffer).expect("sequential benchmark read");
+        if read == 0 {
+            return total;
+        }
+        total += read as u64;
+        std::hint::black_box(&buffer[..read]);
+    }
+}
+
+fn report_throughput(metric: &str, bytes: u64, elapsed: Duration) {
+    let mib_per_second = bytes as f64 / (1024.0 * 1024.0) / elapsed.as_secs_f64();
+    report_rate(metric, mib_per_second, "MiB/s");
+}
+
+fn report_rate(metric: &str, value: f64, unit: &str) {
+    println!("TALON_FUSE_BENCH metric={metric} value={value:.2} unit={unit}");
 }
