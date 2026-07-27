@@ -110,9 +110,14 @@ impl WorkerClient {
             Ok(bytes) => Ok(bytes),
             Err((true, _stale)) => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
-                stream.write_all(&out).await?;
-                stream.flush().await?;
-                let bytes = read_range_reply(&mut stream).await?;
+                let bytes = self
+                    .pool
+                    .with_request_deadline("worker fetch_range retry", async {
+                        stream.write_all(&out).await?;
+                        stream.flush().await?;
+                        read_range_reply(&mut stream).await
+                    })
+                    .await?;
                 self.pool.release(&self.addr, stream);
                 Ok(bytes)
             }
@@ -133,12 +138,14 @@ impl WorkerClient {
             .map_err(|e| (false, WorkerError::from(e)))?;
         // On any error, `stream` is dropped (not released), so a half-broken
         // connection is never returned to the pool.
-        let result: Result<Vec<u8>, WorkerError> = async {
-            stream.write_all(out).await?;
-            stream.flush().await?;
-            read_range_reply(&mut stream).await
-        }
-        .await;
+        let result: Result<Vec<u8>, WorkerError> = self
+            .pool
+            .with_request_deadline("worker fetch_range", async {
+                stream.write_all(out).await?;
+                stream.flush().await?;
+                read_range_reply(&mut stream).await
+            })
+            .await;
         match result {
             Ok(bytes) => {
                 self.pool.release(&self.addr, stream);
@@ -205,10 +212,15 @@ impl WriteClient {
             Err((true, _stale)) => {
                 // Stale pooled connection: retry once on a fresh dial.
                 let mut stream = self.pool.fresh(&self.addr).await?;
-                stream.write_all(&header).await?;
-                stream.write_all(body).await?;
-                stream.flush().await?;
-                let version = read_version_reply(&mut stream).await?;
+                let version = self
+                    .pool
+                    .with_request_deadline("worker put_object retry", async {
+                        stream.write_all(&header).await?;
+                        stream.write_all(body).await?;
+                        stream.flush().await?;
+                        read_version_reply(&mut stream).await
+                    })
+                    .await?;
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
@@ -228,13 +240,15 @@ impl WriteClient {
             .checkout(&self.addr)
             .await
             .map_err(|e| (false, WorkerError::from(e)))?;
-        let result: Result<Version, WorkerError> = async {
-            stream.write_all(header).await?;
-            stream.write_all(body).await?;
-            stream.flush().await?;
-            read_version_reply(&mut stream).await
-        }
-        .await;
+        let result: Result<Version, WorkerError> = self
+            .pool
+            .with_request_deadline("worker put_object", async {
+                stream.write_all(header).await?;
+                stream.write_all(body).await?;
+                stream.flush().await?;
+                read_version_reply(&mut stream).await
+            })
+            .await;
         match result {
             Ok(version) => {
                 self.pool.release(&self.addr, stream);
@@ -256,9 +270,13 @@ impl WriteClient {
             Ok(()) => Ok(()),
             Err((true, _stale)) => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
-                stream.write_all(&frame).await?;
-                stream.flush().await?;
-                let _ = read_version_reply(&mut stream).await?;
+                self.pool
+                    .with_request_deadline("worker delete_object retry", async {
+                        stream.write_all(&frame).await?;
+                        stream.flush().await?;
+                        read_version_reply(&mut stream).await.map(|_| ())
+                    })
+                    .await?;
                 self.pool.release(&self.addr, stream);
                 Ok(())
             }
@@ -272,12 +290,14 @@ impl WriteClient {
             .checkout(&self.addr)
             .await
             .map_err(|e| (false, WorkerError::from(e)))?;
-        let result: Result<(), WorkerError> = async {
-            stream.write_all(frame).await?;
-            stream.flush().await?;
-            read_version_reply(&mut stream).await.map(|_| ())
-        }
-        .await;
+        let result: Result<(), WorkerError> = self
+            .pool
+            .with_request_deadline("worker delete_object", async {
+                stream.write_all(frame).await?;
+                stream.flush().await?;
+                read_version_reply(&mut stream).await.map(|_| ())
+            })
+            .await;
         match result {
             Ok(()) => {
                 self.pool.release(&self.addr, stream);
@@ -327,6 +347,7 @@ async fn read_range_reply(stream: &mut TcpStream) -> Result<Vec<u8>, WorkerError
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
     use talon_core::Backend;
     use talon_transport::{decode_request, encode_error, response_header_ok};
     use tokio::net::TcpListener;
@@ -624,5 +645,90 @@ mod tests {
         let client = WriteClient::new("127.0.0.1:1");
         let err = client.put_object(&object(), b"x").await.unwrap_err();
         assert!(matches!(err, WorkerError::Io(_)));
+    }
+
+    /// Accept the connection, read the request, then never reply and never
+    /// close. This is the realistic worker-wedge case (GC pause, disk stall,
+    /// half-open socket after a crash with no FIN) and it used to hang the
+    /// caller forever — which on the read path means an unkillable mount, and
+    /// which also silently defeats replica fallback, since the next replica is
+    /// only tried once the current attempt returns.
+    async fn stalling_worker() -> (String, Arc<std::sync::Mutex<Vec<TcpStream>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let held: Arc<std::sync::Mutex<Vec<TcpStream>>> = Arc::new(std::sync::Mutex::new(vec![]));
+        let keep = Arc::clone(&held);
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                keep.lock().unwrap().push(sock);
+            }
+        });
+        (addr, held)
+    }
+
+    fn impatient_pool() -> Arc<ConnectionPool> {
+        Arc::new(
+            ConnectionPool::new().with_timeouts(Duration::from_secs(5), Duration::from_millis(150)),
+        )
+    }
+
+    #[tokio::test]
+    async fn fetch_range_times_out_against_a_stalling_worker() {
+        let (addr, _held) = stalling_worker().await;
+        let client = WorkerClient::with_pool(addr, impatient_pool());
+
+        let started = std::time::Instant::now();
+        let err = client
+            .fetch_range(&object(), 0, 4096)
+            .await
+            .expect_err("a stalling worker must not hang the read");
+        match err {
+            WorkerError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a TimedOut I/O error, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn put_object_times_out_against_a_stalling_worker() {
+        let (addr, _held) = stalling_worker().await;
+        let client = WriteClient::with_pool(addr, impatient_pool());
+
+        let started = std::time::Instant::now();
+        let err = client
+            .put_object(&object(), b"payload")
+            .await
+            .expect_err("a stalling worker must not hang the write");
+        assert!(matches!(err, WorkerError::Io(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_object_times_out_against_a_stalling_worker() {
+        let (addr, _held) = stalling_worker().await;
+        let client = WriteClient::with_pool(addr, impatient_pool());
+
+        let started = std::time::Instant::now();
+        let err = client
+            .delete_object(&object())
+            .await
+            .expect_err("a stalling worker must not hang the delete");
+        assert!(matches!(err, WorkerError::Io(_)));
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 }

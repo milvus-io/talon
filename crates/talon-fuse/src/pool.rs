@@ -32,6 +32,16 @@
 //! - **Bounded.** At most `max_idle_per_addr` connections are kept idle per
 //!   address; extras are dropped on release, so the client pool cannot exhaust a
 //!   server's `ConnectionLimit`.
+//! - **Every network wait has a deadline.** Connect and each request/response
+//!   exchange are bounded by [`DEFAULT_CONNECT_TIMEOUT`] /
+//!   [`DEFAULT_REQUEST_TIMEOUT`]. A peer that accepts the TCP connection and
+//!   then wedges (GC pause, disk stall, half-open socket after a peer crash with
+//!   no FIN) would otherwise hang the caller forever. That matters most on the
+//!   FUSE read path, which `block_on`s these futures from a synchronous kernel
+//!   callback: an unbounded wait there puts the mount in uninterruptible sleep,
+//!   which not even `SIGKILL` clears. A hang also silently defeats replica
+//!   fallback, since the next replica is only tried once the current attempt
+//!   returns.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -45,6 +55,29 @@ pub const DEFAULT_MAX_IDLE_PER_ADDR: usize = 8;
 
 /// Default idle lifetime before a pooled connection is discarded.
 pub const DEFAULT_IDLE_TTL: Duration = Duration::from_secs(30);
+
+/// Default deadline for establishing a TCP connection to a peer.
+///
+/// Deliberately short: a worker that cannot be reached quickly should fail over
+/// to the next replica rather than stall the read.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default deadline for one full request/response exchange (write, flush, read
+/// the reply) once connected.
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Build the `io::Error` a timeout surfaces as.
+///
+/// Timeouts are reported as [`std::io::ErrorKind::TimedOut`] so they flow
+/// through the existing `WorkerError::Io` / `CoordinatorError::Io` paths and
+/// trigger the callers' replica-fallback and placement-refresh logic, exactly
+/// like a connection reset does.
+pub fn timeout_error(what: &str, after: Duration) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::TimedOut,
+        format!("{what} timed out after {after:?}"),
+    )
+}
 
 /// One idle connection plus the instant it was returned to the pool.
 struct Idle {
@@ -61,10 +94,12 @@ pub struct ConnectionPool {
     idle: Mutex<HashMap<String, Vec<Idle>>>,
     max_idle_per_addr: usize,
     idle_ttl: Duration,
+    connect_timeout: Duration,
+    request_timeout: Duration,
 }
 
 impl ConnectionPool {
-    /// Create a pool with the default idle bound and TTL.
+    /// Create a pool with the default idle bound, TTL and timeouts.
     pub fn new() -> Self {
         Self::with_limits(DEFAULT_MAX_IDLE_PER_ADDR, DEFAULT_IDLE_TTL)
     }
@@ -75,6 +110,41 @@ impl ConnectionPool {
             idle: Mutex::new(HashMap::new()),
             max_idle_per_addr: max_idle_per_addr.max(1),
             idle_ttl,
+            connect_timeout: DEFAULT_CONNECT_TIMEOUT,
+            request_timeout: DEFAULT_REQUEST_TIMEOUT,
+        }
+    }
+
+    /// Override the connect and per-exchange deadlines (for tuning/tests).
+    pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        self.connect_timeout = connect;
+        self.request_timeout = request;
+        self
+    }
+
+    /// The deadline applied to one full request/response exchange.
+    ///
+    /// Clients wrap their write/flush/read sequence in this so a peer that
+    /// accepts the connection and then never replies cannot hang the caller.
+    pub fn request_timeout(&self) -> Duration {
+        self.request_timeout
+    }
+
+    /// The deadline applied to establishing a connection.
+    pub fn connect_timeout(&self) -> Duration {
+        self.connect_timeout
+    }
+
+    /// Run `fut` under the pool's request deadline, mapping expiry to a
+    /// `TimedOut` I/O error described by `what`.
+    pub async fn with_request_deadline<T, E, F>(&self, what: &str, fut: F) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+        E: From<std::io::Error>,
+    {
+        match tokio::time::timeout(self.request_timeout, fut).await {
+            Ok(result) => result,
+            Err(_) => Err(E::from(timeout_error(what, self.request_timeout))),
         }
     }
 
@@ -93,8 +163,17 @@ impl ConnectionPool {
     }
 
     /// Dial a brand-new connection to `addr`, bypassing the idle pool.
+    ///
+    /// Bounded by [`connect_timeout`](Self::connect_timeout): an unroutable or
+    /// black-holed address must not stall the caller past its own deadline.
     pub async fn fresh(&self, addr: &str) -> std::io::Result<TcpStream> {
-        TcpStream::connect(addr).await
+        match tokio::time::timeout(self.connect_timeout, TcpStream::connect(addr)).await {
+            Ok(result) => result,
+            Err(_) => Err(timeout_error(
+                &format!("connect to {addr}"),
+                self.connect_timeout,
+            )),
+        }
     }
 
     /// Pop a non-stale idle connection for `addr`, discarding expired ones.
@@ -150,6 +229,8 @@ impl std::fmt::Debug for ConnectionPool {
         f.debug_struct("ConnectionPool")
             .field("max_idle_per_addr", &self.max_idle_per_addr)
             .field("idle_ttl", &self.idle_ttl)
+            .field("connect_timeout", &self.connect_timeout)
+            .field("request_timeout", &self.request_timeout)
             .field("addresses_pooled", &addrs)
             .finish()
     }
@@ -270,5 +351,84 @@ mod tests {
         pool.release(&addr, c2);
         pool.release(&addr, c3);
         assert_eq!(pool.idle_count(&addr), 2, "bounded to max_idle_per_addr");
+    }
+
+    /// A peer that accepts the connection and then never replies used to hang
+    /// the caller forever. On the FUSE read path that future is `block_on`ed
+    /// from a synchronous kernel callback, so the mount went into
+    /// uninterruptible sleep. Now the exchange has a deadline.
+    #[tokio::test]
+    async fn request_deadline_fires_on_a_peer_that_accepts_then_stalls() {
+        // Accept connections and then do nothing at all — no reply, no close.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let held = Arc::new(Mutex::new(Vec::new()));
+        let keep = Arc::clone(&held);
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                // Hold the socket open so the client sees silence, not EOF.
+                keep.lock().unwrap().push(sock);
+            }
+        });
+
+        let pool = ConnectionPool::with_limits(DEFAULT_MAX_IDLE_PER_ADDR, DEFAULT_IDLE_TTL)
+            .with_timeouts(Duration::from_secs(5), Duration::from_millis(150));
+
+        let (mut stream, _) = pool.checkout(&addr).await.unwrap();
+        let started = Instant::now();
+        let result: Result<(), std::io::Error> = pool
+            .with_request_deadline("stalling peer", async {
+                stream.write_all(b"ping").await?;
+                stream.flush().await?;
+                let mut buf = [0u8; 1];
+                stream.read_exact(&mut buf).await?;
+                Ok(())
+            })
+            .await;
+
+        let err = result.expect_err("a stalling peer must not hang the caller");
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "returned in {:?}, expected ~150ms",
+            started.elapsed()
+        );
+    }
+
+    /// A black-holed address (packets dropped, no RST) must not stall the dial
+    /// past the connect deadline. 203.0.113.0/24 is TEST-NET-3 (RFC 5737) and
+    /// is not routable, so the SYN goes unanswered.
+    #[tokio::test]
+    async fn connect_deadline_fires_on_an_unresponsive_address() {
+        let pool = ConnectionPool::with_limits(DEFAULT_MAX_IDLE_PER_ADDR, DEFAULT_IDLE_TTL)
+            .with_timeouts(Duration::from_millis(150), Duration::from_secs(30));
+
+        let started = Instant::now();
+        let err = pool
+            .fresh("203.0.113.1:9")
+            .await
+            .expect_err("connect to a black hole must fail, not hang");
+        // Either the deadline fired, or the host rejected the route outright;
+        // both are prompt failures, which is the property under test.
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "connect returned in {:?}, expected ~150ms",
+            started.elapsed()
+        );
+        let _ = err;
+    }
+
+    #[tokio::test]
+    async fn deadlines_default_and_are_overridable() {
+        let pool = ConnectionPool::new();
+        assert_eq!(pool.connect_timeout(), DEFAULT_CONNECT_TIMEOUT);
+        assert_eq!(pool.request_timeout(), DEFAULT_REQUEST_TIMEOUT);
+        let tuned =
+            ConnectionPool::new().with_timeouts(Duration::from_millis(1), Duration::from_millis(2));
+        assert_eq!(tuned.connect_timeout(), Duration::from_millis(1));
+        assert_eq!(tuned.request_timeout(), Duration::from_millis(2));
     }
 }

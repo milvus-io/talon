@@ -219,9 +219,14 @@ impl CoordinatorClient {
             Ok(reply) => Ok(reply),
             Err((true, _stale)) => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
-                stream.write_all(&out).await?;
-                stream.flush().await?;
-                let reply = read_control_frame(&mut stream, expected).await?;
+                let reply = self
+                    .pool
+                    .with_request_deadline("coordinator round_trip retry", async {
+                        stream.write_all(&out).await?;
+                        stream.flush().await?;
+                        read_control_frame(&mut stream, expected).await
+                    })
+                    .await?;
                 self.pool.release(&self.addr, stream);
                 Ok(reply)
             }
@@ -241,12 +246,14 @@ impl CoordinatorClient {
             .checkout(&self.addr)
             .await
             .map_err(|e| (false, CoordinatorError::from(e)))?;
-        let result: Result<ControlMessage, CoordinatorError> = async {
-            stream.write_all(out).await?;
-            stream.flush().await?;
-            read_control_frame(&mut stream, expected).await
-        }
-        .await;
+        let result: Result<ControlMessage, CoordinatorError> = self
+            .pool
+            .with_request_deadline("coordinator round_trip", async {
+                stream.write_all(out).await?;
+                stream.flush().await?;
+                read_control_frame(&mut stream, expected).await
+            })
+            .await;
         match result {
             Ok(reply) => {
                 self.pool.release(&self.addr, stream);
@@ -480,6 +487,46 @@ mod tests {
         assert_eq!(
             resolved.address_of(&NodeId::new("w1")),
             Some("10.0.0.1:7001")
+        );
+    }
+
+    /// A coordinator that accepts and then goes silent used to hang the caller
+    /// forever; on the read path that is an unkillable mount.
+    #[tokio::test]
+    async fn round_trip_times_out_against_a_stalling_coordinator() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let held: std::sync::Arc<std::sync::Mutex<Vec<tokio::net::TcpStream>>> =
+            std::sync::Arc::new(std::sync::Mutex::new(vec![]));
+        let keep = std::sync::Arc::clone(&held);
+        tokio::spawn(async move {
+            loop {
+                let Ok((sock, _)) = listener.accept().await else {
+                    return;
+                };
+                keep.lock().unwrap().push(sock);
+            }
+        });
+
+        let pool = std::sync::Arc::new(crate::ConnectionPool::new().with_timeouts(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(150),
+        ));
+        let client = CoordinatorClient::with_pool(addr, pool);
+
+        let started = std::time::Instant::now();
+        let err = client
+            .membership()
+            .await
+            .expect_err("a stalling coordinator must not hang the caller");
+        match err {
+            CoordinatorError::Io(e) => assert_eq!(e.kind(), std::io::ErrorKind::TimedOut),
+            other => panic!("expected a TimedOut I/O error, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
         );
     }
 }
