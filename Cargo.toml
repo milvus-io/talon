@@ -51,6 +51,8 @@ serde_yaml = "0.9"
 kube = { version = "0.97", default-features = false, features = ["client", "config", "rustls-tls", "runtime"] }
 k8s-openapi = { version = "0.23", default-features = false, features = ["v1_30"] }
 futures = "0.3"
+tempfile = "3"
+tokio-util = { version = "0.7", features = ["io"] }
 # etcd v3 client for the production ClusterStateStore backend. `tls-roots`
 # enables TLS via tonic/ring with the platform's native root certificates and
 # avoids a system OpenSSL build dependency.

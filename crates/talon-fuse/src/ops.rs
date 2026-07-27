@@ -9,16 +9,18 @@
 //!
 //! Paths under the mount mirror the backend namespace (`/s3/<bucket>/<key…>`,
 //! see [`crate::mapping`]). Directories are synthesized from the path hierarchy;
-//! files correspond to objects. Writes accumulate into a per-handle whole-object
-//! buffer (object stores replace whole objects, not byte ranges); the assembled
-//! object is written through to the backend at flush.
+//! files correspond to objects. Small writes accumulate in memory; large or
+//! sparse writes spill into a sparse staging file and stream through at flush.
 
 use crate::lock::MutexExt;
 use crate::mapping::path_to_object;
 use std::collections::HashMap;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
+use tempfile::NamedTempFile;
 
 /// The root inode number (fixed by FUSE convention).
 pub const ROOT_INO: u64 = 1;
@@ -109,6 +111,8 @@ pub enum FsError {
     CrossDevice,
     /// Access is denied by inode mode bits (`EACCES`).
     PermissionDenied,
+    /// Local staging I/O failed (`EIO`).
+    Io,
 }
 
 /// Access and mutation behavior for an open file handle.
@@ -138,12 +142,12 @@ pub enum ReadSource {
 
 /// Default cap on a single in-memory write buffer (1 GiB).
 ///
-/// v1 buffers a whole object in RAM, so the buffer length is attacker-reachable
-/// from an unprivileged `pwrite`/`ftruncate` at an arbitrary offset. Without a
-/// cap, `pwrite(fd, buf, 1, 1<<40)` asks for a 1 TiB zero-filled allocation and
-/// takes the mount (and likely the host) down. See
-/// [`ReadOnlyFs::with_max_object_bytes`] to tune.
+/// Objects larger than this are staged in a sparse temporary file and streamed
+/// through the worker. The limit is a memory threshold, not a logical file-size
+/// limit. See [`ReadOnlyFs::with_max_object_bytes`] to tune.
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 1 << 30;
+/// Default logical size limit for a streamed object (4 GiB).
+pub const DEFAULT_MAX_LOGICAL_OBJECT_BYTES: u64 = 4 << 30;
 
 const INTERNAL_OBJECT_PREFIX: &str = ".__talon_internal";
 const MAX_SYMLINK_TARGET_BYTES: usize = 4095;
@@ -155,6 +159,35 @@ const MODE_BLOCK_DEVICE: u32 = 0o060000;
 const MODE_DIRECTORY: u32 = 0o040000;
 const MODE_CHAR_DEVICE: u32 = 0o020000;
 const MODE_NAMED_PIPE: u32 = 0o010000;
+
+/// A stable snapshot used for backend write-through.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WritebackSource {
+    /// Small object bytes retained in memory.
+    Memory(Vec<u8>),
+    /// A staged file containing exactly `len` logical bytes.
+    File {
+        /// Path kept alive by the open dirty handle.
+        path: PathBuf,
+        /// Exact number of bytes to stream.
+        len: u64,
+    },
+}
+
+impl WritebackSource {
+    /// Logical object length.
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::File { len, .. } => *len,
+        }
+    }
+
+    /// Whether the object is empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// A directory entry yielded by `readdir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -215,7 +248,7 @@ pub struct UnlinkPlan {
     pub(crate) source_path: String,
     pub(crate) source_size: u64,
     pub(crate) orphan_path: Option<String>,
-    pub(crate) buffered_contents: Option<Vec<u8>>,
+    pub(crate) buffered_contents: Option<WritebackSource>,
     pub(crate) backend_object: bool,
 }
 
@@ -225,7 +258,7 @@ pub struct HardLinkPlan {
     pub(crate) source_ino: u64,
     pub(crate) source_path: String,
     pub(crate) source_size: u64,
-    pub(crate) buffered_contents: Option<Vec<u8>>,
+    pub(crate) buffered_contents: Option<WritebackSource>,
     pub(crate) target_parent: u64,
     pub(crate) target_name: String,
     pub(crate) target_path: String,
@@ -283,6 +316,8 @@ pub struct ReadOnlyFs {
     listing_gid: u32,
     /// Cap on the length of any single write handle's in-memory buffer.
     max_object_bytes: u64,
+    /// Cap on logical object length, independent of the staging representation.
+    max_logical_object_bytes: u64,
     /// Mount-scoped backend namespace for open-but-unlinked objects.
     orphan_namespace: String,
 }
@@ -295,11 +330,9 @@ struct Inner {
     // Open file handles -> inode and access mode.
     handles: HashMap<u64, Handle>,
     next_fh: u64,
-    // Write handles -> their in-progress whole-object buffer. A handle opened for
-    // write accumulates bytes here (random-offset writes land by position); the
-    // assembled object is taken at flush/release and written through to the
-    // backend (#226/#231). v1 buffers in memory (objects are single-block/small);
-    // a temp-file-backed buffer for large objects is future work.
+    // Write handles -> their in-progress object contents. Small objects remain
+    // in memory; large or sparse objects use a sparse staging file. The
+    // assembled object is streamed through at flush/release (#226/#231).
     dirty: HashMap<u64, DirtyFile>,
 }
 
@@ -311,13 +344,126 @@ struct Handle {
     append: bool,
 }
 
-/// A per-write-handle whole-object buffer.
+/// Per-write-handle object contents, either in memory or in a staging file.
 struct DirtyFile {
     /// The file inode this handle writes.
     ino: u64,
-    /// The object contents assembled so far (extended with zeros for sparse
-    /// writes past the current end).
-    buf: Vec<u8>,
+    /// The object contents assembled so far.
+    contents: DirtyContents,
+}
+
+enum DirtyContents {
+    Memory(Vec<u8>),
+    Staged { file: NamedTempFile, len: u64 },
+}
+
+impl DirtyContents {
+    fn memory(bytes: Vec<u8>) -> Self {
+        Self::Memory(bytes)
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            Self::Memory(bytes) => bytes.len() as u64,
+            Self::Staged { len, .. } => *len,
+        }
+    }
+
+    fn promote(&mut self, len: u64) -> Result<(), FsError> {
+        let Self::Memory(bytes) = self else {
+            if let Self::Staged {
+                file,
+                len: staged_len,
+            } = self
+            {
+                file.as_file().set_len(len).map_err(|_| FsError::Io)?;
+                *staged_len = len;
+            }
+            return Ok(());
+        };
+        let mut file = NamedTempFile::new().map_err(|_| FsError::Io)?;
+        file.write_all(bytes).map_err(|_| FsError::Io)?;
+        file.as_file().set_len(len).map_err(|_| FsError::Io)?;
+        *self = Self::Staged { file, len };
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, data: &[u8], memory_limit: u64) -> Result<u64, FsError> {
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or(FsError::TooLarge)?;
+        if matches!(self, Self::Memory(_)) && end > memory_limit {
+            self.promote(end)?;
+        }
+        match self {
+            Self::Memory(bytes) => {
+                let start: usize = offset.try_into().map_err(|_| FsError::TooLarge)?;
+                let end: usize = end.try_into().map_err(|_| FsError::TooLarge)?;
+                if bytes.len() < end {
+                    bytes.resize(end, 0);
+                }
+                bytes[start..end].copy_from_slice(data);
+            }
+            Self::Staged { file, len } => {
+                let output = file.as_file_mut();
+                output
+                    .seek(SeekFrom::Start(offset))
+                    .and_then(|_| output.write_all(data))
+                    .map_err(|_| FsError::Io)?;
+                if end > *len {
+                    output.set_len(end).map_err(|_| FsError::Io)?;
+                    *len = end;
+                }
+            }
+        }
+        Ok(end)
+    }
+
+    fn read_range(&self, offset: u64, size: u32) -> Result<Vec<u8>, FsError> {
+        let len = self.len();
+        if offset >= len {
+            return Ok(Vec::new());
+        }
+        let count = (len - offset).min(size as u64) as usize;
+        match self {
+            Self::Memory(bytes) => {
+                let start: usize = offset.try_into().map_err(|_| FsError::TooLarge)?;
+                Ok(bytes[start..start + count].to_vec())
+            }
+            Self::Staged { file, .. } => {
+                let mut input = file.reopen().map_err(|_| FsError::Io)?;
+                input
+                    .seek(SeekFrom::Start(offset))
+                    .map_err(|_| FsError::Io)?;
+                let mut bytes = vec![0u8; count];
+                input.read_exact(&mut bytes).map_err(|_| FsError::Io)?;
+                Ok(bytes)
+            }
+        }
+    }
+
+    fn snapshot(&self) -> WritebackSource {
+        match self {
+            Self::Memory(bytes) => WritebackSource::Memory(bytes.clone()),
+            Self::Staged { file, len } => WritebackSource::File {
+                path: file.path().to_path_buf(),
+                len: *len,
+            },
+        }
+    }
+
+    fn to_vec(&self) -> Result<Vec<u8>, FsError> {
+        match self {
+            Self::Memory(bytes) => Ok(bytes.clone()),
+            Self::Staged { file, len } => {
+                let capacity: usize = (*len).try_into().map_err(|_| FsError::TooLarge)?;
+                let mut input = file.reopen().map_err(|_| FsError::Io)?;
+                let mut bytes = Vec::with_capacity(capacity);
+                input.read_to_end(&mut bytes).map_err(|_| FsError::Io)?;
+                Ok(bytes)
+            }
+        }
+    }
 }
 
 static NEXT_FS_INSTANCE: AtomicU64 = AtomicU64::new(1);
@@ -377,13 +523,15 @@ impl ReadOnlyFs {
             listing_uid: uid,
             listing_gid: gid,
             max_object_bytes: DEFAULT_MAX_OBJECT_BYTES,
+            max_logical_object_bytes: DEFAULT_MAX_LOGICAL_OBJECT_BYTES,
             orphan_namespace: format!("{:x}-{timestamp:x}-{instance:x}", std::process::id()),
         }
     }
 
-    /// Override the per-object write-buffer cap (see
-    /// [`DEFAULT_MAX_OBJECT_BYTES`]). Writes or truncates that would push a
-    /// buffer past this fail with [`FsError::TooLarge`] (`EFBIG`).
+    /// Override the in-memory staging threshold (see
+    /// [`DEFAULT_MAX_OBJECT_BYTES`]). Writes beyond this threshold spill to a
+    /// sparse temporary file. Truncate currently remains memory-backed and
+    /// rejects larger sizes with [`FsError::TooLarge`] (`EFBIG`).
     pub fn with_max_object_bytes(mut self, max: u64) -> Self {
         self.max_object_bytes = max;
         self
@@ -392,6 +540,17 @@ impl ReadOnlyFs {
     /// The configured per-object write-buffer cap.
     pub fn max_object_bytes(&self) -> u64 {
         self.max_object_bytes
+    }
+
+    /// Override the logical object-size limit.
+    pub fn with_max_logical_object_bytes(mut self, max: u64) -> Self {
+        self.max_logical_object_bytes = max;
+        self
+    }
+
+    /// The configured logical object-size limit.
+    pub fn max_logical_object_bytes(&self) -> u64 {
+        self.max_logical_object_bytes
     }
 
     /// Register an object at `path` (e.g. `/s3/bucket/a/b/file.bin`) with `size`,
@@ -809,8 +968,14 @@ impl ReadOnlyFs {
             },
         );
         if let Some(buf) = initial_contents {
-            g.dirty.insert(fh, DirtyFile { ino, buf });
-            let size = g.dirty.get(&fh).unwrap().buf.len() as u64;
+            let size = buf.len() as u64;
+            g.dirty.insert(
+                fh,
+                DirtyFile {
+                    ino,
+                    contents: DirtyContents::memory(buf),
+                },
+            );
             let node = g.nodes.get_mut(&ino).unwrap();
             node.size = size;
             if truncate {
@@ -904,13 +1069,7 @@ impl ReadOnlyFs {
         }
         let ino = handle.ino;
         let source = if let Some(dirty) = g.dirty.get(&fh) {
-            let start = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
-            if start >= dirty.buf.len() {
-                ReadSource::Buffered(Vec::new())
-            } else {
-                let end = start.saturating_add(size as usize).min(dirty.buf.len());
-                ReadSource::Buffered(dirty.buf[start..end].to_vec())
-            }
+            ReadSource::Buffered(dirty.contents.read_range(offset, size)?)
         } else {
             let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
             ReadSource::Backend {
@@ -1034,7 +1193,7 @@ impl ReadOnlyFs {
             fh,
             DirtyFile {
                 ino,
-                buf: Vec::new(),
+                contents: DirtyContents::memory(Vec::new()),
             },
         );
         let attr = Self::attr_of(&g, g.nodes.get(&ino).unwrap());
@@ -1155,13 +1314,12 @@ impl ReadOnlyFs {
         ))
     }
 
-    /// `write`: write `data` at `offset` into the write handle's buffer.
+    /// `write`: write `data` at `offset` into the handle's working copy.
     ///
     /// Random-offset writes land by position; a write past the current end
-    /// extends the buffer with zeros (sparse). Updates the node's visible size.
-    /// Returns the number of bytes written. Fails with [`FsError::BadHandle`] for
-    /// a handle not opened for write, or [`FsError::TooLarge`] (`EFBIG`) if the
-    /// resulting buffer would exceed [`ReadOnlyFs::max_object_bytes`].
+    /// extends the logical file with a hole. Once the logical end exceeds the
+    /// in-memory threshold, the working copy is promoted to a sparse staging
+    /// file instead of allocating zero-filled RAM.
     ///
     /// The end offset is computed with a checked add: `offset` comes straight
     /// from the kernel and `offset + len` would otherwise overflow `usize` (a
@@ -1174,27 +1332,24 @@ impl ReadOnlyFs {
         }
         let append = handle.append;
         let start = if append {
-            g.dirty.get(&fh).ok_or(FsError::BadHandle)?.buf.len() as u64
+            g.dirty.get(&fh).ok_or(FsError::BadHandle)?.contents.len()
         } else {
             offset
         };
         let end = start
             .checked_add(data.len() as u64)
             .ok_or(FsError::TooLarge)?;
-        if end > self.max_object_bytes {
+        if end > self.max_logical_object_bytes {
             return Err(FsError::TooLarge);
         }
-        let end: usize = end.try_into().map_err(|_| FsError::TooLarge)?;
-        let start: usize = start.try_into().map_err(|_| FsError::TooLarge)?;
         let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
-        if dirty.buf.len() < end {
-            dirty.buf.resize(end, 0);
-        }
-        dirty.buf[start..end].copy_from_slice(data);
+        dirty
+            .contents
+            .write_at(start, data, self.max_object_bytes)?;
         let ino = dirty.ino;
-        let new_size = dirty.buf.len() as u64;
+        let new_size = dirty.contents.len();
         if let Some(node) = g.nodes.get_mut(&ino) {
-            node.size = node.size.max(new_size);
+            node.size = new_size;
             let now = SystemTime::now();
             node.mtime = now;
             node.ctime = now;
@@ -1217,7 +1372,7 @@ impl ReadOnlyFs {
         let new_len: usize = size.try_into().map_err(|_| FsError::TooLarge)?;
         let dirty = g.dirty.get(&fh).ok_or(FsError::BadHandle)?;
         let node = g.nodes.get(&dirty.ino).ok_or(FsError::NotFound)?;
-        let mut contents = dirty.buf.clone();
+        let mut contents = dirty.contents.to_vec()?;
         contents.resize(new_len, 0);
         Ok((node.path.clone(), contents))
     }
@@ -1285,7 +1440,7 @@ impl ReadOnlyFs {
         node.mtime = now;
         node.ctime = now;
         for dirty in g.dirty.values_mut().filter(|dirty| dirty.ino == ino) {
-            dirty.buf.clone_from(&contents);
+            dirty.contents = DirtyContents::memory(contents.clone());
         }
         Ok(Self::attr_of(g, g.nodes.get(&ino).unwrap()))
     }
@@ -1295,7 +1450,15 @@ impl ReadOnlyFs {
     /// no-op unless more is written. Returns `None` for a non-write handle.
     pub fn dirty_bytes(&self, fh: u64) -> Option<Vec<u8>> {
         let g = self.inner.lock_recover();
-        g.dirty.get(&fh).map(|d| d.buf.clone())
+        g.dirty
+            .get(&fh)
+            .and_then(|dirty| dirty.contents.to_vec().ok())
+    }
+
+    /// Return a bounded-memory writeback snapshot for a dirty handle.
+    pub fn dirty_source(&self, fh: u64) -> Option<WritebackSource> {
+        let g = self.inner.lock_recover();
+        g.dirty.get(&fh).map(|dirty| dirty.contents.snapshot())
     }
 
     /// The mount-relative object path a write handle targets.
@@ -1370,7 +1533,7 @@ impl ReadOnlyFs {
                 .iter()
                 .filter(|(_, dirty)| dirty.ino == source_ino)
                 .max_by_key(|(fh, _)| *fh)
-                .map(|(_, dirty)| dirty.buf.clone()),
+                .map(|(_, dirty)| dirty.contents.snapshot()),
             target_parent,
             target_name: target_name.to_string(),
             target_path,
@@ -1986,7 +2149,7 @@ impl ReadOnlyFs {
             .iter()
             .filter(|(_, dirty)| dirty.ino == ino)
             .max_by_key(|(fh, _)| *fh)
-            .map(|(_, dirty)| dirty.buf.clone());
+            .map(|(_, dirty)| dirty.contents.snapshot());
         Ok(UnlinkPlan {
             ino,
             parent: parent_ino,
@@ -3221,8 +3384,8 @@ mod tests {
         let orphan_path = plan.orphan_path.clone().unwrap();
         assert!(orphan_path.contains("/.__talon_internal/unlinked/"));
         assert_eq!(
-            plan.buffered_contents.as_deref(),
-            Some(b"contents".as_slice())
+            plan.buffered_contents,
+            Some(WritebackSource::Memory(b"contents".to_vec()))
         );
 
         fs.commit_unlink(&plan).unwrap();
@@ -3380,29 +3543,36 @@ mod tests {
         fs.release(fh).unwrap();
     }
 
-    /// Regression: `offset` comes from the kernel unvalidated, so a single
-    /// `pwrite` at a huge offset used to ask for a proportionally huge
-    /// zero-filled allocation (`buf.resize(offset + len)`) — a one-syscall DoS
-    /// of the whole mount. It is now bounded by `max_object_bytes`.
+    /// Large sparse writes spill to a file rather than allocating the hole.
     #[test]
-    fn write_past_the_cap_is_efbig_and_allocates_nothing() {
-        let fs = fs().with_max_object_bytes(1024);
-        let (attr, fh) = fs.create(data_dir(&fs).ino, "big.bin").unwrap();
+    fn write_past_the_memory_cap_uses_sparse_staging() {
+        let fs = fs()
+            .with_max_object_bytes(1024)
+            .with_max_logical_object_bytes(8192);
+        let (attr, fh) = fs
+            .create_with_options(
+                data_dir(&fs).ino,
+                "big.bin",
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+            )
+            .unwrap();
 
-        // 1 TiB offset: would have been a 1 TiB resize.
+        // A nonsensical logical size is still rejected.
         assert_eq!(fs.write(fh, 1 << 40, b"x"), Err(FsError::TooLarge));
-        // Just past the cap.
-        assert_eq!(fs.write(fh, 1024, b"x"), Err(FsError::TooLarge));
-        // Straddling the cap.
-        assert_eq!(fs.write(fh, 1020, b"12345"), Err(FsError::TooLarge));
-
-        // Nothing was buffered and the visible size never moved.
-        assert!(fs.dirty_bytes(fh).unwrap().is_empty());
-        assert_eq!(fs.getattr(attr.ino).unwrap().size, 0);
-
-        // Exactly at the cap still succeeds.
-        assert_eq!(fs.write(fh, 1023, b"x").unwrap(), 1);
-        assert_eq!(fs.dirty_bytes(fh).unwrap().len(), 1024);
+        assert_eq!(fs.write(fh, 4096, b"x").unwrap(), 1);
+        assert_eq!(fs.getattr(attr.ino).unwrap().size, 4097);
+        assert!(matches!(
+            fs.dirty_source(fh),
+            Some(WritebackSource::File { len: 4097, .. })
+        ));
+        assert_eq!(
+            fs.read_source(fh, 4094, 3).unwrap(),
+            ReadSource::Buffered(vec![0, 0, b'x'])
+        );
     }
 
     /// `offset + data.len()` overflowed `usize`: a debug panic while holding the

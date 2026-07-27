@@ -11,11 +11,13 @@ description = "Blob-store BackendStore implementations (S3/GCS/Azure) for Talon"
 talon-core.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tokio = { workspace = true, features = ["time"] }
+tokio-util.workspace = true
 sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }

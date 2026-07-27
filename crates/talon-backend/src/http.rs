@@ -8,6 +8,7 @@
 //! asserts on the constructed [`HttpRequest`].
 
 use async_trait::async_trait;
+use std::path::Path;
 
 /// An HTTP method (only the verbs the backends need).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +219,20 @@ pub trait HttpClient: Send + Sync {
     /// Execute `req` and return the response, or an error string on transport
     /// failure (DNS/connect/timeout).
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, String>;
+
+    /// Execute a request whose body is streamed from `path`.
+    ///
+    /// Implementations must send exactly `len` bytes with bounded memory. The
+    /// default rejects the operation instead of reading the complete file.
+    async fn execute_file(
+        &self,
+        req: HttpRequest,
+        path: &Path,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        let _ = (req, path, len);
+        Err("HTTP client does not support streamed file bodies".to_string())
+    }
 }
 
 #[cfg(test)]

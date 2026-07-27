@@ -12,6 +12,7 @@
 //! either a SAS token (in the URL query) or Shared Key (see
 //! [`crate::azure_sharedkey`]), signed just before each request executes.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -236,6 +237,18 @@ impl AzureBackend {
         }
     }
 
+    fn build_streamed_put(&self, obj: &ObjectId, len: u64) -> HttpRequest {
+        let mut request = self.build_put(obj, bytes::Bytes::new(), None);
+        if let Some((_, value)) = request
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
+            *value = len.to_string();
+        }
+        request
+    }
+
     /// Build the DELETE request (exposed for testing).
     pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
         HttpRequest {
@@ -371,6 +384,30 @@ impl BackendStore for AzureBackend {
         }
     }
 
+    async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        let request = self.authorized(self.build_streamed_put(obj, len));
+        let resp = self
+            .http
+            .execute_file(request, path, len)
+            .await
+            .map_err(Error::Backend)?;
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "Azure streamed PUT {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )));
+        }
+        match resp
+            .header("etag")
+            .map(|value| Version::new(value.trim_matches('"').to_string()))
+            .filter(|version| !version.0.trim().is_empty())
+        {
+            Some(version) => Ok(version),
+            None => Ok(self.head(obj).await?.version),
+        }
+    }
+
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
         let resp = self
             .http
@@ -398,6 +435,7 @@ mod tests {
 
     struct MockHttp {
         last: Mutex<Option<HttpRequest>>,
+        last_file: Mutex<Option<(HttpRequest, std::path::PathBuf, u64)>>,
         response: HttpResponse,
     }
 
@@ -405,6 +443,7 @@ mod tests {
         fn new(response: HttpResponse) -> Arc<Self> {
             Arc::new(Self {
                 last: Mutex::new(None),
+                last_file: Mutex::new(None),
                 response,
             })
         }
@@ -414,6 +453,16 @@ mod tests {
     impl HttpClient for MockHttp {
         async fn execute(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
             *self.last.lock().unwrap() = Some(req);
+            Ok(self.response.clone())
+        }
+
+        async fn execute_file(
+            &self,
+            req: HttpRequest,
+            path: &Path,
+            len: u64,
+        ) -> std::result::Result<HttpResponse, String> {
+            *self.last_file.lock().unwrap() = Some((req, path.to_path_buf(), len));
             Ok(self.response.clone())
         }
     }
@@ -626,6 +675,29 @@ mod tests {
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.method, Method::Put);
         assert_eq!(req.body, body);
+        assert_eq!(req.header("x-ms-blob-type"), Some("BlockBlob"));
+    }
+
+    #[tokio::test]
+    async fn put_file_streams_block_blob_and_returns_etag() {
+        let http = MockHttp::new(HttpResponse {
+            status: 201,
+            headers: vec![("ETag".into(), "\"0xSTREAM\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let a = AzureBackend::new(AzureConfig::new("acct"), None, http.clone());
+        let mut staged = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut staged, b"azure-stream").unwrap();
+
+        let version = a.put_file(&obj(), staged.path(), 12).await.unwrap();
+
+        assert_eq!(version, Version::new("0xSTREAM"));
+        let (req, path, len) = http.last_file.lock().unwrap().clone().unwrap();
+        assert_eq!(path, staged.path());
+        assert_eq!(len, 12);
+        assert_eq!(req.method, Method::Put);
+        assert!(req.body.is_empty());
+        assert_eq!(req.header("Content-Length"), Some("12"));
         assert_eq!(req.header("x-ms-blob-type"), Some("BlockBlob"));
     }
 
