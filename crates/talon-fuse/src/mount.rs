@@ -22,7 +22,7 @@ use std::time::Duration;
 use crate::block_reader::{BlockReader, FileView};
 use crate::lock::MutexExt;
 use crate::mapping::path_to_object;
-use crate::ops::{Attr, FileKind, FsError, ReadOnlyFs};
+use crate::ops::{Attr, FileKind, FsError, OpenOptions, ReadOnlyFs, ReadSource};
 use crate::prefetch::Prefetcher;
 use crate::readahead::ReadaheadConfig;
 use talon_core::ObjectId;
@@ -54,10 +54,32 @@ pub(crate) fn errno(err: FsError) -> i32 {
     match err {
         FsError::NotFound => libc::ENOENT,
         FsError::ReadOnly => libc::EROFS,
-        FsError::Unsupported => libc::ENOSYS,
+        FsError::Unsupported => libc::EOPNOTSUPP,
         FsError::BadHandle => libc::EBADF,
         FsError::TooLarge => libc::EFBIG,
+        FsError::IsDir => libc::EISDIR,
+        FsError::NotDir => libc::ENOTDIR,
+        FsError::Exists => libc::EEXIST,
+        FsError::Invalid => libc::EINVAL,
     }
+}
+
+fn open_options(flags: i32) -> Result<(OpenOptions, bool), FsError> {
+    let (read, write) = match flags & libc::O_ACCMODE {
+        libc::O_RDONLY => (true, false),
+        libc::O_WRONLY => (false, true),
+        libc::O_RDWR => (true, true),
+        _ => return Err(FsError::Invalid),
+    };
+    let truncate = flags & libc::O_TRUNC != 0;
+    Ok((
+        OpenOptions {
+            read,
+            write,
+            append: flags & libc::O_APPEND != 0,
+        },
+        truncate,
+    ))
 }
 
 /// A monotonic-ish millisecond timestamp for the placement cache TTL.
@@ -286,7 +308,11 @@ impl TalonFuse {
         })
     }
 
-    /// Read the committed object before opening a writable working copy.
+    /// Read the complete committed object before a non-truncating write open.
+    ///
+    /// Talon writes whole objects through to the blob backend. A writable handle
+    /// therefore needs the current bytes as its initial working copy unless
+    /// `O_TRUNC` explicitly starts from an empty object.
     fn read_committed_object(&self, path: &str, size: u64) -> Result<Vec<u8>, i32> {
         if size == 0 {
             return Ok(Vec::new());
@@ -306,6 +332,37 @@ impl TalonFuse {
                 reader.read(&view, 0, size, now_ms()).await
             })
             .map_err(|_| libc::EIO)
+    }
+
+    fn open_inode(&self, ino: u64, flags: i32) -> Result<(u64, u32), i32> {
+        if flags & libc::O_DIRECTORY != 0 {
+            return Err(libc::ENOTDIR);
+        }
+        let (options, truncate) = open_options(flags).map_err(errno)?;
+        let mutates = options.write || truncate;
+        let initial_contents = if mutates {
+            if !self.read_write {
+                return Err(libc::EROFS);
+            }
+            if truncate {
+                Some(Vec::new())
+            } else {
+                let (path, size) = self.fs.inode_file_meta(ino).map_err(errno)?;
+                Some(self.read_committed_object(&path, size)?)
+            }
+        } else {
+            None
+        };
+        let fh = self
+            .fs
+            .open_with_options(ino, options, initial_contents)
+            .map_err(errno)?;
+        let reply_flags = if mutates {
+            0
+        } else {
+            fuser::consts::FOPEN_KEEP_CACHE
+        };
+        Ok((fh, reply_flags))
     }
 
     /// The namespace tree backing metadata ops.
@@ -337,6 +394,13 @@ impl fuser::Filesystem for TalonFuse {
         _req: &fuser::Request<'_>,
         config: &mut fuser::KernelConfig,
     ) -> Result<(), libc::c_int> {
+        match config.add_capabilities(fuser::consts::FUSE_ATOMIC_O_TRUNC) {
+            Ok(()) => tracing::info!("negotiated atomic O_TRUNC handling"),
+            Err(missing) => tracing::warn!(
+                missing_capabilities = missing,
+                "kernel does not support atomic O_TRUNC handling"
+            ),
+        }
         match config.set_max_write(TARGET_MAX_IO) {
             Ok(granted) => tracing::info!(max_write = granted, "negotiated FUSE max_write"),
             Err(cap) => {
@@ -433,47 +497,18 @@ impl fuser::Filesystem for TalonFuse {
 
     /// Open a file inode, returning a handle for subsequent reads.
     ///
-    /// Directories are rejected with `EISDIR`-equivalent `ENOSYS` semantics via
-    /// the op layer (`FsError::Unsupported`). The handle indexes into the
-    /// namespace so the `read` callback can recover the object.
+    /// Directories are rejected with `EISDIR`. Writable opens preserve the
+    /// committed object unless `O_TRUNC` is present; append mode is recorded on
+    /// the handle and enforced by the write op.
     ///
     /// Replies with `FOPEN_KEEP_CACHE` so the kernel retains this file's page
     /// cache across opens: the namespace is read-only and immutable for a mount
     /// session, so repeated reads and `mmap` can serve from RAM without a FUSE
     /// round-trip (issue #180).
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        // A write/read-write open needs the committed bytes as its initial
-        // whole-object working copy. Linux may handle O_TRUNC through setattr
-        // before open, so rejecting an open that lacks the flag breaks normal
-        // std::fs::write and does not reliably identify truncation.
-        let accmode = flags & libc::O_ACCMODE;
-        let wants_write = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
-        if wants_write {
-            if !self.read_write {
-                return reply.error(libc::EROFS);
-            }
-            let initial_contents = if flags & libc::O_TRUNC != 0 {
-                Vec::new()
-            } else {
-                let (path, size) = match self.fs.inode_file_meta(ino) {
-                    Ok(meta) => meta,
-                    Err(error) => return reply.error(errno(error)),
-                };
-                match self.read_committed_object(&path, size) {
-                    Ok(contents) => contents,
-                    Err(error) => return reply.error(error),
-                }
-            };
-            match self.fs.open_write(ino, initial_contents) {
-                // No FOPEN_KEEP_CACHE for a write handle: contents are changing.
-                Ok(fh) => reply.opened(fh, 0),
-                Err(e) => reply.error(errno(e)),
-            }
-        } else {
-            match self.fs.open(ino) {
-                Ok(fh) => reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE),
-                Err(e) => reply.error(errno(e)),
-            }
+        match self.open_inode(ino, flags) {
+            Ok((fh, reply_flags)) => reply.opened(fh, reply_flags),
+            Err(error) => reply.error(error),
         }
     }
 
@@ -496,8 +531,9 @@ impl fuser::Filesystem for TalonFuse {
         _lock: Option<u64>,
         reply: fuser::ReplyData,
     ) {
-        let (path, file_size) = match self.fs.file_meta(fh) {
-            Ok(m) => m,
+        let (path, file_size) = match self.fs.read_source(fh, offset.max(0) as u64, size) {
+            Ok(ReadSource::Buffered(bytes)) => return reply.data(&bytes),
+            Ok(ReadSource::Backend { path, size }) => (path, size),
             Err(e) => return reply.error(errno(e)),
         };
         let object = match path_to_object(&path) {
@@ -551,7 +587,7 @@ impl fuser::Filesystem for TalonFuse {
         name: &std::ffi::OsStr,
         _mode: u32,
         _umask: u32,
-        _flags: i32,
+        flags: i32,
         reply: fuser::ReplyCreate,
     ) {
         if !self.read_write {
@@ -561,7 +597,27 @@ impl fuser::Filesystem for TalonFuse {
             Some(s) => s,
             None => return reply.error(libc::EINVAL),
         };
-        match self.fs.create(parent, name) {
+        let (options, _) = match open_options(flags) {
+            Ok(parsed) => parsed,
+            Err(e) => return reply.error(errno(e)),
+        };
+        match self.fs.lookup(parent, name) {
+            Ok(attr) => {
+                if flags & libc::O_EXCL != 0 {
+                    return reply.error(libc::EEXIST);
+                }
+                return match self.open_inode(attr.ino, flags) {
+                    Ok((fh, reply_flags)) => {
+                        let fa = to_file_attr(attr, req.uid(), req.gid());
+                        reply.created(&ATTR_TTL, &fa, 0, fh, reply_flags);
+                    }
+                    Err(error) => reply.error(error),
+                };
+            }
+            Err(FsError::NotFound) => {}
+            Err(e) => return reply.error(errno(e)),
+        }
+        match self.fs.create_with_options(parent, name, options) {
             Ok((attr, fh)) => {
                 let fa = to_file_attr(attr, req.uid(), req.gid());
                 reply.created(&ATTR_TTL, &fa, 0, fh, 0);
@@ -860,9 +916,50 @@ mod tests {
     fn errno_maps_each_fs_error() {
         assert_eq!(errno(FsError::NotFound), libc::ENOENT);
         assert_eq!(errno(FsError::ReadOnly), libc::EROFS);
-        assert_eq!(errno(FsError::Unsupported), libc::ENOSYS);
+        assert_eq!(errno(FsError::Unsupported), libc::EOPNOTSUPP);
         assert_eq!(errno(FsError::BadHandle), libc::EBADF);
         assert_eq!(errno(FsError::TooLarge), libc::EFBIG);
+        assert_eq!(errno(FsError::IsDir), libc::EISDIR);
+        assert_eq!(errno(FsError::NotDir), libc::ENOTDIR);
+        assert_eq!(errno(FsError::Exists), libc::EEXIST);
+        assert_eq!(errno(FsError::Invalid), libc::EINVAL);
+    }
+
+    #[test]
+    fn open_options_parse_access_append_and_truncate() {
+        let (read_only, truncate) = open_options(libc::O_RDONLY).unwrap();
+        assert_eq!(
+            read_only,
+            OpenOptions {
+                read: true,
+                write: false,
+                append: false,
+            }
+        );
+        assert!(!truncate);
+
+        let (read_write, truncate) =
+            open_options(libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC).unwrap();
+        assert_eq!(
+            read_write,
+            OpenOptions {
+                read: true,
+                write: true,
+                append: true,
+            }
+        );
+        assert!(truncate);
+
+        let (read_truncate, truncate) = open_options(libc::O_RDONLY | libc::O_TRUNC).unwrap();
+        assert_eq!(
+            read_truncate,
+            OpenOptions {
+                read: true,
+                write: false,
+                append: false,
+            }
+        );
+        assert!(truncate);
     }
 
     #[test]
