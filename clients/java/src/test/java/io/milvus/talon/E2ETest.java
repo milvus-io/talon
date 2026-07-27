@@ -27,6 +27,20 @@ public final class E2ETest {
         String uri = "az://container/bench";
 
         try (TalonClient client = TalonClient.connect(coordinator, blockSize)) {
+            check("stat returns size and version", () -> {
+                ObjectStat s = client.stat(uri);
+                assertEquals(version.length(), s.version().length(), "version length");
+                if (s.size() <= 0) {
+                    throw new AssertionError("size should be positive, was " + s.size());
+                }
+            });
+
+            // The common case after #318: no version supplied, resolved via stat.
+            check("read resolves the version automatically", () -> {
+                byte[] got = client.read(uri, 0, 4096);
+                assertBytes(ramp(0, 4096), got);
+            });
+
             check("reads exact bytes at offset 0", () -> {
                 byte[] got = client.read(uri, version, 0, 4096);
                 assertBytes(ramp(0, 4096), got);

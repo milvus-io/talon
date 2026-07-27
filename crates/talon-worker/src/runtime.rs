@@ -295,6 +295,33 @@ impl WorkerRuntime {
         Ok(out.freeze())
     }
 
+    /// Return an object's size and current version (#318).
+    ///
+    /// Backs the `StatObject` control message. A client needs the version
+    /// before it can address any block, since blocks are keyed by it, so this
+    /// is a prerequisite for reading rather than a convenience.
+    ///
+    /// The result is not cached beyond the version cache the read path already
+    /// maintains: a size can change under an overwrite, and serving a stale one
+    /// would make a client read past the end of the new object.
+    pub async fn stat_object(&self, object: &ObjectId) -> anyhow::Result<talon_core::ObjectStat> {
+        let stat = self
+            .backend
+            .head(object)
+            .await
+            .map_err(|error| anyhow::anyhow!("stat object (HEAD): {error}"))?;
+        if stat.version.0.trim().is_empty() {
+            anyhow::bail!(
+                "backend returned no version/etag for {object}; a client cannot address blocks \
+                 without one"
+            );
+        }
+        // Reuse the read path's cache so a stat immediately followed by a read
+        // does not pay a second HEAD.
+        self.store_version(object, &stat.version);
+        Ok(stat)
+    }
+
     /// Resolve the object's current version, refusing an empty/missing version
     /// rather than caching under a placeholder (#119).
     ///
