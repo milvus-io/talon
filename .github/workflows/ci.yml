@@ -399,6 +399,51 @@ jobs:
       - name: Run the Azure e2e test
         run: cargo test -p talon-backend --test azure_e2e --locked -- --nocapture
 
+  python-client:
+    name: python client
+    runs-on: ubuntu-latest
+    # Builds the wheel and drives it against a real coordinator, worker, and
+    # blob origin. Mocks would only assert that the mocks behave as written; the
+    # value of the binding is that it exercises the real protocol path.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install build and test tooling
+        run: python -m pip install --upgrade maturin pytest
+      - name: Build the release binaries the tests drive
+        run: |
+          cargo build --release --locked \
+            -p talon-worker --bin talon-worker \
+            -p talon-coordinator --bin talon-coordinator
+      - name: Build and install the wheel
+        run: |
+          maturin build --release --manifest-path clients/python/Cargo.toml --out dist
+          python -m pip install --force-reinstall dist/*.whl
+      - name: Run the client tests
+        run: python -m pytest clients/python/tests/ -v
+
+  java-client:
+    name: java client
+    runs-on: ubuntu-latest
+    # Two suites: conformance vectors, which guard the hand-written codec
+    # against drift from the Rust implementation, and an end-to-end read against
+    # a live cluster. The first is what makes a second protocol implementation
+    # maintainable; the second proves it actually reads bytes.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # Matches the pom's maven.compiler.release, so a source-level feature
+          # newer than the declared minimum fails here rather than at a user.
+          java-version: "17"
+      - name: Run conformance vectors and the end-to-end suite
+        run: scripts/java_client_e2e.sh
+
   bench:
     name: bench (informational)
     runs-on: ubuntu-latest
