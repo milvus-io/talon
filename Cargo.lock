@@ -2501,9 +2501,11 @@ dependencies = [
 name = "talon-transport"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bincode",
  "monoio",
  "serde",
+ "serde_json",
  "talon-core",
  "thiserror 2.0.19",
  "tokio",

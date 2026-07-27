@@ -39,6 +39,12 @@ check-config-docs:
       --bin talon-gen-config-docs > /tmp/talon-config-ref.md
     diff -u docs/reference/configuration.md /tmp/talon-config-ref.md
 
+# Regenerate the wire-protocol conformance vectors. Run after any intentional
+# change to the wire format, and commit the result in the same change.
+gen-conformance-vectors:
+    cargo run -q -p talon-transport --bin talon-gen-conformance-vectors -- \
+      crates/talon-transport/tests/conformance_vectors.json
+
 # Regenerate the REST API reference from openapi.json.
 gen-api-docs:
     cargo run -q -p talon-coordinator --bin talon-gen-api-docs -- docs/reference/rest-api.md

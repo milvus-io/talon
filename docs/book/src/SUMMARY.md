@@ -33,6 +33,7 @@
 
 - [Configuration reference](./reference/configuration.md)
 - [REST API reference](./reference/rest-api.md)
+- [Wire protocol reference](./reference/wire-protocol.md)
 
 # Explanation
 

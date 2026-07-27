@@ -6,7 +6,14 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
+# Emits the wire-protocol conformance vectors (#311) that every client asserts
+# against. Generated, never hand-written: a test fails if the wire changes.
+[[bin]]
+name = "talon-gen-conformance-vectors"
+path = "src/bin/gen-conformance-vectors.rs"
+
 [dependencies]
+anyhow.workspace = true
 talon-core.workspace = true
 thiserror.workspace = true
 serde.workspace = true
@@ -16,3 +23,4 @@ tracing.workspace = true
 monoio.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
