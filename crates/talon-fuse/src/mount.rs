@@ -839,6 +839,95 @@ impl fuser::Filesystem for TalonFuse {
         }
     }
 
+    /// Rename a regular file by replacing the destination blob, deleting the
+    /// source blob, and only then committing the namespace move.
+    fn rename(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        newparent: u64,
+        newname: &std::ffi::OsStr,
+        flags: u32,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        if flags != 0 {
+            return reply.error(libc::EINVAL);
+        }
+        let (name, newname) = match (name.to_str(), newname.to_str()) {
+            (Some(name), Some(newname)) => (name, newname),
+            _ => return reply.error(libc::EINVAL),
+        };
+        let plan = match self.fs.file_rename_plan(parent, name, newparent, newname) {
+            Ok(plan) => plan,
+            Err(error) => return reply.error(errno(error)),
+        };
+        if plan.source_path == plan.target_path {
+            return reply.ok();
+        }
+        let source_bytes = match self.read_committed_object(&plan.source_path, plan.source_size) {
+            Ok(bytes) => bytes,
+            Err(error) => return reply.error(error),
+        };
+        let target_backup = match plan.target {
+            Some((_, size)) => match self.read_committed_object(&plan.target_path, size) {
+                Ok(bytes) => Some(bytes),
+                Err(error) => return reply.error(error),
+            },
+            None => None,
+        };
+        if let Err(error) = self.writeback_object(&plan.target_path, source_bytes.clone()) {
+            tracing::warn!(
+                source = %plan.source_path,
+                target = %plan.target_path,
+                %error,
+                "rename destination writeback failed"
+            );
+            return reply.error(libc::EIO);
+        }
+        if let Err(error) = self.delete_backend_object(&plan.source_path) {
+            let rollback = match target_backup {
+                Some(bytes) => self.writeback_object(&plan.target_path, bytes),
+                None => self.delete_backend_object(&plan.target_path),
+            };
+            if let Err(rollback_error) = rollback {
+                tracing::error!(
+                    target = %plan.target_path,
+                    %rollback_error,
+                    "rename destination rollback failed"
+                );
+            }
+            tracing::warn!(source = %plan.source_path, %error, "rename source delete failed");
+            return reply.error(libc::EIO);
+        }
+        if let Err(error) = self.fs.commit_file_rename(&plan) {
+            let restore_source = self.writeback_object(&plan.source_path, source_bytes);
+            let restore_target = match target_backup {
+                Some(bytes) => self.writeback_object(&plan.target_path, bytes),
+                None => self.delete_backend_object(&plan.target_path),
+            };
+            if let Err(rollback_error) = restore_source {
+                tracing::error!(
+                    source = %plan.source_path,
+                    %rollback_error,
+                    "rename source rollback failed"
+                );
+            }
+            if let Err(rollback_error) = restore_target {
+                tracing::error!(
+                    target = %plan.target_path,
+                    %rollback_error,
+                    "rename target rollback failed"
+                );
+            }
+            return reply.error(errno(error));
+        }
+        reply.ok();
+    }
+
     /// Remove a file: delete the backend object, then drop the namespace node.
     fn unlink(
         &mut self,
