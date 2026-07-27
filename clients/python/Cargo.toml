@@ -1,0 +1,33 @@
+[package]
+name = "talon-python"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Python bindings for the Talon distributed object-store cache client"
+publish = false
+
+[lib]
+name = "talon"
+# cdylib for the Python extension module; rlib so the crate's own tests can
+# link against it.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# Enabled by maturin when building a wheel; see the pyo3 dependency note.
+extension-module = ["pyo3/extension-module"]
+
+[dependencies]
+talon-core.workspace = true
+talon-transport.workspace = true
+# The read path (block splitting, placement cache, replica fallback, pooling)
+# already exists here and is exercised by the FUSE client. Default features
+# exclude `fuser`, so no FUSE dependency reaches the Python extension.
+talon-fuse = { path = "../../crates/talon-fuse" }
+# `extension-module` tells pyo3 not to link libpython, which is correct for a
+# wheel but breaks `cargo test` (the test harness needs a Python to link
+# against). It is therefore opt-in via the `extension-module` feature, which
+# maturin enables and `cargo test` does not.
+pyo3 = { version = "0.22", features = ["abi3-py38"] }
+tokio = { workspace = true }
