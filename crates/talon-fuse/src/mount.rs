@@ -16,6 +16,7 @@
 //! [#100]: https://github.com/milvus-io/talon/issues/100
 
 use std::collections::HashMap;
+use std::os::unix::ffi::OsStrExt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -66,6 +67,7 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::Invalid => libc::EINVAL,
         FsError::NotEmpty => libc::ENOTEMPTY,
         FsError::NameTooLong => libc::ENAMETOOLONG,
+        FsError::Loop => libc::ELOOP,
     }
 }
 
@@ -98,13 +100,13 @@ fn now_ms() -> u64 {
 /// Convert a synthesized [`Attr`] into a `fuser::FileAttr`.
 ///
 /// Times are fixed to the UNIX epoch (the namespace is synthetic and read-only,
-/// so there is no meaningful mtime); links are 1, ownership is left to the
-/// mounting user via `uid`/`gid`. `blocks` is a 512-byte-unit count as POSIX
-/// expects.
+/// so there is no meaningful mtime); ownership is left to the mounting user via
+/// `uid`/`gid`. `blocks` is a 512-byte-unit count as POSIX expects.
 pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
     let kind = match attr.kind {
         FileKind::Directory => fuser::FileType::Directory,
         FileKind::File => fuser::FileType::RegularFile,
+        FileKind::Symlink => fuser::FileType::Symlink,
     };
     let epoch = std::time::UNIX_EPOCH;
     fuser::FileAttr {
@@ -624,6 +626,7 @@ impl fuser::Filesystem for TalonFuse {
             let kind = match e.kind {
                 FileKind::Directory => fuser::FileType::Directory,
                 FileKind::File => fuser::FileType::RegularFile,
+                FileKind::Symlink => fuser::FileType::Symlink,
             };
             (e.ino, kind, e.name)
         }));
@@ -721,6 +724,14 @@ impl fuser::Filesystem for TalonFuse {
         }
     }
 
+    /// Return the raw target bytes for a symbolic-link inode.
+    fn readlink(&mut self, _req: &fuser::Request<'_>, ino: u64, reply: fuser::ReplyData) {
+        match self.fs.readlink(ino) {
+            Ok(target) => reply.data(&target),
+            Err(error) => reply.error(errno(error)),
+        }
+    }
+
     /// Create and open a new file for writing (`O_CREAT`).
     fn create(
         &mut self,
@@ -765,6 +776,49 @@ impl fuser::Filesystem for TalonFuse {
                 reply.created(&ATTR_TTL, &fa, 0, fh, 0);
             }
             Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Create a symbolic link and persist its raw target bytes.
+    fn symlink(
+        &mut self,
+        req: &fuser::Request<'_>,
+        parent: u64,
+        link_name: &std::ffi::OsStr,
+        target: &std::path::Path,
+        reply: fuser::ReplyEntry,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let link_name = match link_name.to_str() {
+            Some(name) => name,
+            None => return reply.error(libc::EINVAL),
+        };
+        let target = target.as_os_str().as_bytes().to_vec();
+        let path = match self.fs.new_symlink_path(parent, link_name, &target) {
+            Ok(path) => path,
+            Err(error) => return reply.error(errno(error)),
+        };
+        if let Err(error) = self.writeback_object(&path, target.clone()) {
+            tracing::warn!(%path, %error, "symlink target writeback failed");
+            return reply.error(libc::EIO);
+        }
+        match self.fs.symlink(parent, link_name, target) {
+            Ok(attr) => {
+                let file_attr = to_file_attr(attr, req.uid(), req.gid());
+                reply.entry(&ATTR_TTL, &file_attr, 0);
+            }
+            Err(error) => {
+                if let Err(rollback_error) = self.delete_backend_object(&path) {
+                    tracing::error!(
+                        %path,
+                        %rollback_error,
+                        "failed to roll back symlink object"
+                    );
+                }
+                reply.error(errno(error));
+            }
         }
     }
 
@@ -1356,6 +1410,7 @@ mod tests {
         assert_eq!(errno(FsError::Invalid), libc::EINVAL);
         assert_eq!(errno(FsError::NotEmpty), libc::ENOTEMPTY);
         assert_eq!(errno(FsError::NameTooLong), libc::ENAMETOOLONG);
+        assert_eq!(errno(FsError::Loop), libc::ELOOP);
     }
 
     #[test]
@@ -1423,6 +1478,18 @@ mod tests {
         assert_eq!(fa.blocks, 2);
         assert_eq!(fa.blksize, 512);
         assert_eq!(fa.nlink, 0);
+
+        let symlink = Attr {
+            ino: 8,
+            kind: FileKind::Symlink,
+            size: 6,
+            perm: 0o777,
+            nlink: 1,
+        };
+        let fa = to_file_attr(symlink, 0, 0);
+        assert_eq!(fa.kind, fuser::FileType::Symlink);
+        assert_eq!(fa.size, 6);
+        assert_eq!(fa.perm, 0o777);
     }
 
     #[tokio::test]

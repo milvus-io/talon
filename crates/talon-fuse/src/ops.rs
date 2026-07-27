@@ -30,6 +30,8 @@ pub enum FileKind {
     Directory,
     /// A regular file (a backend object).
     File,
+    /// A symbolic link whose target bytes are stored in a backend object.
+    Symlink,
 }
 
 /// Synthesized attributes for a node.
@@ -73,6 +75,8 @@ pub enum FsError {
     NotEmpty,
     /// A pathname component exceeds the filesystem name limit (`ENAMETOOLONG`).
     NameTooLong,
+    /// Too many symbolic links were encountered (`ELOOP`).
+    Loop,
 }
 
 /// Access and mutation behavior for an open file handle.
@@ -110,6 +114,7 @@ pub enum ReadSource {
 pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 1 << 30;
 
 const INTERNAL_OBJECT_PREFIX: &str = ".__talon_internal";
+const MAX_SYMLINK_TARGET_BYTES: usize = 4095;
 
 /// A directory entry yielded by `readdir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -183,6 +188,8 @@ struct Node {
     path: String,
     /// Whether this directory is persisted by a trailing-slash blob marker.
     directory_marker: bool,
+    /// Raw target bytes for symbolic links.
+    symlink_target: Option<Vec<u8>>,
     /// Whether the inode still has a visible namespace entry.
     linked: bool,
 }
@@ -256,6 +263,7 @@ impl ReadOnlyFs {
                 children: Vec::new(),
                 path: String::new(),
                 directory_marker: false,
+                symlink_target: None,
                 linked: true,
             },
         );
@@ -325,6 +333,7 @@ impl ReadOnlyFs {
                 children: Vec::new(),
                 path: current_path.clone(),
                 directory_marker: false,
+                symlink_target: None,
                 linked: true,
             };
             g.nodes.insert(ino, node);
@@ -404,6 +413,7 @@ impl ReadOnlyFs {
                 children: Vec::new(),
                 path: current_path.clone(),
                 directory_marker: index == comps.len() - 1,
+                symlink_target: None,
                 linked: true,
             };
             g.nodes.insert(ino, node);
@@ -418,6 +428,7 @@ impl ReadOnlyFs {
         let perm = match node.kind {
             FileKind::Directory => 0o555,
             FileKind::File => 0o444,
+            FileKind::Symlink => 0o777,
         };
         Attr {
             ino: node.ino,
@@ -492,8 +503,10 @@ impl ReadOnlyFs {
         }
         let mut g = self.inner.lock_recover();
         let kind = g.nodes.get(&ino).ok_or(FsError::NotFound)?.kind;
-        if kind != FileKind::File {
-            return Err(FsError::IsDir);
+        match kind {
+            FileKind::File => {}
+            FileKind::Directory => return Err(FsError::IsDir),
+            FileKind::Symlink => return Err(FsError::Loop),
         }
         if options.write && initial_contents.is_none() {
             return Err(FsError::Invalid);
@@ -669,6 +682,7 @@ impl ReadOnlyFs {
             children: Vec::new(),
             path,
             directory_marker: false,
+            symlink_target: None,
             linked: true,
         };
         g.nodes.insert(ino, node);
@@ -861,7 +875,7 @@ impl ReadOnlyFs {
         let g = self.inner.lock_recover();
         let ino = *g.index.get(&(parent_ino, name.to_string()))?;
         let node = g.nodes.get(&ino)?;
-        if node.kind != FileKind::File {
+        if node.kind == FileKind::Directory {
             return None;
         }
         Some(node.path.clone())
@@ -890,7 +904,7 @@ impl ReadOnlyFs {
             .get(&(source_parent, source_name.to_string()))
             .ok_or(FsError::NotFound)?;
         let source = g.nodes.get(&source_ino).ok_or(FsError::NotFound)?;
-        if source.kind != FileKind::File {
+        if source.kind == FileKind::Directory {
             return Err(FsError::IsDir);
         }
         let target_path = Self::child_path(target_parent_node, target_name);
@@ -899,7 +913,7 @@ impl ReadOnlyFs {
             Some(&target_ino) if target_ino == source_ino => None,
             Some(&target_ino) => {
                 let node = g.nodes.get(&target_ino).ok_or(FsError::NotFound)?;
-                if node.kind != FileKind::File {
+                if node.kind == FileKind::Directory {
                     return Err(FsError::IsDir);
                 }
                 Some((target_ino, node.size))
@@ -1047,7 +1061,7 @@ impl ReadOnlyFs {
                 .ok_or(FsError::Invalid)?;
             let moved_path = format!("{target_path}{suffix}");
             match node.kind {
-                FileKind::File => entries.push(DirectoryRenameEntry {
+                FileKind::File | FileKind::Symlink => entries.push(DirectoryRenameEntry {
                     source_path: node.path.clone(),
                     target_path: moved_path,
                     size: node.size,
@@ -1152,6 +1166,67 @@ impl ReadOnlyFs {
         Ok(())
     }
 
+    /// Validate a new symbolic link and return its backend object path.
+    pub fn new_symlink_path(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        target: &[u8],
+    ) -> Result<String, FsError> {
+        Self::validate_component(name)?;
+        if target.len() > MAX_SYMLINK_TARGET_BYTES {
+            return Err(FsError::NameTooLong);
+        }
+        let g = self.inner.lock_recover();
+        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+        if parent.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if g.index.contains_key(&(parent_ino, name.to_string())) {
+            return Err(FsError::Exists);
+        }
+        let path = Self::child_path(parent, name);
+        Self::validate_visible_object_path(&path)?;
+        Ok(path)
+    }
+
+    /// Insert a symbolic-link inode after its target bytes are written through.
+    pub fn symlink(&self, parent_ino: u64, name: &str, target: Vec<u8>) -> Result<Attr, FsError> {
+        let path = self.new_symlink_path(parent_ino, name, &target)?;
+        let mut g = self.inner.lock_recover();
+        if g.index.contains_key(&(parent_ino, name.to_string())) {
+            return Err(FsError::Exists);
+        }
+        let ino = g.next_ino;
+        g.next_ino += 1;
+        let node = Node {
+            ino,
+            parent: Some(parent_ino),
+            name: name.to_string(),
+            kind: FileKind::Symlink,
+            size: target.len() as u64,
+            children: Vec::new(),
+            path,
+            directory_marker: false,
+            symlink_target: Some(target),
+            linked: true,
+        };
+        g.nodes.insert(ino, node);
+        g.index.insert((parent_ino, name.to_string()), ino);
+        g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
+        Ok(Self::attr_of(g.nodes.get(&ino).unwrap()))
+    }
+
+    /// Return the raw target bytes for a symbolic-link inode.
+    pub fn readlink(&self, ino: u64) -> Result<Vec<u8>, FsError> {
+        let g = self.inner.lock_recover();
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        match &node.symlink_target {
+            Some(target) if node.kind == FileKind::Symlink => Ok(target.clone()),
+            _ => Err(FsError::Invalid),
+        }
+    }
+
     /// Validate a new directory and return its trailing-slash marker path.
     pub fn new_directory_marker_path(
         &self,
@@ -1196,6 +1271,7 @@ impl ReadOnlyFs {
             children: Vec::new(),
             path,
             directory_marker: true,
+            symlink_target: None,
             linked: true,
         };
         g.nodes.insert(ino, node);
@@ -1266,7 +1342,7 @@ impl ReadOnlyFs {
             .get(&(parent_ino, name.to_string()))
             .ok_or(FsError::NotFound)?;
         let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
-        if node.kind != FileKind::File {
+        if node.kind == FileKind::Directory {
             return Err(FsError::IsDir);
         }
         let has_open_handles = g.handles.values().any(|handle| handle.ino == ino);
@@ -1297,7 +1373,7 @@ impl ReadOnlyFs {
             return Err(FsError::NotFound);
         }
         let node = g.nodes.get(&plan.ino).ok_or(FsError::NotFound)?;
-        if node.path != plan.source_path || node.kind != FileKind::File {
+        if node.path != plan.source_path || node.kind == FileKind::Directory {
             return Err(FsError::Invalid);
         }
         let has_open_handles = g.handles.values().any(|handle| handle.ino == plan.ino);
@@ -1560,6 +1636,52 @@ mod tests {
         assert_eq!(
             fs.mkdir(bucket.ino, INTERNAL_OBJECT_PREFIX),
             Err(FsError::Invalid)
+        );
+    }
+
+    #[test]
+    fn symlink_tracks_target_bytes_and_moves_as_a_nondirectory_object() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let target = b"a.bin".to_vec();
+        assert_eq!(
+            fs.new_symlink_path(parent.ino, "alias", &target).unwrap(),
+            "s3/bucket/data/alias"
+        );
+
+        let link = fs.symlink(parent.ino, "alias", target.clone()).unwrap();
+        assert_eq!(link.kind, FileKind::Symlink);
+        assert_eq!(link.size, target.len() as u64);
+        assert_eq!(link.perm, 0o777);
+        assert_eq!(fs.readlink(link.ino).unwrap(), target);
+        assert_eq!(
+            fs.symlink(parent.ino, "alias", b"other".to_vec()),
+            Err(FsError::Exists)
+        );
+
+        let plan = fs
+            .file_rename_plan(parent.ino, "alias", parent.ino, "moved")
+            .unwrap();
+        fs.commit_file_rename(&plan).unwrap();
+        assert_eq!(fs.lookup(parent.ino, "alias"), Err(FsError::NotFound));
+        assert_eq!(fs.lookup(parent.ino, "moved").unwrap().ino, link.ino);
+        assert_eq!(fs.readlink(link.ino).unwrap(), b"a.bin");
+
+        fs.unlink(parent.ino, "moved").unwrap();
+        assert_eq!(fs.getattr(link.ino), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn symlink_rejects_long_targets_and_names() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        assert_eq!(
+            fs.new_symlink_path(parent.ino, "alias", &vec![b'x'; 4096]),
+            Err(FsError::NameTooLong)
+        );
+        assert_eq!(
+            fs.new_symlink_path(parent.ino, &"x".repeat(256), b"target"),
+            Err(FsError::NameTooLong)
         );
     }
 
