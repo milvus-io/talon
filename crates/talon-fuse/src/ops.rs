@@ -130,6 +130,29 @@ pub struct FileRenamePlan {
     pub(crate) target: Option<(u64, u64)>,
 }
 
+/// One backend object moved as part of a directory-tree rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryRenameEntry {
+    pub(crate) source_path: String,
+    pub(crate) target_path: String,
+    pub(crate) size: u64,
+    pub(crate) marker: bool,
+}
+
+/// Immutable backend and namespace facts for a directory-tree rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DirectoryRenamePlan {
+    pub(crate) source_ino: u64,
+    pub(crate) source_parent: u64,
+    pub(crate) source_name: String,
+    pub(crate) source_path: String,
+    pub(crate) target_parent: u64,
+    pub(crate) target_name: String,
+    pub(crate) target_path: String,
+    pub(crate) target: Option<(u64, bool)>,
+    pub(crate) entries: Vec<DirectoryRenameEntry>,
+}
+
 #[derive(Debug, Clone)]
 struct Node {
     ino: u64,
@@ -886,6 +909,184 @@ impl ReadOnlyFs {
         Ok(())
     }
 
+    /// Validate and describe a directory-tree rename without mutating namespace.
+    pub fn directory_rename_plan(
+        &self,
+        source_parent: u64,
+        source_name: &str,
+        target_parent: u64,
+        target_name: &str,
+    ) -> Result<DirectoryRenamePlan, FsError> {
+        Self::validate_component(source_name)?;
+        Self::validate_component(target_name)?;
+        let g = self.inner.lock_recover();
+        let source_parent_node = g.nodes.get(&source_parent).ok_or(FsError::NotFound)?;
+        let target_parent_node = g.nodes.get(&target_parent).ok_or(FsError::NotFound)?;
+        if source_parent_node.kind != FileKind::Directory
+            || target_parent_node.kind != FileKind::Directory
+        {
+            return Err(FsError::NotDir);
+        }
+        let source_ino = *g
+            .index
+            .get(&(source_parent, source_name.to_string()))
+            .ok_or(FsError::NotFound)?;
+        let source = g.nodes.get(&source_ino).ok_or(FsError::NotFound)?;
+        if source.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        let target_path = Self::child_path(target_parent_node, target_name);
+        if source.path == target_path {
+            return Ok(DirectoryRenamePlan {
+                source_ino,
+                source_parent,
+                source_name: source_name.to_string(),
+                source_path: source.path.clone(),
+                target_parent,
+                target_name: target_name.to_string(),
+                target_path,
+                target: None,
+                entries: Vec::new(),
+            });
+        }
+        let mut ancestor = Some(target_parent);
+        while let Some(ino) = ancestor {
+            if ino == source_ino {
+                return Err(FsError::Invalid);
+            }
+            ancestor = g.nodes.get(&ino).and_then(|node| node.parent);
+        }
+        path_to_object(&target_path).map_err(|_| FsError::Invalid)?;
+        let target = match g.index.get(&(target_parent, target_name.to_string())) {
+            Some(&target_ino) => {
+                let node = g.nodes.get(&target_ino).ok_or(FsError::NotFound)?;
+                if node.kind != FileKind::Directory {
+                    return Err(FsError::NotDir);
+                }
+                if !node.children.is_empty() {
+                    return Err(FsError::NotEmpty);
+                }
+                Some((target_ino, node.directory_marker))
+            }
+            None => None,
+        };
+
+        let mut stack = vec![source_ino];
+        let mut entries = Vec::new();
+        while let Some(ino) = stack.pop() {
+            let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+            stack.extend(node.children.iter().copied());
+            let suffix = node
+                .path
+                .strip_prefix(&source.path)
+                .ok_or(FsError::Invalid)?;
+            let moved_path = format!("{target_path}{suffix}");
+            match node.kind {
+                FileKind::File => entries.push(DirectoryRenameEntry {
+                    source_path: node.path.clone(),
+                    target_path: moved_path,
+                    size: node.size,
+                    marker: false,
+                }),
+                FileKind::Directory if node.directory_marker => {
+                    entries.push(DirectoryRenameEntry {
+                        source_path: format!("{}/", node.path),
+                        target_path: format!("{moved_path}/"),
+                        size: 0,
+                        marker: true,
+                    });
+                }
+                FileKind::Directory => {}
+            }
+        }
+        entries.sort_by(|left, right| left.source_path.cmp(&right.source_path));
+        Ok(DirectoryRenamePlan {
+            source_ino,
+            source_parent,
+            source_name: source_name.to_string(),
+            source_path: source.path.clone(),
+            target_parent,
+            target_name: target_name.to_string(),
+            target_path,
+            target,
+            entries,
+        })
+    }
+
+    /// Commit a directory-tree rename after all backend moves succeed.
+    pub fn commit_directory_rename(&self, plan: &DirectoryRenamePlan) -> Result<(), FsError> {
+        if plan.source_path == plan.target_path {
+            return Ok(());
+        }
+        let mut g = self.inner.lock_recover();
+        if g.index
+            .get(&(plan.source_parent, plan.source_name.clone()))
+            .copied()
+            != Some(plan.source_ino)
+        {
+            return Err(FsError::NotFound);
+        }
+        if let Some((target_ino, _)) = plan.target {
+            if g.index
+                .get(&(plan.target_parent, plan.target_name.clone()))
+                .copied()
+                != Some(target_ino)
+            {
+                return Err(FsError::Exists);
+            }
+            let target = g.nodes.get(&target_ino).ok_or(FsError::NotFound)?;
+            if target.kind != FileKind::Directory || !target.children.is_empty() {
+                return Err(FsError::NotEmpty);
+            }
+            g.index
+                .remove(&(plan.target_parent, plan.target_name.clone()));
+            if let Some(parent) = g.nodes.get_mut(&plan.target_parent) {
+                parent.children.retain(|child| *child != target_ino);
+            }
+            g.nodes.remove(&target_ino);
+        } else if g
+            .index
+            .contains_key(&(plan.target_parent, plan.target_name.clone()))
+        {
+            return Err(FsError::Exists);
+        }
+
+        let mut stack = vec![plan.source_ino];
+        let mut subtree = Vec::new();
+        while let Some(ino) = stack.pop() {
+            let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+            stack.extend(node.children.iter().copied());
+            subtree.push(ino);
+        }
+        g.index
+            .remove(&(plan.source_parent, plan.source_name.clone()));
+        if let Some(parent) = g.nodes.get_mut(&plan.source_parent) {
+            parent.children.retain(|child| *child != plan.source_ino);
+        }
+        for ino in subtree {
+            let node = g.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+            let suffix = node
+                .path
+                .strip_prefix(&plan.source_path)
+                .ok_or(FsError::Invalid)?;
+            node.path = format!("{}{}", plan.target_path, suffix);
+            if ino == plan.source_ino {
+                node.parent = Some(plan.target_parent);
+                node.name.clone_from(&plan.target_name);
+            }
+        }
+        g.index.insert(
+            (plan.target_parent, plan.target_name.clone()),
+            plan.source_ino,
+        );
+        g.nodes
+            .get_mut(&plan.target_parent)
+            .ok_or(FsError::NotFound)?
+            .children
+            .push(plan.source_ino);
+        Ok(())
+    }
+
     /// Validate a new directory and return its trailing-slash marker path.
     pub fn new_directory_marker_path(
         &self,
@@ -1402,6 +1603,60 @@ mod tests {
                 "bucket"
             ),
             Err(FsError::IsDir)
+        );
+    }
+
+    #[test]
+    fn directory_rename_rewrites_subtree_paths_and_open_handles() {
+        let fs = fs();
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+        let source = fs.lookup(bucket.ino, "data").unwrap();
+        let file = fs.lookup(source.ino, "a.bin").unwrap();
+        let fh = fs
+            .open_with_options(
+                file.ino,
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                Some(b"abc".to_vec()),
+            )
+            .unwrap();
+
+        let plan = fs
+            .directory_rename_plan(bucket.ino, "data", bucket.ino, "moved")
+            .unwrap();
+        assert_eq!(plan.entries.len(), 2);
+        assert!(plan.entries.iter().any(|entry| {
+            entry.source_path == "s3/bucket/data/a.bin"
+                && entry.target_path == "s3/bucket/moved/a.bin"
+        }));
+        fs.commit_directory_rename(&plan).unwrap();
+
+        assert_eq!(fs.lookup(bucket.ino, "data"), Err(FsError::NotFound));
+        let moved = fs.lookup(bucket.ino, "moved").unwrap();
+        assert_eq!(moved.ino, source.ino);
+        assert_eq!(fs.lookup(moved.ino, "a.bin").unwrap().ino, file.ino);
+        assert_eq!(fs.dirty_path(fh).as_deref(), Some("s3/bucket/moved/a.bin"));
+    }
+
+    #[test]
+    fn directory_rename_rejects_cycles_and_nonempty_targets() {
+        let fs = fs();
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+        let source = fs.lookup(bucket.ino, "data").unwrap();
+        assert_eq!(
+            fs.directory_rename_plan(bucket.ino, "data", source.ino, "nested"),
+            Err(FsError::Invalid)
+        );
+
+        fs.insert_object("s3/bucket/target/file.bin", 1);
+        assert_eq!(
+            fs.directory_rename_plan(bucket.ino, "data", bucket.ino, "target"),
+            Err(FsError::NotEmpty)
         );
     }
 
