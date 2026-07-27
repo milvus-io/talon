@@ -61,6 +61,8 @@ pub(crate) fn errno(err: FsError) -> i32 {
         FsError::NotDir => libc::ENOTDIR,
         FsError::Exists => libc::EEXIST,
         FsError::Invalid => libc::EINVAL,
+        FsError::NotEmpty => libc::ENOTEMPTY,
+        FsError::NameTooLong => libc::ENAMETOOLONG,
     }
 }
 
@@ -275,6 +277,10 @@ impl TalonFuse {
     /// `close(2)`/`fsync(2)` (#232).
     fn writeback_object(&self, path: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
         let object = path_to_object(path)?;
+        self.writeback_object_id(object, bytes)
+    }
+
+    fn writeback_object_id(&self, object: ObjectId, bytes: Vec<u8>) -> anyhow::Result<()> {
         let reader = self.reader.clone();
         let pool = Arc::clone(&self.write_pool);
         let block_size = self.block_size;
@@ -293,6 +299,10 @@ impl TalonFuse {
     /// Delete the object at mount-relative `path` through its owning worker.
     fn delete_backend_object(&self, path: &str) -> anyhow::Result<()> {
         let object = path_to_object(path)?;
+        self.delete_backend_object_id(object)
+    }
+
+    fn delete_backend_object_id(&self, object: ObjectId) -> anyhow::Result<()> {
         let reader = self.reader.clone();
         let pool = Arc::clone(&self.write_pool);
         let block_size = self.block_size;
@@ -306,6 +316,15 @@ impl TalonFuse {
             client.delete_object(&object).await?;
             Ok::<(), anyhow::Error>(())
         })
+    }
+
+    fn directory_marker_object(marker_path: &str) -> anyhow::Result<ObjectId> {
+        let directory_path = marker_path
+            .strip_suffix('/')
+            .ok_or_else(|| anyhow::anyhow!("directory marker must end in '/'"))?;
+        let mut object = path_to_object(directory_path)?;
+        object.object_path.push('/');
+        Ok(object)
     }
 
     /// Read the complete committed object before a non-truncating write open.
@@ -472,11 +491,14 @@ impl fuser::Filesystem for TalonFuse {
             Ok(c) => c,
             Err(e) => return reply.error(errno(e)),
         };
-        // Prepend `.` and `..` so tools like `ls -a` behave; both point at `ino`
-        // (parent tracking is unnecessary for a read-only synthetic namespace).
+        let parent_ino = match self.fs.parent_ino(ino) {
+            Ok(parent) => parent,
+            Err(e) => return reply.error(errno(e)),
+        };
+        // Prepend `.` and `..` so tools like `ls -a` behave.
         let mut all: Vec<(u64, fuser::FileType, String)> = vec![
             (ino, fuser::FileType::Directory, ".".to_string()),
-            (ino, fuser::FileType::Directory, "..".to_string()),
+            (parent_ino, fuser::FileType::Directory, "..".to_string()),
         ];
         all.extend(children.into_iter().map(|e| {
             let kind = match e.kind {
@@ -626,6 +648,56 @@ impl fuser::Filesystem for TalonFuse {
         }
     }
 
+    /// Create a directory and persist it as a trailing-slash blob marker.
+    fn mkdir(
+        &mut self,
+        req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        _mode: u32,
+        _umask: u32,
+        reply: fuser::ReplyEntry,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let name = match name.to_str() {
+            Some(name) => name,
+            None => return reply.error(libc::EINVAL),
+        };
+        let marker_path = match self.fs.new_directory_marker_path(parent, name) {
+            Ok(path) => path,
+            Err(e) => return reply.error(errno(e)),
+        };
+        let marker = match Self::directory_marker_object(&marker_path) {
+            Ok(marker) => marker,
+            Err(error) => {
+                tracing::warn!(%marker_path, %error, "invalid directory marker path");
+                return reply.error(libc::EINVAL);
+            }
+        };
+        if let Err(error) = self.writeback_object_id(marker.clone(), Vec::new()) {
+            tracing::warn!(path = %marker.to_path(), %error, "mkdir marker writeback failed");
+            return reply.error(libc::EIO);
+        }
+        match self.fs.mkdir(parent, name) {
+            Ok(attr) => {
+                let file_attr = to_file_attr(attr, req.uid(), req.gid());
+                reply.entry(&ATTR_TTL, &file_attr, 0);
+            }
+            Err(e) => {
+                if let Err(error) = self.delete_backend_object_id(marker.clone()) {
+                    tracing::warn!(
+                        path = %marker.to_path(),
+                        %error,
+                        "failed to roll back mkdir marker"
+                    );
+                }
+                reply.error(errno(e));
+            }
+        }
+    }
+
     /// Write `data` at `offset` into an open write handle's dirty buffer.
     #[allow(clippy::too_many_arguments)]
     fn write(
@@ -764,6 +836,44 @@ impl fuser::Filesystem for TalonFuse {
         }
         match self.fs.unlink(parent, name) {
             Ok(_) => reply.ok(),
+            Err(e) => reply.error(errno(e)),
+        }
+    }
+
+    /// Remove an empty directory and its trailing-slash blob marker.
+    fn rmdir(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        parent: u64,
+        name: &std::ffi::OsStr,
+        reply: fuser::ReplyEmpty,
+    ) {
+        if !self.read_write {
+            return reply.error(libc::EROFS);
+        }
+        let name = match name.to_str() {
+            Some(name) => name,
+            None => return reply.error(libc::EINVAL),
+        };
+        let marker_path = match self.fs.rmdir_marker_path(parent, name) {
+            Ok(path) => path,
+            Err(e) => return reply.error(errno(e)),
+        };
+        if let Some(marker_path) = marker_path {
+            let marker = match Self::directory_marker_object(&marker_path) {
+                Ok(marker) => marker,
+                Err(error) => {
+                    tracing::warn!(%marker_path, %error, "invalid directory marker path");
+                    return reply.error(libc::EINVAL);
+                }
+            };
+            if let Err(error) = self.delete_backend_object_id(marker.clone()) {
+                tracing::warn!(path = %marker.to_path(), %error, "rmdir marker delete failed");
+                return reply.error(libc::EIO);
+            }
+        }
+        match self.fs.rmdir(parent, name) {
+            Ok(()) => reply.ok(),
             Err(e) => reply.error(errno(e)),
         }
     }
@@ -923,6 +1033,8 @@ mod tests {
         assert_eq!(errno(FsError::NotDir), libc::ENOTDIR);
         assert_eq!(errno(FsError::Exists), libc::EEXIST);
         assert_eq!(errno(FsError::Invalid), libc::EINVAL);
+        assert_eq!(errno(FsError::NotEmpty), libc::ENOTEMPTY);
+        assert_eq!(errno(FsError::NameTooLong), libc::ENAMETOOLONG);
     }
 
     #[test]
