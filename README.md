@@ -66,6 +66,9 @@ Start with the section that matches what you're doing:
 - **Deciding if Talon fits** — [Use cases](docs/use-cases/overview.md): model
   training, checkpointing, notebooks and data sharing, cross-cloud reads, and
   analytics — including where it does *not* help.
+- **Reading from Talon in code** — [Client SDKs](docs/clients/overview.md):
+  a [Python](docs/clients/python.md) wheel and a native-free
+  [Java](docs/clients/java.md) jar, for when a FUSE mount is not the right fit.
 - **Using Talon** — the [Getting started tutorial](docs/tutorials/getting-started.md)
   builds the workspace, runs a cluster, and opens the management console;
   [DESIGN.md](DESIGN.md) explains what each component does, and

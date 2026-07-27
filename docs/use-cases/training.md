@@ -36,7 +36,9 @@ and prefetches subsequent blocks, so a scan is not serialised on per-block
 misses.
 
 **Requires no application change.** Training code opens files under the FUSE
-mount; the framework's existing data loader works unmodified.
+mount; the framework's existing data loader works unmodified. A loader that
+would rather speak in objects and byte ranges can use the
+[Python client](../clients/python.md) instead of a mount.
 
 **Runs on the training node without competing for it.** A worker can sit on the
 same host as the job: one CPU and ~7 MB of RSS serves ~49k range reads per

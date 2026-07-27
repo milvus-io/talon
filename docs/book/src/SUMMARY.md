@@ -29,6 +29,12 @@
 - [Security hardening](./operations/security.md)
 - [Latency lab](./testing/latency-lab.md)
 
+# Client SDKs
+
+- [Overview](./clients/overview.md)
+- [Python client](./clients/python.md)
+- [Java client](./clients/java.md)
+
 # Reference
 
 - [Configuration reference](./reference/configuration.md)
