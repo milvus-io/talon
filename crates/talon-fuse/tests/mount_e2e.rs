@@ -540,7 +540,7 @@ async fn mount_kernel_io_benchmark() {
         store
             .lock()
             .unwrap()
-            .get("s3/bucket/bench-write.bin")
+            .get("/s3/bucket/bench-write.bin")
             .map(Vec::len),
         Some(write_size as usize),
         "benchmark write must reach the mock backend"
