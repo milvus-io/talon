@@ -116,6 +116,20 @@ pub struct DirEntry {
     pub name: String,
 }
 
+/// Immutable backend and namespace facts for a regular-file rename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRenamePlan {
+    pub(crate) source_ino: u64,
+    pub(crate) source_parent: u64,
+    pub(crate) source_name: String,
+    pub(crate) source_path: String,
+    pub(crate) source_size: u64,
+    pub(crate) target_parent: u64,
+    pub(crate) target_name: String,
+    pub(crate) target_path: String,
+    pub(crate) target: Option<(u64, u64)>,
+}
+
 #[derive(Debug, Clone)]
 struct Node {
     ino: u64,
@@ -765,6 +779,113 @@ impl ReadOnlyFs {
         Some(node.path.clone())
     }
 
+    /// Validate and describe a regular-file rename without mutating namespace.
+    pub fn file_rename_plan(
+        &self,
+        source_parent: u64,
+        source_name: &str,
+        target_parent: u64,
+        target_name: &str,
+    ) -> Result<FileRenamePlan, FsError> {
+        Self::validate_component(source_name)?;
+        Self::validate_component(target_name)?;
+        let g = self.inner.lock_recover();
+        let source_parent_node = g.nodes.get(&source_parent).ok_or(FsError::NotFound)?;
+        let target_parent_node = g.nodes.get(&target_parent).ok_or(FsError::NotFound)?;
+        if source_parent_node.kind != FileKind::Directory
+            || target_parent_node.kind != FileKind::Directory
+        {
+            return Err(FsError::NotDir);
+        }
+        let source_ino = *g
+            .index
+            .get(&(source_parent, source_name.to_string()))
+            .ok_or(FsError::NotFound)?;
+        let source = g.nodes.get(&source_ino).ok_or(FsError::NotFound)?;
+        if source.kind != FileKind::File {
+            return Err(FsError::IsDir);
+        }
+        let target_path = Self::child_path(target_parent_node, target_name);
+        path_to_object(&target_path).map_err(|_| FsError::Invalid)?;
+        let target = match g.index.get(&(target_parent, target_name.to_string())) {
+            Some(&target_ino) if target_ino == source_ino => None,
+            Some(&target_ino) => {
+                let node = g.nodes.get(&target_ino).ok_or(FsError::NotFound)?;
+                if node.kind != FileKind::File {
+                    return Err(FsError::IsDir);
+                }
+                Some((target_ino, node.size))
+            }
+            None => None,
+        };
+        Ok(FileRenamePlan {
+            source_ino,
+            source_parent,
+            source_name: source_name.to_string(),
+            source_path: source.path.clone(),
+            source_size: source.size,
+            target_parent,
+            target_name: target_name.to_string(),
+            target_path,
+            target,
+        })
+    }
+
+    /// Commit a regular-file rename after backend copy/delete succeeds.
+    pub fn commit_file_rename(&self, plan: &FileRenamePlan) -> Result<(), FsError> {
+        if plan.source_path == plan.target_path {
+            return Ok(());
+        }
+        let mut g = self.inner.lock_recover();
+        let current_source = g
+            .index
+            .get(&(plan.source_parent, plan.source_name.clone()))
+            .copied();
+        if current_source != Some(plan.source_ino) {
+            return Err(FsError::NotFound);
+        }
+        if let Some((target_ino, _)) = plan.target {
+            let current_target = g
+                .index
+                .get(&(plan.target_parent, plan.target_name.clone()))
+                .copied();
+            if current_target != Some(target_ino) {
+                return Err(FsError::Exists);
+            }
+            g.index
+                .remove(&(plan.target_parent, plan.target_name.clone()));
+            if let Some(parent) = g.nodes.get_mut(&plan.target_parent) {
+                parent.children.retain(|child| *child != target_ino);
+            }
+            g.nodes.remove(&target_ino);
+        } else if g
+            .index
+            .contains_key(&(plan.target_parent, plan.target_name.clone()))
+        {
+            return Err(FsError::Exists);
+        }
+
+        g.index
+            .remove(&(plan.source_parent, plan.source_name.clone()));
+        if let Some(parent) = g.nodes.get_mut(&plan.source_parent) {
+            parent.children.retain(|child| *child != plan.source_ino);
+        }
+        let source = g.nodes.get_mut(&plan.source_ino).ok_or(FsError::NotFound)?;
+        source.parent = Some(plan.target_parent);
+        source.name.clone_from(&plan.target_name);
+        source.path.clone_from(&plan.target_path);
+        g.index.insert(
+            (plan.target_parent, plan.target_name.clone()),
+            plan.source_ino,
+        );
+        g.nodes
+            .get_mut(&plan.target_parent)
+            .ok_or(FsError::NotFound)?
+            .children
+            .push(plan.source_ino);
+        Ok(())
+    }
+
     /// Validate a new directory and return its trailing-slash marker path.
     pub fn new_directory_marker_path(
         &self,
@@ -1219,6 +1340,68 @@ mod tests {
         assert_eq!(
             fs.dirty_bytes(write_fh).unwrap(),
             vec![b'a', b'b', b'c', 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn file_rename_preserves_inode_and_updates_open_handles() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let source = fs.lookup(parent.ino, "a.bin").unwrap();
+        let fh = fs
+            .open_with_options(
+                source.ino,
+                OpenOptions {
+                    read: true,
+                    write: true,
+                    append: false,
+                },
+                Some(b"contents".to_vec()),
+            )
+            .unwrap();
+
+        let plan = fs
+            .file_rename_plan(parent.ino, "a.bin", parent.ino, "renamed.bin")
+            .unwrap();
+        assert_eq!(plan.source_path, "s3/bucket/data/a.bin");
+        assert_eq!(plan.target_path, "s3/bucket/data/renamed.bin");
+        assert_eq!(fs.lookup(parent.ino, "a.bin").unwrap().ino, source.ino);
+
+        fs.commit_file_rename(&plan).unwrap();
+        assert_eq!(fs.lookup(parent.ino, "a.bin"), Err(FsError::NotFound));
+        assert_eq!(
+            fs.lookup(parent.ino, "renamed.bin").unwrap().ino,
+            source.ino
+        );
+        assert_eq!(
+            fs.dirty_path(fh).as_deref(),
+            Some("s3/bucket/data/renamed.bin")
+        );
+    }
+
+    #[test]
+    fn file_rename_replaces_a_regular_file_and_rejects_directories() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let source = fs.lookup(parent.ino, "a.bin").unwrap();
+        let replaced = fs.lookup(parent.ino, "b.bin").unwrap();
+
+        let plan = fs
+            .file_rename_plan(parent.ino, "a.bin", parent.ino, "b.bin")
+            .unwrap();
+        assert_eq!(plan.target, Some((replaced.ino, 500)));
+        fs.commit_file_rename(&plan).unwrap();
+        assert_eq!(fs.lookup(parent.ino, "b.bin").unwrap().ino, source.ino);
+        assert_eq!(fs.getattr(replaced.ino), Err(FsError::NotFound));
+
+        assert_eq!(
+            fs.file_rename_plan(
+                fs.lookup(ROOT_INO, "s3").unwrap().ino,
+                "bucket",
+                parent.ino,
+                "bucket"
+            ),
+            Err(FsError::IsDir)
         );
     }
 
