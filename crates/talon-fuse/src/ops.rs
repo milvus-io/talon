@@ -13,6 +13,7 @@
 //! buffer (object stores replace whole objects, not byte ranges); the assembled
 //! object is written through to the backend at flush.
 
+use crate::lock::MutexExt;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -148,7 +149,7 @@ impl ReadOnlyFs {
     /// creating intermediate directories. Returns the file's inode.
     pub fn insert_object(&self, path: &str, size: u64) -> u64 {
         let comps: Vec<&str> = path.split('/').filter(|c| !c.is_empty()).collect();
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let mut parent = ROOT_INO;
         for (i, comp) in comps.iter().enumerate() {
             let is_leaf = i == comps.len() - 1;
@@ -217,7 +218,7 @@ impl ReadOnlyFs {
 
     /// `lookup`: resolve a child `name` under directory `parent_ino`.
     pub fn lookup(&self, parent_ino: u64, name: &str) -> Result<Attr, FsError> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         let ino = *g
             .index
             .get(&(parent_ino, name.to_string()))
@@ -227,13 +228,13 @@ impl ReadOnlyFs {
 
     /// `getattr`: attributes for an inode.
     pub fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         Ok(Self::attr_of(g.nodes.get(&ino).ok_or(FsError::NotFound)?))
     }
 
     /// `readdir`: list children of a directory inode (excluding `.`/`..`).
     pub fn readdir(&self, ino: u64) -> Result<Vec<DirEntry>, FsError> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
         if node.kind != FileKind::Directory {
             return Err(FsError::NotFound);
@@ -254,7 +255,7 @@ impl ReadOnlyFs {
 
     /// `open`: obtain a read handle for a file inode. Directories are rejected.
     pub fn open(&self, ino: u64) -> Result<u64, FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let kind = g.nodes.get(&ino).ok_or(FsError::NotFound)?.kind;
         if kind != FileKind::File {
             return Err(FsError::Unsupported);
@@ -269,7 +270,7 @@ impl ReadOnlyFs {
     /// write buffer. The caller is expected to have already flushed a dirty write
     /// handle's contents (writeback happens on flush, #232).
     pub fn release(&self, fh: u64) -> Result<(), FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let had_dirty = g.dirty.remove(&fh).is_some();
         let had_handle = g.handles.remove(&fh).is_some();
         if had_handle || had_dirty {
@@ -286,7 +287,7 @@ impl ReadOnlyFs {
     /// Errors with [`FsError::BadHandle`] for an unknown handle or
     /// [`FsError::Unsupported`] if the handle somehow references a directory.
     pub fn file_meta(&self, fh: u64) -> Result<(String, u64), FsError> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         let ino = *g.handles.get(&fh).ok_or(FsError::BadHandle)?;
         let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
         if node.kind != FileKind::File {
@@ -307,7 +308,7 @@ impl ReadOnlyFs {
     /// whole-object creation; opening an existing file for write is
     /// [`open_write`](Self::open_write)).
     pub fn create(&self, parent_ino: u64, name: &str) -> Result<(Attr, u64), FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
         if parent.kind != FileKind::Directory {
             return Err(FsError::NotFound);
@@ -354,7 +355,7 @@ impl ReadOnlyFs {
     /// In-place edit of existing contents (`O_RDWR` without truncate) would need
     /// to first fetch the current object into the buffer; that is future work.
     pub fn open_write(&self, ino: u64) -> Result<u64, FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let kind = g.nodes.get(&ino).ok_or(FsError::NotFound)?.kind;
         if kind != FileKind::File {
             return Err(FsError::Unsupported);
@@ -383,7 +384,7 @@ impl ReadOnlyFs {
     /// Returns the number of bytes written. Fails with [`FsError::BadHandle`] for
     /// a handle not opened for write.
     pub fn write(&self, fh: u64, offset: u64, data: &[u8]) -> Result<u32, FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
         let start = offset as usize;
         let end = start + data.len();
@@ -401,7 +402,7 @@ impl ReadOnlyFs {
 
     /// `setattr(size)`: truncate/extend the write handle's buffer to `size`.
     pub fn truncate(&self, fh: u64, size: u64) -> Result<(), FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let dirty = g.dirty.get_mut(&fh).ok_or(FsError::BadHandle)?;
         dirty.buf.resize(size as usize, 0);
         let ino = dirty.ino;
@@ -415,13 +416,13 @@ impl ReadOnlyFs {
     /// flush/release), leaving the handle's buffer in place so a later flush is a
     /// no-op unless more is written. Returns `None` for a non-write handle.
     pub fn dirty_bytes(&self, fh: u64) -> Option<Vec<u8>> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         g.dirty.get(&fh).map(|d| d.buf.clone())
     }
 
     /// The mount-relative object path a write handle targets.
     pub fn dirty_path(&self, fh: u64) -> Option<String> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         let ino = g.dirty.get(&fh)?.ino;
         g.nodes.get(&ino).map(|n| n.path.clone())
     }
@@ -429,7 +430,7 @@ impl ReadOnlyFs {
     /// The mount-relative object path of file `name` under `parent_ino`, without
     /// removing it. `None` if the name doesn't resolve to a file.
     pub fn file_path(&self, parent_ino: u64, name: &str) -> Option<String> {
-        let g = self.inner.lock().unwrap();
+        let g = self.inner.lock_recover();
         let ino = *g.index.get(&(parent_ino, name.to_string()))?;
         let node = g.nodes.get(&ino)?;
         if node.kind != FileKind::File {
@@ -442,7 +443,7 @@ impl ReadOnlyFs {
     /// namespace. Returns the removed file's mount-relative path so the caller
     /// can delete the backend object. Directories are not removed here.
     pub fn unlink(&self, parent_ino: u64, name: &str) -> Result<String, FsError> {
-        let mut g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock_recover();
         let ino = *g
             .index
             .get(&(parent_ino, name.to_string()))
@@ -699,5 +700,49 @@ mod tests {
             .unwrap();
         let dir = fs.lookup(bucket.ino, "data").unwrap();
         assert_eq!(fs.create(dir.ino, "a.bin"), Err(FsError::ReadOnly));
+    }
+
+    /// The namespace lives behind a single Mutex, so with `lock().unwrap()` one
+    /// panic while holding it poisoned the lock and made *every* subsequent
+    /// FUSE op panic — the mount hung rather than erroring, and could not be
+    /// unmounted cleanly. Poison recovery degrades that to a normal error.
+    #[test]
+    fn namespace_survives_a_panic_under_its_lock() {
+        use std::sync::Arc;
+
+        let fs = Arc::new(fs());
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+
+        // Panic while the namespace lock is actually held, exactly as a bug on
+        // the FUSE thread mid-operation would (e.g. an arithmetic overflow in
+        // an op that has already taken the guard).
+        let fs2 = Arc::clone(&fs);
+        let panicked = std::thread::spawn(move || {
+            let mut g = fs2.inner.lock_recover();
+            // A mutation lands before the panic, so we can also check the data
+            // is still there afterwards rather than silently reset.
+            g.next_fh += 100;
+            panic!("bug on the FUSE thread while holding the namespace lock");
+        })
+        .join();
+        assert!(panicked.is_err(), "the thread must actually have panicked");
+        assert!(
+            fs.inner.is_poisoned(),
+            "the namespace mutex must actually be poisoned"
+        );
+
+        // Every read op still works, and the pre-panic mutation is visible.
+        assert_eq!(fs.lookup(ROOT_INO, "s3").unwrap().ino, s3.ino);
+        let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+        let dir = fs.lookup(bucket.ino, "data").unwrap();
+        assert!(fs.lookup(dir.ino, "a.bin").is_ok());
+        assert!(fs.getattr(ROOT_INO).is_ok());
+        assert!(fs.readdir(dir.ino).is_ok());
+
+        // And write ops: a fresh handle still opens, writes and releases.
+        let (_, fh) = fs.create(dir.ino, "after-panic.bin").unwrap();
+        assert_eq!(fs.write(fh, 0, b"ok").unwrap(), 2);
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"ok");
+        fs.release(fh).unwrap();
     }
 }

@@ -16,6 +16,7 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::lock::RwLockExt;
 use talon_core::BlockId;
 
 /// Why a cached placement entry was (or should be) invalidated.
@@ -66,7 +67,7 @@ impl PlacementCache {
 
     /// Insert/replace a fresh placement for `block` observed at `now_ms`.
     pub fn insert(&self, block: BlockId, cached: Cached, now_ms: u64) {
-        self.entries.write().unwrap().insert(
+        self.entries.write_recover().insert(
             block,
             Entry {
                 cached,
@@ -81,7 +82,7 @@ impl PlacementCache {
     pub fn get(&self, block: &BlockId, now_ms: u64) -> Option<Cached> {
         // Fast path: shared lock.
         {
-            let g = self.entries.read().unwrap();
+            let g = self.entries.read_recover();
             if let Some(e) = g.get(block) {
                 if now_ms.saturating_sub(e.inserted_ms) <= self.ttl_ms {
                     return Some(e.cached.clone());
@@ -91,7 +92,7 @@ impl PlacementCache {
             }
         }
         // Slow path: expired -> drop under a write lock.
-        self.entries.write().unwrap().remove(block);
+        self.entries.write_recover().remove(block);
         None
     }
 
@@ -99,7 +100,7 @@ impl PlacementCache {
     ///
     /// Returns `true` if an entry was present and removed.
     pub fn invalidate(&self, block: &BlockId, _reason: RefreshReason) -> bool {
-        self.entries.write().unwrap().remove(block).is_some()
+        self.entries.write_recover().remove(block).is_some()
     }
 
     /// Reconcile against an observed placement version: if the cached entry's
@@ -116,7 +117,7 @@ impl PlacementCache {
     ///
     /// Returns `true` if the entry was invalidated by the version check.
     pub fn observe_epoch(&self, block: &BlockId, observed_epoch: u64) -> bool {
-        let mut g = self.entries.write().unwrap();
+        let mut g = self.entries.write_recover();
         if let Some(e) = g.get(block) {
             if e.cached.epoch != observed_epoch {
                 g.remove(block);
@@ -128,12 +129,12 @@ impl PlacementCache {
 
     /// Number of entries currently held (including not-yet-collected expired).
     pub fn len(&self) -> usize {
-        self.entries.read().unwrap().len()
+        self.entries.read_recover().len()
     }
 
     /// Whether the cache is empty.
     pub fn is_empty(&self) -> bool {
-        self.entries.read().unwrap().is_empty()
+        self.entries.read_recover().is_empty()
     }
 }
 
