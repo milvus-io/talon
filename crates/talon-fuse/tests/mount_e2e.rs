@@ -810,6 +810,132 @@ async fn mount_regular_file_rename_is_written_through() {
     result.expect("exercise regular-file rename through mount");
 }
 
+/// Rename directory trees through a rollback-capable multi-object transaction.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_directory_tree_rename_is_written_through() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([
+        ("/s3/bucket/tree/".to_string(), Vec::new()),
+        ("/s3/bucket/tree/file.bin".to_string(), b"root".to_vec()),
+        ("/s3/bucket/tree/nested/".to_string(), Vec::new()),
+        (
+            "/s3/bucket/tree/nested/child.bin".to_string(),
+            b"child".to_vec(),
+        ),
+        ("/s3/bucket/target/".to_string(), Vec::new()),
+        (
+            "/s3/bucket/occupied/file.bin".to_string(),
+            b"occupied".to_vec(),
+        ),
+    ])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.populate_from_listing([
+        ("s3/bucket/tree/", 0),
+        ("s3/bucket/tree/file.bin", 4),
+        ("s3/bucket/tree/nested/", 0),
+        ("s3/bucket/tree/nested/child.bin", 5),
+        ("s3/bucket/target/", 0),
+        ("s3/bucket/occupied/file.bin", 8),
+    ]);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-dir-rename-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bucket = mountpoint.join("s3").join("bucket");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        let source = bucket.join("tree");
+        let target = bucket.join("target");
+        let occupied = bucket.join("occupied");
+        let mut open_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(source.join("file.bin"))?;
+
+        std::fs::rename(&source, &target)?;
+        assert!(!source.exists());
+        assert_eq!(std::fs::read(target.join("file.bin"))?, b"root");
+        assert_eq!(
+            std::fs::read(target.join("nested").join("child.bin"))?,
+            b"child"
+        );
+        {
+            let committed = operation_store.lock().unwrap();
+            assert!(!committed
+                .keys()
+                .any(|path| path.starts_with("/s3/bucket/tree/")));
+            assert_eq!(
+                committed.get("/s3/bucket/target/file.bin"),
+                Some(&b"root".to_vec())
+            );
+            assert_eq!(
+                committed.get("/s3/bucket/target/nested/child.bin"),
+                Some(&b"child".to_vec())
+            );
+            assert!(committed.contains_key("/s3/bucket/target/"));
+            assert!(committed.contains_key("/s3/bucket/target/nested/"));
+        }
+
+        open_file.seek(SeekFrom::Start(0))?;
+        open_file.write_all(b"MOVE")?;
+        open_file.sync_all()?;
+        assert_eq!(
+            operation_store
+                .lock()
+                .unwrap()
+                .get("/s3/bucket/target/file.bin"),
+            Some(&b"MOVE".to_vec())
+        );
+
+        let cycle = std::fs::rename(&target, target.join("nested").join("loop")).unwrap_err();
+        assert_eq!(cycle.raw_os_error(), Some(libc::EINVAL));
+        let nonempty = std::fs::rename(&target, &occupied).unwrap_err();
+        assert_eq!(nonempty.raw_os_error(), Some(libc::ENOTEMPTY));
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise directory-tree rename through mount");
+}
+
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
 ///
 /// This is separately gated because the normal real-kernel smoke job runs all

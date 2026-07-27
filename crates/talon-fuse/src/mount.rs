@@ -22,7 +22,10 @@ use std::time::Duration;
 use crate::block_reader::{BlockReader, FileView};
 use crate::lock::MutexExt;
 use crate::mapping::path_to_object;
-use crate::ops::{Attr, FileKind, FsError, OpenOptions, ReadOnlyFs, ReadSource};
+use crate::ops::{
+    Attr, DirectoryRenameEntry, DirectoryRenamePlan, FileKind, FsError, OpenOptions, ReadOnlyFs,
+    ReadSource,
+};
 use crate::prefetch::Prefetcher;
 use crate::readahead::ReadaheadConfig;
 use talon_core::ObjectId;
@@ -325,6 +328,123 @@ impl TalonFuse {
         let mut object = path_to_object(directory_path)?;
         object.object_path.push('/');
         Ok(object)
+    }
+
+    fn write_backend_path(&self, path: &str, marker: bool, bytes: Vec<u8>) -> anyhow::Result<()> {
+        if marker {
+            self.writeback_object_id(Self::directory_marker_object(path)?, bytes)
+        } else {
+            self.writeback_object(path, bytes)
+        }
+    }
+
+    fn delete_backend_path(&self, path: &str, marker: bool) -> anyhow::Result<()> {
+        if marker {
+            self.delete_backend_object_id(Self::directory_marker_object(path)?)
+        } else {
+            self.delete_backend_object(path)
+        }
+    }
+
+    fn read_directory_rename_entry(&self, entry: &DirectoryRenameEntry) -> Result<Vec<u8>, i32> {
+        if entry.marker {
+            Ok(Vec::new())
+        } else {
+            self.read_committed_object(&entry.source_path, entry.size)
+        }
+    }
+
+    fn rollback_directory_rename(
+        &self,
+        plan: &DirectoryRenamePlan,
+        source_objects: &[(DirectoryRenameEntry, Vec<u8>)],
+    ) {
+        for (entry, bytes) in source_objects {
+            if let Err(error) =
+                self.write_backend_path(&entry.source_path, entry.marker, bytes.clone())
+            {
+                tracing::error!(
+                    path = %entry.source_path,
+                    %error,
+                    "directory rename source rollback failed"
+                );
+            }
+        }
+        for (entry, _) in source_objects.iter().rev() {
+            if let Err(error) = self.delete_backend_path(&entry.target_path, entry.marker) {
+                tracing::error!(
+                    path = %entry.target_path,
+                    %error,
+                    "directory rename target rollback failed"
+                );
+            }
+        }
+        if matches!(plan.target, Some((_, true))) {
+            let marker_path = format!("{}/", plan.target_path);
+            if let Err(error) = self.write_backend_path(&marker_path, true, Vec::new()) {
+                tracing::error!(
+                    path = %marker_path,
+                    %error,
+                    "directory rename replaced-marker rollback failed"
+                );
+            }
+        }
+    }
+
+    fn rename_directory_backend(&self, plan: &DirectoryRenamePlan) -> Result<(), i32> {
+        if plan.source_path == plan.target_path {
+            return Ok(());
+        }
+        let mut source_objects = Vec::with_capacity(plan.entries.len());
+        for entry in &plan.entries {
+            source_objects.push((entry.clone(), self.read_directory_rename_entry(entry)?));
+        }
+        for (entry, bytes) in &source_objects {
+            if let Err(error) =
+                self.write_backend_path(&entry.target_path, entry.marker, bytes.clone())
+            {
+                tracing::warn!(
+                    source = %entry.source_path,
+                    target = %entry.target_path,
+                    %error,
+                    "directory rename target writeback failed"
+                );
+                self.rollback_directory_rename(plan, &source_objects);
+                return Err(libc::EIO);
+            }
+        }
+        let target_root_marker = format!("{}/", plan.target_path);
+        let source_replaces_target_marker = plan
+            .entries
+            .iter()
+            .any(|entry| entry.marker && entry.target_path == target_root_marker);
+        if matches!(plan.target, Some((_, true))) && !source_replaces_target_marker {
+            if let Err(error) = self.delete_backend_path(&target_root_marker, true) {
+                tracing::warn!(
+                    path = %target_root_marker,
+                    %error,
+                    "directory rename replaced-marker delete failed"
+                );
+                self.rollback_directory_rename(plan, &source_objects);
+                return Err(libc::EIO);
+            }
+        }
+        for (entry, _) in source_objects.iter().rev() {
+            if let Err(error) = self.delete_backend_path(&entry.source_path, entry.marker) {
+                tracing::warn!(
+                    path = %entry.source_path,
+                    %error,
+                    "directory rename source delete failed"
+                );
+                self.rollback_directory_rename(plan, &source_objects);
+                return Err(libc::EIO);
+            }
+        }
+        if let Err(error) = self.fs.commit_directory_rename(plan) {
+            self.rollback_directory_rename(plan, &source_objects);
+            return Err(errno(error));
+        }
+        Ok(())
     }
 
     /// Read the complete committed object before a non-truncating write open.
@@ -861,6 +981,23 @@ impl fuser::Filesystem for TalonFuse {
             (Some(name), Some(newname)) => (name, newname),
             _ => return reply.error(libc::EINVAL),
         };
+        let source = match self.fs.lookup(parent, name) {
+            Ok(source) => source,
+            Err(error) => return reply.error(errno(error)),
+        };
+        if source.kind == FileKind::Directory {
+            let plan = match self
+                .fs
+                .directory_rename_plan(parent, name, newparent, newname)
+            {
+                Ok(plan) => plan,
+                Err(error) => return reply.error(errno(error)),
+            };
+            return match self.rename_directory_backend(&plan) {
+                Ok(()) => reply.ok(),
+                Err(error) => reply.error(error),
+            };
+        }
         let plan = match self.fs.file_rename_plan(parent, name, newparent, newname) {
             Ok(plan) => plan,
             Err(error) => return reply.error(errno(error)),
