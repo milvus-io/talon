@@ -101,24 +101,22 @@ fn now_ms() -> u64 {
 
 /// Convert a synthesized [`Attr`] into a `fuser::FileAttr`.
 ///
-/// Times are fixed to the UNIX epoch (the namespace is synthetic and read-only,
-/// so there is no meaningful mtime); ownership is left to the mounting user via
-/// `uid`/`gid`. `blocks` is a 512-byte-unit count as POSIX expects.
+/// Ownership is left to the mounting user via `uid`/`gid`. `blocks` is a
+/// 512-byte-unit count as POSIX expects.
 pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
     let kind = match attr.kind {
         FileKind::Directory => fuser::FileType::Directory,
         FileKind::File => fuser::FileType::RegularFile,
         FileKind::Symlink => fuser::FileType::Symlink,
     };
-    let epoch = std::time::UNIX_EPOCH;
     fuser::FileAttr {
         ino: attr.ino,
         size: attr.size,
         blocks: attr.size.div_ceil(512),
-        atime: epoch,
-        mtime: epoch,
-        ctime: epoch,
-        crtime: epoch,
+        atime: attr.atime,
+        mtime: attr.mtime,
+        ctime: attr.ctime,
+        crtime: attr.ctime,
         kind,
         perm: attr.perm,
         nlink: attr.nlink,
@@ -981,8 +979,8 @@ impl fuser::Filesystem for TalonFuse {
         _uid: Option<u32>,
         _gid: Option<u32>,
         size: Option<u64>,
-        _atime: Option<fuser::TimeOrNow>,
-        _mtime: Option<fuser::TimeOrNow>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<std::time::SystemTime>,
         fh: Option<u64>,
         _crtime: Option<std::time::SystemTime>,
@@ -1042,8 +1040,15 @@ impl fuser::Filesystem for TalonFuse {
                 Err(e) => reply.error(errno(e)),
             };
         }
-        // Reply with the current attributes.
-        match self.fs.getattr(ino) {
+        let now = std::time::SystemTime::now();
+        let resolve_time = |time: fuser::TimeOrNow| match time {
+            fuser::TimeOrNow::SpecificTime(time) => time,
+            fuser::TimeOrNow::Now => now,
+        };
+        match self
+            .fs
+            .set_times(ino, atime.map(resolve_time), mtime.map(resolve_time))
+        {
             Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid())),
             Err(e) => reply.error(errno(e)),
         }
@@ -1543,18 +1548,25 @@ mod tests {
 
     #[test]
     fn to_file_attr_maps_kind_size_and_perm() {
+        let timestamp = std::time::UNIX_EPOCH + Duration::from_secs(123);
         let dir = Attr {
             ino: 1,
             kind: FileKind::Directory,
             size: 0,
             perm: 0o555,
             nlink: 1,
+            atime: timestamp,
+            mtime: timestamp,
+            ctime: timestamp,
         };
         let fa = to_file_attr(dir, 1000, 1000);
         assert_eq!(fa.kind, fuser::FileType::Directory);
         assert_eq!(fa.perm, 0o555);
         assert_eq!(fa.uid, 1000);
         assert_eq!(fa.nlink, 1);
+        assert_eq!(fa.atime, timestamp);
+        assert_eq!(fa.mtime, timestamp);
+        assert_eq!(fa.ctime, timestamp);
 
         let file = Attr {
             ino: 7,
@@ -1562,6 +1574,9 @@ mod tests {
             size: 1000, // 1000 bytes → ceil(1000/512) = 2 blocks
             perm: 0o444,
             nlink: 0,
+            atime: timestamp,
+            mtime: timestamp,
+            ctime: timestamp,
         };
         let fa = to_file_attr(file, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::RegularFile);
@@ -1576,6 +1591,9 @@ mod tests {
             size: 6,
             perm: 0o777,
             nlink: 1,
+            atime: timestamp,
+            mtime: timestamp,
+            ctime: timestamp,
         };
         let fa = to_file_attr(symlink, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::Symlink);

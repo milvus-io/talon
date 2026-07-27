@@ -47,6 +47,12 @@ pub struct Attr {
     pub perm: u16,
     /// Number of namespace links. An open file retained after unlink has zero.
     pub nlink: u32,
+    /// Last access time.
+    pub atime: SystemTime,
+    /// Last content modification time.
+    pub mtime: SystemTime,
+    /// Last inode metadata change time.
+    pub ctime: SystemTime,
 }
 
 /// Errors returned by the read-only op layer (mapped to errno by the adapter).
@@ -208,6 +214,9 @@ struct Node {
     symlink_target: Option<Vec<u8>>,
     /// Whether the inode still has a visible namespace entry.
     linked: bool,
+    atime: SystemTime,
+    mtime: SystemTime,
+    ctime: SystemTime,
 }
 
 /// A read-only view over the backend namespace, addressed by inode.
@@ -268,6 +277,7 @@ impl ReadOnlyFs {
     /// Create a filesystem with just the root directory.
     pub fn new() -> Self {
         let mut nodes = HashMap::new();
+        let now = SystemTime::now();
         nodes.insert(
             ROOT_INO,
             Node {
@@ -281,6 +291,9 @@ impl ReadOnlyFs {
                 directory_marker: false,
                 symlink_target: None,
                 linked: true,
+                atime: now,
+                mtime: now,
+                ctime: now,
             },
         );
         let instance = NEXT_FS_INSTANCE.fetch_add(1, Ordering::Relaxed);
@@ -322,6 +335,7 @@ impl ReadOnlyFs {
         let mut g = self.inner.lock_recover();
         let mut parent = ROOT_INO;
         let mut current_path = String::new();
+        let now = SystemTime::now();
         for (i, comp) in comps.iter().enumerate() {
             let is_leaf = i == comps.len() - 1;
             if !current_path.is_empty() {
@@ -351,6 +365,9 @@ impl ReadOnlyFs {
                 directory_marker: false,
                 symlink_target: None,
                 linked: true,
+                atime: now,
+                mtime: now,
+                ctime: now,
             };
             g.nodes.insert(ino, node);
             g.index.insert(key, ino);
@@ -401,6 +418,7 @@ impl ReadOnlyFs {
         let mut g = self.inner.lock_recover();
         let mut parent = ROOT_INO;
         let mut current_path = String::new();
+        let now = SystemTime::now();
         for (index, component) in comps.iter().enumerate() {
             if !current_path.is_empty() {
                 current_path.push('/');
@@ -431,6 +449,9 @@ impl ReadOnlyFs {
                 directory_marker: index == comps.len() - 1,
                 symlink_target: None,
                 linked: true,
+                atime: now,
+                mtime: now,
+                ctime: now,
             };
             g.nodes.insert(ino, node);
             g.index.insert(key, ino);
@@ -460,6 +481,9 @@ impl ReadOnlyFs {
             size: node.size,
             perm,
             nlink,
+            atime: node.atime,
+            mtime: node.mtime,
+            ctime: node.ctime,
         }
     }
 
@@ -480,6 +504,31 @@ impl ReadOnlyFs {
     /// `getattr`: attributes for an inode.
     pub fn getattr(&self, ino: u64) -> Result<Attr, FsError> {
         let g = self.inner.lock_recover();
+        Ok(Self::attr_of(
+            &g,
+            g.nodes.get(&ino).ok_or(FsError::NotFound)?,
+        ))
+    }
+
+    /// Apply explicit atime/mtime updates and advance ctime when either changes.
+    pub fn set_times(
+        &self,
+        ino: u64,
+        atime: Option<SystemTime>,
+        mtime: Option<SystemTime>,
+    ) -> Result<Attr, FsError> {
+        let mut g = self.inner.lock_recover();
+        let node = g.nodes.get_mut(&ino).ok_or(FsError::NotFound)?;
+        let changed = atime.is_some() || mtime.is_some();
+        if let Some(atime) = atime {
+            node.atime = atime;
+        }
+        if let Some(mtime) = mtime {
+            node.mtime = mtime;
+        }
+        if changed {
+            node.ctime = SystemTime::now();
+        }
         Ok(Self::attr_of(
             &g,
             g.nodes.get(&ino).ok_or(FsError::NotFound)?,
@@ -637,24 +686,29 @@ impl ReadOnlyFs {
 
     /// Return a handle's read source, preferring its uncommitted write buffer.
     pub fn read_source(&self, fh: u64, offset: u64, size: u32) -> Result<ReadSource, FsError> {
-        let g = self.inner.lock_recover();
+        let mut g = self.inner.lock_recover();
         let handle = g.handles.get(&fh).ok_or(FsError::BadHandle)?;
         if !handle.read {
             return Err(FsError::BadHandle);
         }
-        let node = g.nodes.get(&handle.ino).ok_or(FsError::NotFound)?;
-        if let Some(dirty) = g.dirty.get(&fh) {
+        let ino = handle.ino;
+        let source = if let Some(dirty) = g.dirty.get(&fh) {
             let start = usize::try_from(offset).map_err(|_| FsError::Invalid)?;
             if start >= dirty.buf.len() {
-                return Ok(ReadSource::Buffered(Vec::new()));
+                ReadSource::Buffered(Vec::new())
+            } else {
+                let end = start.saturating_add(size as usize).min(dirty.buf.len());
+                ReadSource::Buffered(dirty.buf[start..end].to_vec())
             }
-            let end = start.saturating_add(size as usize).min(dirty.buf.len());
-            return Ok(ReadSource::Buffered(dirty.buf[start..end].to_vec()));
-        }
-        Ok(ReadSource::Backend {
-            path: node.path.clone(),
-            size: node.size,
-        })
+        } else {
+            let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+            ReadSource::Backend {
+                path: node.path.clone(),
+                size: node.size,
+            }
+        };
+        g.nodes.get_mut(&ino).ok_or(FsError::NotFound)?.atime = SystemTime::now();
+        Ok(source)
     }
 
     /// Return the committed object path and size for an inode before opening it.
@@ -705,6 +759,7 @@ impl ReadOnlyFs {
         Self::validate_visible_object_path(&path)?;
         let ino = g.next_ino;
         g.next_ino += 1;
+        let now = SystemTime::now();
         let node = Node {
             ino,
             parent: Some(parent_ino),
@@ -716,10 +771,14 @@ impl ReadOnlyFs {
             directory_marker: false,
             symlink_target: None,
             linked: true,
+            atime: now,
+            mtime: now,
+            ctime: now,
         };
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
         g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
+        Self::mark_directory_changed(&mut g, parent_ino, now);
         let fh = g.next_fh;
         g.next_fh += 1;
         g.handles.insert(
@@ -797,6 +856,9 @@ impl ReadOnlyFs {
         let new_size = dirty.buf.len() as u64;
         if let Some(node) = g.nodes.get_mut(&ino) {
             node.size = node.size.max(new_size);
+            let now = SystemTime::now();
+            node.mtime = now;
+            node.ctime = now;
         }
         Ok(data.len() as u32)
     }
@@ -880,6 +942,9 @@ impl ReadOnlyFs {
             return Err(FsError::IsDir);
         }
         node.size = contents.len() as u64;
+        let now = SystemTime::now();
+        node.mtime = now;
+        node.ctime = now;
         for dirty in g.dirty.values_mut().filter(|dirty| dirty.ino == ino) {
             dirty.buf.clone_from(&contents);
         }
@@ -1000,6 +1065,12 @@ impl ReadOnlyFs {
             .ok_or(FsError::NotFound)?
             .children
             .push(plan.source_ino);
+        let now = SystemTime::now();
+        Self::mark_directory_changed(&mut g, plan.target_parent, now);
+        g.nodes
+            .get_mut(&plan.source_ino)
+            .ok_or(FsError::NotFound)?
+            .ctime = now;
         Ok(Self::attr_of(
             &g,
             g.nodes.get(&plan.source_ino).ok_or(FsError::NotFound)?,
@@ -1122,6 +1193,10 @@ impl ReadOnlyFs {
             source.name.clone_from(&plan.target_name);
             source.path.clone_from(&plan.target_path);
         }
+        let now = SystemTime::now();
+        source.ctime = now;
+        Self::mark_directory_changed(&mut g, plan.source_parent, now);
+        Self::mark_directory_changed(&mut g, plan.target_parent, now);
         Ok(())
     }
 
@@ -1294,6 +1369,8 @@ impl ReadOnlyFs {
         let source = g.nodes.get_mut(&plan.source_ino).ok_or(FsError::NotFound)?;
         source.parent = Some(plan.target_parent);
         source.name.clone_from(&plan.target_name);
+        let now = SystemTime::now();
+        source.ctime = now;
         g.index.insert(
             (plan.target_parent, plan.target_name.clone()),
             plan.source_ino,
@@ -1303,6 +1380,8 @@ impl ReadOnlyFs {
             .ok_or(FsError::NotFound)?
             .children
             .push(plan.source_ino);
+        Self::mark_directory_changed(&mut g, plan.source_parent, now);
+        Self::mark_directory_changed(&mut g, plan.target_parent, now);
         Ok(())
     }
 
@@ -1339,6 +1418,7 @@ impl ReadOnlyFs {
         }
         let ino = g.next_ino;
         g.next_ino += 1;
+        let now = SystemTime::now();
         let node = Node {
             ino,
             parent: Some(parent_ino),
@@ -1350,10 +1430,14 @@ impl ReadOnlyFs {
             directory_marker: false,
             symlink_target: Some(target),
             linked: true,
+            atime: now,
+            mtime: now,
+            ctime: now,
         };
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
         g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
+        Self::mark_directory_changed(&mut g, parent_ino, now);
         Ok(Self::attr_of(&g, g.nodes.get(&ino).unwrap()))
     }
 
@@ -1402,6 +1486,7 @@ impl ReadOnlyFs {
         Self::validate_visible_object_path(&path)?;
         let ino = g.next_ino;
         g.next_ino += 1;
+        let now = SystemTime::now();
         let node = Node {
             ino,
             parent: Some(parent_ino),
@@ -1413,10 +1498,14 @@ impl ReadOnlyFs {
             directory_marker: true,
             symlink_target: None,
             linked: true,
+            atime: now,
+            mtime: now,
+            ctime: now,
         };
         g.nodes.insert(ino, node);
         g.index.insert((parent_ino, name.to_string()), ino);
         g.nodes.get_mut(&parent_ino).unwrap().children.push(ino);
+        Self::mark_directory_changed(&mut g, parent_ino, now);
         Ok(Self::attr_of(&g, g.nodes.get(&ino).unwrap()))
     }
 
@@ -1462,6 +1551,7 @@ impl ReadOnlyFs {
         if let Some(parent) = g.nodes.get_mut(&parent_ino) {
             parent.children.retain(|child| *child != ino);
         }
+        Self::mark_directory_changed(&mut g, parent_ino, SystemTime::now());
         Ok(())
     }
 
@@ -1538,6 +1628,8 @@ impl ReadOnlyFs {
 
         g.index.remove(&(plan.parent, plan.name.clone()));
         Self::remove_child_once(&mut g, plan.parent, plan.ino);
+        let now = SystemTime::now();
+        Self::mark_directory_changed(&mut g, plan.parent, now);
         let remaining = Self::inode_dentries_locked(&g, plan.ino);
         if let Some((parent, name, path)) = remaining.first() {
             let node = g.nodes.get_mut(&plan.ino).ok_or(FsError::NotFound)?;
@@ -1547,11 +1639,13 @@ impl ReadOnlyFs {
                 node.path.clone_from(path);
             }
             node.linked = true;
+            node.ctime = now;
         } else if let Some(orphan_path) = &plan.orphan_path {
             let node = g.nodes.get_mut(&plan.ino).ok_or(FsError::NotFound)?;
             node.parent = None;
             node.path.clone_from(orphan_path);
             node.linked = false;
+            node.ctime = now;
         } else {
             g.nodes.remove(&plan.ino);
         }
@@ -1658,6 +1752,13 @@ impl ReadOnlyFs {
         }
     }
 
+    fn mark_directory_changed(g: &mut Inner, ino: u64, now: SystemTime) {
+        if let Some(node) = g.nodes.get_mut(&ino) {
+            node.mtime = now;
+            node.ctime = now;
+        }
+    }
+
     fn orphan_path(&self, source_path: &str, ino: u64) -> Result<String, FsError> {
         let object = path_to_object(source_path).map_err(|_| FsError::Invalid)?;
         Ok(format!(
@@ -1716,6 +1817,29 @@ mod tests {
         assert_eq!(fs.getattr(a.ino).unwrap(), a);
 
         assert_eq!(fs.lookup(ROOT_INO, "nope"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn explicit_timestamp_updates_preserve_omitted_fields_and_advance_ctime() {
+        let fs = fs();
+        let file = fs.lookup(data_dir(&fs).ino, "a.bin").unwrap();
+        let original = fs.getattr(file.ino).unwrap();
+        let atime = UNIX_EPOCH + std::time::Duration::new(123, 456);
+        let mtime = UNIX_EPOCH + std::time::Duration::new(789, 123);
+
+        let updated = fs.set_times(file.ino, Some(atime), Some(mtime)).unwrap();
+        assert_eq!(updated.atime, atime);
+        assert_eq!(updated.mtime, mtime);
+        assert!(updated.ctime >= original.ctime);
+
+        let later_mtime = UNIX_EPOCH + std::time::Duration::new(999, 321);
+        let omitted = fs.set_times(file.ino, None, Some(later_mtime)).unwrap();
+        assert_eq!(omitted.atime, atime);
+        assert_eq!(omitted.mtime, later_mtime);
+        assert!(omitted.ctime >= updated.ctime);
+
+        let unchanged = fs.set_times(file.ino, None, None).unwrap();
+        assert_eq!(unchanged, omitted);
     }
 
     #[test]
