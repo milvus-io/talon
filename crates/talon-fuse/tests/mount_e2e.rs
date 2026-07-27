@@ -23,8 +23,8 @@
 #![cfg(feature = "mount")]
 
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::unix::fs::FileExt;
+use std::io::{Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::{FileExt, OpenOptionsExt};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -389,6 +389,121 @@ async fn mount_write_through_is_visible_in_backend() {
     assert!(
         !final_store.contains_key("/s3/bucket/hello.bin"),
         "object should be gone from backend after unlink"
+    );
+}
+
+/// Exercise open flags through the kernel and verify their blob-store effects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_open_flags_preserve_and_replace_blob_contents() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/existing.bin".to_string(),
+        b"abcdef".to_vec(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/existing.bin", 6);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-open-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(s) => s,
+        Err(e) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {e}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {e}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let path = mountpoint.join("s3").join("bucket").join("existing.bin");
+    let dir = mountpoint.join("s3").join("bucket");
+    let result = tokio::task::spawn_blocking(move || {
+        {
+            let mut file = std::fs::OpenOptions::new().write(true).open(&path)?;
+            file.write_all(b"XY")?;
+        }
+
+        {
+            let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+            file.write_all(b"-tail")?;
+        }
+
+        {
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)?;
+            file.write_all(b"working-copy")?;
+            file.seek(SeekFrom::Start(0))?;
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)?;
+            assert_eq!(bytes, b"working-copy");
+        }
+
+        let exists = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap_err();
+        assert_eq!(exists.raw_os_error(), Some(libc::EEXIST));
+
+        let not_dir = std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY)
+            .open(&path)
+            .unwrap_err();
+        assert_eq!(not_dir.raw_os_error(), Some(libc::ENOTDIR));
+
+        let is_dir = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&dir)
+            .unwrap_err();
+        assert_eq!(is_dir.raw_os_error(), Some(libc::EISDIR));
+
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise open flags through mount");
+
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get("/s3/bucket/existing.bin")
+            .map(Vec::as_slice),
+        Some(b"working-copy".as_slice()),
+        "final write-through must replace the committed blob"
     );
 }
 
