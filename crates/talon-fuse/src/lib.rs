@@ -28,7 +28,7 @@ pub use metrics::{ReadStats, ReadStatsSnapshot};
 pub use mount::{TalonFuse, CANONICAL_MOUNT_VERSION};
 pub use ops::{Attr, DirEntry, FileKind, FsError, ReadOnlyFs, ROOT_INO};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
-pub use pool::ConnectionPool;
+pub use pool::{ConnectionPool, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
 pub use prefetch::Prefetcher;
 pub use read_plan::{plan_read, BlockSegment};
 pub use readahead::{ReadaheadConfig, ReadaheadState};
