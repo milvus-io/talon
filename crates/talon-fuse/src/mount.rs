@@ -117,7 +117,7 @@ pub(crate) fn to_file_attr(attr: Attr, uid: u32, gid: u32) -> fuser::FileAttr {
         crtime: epoch,
         kind,
         perm: attr.perm,
-        nlink: 1,
+        nlink: attr.nlink,
         uid,
         gid,
         rdev: 0,
@@ -1065,7 +1065,12 @@ impl fuser::Filesystem for TalonFuse {
         reply.ok();
     }
 
-    /// Remove a file: delete the backend object, then drop the namespace node.
+    /// Remove a file from the visible namespace.
+    ///
+    /// An inode without open handles is deleted directly. An open inode is first
+    /// written to a mount-scoped internal blob, then the visible backend key is
+    /// deleted and the namespace entry is detached. Its handles continue to use
+    /// the orphan blob until final release deletes it.
     fn unlink(
         &mut self,
         _req: &fuser::Request<'_>,
@@ -1080,22 +1085,67 @@ impl fuser::Filesystem for TalonFuse {
             Some(s) => s,
             None => return reply.error(libc::EINVAL),
         };
-        // Look up the path first (without removing) so a backend delete failure
-        // leaves the namespace entry intact.
-        let path = match self.fs.lookup(parent, name) {
-            Ok(_) => match self.fs.file_path(parent, name) {
-                Some(p) => p,
-                None => return reply.error(libc::ENOENT),
-            },
-            Err(e) => return reply.error(errno(e)),
+        let plan = match self.fs.unlink_plan(parent, name) {
+            Ok(plan) => plan,
+            Err(error) => return reply.error(errno(error)),
         };
-        if let Err(error) = self.delete_backend_object(&path) {
-            tracing::warn!(%path, %error, "unlink backend delete failed");
+        if let Some(orphan_path) = &plan.orphan_path {
+            let contents = match &plan.buffered_contents {
+                Some(contents) => contents.clone(),
+                None => match self.read_committed_object(&plan.source_path, plan.source_size) {
+                    Ok(contents) => contents,
+                    Err(error) => return reply.error(error),
+                },
+            };
+            if let Err(error) = self.writeback_object(orphan_path, contents.clone()) {
+                tracing::warn!(
+                    source = %plan.source_path,
+                    orphan = %orphan_path,
+                    %error,
+                    "unlink orphan writeback failed"
+                );
+                return reply.error(libc::EIO);
+            }
+            if let Err(error) = self.delete_backend_object(&plan.source_path) {
+                if let Err(rollback_error) = self.delete_backend_object(orphan_path) {
+                    tracing::error!(
+                        orphan = %orphan_path,
+                        %rollback_error,
+                        "unlink orphan rollback failed"
+                    );
+                }
+                tracing::warn!(path = %plan.source_path, %error, "unlink backend delete failed");
+                return reply.error(libc::EIO);
+            }
+            if let Err(error) = self.fs.commit_unlink(&plan) {
+                if let Err(rollback_error) =
+                    self.writeback_object(&plan.source_path, contents.clone())
+                {
+                    tracing::error!(
+                        path = %plan.source_path,
+                        %rollback_error,
+                        "unlink source rollback failed"
+                    );
+                }
+                if let Err(rollback_error) = self.delete_backend_object(orphan_path) {
+                    tracing::error!(
+                        orphan = %orphan_path,
+                        %rollback_error,
+                        "unlink orphan cleanup failed"
+                    );
+                }
+                return reply.error(errno(error));
+            }
+            return reply.ok();
+        }
+
+        if let Err(error) = self.delete_backend_object(&plan.source_path) {
+            tracing::warn!(path = %plan.source_path, %error, "unlink backend delete failed");
             return reply.error(libc::EIO);
         }
-        match self.fs.unlink(parent, name) {
-            Ok(_) => reply.ok(),
-            Err(e) => reply.error(errno(e)),
+        match self.fs.commit_unlink(&plan) {
+            Ok(()) => reply.ok(),
+            Err(error) => reply.error(errno(error)),
         }
     }
 
@@ -1151,9 +1201,21 @@ impl fuser::Filesystem for TalonFuse {
         // Drop this handle's prefetch state (and its readahead cursor); any
         // in-flight speculative fetches finish on their own detached tasks.
         self.prefetchers.lock_recover().remove(&fh);
+        let cleanup_path = match self.fs.release_cleanup_path(fh) {
+            Ok(path) => path,
+            Err(error) => return reply.error(errno(error)),
+        };
+        let cleanup_error = cleanup_path.as_deref().and_then(|path| {
+            self.delete_backend_object(path)
+                .inspect_err(|error| {
+                    tracing::warn!(%path, %error, "final unlink orphan cleanup failed");
+                })
+                .err()
+        });
         match self.fs.release(fh) {
-            Ok(()) => reply.ok(),
-            Err(e) => reply.error(errno(e)),
+            Ok(()) if cleanup_error.is_none() => reply.ok(),
+            Ok(()) => reply.error(libc::EIO),
+            Err(error) => reply.error(errno(error)),
         }
     }
 }
@@ -1340,6 +1402,7 @@ mod tests {
             kind: FileKind::Directory,
             size: 0,
             perm: 0o555,
+            nlink: 1,
         };
         let fa = to_file_attr(dir, 1000, 1000);
         assert_eq!(fa.kind, fuser::FileType::Directory);
@@ -1352,12 +1415,14 @@ mod tests {
             kind: FileKind::File,
             size: 1000, // 1000 bytes → ceil(1000/512) = 2 blocks
             perm: 0o444,
+            nlink: 0,
         };
         let fa = to_file_attr(file, 0, 0);
         assert_eq!(fa.kind, fuser::FileType::RegularFile);
         assert_eq!(fa.size, 1000);
         assert_eq!(fa.blocks, 2);
         assert_eq!(fa.blksize, 512);
+        assert_eq!(fa.nlink, 0);
     }
 
     #[tokio::test]

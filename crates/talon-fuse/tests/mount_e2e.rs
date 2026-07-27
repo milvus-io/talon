@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -934,6 +934,125 @@ async fn mount_directory_tree_rename_is_written_through() {
     drop(session);
     std::fs::remove_dir_all(&mountpoint).ok();
     result.expect("exercise directory-tree rename through mount");
+}
+
+/// Keep an unlinked inode on an internal backend object until final release.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_unlink_preserves_open_descriptors_without_recreating_the_name() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/live.bin".to_string(),
+        b"start".to_vec(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/live.bin", 5);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-unlink-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let path = mountpoint.join("s3").join("bucket").join("live.bin");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        let mut open_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)?;
+
+        std::fs::remove_file(&path)?;
+        assert!(!path.exists());
+        assert_eq!(open_file.metadata()?.nlink(), 0);
+
+        let orphan_path = {
+            let committed = operation_store.lock().unwrap();
+            assert!(!committed.contains_key("/s3/bucket/live.bin"));
+            let (path, contents) = committed
+                .iter()
+                .find(|(path, _)| path.starts_with("/s3/bucket/.__talon_internal/unlinked/"))
+                .expect("unlink should create an internal orphan object");
+            assert_eq!(contents, b"start");
+            path.clone()
+        };
+
+        open_file.seek(SeekFrom::Start(0))?;
+        let mut initial = Vec::new();
+        open_file.read_to_end(&mut initial)?;
+        assert_eq!(initial, b"start");
+
+        open_file.seek(SeekFrom::Start(0))?;
+        open_file.write_all(b"after")?;
+        open_file.sync_all()?;
+        assert_eq!(
+            operation_store.lock().unwrap().get(&orphan_path),
+            Some(&b"after".to_vec())
+        );
+
+        std::fs::write(&path, b"replacement")?;
+        open_file.seek(SeekFrom::Start(0))?;
+        open_file.write_all(b"older")?;
+        open_file.sync_all()?;
+        assert_eq!(
+            operation_store.lock().unwrap().get("/s3/bucket/live.bin"),
+            Some(&b"replacement".to_vec())
+        );
+        assert_eq!(
+            operation_store.lock().unwrap().get(&orphan_path),
+            Some(&b"older".to_vec())
+        );
+
+        drop(open_file);
+        for _ in 0..100 {
+            if !operation_store.lock().unwrap().contains_key(&orphan_path) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !operation_store.lock().unwrap().contains_key(&orphan_path),
+            "final release should delete the orphan object"
+        );
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise unlink-while-open through mount");
 }
 
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
