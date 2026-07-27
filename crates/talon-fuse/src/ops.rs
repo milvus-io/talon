@@ -32,6 +32,20 @@ pub enum FileKind {
     File,
     /// A symbolic link whose target bytes are stored in a backend object.
     Symlink,
+    /// A mount-local named pipe.
+    NamedPipe,
+    /// A mount-local block device node.
+    BlockDevice,
+    /// A mount-local character device node.
+    CharDevice,
+    /// A mount-local Unix socket node.
+    Socket,
+}
+
+impl FileKind {
+    pub(crate) fn has_backend_object(self) -> bool {
+        matches!(self, Self::File | Self::Symlink)
+    }
 }
 
 /// Synthesized attributes for a node.
@@ -53,6 +67,8 @@ pub struct Attr {
     pub mtime: SystemTime,
     /// Last inode metadata change time.
     pub ctime: SystemTime,
+    /// Device identifier for block and character devices.
+    pub rdev: u32,
 }
 
 /// Errors returned by the read-only op layer (mapped to errno by the adapter).
@@ -125,6 +141,14 @@ pub const DEFAULT_MAX_OBJECT_BYTES: u64 = 1 << 30;
 
 const INTERNAL_OBJECT_PREFIX: &str = ".__talon_internal";
 const MAX_SYMLINK_TARGET_BYTES: usize = 4095;
+const MODE_TYPE_MASK: u32 = 0o170000;
+const MODE_SOCKET: u32 = 0o140000;
+const MODE_SYMLINK: u32 = 0o120000;
+const MODE_REGULAR: u32 = 0o100000;
+const MODE_BLOCK_DEVICE: u32 = 0o060000;
+const MODE_DIRECTORY: u32 = 0o040000;
+const MODE_CHAR_DEVICE: u32 = 0o020000;
+const MODE_NAMED_PIPE: u32 = 0o010000;
 
 /// A directory entry yielded by `readdir`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,10 +169,12 @@ pub struct FileRenamePlan {
     pub(crate) source_name: String,
     pub(crate) source_path: String,
     pub(crate) source_size: u64,
+    pub(crate) source_backend_object: bool,
     pub(crate) target_parent: u64,
     pub(crate) target_name: String,
     pub(crate) target_path: String,
     pub(crate) target: Option<(u64, u64)>,
+    pub(crate) target_backend_object: bool,
 }
 
 /// One backend object moved as part of a directory-tree rename.
@@ -184,6 +210,7 @@ pub struct UnlinkPlan {
     pub(crate) source_size: u64,
     pub(crate) orphan_path: Option<String>,
     pub(crate) buffered_contents: Option<Vec<u8>>,
+    pub(crate) backend_object: bool,
 }
 
 /// Immutable backend and namespace facts for hard-link creation.
@@ -196,6 +223,18 @@ pub struct HardLinkPlan {
     pub(crate) target_parent: u64,
     pub(crate) target_name: String,
     pub(crate) target_path: String,
+    pub(crate) backend_object: bool,
+}
+
+/// Immutable namespace and backend facts for `mknod`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MknodPlan {
+    pub(crate) parent: u64,
+    pub(crate) name: String,
+    pub(crate) path: String,
+    pub(crate) kind: FileKind,
+    pub(crate) perm: u16,
+    pub(crate) rdev: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -214,6 +253,8 @@ struct Node {
     symlink_target: Option<Vec<u8>>,
     /// Whether the inode still has a visible namespace entry.
     linked: bool,
+    perm: u16,
+    rdev: u32,
     atime: SystemTime,
     mtime: SystemTime,
     ctime: SystemTime,
@@ -291,6 +332,8 @@ impl ReadOnlyFs {
                 directory_marker: false,
                 symlink_target: None,
                 linked: true,
+                perm: 0o555,
+                rdev: 0,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -365,6 +408,8 @@ impl ReadOnlyFs {
                 directory_marker: false,
                 symlink_target: None,
                 linked: true,
+                perm: if is_leaf { 0o444 } else { 0o555 },
+                rdev: 0,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -449,6 +494,8 @@ impl ReadOnlyFs {
                 directory_marker: index == comps.len() - 1,
                 symlink_target: None,
                 linked: true,
+                perm: 0o555,
+                rdev: 0,
                 atime: now,
                 mtime: now,
                 ctime: now,
@@ -462,11 +509,6 @@ impl ReadOnlyFs {
     }
 
     fn attr_of(g: &Inner, node: &Node) -> Attr {
-        let perm = match node.kind {
-            FileKind::Directory => 0o555,
-            FileKind::File => 0o444,
-            FileKind::Symlink => 0o777,
-        };
         let nlink = if node.kind == FileKind::Directory {
             1
         } else {
@@ -479,11 +521,12 @@ impl ReadOnlyFs {
             ino: node.ino,
             kind: node.kind,
             size: node.size,
-            perm,
+            perm: node.perm,
             nlink,
             atime: node.atime,
             mtime: node.mtime,
             ctime: node.ctime,
+            rdev: node.rdev,
         }
     }
 
@@ -588,6 +631,10 @@ impl ReadOnlyFs {
             FileKind::File => {}
             FileKind::Directory => return Err(FsError::IsDir),
             FileKind::Symlink => return Err(FsError::Loop),
+            FileKind::NamedPipe
+            | FileKind::BlockDevice
+            | FileKind::CharDevice
+            | FileKind::Socket => return Err(FsError::Unsupported),
         }
         if options.write && initial_contents.is_none() {
             return Err(FsError::Invalid);
@@ -771,6 +818,8 @@ impl ReadOnlyFs {
             directory_marker: false,
             symlink_target: None,
             linked: true,
+            perm: 0o444,
+            rdev: 0,
             atime: now,
             mtime: now,
             ctime: now,
@@ -814,6 +863,95 @@ impl ReadOnlyFs {
                 append: false,
             },
         )
+    }
+
+    /// Validate and describe a regular or mount-local special node creation.
+    pub fn mknod_plan(
+        &self,
+        parent_ino: u64,
+        name: &str,
+        mode: u32,
+        umask: u32,
+        rdev: u32,
+    ) -> Result<MknodPlan, FsError> {
+        Self::validate_component(name)?;
+        let kind = match mode & MODE_TYPE_MASK {
+            MODE_REGULAR => FileKind::File,
+            MODE_NAMED_PIPE => FileKind::NamedPipe,
+            MODE_BLOCK_DEVICE => FileKind::BlockDevice,
+            MODE_CHAR_DEVICE => FileKind::CharDevice,
+            MODE_SOCKET => FileKind::Socket,
+            MODE_DIRECTORY | MODE_SYMLINK => return Err(FsError::OperationNotPermitted),
+            _ => return Err(FsError::Invalid),
+        };
+        let g = self.inner.lock_recover();
+        let parent = g.nodes.get(&parent_ino).ok_or(FsError::NotFound)?;
+        if parent.kind != FileKind::Directory {
+            return Err(FsError::NotDir);
+        }
+        if g.index.contains_key(&(parent_ino, name.to_string())) {
+            return Err(FsError::Exists);
+        }
+        let path = Self::child_path(parent, name);
+        Self::validate_visible_object_path(&path)?;
+        Ok(MknodPlan {
+            parent: parent_ino,
+            name: name.to_string(),
+            path,
+            kind,
+            perm: ((mode & !umask) & 0o7777) as u16,
+            rdev: if matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) {
+                rdev
+            } else {
+                0
+            },
+        })
+    }
+
+    /// Publish a node after any required regular-file backend PUT succeeds.
+    pub fn commit_mknod(&self, plan: &MknodPlan) -> Result<Attr, FsError> {
+        let mut g = self.inner.lock_recover();
+        if g.index.contains_key(&(plan.parent, plan.name.clone())) {
+            return Err(FsError::Exists);
+        }
+        let parent = g.nodes.get(&plan.parent).ok_or(FsError::NotFound)?;
+        if parent.kind != FileKind::Directory || Self::child_path(parent, &plan.name) != plan.path {
+            return Err(FsError::NotDir);
+        }
+        let ino = g.next_ino;
+        g.next_ino += 1;
+        let now = SystemTime::now();
+        g.nodes.insert(
+            ino,
+            Node {
+                ino,
+                parent: Some(plan.parent),
+                name: plan.name.clone(),
+                kind: plan.kind,
+                size: 0,
+                children: Vec::new(),
+                path: plan.path.clone(),
+                directory_marker: false,
+                symlink_target: None,
+                linked: true,
+                perm: plan.perm,
+                rdev: plan.rdev,
+                atime: now,
+                mtime: now,
+                ctime: now,
+            },
+        );
+        g.index.insert((plan.parent, plan.name.clone()), ino);
+        g.nodes
+            .get_mut(&plan.parent)
+            .ok_or(FsError::NotFound)?
+            .children
+            .push(ino);
+        Self::mark_directory_changed(&mut g, plan.parent, now);
+        Ok(Self::attr_of(
+            &g,
+            g.nodes.get(&ino).ok_or(FsError::NotFound)?,
+        ))
     }
 
     /// `write`: write `data` at `offset` into the write handle's buffer.
@@ -1035,6 +1173,7 @@ impl ReadOnlyFs {
             target_parent,
             target_name: target_name.to_string(),
             target_path,
+            backend_object: source.kind.has_backend_object(),
         })
     }
 
@@ -1120,16 +1259,21 @@ impl ReadOnlyFs {
             }
             None => None,
         };
+        let target_backend_object = target
+            .and_then(|(target_ino, _)| g.nodes.get(&target_ino))
+            .is_some_and(|node| node.kind.has_backend_object());
         Ok(FileRenamePlan {
             source_ino,
             source_parent,
             source_name: source_name.to_string(),
             source_path,
             source_size: source.size,
+            source_backend_object: source.kind.has_backend_object(),
             target_parent,
             target_name: target_name.to_string(),
             target_path,
             target,
+            target_backend_object,
         })
     }
 
@@ -1291,7 +1435,7 @@ impl ReadOnlyFs {
                 let child_target_path = format!("{current_target_path}/{name}");
                 if child.kind == FileKind::Directory {
                     stack.push((child_ino, child_source_path, child_target_path));
-                } else {
+                } else if child.kind.has_backend_object() {
                     entries.push(DirectoryRenameEntry {
                         source_path: child_source_path,
                         target_path: child_target_path,
@@ -1430,6 +1574,8 @@ impl ReadOnlyFs {
             directory_marker: false,
             symlink_target: Some(target),
             linked: true,
+            perm: 0o777,
+            rdev: 0,
             atime: now,
             mtime: now,
             ctime: now,
@@ -1498,6 +1644,8 @@ impl ReadOnlyFs {
             directory_marker: true,
             symlink_target: None,
             linked: true,
+            perm: 0o555,
+            rdev: 0,
             atime: now,
             mtime: now,
             ctime: now,
@@ -1599,6 +1747,7 @@ impl ReadOnlyFs {
             source_size: node.size,
             orphan_path,
             buffered_contents,
+            backend_object: node.kind.has_backend_object(),
         })
     }
 
@@ -2094,6 +2243,72 @@ mod tests {
             fs.hard_link_plan(source.ino, other.ino, "linked.bin"),
             Err(FsError::CrossDevice)
         );
+    }
+
+    #[test]
+    fn mknod_creates_regular_and_mount_local_special_nodes() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let cases = [
+            (MODE_REGULAR, FileKind::File, 0),
+            (MODE_NAMED_PIPE, FileKind::NamedPipe, 0),
+            (MODE_BLOCK_DEVICE, FileKind::BlockDevice, 0x0102),
+            (MODE_CHAR_DEVICE, FileKind::CharDevice, 0x0304),
+            (MODE_SOCKET, FileKind::Socket, 0),
+        ];
+
+        for (index, (mode, kind, rdev)) in cases.into_iter().enumerate() {
+            let name = format!("node-{index}");
+            let plan = fs
+                .mknod_plan(parent.ino, &name, mode | 0o666, 0o022, rdev)
+                .unwrap();
+            assert_eq!(plan.kind, kind);
+            assert_eq!(plan.perm, 0o644);
+            assert_eq!(plan.kind.has_backend_object(), kind == FileKind::File);
+            let attr = fs.commit_mknod(&plan).unwrap();
+            assert_eq!(attr.kind, kind);
+            assert_eq!(attr.perm, 0o644);
+            assert_eq!(
+                attr.rdev,
+                if matches!(kind, FileKind::BlockDevice | FileKind::CharDevice) {
+                    rdev
+                } else {
+                    0
+                }
+            );
+            assert_eq!(fs.lookup(parent.ino, &name).unwrap(), attr);
+        }
+    }
+
+    #[test]
+    fn mount_local_special_nodes_link_rename_and_unlink_without_backend_paths() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let plan = fs
+            .mknod_plan(parent.ino, "fifo", MODE_NAMED_PIPE | 0o600, 0, 0)
+            .unwrap();
+        let fifo = fs.commit_mknod(&plan).unwrap();
+
+        let link = fs
+            .hard_link_plan(fifo.ino, parent.ino, "fifo-link")
+            .unwrap();
+        assert!(!link.backend_object);
+        assert_eq!(fs.commit_hard_link(&link).unwrap().nlink, 2);
+
+        let rename = fs
+            .file_rename_plan(parent.ino, "fifo-link", parent.ino, "fifo-moved")
+            .unwrap();
+        fs.commit_file_rename(&rename).unwrap();
+        assert_eq!(
+            fs.lookup(parent.ino, "fifo-moved").unwrap().kind,
+            FileKind::NamedPipe
+        );
+
+        let unlink = fs.unlink_plan(parent.ino, "fifo").unwrap();
+        assert!(!unlink.backend_object);
+        fs.commit_unlink(&unlink).unwrap();
+        assert_eq!(fs.lookup(parent.ino, "fifo"), Err(FsError::NotFound));
+        assert_eq!(fs.lookup(parent.ino, "fifo-moved").unwrap().nlink, 1);
     }
 
     #[test]

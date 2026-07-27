@@ -26,7 +26,8 @@ use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::net::UnixListener;
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
@@ -1465,6 +1466,222 @@ async fn mount_timestamp_updates_follow_utimens_semantics() {
     drop(session);
     std::fs::remove_dir_all(&mountpoint).ok();
     result.expect("exercise timestamp updates through mount");
+}
+
+/// Create mount-local FIFOs and sockets without materializing blob objects.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_special_nodes_are_namespace_only() {
+    use fuser::MountOption;
+
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/placeholder".to_string(),
+        Vec::new(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/placeholder", 0);
+
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-special-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = match fuser::spawn_mount2(adapter, &mountpoint, &options) {
+        Ok(session) => session,
+        Err(error) => {
+            std::fs::remove_dir_all(&mountpoint).ok();
+            if require_fuse {
+                panic!(
+                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
+                     The runner must provide an accessible /dev/fuse."
+                );
+            }
+            eprintln!("skipping: /dev/fuse unavailable: {error}");
+            return;
+        }
+    };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bucket = mountpoint.join("s3").join("bucket");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        let fifo = bucket.join("events.fifo");
+        let fifo_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o640) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        assert!(std::fs::symlink_metadata(&fifo)?.file_type().is_fifo());
+        assert_eq!(std::fs::metadata(&fifo)?.mode() & 0o7777, 0o640);
+
+        let socket = bucket.join("service.sock");
+        let listener = UnixListener::bind(&socket)?;
+        assert!(std::fs::symlink_metadata(&socket)?.file_type().is_socket());
+
+        let regular = bucket.join("mknod.bin");
+        let regular_path = std::ffi::CString::new(regular.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::mknod(regular_path.as_ptr(), libc::S_IFREG | 0o600, 0) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        assert!(std::fs::metadata(&regular)?.file_type().is_file());
+        assert_eq!(
+            operation_store.lock().unwrap().get("/s3/bucket/mknod.bin"),
+            Some(&Vec::new())
+        );
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/events.fifo"));
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/service.sock"));
+
+        let fifo_link = bucket.join("events-link.fifo");
+        std::fs::hard_link(&fifo, &fifo_link)?;
+        assert_eq!(std::fs::metadata(&fifo)?.nlink(), 2);
+        let fifo_moved = bucket.join("events-moved.fifo");
+        std::fs::rename(&fifo_link, &fifo_moved)?;
+        std::fs::remove_file(&fifo)?;
+        assert!(std::fs::symlink_metadata(&fifo_moved)?
+            .file_type()
+            .is_fifo());
+
+        let replacement = bucket.join("replacement");
+        std::fs::write(&replacement, b"old")?;
+        std::fs::rename(&fifo_moved, &replacement)?;
+        assert!(std::fs::symlink_metadata(&replacement)?
+            .file_type()
+            .is_fifo());
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/replacement"));
+
+        let source = bucket.join("source.bin");
+        std::fs::write(&source, b"new")?;
+        std::fs::rename(&source, &replacement)?;
+        assert!(std::fs::metadata(&replacement)?.file_type().is_file());
+        assert_eq!(std::fs::read(&replacement)?, b"new");
+        assert_eq!(
+            operation_store
+                .lock()
+                .unwrap()
+                .get("/s3/bucket/replacement"),
+            Some(&b"new".to_vec())
+        );
+
+        drop(listener);
+        std::fs::remove_file(&socket)?;
+        std::fs::remove_file(&replacement)?;
+        std::fs::remove_file(&regular)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise mount-local special nodes through mount");
+}
+
+/// Validate privileged block and character device creation through FUSE.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires privileged /dev/fuse and TALON_TEST_DEVICE_NODES=1"]
+async fn mount_device_nodes_preserve_rdev() {
+    use fuser::MountOption;
+
+    if std::env::var_os("TALON_TEST_DEVICE_NODES").is_none() {
+        return;
+    }
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::from([(
+        "/s3/bucket/placeholder".to_string(),
+        Vec::new(),
+    )])));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new());
+    fs.insert_object("s3/bucket/placeholder", 0);
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-devices-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let options = vec![MountOption::FSName("talon".into())];
+    let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
+        .expect("privileged device-node test requires a working FUSE mount");
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let bucket = mountpoint.join("s3").join("bucket");
+    let operation_store = Arc::clone(&store);
+    let result = tokio::task::spawn_blocking(move || {
+        let block = bucket.join("block.dev");
+        let character = bucket.join("char.dev");
+        let block_path = std::ffi::CString::new(block.as_os_str().as_bytes()).unwrap();
+        let char_path = std::ffi::CString::new(character.as_os_str().as_bytes()).unwrap();
+        let block_rdev = libc::makedev(7, 1);
+        let char_rdev = libc::makedev(1, 3);
+        let result = unsafe { libc::mknod(block_path.as_ptr(), libc::S_IFBLK | 0o600, block_rdev) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let result = unsafe { libc::mknod(char_path.as_ptr(), libc::S_IFCHR | 0o620, char_rdev) };
+        if result != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+
+        let block_metadata = std::fs::symlink_metadata(&block)?;
+        assert!(block_metadata.file_type().is_block_device());
+        assert_eq!(block_metadata.rdev(), block_rdev);
+        let char_metadata = std::fs::symlink_metadata(&character)?;
+        assert!(char_metadata.file_type().is_char_device());
+        assert_eq!(char_metadata.rdev(), char_rdev);
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/block.dev"));
+        assert!(!operation_store
+            .lock()
+            .unwrap()
+            .contains_key("/s3/bucket/char.dev"));
+
+        std::fs::remove_file(&block)?;
+        std::fs::remove_file(&character)?;
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap();
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+    result.expect("exercise block and character device nodes through mount");
 }
 
 /// Mount the read-write fixture and run the pinned pjdfstest suite against it.
