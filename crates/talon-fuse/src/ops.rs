@@ -67,6 +67,8 @@ pub enum FsError {
     Invalid,
     /// A directory is not empty (`ENOTEMPTY`).
     NotEmpty,
+    /// A pathname component exceeds the filesystem name limit (`ENAMETOOLONG`).
+    NameTooLong,
 }
 
 /// Access and mutation behavior for an open file handle.
@@ -840,7 +842,9 @@ impl ReadOnlyFs {
     }
 
     fn validate_component(name: &str) -> Result<(), FsError> {
-        if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        if name.len() > 255 {
+            Err(FsError::NameTooLong)
+        } else if name.is_empty() || name == "." || name == ".." || name.contains('/') {
             Err(FsError::Invalid)
         } else {
             Ok(())
@@ -1021,6 +1025,24 @@ mod tests {
         );
         fs.rmdir(parent.ino, "new").unwrap();
         assert_eq!(fs.lookup(parent.ino, "new"), Err(FsError::NotFound));
+    }
+
+    #[test]
+    fn directory_operations_reject_names_over_name_max() {
+        let fs = fs();
+        let parent = data_dir(&fs);
+        let name = "x".repeat(256);
+
+        assert_eq!(
+            fs.new_directory_marker_path(parent.ino, &name),
+            Err(FsError::NameTooLong)
+        );
+        assert_eq!(fs.mkdir(parent.ino, &name), Err(FsError::NameTooLong));
+        assert_eq!(
+            fs.rmdir_marker_path(parent.ino, &name),
+            Err(FsError::NameTooLong)
+        );
+        assert_eq!(fs.rmdir(parent.ino, &name), Err(FsError::NameTooLong));
     }
 
     #[test]
