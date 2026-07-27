@@ -721,9 +721,11 @@ impl fuser::Filesystem for TalonFuse {
         }
     }
 
-    /// Set attributes; only a size change (truncate) is meaningful for a write
-    /// handle. Other attribute sets are accepted as a no-op so `chmod`/`touch`
-    /// don't fail the write flow.
+    /// Set attributes. Size changes are written through as complete replacement
+    /// objects before the visible inode and handle state is committed.
+    ///
+    /// Other attribute sets are accepted as a no-op until the metadata model is
+    /// implemented, so `chmod`/`touch` do not fail unrelated write flows.
     #[allow(clippy::too_many_arguments)]
     fn setattr(
         &mut self,
@@ -747,11 +749,42 @@ impl fuser::Filesystem for TalonFuse {
             if !self.read_write {
                 return reply.error(libc::EROFS);
             }
-            if let Some(fh) = fh {
-                if let Err(e) = self.fs.truncate(fh, new_size) {
-                    return reply.error(errno(e));
-                }
+            if new_size > self.fs.max_object_bytes() {
+                return reply.error(libc::EFBIG);
             }
+            let (path, contents) = if let Some(fh) = fh {
+                match self.fs.truncate_handle_plan(fh, new_size) {
+                    Ok(plan) => plan,
+                    Err(e) => return reply.error(errno(e)),
+                }
+            } else {
+                let (path, current_size) = match self.fs.inode_file_meta(ino) {
+                    Ok(meta) => meta,
+                    Err(e) => return reply.error(errno(e)),
+                };
+                let retained_size = current_size.min(new_size);
+                let existing = match self.read_committed_object(&path, retained_size) {
+                    Ok(contents) => contents,
+                    Err(error) => return reply.error(error),
+                };
+                match self.fs.truncate_inode_plan(ino, new_size, existing) {
+                    Ok(plan) => plan,
+                    Err(e) => return reply.error(errno(e)),
+                }
+            };
+            if let Err(error) = self.writeback_object(&path, contents.clone()) {
+                tracing::warn!(%path, %error, "truncate writeback failed");
+                return reply.error(libc::EIO);
+            }
+            let attr = if let Some(fh) = fh {
+                self.fs.commit_handle_contents(fh, contents)
+            } else {
+                self.fs.commit_inode_contents(ino, contents)
+            };
+            return match attr {
+                Ok(attr) => reply.attr(&ATTR_TTL, &to_file_attr(attr, req.uid(), req.gid())),
+                Err(e) => reply.error(errno(e)),
+            };
         }
         // Reply with the current attributes.
         match self.fs.getattr(ino) {
