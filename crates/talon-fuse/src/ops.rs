@@ -1193,32 +1193,32 @@ mod tests {
                     write: true,
                     append: false,
                 },
-                Some(b"hello".to_vec()),
+                Some(b"abcde".to_vec()),
             )
             .unwrap();
 
         let (path, planned) = fs.truncate_handle_plan(write_fh, 3).unwrap();
         assert_eq!(path, "s3/bucket/data/a.bin");
-        assert_eq!(planned, b"hel");
+        assert_eq!(planned, b"abc");
         assert_eq!(fs.getattr(file.ino).unwrap().size, 5);
-        assert_eq!(fs.dirty_bytes(write_fh).unwrap(), b"hello");
+        assert_eq!(fs.dirty_bytes(write_fh).unwrap(), b"abcde");
 
         let committed = fs.commit_handle_contents(write_fh, planned).unwrap();
         assert_eq!(committed.size, 3);
-        assert_eq!(fs.dirty_bytes(write_fh).unwrap(), b"hel");
+        assert_eq!(fs.dirty_bytes(write_fh).unwrap(), b"abc");
 
         let (path, planned) = fs
-            .truncate_inode_plan(file.ino, 6, b"hel".to_vec())
+            .truncate_inode_plan(file.ino, 6, b"abc".to_vec())
             .unwrap();
         assert_eq!(path, "s3/bucket/data/a.bin");
-        assert_eq!(planned, vec![b'h', b'e', b'l', 0, 0, 0]);
+        assert_eq!(planned, vec![b'a', b'b', b'c', 0, 0, 0]);
         assert_eq!(fs.getattr(file.ino).unwrap().size, 3);
 
         fs.commit_inode_contents(file.ino, planned).unwrap();
         assert_eq!(fs.getattr(file.ino).unwrap().size, 6);
         assert_eq!(
             fs.dirty_bytes(write_fh).unwrap(),
-            vec![b'h', b'e', b'l', 0, 0, 0]
+            vec![b'a', b'b', b'c', 0, 0, 0]
         );
     }
 
