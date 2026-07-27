@@ -350,6 +350,31 @@ async fn mount_write_through_is_visible_in_backend() {
         .unwrap()
         .expect("overwrite file");
 
+    // 2b) Regression: opening the existing object read-write WITHOUT O_TRUNC
+    //     and immediately closing must succeed without changing backend bytes.
+    let p = path.clone();
+    let bytes = tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&p)?;
+        drop(file);
+        // Re-open read-only and report what the object now holds.
+        std::fs::read(&p)
+    })
+    .await
+    .unwrap()
+    .expect("open existing object read-write without truncating");
+    assert_eq!(
+        bytes, overwrite,
+        "O_RDWR open+close must not truncate the object"
+    );
+    assert_eq!(
+        store.lock().unwrap().get("/s3/bucket/hello.bin"),
+        Some(&overwrite),
+        "backend bytes must survive a bare O_RDWR open+close"
+    );
+
     // 3) Delete it.
     let p = path.clone();
     let removed = tokio::task::spawn_blocking(move || std::fs::remove_file(&p)).await;
@@ -362,7 +387,7 @@ async fn mount_write_through_is_visible_in_backend() {
     // The backend should have seen the overwrite bytes, then the delete.
     let final_store = store.lock().unwrap();
     assert!(
-        !final_store.contains_key("s3/bucket/hello.bin"),
+        !final_store.contains_key("/s3/bucket/hello.bin"),
         "object should be gone from backend after unlink"
     );
 }

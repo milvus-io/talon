@@ -286,6 +286,28 @@ impl TalonFuse {
         })
     }
 
+    /// Read the committed object before opening a writable working copy.
+    fn read_committed_object(&self, path: &str, size: u64) -> Result<Vec<u8>, i32> {
+        if size == 0 {
+            return Ok(Vec::new());
+        }
+        let object = path_to_object(path).map_err(|_| libc::EINVAL)?;
+        let reader = self.reader.clone();
+        let block_size = self.block_size;
+        let version = self.version.clone();
+        self.runtime
+            .block_on(async move {
+                let view = FileView {
+                    object: &object,
+                    block_size,
+                    version: &version,
+                    size,
+                };
+                reader.read(&view, 0, size, now_ms()).await
+            })
+            .map_err(|_| libc::EIO)
+    }
+
     /// The namespace tree backing metadata ops.
     pub fn namespace(&self) -> &Arc<ReadOnlyFs> {
         &self.fs
@@ -420,15 +442,29 @@ impl fuser::Filesystem for TalonFuse {
     /// session, so repeated reads and `mmap` can serve from RAM without a FUSE
     /// round-trip (issue #180).
     fn open(&mut self, _req: &fuser::Request<'_>, ino: u64, flags: i32, reply: fuser::ReplyOpen) {
-        // A write/read-write open (O_WRONLY / O_RDWR) starts a dirty buffer for
-        // whole-object rewrite (#232); a read-only open uses the read handle.
+        // A write/read-write open needs the committed bytes as its initial
+        // whole-object working copy. Linux may handle O_TRUNC through setattr
+        // before open, so rejecting an open that lacks the flag breaks normal
+        // std::fs::write and does not reliably identify truncation.
         let accmode = flags & libc::O_ACCMODE;
         let wants_write = accmode == libc::O_WRONLY || accmode == libc::O_RDWR;
         if wants_write {
             if !self.read_write {
                 return reply.error(libc::EROFS);
             }
-            match self.fs.open_write(ino) {
+            let initial_contents = if flags & libc::O_TRUNC != 0 {
+                Vec::new()
+            } else {
+                let (path, size) = match self.fs.inode_file_meta(ino) {
+                    Ok(meta) => meta,
+                    Err(error) => return reply.error(errno(error)),
+                };
+                match self.read_committed_object(&path, size) {
+                    Ok(contents) => contents,
+                    Err(error) => return reply.error(error),
+                }
+            };
+            match self.fs.open_write(ino, initial_contents) {
                 // No FOPEN_KEEP_CACHE for a write handle: contents are changing.
                 Ok(fh) => reply.opened(fh, 0),
                 Err(e) => reply.error(errno(e)),

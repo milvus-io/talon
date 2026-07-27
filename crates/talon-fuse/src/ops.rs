@@ -324,6 +324,16 @@ impl ReadOnlyFs {
         Ok((node.path.clone(), node.size))
     }
 
+    /// Return the committed object path and size before opening a writable copy.
+    pub fn inode_file_meta(&self, ino: u64) -> Result<(String, u64), FsError> {
+        let g = self.inner.lock_recover();
+        let node = g.nodes.get(&ino).ok_or(FsError::NotFound)?;
+        if node.kind != FileKind::File {
+            return Err(FsError::Unsupported);
+        }
+        Ok((node.path.clone(), node.size))
+    }
+
     // ----- write path (#231) -----------------------------------------------
 
     /// `create`: make a new empty file `name` under directory `parent_ino` and
@@ -377,12 +387,8 @@ impl ReadOnlyFs {
         Ok((attr, fh))
     }
 
-    /// Open an existing file `ino` for writing, starting from an empty buffer
-    /// (whole-object rewrite, `O_TRUNC` semantics for v1). Returns a write handle.
-    ///
-    /// In-place edit of existing contents (`O_RDWR` without truncate) would need
-    /// to first fetch the current object into the buffer; that is future work.
-    pub fn open_write(&self, ino: u64) -> Result<u64, FsError> {
+    /// Open an existing file `ino` for writing from a whole-object working copy.
+    pub fn open_write(&self, ino: u64, initial_contents: Vec<u8>) -> Result<u64, FsError> {
         let mut g = self.inner.lock_recover();
         let kind = g.nodes.get(&ino).ok_or(FsError::NotFound)?.kind;
         if kind != FileKind::File {
@@ -391,16 +397,16 @@ impl ReadOnlyFs {
         let fh = g.next_fh;
         g.next_fh += 1;
         g.handles.insert(fh, ino);
+        let size = initial_contents.len() as u64;
         g.dirty.insert(
             fh,
             DirtyFile {
                 ino,
-                buf: Vec::new(),
+                buf: initial_contents,
             },
         );
-        // A truncating open resets the visible size immediately.
         if let Some(node) = g.nodes.get_mut(&ino) {
-            node.size = 0;
+            node.size = size;
         }
         Ok(fh)
     }
@@ -879,5 +885,46 @@ mod tests {
                 .max_object_bytes(),
             7
         );
+    }
+
+    /// Regression: a non-truncating write open must NOT start an empty dirty
+    /// buffer. Doing so meant `open(O_RDWR)` + `close()` PUT zero bytes over a
+    /// live object — silent remote data loss with no write ever issued.
+    #[test]
+    fn open_write_preserves_existing_contents() {
+        let fs = fs();
+        let bucket = fs
+            .lookup(fs.lookup(ROOT_INO, "s3").unwrap().ino, "bucket")
+            .unwrap();
+        let dir = fs.lookup(bucket.ino, "data").unwrap();
+        let file = fs.lookup(dir.ino, "a.bin").unwrap();
+        let fh = fs.open_write(file.ino, b"existing".to_vec()).unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"existing");
+        assert_eq!(fs.getattr(file.ino).unwrap().size, 8);
+        fs.write(fh, 0, b"new").unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"newsting");
+    }
+
+    #[test]
+    fn open_write_with_truncate_resets_size_and_opens_a_write_handle() {
+        let fs = fs();
+        let bucket = fs
+            .lookup(fs.lookup(ROOT_INO, "s3").unwrap().ino, "bucket")
+            .unwrap();
+        let dir = fs.lookup(bucket.ino, "data").unwrap();
+        let file = fs.lookup(dir.ino, "a.bin").unwrap();
+
+        let fh = fs.open_write(file.ino, Vec::new()).unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), Vec::<u8>::new());
+        assert_eq!(fs.getattr(file.ino).unwrap().size, 0);
+        fs.write(fh, 0, b"new contents").unwrap();
+        assert_eq!(fs.dirty_bytes(fh).unwrap(), b"new contents");
+    }
+
+    #[test]
+    fn open_write_on_a_directory_is_unsupported() {
+        let fs = fs();
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        assert_eq!(fs.open_write(s3.ino, Vec::new()), Err(FsError::Unsupported));
     }
 }
