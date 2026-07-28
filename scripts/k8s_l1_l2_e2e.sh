@@ -356,7 +356,7 @@ declare -A placed_workers=()
 for i in $(seq 0 29); do
   output="$(placed_read "shard-$i.bin" 4096 "$ARTIFACT_DIR/shard-$i.out" 2>&1)"
   echo "$output" >>"$ARTIFACT_DIR/placement.log"
-  address="$(sed -n 's/^placed .* on \\([^ ]*\\)$/\\1/p' <<<"$output")"
+  address="$(awk '$1 == "placed" {print $NF}' <<<"$output")"
   [[ -n "$address" ]] || fail "could not parse worker address from client output"
   placed_workers["$address"]=1
 done
