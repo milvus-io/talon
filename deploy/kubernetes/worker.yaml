@@ -110,8 +110,8 @@ spec:
             # includes this capacity plus the worker's normal heap/runtime use.
             - name: TALON_WORKER_L1_CAPACITY_BYTES
               value: "0"
-            - name: TALON_WORKER_L1_MAX_ENTRY_BYTES
-              value: "4194304"
+            - name: TALON_WORKER_L1_PAGE_SIZE_BYTES
+              value: "262144"
             # Object-store backend credentials from the Secret — never logged.
             - name: TALON_WORKER_AZURE_ACCOUNT
               valueFrom:

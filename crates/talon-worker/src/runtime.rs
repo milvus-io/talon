@@ -60,7 +60,8 @@ pub enum ServeOutcome {
 
 /// Shared state required to serve instrumented data-plane range requests.
 pub struct WorkerRuntime {
-    /// Small-block DRAM cache. L1 is inclusive: every entry also exists in L2.
+    /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
+    /// whole-block parent.
     l1: Arc<MemoryStore>,
     /// Persistent local-NVMe cache.
     store: WholeBlockStore,
@@ -124,7 +125,7 @@ impl WorkerRuntime {
         block_size: u32,
         capacity_bytes: u64,
         l1_capacity_bytes: u64,
-        l1_max_entry_bytes: u64,
+        l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
     ) -> Self {
         let lru = Arc::new(Lru::new());
@@ -133,7 +134,7 @@ impl WorkerRuntime {
         }
         let l1 = Arc::new(MemoryStore::with_limits(
             l1_capacity_bytes,
-            l1_max_entry_bytes,
+            l1_page_size_bytes,
         ));
         metrics.set_l1_capacity(l1_capacity_bytes);
         metrics.update_l1_residency(0, 0);
@@ -289,43 +290,21 @@ impl WorkerRuntime {
             .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
         let start_block = (request.offset / block_size) * block_size;
 
-        // Single-block fast paths: L1 bytes first, then an L2 sendfile handle.
+        // With L1 enabled, use the page-granular byte path. With L1 disabled,
+        // preserve the whole-block L2 sendfile fast path.
         if end <= start_block + block_size {
             let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
-            if let Some(bytes) = self.l1_get(&block) {
-                return Ok(ServeOutcome::Bytes(slice(
-                    &bytes,
-                    offset_in_block,
-                    request.len,
-                )?));
+            if self.l1.is_enabled() {
+                return Ok(ServeOutcome::Bytes(
+                    self.block_range_bytes(request, &block, offset_in_block, request.len)
+                        .await?,
+                ));
             }
             if matches!(
                 self.index.presence(&block, PageIndex(0), PageIndex(1)),
                 Presence::Whole
             ) {
-                // Small blocks are promoted into L1 on their first post-restart L2
-                // hit. Large blocks preserve the zero-copy sendfile path.
-                if self
-                    .index
-                    .get(&block)
-                    .is_some_and(|meta| self.l1.is_eligible(meta.len))
-                {
-                    match self.store.get_bytes(&block).await {
-                        Ok(bytes) => {
-                            self.record_l2_hit(&block);
-                            self.admit_l1(&block, bytes.clone());
-                            return Ok(ServeOutcome::Bytes(slice(
-                                &bytes,
-                                offset_in_block,
-                                request.len,
-                            )?));
-                        }
-                        Err(error) => {
-                            tracing::debug!(%block, %error, "L2 promotion read lost an eviction race");
-                        }
-                    }
-                }
                 // Open an fd over exactly the requested window. This can fail if
                 // the block was evicted between the presence check and the open
                 // (a benign race); fall through to the byte path in that case.
@@ -350,14 +329,10 @@ impl WorkerRuntime {
                 }
             }
 
-            self.metrics.record_l2_miss();
-            self.metrics.record_cache_miss();
-            let bytes = self.load_block_bytes(request, &block).await?;
-            return Ok(ServeOutcome::Bytes(slice(
-                &bytes,
-                offset_in_block,
-                request.len,
-            )?));
+            return Ok(ServeOutcome::Bytes(
+                self.block_range_bytes(request, &block, offset_in_block, request.len)
+                    .await?,
+            ));
         }
 
         // Fallback: miss or boundary-spanning read → in-memory bytes.
@@ -389,8 +364,9 @@ impl WorkerRuntime {
         if end <= start_block + block_size {
             let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
-            let bytes = self.block_bytes(request, &block).await?;
-            return slice(&bytes, offset_in_block, request.len);
+            return self
+                .block_range_bytes(request, &block, offset_in_block, request.len)
+                .await;
         }
 
         // Slow path: stitch across blocks.
@@ -401,8 +377,9 @@ impl WorkerRuntime {
             let offset_in_block = cursor - block.offset;
             let block_end = block.offset + block_size;
             let take = block_end.min(end) - cursor;
-            let bytes = self.block_bytes(request, &block).await?;
-            let piece = slice(&bytes, offset_in_block, take)?;
+            let piece = self
+                .block_range_bytes(request, &block, offset_in_block, take)
+                .await?;
             // A block that returned fewer bytes than its share means the object
             // ends inside it; stop rather than silently returning a short read.
             let short = piece.len() < take as usize;
@@ -571,8 +548,8 @@ impl WorkerRuntime {
         self.version_cache.lock().unwrap().remove(object);
     }
 
-    /// Return the full committed/fetched bytes of a single block, using the
-    /// cache-hit path when resident and the backend-miss path otherwise.
+    /// Return one block-relative range, using L1 pages, then an aligned L2 read,
+    /// then a whole-block origin fill.
     ///
     /// Concurrent misses for the same block are deduplicated: the first caller
     /// (the leader, holding an `InFlightGuard`) performs the backend fetch; the
@@ -580,24 +557,28 @@ impl WorkerRuntime {
     /// misses trigger a single backend fetch instead of N (issue #113). The
     /// guard clears the in-flight marker on drop, so a cancelled or panicking
     /// leader can never orphan the key and hang the waiters (issue #162).
-    async fn block_bytes(
+    async fn block_range_bytes(
         &self,
         request: &RangeRequest,
         block: &BlockId,
+        offset: u64,
+        len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
-        if let Some(bytes) = self.cached_block(block).await? {
+        if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
             return Ok(bytes);
         }
 
         self.metrics.record_cache_miss();
-        self.load_block_bytes(request, block).await
+        self.load_block_range(request, block, offset, len).await
     }
 
     /// Load one block after both L1 and L2 have missed.
-    async fn load_block_bytes(
+    async fn load_block_range(
         &self,
         request: &RangeRequest,
         block: &BlockId,
+        offset: u64,
+        len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         let key = LoadKey::Whole(block.clone());
         match self.inflight.admit_owned(key.clone()) {
@@ -606,13 +587,14 @@ impl WorkerRuntime {
                 // (including on cancellation/panic).
                 let result = self.fetch_and_commit(request, block).await;
                 drop(guard);
-                result
+                let bytes = result?;
+                self.range_from_fetched(block, bytes, offset, len)
             }
             None => {
                 // A peer is already fetching this block; wait for it and serve
                 // from cache rather than issuing a duplicate backend fetch.
                 self.inflight.wait(&key).await;
-                if let Some(bytes) = self.cached_block(block).await? {
+                if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                     return Ok(bytes);
                 }
                 // The leader's load failed (marker cleared, block still absent).
@@ -621,65 +603,98 @@ impl WorkerRuntime {
                     Some(guard) => {
                         let result = self.fetch_and_commit(request, block).await;
                         drop(guard);
-                        result
+                        let bytes = result?;
+                        self.range_from_fetched(block, bytes, offset, len)
                     }
                     None => {
                         // Another peer already restarted the load; wait once
                         // more, then, if still absent, fetch without holding
                         // admission to avoid an unbounded wait loop.
                         self.inflight.wait(&key).await;
-                        if let Some(bytes) = self.cached_block(block).await? {
+                        if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                             return Ok(bytes);
                         }
-                        self.fetch_and_commit(request, block).await
+                        let bytes = self.fetch_and_commit(request, block).await?;
+                        self.range_from_fetched(block, bytes, offset, len)
                     }
                 }
             }
         }
     }
 
-    /// Return a block's bytes from the local cache if resident, else `None`.
-    async fn cached_block(&self, block: &BlockId) -> anyhow::Result<Option<bytes::Bytes>> {
-        if let Some(bytes) = self.l1_get(block) {
+    /// Return a block range from the local cache if its L2 parent is resident.
+    async fn cached_block_range(
+        &self,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<Option<bytes::Bytes>> {
+        let Some(meta) = self.index.get(block) else {
+            if self.l1.is_enabled() {
+                self.metrics.record_l1_miss();
+            }
+            self.metrics.record_l2_miss();
+            return Ok(None);
+        };
+        if !matches!(meta.form, BlockForm::Whole) {
+            self.metrics.record_l2_miss();
+            return Ok(None);
+        }
+        let len = available_range_len(meta.len, offset, len)?;
+        if self.l1.is_enabled() {
+            match self.l1.get_range(block, offset, len) {
+                Some(bytes) => {
+                    self.metrics.record_l1_hit();
+                    self.metrics.record_cache_hit();
+                    self.lru.touch(&CacheUnit::Whole(block.clone()));
+                    tracing::debug!(block = %block, offset, len, tier = "l1", "HIT");
+                    return Ok(Some(bytes));
+                }
+                None => {
+                    self.metrics.record_l1_miss();
+                }
+            }
+        }
+
+        self.record_l2_hit(block);
+        tracing::debug!(block = %block, offset, len, tier = "l2", "HIT");
+        if !self.l1.is_enabled() {
+            let bytes = match self.store.get_range_bytes(block, offset, len).await {
+                Ok(bytes) => bytes,
+                Err(Error::NotFound(_)) => {
+                    self.forget_missing_l2_parent(block);
+                    return Ok(None);
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!("read committed block range: {error}"));
+                }
+            };
             return Ok(Some(bytes));
         }
-        if matches!(
-            self.index.presence(block, PageIndex(0), PageIndex(1)),
-            Presence::Whole
-        ) {
-            self.record_l2_hit(block);
-            tracing::info!(block = %block, tier = "l2", "HIT");
-            let bytes = self
-                .store
-                .get_bytes(block)
-                .await
-                .map_err(|error| anyhow::anyhow!("read committed block: {error}"))?;
-            self.admit_l1(block, bytes.clone());
-            Ok(Some(bytes))
-        } else {
-            self.metrics.record_l2_miss();
-            Ok(None)
-        }
+
+        let (page_start, page_len) = self.page_window(offset, len, meta.len)?;
+        let pages = match self
+            .store
+            .get_range_bytes(block, page_start, page_len)
+            .await
+        {
+            Ok(bytes) => bytes,
+            Err(Error::NotFound(_)) => {
+                self.forget_missing_l2_parent(block);
+                return Ok(None);
+            }
+            Err(error) => return Err(anyhow::anyhow!("read committed L2 pages: {error}")),
+        };
+        self.admit_l1_pages(block, page_start, pages.clone());
+        Ok(Some(slice(&pages, offset - page_start, len)?))
     }
 
-    /// Read L1 and keep the inclusive L2 parent hot when present.
-    fn l1_get(&self, block: &BlockId) -> Option<bytes::Bytes> {
-        if !self.l1.is_enabled() {
-            return None;
-        }
-        match self.l1.get(block) {
-            Some(bytes) => {
-                self.metrics.record_l1_hit();
-                self.metrics.record_cache_hit();
-                self.lru.touch(&CacheUnit::Whole(block.clone()));
-                tracing::info!(block = %block, tier = "l1", "HIT");
-                Some(bytes)
-            }
-            None => {
-                self.metrics.record_l1_miss();
-                None
-            }
-        }
+    /// Drop stale metadata after an index-hit/file-miss eviction race.
+    fn forget_missing_l2_parent(&self, block: &BlockId) {
+        self.invalidate_l1(block);
+        self.index.remove(block);
+        self.lru.remove(&CacheUnit::Whole(block.clone()));
+        tracing::debug!(%block, "discarded stale L2 index entry after file miss");
     }
 
     /// Record an L2 hit and touch its capacity LRU.
@@ -689,23 +704,84 @@ impl WorkerRuntime {
         self.lru.touch(&CacheUnit::Whole(block.clone()));
     }
 
-    /// Admit eligible bytes into L1 and publish resulting residency/evictions.
-    fn admit_l1(&self, block: &BlockId, bytes: bytes::Bytes) {
-        match self.l1.insert(block.clone(), bytes) {
-            MemoryInsert::Inserted { evicted } => {
-                self.metrics.record_l1_admission();
-                for victim in evicted {
-                    self.metrics.record_l1_eviction();
-                    tracing::debug!(block = %victim, tier = "l1", "evicted block");
-                }
-                self.refresh_l1_metrics();
-            }
-            MemoryInsert::Disabled | MemoryInsert::TooLarge => {}
+    fn page_window(&self, offset: u64, len: u64, block_len: u64) -> anyhow::Result<(u64, u64)> {
+        if len == 0 {
+            return Ok((offset, 0));
         }
+        let page_size = self.l1.page_size_bytes();
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
+        let start = (offset / page_size) * page_size;
+        let aligned_end = end
+            .div_ceil(page_size)
+            .saturating_mul(page_size)
+            .min(block_len);
+        Ok((start, aligned_end.saturating_sub(start)))
+    }
+
+    /// Split an aligned byte window into pages and publish L1 residency changes.
+    fn admit_l1_pages(&self, block: &BlockId, start: u64, bytes: bytes::Bytes) {
+        if !self.l1.is_enabled() || bytes.is_empty() {
+            return;
+        }
+        let page_size = self.l1.page_size_bytes();
+        debug_assert_eq!(start % page_size, 0);
+        let first_page = start / page_size;
+        let mut chunk_start = 0_usize;
+        let Ok(page_size_usize) = usize::try_from(page_size) else {
+            return;
+        };
+        let mut relative = 0_u64;
+        while chunk_start < bytes.len() {
+            let chunk_end = (chunk_start + page_size_usize).min(bytes.len());
+            let page_number = first_page + relative;
+            let Ok(page_number) = u32::try_from(page_number) else {
+                break;
+            };
+            match self.l1.insert_page(
+                block.clone(),
+                PageIndex(page_number),
+                bytes.slice(chunk_start..chunk_end),
+            ) {
+                MemoryInsert::Inserted { evicted } => {
+                    self.metrics.record_l1_admission();
+                    for victim in evicted {
+                        self.metrics.record_l1_eviction();
+                        tracing::debug!(
+                            block = %victim.block,
+                            page = victim.page.0,
+                            tier = "l1",
+                            "evicted page"
+                        );
+                    }
+                }
+                MemoryInsert::Disabled | MemoryInsert::TooLarge => {}
+            }
+            chunk_start = chunk_end;
+            relative += 1;
+        }
+        self.refresh_l1_metrics();
+    }
+
+    fn range_from_fetched(
+        &self,
+        block: &BlockId,
+        bytes: bytes::Bytes,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let len = available_range_len(bytes.len() as u64, offset, len)?;
+        if self.l1.is_enabled() && len > 0 {
+            let (page_start, page_len) = self.page_window(offset, len, bytes.len() as u64)?;
+            let pages = slice(&bytes, page_start, page_len)?;
+            self.admit_l1_pages(block, page_start, pages);
+        }
+        slice(&bytes, offset, len)
     }
 
     fn invalidate_l1(&self, block: &BlockId) {
-        if self.l1.remove(block) {
+        if !self.l1.remove_block(block).is_empty() {
             self.refresh_l1_metrics();
         }
     }
@@ -772,7 +848,6 @@ impl WorkerRuntime {
         if !self.l1.remove_superseded(block).is_empty() {
             self.refresh_l1_metrics();
         }
-        self.admit_l1(block, bytes.clone());
         tracing::info!(block = %block, bytes = len, "committed block");
         Ok(bytes)
     }
@@ -840,7 +915,7 @@ impl WorkerRuntime {
         if !self.l1.remove_superseded(&block).is_empty() {
             self.refresh_l1_metrics();
         }
-        self.admit_l1(&block, body);
+        self.admit_l1_pages(&block, 0, body);
         tracing::info!(object = %object.to_path(), bytes = len, version = %version, "wrote object");
         Ok(version)
     }
@@ -963,8 +1038,8 @@ impl WorkerRuntime {
         self.index.resident_bytes()
     }
 
-    /// Number of blocks resident in L1.
-    pub fn l1_block_count(&self) -> u64 {
+    /// Number of pages resident in L1.
+    pub fn l1_page_count(&self) -> u64 {
         self.l1.len() as u64
     }
 
@@ -1017,6 +1092,13 @@ fn slice(buffer: &bytes::Bytes, offset: u64, len: u64) -> anyhow::Result<bytes::
     let requested = usize::try_from(len).unwrap_or(usize::MAX);
     let end = start.saturating_add(requested).min(buffer.len());
     Ok(buffer.slice(start..end))
+}
+
+fn available_range_len(block_len: u64, offset: u64, requested: u64) -> anyhow::Result<u64> {
+    if offset > block_len {
+        anyhow::bail!("offset {offset} beyond block length {block_len} bytes");
+    }
+    Ok(requested.min(block_len - offset))
 }
 
 /// Whether an error chain carries a backend [`Error::VersionMismatch`], i.e. an
@@ -1291,7 +1373,7 @@ mod tests {
         root: &PathBuf,
         l2_capacity: u64,
         l1_capacity: u64,
-        l1_max_entry: u64,
+        l1_page_size: u64,
     ) -> WorkerRuntime {
         WorkerRuntime::new_with_l1(
             WholeBlockStore::open(root).unwrap(),
@@ -1301,7 +1383,7 @@ mod tests {
             8,
             l2_capacity,
             l1_capacity,
-            l1_max_entry,
+            l1_page_size,
             metrics,
         )
         .with_version_ttl(Duration::ZERO)
@@ -1347,7 +1429,7 @@ mod tests {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
             ServeOutcome::Sendfile(_) => panic!("origin miss must return fetched bytes"),
         }
-        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_page_count(), 1);
         assert_eq!(runtime.l1_resident_bytes(), 8);
 
         match runtime.serve(&request("l1")).await.unwrap() {
@@ -1360,7 +1442,7 @@ mod tests {
         assert!(rendered.contains("talon_worker_cache_tier_misses_total{tier=\"l1\"} 1"));
         assert!(rendered.contains("talon_worker_cache_tier_misses_total{tier=\"l2\"} 1"));
         assert!(rendered.contains("talon_worker_l1_admissions_total 1"));
-        assert!(rendered.contains("talon_worker_l1_blocks 1"));
+        assert!(rendered.contains("talon_worker_l1_pages 1"));
         assert!(rendered.contains("talon_worker_l1_resident_bytes 8"));
         assert!(rendered.contains("talon_worker_l1_capacity_bytes 16"));
         std::fs::remove_dir_all(root).ok();
@@ -1381,7 +1463,7 @@ mod tests {
             b"abcd"
         );
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(runtime.l1_page_count(), 0);
         assert_eq!(runtime.l1_resident_bytes(), 0);
         let rendered = metrics.render();
         assert!(rendered.contains("talon_worker_cache_tier_hits_total{tier=\"l2\"} 1"));
@@ -1405,7 +1487,7 @@ mod tests {
         );
 
         let _ = runtime.serve(&request("boundary")).await.unwrap();
-        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_page_count(), 1);
         assert_eq!(runtime.l1_resident_bytes(), 8);
         match runtime.serve(&request("boundary")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
@@ -1416,7 +1498,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_block_stays_on_l2_sendfile_path() {
+    async fn block_larger_than_l1_still_caches_its_hot_page() {
         let root = tmp_root();
         let backend = Arc::new(MockBackend {
             calls: AtomicUsize::new(0),
@@ -1425,15 +1507,154 @@ mod tests {
         let runtime = runtime_l1(Arc::clone(&backend), metrics.clone(), &root, 1024, 16, 4);
 
         let _ = runtime.serve(&request("large")).await.unwrap();
-        assert_eq!(runtime.l1_block_count(), 0);
-        assert_eq!(
-            read_handle(runtime.serve(&request("large")).await.unwrap()),
-            b"abcd"
-        );
+        assert_eq!(runtime.l1_page_count(), 1);
+        match runtime.serve(&request("large")).await.unwrap() {
+            ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("hot page must be served from L1"),
+        }
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         assert!(metrics
             .render()
-            .contains("talon_worker_cache_tier_hits_total{tier=\"l2\"} 1"));
+            .contains("talon_worker_cache_tier_hits_total{tier=\"l1\"} 1"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn different_ranges_of_one_block_admit_only_their_touched_pages() {
+        let root = tmp_root();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(CountingRampBackend {
+            block_size: 16,
+            calls: Arc::clone(&calls),
+        });
+        let runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            16,
+            1024,
+            8,
+            4,
+            WorkerMetrics::new(1024),
+        )
+        .with_version_ttl(Duration::ZERO);
+        let object = ObjectId::new(Backend::Azure, "container", "page-hotness");
+
+        let first = RangeRequest {
+            object: object.clone(),
+            offset: 1,
+            len: 2,
+        };
+        assert_eq!(runtime.serve_range(&first).await.unwrap(), expected(1, 2));
+        let block = BlockId::new(object.clone(), 0, 16, Version::new("v1"));
+        assert!(runtime.l1.get_page(&block, PageIndex(0)).is_some());
+        assert!(runtime.l1.get_page(&block, PageIndex(1)).is_none());
+        assert!(runtime.l1.get_page(&block, PageIndex(2)).is_none());
+        assert_eq!(runtime.l1_page_count(), 1);
+
+        let second = RangeRequest {
+            object,
+            offset: 9,
+            len: 2,
+        };
+        assert_eq!(runtime.serve_range(&second).await.unwrap(), expected(9, 2));
+        assert!(runtime.l1.get_page(&block, PageIndex(0)).is_some());
+        assert!(runtime.l1.get_page(&block, PageIndex(1)).is_none());
+        assert!(runtime.l1.get_page(&block, PageIndex(2)).is_some());
+        assert!(runtime.l1.get_page(&block, PageIndex(3)).is_none());
+        assert_eq!(runtime.l1_page_count(), 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn range_crossing_page_boundaries_admits_and_hits_all_touched_pages() {
+        let root = tmp_root();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(CountingRampBackend {
+            block_size: 16,
+            calls: Arc::clone(&calls),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            16,
+            1024,
+            16,
+            4,
+            metrics.clone(),
+        )
+        .with_version_ttl(Duration::ZERO);
+        let request = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "cross-pages"),
+            offset: 3,
+            len: 10,
+        };
+
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            expected(3, 10)
+        );
+        assert_eq!(runtime.l1_page_count(), 4);
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            expected(3, 10)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(metrics
+            .render()
+            .contains("talon_worker_cache_tier_hits_total{tier=\"l1\"} 1"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn default_large_block_can_cache_one_small_hot_page() {
+        const BLOCK_SIZE: u32 = 256 << 20;
+        const PAGE_SIZE: u64 = 256 << 10;
+
+        let root = tmp_root();
+        let store = WholeBlockStore::open(&root).unwrap();
+        let object = ObjectId::new(Backend::Azure, "container", "large-block");
+        let block = BlockId::new(object.clone(), 0, BLOCK_SIZE, Version::new("v1"));
+        let bytes = Bytes::from(vec![7_u8; (PAGE_SIZE * 2) as usize]);
+        store.put(&block, bytes.clone()).await.unwrap();
+        let index = Arc::new(BlockIndex::new());
+        index.commit(BlockMeta {
+            id: block.clone(),
+            form: BlockForm::Whole,
+            len: bytes.len() as u64,
+        });
+        let runtime = WorkerRuntime::new_with_l1(
+            store,
+            index,
+            Arc::new(InFlightLoads::new()),
+            Arc::new(RampBackend {
+                block_size: BLOCK_SIZE as u64,
+            }),
+            BLOCK_SIZE,
+            BLOCK_SIZE as u64,
+            PAGE_SIZE * 2,
+            PAGE_SIZE,
+            WorkerMetrics::new(BLOCK_SIZE as u64),
+        );
+        runtime.store_version(&object, &Version::new("v1"));
+        let request = RangeRequest {
+            object,
+            offset: PAGE_SIZE + 17,
+            len: 64,
+        };
+
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            Bytes::from(vec![7_u8; 64])
+        );
+        assert_eq!(runtime.l1_page_count(), 1);
+        assert!(runtime.l1.get_page(&block, PageIndex(0)).is_none());
+        assert!(runtime.l1.get_page(&block, PageIndex(1)).is_some());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1449,7 +1670,7 @@ mod tests {
         let _ = runtime.serve(&request("a")).await.unwrap();
         let _ = runtime.serve(&request("b")).await.unwrap();
         assert_eq!(runtime.block_count(), 2, "both parents remain in L2");
-        assert_eq!(runtime.l1_block_count(), 1, "L1 holds only the MRU block");
+        assert_eq!(runtime.l1_page_count(), 1, "L1 holds only the MRU block");
         assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
 
         match runtime.serve(&request("a")).await.unwrap() {
@@ -1462,7 +1683,7 @@ mod tests {
             "L1 eviction must degrade to L2, not origin"
         );
         assert_eq!(runtime.block_count(), 2);
-        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_page_count(), 1);
         assert!(metrics
             .render()
             .contains("talon_worker_l1_evictions_total 2"));
@@ -1475,25 +1696,31 @@ mod tests {
         let backend = Arc::new(MockBackend {
             calls: AtomicUsize::new(0),
         });
-        let runtime = runtime_l1(Arc::clone(&backend), WorkerMetrics::new(8), &root, 8, 16, 8);
+        let runtime = runtime_l1(Arc::clone(&backend), WorkerMetrics::new(8), &root, 8, 16, 4);
+        let full = |name| RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", name),
+            offset: 0,
+            len: 8,
+        };
 
-        let _ = runtime.serve(&request("a")).await.unwrap();
-        let _ = runtime.serve(&request("b")).await.unwrap();
+        let _ = runtime.serve(&full("a")).await.unwrap();
+        assert_eq!(runtime.l1_page_count(), 2);
+        let _ = runtime.serve(&full("b")).await.unwrap();
         assert_eq!(runtime.block_count(), 1, "L2 capacity keeps one block");
         assert_eq!(
-            runtime.l1_block_count(),
-            1,
-            "evicted L2 parent must not leave an orphan L1 copy"
+            runtime.l1_page_count(),
+            2,
+            "evicted L2 parent must remove all of its child pages"
         );
 
-        let _ = runtime.serve(&request("a")).await.unwrap();
+        let _ = runtime.serve(&full("a")).await.unwrap();
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
             3,
             "reading the L2-evicted block must fetch origin again"
         );
         assert_eq!(runtime.block_count(), 1);
-        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_page_count(), 2);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1509,7 +1736,7 @@ mod tests {
             &root,
             1024,
             16,
-            8,
+            4,
         );
         let _ = first.serve(&request("restart")).await.unwrap();
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
@@ -1528,11 +1755,11 @@ mod tests {
             8,
             1024,
             16,
-            8,
+            4,
             WorkerMetrics::new(1024),
         )
         .with_version_ttl(Duration::ZERO);
-        assert_eq!(restarted.l1_block_count(), 0);
+        assert_eq!(restarted.l1_page_count(), 0);
         assert_eq!(restarted.block_count(), 1);
 
         match restarted.serve(&request("restart")).await.unwrap() {
@@ -1544,7 +1771,52 @@ mod tests {
             1,
             "restart promotion must not refetch object bytes"
         );
-        assert_eq!(restarted.l1_block_count(), 1);
+        assert_eq!(restarted.l1_page_count(), 1);
+        let block = restarted.block_for(
+            &ObjectId::new(Backend::Azure, "container", "restart"),
+            0,
+            &Version::new("v1"),
+        );
+        assert!(restarted.l1.get_page(&block, PageIndex(0)).is_some());
+        assert!(restarted.l1.get_page(&block, PageIndex(1)).is_none());
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn stale_l2_index_entry_refetches_after_file_disappears() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_l1(
+            Arc::clone(&backend),
+            WorkerMetrics::new(1024),
+            &root,
+            1024,
+            16,
+            4,
+        );
+        let req = request("lost-file");
+        assert_eq!(
+            runtime.serve_range(&req).await.unwrap(),
+            Bytes::from_static(b"abcd")
+        );
+
+        let block = runtime.block_for(&req.object, req.offset, &Version::new("v1"));
+        runtime.l1.remove_block(&block);
+        runtime.store.delete(&block).await.unwrap();
+        assert!(
+            runtime.index.get(&block).is_some(),
+            "test must leave stale metadata behind"
+        );
+
+        assert_eq!(
+            runtime.serve_range(&req).await.unwrap(),
+            Bytes::from_static(b"abcd")
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        assert!(runtime.index.get(&block).is_some());
+        assert_eq!(runtime.l1_page_count(), 1);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -1561,7 +1833,7 @@ mod tests {
             &root,
             1024,
             16,
-            8,
+            4,
         ));
         let _ = runtime.serve(&request("hot")).await.unwrap();
 
@@ -1599,7 +1871,7 @@ mod tests {
             8,
             1024,
             16,
-            8,
+            4,
             metrics.clone(),
         )
         .with_version_ttl(Duration::ZERO);
@@ -1611,8 +1883,8 @@ mod tests {
 
         assert_eq!(runtime.serve_range(&req).await.unwrap(), expected(6, 8));
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        assert_eq!(runtime.l1_block_count(), 2);
-        assert_eq!(runtime.l1_resident_bytes(), 16);
+        assert_eq!(runtime.l1_page_count(), 3);
+        assert_eq!(runtime.l1_resident_bytes(), 12);
 
         assert_eq!(runtime.serve_range(&req).await.unwrap(), expected(6, 8));
         assert_eq!(
@@ -1638,14 +1910,14 @@ mod tests {
             &root,
             1024,
             16,
-            8,
+            4,
         );
 
         assert!(runtime.serve(&request("failure")).await.is_err());
         assert_eq!(runtime.inflight_loads(), 0);
         assert_eq!(runtime.block_count(), 0);
         assert_eq!(runtime.resident_bytes(), 0);
-        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(runtime.l1_page_count(), 0);
         assert_eq!(runtime.l1_resident_bytes(), 0);
         std::fs::remove_dir_all(root).ok();
     }
@@ -2085,30 +2357,31 @@ mod tests {
             8,
             1024,
             16,
-            8,
+            4,
             WorkerMetrics::new(1024),
         )
         .with_version_ttl(Duration::ZERO);
 
+        let full_request = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "versioned"),
+            offset: 0,
+            len: 8,
+        };
         assert_eq!(
-            runtime.serve_range(&request("versioned")).await.unwrap(),
-            Bytes::from_static(b"old-")
+            runtime.serve_range(&full_request).await.unwrap(),
+            Bytes::from_static(b"old-data")
         );
         assert_eq!(runtime.block_count(), 1);
-        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_page_count(), 2);
 
         *backend.version.lock().unwrap() = "v2".into();
         *backend.body.lock().unwrap() = Bytes::from_static(b"new-data");
         assert_eq!(
-            runtime.serve_range(&request("versioned")).await.unwrap(),
-            Bytes::from_static(b"new-")
+            runtime.serve_range(&full_request).await.unwrap(),
+            Bytes::from_static(b"new-data")
         );
         assert_eq!(runtime.block_count(), 1, "old L2 version must be removed");
-        assert_eq!(
-            runtime.l1_block_count(),
-            1,
-            "old L1 version must be removed"
-        );
+        assert_eq!(runtime.l1_page_count(), 2, "old L1 pages must be removed");
         assert_eq!(runtime.l1_resident_bytes(), 8);
         std::fs::remove_dir_all(root).ok();
     }
@@ -2175,7 +2448,7 @@ mod tests {
             8,
             1024,
             16,
-            8,
+            4,
             WorkerMetrics::new(1024),
         );
         let object = ObjectId::new(Backend::Azure, "container", "mutable");
@@ -2189,7 +2462,7 @@ mod tests {
         );
         assert_eq!(backend.puts.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.block_count(), 1);
-        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_page_count(), 2);
 
         assert_eq!(
             runtime
@@ -2211,7 +2484,7 @@ mod tests {
         runtime.delete_object(&object).await.unwrap();
         assert_eq!(backend.deletes.load(Ordering::SeqCst), 1);
         assert_eq!(runtime.block_count(), 0);
-        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(runtime.l1_page_count(), 0);
         assert_eq!(runtime.l1_resident_bytes(), 0);
         std::fs::remove_dir_all(root).ok();
     }
