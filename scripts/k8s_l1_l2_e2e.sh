@@ -476,7 +476,7 @@ start_worker_forward "$TARGET_POD"
 direct_read restart.bin 0 4096 "$ARTIFACT_DIR/restart-before.out" >/dev/null
 restart_before="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" \
   -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-kubectl -n "$NAMESPACE" exec "$TARGET_POD" -- /bin/sh -c 'kill 1' >/dev/null 2>&1 || true
+kubectl -n "$NAMESPACE" exec "$TARGET_POD" -- /bin/sh -c 'kill -9 1' >/dev/null 2>&1 || true
 for _ in $(seq 1 120); do
   restart_after="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" \
     -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)"
