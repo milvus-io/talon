@@ -6,8 +6,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use talon_core::{
-    BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId, ObjectStore,
-    PageIndex, Version,
+    Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId,
+    ObjectStore, PageIndex, Version,
 };
 use talon_transport::data::RangeRequest;
 
@@ -294,6 +294,73 @@ impl WorkerRuntime {
             cursor += take;
         }
         Ok(out.freeze())
+    }
+
+    /// List objects under a mount-relative prefix (#332).
+    ///
+    /// `prefix` is a namespace path like `az/container/dir`: the first segment
+    /// selects the backend, the second the bucket/container, and the rest is a
+    /// key prefix. Returned paths are in the same namespace, so a client can
+    /// feed them straight back to `read`.
+    ///
+    /// Pages are drained here rather than exposed to the client: the control
+    /// protocol has no cursor, and adding one would be a wire change. To keep
+    /// that bounded, both the object count and the number of backend round
+    /// trips are capped — an unbounded listing of a large bucket would
+    /// otherwise hold the whole result set in memory and block the caller for
+    /// an unbounded time. A truncated listing is better than an unbounded one,
+    /// and the cap is high enough that a namespace hitting it is already past
+    /// what a single control message should carry.
+    pub async fn list_objects(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
+        /// Objects returned before truncating.
+        const MAX_OBJECTS: usize = 10_000;
+        /// Backend round trips before giving up, independent of page size.
+        const MAX_PAGES: usize = 20;
+        /// Objects requested per backend page.
+        const PAGE_SIZE: u32 = 1000;
+
+        let trimmed = prefix.trim_start_matches('/');
+        let mut parts = trimmed.splitn(3, '/');
+        let backend_prefix = parts.next().unwrap_or("");
+        if backend_prefix.is_empty() {
+            anyhow::bail!(
+                "listing prefix must name a backend, e.g. `az/container/dir`; got {prefix:?}"
+            );
+        }
+        let backend: Backend = backend_prefix.parse().map_err(|_| {
+            anyhow::anyhow!("unknown backend {backend_prefix:?} in listing prefix {prefix:?}")
+        })?;
+        let bucket = parts.next().unwrap_or("");
+        if bucket.is_empty() {
+            anyhow::bail!(
+                "listing prefix must name a bucket/container, e.g. `az/container`; got {prefix:?}"
+            );
+        }
+        let key_prefix = parts.next().unwrap_or("");
+
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        for _ in 0..MAX_PAGES {
+            let page = self
+                .backend
+                .list_objects(bucket, key_prefix, cursor.as_deref(), PAGE_SIZE)
+                .await
+                .map_err(|error| anyhow::anyhow!("list {prefix}: {error}"))?;
+            for object in page.objects {
+                out.push((
+                    format!("{}/{}/{}", backend.prefix(), bucket, object.key),
+                    object.size,
+                ));
+                if out.len() >= MAX_OBJECTS {
+                    return Ok(out);
+                }
+            }
+            match page.next {
+                Some(next) => cursor = Some(next),
+                None => break,
+            }
+        }
+        Ok(out)
     }
 
     /// Return an object's size and current version (#318).

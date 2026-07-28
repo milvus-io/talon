@@ -20,9 +20,63 @@ pub struct ObjectStat {
     pub version: Version,
 }
 
+/// One object returned by a listing: its key and size.
+///
+/// The key is backend-relative (no bucket, no mount prefix); callers map it
+/// into whatever namespace they present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListedObject {
+    /// Object key within the bucket/container.
+    pub key: String,
+    /// Object size in bytes.
+    pub size: u64,
+}
+
+/// One page of a listing.
+///
+/// Pagination is in the type rather than hidden behind an accumulating `Vec`
+/// because a prefix can hold millions of objects: S3 caps a response at 1000
+/// keys, and a method that looped internally would buffer the whole set in
+/// memory before returning. The caller decides how much to pull.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListPage {
+    /// Objects in this page, in the backend's order.
+    pub objects: Vec<ListedObject>,
+    /// Opaque cursor for the next page, or `None` when the listing is complete.
+    ///
+    /// Treat as opaque: S3 calls it a continuation token, GCS a page token, and
+    /// Azure a marker, and none of them are interchangeable.
+    pub next: Option<String>,
+}
+
 /// A durable blob backend that workers load blocks/pages from on cache miss.
 #[async_trait]
 pub trait BackendStore: Send + Sync {
+    /// List objects under `prefix` within `bucket`, one page at a time.
+    ///
+    /// `prefix` is matched literally against object keys; an empty prefix lists
+    /// the bucket. `max_keys` bounds the page — backends clamp it to their own
+    /// maximum (1000 for S3), so a caller cannot use it to demand an unbounded
+    /// response. `cursor` is the [`ListPage::next`] value from the previous
+    /// page, or `None` to start.
+    ///
+    /// The default returns [`crate::Error::Unsupported`], so a backend that cannot
+    /// list says so rather than silently returning an empty page — an empty
+    /// listing and an unsupported one mean very different things to a caller
+    /// building a namespace from it.
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        max_keys: u32,
+    ) -> Result<ListPage> {
+        let _ = (bucket, prefix, cursor, max_keys);
+        Err(crate::Error::Unsupported(
+            "backend does not support listing".into(),
+        ))
+    }
+
     /// Fetch a byte range `[offset, offset + len)` of a source object.
     ///
     /// Used for both whole-block and page-level loads; the caller chooses the

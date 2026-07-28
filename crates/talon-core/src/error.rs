@@ -29,6 +29,16 @@ pub enum Error {
         found: String,
     },
 
+    /// The operation is not supported by this implementation.
+    ///
+    /// Distinct from [`Error::Backend`]: that means an operation was attempted
+    /// and failed, this means it was never possible. A caller building a
+    /// namespace from a listing needs to tell "this backend cannot list" from
+    /// "this prefix is empty" — conflating them turns a missing capability into
+    /// a silently empty result.
+    #[error("unsupported: {0}")]
+    Unsupported(String),
+
     /// Serialization or deserialization failed.
     #[error("serialization error: {0}")]
     Serialization(String),

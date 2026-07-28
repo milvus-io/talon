@@ -240,9 +240,14 @@ impl Client {
 
     /// List objects under a mount-relative prefix, e.g. `az/container/dir`.
     ///
-    /// **Not usable yet**: `ListObjects` needs a listing capability on
-    /// `BackendStore`, which the S3, GCS, and Azure backends do not yet have
-    /// (#332). `stat` and `read` are unaffected.
+    /// The prefix names a backend and bucket (`az/container`), optionally
+    /// followed by a key prefix. Returned paths are in the same namespace, so
+    /// they can be passed straight to [`read`](Self::read) after converting to
+    /// a URI.
+    ///
+    /// Large listings are truncated rather than paginated: the control protocol
+    /// has no cursor, so the server caps both the object count and the number
+    /// of backend round trips.
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
         let runtime = Arc::clone(&self.runtime);
         let coordinator = self.coordinator.clone();

@@ -269,6 +269,15 @@ impl Coordinator {
                     nodes: self.service.membership().snapshot(),
                 }
             }
+            listing @ ControlMessage::ListObjects { .. } => {
+                if !self.observability.is_ready() {
+                    return ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("coordinator not ready: shared state unavailable".into()),
+                    };
+                }
+                self.proxy_to_worker(listing).await
+            }
             stat @ ControlMessage::StatObject { .. } => {
                 if !self.observability.is_ready() {
                     return ControlMessage::Ack {

@@ -2500,6 +2500,7 @@ dependencies = [
  "bytes",
  "hmac",
  "reqwest",
+ "serde_json",
  "sha2",
  "talon-core",
  "tempfile",

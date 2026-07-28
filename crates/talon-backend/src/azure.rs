@@ -16,9 +16,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use talon_core::{BackendStore, Error, ObjectId, ObjectStat, Result, Version};
+use talon_core::{
+    BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
+};
 
 use crate::http::{HttpClient, HttpRequest, Method};
+
+/// Percent-encode a query value. `/` is escaped: a listing prefix contains
+/// slashes and an unescaped one would change the request path.
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
 
 /// Azure Blob endpoint configuration.
 #[derive(Debug, Clone)]
@@ -132,6 +149,75 @@ impl AzureBackend {
             Some(sas) => format!("{base}?{sas}"),
             None => base,
         }
+    }
+
+    /// Build the container listing URL.
+    ///
+    /// Azure lists with `restype=container&comp=list` on the **container**, and
+    /// a SAS token is itself a query string. Both have to coexist, so the SAS
+    /// is merged with `&` rather than appended with `?` — appending would
+    /// produce two `?` and a request the service rejects as malformed.
+    pub fn list_url(
+        &self,
+        container: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        max: u32,
+    ) -> String {
+        let scheme = if self.config.tls { "https" } else { "http" };
+        let host =
+            self.config.endpoint_host.clone().unwrap_or_else(|| {
+                format!("{}.{}", self.config.account, self.config.endpoint_suffix)
+            });
+        let base = if self.config.path_style {
+            format!("{scheme}://{host}/{}/{container}", self.config.account)
+        } else {
+            format!("{scheme}://{host}/{container}")
+        };
+        let mut query = format!("restype=container&comp=list&maxresults={max}");
+        if !prefix.is_empty() {
+            query.push_str(&format!("&prefix={}", encode_query_value(prefix)));
+        }
+        if let Some(marker) = cursor {
+            query.push_str(&format!("&marker={}", encode_query_value(marker)));
+        }
+        match &self.sas_token {
+            // The SAS is already a query string; join with `&`.
+            Some(sas) => format!("{base}?{query}&{}", sas.trim_start_matches('?')),
+            None => format!("{base}?{query}"),
+        }
+    }
+
+    /// Parse a `List Blobs` response.
+    ///
+    /// `<Blob>` records are isolated before reading their fields so a blob's
+    /// name cannot be paired with a neighbour's size. The continuation cursor
+    /// is `<NextMarker>`, which Azure emits **empty** rather than omitting when
+    /// the listing is complete.
+    pub fn parse_list_response(body: &str) -> Result<ListPage> {
+        let objects = crate::xml::blocks(body, "Blob")
+            .into_iter()
+            .map(|record| {
+                let key = crate::xml::element(record, "Name")
+                    .map(crate::xml::unescape)
+                    .ok_or_else(|| Error::Backend("Azure listing entry has no <Name>".into()))?;
+                let size = crate::xml::element(record, "Content-Length")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::Backend(format!(
+                            "Azure listing entry {key} has no usable <Content-Length>"
+                        ))
+                    })?;
+                Ok(ListedObject { key, size })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Azure sends <NextMarker/> empty on the last page rather than omitting
+        // it; treating an empty marker as a cursor loops forever.
+        let next = crate::xml::element(body, "NextMarker")
+            .map(crate::xml::unescape)
+            .filter(|m| !m.trim().is_empty());
+        Ok(ListPage { objects, next })
     }
 
     /// Format the Azure `x-ms-range` header value for `[offset, offset+len)`.
@@ -308,6 +394,32 @@ impl BackendStore for AzureBackend {
                 obj.to_path()
             ))),
         }
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        max_keys: u32,
+    ) -> Result<ListPage> {
+        // Azure caps maxresults at 5000, higher than S3 and GCS.
+        let max_keys = max_keys.clamp(1, 5000);
+        let url = self.list_url(bucket, prefix, cursor, max_keys);
+        let req = HttpRequest::new(Method::Get, url, self.common_headers());
+        let resp = self.http.execute(req).await.map_err(Error::Backend)?;
+        if resp.status == 404 {
+            return Err(Error::NotFound(bucket.to_string()));
+        }
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "Azure list {bucket}/{prefix} -> HTTP {}",
+                resp.status
+            )));
+        }
+        let body = std::str::from_utf8(&resp.body)
+            .map_err(|e| Error::Backend(format!("Azure listing body is not UTF-8: {e}")))?;
+        Self::parse_list_response(body)
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
@@ -746,6 +858,108 @@ mod tests {
         assert_eq!(
             http.last.lock().unwrap().clone().unwrap().method,
             Method::Delete
+        );
+    }
+
+    /// A real List Blobs body, abbreviated. Azure names the size field
+    /// `Content-Length`, not `Size`.
+    const LIST_BODY: &str = r#"<?xml version="1.0" encoding="utf-8"?>
+<EnumerationResults ContainerName="https://acct.blob.core.windows.net/container">
+  <Blobs>
+    <Blob>
+      <Name>data/a.parquet</Name>
+      <Properties>
+        <Content-Length>1048576</Content-Length>
+        <Etag>0x8DABC</Etag>
+      </Properties>
+    </Blob>
+    <Blob>
+      <Name>data/b.parquet</Name>
+      <Properties>
+        <Content-Length>42</Content-Length>
+        <Etag>0x8DABD</Etag>
+      </Properties>
+    </Blob>
+  </Blobs>
+  <NextMarker />
+</EnumerationResults>"#;
+
+    #[test]
+    fn list_parses_names_and_content_lengths_pairwise() {
+        let page = AzureBackend::parse_list_response(LIST_BODY).unwrap();
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].key, "data/a.parquet");
+        assert_eq!(page.objects[0].size, 1_048_576);
+        assert_eq!(page.objects[1].key, "data/b.parquet");
+        assert_eq!(page.objects[1].size, 42);
+    }
+
+    /// Azure emits `<NextMarker />` **empty** on the last page rather than
+    /// omitting it. Treating an empty marker as a cursor loops forever.
+    #[test]
+    fn list_treats_an_empty_next_marker_as_the_end() {
+        let page = AzureBackend::parse_list_response(LIST_BODY).unwrap();
+        assert_eq!(page.next, None);
+
+        let with_marker = LIST_BODY.replace("<NextMarker />", "<NextMarker>2!abc</NextMarker>");
+        let page = AzureBackend::parse_list_response(&with_marker).unwrap();
+        assert_eq!(page.next.as_deref(), Some("2!abc"));
+    }
+
+    #[test]
+    fn list_unescapes_blob_names() {
+        let body = r#"<EnumerationResults><Blobs><Blob><Name>a&amp;b/c.bin</Name>
+          <Properties><Content-Length>7</Content-Length></Properties></Blob></Blobs>
+          <NextMarker /></EnumerationResults>"#;
+        let page = AzureBackend::parse_list_response(body).unwrap();
+        assert_eq!(page.objects[0].key, "a&b/c.bin");
+    }
+
+    #[test]
+    fn list_of_an_empty_container_is_an_empty_page() {
+        let body = r#"<EnumerationResults><Blobs /><NextMarker /></EnumerationResults>"#;
+        let page = AzureBackend::parse_list_response(body).unwrap();
+        assert!(page.objects.is_empty());
+        assert_eq!(page.next, None);
+    }
+
+    /// A SAS token is itself a query string. Appending listing params with `?`
+    /// would produce two `?` and a request Azure rejects as malformed.
+    #[test]
+    fn list_url_merges_listing_params_with_the_sas_query() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::new(
+            AzureConfig::new("acct"),
+            Some("sv=2021&sig=abc".to_string()),
+            http.clone(),
+        );
+        let url = backend.list_url("container", "data/", None, 5000);
+        assert_eq!(url.matches('?').count(), 1, "exactly one `?`: {url}");
+        assert!(url.contains("restype=container&comp=list"), "url: {url}");
+        assert!(
+            url.contains("prefix=data%2F"),
+            "prefix must be encoded: {url}"
+        );
+        assert!(url.contains("sv=2021&sig=abc"), "SAS must survive: {url}");
+    }
+
+    #[test]
+    fn list_url_without_a_sas_has_a_single_query() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::new(AzureConfig::new("acct"), None, http.clone());
+        let url = backend.list_url("container", "", Some("2!m"), 5000);
+        assert_eq!(url.matches('?').count(), 1, "url: {url}");
+        assert!(
+            url.contains("marker=2%21m"),
+            "marker must be encoded: {url}"
         );
     }
 }

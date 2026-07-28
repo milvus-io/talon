@@ -107,7 +107,7 @@ pub async fn handle_conn(
         if header.msg_type != MsgType::GetRange {
             let err = data::encode_error(
                 header.request_id,
-                "worker only serves GetRange/Put/Delete/StatObject",
+                "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
             );
             stream.write_all(&err).await?;
             stream.flush().await?;
@@ -256,10 +256,31 @@ async fn handle_control_frame(
                 }
             }
         }
+        ControlMessage::ListObjects { prefix } => {
+            if !observability.is_ready() {
+                ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.list_objects(&prefix).await {
+                    Ok(entries) => ControlMessage::ObjectList {
+                        entries: entries
+                            .into_iter()
+                            .map(|(path, size)| talon_transport::ObjectEntry { path, size })
+                            .collect(),
+                    },
+                    Err(error) => ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
         other => ControlMessage::Ack {
             ok: false,
             detail: Some(format!(
-                "worker serves only StatObject on the data plane, got {other:?}"
+                "worker serves only StatObject/ListObjects on the data plane, got {other:?}"
             )),
         },
     };

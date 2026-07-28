@@ -88,7 +88,21 @@ async fn main() -> anyhow::Result<()> {
             tracing::info!(objects = n, "populated namespace from coordinator listing");
         }
         Err(e) => {
-            tracing::warn!(error = %e, "coordinator listing failed; mounting an empty namespace");
+            // Deliberately non-fatal for now, but loud: there is no
+            // cross-backend root listing — a worker cannot enumerate every
+            // bucket across S3, GCS, and Azure — so `list_objects("")` cannot
+            // succeed even now that listing is implemented (#332). The mount
+            // still serves reads for paths a client already knows.
+            //
+            // This silent degradation is why #318 and #332 went unnoticed for
+            // months: the endpoints were unimplemented and the mount still
+            // reported success. Populating the namespace properly needs a
+            // configured prefix naming a backend and bucket, tracked in #366.
+            tracing::warn!(
+                error = %e,
+                "namespace listing failed; the mount will appear empty until a \
+                 namespace prefix is configured (#366). Reads of known paths still work."
+            );
         }
     }
 
