@@ -85,6 +85,7 @@ start_coordinator_forward() {
     >"$ARTIFACT_DIR/coordinator-port-forward.log" 2>&1 &
   PF_PIDS+=("$!")
   wait_port "$COORD_PORT"
+  wait_membership_converged
 }
 
 start_worker_forward() {
@@ -101,6 +102,48 @@ worker_pods() {
     -o custom-columns=NAME:.metadata.name,DELETING:.metadata.deletionTimestamp,READY:.status.containerStatuses[0].ready \
     --no-headers |
     awk '$2 == "<none>" && $3 == "true" {print $1}'
+}
+
+worker_addresses() {
+  while read -r pod; do
+    kubectl -n "$NAMESPACE" get pod "$pod" \
+      -o jsonpath='{.status.podIP}{":7001\n"}'
+  done < <(worker_pods)
+}
+
+wait_membership_converged() {
+  local expected actual output
+  local consecutive=0
+  expected="$(worker_addresses | sort)"
+  [[ "$(wc -l <<<"$expected")" -eq 3 ]] ||
+    fail "cannot validate membership without exactly 3 ready workers"
+
+  for _ in $(seq 1 90); do
+    if output="$(timeout 10s target/release/talon-client \
+      --coordinator "127.0.0.1:$COORD_PORT" --membership-only 2>&1)"; then
+      actual="$(awk '$1 == "member" {print $NF}' <<<"$output" | sort)"
+      if [[ "$actual" == "$expected" ]]; then
+        consecutive=$((consecutive + 1))
+        if [[ "$consecutive" -ge 5 ]]; then
+          printf '%s\n' "$output" >"$ARTIFACT_DIR/membership-converged.txt"
+          return 0
+        fi
+      else
+        consecutive=0
+      fi
+    else
+      consecutive=0
+    fi
+    sleep 1
+  done
+
+  {
+    echo "expected:"
+    echo "$expected"
+    echo "last coordinator response:"
+    echo "${output:-<none>}"
+  } >"$ARTIFACT_DIR/membership-failure.txt"
+  fail "coordinator membership did not converge to the 3 ready worker pods"
 }
 
 first_worker() {

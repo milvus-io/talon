@@ -14,7 +14,7 @@
 use std::time::Instant;
 
 use clap::Parser;
-use talon_core::{BlockId, ObjectId, Version};
+use talon_core::{BlockId, NodeRole, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -38,17 +38,20 @@ struct Args {
     #[arg(long)]
     worker: Option<String>,
     /// Resolve and print placement without connecting to the selected worker.
-    #[arg(long, conflicts_with = "worker")]
+    #[arg(long, conflicts_with_all = ["worker", "membership_only"])]
     placement_only: bool,
+    /// Print the coordinator's current worker membership and exit.
+    #[arg(long, conflicts_with_all = ["worker", "placement_only"])]
+    membership_only: bool,
     /// Object path, e.g. `/az/<container>/<blob>`.
-    #[arg(long)]
-    path: String,
+    #[arg(long, required_unless_present = "membership_only")]
+    path: Option<String>,
     /// Byte offset to start reading at.
     #[arg(long, default_value_t = 0)]
     offset: u64,
     /// Number of bytes to read.
-    #[arg(long)]
-    len: u64,
+    #[arg(long, required_unless_present = "membership_only")]
+    len: Option<u64>,
     /// Optional output file for the fetched bytes.
     #[arg(long)]
     out: Option<std::path::PathBuf>,
@@ -63,7 +66,29 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let object = ObjectId::from_path(&args.path)?;
+    if args.membership_only {
+        let mut nodes = membership_lookup(&args.coordinator).await?;
+        nodes.sort_by(|left, right| {
+            left.address
+                .cmp(&right.address)
+                .then_with(|| left.id.0.cmp(&right.id.0))
+        });
+        for node in nodes {
+            if node.role == NodeRole::Worker {
+                println!("member {} {}", node.id, node.address);
+            }
+        }
+        return Ok(());
+    }
+
+    let path = args
+        .path
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("--path is required for reads"))?;
+    let len = args
+        .len
+        .ok_or_else(|| anyhow::anyhow!("--len is required for reads"))?;
+    let object = ObjectId::from_path(path)?;
     let block = BlockId::new(
         object.clone(),
         (args.offset / PLACEMENT_BLOCK_SIZE as u64) * PLACEMENT_BLOCK_SIZE as u64,
@@ -92,22 +117,22 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if args.placement_only {
-        println!("placed {} on {}", args.path, worker_addr);
+        println!("placed {path} on {worker_addr}");
         return Ok(());
     }
 
     // Fetch the range from the selected worker.
     let start = Instant::now();
-    let bytes = fetch_range(&worker_addr, &object, args.offset, args.len).await?;
+    let bytes = fetch_range(&worker_addr, &object, args.offset, len).await?;
     let elapsed = start.elapsed();
 
     // Verify the worker returned the full requested range. A short read means
     // truncation (or the object ended inside the range); either way, silently
     // reporting it as success would hide corruption (issue #112).
-    if (bytes.len() as u64) < args.len {
+    if (bytes.len() as u64) < len {
         anyhow::bail!(
             "short read: requested {} bytes at offset {}, got {} (truncated or past EOF)",
-            args.len,
+            len,
             args.offset,
             bytes.len()
         );
@@ -145,12 +170,18 @@ async fn placement_lookup(coordinator: &str, block: &BlockId) -> anyhow::Result<
 
 /// Send a `MembershipQuery` and resolve `owner_id` to its worker address.
 async fn resolve_address(coordinator: &str, owner_id: &str) -> anyhow::Result<String> {
+    membership_lookup(coordinator)
+        .await?
+        .into_iter()
+        .find(|n| n.id.0 == owner_id)
+        .map(|n| n.address)
+        .ok_or_else(|| anyhow::anyhow!("owner {owner_id} not in membership list"))
+}
+
+/// Return the coordinator's current membership snapshot.
+async fn membership_lookup(coordinator: &str) -> anyhow::Result<Vec<talon_core::NodeInfo>> {
     match request_control(coordinator, &ControlMessage::MembershipQuery {}).await? {
-        ControlMessage::MembershipList { nodes } => nodes
-            .into_iter()
-            .find(|n| n.id.0 == owner_id)
-            .map(|n| n.address)
-            .ok_or_else(|| anyhow::anyhow!("owner {owner_id} not in membership list")),
+        ControlMessage::MembershipList { nodes } => Ok(nodes),
         other => anyhow::bail!("unexpected membership reply: {other:?}"),
     }
 }
@@ -234,8 +265,9 @@ mod tests {
 
         assert_eq!(args.worker.as_deref(), Some("10.0.0.7:7001"));
         assert!(!args.placement_only);
+        assert!(!args.membership_only);
         assert_eq!(args.coordinator, "127.0.0.1:7000");
-        assert_eq!(args.len, 4096);
+        assert_eq!(args.len, Some(4096));
     }
 
     #[test]
@@ -250,6 +282,7 @@ mod tests {
         ])
         .unwrap();
         assert!(args.placement_only);
+        assert!(!args.membership_only);
         assert!(args.worker.is_none());
 
         assert!(Args::try_parse_from([
@@ -263,5 +296,38 @@ mod tests {
             "4096",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn membership_only_mode_does_not_require_read_arguments() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--membership-only",
+            "--coordinator",
+            "c:7000",
+        ])
+        .unwrap();
+
+        assert!(args.membership_only);
+        assert!(!args.placement_only);
+        assert!(args.worker.is_none());
+        assert!(args.path.is_none());
+        assert!(args.len.is_none());
+    }
+
+    #[test]
+    fn read_modes_still_require_path_and_length() {
+        assert!(Args::try_parse_from(["talon-client"]).is_err());
+        assert!(Args::try_parse_from([
+            "talon-client",
+            "--placement-only",
+            "--path",
+            "/s3/bucket/object",
+        ])
+        .is_err());
+        assert!(
+            Args::try_parse_from(["talon-client", "--membership-only", "--placement-only",])
+                .is_err()
+        );
     }
 }
