@@ -56,7 +56,7 @@ require() {
   command -v "$1" >/dev/null || fail "required command not found: $1"
 }
 
-for command in kubectl helm cargo curl awk sort uniq cmp kind docker timeout; do
+for command in kubectl helm cargo curl awk sort uniq cmp dd kind docker timeout; do
   require "$command"
 done
 
@@ -423,8 +423,8 @@ cmp "$ARTIFACT_DIR/hot.expected" "$ARTIFACT_DIR/hot-warm.out"
 
 CROSS_OFFSET=$((BLOCK_SIZE - 32768))
 CROSS_LEN=65536
-tail -c +$((CROSS_OFFSET + 1)) "$ARTIFACT_DIR/cross.bin" |
-  head -c "$CROSS_LEN" >"$ARTIFACT_DIR/cross.expected"
+dd if="$ARTIFACT_DIR/cross.bin" of="$ARTIFACT_DIR/cross.expected" \
+  bs=1 skip="$CROSS_OFFSET" count="$CROSS_LEN" status=none
 direct_read cross.bin "$CROSS_OFFSET" "$CROSS_LEN" "$ARTIFACT_DIR/cross.out"
 cmp "$ARTIFACT_DIR/cross.expected" "$ARTIFACT_DIR/cross.out"
 
