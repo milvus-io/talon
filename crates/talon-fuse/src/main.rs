@@ -80,7 +80,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Populate the namespace from a coordinator listing (best-effort: a listing
     // failure logs and yields an empty tree rather than aborting the mount).
-    let fs = Arc::new(ReadOnlyFs::new());
+    let (mount_uid, mount_gid) = mount_owner();
+    let fs = Arc::new(ReadOnlyFs::new_with_owner(mount_uid, mount_gid));
     match coordinator.list_objects("").await {
         Ok(entries) => {
             let n = fs.populate_from_listing(entries.iter().map(|e| (e.path.as_str(), e.size)));
@@ -92,6 +93,17 @@ async fn main() -> anyhow::Result<()> {
     }
 
     run_mount(cfg, fs, reader).await
+}
+
+#[cfg(feature = "mount")]
+fn mount_owner() -> (u32, u32) {
+    // SAFETY: geteuid/getegid have no preconditions and do not mutate memory.
+    unsafe { (libc::geteuid(), libc::getegid()) }
+}
+
+#[cfg(not(feature = "mount"))]
+fn mount_owner() -> (u32, u32) {
+    (0, 0)
 }
 
 /// Mount and serve until SIGINT (built with `--features mount`).
