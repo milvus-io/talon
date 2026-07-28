@@ -7,6 +7,7 @@
 pub mod block_store;
 pub mod capacity;
 pub mod eviction;
+pub mod flusher;
 pub mod index;
 pub mod loader;
 pub mod memory_store;
@@ -25,6 +26,7 @@ pub mod write_cache;
 pub use block_store::WholeBlockStore;
 pub use capacity::{CacheDirConfig, CacheDirs};
 pub use eviction::{CacheUnit, Lru};
+pub use flusher::{FlushOutcome, FlushPolicy, FlushStats, Flusher};
 pub use index::{BlockIndex, Presence};
 pub use loader::{LoadOutcome, LoadTask, LoaderPool};
 pub use memory_store::MemoryStore;
