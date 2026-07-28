@@ -167,11 +167,8 @@ make_repeated_file() {
 upload_file() {
   local source="$1"
   local key="$2"
-  local name
-  name="$(basename "$source")"
-  kubectl -n "$NAMESPACE" cp "$source" "minio-client:/tmp/$name"
-  kubectl -n "$NAMESPACE" exec minio-client -- \
-    mc cp --quiet "/tmp/$name" "local/$BUCKET/$key"
+  kubectl -n "$NAMESPACE" exec -i minio-client -- \
+    mc pipe "local/$BUCKET/$key" <"$source"
 }
 
 direct_read() {
@@ -340,8 +337,7 @@ for i in $(seq 0 7); do
   upload_file "$ARTIFACT_DIR/evict-$i.bin" "evict-$i.bin"
 done
 for i in $(seq 0 29); do
-  kubectl -n "$NAMESPACE" exec minio-client -- \
-    mc cp --quiet /tmp/hot.bin "local/$BUCKET/shard-$i.bin"
+  upload_file "$ARTIFACT_DIR/hot.bin" "shard-$i.bin"
 done
 
 log "verifying multi-node placement reaches all three workers"
