@@ -267,8 +267,8 @@ spec:
       image: minio/mc:latest
       command: ["/bin/sh", "-c", "sleep 7200"]
       resources:
-        requests: { cpu: 10m, memory: 32Mi }
-        limits: { cpu: 200m, memory: 128Mi }
+        requests: { cpu: 10m, memory: 64Mi }
+        limits: { cpu: 200m, memory: 512Mi }
   restartPolicy: Never
 EOF
 kubectl -n "$NAMESPACE" rollout status deployment/minio --timeout=180s
