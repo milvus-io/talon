@@ -88,3 +88,19 @@ bench-check *ARGS:
 # Print the current committed baseline.
 bench-baseline NAME="main":
     @cat bench/baselines/{{NAME}}.json
+
+# --- supply chain / coverage ---
+
+# Check the dependency tree for RUSTSEC advisories, banned crates, and unknown
+# sources (install: cargo install cargo-deny). Mirrors the CI `audit` gate.
+# Known advisories are acknowledged with written justifications in deny.toml.
+audit:
+    cargo deny check advisories bans sources
+
+# Per-file line coverage (install: cargo install cargo-llvm-cov).
+coverage:
+    cargo llvm-cov --workspace --all-features --summary-only
+
+# Coverage as a browsable HTML report under target/llvm-cov/html.
+coverage-html:
+    cargo llvm-cov --workspace --all-features --html

@@ -1,0 +1,63 @@
+# cargo-deny configuration — supply-chain gate for the dependency tree.
+#
+# Run locally with `just audit`; CI runs the same command on every PR and on a
+# nightly schedule (an advisory published after a merge still needs to be caught).
+#
+# Scope: this file gates **security advisories** and **duplicate versions**.
+# License policy is deliberately not configured yet — see the note at the bottom.
+
+[advisories]
+# Fail on any advisory affecting a crate we actually build, except the
+# individually justified exceptions below. Each entry must say why it is
+# tolerated and what would remove it; an exception without an exit path is a
+# bug, not a policy.
+ignore = [
+    # RUSTSEC-2025-0141 — bincode 1.3.3 is unmaintained (the team ceased
+    # development; not a vulnerability). We use it for the control-plane codec.
+    # No known exploit; migration to bincode 2.x or postcard is a wire-format
+    # change and needs its own issue.
+    "RUSTSEC-2025-0141",
+
+    # RUSTSEC-2025-0057 — fxhash is unmaintained (not a vulnerability). Pulled
+    # in transitively by monoio 0.2.4, which is the io_uring data-plane runtime.
+    # Not directly reachable from our code; removal depends on monoio.
+    "RUSTSEC-2025-0057",
+
+    # RUSTSEC-2026-0177 — pyo3 <0.29 missing `Sync` bound on
+    # `PyCFunction::new_closure`. The Python client does not call that API
+    # (verified by grep over clients/python/src). Fixing means pyo3 0.22 -> 0.29,
+    # a semver-major bump with its own migration.
+    "RUSTSEC-2026-0177",
+
+    # RUSTSEC-2025-0020 — pyo3 <0.24.1 buffer overflow risk in
+    # `PyString::from_object`. Same reasoning: the API is not called by the
+    # Python client, and the fix is the same major bump.
+    "RUSTSEC-2025-0020",
+]
+
+[bans]
+# Duplicate major versions of the same crate bloat the binary and make it
+# ambiguous which copy a CVE applies to. Warn rather than deny: the tree
+# currently has legitimate duplicates via kube/tonic/etcd-client that we do not
+# control, and turning this red would make the gate noise rather than signal.
+multiple-versions = "warn"
+# Every wildcard requirement in this workspace is an intra-workspace `path`
+# dependency (`talon-core.workspace = true` and friends), which is normal and
+# not a supply-chain risk. cargo-deny's `allow-wildcard-paths` exemption only
+# applies to crates marked unpublishable, which ours are not, so this stays at
+# `warn` rather than flagging our own crates on every run.
+wildcards = "warn"
+
+[sources]
+# Only crates.io. A git or registry source appearing here would be a supply-chain
+# change worth failing on.
+unknown-registry = "deny"
+unknown-git = "deny"
+
+# NOTE on licenses: `cargo deny check licenses` currently rejects all 236
+# dependencies because no allow-list is configured. Choosing that list is a
+# licensing-policy decision for the project (which SPDX identifiers are
+# acceptable for an Apache-2.0 product), not something to settle in a CI plumbing
+# change. Until then CI runs `check advisories bans sources` explicitly rather
+# than bare `cargo deny check`, so the license gate is off rather than silently
+# passing. Enabling it is tracked separately.

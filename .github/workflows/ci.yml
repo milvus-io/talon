@@ -460,3 +460,48 @@ jobs:
       - name: Publish report to job summary
         if: always()
         run: cat bench-report.md >> "$GITHUB_STEP_SUMMARY"
+
+  coverage:
+    name: coverage (informational)
+    runs-on: ubuntu-latest
+    # Informational. The workspace sits around 81% line coverage; the value of
+    # this job is making the *per-file* numbers visible so gaps get noticed
+    # (a new module landing at 0%, a rewrite dropping a file to half), not
+    # gating on a single aggregate. A threshold can follow once there is a
+    # baseline to argue from.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install protoc
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install toolchain (llvm-tools)
+        run: rustup component add llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Measure coverage
+        run: cargo llvm-cov --workspace --all-features --summary-only | tee coverage.txt
+      - name: Publish report to job summary
+        if: always()
+        run: |
+          {
+            echo '### Coverage'
+            echo '```'
+            cat coverage.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    # Blocking, unlike coverage: this has a crisp pass/fail. A crate in the tree
+    # either carries an unacknowledged RUSTSEC advisory or it does not. Known
+    # ones are acknowledged with a written justification in deny.toml.
+    #
+    # A nightly run lives in audit-schedule.yml: an advisory can be published
+    # against an already-merged crate, so the check needs a heartbeat that does
+    # not depend on someone opening a PR.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Check advisories, bans, and sources
+        run: cargo deny check advisories bans sources
