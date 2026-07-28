@@ -17,7 +17,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use talon_core::{ObjectId, Version};
+use talon_core::{ObjectId, RequestId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
     encode_delete, encode_put_header, encode_request, DeleteRequest, Flags, PutRequest,
@@ -119,7 +119,10 @@ impl WorkerClient {
             offset,
             len,
         };
-        let out = encode_request(0, &req)?;
+        // Allocate a correlation id and put it on the wire, so the worker's
+        // logs for this fetch can be joined with the client's (#304).
+        let req_id = RequestId::next();
+        let out = encode_request(req_id.0, &req)?;
         // Try a pooled connection first; if it was reused and fails (the peer may
         // have closed it while idle), retry once on a fresh dial so a stale
         // pooled socket never turns a healthy peer into a spurious failure. A
@@ -139,7 +142,18 @@ impl WorkerClient {
                 self.pool.release(&self.addr, stream);
                 Ok(bytes)
             }
-            Err((false, err)) => Err(err),
+            Err((false, err)) => {
+                tracing::error!(
+                    req = %req_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    offset,
+                    len,
+                    error = %err,
+                    "worker range fetch failed"
+                );
+                Err(err)
+            }
         }
     }
 
@@ -222,8 +236,9 @@ impl WriteClient {
     /// connection, it is safe — the first attempt sent nothing the backend
     /// committed (a mid-stream failure is not retried, it propagates).
     pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
+        let req_id = RequestId::next();
         let header = encode_put_header(
-            0,
+            req_id.0,
             &PutRequest {
                 object: object.clone(),
                 body_len: body.len() as u64,
@@ -246,7 +261,17 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err((false, err)) => Err(err),
+            Err((false, err)) => {
+                tracing::error!(
+                    req = %req_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    bytes = body.len(),
+                    error = %err,
+                    "worker put failed"
+                );
+                Err(err)
+            }
         }
     }
 
@@ -257,8 +282,9 @@ impl WriteClient {
         path: &Path,
         len: u64,
     ) -> Result<Version, WorkerError> {
+        let req_id = RequestId::next();
         let header = encode_put_header(
-            0,
+            req_id.0,
             &PutRequest {
                 object: object.clone(),
                 body_len: len,
@@ -283,7 +309,17 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err((false, error)) => Err(error),
+            Err((false, error)) => {
+                tracing::error!(
+                    req = %req_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    bytes = len,
+                    %error,
+                    "worker streamed put failed"
+                );
+                Err(error)
+            }
         }
     }
 
@@ -347,8 +383,9 @@ impl WriteClient {
 
     /// Delete `object` at the worker (which deletes it at the backend).
     pub async fn delete_object(&self, object: &ObjectId) -> Result<(), WorkerError> {
+        let req_id = RequestId::next();
         let frame = encode_delete(
-            0,
+            req_id.0,
             &DeleteRequest {
                 object: object.clone(),
             },
@@ -367,7 +404,16 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(())
             }
-            Err((false, err)) => Err(err),
+            Err((false, err)) => {
+                tracing::error!(
+                    req = %req_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    error = %err,
+                    "worker delete failed"
+                );
+                Err(err)
+            }
         }
     }
 
@@ -547,9 +593,53 @@ mod tests {
         addr
     }
 
+    /// Spawn a worker that records the `request_id` of each frame it receives,
+    /// serving `count` sequential requests with an empty-range reply.
+    async fn request_id_recording_worker(
+        count: usize,
+    ) -> (String, Arc<std::sync::Mutex<Vec<u32>>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<std::sync::Mutex<Vec<u32>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            for _ in 0..count {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let mut hdr = [0u8; HEADER_LEN];
+                sock.read_exact(&mut hdr).await.unwrap();
+                let header = FrameHeader::decode(&hdr).unwrap();
+                let mut body = vec![0u8; header.length as usize];
+                sock.read_exact(&mut body).await.unwrap();
+                recorded.lock().unwrap().push(header.request_id);
+                // Echo the id back on the reply, as a real worker does.
+                let reply = response_header_ok(header.request_id, 0).to_vec();
+                sock.write_all(&reply).await.unwrap();
+                sock.flush().await.unwrap();
+            }
+        });
+        (addr, seen)
+    }
+
+    #[tokio::test]
+    async fn fetch_puts_a_unique_nonzero_request_id_on_the_wire() {
+        // Correlation (#304) depends on the client stamping a real id into the
+        // frame header: a hardcoded 0 makes client and worker logs unjoinable.
+        let (addr, seen) = request_id_recording_worker(2).await;
+        let client = WorkerClient::new(addr);
+        client.fetch_range(&object(), 0, 0).await.unwrap();
+        client.fetch_range(&object(), 0, 0).await.unwrap();
+
+        let ids = seen.lock().unwrap().clone();
+        assert_eq!(ids.len(), 2, "worker should have seen two requests");
+        assert!(ids[0] != 0 && ids[1] != 0, "request_id must not be zero");
+        assert_ne!(
+            ids[0], ids[1],
+            "each request needs a distinct id to be correlatable"
+        );
+    }
+
     #[tokio::test]
     async fn fetch_returns_raw_bytes() {
-        // Worker returns deterministic bytes for the requested range.
         let addr = mock_worker(|req| {
             let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
             let mut out = response_header_ok(0, payload.len() as u32).to_vec();

@@ -57,7 +57,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use monoio::net::TcpStream;
-use talon_core::BlockHandle;
+use talon_core::{BlockHandle, RequestId};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::uring::{read_frame, write_all};
@@ -193,6 +193,14 @@ pub async fn handle_conn(
                     .record_request_success(n, request_started.elapsed());
             }
             Err(e) => {
+                tracing::error!(
+                    req = %RequestId(h.request_id),
+                    object = %req.object.to_path(),
+                    offset = req.offset,
+                    len = req.len,
+                    error = %e,
+                    "serving range failed"
+                );
                 let err = data::encode_error(h.request_id, &e.to_string());
                 write_all(&mut stream, err).await?;
                 observability
