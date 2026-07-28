@@ -16,6 +16,7 @@ use std::sync::Arc;
 use clap::Parser;
 use talon_core::{FuseConfig, FuseConfigPatch};
 use talon_fuse::{BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
+use talon_transport::ObjectEntry;
 
 /// Command-line arguments for the Talon FUSE mount.
 #[derive(Debug, Parser)]
@@ -30,6 +31,9 @@ struct Args {
     /// Address of the coordinator to connect to.
     #[arg(long)]
     coordinator: Option<String>,
+    /// Backend namespace to enumerate, for example `az/container`.
+    #[arg(long)]
+    namespace_prefix: Option<String>,
     /// Logical block size in bytes.
     #[arg(long)]
     block_size: Option<u32>,
@@ -41,6 +45,7 @@ impl Args {
         FuseConfigPatch {
             mountpoint: self.mountpoint.clone(),
             coordinator: self.coordinator.clone(),
+            namespace_prefix: self.namespace_prefix.clone(),
             block_size: self.block_size,
             placement_ttl_ms: None,
             readahead_blocks: None,
@@ -67,6 +72,7 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(
         mountpoint = %cfg.mountpoint.display(),
         coordinator = %cfg.coordinator,
+        namespace_prefix = %cfg.namespace_prefix,
         block_size = cfg.block_size,
         placement_ttl_ms = cfg.placement_ttl_ms,
         readahead_blocks = cfg.readahead_blocks,
@@ -78,35 +84,40 @@ async fn main() -> anyhow::Result<()> {
     let cache = Arc::new(PlacementCache::new(cfg.placement_ttl_ms));
     let reader = BlockReader::new(coordinator.clone(), cache, 1);
 
-    // Populate the namespace from a coordinator listing (best-effort: a listing
-    // failure logs and yields an empty tree rather than aborting the mount).
+    // Populate the namespace before mounting. A listing failure is fatal: an
+    // apparently healthy mount with an empty tree hides backend/configuration
+    // failures and is less useful than an actionable startup error (#366).
     let (mount_uid, mount_gid) = mount_owner();
     let fs = Arc::new(ReadOnlyFs::new_with_owner(mount_uid, mount_gid));
-    match coordinator.list_objects("").await {
-        Ok(entries) => {
-            let n = fs.populate_from_listing(entries.iter().map(|e| (e.path.as_str(), e.size)));
-            tracing::info!(objects = n, "populated namespace from coordinator listing");
-        }
-        Err(e) => {
-            // Deliberately non-fatal for now, but loud: there is no
-            // cross-backend root listing — a worker cannot enumerate every
-            // bucket across S3, GCS, and Azure — so `list_objects("")` cannot
-            // succeed even now that listing is implemented (#332). The mount
-            // still serves reads for paths a client already knows.
-            //
-            // This silent degradation is why #318 and #332 went unnoticed for
-            // months: the endpoints were unimplemented and the mount still
-            // reported success. Populating the namespace properly needs a
-            // configured prefix naming a backend and bucket, tracked in #366.
-            tracing::warn!(
-                error = %e,
-                "namespace listing failed; the mount will appear empty until a \
-                 namespace prefix is configured (#366). Reads of known paths still work."
-            );
-        }
-    }
+    let listing = coordinator.list_objects(&cfg.namespace_prefix).await;
+    populate_namespace(&fs, &cfg.namespace_prefix, listing)?;
 
     run_mount(cfg, fs, reader).await
+}
+
+/// Apply the coordinator's startup listing, refusing to hide listing errors
+/// behind an apparently healthy empty mount.
+fn populate_namespace<E>(
+    fs: &ReadOnlyFs,
+    namespace_prefix: &str,
+    listing: Result<Vec<ObjectEntry>, E>,
+) -> anyhow::Result<usize>
+where
+    E: std::fmt::Display,
+{
+    let entries = listing.map_err(|error| {
+        anyhow::anyhow!("failed to list namespace prefix {namespace_prefix:?}: {error}")
+    })?;
+    if entries.is_empty() {
+        tracing::warn!(namespace_prefix, "namespace listing returned zero objects");
+    }
+    let n = fs.populate_from_listing(entries.iter().map(|e| (e.path.as_str(), e.size)));
+    tracing::info!(
+        objects = n,
+        namespace_prefix,
+        "populated namespace from coordinator listing"
+    );
+    Ok(n)
 }
 
 #[cfg(feature = "mount")]
@@ -186,4 +197,52 @@ async fn run_mount(
          Rebuild with `--features mount` to enable the kernel FUSE mount."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn namespace_prefix_cli_flag_populates_patch() {
+        let args =
+            Args::try_parse_from(["talon-fuse", "--namespace-prefix", "az/container/datasets"])
+                .unwrap();
+
+        assert_eq!(
+            args.to_patch().namespace_prefix.as_deref(),
+            Some("az/container/datasets")
+        );
+    }
+
+    #[test]
+    fn namespace_listing_failure_is_fatal() {
+        let fs = ReadOnlyFs::new();
+        let error =
+            populate_namespace::<&str>(&fs, "s3/training-data", Err("coordinator unavailable"))
+                .unwrap_err();
+
+        let message = error.to_string();
+        assert!(message.contains("s3/training-data"));
+        assert!(message.contains("coordinator unavailable"));
+    }
+
+    #[test]
+    fn successful_namespace_listing_populates_tree() {
+        let fs = ReadOnlyFs::new();
+        let count = populate_namespace::<&str>(
+            &fs,
+            "gcs/models",
+            Ok(vec![ObjectEntry {
+                path: "gcs/models/checkpoint.bin".into(),
+                size: 42,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(count, 1);
+        let gcs = fs.lookup(talon_fuse::ops::ROOT_INO, "gcs").unwrap();
+        let models = fs.lookup(gcs.ino, "models").unwrap();
+        assert!(fs.lookup(models.ino, "checkpoint.bin").is_ok());
+    }
 }

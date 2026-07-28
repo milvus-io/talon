@@ -20,7 +20,7 @@ Admin HTTP bind address: metrics, health, API, UI.
 
 - **Environment variable:** `TALON_COORDINATOR_ADMIN_LISTEN`
 - **Default:** `127.0.0.1:8000`
-- **CLI flag:** `--admin_listen`
+- **CLI flag:** `--admin-listen`
 
 ### `admin_advertise`
 
@@ -28,7 +28,7 @@ Admin address advertised in node status.
 
 - **Environment variable:** `TALON_COORDINATOR_ADMIN_ADVERTISE`
 - **Default:** `<admin_listen>`
-- **CLI flag:** `--admin_advertise`
+- **CLI flag:** `--admin-advertise`
 
 ### `cluster_id`
 
@@ -36,7 +36,7 @@ Logical cluster identity.
 
 - **Environment variable:** `TALON_COORDINATOR_CLUSTER_ID`
 - **Default:** `default`
-- **CLI flag:** `--cluster_id`
+- **CLI flag:** `--cluster-id`
 
 ### `node_id`
 
@@ -44,7 +44,7 @@ Stable coordinator node identity.
 
 - **Environment variable:** `TALON_COORDINATOR_NODE_ID`
 - **Default:** `<listen>`
-- **CLI flag:** `--node_id`
+- **CLI flag:** `--node-id`
 
 ### `state_backend`
 
@@ -52,7 +52,7 @@ Shared-state backend: memory | etcd | kubernetes.
 
 - **Environment variable:** `TALON_COORDINATOR_STATE_BACKEND`
 - **Default:** `memory`
-- **CLI flag:** `--state_backend`
+- **CLI flag:** `--state-backend`
 
 ### `ha_enabled`
 
@@ -60,7 +60,7 @@ Enable active-active mode; rejects the memory backend.
 
 - **Environment variable:** `TALON_COORDINATOR_HA_ENABLED`
 - **Default:** `false`
-- **CLI flag:** `--ha_enabled`
+- **CLI flag:** `--ha-enabled`
 
 ### `coordinator_replicas`
 
@@ -68,7 +68,7 @@ Expected coordinator replica count.
 
 - **Environment variable:** `TALON_COORDINATOR_REPLICAS`
 - **Default:** `1`
-- **CLI flag:** `--coordinator_replicas`
+- **CLI flag:** `--coordinator-replicas`
 
 ### `heartbeat_interval_ms`
 
@@ -76,7 +76,7 @@ Node heartbeat interval (ms).
 
 - **Environment variable:** `TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS`
 - **Default:** `5000`
-- **CLI flag:** `--heartbeat_interval_ms`
+- **CLI flag:** `--heartbeat-interval-ms`
 
 ### `unhealthy_after_ms`
 
@@ -84,7 +84,7 @@ Silence before a node is unhealthy (ms); must exceed heartbeat.
 
 - **Environment variable:** `TALON_COORDINATOR_UNHEALTHY_AFTER_MS`
 - **Default:** `15000`
-- **CLI flag:** `--unhealthy_after_ms`
+- **CLI flag:** `--unhealthy-after-ms`
 
 ### `lease_ttl_ms`
 
@@ -92,7 +92,7 @@ Node lease TTL (ms); must exceed unhealthy_after.
 
 - **Environment variable:** `TALON_COORDINATOR_LEASE_TTL_MS`
 - **Default:** `30000`
-- **CLI flag:** `--lease_ttl_ms`
+- **CLI flag:** `--lease-ttl-ms`
 
 ### `request_timeout_ms`
 
@@ -100,7 +100,7 @@ Deadline for one authoritative backend operation (ms).
 
 - **Environment variable:** `TALON_COORDINATOR_REQUEST_TIMEOUT_MS`
 - **Default:** `3000`
-- **CLI flag:** `--request_timeout_ms`
+- **CLI flag:** `--request-timeout-ms`
 
 ### `(env only)` 🔒
 
@@ -192,7 +192,7 @@ Routable address advertised to the coordinator.
 
 - **Environment variable:** `TALON_WORKER_ADVERTISE_ADDR`
 - **Default:** `<listen>`
-- **CLI flag:** `--advertise_addr`
+- **CLI flag:** `--advertise-addr`
 
 ### `admin_listen`
 
@@ -200,7 +200,7 @@ Admin HTTP bind address: metrics, health, status.
 
 - **Environment variable:** `TALON_WORKER_ADMIN_LISTEN`
 - **Default:** `127.0.0.1:8001`
-- **CLI flag:** `--admin_listen`
+- **CLI flag:** `--admin-listen`
 
 ### `coordinator`
 
@@ -216,7 +216,7 @@ Logical cluster advertised in status.
 
 - **Environment variable:** `TALON_WORKER_CLUSTER_ID`
 - **Default:** `default`
-- **CLI flag:** `--cluster_id`
+- **CLI flag:** `--cluster-id`
 
 ### `node_id`
 
@@ -224,7 +224,7 @@ Stable worker node identity.
 
 - **Environment variable:** `TALON_WORKER_NODE_ID`
 - **Default:** `<listen>`
-- **CLI flag:** `--node_id`
+- **CLI flag:** `--node-id`
 
 ### `heartbeat_interval_ms`
 
@@ -232,7 +232,7 @@ Heartbeat interval (ms).
 
 - **Environment variable:** `TALON_WORKER_HEARTBEAT_INTERVAL_MS`
 - **Default:** `5000`
-- **CLI flag:** `--heartbeat_interval_ms`
+- **CLI flag:** `--heartbeat-interval-ms`
 
 ### `block_size`
 
@@ -240,7 +240,7 @@ Logical block size (bytes).
 
 - **Environment variable:** `TALON_WORKER_BLOCK_SIZE`
 - **Default:** `268435456`
-- **CLI flag:** `--block_size`
+- **CLI flag:** `--block-size`
 
 ### `cache_dirs`
 
@@ -352,7 +352,7 @@ io_uring rings for the data plane; 0 = one per core. Falls back to Tokio if io_u
 
 - **Environment variable:** `TALON_WORKER_DATA_PLANE_RINGS`
 - **Default:** `0 (one ring per core)`
-- **CLI flag:** `--data_plane_rings`
+- **CLI flag:** `--data-plane-rings`
 
 ### `s3_region`
 
@@ -448,13 +448,21 @@ Coordinator address for placement and membership.
 - **Default:** `127.0.0.1:7000`
 - **CLI flag:** `--coordinator`
 
+### `namespace_prefix`
+
+Backend namespace to enumerate (for example, `az/container`).
+
+- **Environment variable:** `TALON_FUSE_NAMESPACE_PREFIX`
+- **Default:** none
+- **CLI flag:** `--namespace-prefix`
+
 ### `block_size`
 
 Logical block size (bytes); must match the cluster.
 
 - **Environment variable:** `TALON_FUSE_BLOCK_SIZE`
 - **Default:** `268435456`
-- **CLI flag:** `--block_size`
+- **CLI flag:** `--block-size`
 
 ### `placement_ttl_ms`
 
