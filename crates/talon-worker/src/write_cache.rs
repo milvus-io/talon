@@ -12,10 +12,17 @@
 //! locally. This module is that machinery, built and tested on its own.
 //!
 //! It is deliberately **not** wired into [`WorkerRuntime`](crate::WorkerRuntime)
-//! or the serve path: whether Talon promises write-back at all is an ADR-level
-//! decision (roadmap #274 item 4), and NVMe alone is not durability — real
-//! write-back also needs replication before ack. This module is the mechanism,
-//! not the policy.
+//! or the serve path. ADR 0002 (`docs/adr/0002-write-cache-durability.md`)
+//! settled the question this module exists to serve: Talon promises
+//! **write-through only** — a write is durable when the origin acknowledges it,
+//! never before — and write-back stays deferred behind explicit entry
+//! conditions, chief among them replication before acknowledgement, since
+//! acknowledging from one node's NVMe is not durability.
+//!
+//! So this module is the mechanism a future write-back would need, kept built
+//! and tested so that decision is a wiring and replication problem rather than a
+//! from-scratch design problem. Enabling it requires its own ADR superseding
+//! 0002.
 //!
 //! # On-disk layout
 //!
