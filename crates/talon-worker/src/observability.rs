@@ -37,6 +37,8 @@ pub struct WorkerMetrics {
     cache_misses_total: Counter,
     backend_fetch_bytes_total: Counter,
     backend_fetch_errors_total: Counter,
+    backend_retries_total: Counter,
+    backend_timeouts_total: Counter,
     backend_write_bytes_total: Counter,
     backend_write_errors_total: Counter,
     backend_delete_total: Counter,
@@ -111,6 +113,16 @@ impl WorkerMetrics {
         let backend_fetch_errors_total = registry.counter(
             "talon_worker_backend_fetch_errors_total",
             "Origin backend range fetch failures.",
+            labels(BACKEND_LABELS),
+        );
+        let backend_retries_total = registry.counter(
+            "talon_worker_backend_retries_total",
+            "Origin backend requests re-issued after a transient failure.",
+            labels(BACKEND_LABELS),
+        );
+        let backend_timeouts_total = registry.counter(
+            "talon_worker_backend_timeouts_total",
+            "Origin backend request attempts that exceeded their deadline.",
             labels(BACKEND_LABELS),
         );
         let backend_write_bytes_total = registry.counter(
@@ -211,6 +223,8 @@ impl WorkerMetrics {
             cache_misses_total,
             backend_fetch_bytes_total,
             backend_fetch_errors_total,
+            backend_retries_total,
+            backend_timeouts_total,
             backend_write_bytes_total,
             backend_write_errors_total,
             backend_delete_total,
@@ -266,6 +280,19 @@ impl WorkerMetrics {
         self.backend_fetch_errors_total.inc();
         self.backend_fetch_duration_seconds
             .observe(elapsed.as_secs_f64());
+    }
+
+    /// Record a backend request being re-issued after a transient failure.
+    ///
+    /// Retries succeed silently by design, so without this counter a degrading
+    /// origin is invisible: reads keep working while latency and cost climb.
+    pub fn record_backend_retry(&self) {
+        self.backend_retries_total.inc();
+    }
+
+    /// Record a backend request attempt that exceeded its deadline.
+    pub fn record_backend_timeout(&self) {
+        self.backend_timeouts_total.inc();
     }
 
     /// Record a successful write-through PUT of `bytes` to the origin backend.

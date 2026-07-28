@@ -106,6 +106,25 @@ pub struct WorkerConfig {
     pub backend_jitter_ms: Option<u64>,
     /// Optional bandwidth ceiling (bytes/second) modeled by the delay decorator.
     pub backend_throughput_bytes: Option<u64>,
+    /// Retries after the initial attempt for a transient backend failure
+    /// (`408/429/5xx` or a transport error). `Some(0)` disables retrying;
+    /// per-attempt timeouts still apply. `None` uses the built-in default.
+    pub backend_max_retries: Option<u32>,
+    /// Base of the exponential backoff between retries, in milliseconds. The
+    /// actual wait is drawn uniformly from `[0, base * 2^attempt]` (full jitter)
+    /// so a fleet does not retry in lockstep.
+    pub backend_retry_base_ms: Option<u64>,
+    /// Ceiling on any single backoff wait, in milliseconds. Also clamps a
+    /// `Retry-After` hint from the origin.
+    pub backend_retry_max_delay_ms: Option<u64>,
+    /// Fixed part of the per-attempt deadline, in milliseconds, covering connect
+    /// and time-to-first-byte.
+    pub backend_timeout_floor_ms: Option<u64>,
+    /// Throughput floor (bytes/second) used to extend the per-attempt deadline
+    /// by transfer size, so a 256 MiB block fetch is not held to the same
+    /// deadline as a HEAD. `Some(0)` makes the deadline a flat
+    /// `backend_timeout_floor_ms`.
+    pub backend_min_throughput_bytes: Option<u64>,
     /// S3 region (e.g. `us-east-1`). Required when `backend = s3`.
     pub s3_region: Option<String>,
     /// S3 endpoint host override (e.g. a MinIO/LocalStack host). Defaults to the
@@ -192,6 +211,11 @@ impl Default for WorkerConfig {
             backend_delay_ms: None,
             backend_jitter_ms: None,
             backend_throughput_bytes: None,
+            backend_max_retries: None,
+            backend_retry_base_ms: None,
+            backend_retry_max_delay_ms: None,
+            backend_timeout_floor_ms: None,
+            backend_min_throughput_bytes: None,
             s3_region: None,
             s3_endpoint: None,
             s3_access_key_id: None,
@@ -241,6 +265,16 @@ pub struct WorkerConfigPatch {
     pub backend_jitter_ms: Option<u64>,
     /// Override for [`WorkerConfig::backend_throughput_bytes`].
     pub backend_throughput_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::backend_max_retries`].
+    pub backend_max_retries: Option<u32>,
+    /// Override for [`WorkerConfig::backend_retry_base_ms`].
+    pub backend_retry_base_ms: Option<u64>,
+    /// Override for [`WorkerConfig::backend_retry_max_delay_ms`].
+    pub backend_retry_max_delay_ms: Option<u64>,
+    /// Override for [`WorkerConfig::backend_timeout_floor_ms`].
+    pub backend_timeout_floor_ms: Option<u64>,
+    /// Override for [`WorkerConfig::backend_min_throughput_bytes`].
+    pub backend_min_throughput_bytes: Option<u64>,
     /// Override for [`WorkerConfig::s3_region`].
     pub s3_region: Option<String>,
     /// Override for [`WorkerConfig::s3_endpoint`].
@@ -276,6 +310,17 @@ impl Patch for WorkerConfigPatch {
             backend_throughput_bytes: self
                 .backend_throughput_bytes
                 .or(base.backend_throughput_bytes),
+            backend_max_retries: self.backend_max_retries.or(base.backend_max_retries),
+            backend_retry_base_ms: self.backend_retry_base_ms.or(base.backend_retry_base_ms),
+            backend_retry_max_delay_ms: self
+                .backend_retry_max_delay_ms
+                .or(base.backend_retry_max_delay_ms),
+            backend_timeout_floor_ms: self
+                .backend_timeout_floor_ms
+                .or(base.backend_timeout_floor_ms),
+            backend_min_throughput_bytes: self
+                .backend_min_throughput_bytes
+                .or(base.backend_min_throughput_bytes),
             s3_region: self.s3_region.or(base.s3_region),
             s3_endpoint: self.s3_endpoint.or(base.s3_endpoint),
             s3_access_key_id: self.s3_access_key_id.or(base.s3_access_key_id),
@@ -419,6 +464,46 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).",
     },
     ConfigVar {
+        env: "TALON_WORKER_BACKEND_MAX_RETRIES",
+        key: "backend_max_retries",
+        default: Some("3"),
+        cli: false,
+        secret: false,
+        help: "Retries after the first attempt for a transient backend failure (0 disables).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_RETRY_BASE_MS",
+        key: "backend_retry_base_ms",
+        default: Some("100"),
+        cli: false,
+        secret: false,
+        help: "Exponential backoff base in ms; the wait is jittered over [0, base * 2^attempt].",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_RETRY_MAX_DELAY_MS",
+        key: "backend_retry_max_delay_ms",
+        default: Some("5000"),
+        cli: false,
+        secret: false,
+        help: "Ceiling on a single backoff wait in ms; also clamps an origin Retry-After hint.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_TIMEOUT_FLOOR_MS",
+        key: "backend_timeout_floor_ms",
+        default: Some("5000"),
+        cli: false,
+        secret: false,
+        help: "Fixed part of the per-attempt backend deadline in ms (connect + first byte).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_BACKEND_MIN_THROUGHPUT_BYTES",
+        key: "backend_min_throughput_bytes",
+        default: Some("10485760 (10 MiB/s)"),
+        cli: false,
+        secret: false,
+        help: "Throughput floor in bytes/sec used to extend the deadline by transfer size (0 = flat).",
+    },
+    ConfigVar {
         env: "TALON_WORKER_DATA_PLANE_RINGS",
         key: "data_plane_rings",
         default: Some("0 (one ring per core)"),
@@ -517,6 +602,11 @@ pub(crate) mod worker_env {
     pub const BACKEND_DELAY_MS: &str = "TALON_WORKER_BACKEND_DELAY_MS";
     pub const BACKEND_JITTER_MS: &str = "TALON_WORKER_BACKEND_JITTER_MS";
     pub const BACKEND_THROUGHPUT_BYTES: &str = "TALON_WORKER_BACKEND_THROUGHPUT_BYTES";
+    pub const BACKEND_MAX_RETRIES: &str = "TALON_WORKER_BACKEND_MAX_RETRIES";
+    pub const BACKEND_RETRY_BASE_MS: &str = "TALON_WORKER_BACKEND_RETRY_BASE_MS";
+    pub const BACKEND_RETRY_MAX_DELAY_MS: &str = "TALON_WORKER_BACKEND_RETRY_MAX_DELAY_MS";
+    pub const BACKEND_TIMEOUT_FLOOR_MS: &str = "TALON_WORKER_BACKEND_TIMEOUT_FLOOR_MS";
+    pub const BACKEND_MIN_THROUGHPUT_BYTES: &str = "TALON_WORKER_BACKEND_MIN_THROUGHPUT_BYTES";
     pub const DATA_PLANE_RINGS: &str = "TALON_WORKER_DATA_PLANE_RINGS";
     pub const S3_REGION: &str = "TALON_WORKER_S3_REGION";
     pub const S3_ENDPOINT: &str = "TALON_WORKER_S3_ENDPOINT";
@@ -616,6 +706,21 @@ impl WorkerConfigPatch {
             backend_throughput_bytes: get(worker_env::BACKEND_THROUGHPUT_BYTES)
                 .map(|v| parse_u64(v, worker_env::BACKEND_THROUGHPUT_BYTES))
                 .transpose()?,
+            backend_max_retries: get(worker_env::BACKEND_MAX_RETRIES)
+                .map(|v| parse_u32(v, worker_env::BACKEND_MAX_RETRIES))
+                .transpose()?,
+            backend_retry_base_ms: get(worker_env::BACKEND_RETRY_BASE_MS)
+                .map(|v| parse_u64(v, worker_env::BACKEND_RETRY_BASE_MS))
+                .transpose()?,
+            backend_retry_max_delay_ms: get(worker_env::BACKEND_RETRY_MAX_DELAY_MS)
+                .map(|v| parse_u64(v, worker_env::BACKEND_RETRY_MAX_DELAY_MS))
+                .transpose()?,
+            backend_timeout_floor_ms: get(worker_env::BACKEND_TIMEOUT_FLOOR_MS)
+                .map(|v| parse_u64(v, worker_env::BACKEND_TIMEOUT_FLOOR_MS))
+                .transpose()?,
+            backend_min_throughput_bytes: get(worker_env::BACKEND_MIN_THROUGHPUT_BYTES)
+                .map(|v| parse_u64(v, worker_env::BACKEND_MIN_THROUGHPUT_BYTES))
+                .transpose()?,
         })
     }
 }
@@ -663,6 +768,17 @@ impl WorkerConfig {
             backend_throughput_bytes: merged
                 .backend_throughput_bytes
                 .or(d.backend_throughput_bytes),
+            backend_max_retries: merged.backend_max_retries.or(d.backend_max_retries),
+            backend_retry_base_ms: merged.backend_retry_base_ms.or(d.backend_retry_base_ms),
+            backend_retry_max_delay_ms: merged
+                .backend_retry_max_delay_ms
+                .or(d.backend_retry_max_delay_ms),
+            backend_timeout_floor_ms: merged
+                .backend_timeout_floor_ms
+                .or(d.backend_timeout_floor_ms),
+            backend_min_throughput_bytes: merged
+                .backend_min_throughput_bytes
+                .or(d.backend_min_throughput_bytes),
             data_plane_rings: merged.data_plane_rings.unwrap_or(d.data_plane_rings),
         };
         cfg.validate()?;

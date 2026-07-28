@@ -306,6 +306,46 @@ Synthetic backend bandwidth ceiling in bytes/sec (test/latency lab).
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `backend_max_retries`
+
+Retries after the first attempt for a transient backend failure (0 disables).
+
+- **Environment variable:** `TALON_WORKER_BACKEND_MAX_RETRIES`
+- **Default:** `3`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_retry_base_ms`
+
+Exponential backoff base in ms; the wait is jittered over [0, base * 2^attempt].
+
+- **Environment variable:** `TALON_WORKER_BACKEND_RETRY_BASE_MS`
+- **Default:** `100`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_retry_max_delay_ms`
+
+Ceiling on a single backoff wait in ms; also clamps an origin Retry-After hint.
+
+- **Environment variable:** `TALON_WORKER_BACKEND_RETRY_MAX_DELAY_MS`
+- **Default:** `5000`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_timeout_floor_ms`
+
+Fixed part of the per-attempt backend deadline in ms (connect + first byte).
+
+- **Environment variable:** `TALON_WORKER_BACKEND_TIMEOUT_FLOOR_MS`
+- **Default:** `5000`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_min_throughput_bytes`
+
+Throughput floor in bytes/sec used to extend the deadline by transfer size (0 = flat).
+
+- **Environment variable:** `TALON_WORKER_BACKEND_MIN_THROUGHPUT_BYTES`
+- **Default:** `10485760 (10 MiB/s)`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `data_plane_rings`
 
 io_uring rings for the data plane; 0 = one per core. Falls back to Tokio if io_uring is unavailable.
