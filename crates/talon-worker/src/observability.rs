@@ -22,8 +22,6 @@ use tokio::net::TcpListener;
 
 use crate::{BlockIndex, InFlightLoads};
 
-const BACKEND_LABELS: &[(&str, &str)] = &[("backend", "azure")];
-
 /// Pre-registered metric handles used on worker hot paths.
 #[derive(Clone)]
 pub struct WorkerMetrics {
@@ -35,6 +33,12 @@ pub struct WorkerMetrics {
     bytes_served_total: Counter,
     cache_hits_total: Counter,
     cache_misses_total: Counter,
+    l1_hits_total: Counter,
+    l1_misses_total: Counter,
+    l2_hits_total: Counter,
+    l2_misses_total: Counter,
+    l1_admissions_total: Counter,
+    l1_evictions_total: Counter,
     backend_fetch_bytes_total: Counter,
     backend_fetch_errors_total: Counter,
     backend_retries_total: Counter,
@@ -53,6 +57,9 @@ pub struct WorkerMetrics {
     block_count: Gauge,
     page_count: Gauge,
     resident_bytes: Gauge,
+    l1_blocks: Gauge,
+    l1_resident_bytes: Gauge,
+    l1_capacity_bytes: Gauge,
     ready: Gauge,
     process_uptime_seconds: Gauge,
 }
@@ -71,7 +78,13 @@ impl Drop for ActiveConnectionGuard {
 impl WorkerMetrics {
     /// Create all worker metric families and initialize configured capacity.
     pub fn new(configured_capacity_bytes: u64) -> Self {
+        Self::new_with_backend(configured_capacity_bytes, "azure")
+    }
+
+    /// Create worker metrics labeled with the configured object-store backend.
+    pub fn new_with_backend(configured_capacity_bytes: u64, backend: &str) -> Self {
         let registry = Metrics::new();
+        let backend_labels = labels(&[("backend", backend)]);
         registry
             .gauge(
                 "talon_worker_build_info",
@@ -105,45 +118,75 @@ impl WorkerMetrics {
             "Worker cache misses.",
             labels(&[("form", "whole")]),
         );
+        let l1_hits_total = registry.counter(
+            "talon_worker_cache_tier_hits_total",
+            "Worker cache hits by storage tier.",
+            labels(&[("tier", "l1")]),
+        );
+        let l1_misses_total = registry.counter(
+            "talon_worker_cache_tier_misses_total",
+            "Worker cache misses by storage tier.",
+            labels(&[("tier", "l1")]),
+        );
+        let l2_hits_total = registry.counter(
+            "talon_worker_cache_tier_hits_total",
+            "Worker cache hits by storage tier.",
+            labels(&[("tier", "l2")]),
+        );
+        let l2_misses_total = registry.counter(
+            "talon_worker_cache_tier_misses_total",
+            "Worker cache misses by storage tier.",
+            labels(&[("tier", "l2")]),
+        );
+        let l1_admissions_total = registry.counter(
+            "talon_worker_l1_admissions_total",
+            "Blocks admitted or promoted into the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
+        let l1_evictions_total = registry.counter(
+            "talon_worker_l1_evictions_total",
+            "Blocks evicted from the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
         let backend_fetch_bytes_total = registry.counter(
             "talon_worker_backend_fetch_bytes_total",
             "Bytes fetched from the origin backend.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_fetch_errors_total = registry.counter(
             "talon_worker_backend_fetch_errors_total",
             "Origin backend range fetch failures.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_retries_total = registry.counter(
             "talon_worker_backend_retries_total",
             "Origin backend requests re-issued after a transient failure.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_timeouts_total = registry.counter(
             "talon_worker_backend_timeouts_total",
             "Origin backend request attempts that exceeded their deadline.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_write_bytes_total = registry.counter(
             "talon_worker_backend_write_bytes_total",
             "Bytes written through to the origin backend.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_write_errors_total = registry.counter(
             "talon_worker_backend_write_errors_total",
             "Origin backend object PUT failures.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_delete_total = registry.counter(
             "talon_worker_backend_delete_total",
             "Objects deleted from the origin backend.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_delete_errors_total = registry.counter(
             "talon_worker_backend_delete_errors_total",
             "Origin backend object DELETE failures.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let evictions_total = registry.counter(
             "talon_worker_evictions_total",
@@ -168,7 +211,7 @@ impl WorkerMetrics {
         let backend_fetch_duration_seconds = registry.histogram(
             "talon_worker_backend_fetch_duration_seconds",
             "Origin backend range fetch latency in seconds.",
-            labels(BACKEND_LABELS),
+            backend_labels,
         );
         let active_connections = registry.gauge(
             "talon_worker_active_connections",
@@ -193,6 +236,21 @@ impl WorkerMetrics {
         let resident_bytes = registry.gauge(
             "talon_worker_resident_bytes",
             "Bytes currently resident in the worker cache.",
+            BTreeMap::new(),
+        );
+        let l1_blocks = registry.gauge(
+            "talon_worker_l1_blocks",
+            "Blocks currently resident in the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
+        let l1_resident_bytes = registry.gauge(
+            "talon_worker_l1_resident_bytes",
+            "Payload bytes currently resident in the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
+        let l1_capacity_bytes = registry.gauge(
+            "talon_worker_l1_capacity_bytes",
+            "Configured L1 DRAM cache capacity in bytes.",
             BTreeMap::new(),
         );
         let capacity_bytes = registry.gauge(
@@ -221,6 +279,12 @@ impl WorkerMetrics {
             bytes_served_total,
             cache_hits_total,
             cache_misses_total,
+            l1_hits_total,
+            l1_misses_total,
+            l2_hits_total,
+            l2_misses_total,
+            l1_admissions_total,
+            l1_evictions_total,
             backend_fetch_bytes_total,
             backend_fetch_errors_total,
             backend_retries_total,
@@ -239,6 +303,9 @@ impl WorkerMetrics {
             block_count,
             page_count,
             resident_bytes,
+            l1_blocks,
+            l1_resident_bytes,
+            l1_capacity_bytes,
             ready,
             process_uptime_seconds,
         }
@@ -266,6 +333,47 @@ impl WorkerMetrics {
     /// Record a whole-block cache miss.
     pub fn record_cache_miss(&self) {
         self.cache_misses_total.inc();
+    }
+
+    /// Record an L1 DRAM hit.
+    pub fn record_l1_hit(&self) {
+        self.l1_hits_total.inc();
+    }
+
+    /// Record an L1 DRAM miss.
+    pub fn record_l1_miss(&self) {
+        self.l1_misses_total.inc();
+    }
+
+    /// Record an L2 NVMe hit.
+    pub fn record_l2_hit(&self) {
+        self.l2_hits_total.inc();
+    }
+
+    /// Record an L2 NVMe miss.
+    pub fn record_l2_miss(&self) {
+        self.l2_misses_total.inc();
+    }
+
+    /// Record a block admitted or promoted into L1.
+    pub fn record_l1_admission(&self) {
+        self.l1_admissions_total.inc();
+    }
+
+    /// Record a capacity eviction from L1.
+    pub fn record_l1_eviction(&self) {
+        self.l1_evictions_total.inc();
+    }
+
+    /// Set the configured L1 capacity.
+    pub fn set_l1_capacity(&self, capacity_bytes: u64) {
+        self.l1_capacity_bytes.set(capacity_bytes as f64);
+    }
+
+    /// Publish current L1 entry and byte residency.
+    pub fn update_l1_residency(&self, blocks: u64, resident_bytes: u64) {
+        self.l1_blocks.set(blocks as f64);
+        self.l1_resident_bytes.set(resident_bytes as f64);
     }
 
     /// Record a successful backend fetch.
@@ -504,6 +612,27 @@ impl WorkerObservability {
         index: Arc<BlockIndex>,
         inflight: Arc<InFlightLoads>,
     ) -> std::io::Result<Self> {
+        Self::new_with_backend(
+            cluster_id,
+            node,
+            admin_address,
+            capacity_bytes,
+            "azure",
+            index,
+            inflight,
+        )
+    }
+
+    /// Create worker observability labeled with the selected object-store backend.
+    pub fn new_with_backend(
+        cluster_id: String,
+        node: NodeInfo,
+        admin_address: String,
+        capacity_bytes: u64,
+        backend: &str,
+        index: Arc<BlockIndex>,
+        inflight: Arc<InFlightLoads>,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             node,
             cluster_id,
@@ -513,7 +642,7 @@ impl WorkerObservability {
             started_at_unix_ms: now_unix_ms(),
             started: Instant::now(),
             heartbeat_seq: AtomicU64::new(0),
-            metrics: WorkerMetrics::new(capacity_bytes),
+            metrics: WorkerMetrics::new_with_backend(capacity_bytes, backend),
             readiness: WorkerReadiness::default(),
             index,
             inflight,
@@ -694,6 +823,16 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn backend_metrics_use_the_configured_backend_label() {
+        let metrics = WorkerMetrics::new_with_backend(4096, "s3");
+        metrics.record_backend_fetch_success(1024, Duration::from_millis(5));
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("talon_worker_backend_fetch_bytes_total{backend=\"s3\"} 1024"));
+        assert!(!rendered.contains("backend=\"azure\""));
     }
 
     #[test]

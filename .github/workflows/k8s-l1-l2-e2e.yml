@@ -1,0 +1,47 @@
+name: Kubernetes L1/L2 E2E
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/k8s-l1-l2-e2e.yml"
+      - "crates/talon-client/**"
+      - "crates/talon-core/src/config.rs"
+      - "crates/talon-worker/**"
+      - "deploy/docker/**"
+      - "deploy/helm/talon/**"
+      - "scripts/k8s_l1_l2_e2e.sh"
+
+permissions:
+  contents: read
+
+jobs:
+  multi-node:
+    name: 3-worker L1/L2 E2E and benchmark
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: helm/kind-action@v1.12.0
+        with:
+          install_only: true
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+
+      - name: Run multi-node Kubernetes E2E
+        env:
+          BENCH_SECONDS: "3"
+        run: scripts/k8s_l1_l2_e2e.sh
+
+      - name: Upload E2E and benchmark artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: k8s-l1-l2-e2e
+          path: .artifacts/k8s-l1-l2
+          if-no-files-found: warn
