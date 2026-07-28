@@ -291,6 +291,14 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   [`docs/adr/0001-management-plane-ha.md`](docs/adr/0001-management-plane-ha.md).
   Raft remains out of scope unless the coordinator later owns durable,
   non-rebuildable metadata such as write-back state.
+- **Writes:** **write-through only** — a write is durable when the origin object
+  store has acknowledged it, and never before. Read-your-writes and monotonic
+  reads follow from that. Write-back is deferred behind explicit entry
+  conditions (replication before acknowledgement, bounded dirty state, proven
+  crash recovery), because acknowledging from one node's NVMe is not durability.
+  The contract, failure semantics, and the conditions under which write-back
+  could be revisited are defined in
+  [`docs/adr/0002-write-cache-durability.md`](docs/adr/0002-write-cache-durability.md).
 - **Membership:** Kubernetes watch/poll as the membership source; worker
   heartbeats provide liveness + block inventory. No gossip. Timeout at 3–6
   heartbeat windows (e.g. 10s heartbeat → 30–60s to mark unhealthy).
