@@ -10,6 +10,7 @@
 //! construction and response parsing are unit-testable offline; a real OAuth2
 //! bearer-token client is injected in production.
 
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -165,6 +166,18 @@ impl GcsBackend {
         }
     }
 
+    fn build_streamed_put(&self, obj: &ObjectId, len: u64) -> HttpRequest {
+        let mut request = self.build_put(obj, bytes::Bytes::new(), None);
+        if let Some((_, value)) = request
+            .headers
+            .iter_mut()
+            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+        {
+            *value = len.to_string();
+        }
+        request
+    }
+
     /// Build the DELETE request (exposed for testing).
     pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
         HttpRequest {
@@ -305,6 +318,30 @@ impl BackendStore for GcsBackend {
         }
     }
 
+    async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        let resp = self
+            .http
+            .execute_file(self.build_streamed_put(obj, len), path, len)
+            .await
+            .map_err(Error::Backend)?;
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "GCS streamed PUT {} -> HTTP {}",
+                obj.to_path(),
+                resp.status
+            )));
+        }
+        match resp
+            .header("x-goog-generation")
+            .or_else(|| resp.header("etag"))
+            .map(|value| Version::new(value.trim_matches('"').to_string()))
+            .filter(|version| !version.0.trim().is_empty())
+        {
+            Some(version) => Ok(version),
+            None => Ok(self.head(obj).await?.version),
+        }
+    }
+
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
         let resp = self
             .http
@@ -332,6 +369,7 @@ mod tests {
 
     struct MockHttp {
         last: Mutex<Option<HttpRequest>>,
+        last_file: Mutex<Option<(HttpRequest, std::path::PathBuf, u64)>>,
         response: HttpResponse,
     }
 
@@ -339,6 +377,7 @@ mod tests {
         fn new(response: HttpResponse) -> Arc<Self> {
             Arc::new(Self {
                 last: Mutex::new(None),
+                last_file: Mutex::new(None),
                 response,
             })
         }
@@ -348,6 +387,16 @@ mod tests {
     impl HttpClient for MockHttp {
         async fn execute(&self, req: HttpRequest) -> std::result::Result<HttpResponse, String> {
             *self.last.lock().unwrap() = Some(req);
+            Ok(self.response.clone())
+        }
+
+        async fn execute_file(
+            &self,
+            req: HttpRequest,
+            path: &Path,
+            len: u64,
+        ) -> std::result::Result<HttpResponse, String> {
+            *self.last_file.lock().unwrap() = Some((req, path.to_path_buf(), len));
             Ok(self.response.clone())
         }
     }
@@ -516,6 +565,29 @@ mod tests {
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.method, Method::Put);
         assert_eq!(req.body, body);
+        assert_eq!(req.header("Authorization"), Some("Bearer tok"));
+    }
+
+    #[tokio::test]
+    async fn put_file_streams_body_and_returns_generation() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![("x-goog-generation".into(), "1700000011".into())],
+            body: bytes::Bytes::new(),
+        });
+        let g = GcsBackend::new(GcsConfig::default(), Some("tok".into()), http.clone());
+        let mut staged = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut staged, b"gcs-stream").unwrap();
+
+        let version = g.put_file(&obj(), staged.path(), 10).await.unwrap();
+
+        assert_eq!(version, Version::new("1700000011"));
+        let (req, path, len) = http.last_file.lock().unwrap().clone().unwrap();
+        assert_eq!(path, staged.path());
+        assert_eq!(len, 10);
+        assert_eq!(req.method, Method::Put);
+        assert!(req.body.is_empty());
+        assert_eq!(req.header("Content-Length"), Some("10"));
         assert_eq!(req.header("Authorization"), Some("Bearer tok"));
     }
 

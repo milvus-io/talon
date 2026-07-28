@@ -133,9 +133,20 @@ pub fn sign_request(
     service: &str,
     date: &AmzDate,
 ) {
-    let (host, path, query) = split_url(&req.url);
     let payload_hash = sha256_hex(&req.body);
+    sign_request_with_payload_hash(req, creds, region, service, date, &payload_hash);
+}
 
+/// Sign `req` using a SHA-256 hash computed by a streaming caller.
+pub fn sign_request_with_payload_hash(
+    req: &mut HttpRequest,
+    creds: &S3Credentials,
+    region: &str,
+    service: &str,
+    date: &AmzDate,
+    payload_hash: &str,
+) {
+    let (host, path, query) = split_url(&req.url);
     // Reset the headers we own, keeping caller headers (Range, If-Match, ...).
     req.headers.retain(|(k, _)| {
         !matches!(
@@ -151,7 +162,7 @@ pub fn sign_request(
     req.headers
         .push(("x-amz-date".into(), date.datetime.clone()));
     req.headers
-        .push(("x-amz-content-sha256".into(), payload_hash.clone()));
+        .push(("x-amz-content-sha256".into(), payload_hash.to_string()));
     if let Some(tok) = &creds.session_token {
         req.headers
             .push(("x-amz-security-token".into(), tok.clone()));
@@ -160,7 +171,7 @@ pub fn sign_request(
     // Canonical headers: the signed set, lowercased, sorted, trimmed values.
     let mut signed: Vec<(String, String)> = vec![
         ("host".into(), host),
-        ("x-amz-content-sha256".into(), payload_hash.clone()),
+        ("x-amz-content-sha256".into(), payload_hash.to_string()),
         ("x-amz-date".into(), date.datetime.clone()),
     ];
     if let Some(tok) = &creds.session_token {

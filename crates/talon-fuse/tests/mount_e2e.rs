@@ -403,6 +403,85 @@ async fn mount_write_through_is_visible_in_backend() {
     );
 }
 
+/// Spill a sparse write past the memory threshold and stream it through close.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
+async fn mount_large_sparse_write_streams_without_whole_object_memory() {
+    use fuser::MountOption;
+
+    let _mount_test_guard = serialize_mount_test().await;
+    let block_size: u32 = 4 * 1024 * 1024;
+    let store: Store = Arc::new(Mutex::new(HashMap::new()));
+    let worker = spawn_rw_worker(Arc::clone(&store)).await;
+    let coord = spawn_coordinator(worker).await;
+
+    let fs = Arc::new(ReadOnlyFs::new().with_max_object_bytes(1024));
+    fs.insert_object("s3/bucket/placeholder", 0);
+    let cache = Arc::new(PlacementCache::new(10_000));
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let adapter = TalonFuse::new(
+        Arc::clone(&fs),
+        reader,
+        tokio::runtime::Handle::current(),
+        block_size,
+        talon_core::Version::new(talon_fuse::mount::CANONICAL_MOUNT_VERSION),
+    )
+    .with_read_write(true);
+
+    let require_fuse = std::env::var_os("TALON_REQUIRE_FUSE").is_some();
+    let mountpoint =
+        std::env::temp_dir().join(format!("talon-mount-e2e-stream-{}", std::process::id()));
+    std::fs::create_dir_all(&mountpoint).unwrap();
+    let session =
+        match fuser::spawn_mount2(adapter, &mountpoint, &[MountOption::FSName("talon".into())]) {
+            Ok(session) => session,
+            Err(error) => {
+                std::fs::remove_dir_all(&mountpoint).ok();
+                if require_fuse {
+                    panic!("TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}");
+                }
+                eprintln!("skipping: /dev/fuse unavailable: {error}");
+                return;
+            }
+        };
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let path = mountpoint.join("s3").join("bucket").join("sparse.bin");
+    let write_path = path.clone();
+    let logical_offset = 8 * 1024 * 1024 + 1;
+    tokio::task::spawn_blocking(move || {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&write_path)?;
+        assert_eq!(file.write_at(b"x", logical_offset)?, 1);
+        drop(file);
+
+        assert_eq!(std::fs::metadata(&write_path)?.len(), logical_offset + 1);
+        let file = std::fs::File::open(&write_path)?;
+        let mut byte = [0u8; 1];
+        assert_eq!(file.read_at(&mut byte, logical_offset)?, 1);
+        assert_eq!(byte, [b'x']);
+        Ok::<(), std::io::Error>(())
+    })
+    .await
+    .unwrap()
+    .expect("stream a sparse write through the mount");
+
+    drop(session);
+    std::fs::remove_dir_all(&mountpoint).ok();
+
+    let stored = store
+        .lock()
+        .unwrap()
+        .get("/s3/bucket/sparse.bin")
+        .cloned()
+        .expect("mock backend received streamed object");
+    assert_eq!(stored.len() as u64, logical_offset + 1);
+    assert_eq!(stored[logical_offset as usize], b'x');
+}
+
 /// Exercise open flags through the kernel and verify their blob-store effects.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]

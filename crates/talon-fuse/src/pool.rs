@@ -142,9 +142,23 @@ impl ConnectionPool {
         F: std::future::Future<Output = Result<T, E>>,
         E: From<std::io::Error>,
     {
-        match tokio::time::timeout(self.request_timeout, fut).await {
+        self.with_deadline(what, self.request_timeout, fut).await
+    }
+
+    /// Run an exchange with a caller-selected bounded deadline.
+    pub async fn with_deadline<T, E, F>(
+        &self,
+        what: &str,
+        timeout: Duration,
+        fut: F,
+    ) -> Result<T, E>
+    where
+        F: std::future::Future<Output = Result<T, E>>,
+        E: From<std::io::Error>,
+    {
+        match tokio::time::timeout(timeout, fut).await {
             Ok(result) => result,
-            Err(_) => Err(E::from(timeout_error(what, self.request_timeout))),
+            Err(_) => Err(E::from(timeout_error(what, timeout))),
         }
     }
 

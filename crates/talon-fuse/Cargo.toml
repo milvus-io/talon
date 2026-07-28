@@ -21,6 +21,7 @@ tracing-subscriber.workspace = true
 clap.workspace = true
 async-trait.workspace = true
 thiserror.workspace = true
+tempfile.workspace = true
 
 # The kernel mount layer is optional: enabling the `mount` feature pulls in
 # `fuser` and compiles the `fuser::Filesystem` adapter. Default builds (and CI

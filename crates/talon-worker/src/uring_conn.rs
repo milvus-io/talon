@@ -51,6 +51,7 @@
 //! mean porting `block_store` and the miss path to monoio's own blocking pool —
 //! worth doing eventually, but a separate change from the data plane itself.
 
+use std::io::{Seek, Write};
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
@@ -357,15 +358,38 @@ async fn handle_put(
         return Ok(());
     }
 
-    // Read exactly body_len raw object bytes following the header.
     use monoio::io::AsyncReadRentExt;
-    let (res, body) = stream.read_exact(vec![0u8; req.body_len as usize]).await;
-    res?;
+    let write_result = if req.body_len <= worker.max_inline_write_bytes() {
+        let body_len = usize::try_from(req.body_len)
+            .map_err(|_| anyhow::anyhow!("PUT body length is not representable"))?;
+        let (res, body) = stream.read_exact(vec![0u8; body_len]).await;
+        res?;
+        worker
+            .write_object(&req.object, bytes::Bytes::from(body))
+            .await
+    } else {
+        let staged = tempfile::NamedTempFile::new()?;
+        let mut file = staged.reopen()?;
+        let mut remaining = req.body_len;
+        while remaining > 0 {
+            let chunk_len = remaining.min(8 * 1024 * 1024) as usize;
+            let (res, chunk) = stream.read_exact(vec![0u8; chunk_len]).await;
+            res?;
+            if chunk.iter().all(|byte| *byte == 0) {
+                file.seek(std::io::SeekFrom::Current(chunk_len as i64))?;
+            } else {
+                file.write_all(&chunk)?;
+            }
+            remaining -= chunk_len as u64;
+        }
+        file.set_len(req.body_len)?;
+        file.flush()?;
+        worker
+            .write_object_file(&req.object, staged.path(), req.body_len)
+            .await
+    };
 
-    match worker
-        .write_object(&req.object, bytes::Bytes::from(body))
-        .await
-    {
+    match write_result {
         Ok(version) => {
             let vbytes = version.as_str().as_bytes().to_vec();
             let hdr = data::response_header_ok(h.request_id, vbytes.len() as u32).to_vec();
