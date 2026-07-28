@@ -17,6 +17,7 @@ pub mod runtime;
 pub mod sendfile;
 pub mod splice;
 pub mod staging;
+pub mod tokio_conn;
 pub mod uring_conn;
 pub mod uring_serve;
 
