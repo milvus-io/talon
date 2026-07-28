@@ -7,7 +7,8 @@
 # Mounting talks to the kernel, so a container running this image needs
 # `/dev/fuse` and the SYS_ADMIN capability, e.g.:
 #   docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
-#     -e TALON_FUSE_COORDINATOR=coordinator:7000 talon-fuse \
+#     -e TALON_FUSE_COORDINATOR=coordinator:7000 \
+#     -e TALON_FUSE_NAMESPACE_PREFIX=az/container talon-fuse \
 #     --mountpoint /mnt/talon
 #
 # Build from the repository root:

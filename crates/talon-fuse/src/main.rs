@@ -10,12 +10,13 @@
 //! but prints a clear message instead of mounting, so it still builds and runs
 //! in environments without `/dev/fuse` or libfuse.
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
 use talon_core::{FuseConfig, FuseConfigPatch};
-use talon_fuse::{BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
+use talon_fuse::{path_to_object, BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
 use talon_transport::ObjectEntry;
 
 /// Command-line arguments for the Talon FUSE mount.
@@ -108,16 +109,146 @@ where
     let entries = listing.map_err(|error| {
         anyhow::anyhow!("failed to list namespace prefix {namespace_prefix:?}: {error}")
     })?;
-    if entries.is_empty() {
-        tracing::warn!(namespace_prefix, "namespace listing returned zero objects");
-    }
+
+    // Validate the entire response before mutating the tree.  Object-store keys
+    // may legally contain empty, `.` or `..` components, but those cannot be
+    // represented reversibly in a POSIX namespace.  Failing the mount is safer
+    // than silently mapping (for example) `foo//bar` to the different key
+    // `foo/bar`.  A single trailing slash is retained as a directory marker.
+    validate_listing_paths(namespace_prefix, &entries)?;
+
     let n = fs.populate_from_listing(entries.iter().map(|e| (e.path.as_str(), e.size)));
+    if n == 0 {
+        tracing::warn!(
+            namespace_prefix,
+            "namespace listing returned zero visible objects"
+        );
+    }
     tracing::info!(
         objects = n,
         namespace_prefix,
         "populated namespace from coordinator listing"
     );
     Ok(n)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ListingPathKind {
+    File,
+    DirectoryMarker,
+}
+
+const MAX_FUSE_COMPONENT_BYTES: usize = 255;
+
+/// Validate individual paths, requested scope, and relationships across the
+/// whole listing.
+///
+/// Object stores permit a key such as `foo` to coexist with `foo/bar`, but a
+/// POSIX node cannot be both a file and a directory. Detect those collisions
+/// before populating so the result does not depend on backend listing order.
+fn validate_listing_paths(namespace_prefix: &str, entries: &[ObjectEntry]) -> anyhow::Result<()> {
+    let namespace_prefix = namespace_prefix
+        .strip_prefix('/')
+        .unwrap_or(namespace_prefix);
+    let mut scope_parts = namespace_prefix.splitn(3, '/');
+    let backend = scope_parts.next().unwrap_or_default();
+    let bucket = scope_parts.next().unwrap_or_default();
+    if backend.is_empty() || bucket.is_empty() {
+        anyhow::bail!("invalid namespace prefix {namespace_prefix:?}");
+    }
+    let key_prefix = scope_parts.next().unwrap_or_default();
+    let namespace_root = format!("{backend}/{bucket}/");
+
+    let mut paths = BTreeMap::new();
+    for entry in entries {
+        validate_listing_path(&entry.path)?;
+        let entry_key = entry.path.strip_prefix(&namespace_root).ok_or_else(|| {
+            anyhow::anyhow!(
+                "namespace listing for {namespace_prefix:?} returned out-of-scope object path {:?}",
+                entry.path
+            )
+        })?;
+        if !entry_key.starts_with(key_prefix) {
+            anyhow::bail!(
+                "namespace listing for {namespace_prefix:?} returned out-of-scope object path {:?}",
+                entry.path
+            );
+        }
+        let (path, kind) = match entry.path.strip_suffix('/') {
+            Some(path) => {
+                if entry.size != 0 {
+                    anyhow::bail!(
+                        "namespace listing contains non-empty trailing-slash object {:?} ({} bytes); only zero-byte directory markers can be represented safely",
+                        entry.path,
+                        entry.size
+                    );
+                }
+                (path, ListingPathKind::DirectoryMarker)
+            }
+            None => (entry.path.as_str(), ListingPathKind::File),
+        };
+
+        if let Some(existing) = paths.insert(path, kind) {
+            if existing == kind {
+                anyhow::bail!(
+                    "namespace listing contains duplicate object path {:?}",
+                    entry.path
+                );
+            }
+            anyhow::bail!(
+                "namespace listing contains conflicting file and directory marker for {path:?}"
+            );
+        }
+    }
+
+    for path in paths.keys().copied() {
+        for (slash, _) in path.match_indices('/') {
+            let ancestor = &path[..slash];
+            if paths.get(ancestor) == Some(&ListingPathKind::File) {
+                anyhow::bail!(
+                    "namespace listing cannot represent file {ancestor:?} alongside descendant {path:?}"
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Require the coordinator's mount-relative path to round-trip exactly through
+/// Talon's object-path mapping. Directory markers use one trailing slash,
+/// which is intentionally outside [`path_to_object`]'s file-path grammar.
+fn validate_listing_path(path: &str) -> anyhow::Result<()> {
+    let object_path = path.strip_suffix('/').unwrap_or(path);
+    if path.starts_with('/') {
+        anyhow::bail!("namespace listing returned non-canonical object path {path:?}");
+    }
+    for component in object_path.split('/') {
+        if matches!(component, "" | "." | "..") {
+            anyhow::bail!("namespace listing returned non-canonical object path {path:?}");
+        }
+        if component.as_bytes().contains(&0) {
+            anyhow::bail!("namespace listing returned object path {path:?} containing a NUL byte");
+        }
+        if component.len() > MAX_FUSE_COMPONENT_BYTES {
+            anyhow::bail!(
+                "namespace listing returned object path {path:?} with a component longer than {MAX_FUSE_COMPONENT_BYTES} bytes"
+            );
+        }
+    }
+
+    let object = path_to_object(object_path).map_err(|error| {
+        anyhow::anyhow!("namespace listing returned invalid object path {path:?}: {error}")
+    })?;
+    let canonical = object.to_path();
+    let canonical = canonical
+        .strip_prefix('/')
+        .expect("ObjectId::to_path always starts with a slash");
+    if canonical != object_path {
+        anyhow::bail!(
+            "namespace listing returned non-canonical object path {path:?}; expected {canonical:?}"
+        );
+    }
+    Ok(())
 }
 
 #[cfg(feature = "mount")]
@@ -244,5 +375,272 @@ mod tests {
         let gcs = fs.lookup(talon_fuse::ops::ROOT_INO, "gcs").unwrap();
         let models = fs.lookup(gcs.ino, "models").unwrap();
         assert!(fs.lookup(models.ino, "checkpoint.bin").is_ok());
+    }
+
+    #[test]
+    fn namespace_listing_rejects_ambiguous_paths_before_populating() {
+        for invalid in [
+            "/s3/bucket/file.bin",
+            "azure/container/file.bin",
+            "s3/bucket/a//b",
+            "s3/bucket/./file.bin",
+            "s3/bucket/../file.bin",
+            "s3/./file.bin",
+            "s3/../file.bin",
+            "s3/bucket/dir//",
+        ] {
+            let fs = ReadOnlyFs::new();
+            let error = populate_namespace::<&str>(
+                &fs,
+                "s3/bucket",
+                Ok(vec![
+                    ObjectEntry {
+                        path: "s3/bucket/valid.bin".into(),
+                        size: 1,
+                    },
+                    ObjectEntry {
+                        path: invalid.into(),
+                        size: 2,
+                    },
+                ]),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains(invalid), "{error:#}");
+            assert!(
+                fs.lookup(talon_fuse::ops::ROOT_INO, "s3").is_err(),
+                "{invalid:?} left a partially populated namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_listing_accepts_directory_markers() {
+        let entries = vec![
+            ObjectEntry {
+                path: "s3/bucket/empty/".into(),
+                size: 0,
+            },
+            ObjectEntry {
+                path: "s3/bucket/empty/file.bin".into(),
+                size: 3,
+            },
+        ];
+
+        for reverse in [false, true] {
+            let fs = ReadOnlyFs::new();
+            let mut ordered = entries.clone();
+            if reverse {
+                ordered.reverse();
+            }
+            let count = populate_namespace::<&str>(&fs, "s3/bucket", Ok(ordered)).unwrap();
+
+            assert_eq!(count, 2);
+            let s3 = fs.lookup(talon_fuse::ops::ROOT_INO, "s3").unwrap();
+            let bucket = fs.lookup(s3.ino, "bucket").unwrap();
+            let empty = fs.lookup(bucket.ino, "empty").unwrap();
+            assert_eq!(empty.kind, talon_fuse::FileKind::Directory);
+            assert!(fs.lookup(empty.ino, "file.bin").is_ok());
+        }
+    }
+
+    #[test]
+    fn namespace_listing_rejects_unrepresentable_components_before_populating() {
+        let invalid = [
+            "s3/bucket/nul\0name".to_string(),
+            format!("s3/bucket/{}", "x".repeat(MAX_FUSE_COMPONENT_BYTES + 1)),
+        ];
+
+        for path in invalid {
+            let fs = ReadOnlyFs::new();
+            let error = populate_namespace::<&str>(
+                &fs,
+                "s3/bucket",
+                Ok(vec![ObjectEntry { path, size: 1 }]),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("namespace listing"), "{error:#}");
+            assert!(
+                fs.lookup(talon_fuse::ops::ROOT_INO, "s3").is_err(),
+                "invalid listing left a partially populated namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_listing_rejects_nonempty_trailing_slash_objects() {
+        let fs = ReadOnlyFs::new();
+        let error = populate_namespace::<&str>(
+            &fs,
+            "s3/bucket",
+            Ok(vec![ObjectEntry {
+                path: "s3/bucket/not-a-marker/".into(),
+                size: 7,
+            }]),
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("non-empty trailing-slash"));
+        assert!(fs.lookup(talon_fuse::ops::ROOT_INO, "s3").is_err());
+    }
+
+    #[test]
+    fn namespace_listing_enforces_backend_bucket_and_raw_key_scope() {
+        for (namespace_prefix, in_scope, out_of_scope) in [
+            ("s3/bucket", "s3/bucket/file.bin", "gcs/bucket/file.bin"),
+            ("s3/bucket", "s3/bucket/file.bin", "s3/other/file.bin"),
+            (
+                "s3/bucket/wanted",
+                "s3/bucket/wanted.bin",
+                "s3/bucket/other.bin",
+            ),
+            (
+                "s3/bucket/dir/",
+                "s3/bucket/dir/file.bin",
+                "s3/bucket/dir2/file.bin",
+            ),
+        ] {
+            let fs = ReadOnlyFs::new();
+            let error = populate_namespace::<&str>(
+                &fs,
+                namespace_prefix,
+                Ok(vec![
+                    ObjectEntry {
+                        path: in_scope.into(),
+                        size: 1,
+                    },
+                    ObjectEntry {
+                        path: out_of_scope.into(),
+                        size: 2,
+                    },
+                ]),
+            )
+            .unwrap_err();
+
+            assert!(error.to_string().contains("out-of-scope"), "{error:#}");
+            assert!(
+                fs.lookup(talon_fuse::ops::ROOT_INO, "s3").is_err(),
+                "out-of-scope listing left a partially populated namespace"
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_listing_preserves_raw_prefix_semantics() {
+        let fs = ReadOnlyFs::new();
+        let count = populate_namespace::<&str>(
+            &fs,
+            "/s3/bucket/dir",
+            Ok(vec![
+                ObjectEntry {
+                    path: "s3/bucket/dir2/file.bin".into(),
+                    size: 1,
+                },
+                ObjectEntry {
+                    path: "s3/bucket/directory/file.bin".into(),
+                    size: 2,
+                },
+            ]),
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+
+        let fs = ReadOnlyFs::new();
+        let count = populate_namespace::<&str>(
+            &fs,
+            "s3/bucket/dir/",
+            Ok(vec![
+                ObjectEntry {
+                    path: "s3/bucket/dir/".into(),
+                    size: 0,
+                },
+                ObjectEntry {
+                    path: "s3/bucket/dir/file.bin".into(),
+                    size: 3,
+                },
+            ]),
+        )
+        .unwrap();
+        assert_eq!(count, 2);
+    }
+
+    #[test]
+    fn namespace_listing_rejects_tree_conflicts_in_any_order() {
+        let conflicts = [
+            vec![
+                ObjectEntry {
+                    path: "s3/bucket/foo".into(),
+                    size: 1,
+                },
+                ObjectEntry {
+                    path: "s3/bucket/foo/bar".into(),
+                    size: 2,
+                },
+            ],
+            vec![
+                ObjectEntry {
+                    path: "s3/bucket/foo".into(),
+                    size: 1,
+                },
+                ObjectEntry {
+                    path: "s3/bucket/foo/".into(),
+                    size: 0,
+                },
+            ],
+            vec![
+                ObjectEntry {
+                    path: "s3/bucket/foo".into(),
+                    size: 1,
+                },
+                ObjectEntry {
+                    path: "s3/bucket/foo/bar/".into(),
+                    size: 0,
+                },
+            ],
+            vec![
+                ObjectEntry {
+                    path: "s3/bucket/foo".into(),
+                    size: 1,
+                },
+                ObjectEntry {
+                    path: "s3/bucket/foo".into(),
+                    size: 2,
+                },
+            ],
+        ];
+
+        for entries in conflicts {
+            for reverse in [false, true] {
+                let fs = ReadOnlyFs::new();
+                let mut ordered = entries.clone();
+                if reverse {
+                    ordered.reverse();
+                }
+                let error = populate_namespace::<&str>(&fs, "s3/bucket", Ok(ordered)).unwrap_err();
+
+                assert!(error.to_string().contains("namespace listing"), "{error:#}");
+                assert!(
+                    fs.lookup(talon_fuse::ops::ROOT_INO, "s3").is_err(),
+                    "conflicting listing left a partially populated namespace"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn internal_only_listing_has_zero_visible_objects() {
+        let fs = ReadOnlyFs::new();
+        let count = populate_namespace::<&str>(
+            &fs,
+            "s3/bucket",
+            Ok(vec![ObjectEntry {
+                path: "s3/bucket/.__talon_internal/unlinked/stale/1".into(),
+                size: 7,
+            }]),
+        )
+        .unwrap();
+
+        assert_eq!(count, 0);
     }
 }

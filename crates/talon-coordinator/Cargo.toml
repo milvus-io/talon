@@ -54,7 +54,7 @@ tonic = { workspace = true, optional = true }
 
 [dev-dependencies]
 divan.workspace = true
-tokio.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tower = { version = "0.5", features = ["util"] }
 
 [[bench]]

@@ -10,6 +10,8 @@ use talon_core::{
     ObjectStore, PageIndex, Version,
 };
 use talon_transport::data::RangeRequest;
+use talon_transport::frame::HEADER_LEN;
+use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LEN};
 
 use crate::{
     BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert, MemoryStore, Presence,
@@ -23,6 +25,16 @@ use crate::{
 /// read path; the conditional GET (`If-Match`) is the hard correctness guard
 /// that catches an overwrite inside the window (issue #163).
 const DEFAULT_VERSION_TTL: Duration = Duration::from_secs(3);
+
+/// Maximum number of objects that can be returned by one non-paginated
+/// `ListObjects` control request.
+const MAX_LIST_OBJECTS: usize = 10_000;
+
+/// Maximum backend pages drained by one non-paginated `ListObjects` request.
+const MAX_LIST_PAGES: usize = 20;
+
+/// Objects requested per backend page.
+const LIST_PAGE_SIZE: u32 = 1000;
 
 /// A per-object resolved version with the instant it was resolved.
 struct CachedVersion {
@@ -55,6 +67,10 @@ pub struct WorkerRuntime {
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
     backend: Arc<dyn BackendStore>,
+    /// Backend selected by the worker process. Optional only so unit-test
+    /// runtimes that do not exercise backend routing retain their compact
+    /// constructors.
+    configured_backend: Option<Backend>,
     block_size: u32,
     metrics: WorkerMetrics,
     /// Byte-accounted LRU driving capacity enforcement/eviction (issue #159).
@@ -127,6 +143,7 @@ impl WorkerRuntime {
             index,
             inflight,
             backend,
+            configured_backend: None,
             block_size,
             metrics,
             lru,
@@ -134,6 +151,32 @@ impl WorkerRuntime {
             version_cache: Mutex::new(HashMap::new()),
             version_ttl: DEFAULT_VERSION_TTL,
         }
+    }
+
+    /// Record the backend selected by the worker process.
+    ///
+    /// Requests carry a backend either directly in their [`ObjectId`] or in a
+    /// namespace prefix (`s3`, `gcs`, or `az`). A worker has exactly one
+    /// configured backend, so retaining that selection lets it reject a request
+    /// routed to the wrong worker instead of addressing the same bucket/key on
+    /// a different object store.
+    pub fn with_backend_kind(mut self, backend: Backend) -> Self {
+        self.configured_backend = Some(backend);
+        self
+    }
+
+    /// Reject an operation routed to a worker for another object-store backend.
+    fn ensure_configured_backend(&self, requested: Backend) -> anyhow::Result<()> {
+        let Some(configured) = self.configured_backend else {
+            return Ok(());
+        };
+        if requested != configured {
+            anyhow::bail!(
+                "request selects backend {requested}, but this worker is configured for \
+                 {configured}; route the request to a {requested} worker"
+            );
+        }
+        Ok(())
     }
 
     /// Override the resolved-version cache TTL (test hook).
@@ -178,6 +221,7 @@ impl WorkerRuntime {
     /// invalidated and the request is retried once against the freshly-resolved
     /// version (issue #163).
     pub async fn serve_range(&self, request: &RangeRequest) -> anyhow::Result<bytes::Bytes> {
+        self.ensure_configured_backend(request.object.backend)?;
         if request.len == 0 {
             return Ok(bytes::Bytes::new());
         }
@@ -211,6 +255,7 @@ impl WorkerRuntime {
     /// blocks are keyed by the resolved ETag, and a `412`/`VersionMismatch` inside
     /// the version-cache window re-resolves once (issues #119, #163).
     pub async fn serve(&self, request: &RangeRequest) -> anyhow::Result<ServeOutcome> {
+        self.ensure_configured_backend(request.object.backend)?;
         if request.len == 0 {
             return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
         }
@@ -378,21 +423,11 @@ impl WorkerRuntime {
     /// feed them straight back to `read`.
     ///
     /// Pages are drained here rather than exposed to the client: the control
-    /// protocol has no cursor, and adding one would be a wire change. To keep
-    /// that bounded, both the object count and the number of backend round
-    /// trips are capped — an unbounded listing of a large bucket would
-    /// otherwise hold the whole result set in memory and block the caller for
-    /// an unbounded time. A truncated listing is better than an unbounded one,
-    /// and the cap is high enough that a namespace hitting it is already past
-    /// what a single control message should carry.
+    /// protocol has no cursor, and adding one would be a wire change. Object,
+    /// page, and encoded-response limits bound the operation. Hitting any limit
+    /// is an error: returning a partial success would mount an apparently
+    /// healthy but incomplete namespace.
     pub async fn list_objects(&self, prefix: &str) -> anyhow::Result<Vec<(String, u64)>> {
-        /// Objects returned before truncating.
-        const MAX_OBJECTS: usize = 10_000;
-        /// Backend round trips before giving up, independent of page size.
-        const MAX_PAGES: usize = 20;
-        /// Objects requested per backend page.
-        const PAGE_SIZE: u32 = 1000;
-
         let trimmed = prefix.trim_start_matches('/');
         let mut parts = trimmed.splitn(3, '/');
         let backend_prefix = parts.next().unwrap_or("");
@@ -404,6 +439,7 @@ impl WorkerRuntime {
         let backend: Backend = backend_prefix.parse().map_err(|_| {
             anyhow::anyhow!("unknown backend {backend_prefix:?} in listing prefix {prefix:?}")
         })?;
+        self.ensure_configured_backend(backend)?;
         let bucket = parts.next().unwrap_or("");
         if bucket.is_empty() {
             anyhow::bail!(
@@ -414,27 +450,43 @@ impl WorkerRuntime {
 
         let mut out = Vec::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..MAX_PAGES {
+        for page_number in 1..=MAX_LIST_PAGES {
             let page = self
                 .backend
-                .list_objects(bucket, key_prefix, cursor.as_deref(), PAGE_SIZE)
+                .list_objects(bucket, key_prefix, cursor.as_deref(), LIST_PAGE_SIZE)
                 .await
                 .map_err(|error| anyhow::anyhow!("list {prefix}: {error}"))?;
+
+            let page_len = page.objects.len();
+            let remaining = MAX_LIST_OBJECTS.saturating_sub(out.len());
+            if page_len > remaining || (page_len == remaining && page.next.is_some()) {
+                anyhow::bail!(
+                    "listing {prefix:?} exceeds the 10,000-object control-response \
+                     limit; narrow the namespace prefix"
+                );
+            }
             for object in page.objects {
                 out.push((
                     format!("{}/{}/{}", backend.prefix(), bucket, object.key),
                     object.size,
                 ));
-                if out.len() >= MAX_OBJECTS {
-                    return Ok(out);
-                }
             }
+
+            ensure_listing_fits_control_frame(prefix, &out)?;
+
             match page.next {
                 Some(next) => cursor = Some(next),
-                None => break,
+                None => return Ok(out),
+            }
+            if page_number == MAX_LIST_PAGES {
+                anyhow::bail!(
+                    "listing {prefix:?} did not complete within {MAX_LIST_PAGES} backend pages; \
+                     narrow the namespace prefix"
+                );
             }
         }
-        Ok(out)
+
+        unreachable!("the bounded listing loop always returns or reports its limit")
     }
 
     /// Return an object's size and current version (#318).
@@ -447,6 +499,7 @@ impl WorkerRuntime {
     /// maintains: a size can change under an overwrite, and serving a stale one
     /// would make a client read past the end of the new object.
     pub async fn stat_object(&self, object: &ObjectId) -> anyhow::Result<talon_core::ObjectStat> {
+        self.ensure_configured_backend(object.backend)?;
         let stat = self
             .backend
             .head(object)
@@ -740,6 +793,7 @@ impl WorkerRuntime {
         object: &ObjectId,
         body: bytes::Bytes,
     ) -> anyhow::Result<Version> {
+        self.ensure_configured_backend(object.backend)?;
         if body.len() as u64 > self.block_size as u64 {
             anyhow::bail!(
                 "object {} is {} bytes; v1 write supports at most one block ({} bytes)",
@@ -802,6 +856,7 @@ impl WorkerRuntime {
         path: &Path,
         len: u64,
     ) -> anyhow::Result<Version> {
+        self.ensure_configured_backend(object.backend)?;
         if len <= self.block_size as u64 {
             let body = tokio::fs::read(path).await?;
             if body.len() as u64 != len {
@@ -849,6 +904,7 @@ impl WorkerRuntime {
     /// cached version so a subsequent read re-resolves (and sees the object gone).
     /// Best-effort evicts the object's currently-cached block.
     pub async fn delete_object(&self, object: &ObjectId) -> anyhow::Result<()> {
+        self.ensure_configured_backend(object.backend)?;
         match self.backend.delete(object).await {
             Ok(()) => self.metrics.record_backend_delete_success(),
             Err(error) => {
@@ -923,6 +979,36 @@ impl WorkerRuntime {
     }
 }
 
+/// Ensure a successful listing reply can cross the control-plane transport.
+///
+/// The transport reader rejects control payloads above 1 MiB. Check the exact
+/// codec output here so the worker can return a small, actionable `Ack(false)`
+/// instead of writing a frame that every conforming client must reject.
+fn ensure_listing_fits_control_frame(
+    prefix: &str,
+    entries: &[(String, u64)],
+) -> anyhow::Result<()> {
+    let message = ControlMessage::ObjectList {
+        entries: entries
+            .iter()
+            .map(|(path, size)| ObjectEntry {
+                path: path.clone(),
+                size: *size,
+            })
+            .collect(),
+    };
+    let encoded = codec::encode(0, &message)
+        .map_err(|error| anyhow::anyhow!("encode listing response for {prefix:?}: {error}"))?;
+    let payload_len = encoded.len().saturating_sub(HEADER_LEN);
+    if payload_len > MAX_CONTROL_PAYLOAD_LEN as usize {
+        anyhow::bail!(
+            "listing {prefix:?} requires a {payload_len}-byte control response, exceeding the \
+             {MAX_CONTROL_PAYLOAD_LEN}-byte transport limit; narrow the namespace prefix"
+        );
+    }
+    Ok(())
+}
+
 fn slice(buffer: &bytes::Bytes, offset: u64, len: u64) -> anyhow::Result<bytes::Bytes> {
     let start = usize::try_from(offset).map_err(|_| anyhow::anyhow!("offset is too large"))?;
     if start > buffer.len() {
@@ -948,6 +1034,7 @@ fn is_version_mismatch(error: &anyhow::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::hash_map::DefaultHasher;
+    use std::collections::VecDeque;
     use std::hash::{Hash, Hasher};
     use std::os::unix::fs::FileExt;
     use std::path::{Path, PathBuf};
@@ -956,7 +1043,7 @@ mod tests {
 
     use async_trait::async_trait;
     use bytes::Bytes;
-    use talon_core::{Backend, Error, ObjectStat, Result};
+    use talon_core::{Backend, Error, ListPage, ListedObject, ObjectStat, Result};
 
     use super::*;
 
@@ -983,6 +1070,46 @@ mod tests {
         }
     }
 
+    struct ListingBackend {
+        pages: Mutex<VecDeque<ListPage>>,
+        calls: AtomicUsize,
+    }
+
+    impl ListingBackend {
+        fn new(pages: impl IntoIterator<Item = ListPage>) -> Self {
+            Self {
+                pages: Mutex::new(pages.into_iter().collect()),
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl BackendStore for ListingBackend {
+        async fn list_objects(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _max_keys: u32,
+        ) -> Result<ListPage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.pages
+                .lock()
+                .unwrap()
+                .pop_front()
+                .ok_or_else(|| Error::Backend("unexpected extra listing page".into()))
+        }
+
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            Err(Error::Backend("not used by listing tests".into()))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Err(Error::Backend("not used by listing tests".into()))
+        }
+    }
+
     fn request(path: &str) -> RangeRequest {
         RangeRequest {
             object: ObjectId::new(Backend::Azure, "container", path),
@@ -1004,6 +1131,158 @@ mod tests {
         // Most tests assert version-sensitivity per read; a zero TTL keeps the
         // resolved-version cache from masking a source overwrite between reads.
         .with_version_ttl(Duration::ZERO)
+    }
+
+    fn listing_runtime(backend: Arc<ListingBackend>, root: &Path) -> WorkerRuntime {
+        WorkerRuntime::new(
+            WholeBlockStore::open(root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            8,
+            0,
+            WorkerMetrics::new(1024),
+        )
+        .with_backend_kind(Backend::Azure)
+    }
+
+    fn listing_page(page: usize, count: usize, has_next: bool) -> ListPage {
+        ListPage {
+            objects: (0..count)
+                .map(|index| ListedObject {
+                    key: format!("dir/object-{page}-{index}"),
+                    size: index as u64,
+                })
+                .collect(),
+            next: has_next.then(|| format!("cursor-{page}")),
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_rejects_a_backend_prefix_for_another_worker() {
+        let root = tmp_root();
+        let backend = Arc::new(ListingBackend::new([listing_page(0, 1, false)]));
+        let runtime = listing_runtime(Arc::clone(&backend), &root);
+
+        let error = runtime.list_objects("s3/bucket/dir").await.unwrap_err();
+
+        assert!(error.to_string().contains("configured for az"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    fn assert_backend_mismatch(error: anyhow::Error) {
+        let detail = error.to_string();
+        assert!(detail.contains("selects backend s3"), "{detail}");
+        assert!(detail.contains("configured for az"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn object_operations_reject_a_backend_for_another_worker() {
+        let root = tmp_root();
+        let backend = Arc::new(ListingBackend::new([]));
+        let runtime = listing_runtime(Arc::clone(&backend), &root);
+        let object = ObjectId::new(Backend::S3, "bucket", "object");
+        let request = RangeRequest {
+            object: object.clone(),
+            offset: 0,
+            len: 0,
+        };
+
+        assert_backend_mismatch(runtime.serve_range(&request).await.unwrap_err());
+        let serve_error = match runtime.serve(&request).await {
+            Ok(_) => panic!("serve accepted an object for another backend"),
+            Err(error) => error,
+        };
+        assert_backend_mismatch(serve_error);
+        assert_backend_mismatch(runtime.stat_object(&object).await.unwrap_err());
+        assert_backend_mismatch(
+            runtime
+                .write_object(&object, Bytes::from_static(b"x"))
+                .await
+                .unwrap_err(),
+        );
+        assert_backend_mismatch(
+            runtime
+                .write_object_file(&object, Path::new("unused-mismatched-backend-file"), 9)
+                .await
+                .unwrap_err(),
+        );
+        assert_backend_mismatch(runtime.delete_object(&object).await.unwrap_err());
+
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn listing_reports_object_limit_instead_of_returning_a_partial_success() {
+        let root = tmp_root();
+        let pages = (0..10).map(|page| listing_page(page, 1000, true));
+        let backend = Arc::new(ListingBackend::new(pages));
+        let runtime = listing_runtime(Arc::clone(&backend), &root);
+
+        let error = runtime.list_objects("az/bucket/dir").await.unwrap_err();
+
+        assert!(error.to_string().contains("10,000-object"));
+        assert!(error.to_string().contains("narrow the namespace prefix"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 10);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn listing_reports_page_limit_instead_of_returning_a_partial_success() {
+        let root = tmp_root();
+        let pages = (0..MAX_LIST_PAGES).map(|page| listing_page(page, 1, true));
+        let backend = Arc::new(ListingBackend::new(pages));
+        let runtime = listing_runtime(Arc::clone(&backend), &root);
+
+        let error = runtime.list_objects("az/bucket/dir").await.unwrap_err();
+
+        assert!(error.to_string().contains("20 backend pages"));
+        assert!(error.to_string().contains("narrow the namespace prefix"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), MAX_LIST_PAGES);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn listing_accepts_exact_object_and_page_boundaries_when_complete() {
+        let root = tmp_root();
+        let pages = (0..MAX_LIST_PAGES).map(|page| {
+            listing_page(
+                page,
+                MAX_LIST_OBJECTS / MAX_LIST_PAGES,
+                page + 1 < MAX_LIST_PAGES,
+            )
+        });
+        let backend = Arc::new(ListingBackend::new(pages));
+        let runtime = listing_runtime(Arc::clone(&backend), &root);
+
+        let entries = runtime.list_objects("az/bucket/dir").await.unwrap();
+
+        assert_eq!(entries.len(), MAX_LIST_OBJECTS);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), MAX_LIST_PAGES);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn listing_reports_transport_limit_before_writing_an_oversized_frame() {
+        let root = tmp_root();
+        let page = ListPage {
+            objects: vec![ListedObject {
+                key: "x".repeat(MAX_CONTROL_PAYLOAD_LEN as usize),
+                size: 1,
+            }],
+            next: None,
+        };
+        let backend = Arc::new(ListingBackend::new([page]));
+        let runtime = listing_runtime(Arc::clone(&backend), &root);
+
+        let error = runtime.list_objects("az/bucket").await.unwrap_err();
+
+        assert!(error.to_string().contains("transport limit"));
+        assert!(error.to_string().contains("narrow the namespace prefix"));
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
     }
 
     fn runtime_l1(
