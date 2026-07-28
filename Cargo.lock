@@ -2628,6 +2628,7 @@ dependencies = [
  "divan",
  "libc",
  "monoio",
+ "serde",
  "serde_json",
  "talon-backend",
  "talon-core",

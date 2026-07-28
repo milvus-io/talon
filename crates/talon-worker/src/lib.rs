@@ -20,6 +20,7 @@ pub mod staging;
 pub mod tokio_conn;
 pub mod uring_conn;
 pub mod uring_serve;
+pub mod write_cache;
 
 pub use block_store::WholeBlockStore;
 pub use capacity::{CacheDirConfig, CacheDirs};
@@ -34,3 +35,4 @@ pub use runtime::{ServeOutcome, WorkerRuntime};
 pub use sendfile::{send_file_range, DEFAULT_CHUNK};
 pub use splice::{ingest_put, splice_to_file};
 pub use staging::{Checksum, Stager};
+pub use write_cache::{FlushItem, WriteCache};
