@@ -47,7 +47,7 @@ spec:
       topologySpreadConstraints:
         - maxSkew: 1
           topologyKey: kubernetes.io/hostname
-          whenUnsatisfiable: ScheduleAnyway
+          whenUnsatisfiable: {{ .Values.worker.topologySpreadWhenUnsatisfiable }}
           labelSelector:
             matchLabels:
               {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 14 }}

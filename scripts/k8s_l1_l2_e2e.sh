@@ -291,6 +291,7 @@ helm upgrade --install "$RELEASE" deploy/helm/talon -n "$NAMESPACE" \
   --set coordinator.replicas=3 \
   --set coordinator.clusterId=e2e \
   --set worker.replicas=3 \
+  --set worker.topologySpreadWhenUnsatisfiable=DoNotSchedule \
   --set worker.blockSizeBytes=$BLOCK_SIZE \
   --set worker.capacityBytes=$((64 * BLOCK_SIZE)) \
   --set worker.l1CapacityBytes=$((32 * BLOCK_SIZE)) \
