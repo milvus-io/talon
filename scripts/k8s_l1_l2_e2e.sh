@@ -97,7 +97,10 @@ start_worker_forward() {
 
 worker_pods() {
   kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/component=worker \
-    -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}'
+    --field-selector=status.phase=Running \
+    -o custom-columns=NAME:.metadata.name,DELETING:.metadata.deletionTimestamp,READY:.status.containerStatuses[0].ready \
+    --no-headers |
+    awk '$2 == "<none>" && $3 == "true" {print $1}'
 }
 
 first_worker() {
@@ -105,12 +108,19 @@ first_worker() {
 }
 
 assert_workers_spread() {
-  local ready nodes
-  ready="$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/component=worker \
-    -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.metadata.name}{"\n"}{end}' | wc -l)"
+  local ready=0 nodes pod
+  for _ in $(seq 1 60); do
+    ready="$(worker_pods | wc -l)"
+    [[ "$ready" -eq 3 ]] && break
+    sleep 1
+  done
   [[ "$ready" -eq 3 ]] || fail "expected 3 ready workers, found $ready"
-  nodes="$(kubectl -n "$NAMESPACE" get pods -l app.kubernetes.io/component=worker \
-    -o jsonpath='{range .items[?(@.status.containerStatuses[0].ready==true)]}{.spec.nodeName}{"\n"}{end}' | sort -u | wc -l)"
+  nodes="$(
+    while read -r pod; do
+      kubectl -n "$NAMESPACE" get pod "$pod" -o jsonpath='{.spec.nodeName}{"\n"}'
+    done < <(worker_pods)
+  )"
+  nodes="$(sort -u <<<"$nodes" | wc -l)"
   [[ "$nodes" -eq 3 ]] || fail "expected workers on 3 Kubernetes nodes, found $nodes"
 }
 
