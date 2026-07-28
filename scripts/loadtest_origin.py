@@ -42,6 +42,30 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self):
+        # Azure List Blobs: restype=container&comp=list
+        if "comp=list" in (self.path or ""):
+            import urllib.parse as _u
+            q = _u.parse_qs(_u.urlparse(self.path).query)
+            want = q.get("prefix", [""])[0]
+            blobs = [("bench", SIZE), ("nested/other.bin", 1024)]
+            blobs = [b for b in blobs if b[0].startswith(want)]
+            entries = "".join(
+                f"<Blob><Name>{n}</Name><Properties>"
+                f"<Content-Length>{sz}</Content-Length></Properties></Blob>"
+                for n, sz in blobs
+            )
+            body = (
+                '<?xml version="1.0" encoding="utf-8"?>'
+                f"<EnumerationResults><Blobs>{entries}</Blobs>"
+                "<NextMarker /></EnumerationResults>"
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Content-Type", "application/xml")
+            self.end_headers()
+            self.wfile.write(body)
+            return
+
         rng = self.headers.get("x-ms-range") or self.headers.get("Range")
         if rng and rng.startswith("bytes="):
             first, _, last = rng[len("bytes="):].partition("-")

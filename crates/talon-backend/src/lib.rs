@@ -15,6 +15,7 @@ pub mod reqwest_client;
 pub mod retry;
 pub mod s3;
 pub mod sigv4;
+pub mod xml;
 
 pub use azure::{AzureBackend, AzureConfig};
 pub use delay::{DelayConfig, DelayingHttpClient};

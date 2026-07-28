@@ -14,9 +14,26 @@ use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use talon_core::{BackendStore, Error, ObjectId, ObjectStat, Result, Version};
+use talon_core::{
+    BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
+};
 
 use crate::http::{HttpClient, HttpRequest, Method};
+
+/// Percent-encode a query value. `/` is escaped: a listing prefix contains
+/// slashes and an unescaped one would change the request path.
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
 
 /// GCS endpoint configuration.
 #[derive(Debug, Clone)]
@@ -71,6 +88,72 @@ impl GcsBackend {
         let scheme = if self.config.tls { "https" } else { "http" };
         let key = obj.object_path.trim_start_matches('/');
         format!("{scheme}://{}/{}/{}", self.config.endpoint, obj.bucket, key)
+    }
+
+    /// Build the JSON API listing URL for a bucket.
+    ///
+    /// GCS lists through the **JSON API** (`/storage/v1/b/<bucket>/o`), not the
+    /// download endpoint the object URLs use, so this does not go through
+    /// [`object_url`](Self::object_url).
+    pub fn list_url(&self, bucket: &str, prefix: &str, cursor: Option<&str>, max: u32) -> String {
+        let scheme = if self.config.tls { "https" } else { "http" };
+        let mut url = format!(
+            "{scheme}://{}/storage/v1/b/{}/o?maxResults={max}",
+            self.config.endpoint,
+            encode_query_value(bucket)
+        );
+        if !prefix.is_empty() {
+            url.push_str(&format!("&prefix={}", encode_query_value(prefix)));
+        }
+        if let Some(token) = cursor {
+            url.push_str(&format!("&pageToken={}", encode_query_value(token)));
+        }
+        url
+    }
+
+    /// Parse a GCS JSON listing response.
+    ///
+    /// `size` arrives as a **string**, not a number — GCS encodes 64-bit values
+    /// that way to survive JavaScript's 53-bit integers. Reading it as a JSON
+    /// number silently yields nothing for every object.
+    pub fn parse_list_response(body: &str) -> Result<ListPage> {
+        let doc: serde_json::Value = serde_json::from_str(body)
+            .map_err(|e| Error::Backend(format!("GCS listing is not valid JSON: {e}")))?;
+
+        let objects = match doc.get("items") {
+            // An empty prefix omits `items` entirely rather than sending [].
+            None => Vec::new(),
+            Some(items) => items
+                .as_array()
+                .ok_or_else(|| Error::Backend("GCS listing `items` is not an array".into()))?
+                .iter()
+                .map(|item| {
+                    let key = item
+                        .get("name")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| Error::Backend("GCS listing entry has no `name`".into()))?
+                        .to_string();
+                    let size = item
+                        .get("size")
+                        .and_then(|v| v.as_str())
+                        .and_then(|v| v.parse::<u64>().ok())
+                        .ok_or_else(|| {
+                            Error::Backend(format!(
+                                "GCS listing entry {key} has no usable `size` \
+                                 (expected a decimal string)"
+                            ))
+                        })?;
+                    Ok(ListedObject { key, size })
+                })
+                .collect::<Result<Vec<_>>>()?,
+        };
+
+        let next = doc
+            .get("nextPageToken")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(|t| t.to_string());
+        Ok(ListPage { objects, next })
     }
 
     /// Format an inclusive HTTP `Range` header for `[offset, offset+len)`.
@@ -238,6 +321,33 @@ impl BackendStore for GcsBackend {
                 obj.to_path()
             ))),
         }
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        max_keys: u32,
+    ) -> Result<ListPage> {
+        // GCS caps maxResults at 1000 and silently reduces larger values;
+        // clamping keeps the request honest.
+        let max_keys = max_keys.clamp(1, 1000);
+        let url = self.list_url(bucket, prefix, cursor, max_keys);
+        let req = HttpRequest::new(Method::Get, url, self.auth_headers());
+        let resp = self.http.execute(req).await.map_err(Error::Backend)?;
+        if resp.status == 404 {
+            return Err(Error::NotFound(bucket.to_string()));
+        }
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "GCS list {bucket}/{prefix} -> HTTP {}",
+                resp.status
+            )));
+        }
+        let body = std::str::from_utf8(&resp.body)
+            .map_err(|e| Error::Backend(format!("GCS listing body is not UTF-8: {e}")))?;
+        Self::parse_list_response(body)
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
@@ -630,5 +740,80 @@ mod tests {
             http.last.lock().unwrap().clone().unwrap().method,
             Method::Delete
         );
+    }
+
+    /// A real JSON listing response. `size` is a **string** — GCS encodes
+    /// 64-bit values that way, and reading it as a number yields nothing.
+    const LIST_BODY: &str = r#"{
+  "kind": "storage#objects",
+  "items": [
+    {"kind":"storage#object","name":"data/a.parquet","size":"1048576","generation":"17"},
+    {"kind":"storage#object","name":"data/b.parquet","size":"42","generation":"18"}
+  ]
+}"#;
+
+    #[test]
+    fn list_parses_string_encoded_sizes() {
+        let page = GcsBackend::parse_list_response(LIST_BODY).unwrap();
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].key, "data/a.parquet");
+        assert_eq!(page.objects[0].size, 1_048_576);
+        assert_eq!(page.objects[1].size, 42);
+        assert_eq!(page.next, None);
+    }
+
+    /// Sizes beyond 2^53 are exactly why GCS sends them as strings; a parser
+    /// that routed through f64 would round here.
+    #[test]
+    fn list_preserves_sizes_beyond_53_bits() {
+        let body = r#"{"items":[{"name":"big","size":"9007199254740993"}]}"#;
+        let page = GcsBackend::parse_list_response(body).unwrap();
+        assert_eq!(page.objects[0].size, 9_007_199_254_740_993);
+    }
+
+    #[test]
+    fn list_returns_the_page_token_when_present() {
+        let body = r#"{"items":[{"name":"a","size":"1"}],"nextPageToken":"CgZhLnR4dA=="}"#;
+        let page = GcsBackend::parse_list_response(body).unwrap();
+        assert_eq!(page.next.as_deref(), Some("CgZhLnR4dA=="));
+    }
+
+    /// An empty prefix omits `items` entirely rather than sending `[]`, so a
+    /// parser requiring the key would error on a legitimately empty listing.
+    #[test]
+    fn list_of_an_empty_prefix_omits_items_and_is_not_an_error() {
+        let page = GcsBackend::parse_list_response(r#"{"kind":"storage#objects"}"#).unwrap();
+        assert!(page.objects.is_empty());
+        assert_eq!(page.next, None);
+    }
+
+    #[test]
+    fn list_rejects_an_entry_without_a_usable_size() {
+        let body = r#"{"items":[{"name":"a"}]}"#;
+        assert!(GcsBackend::parse_list_response(body).is_err());
+        // A numeric size is not what GCS sends; reject rather than guess.
+        let numeric = r#"{"items":[{"name":"a","size":42}]}"#;
+        assert!(GcsBackend::parse_list_response(numeric).is_err());
+    }
+
+    #[test]
+    fn list_url_targets_the_json_api_and_encodes_the_prefix() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = GcsBackend::new(GcsConfig::default(), None, http.clone());
+        let url = backend.list_url("bucket", "data/sub", Some("tok+en"), 1000);
+        assert!(url.contains("/storage/v1/b/bucket/o"), "url: {url}");
+        assert!(
+            url.contains("prefix=data%2Fsub"),
+            "prefix must be encoded: {url}"
+        );
+        assert!(
+            url.contains("pageToken=tok%2Ben"),
+            "token must be encoded: {url}"
+        );
+        assert!(url.contains("maxResults=1000"), "url: {url}");
     }
 }

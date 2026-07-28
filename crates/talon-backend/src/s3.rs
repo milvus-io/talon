@@ -18,9 +18,29 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
-use talon_core::{BackendStore, Error, ObjectId, ObjectStat, Result, Version};
+use talon_core::{
+    BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
+};
 
 use crate::http::{HttpClient, HttpRequest, Method};
+
+/// Percent-encode a query value.
+///
+/// The URL is signed after this, and SigV4 canonicalizes the query itself, so
+/// this only has to produce a valid URL. `/` is escaped because a listing
+/// prefix contains slashes and an unescaped one would change the request path.
+fn encode_query_value(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
 
 /// S3 credentials + endpoint configuration.
 #[derive(Debug, Clone)]
@@ -88,6 +108,53 @@ impl S3Backend {
         } else {
             format!("{scheme}://{}.{}/{}", obj.bucket, self.config.endpoint, key)
         }
+    }
+
+    /// Build the bucket URL (no key), used by listing.
+    pub fn bucket_url(&self, bucket: &str) -> String {
+        let scheme = if self.config.tls { "https" } else { "http" };
+        if self.config.path_style {
+            format!("{scheme}://{}/{bucket}", self.config.endpoint)
+        } else {
+            format!("{scheme}://{bucket}.{}", self.config.endpoint)
+        }
+    }
+
+    /// Parse a `ListObjectsV2` response body.
+    ///
+    /// `<Contents>` blocks are isolated before reading `<Key>`/`<Size>`, so a
+    /// record's fields cannot be paired with a neighbour's. Keys are unescaped:
+    /// a key containing `&` arrives as `&amp;` and would otherwise name a
+    /// different object.
+    pub fn parse_list_response(body: &str) -> Result<ListPage> {
+        let objects = crate::xml::blocks(body, "Contents")
+            .into_iter()
+            .map(|record| {
+                let key = crate::xml::element(record, "Key")
+                    .map(crate::xml::unescape)
+                    .ok_or_else(|| Error::Backend("S3 listing entry has no <Key>".into()))?;
+                let size = crate::xml::element(record, "Size")
+                    .and_then(|v| v.trim().parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::Backend(format!("S3 listing entry {key} has no usable <Size>"))
+                    })?;
+                Ok(ListedObject { key, size })
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        // Only trust the continuation token when IsTruncated says there is
+        // more; S3 may echo a token on the final page.
+        let truncated = crate::xml::element(body, "IsTruncated")
+            .map(|v| v.trim().eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let next = if truncated {
+            crate::xml::element(body, "NextContinuationToken")
+                .map(crate::xml::unescape)
+                .filter(|t| !t.is_empty())
+        } else {
+            None
+        };
+        Ok(ListPage { objects, next })
     }
 
     /// Format an HTTP `Range` header value for `[offset, offset+len)`.
@@ -314,6 +381,44 @@ impl BackendStore for S3Backend {
                 resp.status
             )))
         }
+    }
+
+    async fn list_objects(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        cursor: Option<&str>,
+        max_keys: u32,
+    ) -> Result<ListPage> {
+        // S3 caps a page at 1000 regardless of what is asked, so clamping here
+        // keeps the request honest rather than relying on the service to
+        // silently reduce it.
+        let max_keys = max_keys.clamp(1, 1000);
+        let mut query = format!("list-type=2&max-keys={max_keys}");
+        if !prefix.is_empty() {
+            query.push_str(&format!("&prefix={}", encode_query_value(prefix)));
+        }
+        if let Some(token) = cursor {
+            query.push_str(&format!(
+                "&continuation-token={}",
+                encode_query_value(token)
+            ));
+        }
+        let url = format!("{}?{query}", self.bucket_url(bucket));
+        let req = self.signed(HttpRequest::new(Method::Get, url, Vec::new()));
+        let resp = self.http.execute(req).await.map_err(Error::Backend)?;
+        if resp.status == 404 {
+            return Err(Error::NotFound(bucket.to_string()));
+        }
+        if !resp.is_success() {
+            return Err(Error::Backend(format!(
+                "S3 list {bucket}/{prefix} -> HTTP {}",
+                resp.status
+            )));
+        }
+        let body = std::str::from_utf8(&resp.body)
+            .map_err(|e| Error::Backend(format!("S3 listing body is not UTF-8: {e}")))?;
+        Self::parse_list_response(body)
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
@@ -778,5 +883,143 @@ mod tests {
         });
         let s3 = S3Backend::new(S3Config::aws("us-east-1"), creds(), http404);
         s3.delete(&obj()).await.unwrap();
+    }
+
+    /// A real ListObjectsV2 body, abbreviated. Parsing must pair each key with
+    /// its own size rather than reading fields document-wide.
+    const LIST_BODY: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>data/</Prefix>
+  <KeyCount>2</KeyCount>
+  <MaxKeys>1000</MaxKeys>
+  <IsTruncated>false</IsTruncated>
+  <Contents>
+    <Key>data/a.parquet</Key>
+    <LastModified>2026-01-01T00:00:00.000Z</LastModified>
+    <ETag>&quot;abc&quot;</ETag>
+    <Size>1048576</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+  <Contents>
+    <Key>data/b.parquet</Key>
+    <LastModified>2026-01-02T00:00:00.000Z</LastModified>
+    <ETag>&quot;def&quot;</ETag>
+    <Size>42</Size>
+    <StorageClass>STANDARD</StorageClass>
+  </Contents>
+</ListBucketResult>"#;
+
+    #[test]
+    fn list_parses_keys_and_sizes_pairwise() {
+        let page = S3Backend::parse_list_response(LIST_BODY).unwrap();
+        assert_eq!(page.objects.len(), 2);
+        assert_eq!(page.objects[0].key, "data/a.parquet");
+        assert_eq!(page.objects[0].size, 1_048_576);
+        assert_eq!(page.objects[1].key, "data/b.parquet");
+        assert_eq!(page.objects[1].size, 42);
+        assert_eq!(page.next, None, "IsTruncated=false means no more pages");
+    }
+
+    /// A truncated listing must surface its continuation token, or the caller
+    /// silently sees only the first page of a large prefix.
+    #[test]
+    fn list_returns_the_continuation_token_when_truncated() {
+        let body = r#"<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>1PagE2Tok</NextContinuationToken>
+  <Contents><Key>a</Key><Size>1</Size></Contents>
+</ListBucketResult>"#;
+        let page = S3Backend::parse_list_response(body).unwrap();
+        assert_eq!(page.next.as_deref(), Some("1PagE2Tok"));
+    }
+
+    /// S3 may echo a token on the final page; trusting it without checking
+    /// IsTruncated causes an extra round trip and, worse, a caller that never
+    /// terminates if the service keeps echoing it.
+    #[test]
+    fn list_ignores_a_token_when_not_truncated() {
+        let body = r#"<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <NextContinuationToken>stale</NextContinuationToken>
+  <Contents><Key>a</Key><Size>1</Size></Contents>
+</ListBucketResult>"#;
+        let page = S3Backend::parse_list_response(body).unwrap();
+        assert_eq!(page.next, None);
+    }
+
+    /// Keys legitimately contain `&`, which arrives escaped. Leaving it escaped
+    /// names an object that does not exist.
+    #[test]
+    fn list_unescapes_keys() {
+        let body = r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+  <Contents><Key>a&amp;b/c.bin</Key><Size>7</Size></Contents></ListBucketResult>"#;
+        let page = S3Backend::parse_list_response(body).unwrap();
+        assert_eq!(page.objects[0].key, "a&b/c.bin");
+    }
+
+    #[test]
+    fn list_of_an_empty_prefix_is_an_empty_page_not_an_error() {
+        let body = r#"<ListBucketResult><IsTruncated>false</IsTruncated><KeyCount>0</KeyCount></ListBucketResult>"#;
+        let page = S3Backend::parse_list_response(body).unwrap();
+        assert!(page.objects.is_empty());
+        assert_eq!(page.next, None);
+    }
+
+    /// An entry missing its size is a malformed response, not a zero-byte
+    /// object — reporting it as zero would make a reader believe the object is
+    /// empty.
+    #[test]
+    fn list_rejects_an_entry_without_a_size() {
+        let body = r#"<ListBucketResult><IsTruncated>false</IsTruncated>
+  <Contents><Key>a</Key></Contents></ListBucketResult>"#;
+        assert!(S3Backend::parse_list_response(body).is_err());
+    }
+
+    #[tokio::test]
+    async fn list_request_carries_query_and_is_signed() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::from_static(LIST_BODY.as_bytes()),
+        });
+        let backend = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        let page = backend
+            .list_objects("bucket", "data/", None, 1000)
+            .await
+            .unwrap();
+        assert_eq!(page.objects.len(), 2);
+
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert!(req.url.contains("list-type=2"), "url: {}", req.url);
+        assert!(
+            req.url.contains("prefix=data%2F"),
+            "prefix must be encoded: {}",
+            req.url
+        );
+        assert!(
+            req.headers
+                .iter()
+                .any(|(k, _)| k.eq_ignore_ascii_case("authorization")),
+            "listing must be signed"
+        );
+    }
+
+    /// max_keys above S3's ceiling is clamped rather than sent verbatim, so a
+    /// caller cannot ask for an unbounded page.
+    #[tokio::test]
+    async fn list_clamps_max_keys_to_the_service_maximum() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::from_static(LIST_BODY.as_bytes()),
+        });
+        let backend = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        backend
+            .list_objects("bucket", "", None, 100_000)
+            .await
+            .unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert!(req.url.contains("max-keys=1000"), "url: {}", req.url);
     }
 }

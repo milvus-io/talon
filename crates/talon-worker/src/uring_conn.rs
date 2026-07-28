@@ -132,7 +132,7 @@ pub async fn handle_conn(
             _ => {
                 let err = data::encode_error(
                     header.request_id,
-                    "worker only serves GetRange/Put/Delete/StatObject",
+                    "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
                 );
                 write_all(&mut stream, err).await?;
                 observability
@@ -313,10 +313,31 @@ async fn handle_control_frame(
                 }
             }
         }
+        talon_transport::ControlMessage::ListObjects { prefix } => {
+            if !observability.is_ready() {
+                talon_transport::ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.list_objects(&prefix).await {
+                    Ok(entries) => talon_transport::ControlMessage::ObjectList {
+                        entries: entries
+                            .into_iter()
+                            .map(|(path, size)| talon_transport::ObjectEntry { path, size })
+                            .collect(),
+                    },
+                    Err(error) => talon_transport::ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
         other => talon_transport::ControlMessage::Ack {
             ok: false,
             detail: Some(format!(
-                "worker serves only StatObject on the data plane, got {other:?}"
+                "worker serves only StatObject/ListObjects on the data plane, got {other:?}"
             )),
         },
     };

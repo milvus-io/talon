@@ -62,6 +62,52 @@ fn uri_encode_path(path: &str) -> String {
     out
 }
 
+/// Canonicalize a query string per SigV4: each key and value URI-encoded, pairs
+/// sorted by encoded key (then encoded value), joined with `&`.
+///
+/// Required once any request carries query parameters — listing does. AWS
+/// rejects a signature computed over an unsorted or unencoded query, and the
+/// failure is a 403 that looks like a credentials problem rather than an
+/// encoding one.
+fn canonical_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|pair| match pair.split_once('=') {
+            Some((k, v)) => (uri_encode_component(k), uri_encode_component(v)),
+            // A bare key still needs a trailing `=` in the canonical form.
+            None => (uri_encode_component(pair), String::new()),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// URI-encode a query key or value.
+///
+/// Unlike [`uri_encode_path`], `/` is **not** left literal: in a query
+/// component it is a reserved character and must be escaped, which matters for
+/// a listing prefix like `dir/sub`.
+fn uri_encode_component(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
+}
+
 /// A timestamp split into the two forms SigV4 needs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AmzDate {
@@ -192,7 +238,7 @@ pub fn sign_request_with_payload_hash(
         "{}\n{}\n{}\n{}\n{}\n{}",
         method_str(req.method),
         uri_encode_path(&path),
-        query, // requests carry no query params today
+        canonical_query(&query),
         canonical_headers,
         signed_headers,
         payload_hash
@@ -225,6 +271,45 @@ pub fn sign_request_with_payload_hash(
 
 #[cfg(test)]
 mod tests {
+    /// SigV4 requires the canonical query sorted by encoded key. An unsorted
+    /// query produces a signature AWS rejects with a 403 that reads like a
+    /// credentials failure, so this is worth pinning.
+    #[test]
+    fn canonical_query_sorts_by_encoded_key() {
+        assert_eq!(
+            canonical_query("prefix=a&list-type=2&max-keys=1000"),
+            "list-type=2&max-keys=1000&prefix=a"
+        );
+    }
+
+    /// `/` is reserved in a query component even though it is literal in a
+    /// path. A listing prefix contains slashes, so getting this wrong breaks
+    /// exactly the case listing needs.
+    #[test]
+    fn canonical_query_escapes_slashes_in_values() {
+        assert_eq!(canonical_query("prefix=dir/sub/"), "prefix=dir%2Fsub%2F");
+    }
+
+    #[test]
+    fn canonical_query_handles_empty_and_bare_keys() {
+        assert_eq!(canonical_query(""), "");
+        // A valueless key still needs its `=` in canonical form.
+        assert_eq!(canonical_query("acl"), "acl=");
+    }
+
+    /// Continuation tokens are opaque base64 and routinely contain `+`, `/`,
+    /// and `=`, all of which must be percent-encoded in the canonical query.
+    #[test]
+    fn canonical_query_escapes_continuation_token_characters() {
+        let encoded = canonical_query("continuation-token=a+b/c=");
+        assert_eq!(encoded, "continuation-token=a%2Bb%2Fc%3D");
+    }
+
+    #[test]
+    fn uri_encode_component_leaves_unreserved_characters_alone() {
+        assert_eq!(uri_encode_component("aZ0-_.~"), "aZ0-_.~");
+    }
+
     use super::*;
 
     #[test]
