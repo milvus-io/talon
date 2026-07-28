@@ -119,6 +119,63 @@ Honor X-Forwarded-For for audit attribution behind a trusted proxy.
 - **Default:** `false`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `etcd.endpoints`
+
+Comma-separated etcd host:port endpoints.
+
+- **Environment variable:** `TALON_COORDINATOR_ETCD_ENDPOINTS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `etcd.username`
+
+etcd username (requires password).
+
+- **Environment variable:** `TALON_COORDINATOR_ETCD_USERNAME`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `etcd.password` 🔒
+
+etcd password; keep in a Secret, not the config file.
+
+- **Environment variable:** `TALON_COORDINATOR_ETCD_PASSWORD`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `etcd.tls.ca_cert_path`
+
+PEM CA certificate path; enables TLS.
+
+- **Environment variable:** `TALON_COORDINATOR_ETCD_CA_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `etcd.tls.client_cert_path`
+
+PEM client certificate path; mutual TLS.
+
+- **Environment variable:** `TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `etcd.tls.client_key_path`
+
+PEM client key path; mutual TLS.
+
+- **Environment variable:** `TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `kubernetes.namespace`
+
+Namespace holding Talon Lease objects.
+
+- **Environment variable:** `TALON_COORDINATOR_K8S_NAMESPACE`
+- **Default:** `talon`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ## Worker
 
 ### `listen`
