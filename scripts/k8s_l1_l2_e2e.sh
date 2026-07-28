@@ -56,7 +56,7 @@ require() {
   command -v "$1" >/dev/null || fail "required command not found: $1"
 }
 
-for command in kubectl helm cargo curl awk sort uniq cmp kind docker; do
+for command in kubectl helm cargo curl awk sort uniq cmp kind docker timeout; do
   require "$command"
 done
 
@@ -193,9 +193,10 @@ placed_read() {
   local path="$1"
   local len="$2"
   local out="$3"
-  target/release/talon-client \
+  timeout 15s target/release/talon-client \
     --coordinator "127.0.0.1:$COORD_PORT" \
-    --path "/s3/$BUCKET/$path" --len "$len" --out "$out"
+    --placement-only --path "/s3/$BUCKET/$path" --len "$len" >"$out"
+  cat "$out"
 }
 
 if [[ "$CREATE_KIND_CLUSTER" == "1" ]]; then
@@ -355,7 +356,7 @@ declare -A placed_workers=()
 for i in $(seq 0 29); do
   output="$(placed_read "shard-$i.bin" 4096 "$ARTIFACT_DIR/shard-$i.out" 2>&1)"
   echo "$output" >>"$ARTIFACT_DIR/placement.log"
-  address="$(sed -n 's/^read .* from \\([^ ]*\\) in .*/\\1/p' <<<"$output")"
+  address="$(sed -n 's/^placed .* on \\([^ ]*\\)$/\\1/p' <<<"$output")"
   [[ -n "$address" ]] || fail "could not parse worker address from client output"
   placed_workers["$address"]=1
 done

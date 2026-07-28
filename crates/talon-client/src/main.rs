@@ -37,6 +37,9 @@ struct Args {
     /// Connect directly to one worker, bypassing placement (diagnostics/tests).
     #[arg(long)]
     worker: Option<String>,
+    /// Resolve and print placement without connecting to the selected worker.
+    #[arg(long, conflicts_with = "worker")]
+    placement_only: bool,
     /// Object path, e.g. `/az/<container>/<blob>`.
     #[arg(long)]
     path: String,
@@ -87,6 +90,11 @@ async fn main() -> anyhow::Result<()> {
             worker_addr
         }
     };
+
+    if args.placement_only {
+        println!("placed {} on {}", args.path, worker_addr);
+        return Ok(());
+    }
 
     // Fetch the range from the selected worker.
     let start = Instant::now();
@@ -225,7 +233,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(args.worker.as_deref(), Some("10.0.0.7:7001"));
+        assert!(!args.placement_only);
         assert_eq!(args.coordinator, "127.0.0.1:7000");
         assert_eq!(args.len, 4096);
+    }
+
+    #[test]
+    fn placement_only_mode_conflicts_with_direct_worker() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--placement-only",
+            "--path",
+            "/s3/bucket/object",
+            "--len",
+            "4096",
+        ])
+        .unwrap();
+        assert!(args.placement_only);
+        assert!(args.worker.is_none());
+
+        assert!(Args::try_parse_from([
+            "talon-client",
+            "--placement-only",
+            "--worker",
+            "10.0.0.7:7001",
+            "--path",
+            "/s3/bucket/object",
+            "--len",
+            "4096",
+        ])
+        .is_err());
     }
 }
