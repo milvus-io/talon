@@ -21,7 +21,7 @@ use talon_core::{ObjectId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
     encode_delete, encode_put_header, encode_request, DeleteRequest, Flags, PutRequest,
-    RangeRequest,
+    RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -43,6 +43,22 @@ pub enum WorkerError {
     /// The worker replied with a non-`GetRange` frame.
     #[error("expected a GetRange reply, got {0:?}")]
     NotGetRange(MsgType),
+    /// A successful range reply did not contain exactly the requested bytes.
+    #[error("worker range length mismatch: expected {expected}, got {actual}")]
+    RangeLengthMismatch {
+        /// Number of bytes requested from the worker.
+        expected: u64,
+        /// Number of bytes advertised or returned by the worker.
+        actual: u64,
+    },
+    /// A non-range payload exceeded the small-message safety cap.
+    #[error("worker payload length {length} exceeds cap {cap}")]
+    PayloadTooLarge {
+        /// Number of bytes advertised by the worker.
+        length: u32,
+        /// Maximum accepted payload size for this reply.
+        cap: u32,
+    },
     /// The worker set the ERROR flag and returned this message.
     #[error("worker error: {0}")]
     Remote(String),
@@ -108,7 +124,7 @@ impl WorkerClient {
         // have closed it while idle), retry once on a fresh dial so a stale
         // pooled socket never turns a healthy peer into a spurious failure. A
         // failure on a *fresh* connection is a real peer error and propagates.
-        match self.exchange(&out).await {
+        match self.exchange(&out, len).await {
             Ok(bytes) => Ok(bytes),
             Err((true, _stale)) => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
@@ -117,7 +133,7 @@ impl WorkerClient {
                     .with_request_deadline("worker fetch_range retry", async {
                         stream.write_all(&out).await?;
                         stream.flush().await?;
-                        read_range_reply(&mut stream).await
+                        read_range_reply(&mut stream, len).await
                     })
                     .await?;
                 self.pool.release(&self.addr, stream);
@@ -132,7 +148,11 @@ impl WorkerClient {
     /// On success releases the connection for reuse. On error returns
     /// `(was_reused, err)` so the caller can decide whether to retry (a reused
     /// connection may simply have been closed while idle).
-    async fn exchange(&self, out: &[u8]) -> Result<Vec<u8>, (bool, WorkerError)> {
+    async fn exchange(
+        &self,
+        out: &[u8],
+        expected_len: u64,
+    ) -> Result<Vec<u8>, (bool, WorkerError)> {
         let (mut stream, reused) = self
             .pool
             .checkout(&self.addr)
@@ -145,7 +165,7 @@ impl WorkerClient {
             .with_request_deadline("worker fetch_range", async {
                 stream.write_all(out).await?;
                 stream.flush().await?;
-                read_range_reply(&mut stream).await
+                read_range_reply(&mut stream, expected_len).await
             })
             .await;
         match result {
@@ -409,6 +429,15 @@ async fn read_version_reply(stream: &mut TcpStream) -> Result<Version, WorkerErr
     let mut header_buf = [0u8; HEADER_LEN];
     stream.read_exact(&mut header_buf).await?;
     let header = FrameHeader::decode(&header_buf)?;
+    if header.msg_type != MsgType::GetRange {
+        return Err(WorkerError::NotGetRange(header.msg_type));
+    }
+    if header.length > MAX_CONTROL_PAYLOAD_LEN {
+        return Err(WorkerError::PayloadTooLarge {
+            length: header.length,
+            cap: MAX_CONTROL_PAYLOAD_LEN,
+        });
+    }
     let mut body = vec![0u8; header.length as usize];
     stream.read_exact(&mut body).await?;
     if header.flags.contains(Flags::ERROR) {
@@ -419,16 +448,34 @@ async fn read_version_reply(stream: &mut TcpStream) -> Result<Version, WorkerErr
     Ok(Version::new(String::from_utf8_lossy(&body).into_owned()))
 }
 
-/// Read one framed data-plane reply: header, then exactly `length` bytes.
+/// Read one framed data-plane reply for a request of `expected_len` bytes.
 ///
-/// If the header carries [`Flags::ERROR`], the body is a UTF-8 message and is
-/// returned as [`WorkerError::Remote`]; otherwise the body is the raw range.
-async fn read_range_reply(stream: &mut TcpStream) -> Result<Vec<u8>, WorkerError> {
+/// A successful reply must advertise exactly `expected_len` before its buffer is
+/// allocated. If the header carries [`Flags::ERROR`], the body is instead a
+/// UTF-8 message capped at [`MAX_CONTROL_PAYLOAD_LEN`] and returned as
+/// [`WorkerError::Remote`].
+async fn read_range_reply(
+    stream: &mut TcpStream,
+    expected_len: u64,
+) -> Result<Vec<u8>, WorkerError> {
     let mut header_buf = [0u8; HEADER_LEN];
     stream.read_exact(&mut header_buf).await?;
     let header = FrameHeader::decode(&header_buf)?;
     if header.msg_type != MsgType::GetRange {
         return Err(WorkerError::NotGetRange(header.msg_type));
+    }
+    if header.flags.contains(Flags::ERROR) {
+        if header.length > MAX_CONTROL_PAYLOAD_LEN {
+            return Err(WorkerError::PayloadTooLarge {
+                length: header.length,
+                cap: MAX_CONTROL_PAYLOAD_LEN,
+            });
+        }
+    } else if u64::from(header.length) != expected_len {
+        return Err(WorkerError::RangeLengthMismatch {
+            expected: expected_len,
+            actual: u64::from(header.length),
+        });
     }
     let mut body = vec![0u8; header.length as usize];
     stream.read_exact(&mut body).await?;
@@ -475,6 +522,27 @@ mod tests {
             let reply = respond(req);
             sock.write_all(&reply).await.unwrap();
             sock.flush().await.unwrap();
+        });
+        addr
+    }
+
+    /// Spawn a one-shot range worker that writes only `reply_header`, then keeps
+    /// the socket open. A correct client must reject the header before trying to
+    /// allocate or read its advertised body.
+    async fn header_only_range_worker(reply_header: FrameHeader) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            let mut body = vec![0u8; header.length as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            sock.write_all(&reply_header.encode()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(sock);
         });
         addr
     }
@@ -631,6 +699,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mismatched_range_length_is_rejected_before_body() {
+        let header = FrameHeader::new(MsgType::GetRange, 0, 17);
+        let addr = header_only_range_worker(header).await;
+        let client = WorkerClient::with_pool(addr, impatient_pool());
+
+        let err = client.fetch_range(&object(), 0, 16).await.unwrap_err();
+        assert!(matches!(
+            err,
+            WorkerError::RangeLengthMismatch {
+                expected: 16,
+                actual: 17
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_error_payload_is_rejected_before_body() {
+        let mut header = FrameHeader::new(MsgType::GetRange, 0, MAX_CONTROL_PAYLOAD_LEN + 1);
+        header.flags = Flags(Flags::ERROR);
+        let addr = header_only_range_worker(header).await;
+        let client = WorkerClient::with_pool(addr, impatient_pool());
+
+        let err = client.fetch_range(&object(), 0, 16).await.unwrap_err();
+        assert!(matches!(
+            err,
+            WorkerError::PayloadTooLarge {
+                length,
+                cap: MAX_CONTROL_PAYLOAD_LEN
+            } if length == MAX_CONTROL_PAYLOAD_LEN + 1
+        ));
+    }
+
+    #[tokio::test]
     async fn connect_failure_is_io_error() {
         let client = WorkerClient::new("127.0.0.1:1");
         let err = client.fetch_range(&object(), 0, 16).await.unwrap_err();
@@ -665,6 +766,32 @@ mod tests {
         addr
     }
 
+    /// Spawn a one-shot write worker that consumes a complete Put request and
+    /// writes only `reply_header`, keeping the connection open afterwards.
+    async fn header_only_write_worker(reply_header: FrameHeader) -> String {
+        use talon_transport::decode_put_header;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            let mut hbody = vec![0u8; header.length as usize];
+            sock.read_exact(&mut hbody).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&hbody);
+            let (_header, req) = decode_put_header(&full).unwrap();
+            let mut body = vec![0u8; req.body_len as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            sock.write_all(&reply_header.encode()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(sock);
+        });
+        addr
+    }
+
     #[tokio::test]
     async fn put_object_sends_header_and_body_and_returns_version() {
         let recorded = Arc::new(std::sync::Mutex::new(None));
@@ -676,6 +803,32 @@ mod tests {
         let (obj, got) = recorded.lock().unwrap().take().unwrap();
         assert_eq!(obj, object());
         assert_eq!(got, body, "worker received the exact object bytes");
+    }
+
+    #[tokio::test]
+    async fn version_reply_with_wrong_message_type_is_rejected() {
+        let header = FrameHeader::new(MsgType::Control, 0, 0);
+        let addr = header_only_write_worker(header).await;
+        let client = WriteClient::new(addr);
+
+        let err = client.put_object(&object(), b"x").await.unwrap_err();
+        assert!(matches!(err, WorkerError::NotGetRange(MsgType::Control)));
+    }
+
+    #[tokio::test]
+    async fn oversized_version_payload_is_rejected_before_body() {
+        let header = FrameHeader::new(MsgType::GetRange, 0, MAX_CONTROL_PAYLOAD_LEN + 1);
+        let addr = header_only_write_worker(header).await;
+        let client = WriteClient::with_pool(addr, impatient_pool());
+
+        let err = client.put_object(&object(), b"x").await.unwrap_err();
+        assert!(matches!(
+            err,
+            WorkerError::PayloadTooLarge {
+                length,
+                cap: MAX_CONTROL_PAYLOAD_LEN
+            } if length == MAX_CONTROL_PAYLOAD_LEN + 1
+        ));
     }
 
     #[tokio::test]

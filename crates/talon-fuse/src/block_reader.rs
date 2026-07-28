@@ -208,7 +208,11 @@ impl BlockReader {
                 .fetch_range(&block.object, abs_offset, len as u64)
                 .await
             {
-                Ok(bytes) => return Ok(bytes),
+                Ok(bytes) if bytes.len() as u64 == u64::from(len) => return Ok(bytes),
+                Ok(_) => {
+                    self.stats.record_worker_failure();
+                    last = RefreshReason::WrongOwner;
+                }
                 Err(e) => {
                     self.stats.record_worker_failure();
                     last = match e {
@@ -265,6 +269,13 @@ impl BlockReader {
             let bytes = self
                 .read_block(&seg.block, seg.offset_in_block, seg.len, now_ms)
                 .await?;
+            if bytes.len() as u64 != u64::from(seg.len) {
+                return Err(WorkerError::RangeLengthMismatch {
+                    expected: u64::from(seg.len),
+                    actual: bytes.len() as u64,
+                }
+                .into());
+            }
             out.extend_from_slice(&bytes);
         }
         Ok(out)
@@ -467,6 +478,42 @@ mod tests {
         addr
     }
 
+    /// A mock worker that returns a self-consistent but one-byte-short success
+    /// frame, counting how many requests it saw.
+    async fn spawn_short_reply_worker(count: Arc<std::sync::atomic::AtomicU32>) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let count = Arc::clone(&count);
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; HEADER_LEN];
+                    if s.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let h = FrameHeader::decode(&hdr).unwrap();
+                    let mut body = vec![0u8; h.length as usize];
+                    s.read_exact(&mut body).await.unwrap();
+                    let mut full = hdr.to_vec();
+                    full.extend_from_slice(&body);
+                    let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let short_len = req.len.saturating_sub(1) as usize;
+                    let payload = vec![0u8; short_len];
+                    let mut out = response_header_ok(0, short_len as u32).to_vec();
+                    out.extend_from_slice(&payload);
+                    s.write_all(&out).await.unwrap();
+                    s.flush().await.unwrap();
+                });
+            }
+        });
+        addr
+    }
+
     /// A mock coordinator that returns two ordered owners (w1, w2) and resolves
     /// their addresses via membership.
     async fn mock_coordinator_two(w1: String, w2: String) -> String {
@@ -640,6 +687,36 @@ mod tests {
         );
         // Placement stays cached (fallback within the list, no invalidation).
         assert_eq!(cache.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn short_reply_from_worker_falls_back_to_next_replica() {
+        let short = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let good = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let w1 = spawn_short_reply_worker(Arc::clone(&short)).await;
+        let w2 = mock_worker(Arc::clone(&good)).await;
+        let coord = mock_coordinator_two(w1, w2).await;
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord), Arc::clone(&cache), 2);
+
+        let bytes = reader.read_block(&block(), 0, 32, 0).await.unwrap();
+        assert_eq!(bytes.len(), 32);
+        assert_eq!(
+            short.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "short primary reply was rejected"
+        );
+        assert_eq!(
+            good.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "read fell back to the healthy replica"
+        );
+        assert_eq!(cache.len(), 1, "fallback did not invalidate placement");
+        let stats = reader.stats().snapshot();
+        assert_eq!(stats.worker_fetches, 2);
+        assert_eq!(stats.worker_failures, 1);
+        assert_eq!(stats.coordinator_refreshes, 0);
+        assert_eq!(stats.bytes_served, 32);
     }
 
     #[tokio::test]

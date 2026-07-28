@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
-use talon_transport::ControlMessage;
+use talon_transport::{ControlMessage, MAX_CONTROL_PAYLOAD_LEN};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -54,6 +54,14 @@ pub enum CoordinatorError {
     /// A frame could not be encoded/decoded.
     #[error("coordinator codec: {0}")]
     Codec(#[from] talon_transport::CodecError),
+    /// The coordinator advertised a control payload above the safety cap.
+    #[error("coordinator payload length {length} exceeds cap {cap}")]
+    PayloadTooLarge {
+        /// Number of bytes advertised by the coordinator.
+        length: u32,
+        /// Maximum accepted control payload size.
+        cap: u32,
+    },
     /// The coordinator replied, but with an unexpected message shape.
     #[error("unexpected reply to {expected}: {got:?}")]
     Unexpected {
@@ -286,9 +294,9 @@ impl ResolvedPlacement {
 
 /// Read one framed [`ControlMessage`] from `stream`.
 ///
-/// Reads the 16-byte header, then exactly `length` payload bytes, then decodes
-/// the full frame with the control codec. `expected` names the request for
-/// error context only.
+/// Reads the 16-byte header, validates the payload against
+/// [`MAX_CONTROL_PAYLOAD_LEN`] before allocation, then decodes the full frame
+/// with the control codec. `expected` names the request for error context only.
 async fn read_control_frame(
     stream: &mut TcpStream,
     expected: &'static str,
@@ -302,6 +310,12 @@ async fn read_control_frame(
         return Err(CoordinatorError::Codec(
             talon_transport::CodecError::NotControl(header.msg_type),
         ));
+    }
+    if header.length > MAX_CONTROL_PAYLOAD_LEN {
+        return Err(CoordinatorError::PayloadTooLarge {
+            length: header.length,
+            cap: MAX_CONTROL_PAYLOAD_LEN,
+        });
     }
     let mut payload = vec![0u8; header.length as usize];
     stream.read_exact(&mut payload).await?;
@@ -440,6 +454,43 @@ mod tests {
         let client = CoordinatorClient::new("127.0.0.1:1");
         let err = client.membership().await.unwrap_err();
         assert!(matches!(err, CoordinatorError::Io(_)));
+    }
+
+    #[tokio::test]
+    async fn oversized_control_payload_is_rejected_before_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let request = FrameHeader::decode(&hdr).unwrap();
+            let mut body = vec![0u8; request.length as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            let reply = FrameHeader::new(
+                MsgType::Control,
+                request.request_id,
+                MAX_CONTROL_PAYLOAD_LEN + 1,
+            );
+            sock.write_all(&reply.encode()).await.unwrap();
+            sock.flush().await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            drop(sock);
+        });
+        let pool = Arc::new(ConnectionPool::new().with_timeouts(
+            std::time::Duration::from_secs(5),
+            std::time::Duration::from_millis(150),
+        ));
+        let client = CoordinatorClient::with_pool(addr, pool);
+
+        let err = client.membership().await.unwrap_err();
+        assert!(matches!(
+            err,
+            CoordinatorError::PayloadTooLarge {
+                length,
+                cap: MAX_CONTROL_PAYLOAD_LEN
+            } if length == MAX_CONTROL_PAYLOAD_LEN + 1
+        ));
     }
 
     #[tokio::test]
