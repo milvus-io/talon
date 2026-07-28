@@ -68,7 +68,7 @@ fn section(s: &mut String, title: &str, schema: &[ConfigVar]) {
         s.push_str(&format!(
             "- **CLI flag:** {}\n",
             if v.cli {
-                format!("`--{}`", v.key)
+                format!("`--{}`", v.key.replace('_', "-"))
             } else {
                 "not settable via CLI (config file or environment only)".to_string()
             }

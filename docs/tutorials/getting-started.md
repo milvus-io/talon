@@ -169,23 +169,28 @@ mkdir -p /tmp/talon-mnt
 
 cargo run -p talon-fuse --features mount -- \
   --mountpoint /tmp/talon-mnt \
-  --coordinator 127.0.0.1:7000
+  --coordinator 127.0.0.1:7000 \
+  --namespace-prefix az/my-container
 ```
 
-Built **without** `--features mount`, the client still performs all of its setup
-and validation, then prints a message instead of mounting — useful on hosts
-without `/dev/fuse`:
+Replace `az/my-container` with a backend namespace the worker can access, such
+as `s3/training-data` or `gcs/models/checkpoints`. The client lists that prefix
+before mounting and exits with an error if listing fails; it never presents a
+healthy-looking but accidentally empty filesystem.
+
+Built **without** `--features mount`, the client still validates configuration
+and lists the namespace, then prints a message instead of mounting — useful on
+hosts without `/dev/fuse` when testing against a real object-store backend:
 
 ```
 built without the `mount` feature: not mounting.
 Rebuild with `--features mount` to enable the kernel FUSE mount.
 ```
 
-> **Reading real objects** requires a worker configured against a real object
-> store (Section 3 used placeholders) and the coordinator's object-listing path.
-> Populating the namespace and serving object reads end-to-end is beyond this
-> introductory tutorial — see [DESIGN.md](../../DESIGN.md) for the read path and
-> the [operator runbook](../operations/runbook.md) for production configuration.
+> **The command above requires real object-store credentials.** Section 3 used
+> placeholders, so use a worker configured for an accessible backend before
+> running it. See [DESIGN.md](../../DESIGN.md) for the read path and the
+> [operator runbook](../operations/runbook.md) for production configuration.
 
 ## Clean up
 

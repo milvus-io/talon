@@ -88,7 +88,8 @@ and the `SYS_ADMIN` capability:
 ```sh
 docker run --rm --device /dev/fuse --cap-add SYS_ADMIN \
   ghcr.io/milvus-io/talon-fuse:latest \
-  --mountpoint /mnt/talon --coordinator coordinator:7000
+  --mountpoint /mnt/talon --coordinator coordinator:7000 \
+  --namespace-prefix az/my-container
 ```
 
 ## Next steps

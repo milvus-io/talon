@@ -55,8 +55,13 @@ feature and needs `/dev/fuse` (Linux with FUSE and `libfuse3-dev` installed):
 
 ```sh
 cargo run -p talon-fuse --features mount -- \
-  --mountpoint /tmp/talon-mnt --coordinator 127.0.0.1:7000
+  --mountpoint /tmp/talon-mnt \
+  --coordinator 127.0.0.1:7000 \
+  --namespace-prefix az/my-container
 ```
+
+Set `--namespace-prefix` to the backend and bucket/container the worker can
+enumerate, optionally followed by an object-key prefix.
 
 ## Developing
 

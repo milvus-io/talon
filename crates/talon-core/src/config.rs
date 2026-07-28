@@ -878,6 +878,11 @@ pub struct FuseConfig {
     pub mountpoint: PathBuf,
     /// Address of the coordinator to resolve placement + membership against.
     pub coordinator: String,
+    /// Mount-relative backend namespace to enumerate at startup.
+    ///
+    /// Must name at least a backend and bucket/container, for example
+    /// `s3/my-bucket` or `az/my-container/datasets`.
+    pub namespace_prefix: String,
     /// Logical block size in bytes (must match the cluster's; 256 MiB default).
     pub block_size: u32,
     /// Placement-cache entry TTL in milliseconds.
@@ -896,6 +901,7 @@ impl Default for FuseConfig {
         Self {
             mountpoint: PathBuf::from("/mnt/talon"),
             coordinator: "127.0.0.1:7000".into(),
+            namespace_prefix: String::new(),
             block_size: 256 << 20,
             placement_ttl_ms: 5_000,
             readahead_blocks: 4,
@@ -914,6 +920,8 @@ pub struct FuseConfigPatch {
     pub mountpoint: Option<PathBuf>,
     /// Override for [`FuseConfig::coordinator`].
     pub coordinator: Option<String>,
+    /// Override for [`FuseConfig::namespace_prefix`].
+    pub namespace_prefix: Option<String>,
     /// Override for [`FuseConfig::block_size`].
     pub block_size: Option<u32>,
     /// Override for [`FuseConfig::placement_ttl_ms`].
@@ -927,6 +935,7 @@ impl Patch for FuseConfigPatch {
         Self {
             mountpoint: self.mountpoint.or(base.mountpoint),
             coordinator: self.coordinator.or(base.coordinator),
+            namespace_prefix: self.namespace_prefix.or(base.namespace_prefix),
             block_size: self.block_size.or(base.block_size),
             placement_ttl_ms: self.placement_ttl_ms.or(base.placement_ttl_ms),
             readahead_blocks: self.readahead_blocks.or(base.readahead_blocks),
@@ -952,6 +961,14 @@ pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
         cli: true,
         secret: false,
         help: "Coordinator address for placement and membership.",
+    },
+    ConfigVar {
+        env: "TALON_FUSE_NAMESPACE_PREFIX",
+        key: "namespace_prefix",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Backend namespace to enumerate (for example, `az/container`).",
     },
     ConfigVar {
         env: "TALON_FUSE_BLOCK_SIZE",
@@ -982,6 +999,7 @@ pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
 pub(crate) mod fuse_env {
     pub const MOUNTPOINT: &str = "TALON_FUSE_MOUNTPOINT";
     pub const COORDINATOR: &str = "TALON_FUSE_COORDINATOR";
+    pub const NAMESPACE_PREFIX: &str = "TALON_FUSE_NAMESPACE_PREFIX";
     pub const BLOCK_SIZE: &str = "TALON_FUSE_BLOCK_SIZE";
     pub const PLACEMENT_TTL_MS: &str = "TALON_FUSE_PLACEMENT_TTL_MS";
     pub const READAHEAD_BLOCKS: &str = "TALON_FUSE_READAHEAD_BLOCKS";
@@ -1005,8 +1023,8 @@ impl FuseConfigPatch {
     /// Assemble a patch from `TALON_FUSE_*` environment variables.
     ///
     /// Recognized keys: `TALON_FUSE_MOUNTPOINT`, `TALON_FUSE_COORDINATOR`,
-    /// `TALON_FUSE_BLOCK_SIZE`, `TALON_FUSE_PLACEMENT_TTL_MS`,
-    /// `TALON_FUSE_READAHEAD_BLOCKS`.
+    /// `TALON_FUSE_NAMESPACE_PREFIX`, `TALON_FUSE_BLOCK_SIZE`,
+    /// `TALON_FUSE_PLACEMENT_TTL_MS`, `TALON_FUSE_READAHEAD_BLOCKS`.
     pub fn from_env() -> Result<Self> {
         Self::from_env_with(|k| std::env::var(k).ok())
     }
@@ -1024,6 +1042,7 @@ impl FuseConfigPatch {
         Ok(Self {
             mountpoint: get(fuse_env::MOUNTPOINT).map(PathBuf::from),
             coordinator: get(fuse_env::COORDINATOR),
+            namespace_prefix: get(fuse_env::NAMESPACE_PREFIX),
             block_size: get(fuse_env::BLOCK_SIZE)
                 .map(|v| parse_u32(v, fuse_env::BLOCK_SIZE))
                 .transpose()?,
@@ -1049,6 +1068,7 @@ impl FuseConfig {
         let cfg = FuseConfig {
             mountpoint: merged.mountpoint.unwrap_or(d.mountpoint),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
+            namespace_prefix: merged.namespace_prefix.unwrap_or(d.namespace_prefix),
             block_size: merged.block_size.unwrap_or(d.block_size),
             placement_ttl_ms: merged.placement_ttl_ms.unwrap_or(d.placement_ttl_ms),
             readahead_blocks: merged.readahead_blocks.unwrap_or(d.readahead_blocks),
@@ -1064,6 +1084,21 @@ impl FuseConfig {
         }
         if self.coordinator.is_empty() {
             return Err(Error::Other("coordinator address must not be empty".into()));
+        }
+        let trimmed = self.namespace_prefix.trim_start_matches('/');
+        let mut parts = trimmed.split('/');
+        let backend = parts.next().unwrap_or_default();
+        if backend.parse::<crate::Backend>().is_err() {
+            return Err(Error::Other(format!(
+                "namespace_prefix must start with a supported backend (s3, gcs, or az): {:?}",
+                self.namespace_prefix
+            )));
+        }
+        if !matches!(parts.next(), Some(bucket) if !bucket.is_empty()) {
+            return Err(Error::Other(format!(
+                "namespace_prefix must name a bucket/container (for example, az/container): {:?}",
+                self.namespace_prefix
+            )));
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
@@ -1107,7 +1142,11 @@ mod tests {
                 "worker schema missing {name}"
             );
         }
-        for name in [fuse_env::MOUNTPOINT, fuse_env::READAHEAD_BLOCKS] {
+        for name in [
+            fuse_env::MOUNTPOINT,
+            fuse_env::NAMESPACE_PREFIX,
+            fuse_env::READAHEAD_BLOCKS,
+        ] {
             assert!(
                 FUSE_ENV_SCHEMA.iter().any(|v| v.env == name),
                 "fuse schema missing {name}"
@@ -1309,8 +1348,10 @@ mod tests {
     }
 
     #[test]
-    fn fuse_defaults_are_valid() {
-        FuseConfig::default().validate().unwrap();
+    fn fuse_namespace_prefix_is_required() {
+        let err = FuseConfig::resolve(Default::default(), Default::default(), Default::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("namespace_prefix"));
     }
 
     #[test]
@@ -1318,6 +1359,7 @@ mod tests {
         let file = FuseConfigPatch {
             mountpoint: Some(PathBuf::from("/file/mnt")),
             coordinator: Some("file-coord".into()),
+            namespace_prefix: Some("s3/file-bucket".into()),
             block_size: Some(1 << 20),
             ..Default::default()
         };
@@ -1328,11 +1370,13 @@ mod tests {
         };
         let cli = FuseConfigPatch {
             mountpoint: Some(PathBuf::from("/cli/mnt")),
+            namespace_prefix: Some("az/cli-container/datasets".into()),
             ..Default::default()
         };
         let cfg = FuseConfig::resolve(file, env, cli).unwrap();
         assert_eq!(cfg.mountpoint, PathBuf::from("/cli/mnt")); // CLI wins
         assert_eq!(cfg.coordinator, "env-coord"); // env beats file
+        assert_eq!(cfg.namespace_prefix, "az/cli-container/datasets"); // CLI wins
         assert_eq!(cfg.block_size, 1 << 20); // file beats default
         assert_eq!(cfg.readahead_blocks, 8); // env
         assert_eq!(cfg.placement_ttl_ms, FuseConfig::default().placement_ttl_ms);
@@ -1342,7 +1386,7 @@ mod tests {
     #[test]
     fn fuse_from_toml_parses_and_rejects_unknown() {
         let patch = FuseConfigPatch::from_toml(
-            "mountpoint = \"/mnt/x\"\nreadahead_blocks = 16\nplacement_ttl_ms = 250\n",
+            "mountpoint = \"/mnt/x\"\nnamespace_prefix = \"gcs/models/checkpoints\"\nreadahead_blocks = 16\nplacement_ttl_ms = 250\n",
         )
         .unwrap();
         assert_eq!(
@@ -1351,6 +1395,10 @@ mod tests {
         );
         assert_eq!(patch.readahead_blocks, Some(16));
         assert_eq!(patch.placement_ttl_ms, Some(250));
+        assert_eq!(
+            patch.namespace_prefix.as_deref(),
+            Some("gcs/models/checkpoints")
+        );
         assert!(FuseConfigPatch::from_toml("nope = true").is_err());
     }
 
@@ -1359,6 +1407,7 @@ mod tests {
         let map = |k: &str| match k {
             "TALON_FUSE_BLOCK_SIZE" => Some("1048576".to_string()),
             "TALON_FUSE_MOUNTPOINT" => Some("/mnt/talon".to_string()),
+            "TALON_FUSE_NAMESPACE_PREFIX" => Some("az/container".to_string()),
             "TALON_FUSE_READAHEAD_BLOCKS" => Some("2".to_string()),
             _ => None,
         };
@@ -1369,6 +1418,7 @@ mod tests {
             Some(std::path::Path::new("/mnt/talon"))
         );
         assert_eq!(patch.readahead_blocks, Some(2));
+        assert_eq!(patch.namespace_prefix.as_deref(), Some("az/container"));
         assert!(patch.coordinator.is_none());
 
         let bad = |k: &str| (k == "TALON_FUSE_PLACEMENT_TTL_MS").then(|| "NaN".to_string());
@@ -1378,10 +1428,40 @@ mod tests {
     #[test]
     fn fuse_invalid_config_fails_fast() {
         let cli = FuseConfigPatch {
+            namespace_prefix: Some("az/container".into()),
             block_size: Some(0),
             ..Default::default()
         };
         let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("block_size"));
+    }
+
+    #[test]
+    fn fuse_namespace_prefix_requires_backend_and_bucket() {
+        for invalid in ["", "unknown/bucket", "s3", "gcs/"] {
+            let cli = FuseConfigPatch {
+                namespace_prefix: Some(invalid.into()),
+                ..Default::default()
+            };
+            let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+            assert!(
+                err.to_string().contains("namespace_prefix"),
+                "unexpected error for {invalid:?}: {err}"
+            );
+        }
+
+        for valid in [
+            "s3/bucket",
+            "gcs/bucket/dir",
+            "az/container",
+            "/az/container/prefix",
+        ] {
+            let cli = FuseConfigPatch {
+                namespace_prefix: Some(valid.into()),
+                ..Default::default()
+            };
+            let cfg = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+            assert_eq!(cfg.namespace_prefix, valid);
+        }
     }
 }
