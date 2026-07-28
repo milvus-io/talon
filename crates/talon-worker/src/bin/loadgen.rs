@@ -67,12 +67,24 @@ struct Args {
     /// Container or bucket the object lives in.
     #[arg(long, default_value = "c")]
     container: String,
+    /// Backend the object lives in (`s3`, `gcs`, or `az`).
+    ///
+    /// A worker rejects every request whose backend does not match the one it
+    /// was configured for, so a wrong value here produces zero samples rather
+    /// than a slow run: the benchmark must name the fleet's actual backend.
+    #[arg(long, default_value = "az", value_parser = parse_backend)]
+    backend: Backend,
     /// Worker PID to sample CPU and RSS from. Skipped when unset.
     #[arg(long)]
     server_pid: Option<u32>,
     /// Emit JSON Lines instead of a table, for scripted comparison.
     #[arg(long)]
     json: bool,
+}
+
+/// Parse a backend name for clap, mapping the core error to a CLI message.
+fn parse_backend(s: &str) -> Result<Backend, String> {
+    s.parse::<Backend>().map_err(|e| e.to_string())
 }
 
 /// One connection count's result.
