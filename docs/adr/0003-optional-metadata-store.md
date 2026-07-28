@@ -3,7 +3,8 @@
 - Status: Proposed
 - Date: 2026-07-28
 - Last revised: 2026-07-28 (§3a, §9 — write-back state is an ownership lease,
-  not a per-object record)
+  not a per-object record; open questions 7 and 8 — two mechanisms §9 assumes
+  do not currently provide what it needs)
 - Tracking issue: #274 (roadmap items 4 and 7)
 - Motivating defects: #363 (hard links cannot be made write-atomic), #359
 - Prerequisite for: write-back (ADR 0002 §2), POSIX locking
@@ -85,6 +86,16 @@ boundary that prevents TMS from growing into a namespace database.
 The right column stays derivable **whether or not TMS is configured**. A cluster
 that enables TMS and then loses it permanently still has an intact, readable
 namespace; it loses hard links, locks, and any un-flushed writes, not its data.
+
+One entry needs a caveat, because it is excluded on different grounds from the
+rest. Everything else in the right column is derivable *from the object store*.
+Dirty state is not — by definition the bytes are not there yet. It is derivable
+from its **owner**, which is a weaker property: it survives owner restart
+(`write_cache.rs` recovers it from local disk) but not owner loss, and reaching
+it requires knowing who the owner is. It is excluded from TMS by §3a's
+write-rate argument rather than by §2's derivability test, and §9 is what makes
+that exclusion safe by keeping ownership itself in TMS. The admission rule is
+otherwise unqualified, and this is the one place it needs reading alongside §3a.
 
 ### 3. TMS is sparse by construction
 
@@ -286,6 +297,14 @@ is:
 - **already half-derived** — the intended owner comes from the existing
   deterministic HRW placement, so TMS records the *lease*, not the mapping.
 
+Two caveats on that third point, both recorded as open questions rather than
+resolved here. HRW as implemented hashes the object's *version* along with its
+key, so ownership is not in fact stable across a write (question 7); and the
+generation counter §9 relies on for takeover is process-local, so it does not
+order copies held by different workers (question 8). Neither invalidates the
+lease model, but §9 cannot be implemented against these mechanisms as they
+stand.
+
 What does **not** require consensus is the inventory of which objects are
 currently dirty and which generation is newest. That is knowable by the owner
 alone, is already durable on the owner's NVMe with crash recovery
@@ -407,6 +426,62 @@ These are unresolved and block moving this ADR to Accepted.
    replicas answer, some do not), and an answer for what happens to writes to
    that range meanwhile — refuse, or accept into the new owner's cache while
    recovery proceeds.
+
+7. **What is the lease's hash input, given that HRW ownership is not stable
+   across a version bump?** §9 says ownership "changes on membership change,
+   not on write" and derives the intended owner from the existing HRW
+   placement. The placement function as implemented does not have that
+   stability: `RendezvousPlacement::weight` hashes the whole `BlockId`
+   (`placement.rs`), and `BlockId` includes `version` with a derived `Hash`
+   (`key.rs`). A new ETag therefore rehashes the block and can relocate it.
+
+   Measured, 1000 objects, identical key and offset, only the version changed:
+
+   | Nodes | Owner changed | Uniform-rehash prediction `(N-1)/N` |
+   |---|---|---|
+   | 4 | 743 / 1000 | 750 |
+   | 8 | 875 / 1000 | 875 |
+   | 16 | 932 / 1000 | 938 |
+
+   The match to `(N-1)/N` confirms this is ordinary rehashing rather than an
+   artifact of the test keys.
+
+   This is correct behaviour for *read* placement, where a version is a
+   distinct cache entry and relocating it is harmless. It is a problem for a
+   write-ownership lease: **a write produces a new version, so the very act the
+   lease exists to arbitrate can move the range out from under its holder.**
+   The worker that accepted the write and holds the dirty bytes may not be the
+   HRW owner of the resulting version.
+
+   The lease must therefore be keyed on something version-independent —
+   `(backend, bucket, object_path)` or a prefix of it — and §9 must state the
+   relationship between that key and the version-bearing `BlockId` used for
+   read placement. Note this is a separate decision from question 5: the *hash
+   input* must exclude version regardless of how coarse the *range* turns out
+   to be.
+
+8. **What orders generations across nodes during takeover?** §9's recovery
+   interrogates replica candidates for the predecessor's un-flushed inventory,
+   which requires deciding which returned copy is newest.
+
+   `WriteCache`'s `seq` is process-monotonic (`write_cache.rs`): it starts at
+   `AtomicU64::new(0)` and `recover()` reseeds it to `max_seq + 1` from a scan
+   of the *local* staging directory. That is sufficient today, because the only
+   comparison is within one node's own directory.
+
+   Under §9 the comparison becomes cross-node, and there `seq` has no shared
+   basis. Worker A's seq 5 and worker B's seq 5 for the same object are
+   unrelated, and a restarted worker's counter is reseeded only from whatever
+   survived locally. There is no total order to recover, so "which generation
+   is newest" is not answerable from the data §9 relies on.
+
+   Two candidate shapes: a cluster-meaningful generation (lease epoch plus
+   local seq — the lease already carries an incarnation, so the ordering
+   material exists), or a rule that only the lease holder at write time may
+   hold staged data, making the successor's choice trivial. The second is
+   simpler but interacts badly with question 6's partially-reachable
+   predecessor — which is precisely the case where multiple candidate copies
+   exist and must be ordered.
 
 ## Rejected alternatives
 
