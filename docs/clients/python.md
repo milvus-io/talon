@@ -10,7 +10,19 @@ local NVMe.
 pip install talon-client
 ```
 
-Wheels are `abi3`, so one artifact per platform covers CPython 3.8 and newer.
+Wheels are `abi3`, so one artifact per platform covers CPython 3.8 and newer:
+
+| platform | wheel |
+|---|---|
+| Linux x86_64 | manylinux 2.28 |
+| Linux aarch64 | manylinux 2.28 |
+| macOS x86_64 | 10.12+ |
+| macOS arm64 | 11.0+ |
+
+Windows is not built, since the worker is Linux-only.
+
+Wheels are built on release tags by the `release wheels` workflow; the per-PR
+job builds and tests a Linux x86_64 wheel as a regression check.
 
 To build from a checkout:
 
