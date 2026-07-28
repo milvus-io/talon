@@ -6,6 +6,11 @@ object-store cache.
 Reads objects through a Talon cache cluster instead of from the origin, so
 repeated reads across a fleet are served from local NVMe.
 
+Wheels are `abi3`, so one artifact per platform covers CPython 3.8 and newer:
+Linux x86_64 and aarch64 (manylinux 2.28), and macOS x86_64 and arm64. Windows
+is not built — the worker is Linux-only, so a Windows client would be talking to
+a cluster it cannot host.
+
 ```python
 import talon
 

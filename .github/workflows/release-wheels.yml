@@ -1,0 +1,124 @@
+# Build Python client wheels for every platform the package supports (#349).
+#
+# The per-PR `python client` job in ci.yml builds one Linux x86_64 wheel and
+# runs the test suite against it — that is the fast regression check. This
+# workflow is the release artifact set, and it runs on tags rather than on every
+# PR because a full matrix costs ~10 minutes for platforms no PR changes.
+#
+# Wheels are abi3 (CPython >= 3.8), so the matrix is over *platforms*, not
+# Python versions: one wheel per platform covers every supported interpreter.
+name: release wheels
+
+on:
+  push:
+    tags:
+      - "v*"
+  # Manual runs are useful for checking the matrix still builds before a tag,
+  # and for producing artifacts from a branch.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  wheels:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      # One broken target should not hide whether the others build.
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+          # aarch64 Linux is increasingly the default for cloud GPU and ARM
+          # instances, which is where a cache client is most likely to run.
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            manylinux: "2_28"
+          - target: x86_64-apple-darwin
+            runner: macos-13
+          - target: aarch64-apple-darwin
+            runner: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          target: ${{ matrix.target }}
+          # maturin cross-compiles Rust extensions directly; cibuildwheel would
+          # add a container layer this does not need.
+          manylinux: ${{ matrix.manylinux || 'auto' }}
+          args: >-
+            --release
+            --manifest-path clients/python/Cargo.toml
+            --out dist
+          # Cross-compilation needs a linker for the target; the action's
+          # container provides one for the Linux targets.
+          sccache: "true"
+
+      - name: Check the wheel's metadata and platform tag
+        # A wheel that builds but is tagged wrong installs on the wrong platform
+        # or on none at all, which only shows up at `pip install` time.
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*.whl
+          ls -l dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-${{ matrix.target }}
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # Only the native-architecture wheel can be executed on its own runner, so
+  # this verifies the artifact actually imports rather than only that it built.
+  smoke-test:
+    name: import check (x86_64 linux)
+    needs: wheels
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: wheels-x86_64-unknown-linux-gnu
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.8"
+      - name: Install and import
+        # Python 3.8 specifically: the wheel claims abi3-py38, and installing it
+        # on the oldest supported interpreter is the only way to find out
+        # whether that claim holds.
+        run: |
+          python -m pip install dist/*.whl
+          python -c "import talon; print(talon.__version__); print(talon.Client)"
+
+  collect:
+    name: collect wheels
+    needs: [wheels, smoke-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+          path: dist
+      - name: Summarize the artifact set
+        run: |
+          {
+            echo "## Python client wheels"
+            echo
+            echo '```'
+            ls -1 dist/
+            echo '```'
+            echo
+            echo "Publishing to PyPI is a separate decision; these are build"
+            echo "artifacts only."
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: wheels-all
+          path: dist/*.whl
+          if-no-files-found: error
