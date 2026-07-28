@@ -2,6 +2,8 @@
 
 - Status: Proposed
 - Date: 2026-07-28
+- Last revised: 2026-07-28 (§3a, §9 — write-back state is an ownership lease,
+  not a per-object record)
 - Tracking issue: #274 (roadmap items 4 and 7)
 - Motivating defects: #363 (hard links cannot be made write-atomic), #359
 - Prerequisite for: write-back (ADR 0002 §2), POSIX locking
@@ -76,8 +78,9 @@ boundary that prevents TMS from growing into a namespace database.
 |---|---|
 | `path -> inode` for files with more than one link | File existence (the key list is the truth) |
 | Lock holder, owner identity, lease expiry | Directory structure (marker blobs) |
-| Dirty-object owner and replica set | File size, mtime, ETag (`head` is the truth) |
-| Inode reference counts | Placement (derived from the worker set hash) |
+| Write-ownership leases over key ranges (§9) | Which objects are dirty, and their generations (owner-local, §9) |
+| Inode reference counts | File size, mtime, ETag (`head` is the truth) |
+| | Placement and replica candidates (derived from the worker set hash) |
 
 The right column stays derivable **whether or not TMS is configured**. A cluster
 that enables TMS and then loses it permanently still has an intact, readable
@@ -90,18 +93,56 @@ record per object:
 
 - a file with a single link occupies zero TMS records;
 - a file with three links occupies one;
-- an object with no un-flushed writes occupies zero;
 - an unlocked file occupies zero.
 
 This is what makes an etcd-class backend viable. Node records under ADR 0001
 number in the hundreds; per-object records for a billion-object bucket would
 not fit (etcd holds its keyspace in memory, with a practical ceiling in the
 single-digit GB and a 1.5 MB per-value limit). Per-*linked*-file and
-per-*dirty*-object records are orders of magnitude smaller, and are zero for
+per-*locked*-file records are orders of magnitude smaller, and are zero for
 workloads that use neither feature.
 
 A deployment that exceeds an etcd-class backend's capacity is a signal that the
 workload wants a filesystem, not a cache. TMS does not attempt to serve it.
+
+### 3a. Sparsity is a claim about record count; write-back needs a claim about write rate
+
+§3's argument is a *capacity* argument, and it holds for links and locks. It
+does **not** transfer to write-back state, and the difference is what §9's
+design has to be built around.
+
+Link and lock records are user-triggered, rare, and long-lived. Dirty-object
+records would be none of those:
+
+| | Links / locks | Dirty objects |
+|---|---|---|
+| Triggered by | An explicit, uncommon syscall | **Every write**, implicitly |
+| Lifetime | Indefinite | Seconds: create, flush, delete |
+| Steady-state count | Small, stable | Proportional to **write throughput** |
+| Write pattern | Occasional | Sustained create/delete churn |
+
+The population of dirty records is not a function of how many objects exist. It
+is `write_rate × flush_latency`. A checkpointing workload writing 1,000 objects
+per second with a two-second flush lag holds only ~2,000 records — a trivial
+*capacity* figure that conceals 1,000 creates plus 1,000 deletes per second
+landing on a consensus group.
+
+**etcd's binding constraint is write throughput, not key count.** Every write is
+a Raft round trip plus an fsync; sustained write rates are practically in the
+low tens of thousands per second cluster-wide, and latency degrades well before
+that ceiling. So a naive "one TMS record per dirty object" design puts a
+consensus write on the critical path of every single write — in a feature whose
+entire purpose is to make writes fast. It would plausibly cost more than
+write-back gains, while adding a hard availability dependency to the write path
+that §6 explicitly refuses for reads.
+
+The 256 MiB default block size does not rescue this. Dirty records are
+per-object rather than per-block (`write_cache.rs` already tracks at object
+granularity), which is a constant factor; the proportionality to write rate is
+unchanged.
+
+The conclusion is not that write-back is infeasible, but that **dirty state must
+not be modelled as one TMS record per dirty object**. §9 states the alternative.
 
 ### 4. Optionality is capability negotiation, never silent degradation
 
@@ -199,6 +240,15 @@ variants, and pluggable backends with a memory implementation for tests.
 Both may target the same physical etcd cluster under different prefixes. They
 remain separate abstractions with separate invariants.
 
+The same reasoning is what forbids folding write-back's dirty inventory into
+TMS. §7 separates two stores because membership is *ephemeral and rebuildable*
+while TMS records are *durable and not rebuildable* — different invariants, so
+different abstractions. Dirty inventory differs from TMS records along a
+different axis (high-frequency and short-lived versus low-frequency and
+long-lived, §3a), and the conclusion is the same: it does not belong in TMS.
+§9 keeps it owner-local rather than inventing a third store, because the owner's
+NVMe already provides durability and crash recovery for exactly this data.
+
 ### 8. ADR 0001 §1 is amended, conditionally
 
 ADR 0001 excluded leader election, conditioned on Talon having no durable
@@ -217,18 +267,66 @@ The amendment is narrow:
   operate one.
 - For clusters without TMS, ADR 0001 is unchanged in full.
 
-### 9. Relationship to ADR 0002
+### 9. Relationship to ADR 0002: TMS records ownership, not dirty objects
 
-TMS is a **prerequisite** for write-back, not a parallel feature.
+TMS is a **prerequisite** for write-back, not a parallel feature. But per §3a,
+the naive form of that dependency — a TMS record per un-flushed object — puts a
+consensus write on the critical path of every write. This section states the
+form the dependency must actually take.
 
-ADR 0002 §2's first entry condition — replication before acknowledgement —
-requires durable knowledge of which workers hold which un-flushed bytes. That is
-a TMS record by the §2 admission rule: it cannot be derived from the object
-store, because by definition the data is not there yet.
+**Split the fact that needs consensus from the fact that does not.**
 
-ADR 0002 §2 remains in force. TMS satisfies one of five entry conditions.
-Write-back still requires the other four and its own superseding ADR. Nothing in
-this ADR makes write-back reachable.
+What genuinely requires strongly consistent, cluster-visible arbitration is
+*which worker holds the write-ownership of a given key range*. Two workers
+believing they own the same object is the split-brain that loses data. That fact
+is:
+
+- **coarse** — one record per (worker, key range), not per object;
+- **long-lived** — it changes on membership change, not on write;
+- **already half-derived** — the intended owner comes from the existing
+  deterministic HRW placement, so TMS records the *lease*, not the mapping.
+
+What does **not** require consensus is the inventory of which objects are
+currently dirty and which generation is newest. That is knowable by the owner
+alone, is already durable on the owner's NVMe with crash recovery
+(`write_cache.rs`), and is only needed by another node during **recovery** —
+which is precisely when the ownership lease has expired and a new owner is
+taking over.
+
+So:
+
+```text
+TMS (consensus, low frequency):
+  lease: key-range -> owning worker, incarnation, expiry
+
+Owner-local durable state (no consensus, high frequency):
+  which objects are dirty, which generation, which replicas acked
+```
+
+The consensus write rate drops from **per write** to **per membership change** —
+orders of magnitude, not a constant factor — and it reuses two mechanisms that
+already exist: the lease discipline of ADR 0001 §3 and HRW placement.
+
+**Replica sets are derived, not stored.** ADR 0002 §2's first entry condition
+(replication before acknowledgement) does not require persisting which replicas
+hold which bytes. `Placement::locate_top_k` already yields a deterministic,
+ordered replica candidate list from the worker set, so *which workers should
+hold a given object* is computable by anyone. What cannot be derived is which of
+them **actually** acked — and that is recoverable by querying the candidates
+during takeover, rather than by writing a record on every write. This weakens
+§9's TMS requirement from "durably record the replica set" to "durably record
+the ownership lease."
+
+**What this costs.** Recovery becomes a scan-and-query rather than a lookup: a
+new owner must interrogate the candidate replicas for the previous owner's
+un-flushed inventory, and that path must be bounded and tested. This is a
+deliberate trade — a slower, more complex cold path in exchange for removing
+consensus from the hot one. A recovery path runs on membership change; the hot
+path runs on every write.
+
+**ADR 0002 §2 remains in force.** TMS satisfies part of one of five entry
+conditions. Write-back still requires the other four and its own superseding
+ADR. Nothing in this ADR makes write-back reachable.
 
 ## Consequences
 
@@ -237,7 +335,8 @@ this ADR makes write-back reachable.
 - Hard links become correct rather than approximately correct, or are honestly
   refused. Either outcome is better than shipping silent divergence.
 - Write-back's hardest prerequisite gains a design, without write-back becoming
-  reachable.
+  reachable. Ownership leases keep consensus off the per-write path, so the
+  prerequisite does not silently cost more than the feature is worth (§3a, §9).
 - POSIX locking becomes expressible for the first time.
 - Clusters that need none of this are unaffected: no new dependency, no new
   failure domain, no new operational burden.
@@ -262,6 +361,12 @@ this ADR makes write-back reachable.
 - **Link/unlink becomes multi-step** (TMS update + object move) and is not
   atomic across the two. Crash mid-transition must be recoverable, which needs
   the same staging/marker discipline `write_cache.rs` already uses locally.
+- **Write-back recovery becomes a query, not a lookup.** §9 buys a cheap hot
+  path with a more expensive cold one: taking over a key range means
+  interrogating replica candidates for the previous owner's un-flushed
+  inventory, and doing so under a bounded timeout while the range is
+  unavailable for writes. The failure modes of that handover need their own
+  design, and a partially-reachable predecessor is the hard case.
 
 ## Open questions
 
@@ -288,6 +393,20 @@ These are unresolved and block moving this ADR to Accepted.
    applications treat lock failure as fatal where they would tolerate advisory
    locking being a no-op. This needs a survey of the target workloads before
    being fixed.
+
+5. **What is the write-ownership lease granularity?** §9 records leases over
+   "key ranges", but the range definition is undecided: per HRW placement slot,
+   per bucket, or per explicit shard. Too coarse and a single membership change
+   stalls writes across a large key space; too fine and the lease population
+   starts tracking object count again, reintroducing §3a's problem through the
+   back door. This is the parameter the whole §9 design turns on.
+
+6. **How does a new owner bound the takeover query?** §9 recovers the previous
+   owner's un-flushed inventory by interrogating replica candidates. That needs
+   a defined timeout, a rule for a partially-reachable predecessor (some
+   replicas answer, some do not), and an answer for what happens to writes to
+   that range meanwhile — refuse, or accept into the new owner's cache while
+   recovery proceeds.
 
 ## Rejected alternatives
 
@@ -324,6 +443,31 @@ simple deployment simple.
 
 Rejected. Invisible to other mounts. Two clients on one bucket would diverge
 immediately, which is worse than the copy semantics being replaced.
+
+### One TMS record per dirty object
+
+Rejected per §3a and §9. It is the obvious modelling of write-back state and it
+does not survive a throughput calculation: the record population scales with
+`write_rate × flush_latency`, so every write becomes a consensus write plus a
+consensus delete. etcd's binding constraint is write throughput rather than key
+count, so this saturates the metadata store in a feature whose purpose is faster
+writes, and makes TMS an availability dependency of the write path — the same
+coupling §6 refuses for reads.
+
+Recording coarse, long-lived ownership leases instead, and keeping the dirty
+inventory on the owner's already-durable local storage, preserves the property
+that matters (no two workers believe they own the same object) at a consensus
+write rate proportional to membership change rather than to traffic.
+
+### A third store tuned for high-frequency dirty records
+
+Rejected. Having established that dirty inventory does not fit TMS, the tempting
+next step is a store that does — something log-structured or sharded, tuned for
+churn. It is unnecessary: the data is already durable, checksummed, and
+crash-recoverable on the owning worker's NVMe (`write_cache.rs`), and the only
+consumer outside that worker is a recovering successor. Adding a third
+distributed store to serve one cold path would be a large operational cost for
+data that has an owner by construction.
 
 ### Defer the `link()` fix until TMS ships
 
