@@ -258,7 +258,6 @@ pub struct HardLinkPlan {
     pub(crate) source_ino: u64,
     pub(crate) source_path: String,
     pub(crate) source_size: u64,
-    pub(crate) buffered_contents: Option<WritebackSource>,
     pub(crate) target_parent: u64,
     pub(crate) target_name: String,
     pub(crate) target_path: String,
@@ -1528,12 +1527,6 @@ impl ReadOnlyFs {
             source_ino,
             source_path: source.path.clone(),
             source_size: source.size,
-            buffered_contents: g
-                .dirty
-                .iter()
-                .filter(|(_, dirty)| dirty.ino == source_ino)
-                .max_by_key(|(fh, _)| *fh)
-                .map(|(_, dirty)| dirty.contents.snapshot()),
             target_parent,
             target_name: target_name.to_string(),
             target_path,
@@ -2646,6 +2639,47 @@ mod tests {
         assert_eq!(
             fs.new_symlink_path(parent.ino, &"x".repeat(256), b"target"),
             Err(FsError::NameTooLong)
+        );
+    }
+
+    #[test]
+    fn hard_link_plan_marks_object_backed_kinds_for_refusal() {
+        // The mount layer refuses a link whose plan reports `backend_object`
+        // (#363): those kinds would need one backend copy per link path, and
+        // object stores have no cross-key atomic write to keep the copies
+        // equal. Mount-local special nodes carry no object and stay linkable,
+        // so this pins which side of that branch each kind falls on.
+        let fs = fs();
+        let parent = data_dir(&fs);
+
+        let file = fs.lookup(parent.ino, "a.bin").unwrap();
+        let file_plan = fs
+            .hard_link_plan(file.ino, parent.ino, "file-link.bin")
+            .unwrap();
+        assert!(
+            file_plan.backend_object,
+            "a regular file is object-backed, so link() must refuse it"
+        );
+
+        let symlink = fs
+            .symlink(parent.ino, "sym", b"a.bin".to_vec())
+            .expect("create symlink");
+        let symlink_plan = fs
+            .hard_link_plan(symlink.ino, parent.ino, "sym-link")
+            .unwrap();
+        assert!(
+            symlink_plan.backend_object,
+            "a symlink stores its target in an object, so link() must refuse it too"
+        );
+
+        let fifo_plan = fs.mknod_plan(parent.ino, "fifo", MODE_NAMED_PIPE | 0o644, 0, 0, 0, 0);
+        let fifo = fs.commit_mknod(&fifo_plan.unwrap()).unwrap();
+        let fifo_link = fs
+            .hard_link_plan(fifo.ino, parent.ino, "fifo-link")
+            .unwrap();
+        assert!(
+            !fifo_link.backend_object,
+            "a mount-local special node has no object; linking it is a pure namespace op"
         );
     }
 
