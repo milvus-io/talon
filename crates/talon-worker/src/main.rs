@@ -134,6 +134,8 @@ impl Args {
             data_plane_rings: self.data_plane_rings,
             cache_dirs: None,
             capacity_bytes: None,
+            l1_capacity_bytes: None,
+            l1_max_entry_bytes: None,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -268,6 +270,8 @@ async fn main() -> anyhow::Result<()> {
         block_size = cfg.block_size,
         cache_dirs = ?cfg.cache_dirs,
         capacity_bytes = cfg.capacity_bytes,
+        l1_capacity_bytes = cfg.l1_capacity_bytes,
+        l1_max_entry_bytes = cfg.l1_max_entry_bytes,
         azure_account = ?cfg.azure_account,
         azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
@@ -325,6 +329,9 @@ async fn main() -> anyhow::Result<()> {
     )?);
     observability.readiness().set_backend_ready(true);
     observability.readiness().set_store_ready(true);
+    observability
+        .metrics()
+        .set_l1_capacity(cfg.l1_capacity_bytes);
 
     // The networked HTTP client, shared by whichever backend is selected. Two
     // decorators may wrap it, innermost first: retry (always on — a cache with
@@ -412,13 +419,15 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let worker = Arc::new(WorkerRuntime::new(
+    let worker = Arc::new(WorkerRuntime::new_with_l1(
         store,
         index,
         inflight,
         backend,
         cfg.block_size,
         cfg.capacity_bytes,
+        cfg.l1_capacity_bytes,
+        cfg.l1_max_entry_bytes,
         observability.metrics().clone(),
     ));
 

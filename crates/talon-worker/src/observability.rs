@@ -35,6 +35,12 @@ pub struct WorkerMetrics {
     bytes_served_total: Counter,
     cache_hits_total: Counter,
     cache_misses_total: Counter,
+    l1_hits_total: Counter,
+    l1_misses_total: Counter,
+    l2_hits_total: Counter,
+    l2_misses_total: Counter,
+    l1_admissions_total: Counter,
+    l1_evictions_total: Counter,
     backend_fetch_bytes_total: Counter,
     backend_fetch_errors_total: Counter,
     backend_retries_total: Counter,
@@ -53,6 +59,9 @@ pub struct WorkerMetrics {
     block_count: Gauge,
     page_count: Gauge,
     resident_bytes: Gauge,
+    l1_blocks: Gauge,
+    l1_resident_bytes: Gauge,
+    l1_capacity_bytes: Gauge,
     ready: Gauge,
     process_uptime_seconds: Gauge,
 }
@@ -104,6 +113,36 @@ impl WorkerMetrics {
             "talon_worker_cache_misses_total",
             "Worker cache misses.",
             labels(&[("form", "whole")]),
+        );
+        let l1_hits_total = registry.counter(
+            "talon_worker_cache_tier_hits_total",
+            "Worker cache hits by storage tier.",
+            labels(&[("tier", "l1")]),
+        );
+        let l1_misses_total = registry.counter(
+            "talon_worker_cache_tier_misses_total",
+            "Worker cache misses by storage tier.",
+            labels(&[("tier", "l1")]),
+        );
+        let l2_hits_total = registry.counter(
+            "talon_worker_cache_tier_hits_total",
+            "Worker cache hits by storage tier.",
+            labels(&[("tier", "l2")]),
+        );
+        let l2_misses_total = registry.counter(
+            "talon_worker_cache_tier_misses_total",
+            "Worker cache misses by storage tier.",
+            labels(&[("tier", "l2")]),
+        );
+        let l1_admissions_total = registry.counter(
+            "talon_worker_l1_admissions_total",
+            "Blocks admitted or promoted into the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
+        let l1_evictions_total = registry.counter(
+            "talon_worker_l1_evictions_total",
+            "Blocks evicted from the L1 DRAM cache.",
+            BTreeMap::new(),
         );
         let backend_fetch_bytes_total = registry.counter(
             "talon_worker_backend_fetch_bytes_total",
@@ -195,6 +234,21 @@ impl WorkerMetrics {
             "Bytes currently resident in the worker cache.",
             BTreeMap::new(),
         );
+        let l1_blocks = registry.gauge(
+            "talon_worker_l1_blocks",
+            "Blocks currently resident in the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
+        let l1_resident_bytes = registry.gauge(
+            "talon_worker_l1_resident_bytes",
+            "Payload bytes currently resident in the L1 DRAM cache.",
+            BTreeMap::new(),
+        );
+        let l1_capacity_bytes = registry.gauge(
+            "talon_worker_l1_capacity_bytes",
+            "Configured L1 DRAM cache capacity in bytes.",
+            BTreeMap::new(),
+        );
         let capacity_bytes = registry.gauge(
             "talon_worker_capacity_bytes",
             "Configured worker cache capacity in bytes.",
@@ -221,6 +275,12 @@ impl WorkerMetrics {
             bytes_served_total,
             cache_hits_total,
             cache_misses_total,
+            l1_hits_total,
+            l1_misses_total,
+            l2_hits_total,
+            l2_misses_total,
+            l1_admissions_total,
+            l1_evictions_total,
             backend_fetch_bytes_total,
             backend_fetch_errors_total,
             backend_retries_total,
@@ -239,6 +299,9 @@ impl WorkerMetrics {
             block_count,
             page_count,
             resident_bytes,
+            l1_blocks,
+            l1_resident_bytes,
+            l1_capacity_bytes,
             ready,
             process_uptime_seconds,
         }
@@ -266,6 +329,47 @@ impl WorkerMetrics {
     /// Record a whole-block cache miss.
     pub fn record_cache_miss(&self) {
         self.cache_misses_total.inc();
+    }
+
+    /// Record an L1 DRAM hit.
+    pub fn record_l1_hit(&self) {
+        self.l1_hits_total.inc();
+    }
+
+    /// Record an L1 DRAM miss.
+    pub fn record_l1_miss(&self) {
+        self.l1_misses_total.inc();
+    }
+
+    /// Record an L2 NVMe hit.
+    pub fn record_l2_hit(&self) {
+        self.l2_hits_total.inc();
+    }
+
+    /// Record an L2 NVMe miss.
+    pub fn record_l2_miss(&self) {
+        self.l2_misses_total.inc();
+    }
+
+    /// Record a block admitted or promoted into L1.
+    pub fn record_l1_admission(&self) {
+        self.l1_admissions_total.inc();
+    }
+
+    /// Record a capacity eviction from L1.
+    pub fn record_l1_eviction(&self) {
+        self.l1_evictions_total.inc();
+    }
+
+    /// Set the configured L1 capacity.
+    pub fn set_l1_capacity(&self, capacity_bytes: u64) {
+        self.l1_capacity_bytes.set(capacity_bytes as f64);
+    }
+
+    /// Publish current L1 entry and byte residency.
+    pub fn update_l1_residency(&self, blocks: u64, resident_bytes: u64) {
+        self.l1_blocks.set(blocks as f64);
+        self.l1_resident_bytes.set(resident_bytes as f64);
     }
 
     /// Record a successful backend fetch.

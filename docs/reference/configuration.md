@@ -258,6 +258,22 @@ Worker cache capacity (bytes).
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `l1_capacity_bytes`
+
+L1 DRAM cache capacity in bytes; 0 disables L1.
+
+- **Environment variable:** `TALON_WORKER_L1_CAPACITY_BYTES`
+- **Default:** `0`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `l1_max_entry_bytes`
+
+Largest whole block eligible for the L1 DRAM cache.
+
+- **Environment variable:** `TALON_WORKER_L1_MAX_ENTRY_BYTES`
+- **Default:** `4194304`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `backend`
 
 Object-store backend: azure (default), s3, or gcs.

@@ -26,7 +26,7 @@ pub use capacity::{CacheDirConfig, CacheDirs};
 pub use eviction::{CacheUnit, Lru};
 pub use index::{BlockIndex, Presence};
 pub use loader::{LoadOutcome, LoadTask, LoaderPool};
-pub use memory_store::MemoryStore;
+pub use memory_store::{MemoryInsert, MemoryStore};
 pub use miss::{touched_pages, Admission, InFlightGuard, InFlightLoads, LoadKey};
 pub use observability::{serve_admin, WorkerMetrics, WorkerObservability, WorkerReadiness};
 pub use paged_store::PagedBlockStore;

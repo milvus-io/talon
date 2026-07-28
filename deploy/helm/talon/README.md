@@ -52,6 +52,8 @@ SSD) instead of an `emptyDir`. Disable workers entirely with
 | `worker.enabled` | `true` | Deploy cache workers |
 | `worker.replicas` | `3` | Worker replicas |
 | `worker.capacityBytes` | `8589934592` | Per-worker cache capacity |
+| `worker.l1CapacityBytes` | `0` | L1 DRAM capacity; zero disables L1 |
+| `worker.l1MaxEntryBytes` | `4194304` | Largest block admitted to L1 |
 | `image.registry` / `image.tag` | `ghcr.io/milvus-io` / chart appVersion | Image source |
 | `serviceMonitor.enabled` | `false` | Prometheus Operator ServiceMonitor |
 

@@ -12,7 +12,8 @@ use talon_core::{
 use talon_transport::data::RangeRequest;
 
 use crate::{
-    BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, Presence, WholeBlockStore, WorkerMetrics,
+    BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert, MemoryStore, Presence,
+    WholeBlockStore, WorkerMetrics,
 };
 
 /// Default lifetime of a cached resolved object version.
@@ -47,6 +48,9 @@ pub enum ServeOutcome {
 
 /// Shared state required to serve instrumented data-plane range requests.
 pub struct WorkerRuntime {
+    /// Small-block DRAM cache. L1 is inclusive: every entry also exists in L2.
+    l1: Arc<MemoryStore>,
+    /// Persistent local-NVMe cache.
     store: WholeBlockStore,
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
@@ -81,11 +85,44 @@ impl WorkerRuntime {
         capacity_bytes: u64,
         metrics: WorkerMetrics,
     ) -> Self {
+        Self::new_with_l1(
+            store,
+            index,
+            inflight,
+            backend,
+            block_size,
+            capacity_bytes,
+            0,
+            0,
+            metrics,
+        )
+    }
+
+    /// Create a runtime with an explicit L1 DRAM tier over the L2 NVMe store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_l1(
+        store: WholeBlockStore,
+        index: Arc<BlockIndex>,
+        inflight: Arc<InFlightLoads>,
+        backend: Arc<dyn BackendStore>,
+        block_size: u32,
+        capacity_bytes: u64,
+        l1_capacity_bytes: u64,
+        l1_max_entry_bytes: u64,
+        metrics: WorkerMetrics,
+    ) -> Self {
         let lru = Arc::new(Lru::new());
         for (id, len) in index.snapshot_lens() {
             lru.insert(CacheUnit::Whole(id), len);
         }
+        let l1 = Arc::new(MemoryStore::with_limits(
+            l1_capacity_bytes,
+            l1_max_entry_bytes,
+        ));
+        metrics.set_l1_capacity(l1_capacity_bytes);
+        metrics.update_l1_residency(0, 0);
         Self {
+            l1,
             store,
             index,
             inflight,
@@ -207,14 +244,43 @@ impl WorkerRuntime {
             .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
         let start_block = (request.offset / block_size) * block_size;
 
-        // Zero-copy fast path: whole range within one block that is resident.
+        // Single-block fast paths: L1 bytes first, then an L2 sendfile handle.
         if end <= start_block + block_size {
             let block = self.block_for(&request.object, request.offset, version);
+            let offset_in_block = request.offset - block.offset;
+            if let Some(bytes) = self.l1_get(&block) {
+                return Ok(ServeOutcome::Bytes(slice(
+                    &bytes,
+                    offset_in_block,
+                    request.len,
+                )?));
+            }
             if matches!(
                 self.index.presence(&block, PageIndex(0), PageIndex(1)),
                 Presence::Whole
             ) {
-                let offset_in_block = request.offset - block.offset;
+                // Small blocks are promoted into L1 on their first post-restart L2
+                // hit. Large blocks preserve the zero-copy sendfile path.
+                if self
+                    .index
+                    .get(&block)
+                    .is_some_and(|meta| self.l1.is_eligible(meta.len))
+                {
+                    match self.store.get_bytes(&block).await {
+                        Ok(bytes) => {
+                            self.record_l2_hit(&block);
+                            self.admit_l1(&block, bytes.clone());
+                            return Ok(ServeOutcome::Bytes(slice(
+                                &bytes,
+                                offset_in_block,
+                                request.len,
+                            )?));
+                        }
+                        Err(error) => {
+                            tracing::debug!(%block, %error, "L2 promotion read lost an eviction race");
+                        }
+                    }
+                }
                 // Open an fd over exactly the requested window. This can fail if
                 // the block was evicted between the presence check and the open
                 // (a benign race); fall through to the byte path in that case.
@@ -227,9 +293,8 @@ impl WorkerRuntime {
                     // the requested window.
                     Ok(mut handles) if handles.len() == 1 => {
                         let handle = handles.pop().expect("one handle");
-                        self.metrics.record_cache_hit();
-                        self.lru.touch(&CacheUnit::Whole(block.clone()));
-                        tracing::info!(block = %block, "HIT (sendfile)");
+                        self.record_l2_hit(&block);
+                        tracing::info!(block = %block, tier = "l2", "HIT (sendfile)");
                         return Ok(ServeOutcome::Sendfile(handle));
                     }
                     Ok(_) | Err(_) => {
@@ -239,6 +304,15 @@ impl WorkerRuntime {
                     }
                 }
             }
+
+            self.metrics.record_l2_miss();
+            self.metrics.record_cache_miss();
+            let bytes = self.load_block_bytes(request, &block).await?;
+            return Ok(ServeOutcome::Bytes(slice(
+                &bytes,
+                offset_in_block,
+                request.len,
+            )?));
         }
 
         // Fallback: miss or boundary-spanning read → in-memory bytes.
@@ -396,6 +470,15 @@ impl WorkerRuntime {
         }
 
         self.metrics.record_cache_miss();
+        self.load_block_bytes(request, block).await
+    }
+
+    /// Load one block after both L1 and L2 have missed.
+    async fn load_block_bytes(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+    ) -> anyhow::Result<bytes::Bytes> {
         let key = LoadKey::Whole(block.clone());
         match self.inflight.admit_owned(key.clone()) {
             Some(guard) => {
@@ -437,24 +520,79 @@ impl WorkerRuntime {
 
     /// Return a block's bytes from the local cache if resident, else `None`.
     async fn cached_block(&self, block: &BlockId) -> anyhow::Result<Option<bytes::Bytes>> {
+        if let Some(bytes) = self.l1_get(block) {
+            return Ok(Some(bytes));
+        }
         if matches!(
             self.index.presence(block, PageIndex(0), PageIndex(1)),
             Presence::Whole
         ) {
-            self.metrics.record_cache_hit();
-            // Mark the block most-recently-used so a hot block is not the eviction
-            // victim under pressure (issue #159).
-            self.lru.touch(&CacheUnit::Whole(block.clone()));
-            tracing::info!(block = %block, "HIT");
+            self.record_l2_hit(block);
+            tracing::info!(block = %block, tier = "l2", "HIT");
             let bytes = self
                 .store
                 .get_bytes(block)
                 .await
                 .map_err(|error| anyhow::anyhow!("read committed block: {error}"))?;
+            self.admit_l1(block, bytes.clone());
             Ok(Some(bytes))
         } else {
+            self.metrics.record_l2_miss();
             Ok(None)
         }
+    }
+
+    /// Read L1 and keep the inclusive L2 parent hot when present.
+    fn l1_get(&self, block: &BlockId) -> Option<bytes::Bytes> {
+        if !self.l1.is_enabled() {
+            return None;
+        }
+        match self.l1.get(block) {
+            Some(bytes) => {
+                self.metrics.record_l1_hit();
+                self.metrics.record_cache_hit();
+                self.lru.touch(&CacheUnit::Whole(block.clone()));
+                tracing::info!(block = %block, tier = "l1", "HIT");
+                Some(bytes)
+            }
+            None => {
+                self.metrics.record_l1_miss();
+                None
+            }
+        }
+    }
+
+    /// Record an L2 hit and touch its capacity LRU.
+    fn record_l2_hit(&self, block: &BlockId) {
+        self.metrics.record_l2_hit();
+        self.metrics.record_cache_hit();
+        self.lru.touch(&CacheUnit::Whole(block.clone()));
+    }
+
+    /// Admit eligible bytes into L1 and publish resulting residency/evictions.
+    fn admit_l1(&self, block: &BlockId, bytes: bytes::Bytes) {
+        match self.l1.insert(block.clone(), bytes) {
+            MemoryInsert::Inserted { evicted } => {
+                self.metrics.record_l1_admission();
+                for victim in evicted {
+                    self.metrics.record_l1_eviction();
+                    tracing::debug!(block = %victim, tier = "l1", "evicted block");
+                }
+                self.refresh_l1_metrics();
+            }
+            MemoryInsert::Disabled | MemoryInsert::TooLarge => {}
+        }
+    }
+
+    fn invalidate_l1(&self, block: &BlockId) {
+        if self.l1.remove(block) {
+            self.refresh_l1_metrics();
+        }
+    }
+
+    fn refresh_l1_metrics(&self) {
+        self.metrics
+            .update_l1_residency(self.l1.len() as u64, self.l1.resident_bytes());
     }
 
     /// Fetch a block from the backend and commit it to the local cache.
@@ -511,6 +649,10 @@ impl WorkerRuntime {
         self.unlink_units(superseded).await;
         self.enforce_capacity().await;
         self.lru.unpin(&CacheUnit::Whole(block.clone()));
+        if !self.l1.remove_superseded(block).is_empty() {
+            self.refresh_l1_metrics();
+        }
+        self.admit_l1(block, bytes.clone());
         tracing::info!(block = %block, bytes = len, "committed block");
         Ok(bytes)
     }
@@ -559,7 +701,7 @@ impl WorkerRuntime {
         let block = self.block_for(object, 0, &version);
         let len = body.len() as u64;
         self.store
-            .put(&block, body)
+            .put(&block, body.clone())
             .await
             .map_err(|error| anyhow::anyhow!("commit written block failed: {error}"))?;
         self.index.commit(BlockMeta {
@@ -574,6 +716,10 @@ impl WorkerRuntime {
         self.unlink_units(superseded).await;
         self.enforce_capacity().await;
         self.lru.unpin(&CacheUnit::Whole(block.clone()));
+        if !self.l1.remove_superseded(&block).is_empty() {
+            self.refresh_l1_metrics();
+        }
+        self.admit_l1(&block, body);
         tracing::info!(object = %object.to_path(), bytes = len, version = %version, "wrote object");
         Ok(version)
     }
@@ -674,6 +820,7 @@ impl WorkerRuntime {
             let CacheUnit::Whole(id) = unit else {
                 continue;
             };
+            self.invalidate_l1(&id);
             if let Err(error) = self.store.delete(&id).await {
                 tracing::warn!(block = %id, %error, "failed to unlink evicted block");
             }
@@ -693,20 +840,30 @@ impl WorkerRuntime {
         self.index.resident_bytes()
     }
 
+    /// Number of blocks resident in L1.
+    pub fn l1_block_count(&self) -> u64 {
+        self.l1.len() as u64
+    }
+
+    /// Bytes resident in L1.
+    pub fn l1_resident_bytes(&self) -> u64 {
+        self.l1.resident_bytes()
+    }
+
     /// Number of backend loads currently in flight.
     pub fn inflight_loads(&self) -> u64 {
         self.inflight.len() as u64
     }
 }
 
-fn slice(buffer: &[u8], offset: u64, len: u64) -> anyhow::Result<bytes::Bytes> {
+fn slice(buffer: &bytes::Bytes, offset: u64, len: u64) -> anyhow::Result<bytes::Bytes> {
     let start = usize::try_from(offset).map_err(|_| anyhow::anyhow!("offset is too large"))?;
     if start > buffer.len() {
         anyhow::bail!("offset {offset} beyond block length {} bytes", buffer.len());
     }
     let requested = usize::try_from(len).unwrap_or(usize::MAX);
     let end = start.saturating_add(requested).min(buffer.len());
-    Ok(bytes::Bytes::copy_from_slice(&buffer[start..end]))
+    Ok(buffer.slice(start..end))
 }
 
 /// Whether an error chain carries a backend [`Error::VersionMismatch`], i.e. an
@@ -782,6 +939,28 @@ mod tests {
         .with_version_ttl(Duration::ZERO)
     }
 
+    fn runtime_l1(
+        backend: Arc<MockBackend>,
+        metrics: WorkerMetrics,
+        root: &PathBuf,
+        l2_capacity: u64,
+        l1_capacity: u64,
+        l1_max_entry: u64,
+    ) -> WorkerRuntime {
+        WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            8,
+            l2_capacity,
+            l1_capacity,
+            l1_max_entry,
+            metrics,
+        )
+        .with_version_ttl(Duration::ZERO)
+    }
+
     #[tokio::test]
     async fn miss_then_hit_records_cache_and_backend_metrics() {
         let root = tmp_root();
@@ -806,6 +985,322 @@ mod tests {
         assert!(rendered.contains("talon_worker_cache_misses_total{form=\"whole\"} 1"));
         assert!(rendered.contains("talon_worker_cache_hits_total{form=\"whole\"} 1"));
         assert!(rendered.contains("talon_worker_backend_fetch_bytes_total{backend=\"azure\"} 8"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn l1_origin_fill_then_hit_uses_memory_bytes() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = runtime_l1(Arc::clone(&backend), metrics.clone(), &root, 1024, 16, 8);
+
+        match runtime.serve(&request("l1")).await.unwrap() {
+            ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("origin miss must return fetched bytes"),
+        }
+        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_resident_bytes(), 8);
+
+        match runtime.serve(&request("l1")).await.unwrap() {
+            ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("eligible warm block must hit L1"),
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        let rendered = metrics.render();
+        assert!(rendered.contains("talon_worker_cache_tier_hits_total{tier=\"l1\"} 1"));
+        assert!(rendered.contains("talon_worker_cache_tier_misses_total{tier=\"l1\"} 1"));
+        assert!(rendered.contains("talon_worker_cache_tier_misses_total{tier=\"l2\"} 1"));
+        assert!(rendered.contains("talon_worker_l1_admissions_total 1"));
+        assert!(rendered.contains("talon_worker_l1_blocks 1"));
+        assert!(rendered.contains("talon_worker_l1_resident_bytes 8"));
+        assert!(rendered.contains("talon_worker_l1_capacity_bytes 16"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn disabled_l1_preserves_l2_sendfile_behavior() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = runtime_l1(Arc::clone(&backend), metrics.clone(), &root, 1024, 0, 0);
+
+        let _ = runtime.serve(&request("disabled")).await.unwrap();
+        assert_eq!(
+            read_handle(runtime.serve(&request("disabled")).await.unwrap()),
+            b"abcd"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(runtime.l1_resident_bytes(), 0);
+        let rendered = metrics.render();
+        assert!(rendered.contains("talon_worker_cache_tier_hits_total{tier=\"l2\"} 1"));
+        assert!(rendered.contains("talon_worker_l1_admissions_total 0"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn entry_at_l1_size_limit_is_admitted() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_l1(
+            Arc::clone(&backend),
+            WorkerMetrics::new(1024),
+            &root,
+            1024,
+            8,
+            8,
+        );
+
+        let _ = runtime.serve(&request("boundary")).await.unwrap();
+        assert_eq!(runtime.l1_block_count(), 1);
+        assert_eq!(runtime.l1_resident_bytes(), 8);
+        match runtime.serve(&request("boundary")).await.unwrap() {
+            ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("entry at the limit must be admitted to L1"),
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn oversized_block_stays_on_l2_sendfile_path() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = runtime_l1(Arc::clone(&backend), metrics.clone(), &root, 1024, 16, 4);
+
+        let _ = runtime.serve(&request("large")).await.unwrap();
+        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(
+            read_handle(runtime.serve(&request("large")).await.unwrap()),
+            b"abcd"
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert!(metrics
+            .render()
+            .contains("talon_worker_cache_tier_hits_total{tier=\"l2\"} 1"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn l1_eviction_falls_back_to_l2_without_origin_fetch() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = runtime_l1(Arc::clone(&backend), metrics.clone(), &root, 1024, 8, 8);
+
+        let _ = runtime.serve(&request("a")).await.unwrap();
+        let _ = runtime.serve(&request("b")).await.unwrap();
+        assert_eq!(runtime.block_count(), 2, "both parents remain in L2");
+        assert_eq!(runtime.l1_block_count(), 1, "L1 holds only the MRU block");
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+
+        match runtime.serve(&request("a")).await.unwrap() {
+            ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("eligible L2 hit should promote to L1"),
+        }
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            2,
+            "L1 eviction must degrade to L2, not origin"
+        );
+        assert_eq!(runtime.block_count(), 2);
+        assert_eq!(runtime.l1_block_count(), 1);
+        assert!(metrics
+            .render()
+            .contains("talon_worker_l1_evictions_total 2"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn l2_eviction_invalidates_inclusive_l1_copy() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_l1(Arc::clone(&backend), WorkerMetrics::new(8), &root, 8, 16, 8);
+
+        let _ = runtime.serve(&request("a")).await.unwrap();
+        let _ = runtime.serve(&request("b")).await.unwrap();
+        assert_eq!(runtime.block_count(), 1, "L2 capacity keeps one block");
+        assert_eq!(
+            runtime.l1_block_count(),
+            1,
+            "evicted L2 parent must not leave an orphan L1 copy"
+        );
+
+        let _ = runtime.serve(&request("a")).await.unwrap();
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            3,
+            "reading the L2-evicted block must fetch origin again"
+        );
+        assert_eq!(runtime.block_count(), 1);
+        assert_eq!(runtime.l1_block_count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn restart_rebuilds_l2_then_promotes_without_refetching_body() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let first = runtime_l1(
+            Arc::clone(&backend),
+            WorkerMetrics::new(1024),
+            &root,
+            1024,
+            16,
+            8,
+        );
+        let _ = first.serve(&request("restart")).await.unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        drop(first);
+
+        let store = WholeBlockStore::open(&root).unwrap();
+        let index = Arc::new(BlockIndex::new());
+        for meta in store.scan().unwrap() {
+            index.commit(meta);
+        }
+        let restarted = WorkerRuntime::new_with_l1(
+            store,
+            index,
+            Arc::new(InFlightLoads::new()),
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            8,
+            1024,
+            16,
+            8,
+            WorkerMetrics::new(1024),
+        )
+        .with_version_ttl(Duration::ZERO);
+        assert_eq!(restarted.l1_block_count(), 0);
+        assert_eq!(restarted.block_count(), 1);
+
+        match restarted.serve(&request("restart")).await.unwrap() {
+            ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
+            ServeOutcome::Sendfile(_) => panic!("eligible L2 block should promote after restart"),
+        }
+        assert_eq!(
+            backend.calls.load(Ordering::SeqCst),
+            1,
+            "restart promotion must not refetch object bytes"
+        );
+        assert_eq!(restarted.l1_block_count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_warm_reads_are_all_served_from_l1() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = Arc::new(runtime_l1(
+            Arc::clone(&backend),
+            metrics.clone(),
+            &root,
+            1024,
+            16,
+            8,
+        ));
+        let _ = runtime.serve(&request("hot")).await.unwrap();
+
+        let mut tasks = Vec::new();
+        for _ in 0..64 {
+            let runtime = Arc::clone(&runtime);
+            tasks.push(tokio::spawn(async move {
+                runtime.serve_range(&request("hot")).await.unwrap()
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), Bytes::from_static(b"abcd"));
+        }
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert!(metrics
+            .render()
+            .contains("talon_worker_cache_tier_hits_total{tier=\"l1\"} 64"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cross_block_read_is_filled_then_served_entirely_from_l1() {
+        let root = tmp_root();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let backend = Arc::new(CountingRampBackend {
+            block_size: 8,
+            calls: Arc::clone(&calls),
+        });
+        let metrics = WorkerMetrics::new(1024);
+        let runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            8,
+            1024,
+            16,
+            8,
+            metrics.clone(),
+        )
+        .with_version_ttl(Duration::ZERO);
+        let req = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "cross-l1"),
+            offset: 6,
+            len: 8,
+        };
+
+        assert_eq!(runtime.serve_range(&req).await.unwrap(), expected(6, 8));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(runtime.l1_block_count(), 2);
+        assert_eq!(runtime.l1_resident_bytes(), 16);
+
+        assert_eq!(runtime.serve_range(&req).await.unwrap(), expected(6, 8));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            2,
+            "both blocks must be served from L1 after the first read"
+        );
+        assert!(metrics
+            .render()
+            .contains("talon_worker_cache_tier_hits_total{tier=\"l1\"} 2"));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn backend_failure_does_not_populate_either_cache_tier() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_l1(
+            Arc::clone(&backend),
+            WorkerMetrics::new(1024),
+            &root,
+            1024,
+            16,
+            8,
+        );
+
+        assert!(runtime.serve(&request("failure")).await.is_err());
+        assert_eq!(runtime.inflight_loads(), 0);
+        assert_eq!(runtime.block_count(), 0);
+        assert_eq!(runtime.resident_bytes(), 0);
+        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(runtime.l1_resident_bytes(), 0);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -906,6 +1401,28 @@ mod tests {
         async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
             // Return one block worth of bytes starting at `offset`; byte i has
             // value (offset + i) % 251 (prime, so no accidental alignment).
+            let n = len.min(self.block_size) as usize;
+            let buf: Vec<u8> = (0..n).map(|i| ((offset + i as u64) % 251) as u8).collect();
+            Ok(Bytes::from(buf))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: u64::MAX,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    struct CountingRampBackend {
+        block_size: u64,
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl BackendStore for CountingRampBackend {
+        async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
             let n = len.min(self.block_size) as usize;
             let buf: Vec<u8> = (0..n).map(|i| ((offset + i as u64) % 251) as u8).collect();
             Ok(Bytes::from(buf))
@@ -1203,6 +1720,153 @@ mod tests {
         // version remains resident — version churn no longer accumulates stale
         // .blk files (issue #159).
         assert_eq!(runtime.block_count(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn source_overwrite_replaces_old_version_in_both_tiers() {
+        let root = tmp_root();
+        let backend = Arc::new(VersionedBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-data")),
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            8,
+            1024,
+            16,
+            8,
+            WorkerMetrics::new(1024),
+        )
+        .with_version_ttl(Duration::ZERO);
+
+        assert_eq!(
+            runtime.serve_range(&request("versioned")).await.unwrap(),
+            Bytes::from_static(b"old-")
+        );
+        assert_eq!(runtime.block_count(), 1);
+        assert_eq!(runtime.l1_block_count(), 1);
+
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-data");
+        assert_eq!(
+            runtime.serve_range(&request("versioned")).await.unwrap(),
+            Bytes::from_static(b"new-")
+        );
+        assert_eq!(runtime.block_count(), 1, "old L2 version must be removed");
+        assert_eq!(
+            runtime.l1_block_count(),
+            1,
+            "old L1 version must be removed"
+        );
+        assert_eq!(runtime.l1_resident_bytes(), 8);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    struct MutableBackend {
+        body: std::sync::Mutex<Option<Bytes>>,
+        version: std::sync::Mutex<String>,
+        fetches: AtomicUsize,
+        puts: AtomicUsize,
+        deletes: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for MutableBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            self.body
+                .lock()
+                .unwrap()
+                .clone()
+                .ok_or_else(|| Error::NotFound("deleted".into()))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            let body = self.body.lock().unwrap();
+            let body = body
+                .as_ref()
+                .ok_or_else(|| Error::NotFound("deleted".into()))?;
+            Ok(ObjectStat {
+                len: body.len() as u64,
+                version: Version::new(self.version.lock().unwrap().clone()),
+            })
+        }
+
+        async fn put(&self, _object: &ObjectId, body: Bytes) -> Result<Version> {
+            self.puts.fetch_add(1, Ordering::SeqCst);
+            *self.body.lock().unwrap() = Some(body);
+            *self.version.lock().unwrap() = "written-v2".into();
+            Ok(Version::new("written-v2"))
+        }
+
+        async fn delete(&self, _object: &ObjectId) -> Result<()> {
+            self.deletes.fetch_add(1, Ordering::SeqCst);
+            *self.body.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn write_through_populates_l1_and_l2_then_delete_invalidates_both() {
+        let root = tmp_root();
+        let backend = Arc::new(MutableBackend {
+            body: std::sync::Mutex::new(Some(Bytes::from_static(b"old-data"))),
+            version: std::sync::Mutex::new("v1".into()),
+            fetches: AtomicUsize::new(0),
+            puts: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+        });
+        let runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(&root).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            8,
+            1024,
+            16,
+            8,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "container", "mutable");
+
+        assert_eq!(
+            runtime
+                .write_object(&object, Bytes::from_static(b"new-data"))
+                .await
+                .unwrap(),
+            Version::new("written-v2")
+        );
+        assert_eq!(backend.puts.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.block_count(), 1);
+        assert_eq!(runtime.l1_block_count(), 1);
+
+        assert_eq!(
+            runtime
+                .serve_range(&RangeRequest {
+                    object: object.clone(),
+                    offset: 0,
+                    len: 8,
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"new-data")
+        );
+        assert_eq!(
+            backend.fetches.load(Ordering::SeqCst),
+            0,
+            "read-after-write must be an L1 hit"
+        );
+
+        runtime.delete_object(&object).await.unwrap();
+        assert_eq!(backend.deletes.load(Ordering::SeqCst), 1);
+        assert_eq!(runtime.block_count(), 0);
+        assert_eq!(runtime.l1_block_count(), 0);
+        assert_eq!(runtime.l1_resident_bytes(), 0);
         std::fs::remove_dir_all(root).ok();
     }
 

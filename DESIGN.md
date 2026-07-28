@@ -188,15 +188,16 @@ today; only the data-plane TCP scheduling layer diverges.
 
 **L1 memory hit** (optional, default off; for very hot small blocks): decode
 header + key → `mem_cache` lookup → send header → plain async socket write from
-a shared buffer (`Arc<Vec<u8>>` on the current Tokio runtime; `Rc<Vec<u8>>`
-under a thread-per-core ring, where the buffer never leaves its core). No disk,
-no `sendfile`.
+a shared `Bytes` buffer. L1 is inclusive: every DRAM entry also has an L2 copy,
+and an L2 eviction/delete/version replacement invalidates the L1 entry. No disk,
+no `sendfile`; capacity and maximum entry size are independently bounded.
 
-**L2 NVMe hit** (primary hot path): decode header + key → `BlockIndex` lookup →
-open cached `.blk` fd → write response header → `sendfile(cached_fd → socket)` in
-the blocking helper. The block is **never** read into a `Vec<u8>`, avoiding
-NVMe→userspace and userspace→socket copies, heap pressure, and buffer bloat on
-the runtime. Path is `NVMe/page-cache → kernel → TCP socket`.
+**L2 NVMe hit** (primary large-block path): decode header + key → `BlockIndex`
+lookup → open cached `.blk` fd → write response header →
+`sendfile(cached_fd → socket)` in the blocking helper. Large blocks are never
+read into a `Vec<u8>`, avoiding NVMe→userspace and userspace→socket copies, heap
+pressure, and buffer bloat. An L1-eligible small block is read once from L2 and
+promoted instead. Large-block path: `NVMe/page-cache → kernel → TCP socket`.
 
 **GET_RANGE hit:** identical to L2 hit but `sendfile` uses `(offset, length)` —
 suited to Lance / checkpoint footer / partial reads.
@@ -301,10 +302,11 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
 
 ## 3. Worker storage
 
-- **Tiering:** primary store is local **NVMe SSD**. Memory holds only the index,
-  small-object cache, and hot metadata. No `mmap` as the default abstraction —
-  the Linux page cache already provides the memory tier; explicit
-  `pread`/`sendfile` is more controllable.
+- **Tiering:** optional byte-bounded **L1 DRAM** for small whole blocks over an
+  inclusive local **L2 NVMe SSD** store. L1 is empty after restart and promotes
+  eligible L2 hits; L2 remains persistent and authoritative for cache residency.
+  Large blocks bypass L1 and retain the `sendfile` path. No `mmap` as the default
+  abstraction.
 - **Eviction:** byte-accounted **LRU / segmented-LRU** first. LFU risks pinning
   stale hotspots; TinyLFU is more complex — revisit with real workload data.
   Capacity is per-worker, with support for multiple cache dirs each with its own
