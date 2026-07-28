@@ -113,6 +113,12 @@ struct Inner {
     /// FIFO of objects with a pending entry. May hold stale duplicates, which
     /// `take_next` skips.
     queue: VecDeque<ObjectId>,
+    /// Generations whose flush failed permanently, parked out of the queue.
+    ///
+    /// Their files stay on disk: this is acknowledged data that could not be
+    /// delivered to the origin, so dropping it would be silent data loss. It is
+    /// held for an operator to drain or abandon deliberately (ADR 0002 §5).
+    failed: HashMap<ObjectId, Entry>,
 }
 
 /// Durable staging area and flush queue for un-flushed (dirty) objects.
@@ -159,14 +165,37 @@ impl WriteCache {
         self.inner.lock().unwrap().inflight.len()
     }
 
-    /// Total staged bytes across pending and in-flight generations.
+    /// Number of objects parked after a permanently-failed flush.
+    ///
+    /// A non-zero value means the node is holding acknowledged data the origin
+    /// has refused to accept. It requires operator action and does not resolve
+    /// on its own.
+    pub fn failed_len(&self) -> usize {
+        self.inner.lock().unwrap().failed.len()
+    }
+
+    /// The objects parked after a permanently-failed flush, with their staged
+    /// byte counts — the enumeration an operator drain procedure works from.
+    pub fn failed_objects(&self) -> Vec<(ObjectId, u64)> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .failed
+            .iter()
+            .map(|(object, entry)| (object.clone(), entry.len))
+            .collect()
+    }
+
+    /// Total staged bytes across pending, in-flight, and failed generations.
     ///
     /// This is the amount of acknowledged-but-not-yet-durable-at-the-origin data
     /// the node is holding — the number a write-back deployment must alarm on.
+    /// Parked failures count: they are the part of it that will not drain by
+    /// itself.
     pub fn dirty_bytes(&self) -> u64 {
         let inner = self.inner.lock().unwrap();
         inner.pending.values().map(|e| e.len).sum::<u64>()
             + inner.inflight.values().map(|e| e.len).sum::<u64>()
+            + inner.failed.values().map(|e| e.len).sum::<u64>()
     }
 
     /// Durably stage `body` as the newest generation of `object` and enqueue it
@@ -208,11 +237,15 @@ impl WriteCache {
             if superseded.is_none() {
                 inner.queue.push_back(object.clone());
             }
-            superseded
+            // A rewrite also resolves a parked failure: the newer bytes replace
+            // whatever the origin refused, so holding the old generation would
+            // pin capacity and keep alarming for data nobody wants delivered.
+            let parked = inner.failed.remove(object);
+            superseded.into_iter().chain(parked).collect::<Vec<_>>()
         };
-        // Drop the superseded generation's files outside the lock; it was not in
+        // Drop superseded generations' files outside the lock; neither was in
         // flight, so nobody is reading them.
-        if let Some(old) = superseded {
+        for old in superseded {
             self.remove_files(object, old.seq);
         }
         Ok(seq)
@@ -221,18 +254,28 @@ impl WriteCache {
     /// Return the newest staged bytes for `object`, if any — the read-your-writes
     /// lookup.
     ///
-    /// Prefers a pending generation over an in-flight one (it is newer by
-    /// construction). The body is checksum-verified, so a corrupted staged file
-    /// surfaces as an error rather than as silently wrong data served in place
-    /// of the origin's.
+    /// Returns the newest staged generation across the pending, in-flight, and
+    /// parked-failure sets. Parked entries are included deliberately: a flush
+    /// that failed does not make the bytes wrong, and dropping them from this
+    /// lookup would break read-your-writes exactly when the origin is unable to
+    /// serve the data either.
+    ///
+    /// The body is checksum-verified, so a corrupted staged file surfaces as an
+    /// error rather than as silently wrong data served in place of the origin's.
     pub fn staged_bytes(&self, object: &ObjectId) -> Result<Option<bytes::Bytes>> {
         let entry = {
             let inner = self.inner.lock().unwrap();
-            match (inner.pending.get(object), inner.inflight.get(object)) {
-                (Some(p), Some(f)) if f.seq > p.seq => f.clone(),
-                (Some(p), _) => p.clone(),
-                (None, Some(f)) => f.clone(),
-                (None, None) => return Ok(None),
+            let newest = [
+                inner.pending.get(object),
+                inner.inflight.get(object),
+                inner.failed.get(object),
+            ]
+            .into_iter()
+            .flatten()
+            .max_by_key(|entry| entry.seq);
+            match newest {
+                Some(entry) => entry.clone(),
+                None => return Ok(None),
             }
         };
         self.read_verified(object, &entry).map(Some)
@@ -356,6 +399,78 @@ impl WriteCache {
         if stale {
             self.remove_files(object, seq);
         }
+    }
+
+    /// Park a generation whose flush failed permanently, out of the retry queue.
+    ///
+    /// Called when a driver exhausts its retry budget. The staged files are
+    /// **kept**: this is acknowledged data the origin would not accept, so
+    /// deleting it would turn a delivery failure into silent data loss. It stays
+    /// counted in [`dirty_bytes`](Self::dirty_bytes) and enumerable via
+    /// [`failed_objects`](Self::failed_objects) so an operator can drain or
+    /// abandon it deliberately (ADR 0002 §5).
+    ///
+    /// If a newer generation was staged while this one was in flight, the failed
+    /// generation is discarded instead — the newer bytes supersede it, and the
+    /// newer flush may well succeed.
+    pub fn park_failed(&self, object: &ObjectId, seq: u64) {
+        let stale = {
+            let mut inner = self.inner.lock().unwrap();
+            match inner.inflight.get(object) {
+                Some(entry) if entry.seq == seq => {
+                    let entry = inner.inflight.remove(object).expect("just matched");
+                    match inner.pending.get(object) {
+                        Some(newer) if newer.seq > entry.seq => true,
+                        _ => {
+                            tracing::error!(
+                                object = %object.to_path(),
+                                seq,
+                                bytes = entry.len,
+                                "staged write parked after permanent flush failure; \
+                                 it will not drain without operator action"
+                            );
+                            inner.failed.insert(object.clone(), entry);
+                            false
+                        }
+                    }
+                }
+                _ => false,
+            }
+        };
+        if stale {
+            self.remove_files(object, seq);
+        }
+    }
+
+    /// Move every parked failure back into the flush queue.
+    ///
+    /// The operator-facing half of [`park_failed`](Self::park_failed): after the
+    /// cause is fixed (credentials, quota, a bucket policy), this re-arms them
+    /// without restarting the process. Returns how many were requeued. A parked
+    /// object that has since been rewritten is dropped rather than requeued —
+    /// the newer generation already covers it.
+    pub fn retry_failed(&self) -> usize {
+        let (requeued, superseded) = {
+            let mut inner = self.inner.lock().unwrap();
+            let parked: Vec<_> = inner.failed.drain().collect();
+            let mut requeued = 0;
+            let mut superseded = Vec::new();
+            for (object, entry) in parked {
+                match inner.pending.get(&object) {
+                    Some(newer) if newer.seq > entry.seq => superseded.push((object, entry.seq)),
+                    _ => {
+                        inner.pending.insert(object.clone(), entry);
+                        inner.queue.push_back(object);
+                        requeued += 1;
+                    }
+                }
+            }
+            (requeued, superseded)
+        };
+        for (object, seq) in superseded {
+            self.remove_files(&object, seq);
+        }
+        requeued
     }
 
     /// Read a staged body and verify it against the entry's checksum.
@@ -791,6 +906,102 @@ mod tests {
             .map(|i| i.object.object_path)
             .collect();
         assert_eq!(order, ["a.bin", "b.bin", "c.bin"]);
+    }
+
+    #[test]
+    fn park_failed_keeps_the_bytes_out_of_the_queue_but_still_accounted() {
+        let (_dir, cache) = cache();
+        let seq = cache.stage(&object("a.bin"), b"hello").unwrap();
+        let item = cache.take_next().unwrap().unwrap();
+        cache.park_failed(&item.object, item.seq);
+
+        // Not flushable, but not lost: the files stay and the bytes still count
+        // as dirty, because this is acknowledged data the origin refused.
+        assert!(cache.take_next().unwrap().is_none());
+        assert_eq!(cache.pending_len(), 0);
+        assert_eq!(cache.inflight_len(), 0);
+        assert_eq!(cache.failed_len(), 1);
+        assert_eq!(cache.dirty_bytes(), 5);
+        assert_eq!(cache.failed_objects(), vec![(object("a.bin"), 5)]);
+        assert!(cache.data_path(&object("a.bin"), seq).exists());
+        // And still readable, so read-your-writes survives a failed flush.
+        assert_eq!(
+            &cache.staged_bytes(&object("a.bin")).unwrap().unwrap()[..],
+            b"hello"
+        );
+    }
+
+    #[test]
+    fn retry_failed_returns_parked_entries_to_the_queue() {
+        let (_dir, cache) = cache();
+        for name in ["a.bin", "b.bin"] {
+            cache.stage(&object(name), name.as_bytes()).unwrap();
+            let item = cache.take_next().unwrap().unwrap();
+            cache.park_failed(&item.object, item.seq);
+        }
+        assert_eq!(cache.failed_len(), 2);
+
+        assert_eq!(cache.retry_failed(), 2);
+        assert_eq!(cache.failed_len(), 0);
+        assert_eq!(cache.pending_len(), 2);
+
+        let mut names: Vec<_> = std::iter::from_fn(|| cache.take_next().unwrap())
+            .map(|i| i.object.object_path)
+            .collect();
+        names.sort();
+        assert_eq!(names, ["a.bin", "b.bin"]);
+    }
+
+    #[test]
+    fn a_rewrite_releases_a_parked_generation() {
+        let (_dir, cache) = cache();
+        let old = cache.stage(&object("a.bin"), b"v1").unwrap();
+        let item = cache.take_next().unwrap().unwrap();
+        cache.park_failed(&item.object, item.seq);
+
+        cache.stage(&object("a.bin"), b"v2").unwrap();
+
+        // The parked generation is released rather than pinning capacity and
+        // alarming forever for bytes nobody wants delivered any more.
+        assert_eq!(cache.failed_len(), 0);
+        assert_eq!(cache.dirty_bytes(), 2);
+        assert!(!cache.data_path(&object("a.bin"), old).exists());
+        let next = cache.take_next().unwrap().unwrap();
+        assert_eq!(&next.bytes[..], b"v2");
+    }
+
+    #[test]
+    fn parking_a_generation_superseded_in_flight_discards_it() {
+        let (_dir, cache) = cache();
+        cache.stage(&object("a.bin"), b"v1").unwrap();
+        let inflight = cache.take_next().unwrap().unwrap();
+        cache.stage(&object("a.bin"), b"v2").unwrap();
+        cache.park_failed(&inflight.object, inflight.seq);
+
+        // v2 supersedes v1 and may well succeed, so v1 is not parked.
+        assert_eq!(cache.failed_len(), 0);
+        assert_eq!(cache.pending_len(), 1);
+        assert!(!cache.data_path(&object("a.bin"), inflight.seq).exists());
+    }
+
+    #[test]
+    fn parked_entries_survive_a_restart_as_pending() {
+        let dir = tempdir::TempDir::new();
+        {
+            let cache = WriteCache::open(dir.path()).unwrap();
+            cache.stage(&object("a.bin"), b"hello").unwrap();
+            let item = cache.take_next().unwrap().unwrap();
+            cache.park_failed(&item.object, item.seq);
+        }
+
+        // Recovery does not distinguish parked from pending — a restart is a
+        // legitimate reason to try again, and the bytes are still owed to the
+        // origin either way.
+        let cache = WriteCache::open(dir.path()).unwrap();
+        assert_eq!(cache.pending_len(), 1);
+        assert_eq!(cache.dirty_bytes(), 5);
+        let item = cache.take_next().unwrap().unwrap();
+        assert_eq!(&item.bytes[..], b"hello");
     }
 
     /// A minimal scoped temp directory (the worker crate has no tempfile dep).
