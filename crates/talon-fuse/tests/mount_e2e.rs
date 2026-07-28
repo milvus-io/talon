@@ -1262,10 +1262,18 @@ async fn mount_symbolic_links_are_written_through() {
     result.expect("exercise symbolic links through mount");
 }
 
-/// Keep hard-link dentries on one inode while writing every linked blob key.
+/// Refuse hard links to object-backed files, and keep the rest of the
+/// link-adjacent lifecycle intact.
+///
+/// `link()` on a regular file returns `EPERM` (#363): the only representation
+/// available without a metadata store is one backend copy per link path, and
+/// object stores offer no cross-key atomic write to keep those copies equal.
+/// This asserts the refusal is clean — no partial object is created, and the
+/// namespace is untouched — and that unrelated behaviour (cross-bucket
+/// rejection, rename, unlink-while-open) still works.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires /dev/fuse; run with --features mount -- --ignored"]
-async fn mount_hard_links_share_inode_and_backend_contents() {
+async fn mount_hard_links_to_objects_are_refused() {
     use fuser::MountOption;
 
     let block_size: u32 = 4 * 1024 * 1024;
@@ -1319,59 +1327,34 @@ async fn mount_hard_links_share_inode_and_backend_contents() {
     let cross_bucket = mountpoint.join("gcs").join("other").join("linked.bin");
     let operation_store = Arc::clone(&store);
     let result = tokio::task::spawn_blocking(move || {
-        std::fs::hard_link(&source, &linked)?;
-        let source_metadata = std::fs::metadata(&source)?;
-        let linked_metadata = std::fs::metadata(&linked)?;
-        assert_eq!(source_metadata.ino(), linked_metadata.ino());
-        assert_eq!(source_metadata.nlink(), 2);
-        assert_eq!(linked_metadata.nlink(), 2);
+        // A link to an object-backed file is refused, not approximated.
+        assert_eq!(
+            std::fs::hard_link(&source, &linked)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(libc::EPERM),
+            "hard link to a regular file must be refused (#363)"
+        );
+
+        // The refusal leaves nothing behind: no dentry, no partial object, and
+        // the source is untouched.
+        assert!(!linked.exists(), "refused link must not create a name");
+        assert_eq!(std::fs::metadata(&source)?.nlink(), 1);
         {
             let committed = operation_store.lock().unwrap();
-            assert_eq!(
-                committed.get("/s3/bucket/source.bin"),
-                Some(&b"seed".to_vec())
+            assert!(
+                !committed.contains_key("/s3/bucket/linked.bin"),
+                "refused link must not write a backend object"
             );
             assert_eq!(
-                committed.get("/s3/bucket/linked.bin"),
-                Some(&b"seed".to_vec())
+                committed.get("/s3/bucket/source.bin"),
+                Some(&b"seed".to_vec()),
+                "refused link must not disturb the source object"
             );
         }
 
-        let mut writer = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&linked)?;
-        writer.seek(SeekFrom::Start(0))?;
-        writer.write_all(b"next")?;
-        writer.sync_all()?;
-        {
-            let committed = operation_store.lock().unwrap();
-            assert_eq!(
-                committed.get("/s3/bucket/source.bin"),
-                Some(&b"next".to_vec())
-            );
-            assert_eq!(
-                committed.get("/s3/bucket/linked.bin"),
-                Some(&b"next".to_vec())
-            );
-        }
-
-        writer.set_len(2)?;
-        writer.sync_all()?;
-        assert_eq!(std::fs::read(&source)?, b"ne");
-        {
-            let committed = operation_store.lock().unwrap();
-            assert_eq!(
-                committed.get("/s3/bucket/source.bin"),
-                Some(&b"ne".to_vec())
-            );
-            assert_eq!(
-                committed.get("/s3/bucket/linked.bin"),
-                Some(&b"ne".to_vec())
-            );
-        }
-        drop(writer);
-
+        // A cross-bucket link is rejected before the kind check, so it keeps
+        // reporting EXDEV rather than EPERM.
         assert_eq!(
             std::fs::hard_link(&source, &cross_bucket)
                 .unwrap_err()
@@ -1379,25 +1362,38 @@ async fn mount_hard_links_share_inode_and_backend_contents() {
             Some(libc::EXDEV)
         );
 
-        std::fs::rename(&linked, &moved)?;
-        assert_eq!(std::fs::metadata(&source)?.nlink(), 2);
-        assert_eq!(std::fs::metadata(&moved)?.nlink(), 2);
+        // Writes to the single-linked file still work end to end.
+        let mut writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&source)?;
+        writer.seek(SeekFrom::Start(0))?;
+        writer.write_all(b"next")?;
+        writer.sync_all()?;
+        writer.set_len(2)?;
+        writer.sync_all()?;
+        drop(writer);
+        assert_eq!(std::fs::read(&source)?, b"ne");
         {
             let committed = operation_store.lock().unwrap();
-            assert!(!committed.contains_key("/s3/bucket/linked.bin"));
+            assert_eq!(
+                committed.get("/s3/bucket/source.bin"),
+                Some(&b"ne".to_vec())
+            );
+        }
+
+        // Rename still moves the object.
+        std::fs::rename(&source, &moved)?;
+        assert!(!source.exists());
+        assert_eq!(std::fs::metadata(&moved)?.nlink(), 1);
+        {
+            let committed = operation_store.lock().unwrap();
+            assert!(!committed.contains_key("/s3/bucket/source.bin"));
             assert_eq!(committed.get("/s3/bucket/moved.bin"), Some(&b"ne".to_vec()));
         }
 
-        std::fs::rename(&source, &moved)?;
-        assert!(source.exists());
-        assert!(moved.exists());
-        assert_eq!(std::fs::metadata(&source)?.nlink(), 2);
-
-        std::fs::remove_file(&source)?;
-        assert!(!source.exists());
-        assert_eq!(std::fs::metadata(&moved)?.nlink(), 1);
-        assert_eq!(std::fs::read(&moved)?, b"ne");
-
+        // Unlink-while-open still retains the inode on an orphan object and
+        // reclaims it on final release.
         let mut final_handle = std::fs::File::open(&moved)?;
         std::fs::remove_file(&moved)?;
         assert_eq!(final_handle.metadata()?.nlink(), 0);
@@ -1432,7 +1428,7 @@ async fn mount_hard_links_share_inode_and_backend_contents() {
 
     drop(session);
     std::fs::remove_dir_all(&mountpoint).ok();
-    result.expect("exercise hard links through mount");
+    result.expect("exercise hard-link refusal through mount");
 }
 
 /// Apply explicit, omitted, and current timestamps through kernel setattr.

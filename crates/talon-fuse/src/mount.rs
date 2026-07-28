@@ -898,7 +898,21 @@ impl fuser::Filesystem for TalonFuse {
         }
     }
 
-    /// Create a hard link by materializing the shared inode bytes at a new key.
+    /// Create a hard link, for node kinds that have no backend object.
+    ///
+    /// A link to a mount-local special node (FIFO, socket, device) is a pure
+    /// namespace operation: one inode gains a second dentry and no bytes move,
+    /// which is what a hard link actually means.
+    ///
+    /// A link to a regular file or symlink is **refused with `EPERM`**. Those
+    /// kinds are backed by an object, and the only representation available
+    /// without a metadata store is a copy per link path — N independent objects
+    /// that a write must fan out across. Object stores have no cross-key atomic
+    /// write, so any fan-out has a window where the copies disagree, and nothing
+    /// reconciles them afterwards (#363). Refusing is the honest answer until
+    /// the inode indirection in ADR 0003 §5 exists: an application can handle
+    /// `EPERM`, but it cannot detect two paths that POSIX says are one file
+    /// silently returning different bytes.
     fn link(
         &mut self,
         req: &fuser::Request<'_>,
@@ -924,38 +938,15 @@ impl fuser::Filesystem for TalonFuse {
                 Err(error) => reply.error(errno(error)),
             };
         }
-        let contents = match &plan.buffered_contents {
-            Some(contents) => contents.clone(),
-            None => match self.read_committed_object(&plan.source_path, plan.source_size) {
-                Ok(contents) => WritebackSource::Memory(contents),
-                Err(error) => return reply.error(error),
-            },
-        };
-        if let Err(error) = self.writeback_object_source(&plan.target_path, contents) {
-            tracing::warn!(
-                source = %plan.source_path,
-                target = %plan.target_path,
-                %error,
-                "hard-link destination writeback failed"
-            );
-            return reply.error(libc::EIO);
-        }
-        match self.fs.commit_hard_link(&plan) {
-            Ok(attr) => {
-                let file_attr = to_file_attr(attr, req.uid(), req.gid());
-                reply.entry(&ATTR_TTL, &file_attr, 0);
-            }
-            Err(error) => {
-                if let Err(rollback_error) = self.delete_backend_object(&plan.target_path) {
-                    tracing::error!(
-                        target = %plan.target_path,
-                        %rollback_error,
-                        "hard-link destination rollback failed"
-                    );
-                }
-                reply.error(errno(error));
-            }
-        }
+        // Object-backed kinds would need a copy per link path. See the method
+        // doc and #363: divergence is inherent to that representation, not a
+        // bug in the fan-out, so this refuses rather than approximating.
+        tracing::debug!(
+            source = %plan.source_path,
+            target = %plan.target_path,
+            "refusing hard link to an object-backed file; requires inode indirection (#363)"
+        );
+        reply.error(libc::EPERM);
     }
 
     /// Create a regular file or mount-local POSIX special node.
