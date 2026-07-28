@@ -171,6 +171,14 @@ upload_file() {
     mc pipe "local/$BUCKET/$key" <"$source"
 }
 
+stage_file() {
+  local source="$1"
+  local key="$2"
+  # shellcheck disable=SC2016 # $1 expands in the container shell.
+  kubectl -n "$NAMESPACE" exec -i minio-client -- \
+    sh -c 'mkdir -p /tmp/fixtures && cat >"/tmp/fixtures/$1"' sh "$key" <"$source"
+}
+
 direct_read() {
   local path="$1"
   local offset="$2"
@@ -328,17 +336,19 @@ make_repeated_file B $((16 * BLOCK_SIZE)) "$ARTIFACT_DIR/bench"
 
 for object in hot.bin singleflight.bin version.bin restart.bin bench cross.bin; do
   case "$object" in
-    version.bin) upload_file "$ARTIFACT_DIR/version-old.bin" "$object" ;;
-    *) upload_file "$ARTIFACT_DIR/$object" "$object" ;;
+    version.bin) stage_file "$ARTIFACT_DIR/version-old.bin" "$object" ;;
+    *) stage_file "$ARTIFACT_DIR/$object" "$object" ;;
   esac
 done
 for i in $(seq 0 7); do
   make_repeated_file "$(printf '\\%03o' $((65 + i)))" "$BLOCK_SIZE" "$ARTIFACT_DIR/evict-$i.bin"
-  upload_file "$ARTIFACT_DIR/evict-$i.bin" "evict-$i.bin"
+  stage_file "$ARTIFACT_DIR/evict-$i.bin" "evict-$i.bin"
 done
-for i in $(seq 0 29); do
-  upload_file "$ARTIFACT_DIR/hot.bin" "shard-$i.bin"
-done
+# shellcheck disable=SC2016 # Loop variables expand in the container shell.
+kubectl -n "$NAMESPACE" exec minio-client -- sh -c \
+  'i=0; while [ "$i" -lt 30 ]; do cp /tmp/fixtures/hot.bin "/tmp/fixtures/shard-$i.bin"; i=$((i + 1)); done'
+kubectl -n "$NAMESPACE" exec minio-client -- \
+  mc mirror --overwrite /tmp/fixtures "local/$BUCKET"
 
 log "verifying multi-node placement reaches all three workers"
 declare -A placed_workers=()
