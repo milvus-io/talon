@@ -32,7 +32,7 @@ use talon_backend::{
 };
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
-    BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
+    BackendStore, NodeId, NodeInfo, NodeRole, RequestId, WorkerConfig, WorkerConfigPatch,
 };
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
@@ -762,6 +762,14 @@ async fn handle_conn(
                     .record_request_success(bytes.len() as u64, request_started.elapsed());
             }
             Err(e) => {
+                tracing::error!(
+                    req = %RequestId(h.request_id),
+                    object = %req.object.to_path(),
+                    offset = req.offset,
+                    len = req.len,
+                    error = %e,
+                    "serving range failed"
+                );
                 let err = data::encode_error(h.request_id, &e.to_string());
                 stream.write_all(&err).await?;
                 stream.flush().await?;
