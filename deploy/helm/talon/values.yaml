@@ -56,8 +56,16 @@ worker:
   # -- Deploy cache workers alongside the coordinator.
   enabled: true
   replicas: 3
+  # -- Scheduler behavior when workers cannot be evenly spread across nodes.
+  topologySpreadWhenUnsatisfiable: ScheduleAnyway
+  # -- Cache block size in bytes. Capacity must be at least one block.
+  blockSizeBytes: 268435456
   # -- Cache capacity in bytes the worker is allowed to fill.
   capacityBytes: 8589934592
+  # -- L1 DRAM cache capacity in bytes. Zero keeps L1 disabled.
+  l1CapacityBytes: 0
+  # -- Largest whole block eligible for L1 admission.
+  l1MaxEntryBytes: 4194304
   # -- Object-store credentials. Reference a Secret you create out-of-band (see
   # deploy/kubernetes/worker-secret.example.yaml).
   backend:

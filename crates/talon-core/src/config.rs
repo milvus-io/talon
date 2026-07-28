@@ -83,6 +83,10 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// L1 DRAM cache capacity in bytes. Zero disables L1.
+    pub l1_capacity_bytes: u64,
+    /// Largest whole block eligible for admission into L1.
+    pub l1_max_entry_bytes: u64,
     /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
     /// per-backend endpoint/credential fields below apply to the selected one.
     pub backend: Option<String>,
@@ -205,6 +209,8 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            l1_capacity_bytes: 0,
+            l1_max_entry_bytes: 4 << 20,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -253,6 +259,10 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::l1_capacity_bytes`].
+    pub l1_capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::l1_max_entry_bytes`].
+    pub l1_max_entry_bytes: Option<u64>,
     /// Override for [`WorkerConfig::backend`].
     pub backend: Option<String>,
     /// Override for [`WorkerConfig::azure_account`].
@@ -302,6 +312,8 @@ impl Patch for WorkerConfigPatch {
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
+            l1_max_entry_bytes: self.l1_max_entry_bytes.or(base.l1_max_entry_bytes),
             backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
@@ -414,6 +426,22 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: false,
         secret: false,
         help: "Worker cache capacity (bytes).",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_L1_CAPACITY_BYTES",
+        key: "l1_capacity_bytes",
+        default: Some("0"),
+        cli: false,
+        secret: false,
+        help: "L1 DRAM cache capacity in bytes; 0 disables L1.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_L1_MAX_ENTRY_BYTES",
+        key: "l1_max_entry_bytes",
+        default: Some("4194304"),
+        cli: false,
+        secret: false,
+        help: "Largest whole block eligible for the L1 DRAM cache.",
     },
     ConfigVar {
         env: "TALON_WORKER_BACKEND",
@@ -596,6 +624,8 @@ pub(crate) mod worker_env {
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
+    pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
+    pub const L1_MAX_ENTRY_BYTES: &str = "TALON_WORKER_L1_MAX_ENTRY_BYTES";
     pub const BACKEND: &str = "TALON_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
@@ -684,6 +714,12 @@ impl WorkerConfigPatch {
             capacity_bytes: get(worker_env::CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
                 .transpose()?,
+            l1_capacity_bytes: get(worker_env::L1_CAPACITY_BYTES)
+                .map(|v| parse_u64(v, worker_env::L1_CAPACITY_BYTES))
+                .transpose()?,
+            l1_max_entry_bytes: get(worker_env::L1_MAX_ENTRY_BYTES)
+                .map(|v| parse_u64(v, worker_env::L1_MAX_ENTRY_BYTES))
+                .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
             backend: get(worker_env::BACKEND),
@@ -740,10 +776,14 @@ impl WorkerConfig {
         let merged = cli.merge(env).merge(file);
         let d = WorkerConfig::default();
         let listen = merged.listen.unwrap_or(d.listen);
+        let advertise_addr = normalize_worker_advertise_addr(
+            merged.advertise_addr.unwrap_or_else(|| listen.clone()),
+            &listen,
+        );
         let cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
             // address (issue #118: never silently advertise a wildcard bind).
-            advertise_addr: merged.advertise_addr.unwrap_or_else(|| listen.clone()),
+            advertise_addr,
             listen,
             admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
@@ -755,6 +795,8 @@ impl WorkerConfig {
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
+            l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
+            l1_max_entry_bytes: merged.l1_max_entry_bytes.unwrap_or(d.l1_max_entry_bytes),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
             backend: merged.backend.or(d.backend),
@@ -862,8 +904,33 @@ impl WorkerConfig {
                 self.capacity_bytes, self.block_size
             )));
         }
+        if self.l1_capacity_bytes > 0 {
+            if self.l1_max_entry_bytes == 0 {
+                return Err(Error::Other(
+                    "l1_max_entry_bytes must be > 0 when L1 is enabled".into(),
+                ));
+            }
+            if self.l1_max_entry_bytes > self.l1_capacity_bytes {
+                return Err(Error::Other(format!(
+                    "l1_max_entry_bytes ({}) must be <= l1_capacity_bytes ({})",
+                    self.l1_max_entry_bytes, self.l1_capacity_bytes
+                )));
+            }
+        }
         Ok(())
     }
+}
+
+/// The Kubernetes Downward API can expose a Pod IP but cannot append a port.
+/// Accept that common shape and inherit the configured data-plane listen port.
+fn normalize_worker_advertise_addr(advertise_addr: String, listen: &str) -> String {
+    let Ok(ip) = advertise_addr.parse::<std::net::IpAddr>() else {
+        return advertise_addr;
+    };
+    let Ok(listen) = listen.parse::<std::net::SocketAddr>() else {
+        return advertise_addr;
+    };
+    std::net::SocketAddr::new(ip, listen.port()).to_string()
 }
 
 /// Fully-resolved FUSE client configuration.
@@ -1186,13 +1253,38 @@ mod tests {
     }
 
     #[test]
+    fn l1_config_respects_layer_precedence() {
+        let file = WorkerConfigPatch {
+            l1_capacity_bytes: Some(16 << 20),
+            l1_max_entry_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        let env = WorkerConfigPatch {
+            l1_capacity_bytes: Some(32 << 20),
+            l1_max_entry_bytes: Some(2 << 20),
+            ..Default::default()
+        };
+        let cli = WorkerConfigPatch {
+            l1_capacity_bytes: Some(64 << 20),
+            ..Default::default()
+        };
+
+        let cfg = WorkerConfig::resolve(file, env, cli).unwrap();
+        assert_eq!(cfg.l1_capacity_bytes, 64 << 20);
+        assert_eq!(cfg.l1_max_entry_bytes, 2 << 20);
+    }
+
+    #[test]
     fn from_toml_parses_and_rejects_unknown() {
         let patch = WorkerConfigPatch::from_toml(
-            "listen = \"0.0.0.0:9000\"\ncache_dirs = [\"/a\", \"/b\"]\n",
+            "listen = \"0.0.0.0:9000\"\ncache_dirs = [\"/a\", \"/b\"]\n\
+             l1_capacity_bytes = 67108864\nl1_max_entry_bytes = 1048576\n",
         )
         .unwrap();
         assert_eq!(patch.listen.as_deref(), Some("0.0.0.0:9000"));
         assert_eq!(patch.cache_dirs.unwrap().len(), 2);
+        assert_eq!(patch.l1_capacity_bytes, Some(64 << 20));
+        assert_eq!(patch.l1_max_entry_bytes, Some(1 << 20));
         assert!(WorkerConfigPatch::from_toml("bogus_key = 1").is_err());
     }
 
@@ -1207,6 +1299,8 @@ mod tests {
             "TALON_WORKER_BACKEND_DELAY_MS" => Some("300".to_string()),
             "TALON_WORKER_BACKEND_JITTER_MS" => Some("50".to_string()),
             "TALON_WORKER_BACKEND_THROUGHPUT_BYTES" => Some("1048576".to_string()),
+            "TALON_WORKER_L1_CAPACITY_BYTES" => Some("67108864".to_string()),
+            "TALON_WORKER_L1_MAX_ENTRY_BYTES" => Some("1048576".to_string()),
             "TALON_WORKER_BACKEND" => Some("s3".to_string()),
             "TALON_WORKER_S3_REGION" => Some("us-east-1".to_string()),
             "TALON_WORKER_S3_PATH_STYLE" => Some("true".to_string()),
@@ -1225,6 +1319,8 @@ mod tests {
         assert_eq!(patch.backend_delay_ms, Some(300));
         assert_eq!(patch.backend_jitter_ms, Some(50));
         assert_eq!(patch.backend_throughput_bytes, Some(1 << 20));
+        assert_eq!(patch.l1_capacity_bytes, Some(64 << 20));
+        assert_eq!(patch.l1_max_entry_bytes, Some(1 << 20));
         assert_eq!(patch.backend.as_deref(), Some("s3"));
         assert_eq!(patch.s3_region.as_deref(), Some("us-east-1"));
         assert_eq!(patch.s3_path_style, Some(true));
@@ -1267,6 +1363,22 @@ mod tests {
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("cluster_id"));
+
+        let cli = WorkerConfigPatch {
+            l1_capacity_bytes: Some(1024),
+            l1_max_entry_bytes: Some(2048),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("l1_max_entry_bytes"));
+
+        let cli = WorkerConfigPatch {
+            l1_capacity_bytes: Some(1024),
+            l1_max_entry_bytes: Some(0),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("must be > 0"));
     }
 
     #[test]
@@ -1278,6 +1390,24 @@ mod tests {
         };
         let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
         assert_eq!(cfg.advertise_addr, "10.0.0.5:7001");
+
+        // Kubernetes injects a bare Pod IP through the Downward API. It inherits
+        // the data-plane port so the registered address remains dialable.
+        let cli = WorkerConfigPatch {
+            listen: Some("0.0.0.0:7101".into()),
+            advertise_addr: Some("10.244.1.7".into()),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "10.244.1.7:7101");
+
+        let cli = WorkerConfigPatch {
+            listen: Some("[::]:7201".into()),
+            advertise_addr: Some("fd00::7".into()),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "[fd00::7]:7201");
 
         // A wildcard bind can be used for `listen` as long as `advertise_addr`
         // is a routable address.

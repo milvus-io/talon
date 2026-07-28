@@ -106,6 +106,12 @@ spec:
             # below the emptyDir/PVC size and the container memory limit.
             - name: TALON_WORKER_CAPACITY_BYTES
               value: "8589934592"
+            # Optional L1 DRAM cache. Keep disabled unless the pod memory limit
+            # includes this capacity plus the worker's normal heap/runtime use.
+            - name: TALON_WORKER_L1_CAPACITY_BYTES
+              value: "0"
+            - name: TALON_WORKER_L1_MAX_ENTRY_BYTES
+              value: "4194304"
             # Object-store backend credentials from the Secret — never logged.
             - name: TALON_WORKER_AZURE_ACCOUNT
               valueFrom:
