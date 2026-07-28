@@ -96,6 +96,8 @@ spec:
                   fieldPath: status.podIP
             - name: TALON_WORKER_CACHE_DIRS
               value: /var/cache/talon
+            - name: TALON_WORKER_BLOCK_SIZE
+              value: {{ .Values.worker.blockSizeBytes | quote }}
             - name: TALON_WORKER_CAPACITY_BYTES
               value: {{ .Values.worker.capacityBytes | quote }}
             - name: TALON_WORKER_L1_CAPACITY_BYTES

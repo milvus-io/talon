@@ -39,8 +39,13 @@ cleanup() {
   kubectl -n "$NAMESPACE" get pods -o wide >"$ARTIFACT_DIR/pods-final.txt" 2>/dev/null || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=worker --all-containers \
     --prefix >"$ARTIFACT_DIR/workers.log" 2>/dev/null || true
+  kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=worker --all-containers \
+    --prefix --previous >"$ARTIFACT_DIR/workers-previous.log" 2>/dev/null || true
   kubectl -n "$NAMESPACE" logs -l app.kubernetes.io/component=coordinator --all-containers \
     --prefix >"$ARTIFACT_DIR/coordinators.log" 2>/dev/null || true
+  kubectl -n "$NAMESPACE" describe pods >"$ARTIFACT_DIR/pods-describe.txt" 2>/dev/null || true
+  kubectl -n "$NAMESPACE" get events --sort-by=.lastTimestamp \
+    >"$ARTIFACT_DIR/events.txt" 2>/dev/null || true
   if [[ "$CREATE_KIND_CLUSTER" == "1" && "$KEEP_CLUSTER" != "1" ]]; then
     kind delete cluster --name "$CLUSTER_NAME" >/dev/null 2>&1 || true
   fi
@@ -276,6 +281,7 @@ helm upgrade --install "$RELEASE" deploy/helm/talon -n "$NAMESPACE" \
   --set coordinator.replicas=3 \
   --set coordinator.clusterId=e2e \
   --set worker.replicas=3 \
+  --set worker.blockSizeBytes=$BLOCK_SIZE \
   --set worker.capacityBytes=$((64 * BLOCK_SIZE)) \
   --set worker.l1CapacityBytes=$((32 * BLOCK_SIZE)) \
   --set worker.l1MaxEntryBytes=$BLOCK_SIZE \
@@ -292,7 +298,6 @@ kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
   TALON_WORKER_S3_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" \
   TALON_WORKER_S3_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
   TALON_WORKER_S3_PATH_STYLE=true \
-  TALON_WORKER_BLOCK_SIZE="$BLOCK_SIZE" \
   TALON_WORKER_BACKEND_DELAY_MS=50 \
   TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 >/dev/null
 rollout_workers
