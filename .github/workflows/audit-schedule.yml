@@ -1,0 +1,26 @@
+name: Dependency advisories (nightly)
+
+# The `audit` job in ci.yml covers every PR and push. This workflow exists for
+# the case that one cannot catch: a RUSTSEC advisory published against a crate
+# that is already in the tree, with no repository activity to trigger a run.
+#
+# Deliberately off the :00 mark — every scheduled workflow on GitHub asking for
+# "6am" fires at the same instant.
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  # Allow a manual run when triaging a newly-published advisory.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    name: dependency advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@cargo-deny
+      - name: Check advisories, bans, and sources
+        run: cargo deny check advisories bans sources
