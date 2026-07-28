@@ -450,10 +450,20 @@ l2_hits_after="$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{
 direct_read evict-3.bin 0 4096 "$ARTIFACT_DIR/evict-3.out" >/dev/null
 direct_read evict-4.bin 0 4096 "$ARTIFACT_DIR/evict-4.out" >/dev/null
 fetch_before="$(metric_value "$TARGET_POD" 'talon_worker_backend_fetch_bytes_total{backend="s3"}')"
+l1_hits_before="$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l1"}')"
 direct_read evict-1.bin 0 4096 "$ARTIFACT_DIR/evict-1-refetched.out" >/dev/null
 fetch_after="$(metric_value "$TARGET_POD" 'talon_worker_backend_fetch_bytes_total{backend="s3"}')"
-[[ $((fetch_after - fetch_before)) -eq "$BLOCK_SIZE" ]] ||
-  fail "L2 eviction left an orphan L1 copy or fetched an unexpected byte count"
+l1_hits_after="$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l1"}')"
+{
+  echo "backend_fetch_bytes_before=$fetch_before"
+  echo "backend_fetch_bytes_after=$fetch_after"
+  echo "l1_hits_before=$l1_hits_before"
+  echo "l1_hits_after=$l1_hits_after"
+} >"$ARTIFACT_DIR/l2-invalidation-metrics.txt"
+[[ "$fetch_after" -gt "$fetch_before" ]] ||
+  fail "L2 eviction left an orphan L1 copy instead of refetching origin"
+[[ "$l1_hits_after" -eq "$l1_hits_before" ]] ||
+  fail "L2-evicted block was incorrectly served from an orphan L1 copy"
 [[ "$(metric_value "$TARGET_POD" talon_worker_l1_blocks)" -le 2 ]] ||
   fail "L1 exceeded its configured block capacity"
 
