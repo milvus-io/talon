@@ -20,9 +20,31 @@ use tokio::net::{TcpListener, TcpStream};
 /// this, new peers wait for an in-flight connection to finish.
 const MAX_CONTROL_CONNECTIONS: usize = 1024;
 
-/// Bound on a proxied worker round trip (#318). Short: a client is blocked on
-/// this, and trying the next worker beats waiting on an unresponsive one.
-const PROXY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+/// Bound on establishing a proxied worker connection (#318). Keep this short:
+/// trying the next worker beats waiting on an unreachable one.
+const PROXY_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default total budget for trying all workers for one proxied request.
+const PROXY_REQUEST_BUDGET: Duration = Duration::from_secs(5);
+
+/// Total budget for trying all workers for a listing. Listing drains multiple
+/// backend pages, so it needs more time than single-operation RPCs. This is one
+/// shared deadline across retries—not 25 seconds per worker—and leaves headroom
+/// inside the FUSE client's default 30-second coordinator exchange deadline.
+const LIST_OBJECTS_PROXY_BUDGET: Duration = Duration::from_secs(25);
+
+/// Minimum time preserved for each worker that has not yet been attempted.
+/// When the request budget cannot cover this reserve, attempts share the
+/// remaining time evenly instead.
+const MIN_PROXY_RETRY_RESERVE: Duration = Duration::from_secs(1);
+
+/// Keep aggregated worker diagnostics comfortably below the 1 MiB control
+/// payload cap even when a worker returns an unusually large rejection detail.
+const MAX_PROXY_ATTEMPT_ERRORS_BYTES: usize = 8 * 1024;
+
+/// Prevent one oversized worker rejection from consuming the whole aggregate
+/// and hiding diagnostics from workers attempted afterward.
+const MAX_PROXY_ATTEMPT_ERROR_BYTES: usize = 1024;
 
 #[derive(Debug, Parser)]
 #[command(name = "talon-coordinator", version, about)]
@@ -96,6 +118,58 @@ struct Coordinator {
     lease_ttl: Duration,
 }
 
+fn proxy_request_budget(message: &ControlMessage) -> Duration {
+    match message {
+        ControlMessage::ListObjects { .. } => LIST_OBJECTS_PROXY_BUDGET,
+        _ => PROXY_REQUEST_BUDGET,
+    }
+}
+
+/// Give one serial attempt most of the time still available while preserving a
+/// minimum retry window for every worker that follows.
+///
+/// This lets a listing use nearly all of its 25-second budget to drain backend
+/// pages: with two workers the first gets up to 24 seconds, rather than an even
+/// 12.5-second split. A silent worker still cannot consume the one-second retry
+/// reserve. Fast failures donate all unused time to later workers. When the
+/// remaining budget is tight, clamp each reservation to the current fair share;
+/// this degrades smoothly to an even split without starving the current worker.
+fn proxy_attempt_budget(remaining: Duration, workers_remaining: usize) -> Duration {
+    debug_assert!(workers_remaining > 0);
+    let divisor = u32::try_from(workers_remaining).unwrap_or(u32::MAX);
+    let later_workers = divisor.saturating_sub(1);
+    let fair_share = remaining / divisor;
+    let reserve_per_later = MIN_PROXY_RETRY_RESERVE.min(fair_share);
+    let retry_reserve = reserve_per_later.saturating_mul(later_workers);
+    remaining.saturating_sub(retry_reserve)
+}
+
+fn append_proxy_attempt_error(errors: &mut String, error: &str) {
+    let separator = if errors.is_empty() { "" } else { "; " };
+    let remaining = MAX_PROXY_ATTEMPT_ERRORS_BYTES.saturating_sub(errors.len());
+    if remaining <= separator.len() {
+        return;
+    }
+    errors.push_str(separator);
+
+    let remaining =
+        (MAX_PROXY_ATTEMPT_ERRORS_BYTES - errors.len()).min(MAX_PROXY_ATTEMPT_ERROR_BYTES);
+    if error.len() <= remaining {
+        errors.push_str(error);
+        return;
+    }
+
+    const TRUNCATED: &str = "...";
+    let mut end = remaining.saturating_sub(TRUNCATED.len()).min(error.len());
+    while !error.is_char_boundary(end) {
+        end -= 1;
+    }
+    errors.push_str(&error[..end]);
+    if remaining >= TRUNCATED.len() {
+        errors.push_str(TRUNCATED);
+    }
+}
+
 impl Coordinator {
     fn new(observability: Arc<CoordinatorObservability>, lease_ttl: Duration) -> Arc<Self> {
         Arc::new(Self {
@@ -132,19 +206,84 @@ impl Coordinator {
             };
         }
 
-        let mut last_error = None;
-        for worker in &workers {
-            match Self::round_trip_worker(&worker.address, &message).await {
-                Ok(reply) => return reply,
-                Err(e) => last_error = Some(format!("{}: {e}", worker.address)),
+        Self::proxy_to_workers(&workers, message).await
+    }
+
+    /// Try workers in order, treating both transport errors and explicit worker
+    /// rejections as retryable. A worker can be ready enough to advertise but
+    /// still reject a request that a later healthy worker can serve.
+    async fn proxy_to_workers(workers: &[NodeInfo], message: ControlMessage) -> ControlMessage {
+        let budget = proxy_request_budget(&message);
+        Self::proxy_to_workers_with_budget(workers, message, budget).await
+    }
+
+    /// Proxy under one deadline shared by every serial worker attempt.
+    ///
+    /// Each attempt receives the remaining total budget minus a small reserve
+    /// for every later worker. This prevents a silent first worker from
+    /// consuming the whole request while leaving long-running listings most of
+    /// their 25-second budget.
+    async fn proxy_to_workers_with_budget(
+        workers: &[NodeInfo],
+        message: ControlMessage,
+        budget: Duration,
+    ) -> ControlMessage {
+        let deadline = tokio::time::Instant::now() + budget;
+        let mut attempt_errors = String::new();
+        let mut tried = 0;
+        for (index, worker) in workers.iter().enumerate() {
+            let now = tokio::time::Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            if remaining.is_zero() {
+                break;
+            }
+            let workers_remaining = workers.len() - index;
+            let attempt_budget = proxy_attempt_budget(remaining, workers_remaining);
+            let attempt_deadline = now + attempt_budget;
+            tried += 1;
+            let attempt = tokio::time::timeout_at(
+                attempt_deadline,
+                Self::round_trip_worker(&worker.address, &message, attempt_deadline),
+            )
+            .await;
+            match attempt {
+                Err(_) => append_proxy_attempt_error(
+                    &mut attempt_errors,
+                    &format!(
+                        "{}: worker attempt timed out after {attempt_budget:?}",
+                        worker.address
+                    ),
+                ),
+                Ok(Ok(ControlMessage::Ack { ok: false, detail })) => {
+                    append_proxy_attempt_error(
+                        &mut attempt_errors,
+                        &format!(
+                            "{}: worker rejected request: {}",
+                            worker.address,
+                            detail.unwrap_or_else(|| "no detail provided".into())
+                        ),
+                    );
+                }
+                Ok(Ok(reply)) => return reply,
+                Ok(Err(e)) => append_proxy_attempt_error(
+                    &mut attempt_errors,
+                    &format!("{}: {e}", worker.address),
+                ),
+            }
+            if tokio::time::Instant::now() >= deadline {
+                break;
             }
         }
         ControlMessage::Ack {
             ok: false,
             detail: Some(format!(
-                "no worker served the request ({} tried); last error: {}",
+                "no worker served the request ({tried}/{} tried within {budget:?}); attempt errors: {}",
                 workers.len(),
-                last_error.unwrap_or_else(|| "unknown".into())
+                if attempt_errors.is_empty() {
+                    "unknown"
+                } else {
+                    &attempt_errors
+                }
             )),
         }
     }
@@ -153,17 +292,30 @@ impl Coordinator {
     async fn round_trip_worker(
         address: &str,
         message: &ControlMessage,
+        attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<ControlMessage> {
-        let mut stream = tokio::time::timeout(PROXY_TIMEOUT, TcpStream::connect(address)).await??;
+        let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("worker attempt budget exhausted before connecting");
+        }
+        let connect_timeout = PROXY_CONNECT_TIMEOUT.min(remaining);
+        let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect timed out after {connect_timeout:?}"))??;
         let buf = codec::encode(0, message)?;
         stream.write_all(&buf).await?;
         stream.flush().await?;
 
+        let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("worker attempt budget exhausted before reading response");
+        }
         let (header, payload) = tokio::time::timeout(
-            PROXY_TIMEOUT,
-            talon_transport::read_frame(&mut stream, PROXY_TIMEOUT),
+            remaining,
+            talon_transport::read_frame(&mut stream, remaining),
         )
-        .await?
+        .await
+        .map_err(|_| anyhow::anyhow!("worker response did not arrive within its attempt budget"))?
         .map_err(|e| anyhow::anyhow!("{e}"))?;
         let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
         full.extend_from_slice(&header.encode());
@@ -707,6 +859,302 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn listings_use_one_dedicated_total_proxy_budget() {
+        let listing = ControlMessage::ListObjects {
+            prefix: "s3/bucket".into(),
+        };
+        let stat = ControlMessage::StatObject {
+            object: talon_core::ObjectId::new(talon_core::Backend::S3, "bucket", "object"),
+        };
+
+        assert_eq!(proxy_request_budget(&listing), Duration::from_secs(25));
+        assert_eq!(proxy_request_budget(&stat), Duration::from_secs(5));
+        assert!(proxy_request_budget(&listing) > proxy_request_budget(&stat));
+        assert!(
+            proxy_request_budget(&listing) < Duration::from_secs(30),
+            "listing proxy must leave headroom inside the FUSE client deadline"
+        );
+        assert_eq!(
+            proxy_attempt_budget(proxy_request_budget(&listing), 2),
+            Duration::from_secs(24),
+            "listing keeps most of its long-running budget while reserving a retry"
+        );
+        assert_eq!(
+            proxy_attempt_budget(proxy_request_budget(&listing), 1),
+            Duration::from_secs(25),
+            "a sole listing worker keeps the full long-running budget"
+        );
+        assert_eq!(
+            proxy_attempt_budget(Duration::from_millis(2_100), 3),
+            Duration::from_millis(700),
+            "a tight budget degrades to an even split"
+        );
+        assert_eq!(
+            proxy_attempt_budget(Duration::from_millis(3_001), 3),
+            Duration::from_millis(1_001),
+            "crossing the one-second reserve threshold must be continuous"
+        );
+    }
+
+    #[test]
+    fn proxy_attempt_errors_are_bounded_without_hiding_the_next_worker() {
+        let mut errors = String::new();
+        let oversized = format!(
+            "worker-a: actionable listing limit; narrow the namespace prefix: {}",
+            "x".repeat(MAX_PROXY_ATTEMPT_ERRORS_BYTES)
+        );
+
+        append_proxy_attempt_error(&mut errors, &oversized);
+        append_proxy_attempt_error(&mut errors, "worker-b: backend mismatch");
+
+        assert!(errors.len() <= MAX_PROXY_ATTEMPT_ERRORS_BYTES);
+        assert!(errors.contains("worker-a: actionable listing limit"));
+        assert!(errors.contains("worker-b: backend mismatch"));
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_after_a_worker_rejects_the_request() {
+        let rejecting_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let rejecting_address = rejecting_listener.local_addr().unwrap().to_string();
+        let rejecting_server = tokio::spawn(async move {
+            let (mut stream, _) = rejecting_listener.accept().await.unwrap();
+            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            let reply = codec::encode(
+                0,
+                &ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker backend mismatch".into()),
+                },
+            )
+            .unwrap();
+            stream.write_all(&reply).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let serving_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving_address = serving_listener.local_addr().unwrap().to_string();
+        let serving_server = tokio::spawn(async move {
+            let (mut stream, _) = serving_listener.accept().await.unwrap();
+            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            let reply = codec::encode(
+                0,
+                &ControlMessage::ObjectList {
+                    entries: vec![talon_transport::ObjectEntry {
+                        path: "s3/bucket/object".into(),
+                        size: 42,
+                    }],
+                },
+            )
+            .unwrap();
+            stream.write_all(&reply).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let workers = vec![
+            NodeInfo {
+                id: NodeId::new("worker-rejects"),
+                address: rejecting_address,
+                role: NodeRole::Worker,
+            },
+            NodeInfo {
+                id: NodeId::new("worker-serves"),
+                address: serving_address,
+                role: NodeRole::Worker,
+            },
+        ];
+        let reply = Coordinator::proxy_to_workers(
+            &workers,
+            ControlMessage::ListObjects {
+                prefix: "s3/bucket".into(),
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            reply,
+            ControlMessage::ObjectList { entries }
+                if entries == vec![talon_transport::ObjectEntry {
+                    path: "s3/bucket/object".into(),
+                    size: 42,
+                }]
+        ));
+        rejecting_server.await.unwrap();
+        serving_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_a_healthy_worker_after_a_silent_worker_times_out() {
+        let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_address = stalled_listener.local_addr().unwrap().to_string();
+        let (stalled_request_tx, stalled_request_rx) = tokio::sync::oneshot::channel();
+        let stalled_server = tokio::spawn(async move {
+            let (mut stream, _) = stalled_listener.accept().await.unwrap();
+            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            stalled_request_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let serving_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let serving_address = serving_listener.local_addr().unwrap().to_string();
+        let serving_server = tokio::spawn(async move {
+            let (mut stream, _) = serving_listener.accept().await.unwrap();
+            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            let reply = codec::encode(
+                0,
+                &ControlMessage::ObjectList {
+                    entries: vec![talon_transport::ObjectEntry {
+                        path: "s3/bucket/object".into(),
+                        size: 42,
+                    }],
+                },
+            )
+            .unwrap();
+            stream.write_all(&reply).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        let workers = vec![
+            NodeInfo {
+                id: NodeId::new("worker-stalls"),
+                address: stalled_address,
+                role: NodeRole::Worker,
+            },
+            NodeInfo {
+                id: NodeId::new("worker-serves"),
+                address: serving_address,
+                role: NodeRole::Worker,
+            },
+        ];
+        let budget = Duration::from_secs(4);
+        let proxy = tokio::spawn(async move {
+            Coordinator::proxy_to_workers_with_budget(
+                &workers,
+                ControlMessage::ListObjects {
+                    prefix: "s3/bucket".into(),
+                },
+                budget,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), stalled_request_rx)
+            .await
+            .expect("coordinator did not reach the stalled worker")
+            .expect("stalled worker exited before receiving the request");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3)).await;
+        tokio::time::resume();
+
+        let reply = tokio::time::timeout(Duration::from_secs(3), proxy)
+            .await
+            .expect("coordinator did not retry the healthy worker")
+            .unwrap();
+        assert!(matches!(
+            reply,
+            ControlMessage::ObjectList { entries }
+                if entries == vec![talon_transport::ObjectEntry {
+                    path: "s3/bucket/object".into(),
+                    size: 42,
+                }]
+        ));
+
+        stalled_server.abort();
+        serving_server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn proxy_attempt_timeouts_do_not_reset_the_shared_total_budget() {
+        let first_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let first_address = first_listener.local_addr().unwrap().to_string();
+        let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
+        let first_server = tokio::spawn(async move {
+            let (mut stream, _) = first_listener.accept().await.unwrap();
+            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            first_request_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let second_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let second_address = second_listener.local_addr().unwrap().to_string();
+        let (second_request_tx, second_request_rx) = tokio::sync::oneshot::channel();
+        let second_server = tokio::spawn(async move {
+            let (mut stream, _) = second_listener.accept().await.unwrap();
+            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            second_request_tx.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+
+        let workers = vec![
+            NodeInfo {
+                id: NodeId::new("worker-stalls-first"),
+                address: first_address.clone(),
+                role: NodeRole::Worker,
+            },
+            NodeInfo {
+                id: NodeId::new("worker-stalls-second"),
+                address: second_address.clone(),
+                role: NodeRole::Worker,
+            },
+        ];
+        let budget = Duration::from_secs(6);
+        let started = tokio::time::Instant::now();
+        let proxy = tokio::spawn(async move {
+            Coordinator::proxy_to_workers_with_budget(
+                &workers,
+                ControlMessage::ListObjects {
+                    prefix: "s3/bucket".into(),
+                },
+                budget,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), first_request_rx)
+            .await
+            .expect("coordinator did not reach the first worker")
+            .expect("first worker exited before receiving the request");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(1), second_request_rx)
+            .await
+            .expect("coordinator did not spend a separate slice on the second worker")
+            .expect("second worker exited before receiving the request");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(1)).await;
+        tokio::time::resume();
+
+        let reply = tokio::time::timeout(Duration::from_secs(1), proxy)
+            .await
+            .expect("second worker received a fresh total budget")
+            .unwrap();
+        assert!(
+            started.elapsed() < budget + Duration::from_secs(2),
+            "shared {budget:?} budget took {:?}",
+            started.elapsed()
+        );
+        let detail = match reply {
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some(detail),
+            } => detail,
+            other => panic!("expected aggregate proxy failure, got {other:?}"),
+        };
+        assert!(detail.contains("2/2 tried within 6s"), "{detail}");
+        assert!(detail.contains(&first_address), "{detail}");
+        assert!(detail.contains(&second_address), "{detail}");
+
+        first_server.abort();
+        second_server.abort();
     }
 
     #[tokio::test]

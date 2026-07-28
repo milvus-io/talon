@@ -1152,18 +1152,52 @@ impl FuseConfig {
         if self.coordinator.is_empty() {
             return Err(Error::Other("coordinator address must not be empty".into()));
         }
-        let trimmed = self.namespace_prefix.trim_start_matches('/');
-        let mut parts = trimmed.split('/');
-        let backend = parts.next().unwrap_or_default();
-        if backend.parse::<crate::Backend>().is_err() {
+        // Accept the historical absolute-looking spelling (`/s3/bucket`), but
+        // otherwise require a canonical namespace path. Empty, `.` and `..`
+        // components are ambiguous once the prefix is mapped into the FUSE
+        // tree and can cause the mounted path to address a different object.
+        // One trailing slash is meaningful after a non-empty key prefix (for
+        // example, `s3/bucket/dir/` must not also match `dir2`) and is retained.
+        let trimmed = self
+            .namespace_prefix
+            .strip_prefix('/')
+            .unwrap_or(&self.namespace_prefix);
+        if trimmed.starts_with('/') {
+            return Err(Error::Other(format!(
+                "namespace_prefix must not contain multiple leading slashes: {:?}",
+                self.namespace_prefix
+            )));
+        }
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        let backend = parts.first().copied().unwrap_or_default();
+        if !matches!(
+            backend.parse::<crate::Backend>(),
+            Ok(parsed) if parsed.prefix() == backend
+        ) {
             return Err(Error::Other(format!(
                 "namespace_prefix must start with a supported backend (s3, gcs, or az): {:?}",
                 self.namespace_prefix
             )));
         }
-        if !matches!(parts.next(), Some(bucket) if !bucket.is_empty()) {
+        let bucket = parts.get(1).copied().unwrap_or_default();
+        if matches!(bucket, "" | "." | "..") {
             return Err(Error::Other(format!(
                 "namespace_prefix must name a bucket/container (for example, az/container): {:?}",
+                self.namespace_prefix
+            )));
+        }
+        const MAX_FUSE_COMPONENT_BYTES: usize = 255;
+        let invalid_component = parts.iter().enumerate().any(|(index, component)| {
+            let is_key_trailing_slash =
+                index + 1 == parts.len() && index >= 3 && component.is_empty();
+            matches!(*component, "." | "..")
+                || (component.is_empty() && !is_key_trailing_slash)
+                || component.as_bytes().contains(&0)
+                || component.len() > MAX_FUSE_COMPONENT_BYTES
+        });
+        if invalid_component {
+            return Err(Error::Other(format!(
+                "namespace_prefix contains an empty, `.` or `..` component, a NUL byte, or a component longer than {MAX_FUSE_COMPONENT_BYTES} bytes: {:?}",
                 self.namespace_prefix
             )));
         }
@@ -1568,7 +1602,22 @@ mod tests {
 
     #[test]
     fn fuse_namespace_prefix_requires_backend_and_bucket() {
-        for invalid in ["", "unknown/bucket", "s3", "gcs/"] {
+        for invalid in [
+            "",
+            "unknown/bucket",
+            "azure/container",
+            "s3",
+            "gcs/",
+            "//az/container",
+            "s3/./key",
+            "s3/../key",
+            "s3/bucket/",
+            "s3/bucket//dir",
+            "s3/bucket/./dir",
+            "s3/bucket/../dir",
+            "s3/bucket/dir//",
+            "s3/buck\0et/dir",
+        ] {
             let cli = FuseConfigPatch {
                 namespace_prefix: Some(invalid.into()),
                 ..Default::default()
@@ -1583,8 +1632,10 @@ mod tests {
         for valid in [
             "s3/bucket",
             "gcs/bucket/dir",
+            "gcs/bucket/dir/",
             "az/container",
             "/az/container/prefix",
+            "/az/container/prefix/",
         ] {
             let cli = FuseConfigPatch {
                 namespace_prefix: Some(valid.into()),
@@ -1593,5 +1644,13 @@ mod tests {
             let cfg = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap();
             assert_eq!(cfg.namespace_prefix, valid);
         }
+
+        let too_long = format!("s3/bucket/{}", "x".repeat(256));
+        let cli = FuseConfigPatch {
+            namespace_prefix: Some(too_long),
+            ..Default::default()
+        };
+        let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("255"), "{err}");
     }
 }

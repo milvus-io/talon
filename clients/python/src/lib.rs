@@ -245,9 +245,9 @@ impl Client {
     /// they can be passed straight to [`read`](Self::read) after converting to
     /// a URI.
     ///
-    /// Large listings are truncated rather than paginated: the control protocol
-    /// has no cursor, so the server caps both the object count and the number
-    /// of backend round trips.
+    /// The control protocol carries one bounded response. If a prefix exceeds
+    /// the server's object, page, or payload limit, the call fails explicitly
+    /// instead of returning an incomplete list; use a narrower prefix.
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
         let runtime = Arc::clone(&self.runtime);
         let coordinator = self.coordinator.clone();
