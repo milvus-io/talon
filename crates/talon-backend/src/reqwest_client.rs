@@ -15,6 +15,17 @@ use async_trait::async_trait;
 
 use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 
+/// Cap on establishing a TCP+TLS connection. Independent of transfer size, so a
+/// slow connect always indicates a fault rather than a large object.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Last-resort ceiling on a whole request. Sized well above any deadline the
+/// retry decorator would compute so it never fires first in normal operation.
+const REQUEST_BACKSTOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long an idle pooled connection is kept before being dropped.
+const POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// A `reqwest`-backed HTTP client.
 pub struct ReqwestClient {
     inner: reqwest::Client,
@@ -22,10 +33,25 @@ pub struct ReqwestClient {
 
 impl ReqwestClient {
     /// Build a client with sensible pooled defaults.
+    ///
+    /// The timeouts here are a **backstop for undecorated use**, not the primary
+    /// deadline. [`RetryingHttpClient`](crate::retry::RetryingHttpClient) owns
+    /// the real per-attempt deadline, which scales with transfer size; the flat
+    /// ceiling below is deliberately far larger so it never preempts that
+    /// calculation, and exists only so a bare `ReqwestClient` cannot hang
+    /// forever on a wedged origin. `connect_timeout` is separate and short:
+    /// establishing a connection is size-independent, so a slow connect is
+    /// always a fault.
     pub fn new() -> Self {
-        Self {
-            inner: reqwest::Client::new(),
-        }
+        let inner = reqwest::Client::builder()
+            .connect_timeout(CONNECT_TIMEOUT)
+            .timeout(REQUEST_BACKSTOP_TIMEOUT)
+            .pool_idle_timeout(POOL_IDLE_TIMEOUT)
+            .build()
+            // The builder only fails if the TLS backend cannot initialize, which
+            // is a process-level fault; fall back so construction stays infallible.
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self { inner }
     }
 
     /// Build over a pre-configured [`reqwest::Client`] (timeouts, proxies, etc.).

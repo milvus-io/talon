@@ -12,6 +12,7 @@ pub mod delay;
 pub mod gcs;
 pub mod http;
 pub mod reqwest_client;
+pub mod retry;
 pub mod s3;
 pub mod sigv4;
 
@@ -20,5 +21,6 @@ pub use delay::{DelayConfig, DelayingHttpClient};
 pub use gcs::{GcsBackend, GcsConfig};
 pub use http::{HttpClient, HttpRequest, HttpResponse, Method};
 pub use reqwest_client::ReqwestClient;
+pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
 pub use s3::{S3Backend, S3Config, S3Credentials};
 pub use sigv4::{sign_request, AmzDate};

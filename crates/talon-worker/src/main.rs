@@ -57,6 +57,25 @@ const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
 /// pinned: a large pool per ring would oversubscribe the cores they sit on.
 const URING_BLOCKING_THREADS_PER_RING: usize = 4;
 
+/// Bridges the backend retry decorator to the worker's metrics registry.
+///
+/// `talon-backend` deliberately knows nothing about the worker's registry, so it
+/// emits retry and timeout events through the [`RetryObserver`] trait and this
+/// adapter turns them into counters.
+struct MetricsRetryObserver {
+    observability: Arc<WorkerObservability>,
+}
+
+impl talon_backend::RetryObserver for MetricsRetryObserver {
+    fn on_retry(&self, _attempt: u32, _status: Option<u16>) {
+        self.observability.metrics().record_backend_retry();
+    }
+
+    fn on_timeout(&self) {
+        self.observability.metrics().record_backend_timeout();
+    }
+}
+
 /// Set to `1` to pin the legacy Tokio data plane regardless of io_uring
 /// availability. An escape hatch for operators who hit a regression; the
 /// io_uring path is the default because it wins decisively under the
@@ -123,6 +142,13 @@ impl Args {
             backend_delay_ms: None,
             backend_jitter_ms: None,
             backend_throughput_bytes: None,
+            // Retry/timeout knobs are env- and file-only (`cli: false` in the
+            // ConfigVar schema), so the CLI patch leaves them unset.
+            backend_max_retries: None,
+            backend_retry_base_ms: None,
+            backend_retry_max_delay_ms: None,
+            backend_timeout_floor_ms: None,
+            backend_min_throughput_bytes: None,
             s3_region: None,
             s3_endpoint: None,
             s3_access_key_id: None,
@@ -249,50 +275,6 @@ async fn main() -> anyhow::Result<()> {
         "starting talon-worker"
     );
 
-    // The networked HTTP client, shared by whichever backend is selected. It is
-    // optionally wrapped in a latency decorator (test/latency lab); inert unless
-    // a delay/jitter/throughput knob is set.
-    let http: Arc<dyn talon_backend::http::HttpClient> = {
-        let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(ReqwestClient::new());
-        let delay = talon_backend::DelayConfig {
-            base: Duration::from_millis(cfg.backend_delay_ms.unwrap_or(0)),
-            jitter: Duration::from_millis(cfg.backend_jitter_ms.unwrap_or(0)),
-            throughput_bytes_per_sec: cfg.backend_throughput_bytes.filter(|&b| b > 0),
-        };
-        if delay.is_active() {
-            tracing::info!(
-                base_ms = cfg.backend_delay_ms.unwrap_or(0),
-                jitter_ms = cfg.backend_jitter_ms.unwrap_or(0),
-                throughput_bytes = ?cfg.backend_throughput_bytes,
-                "synthetic backend latency enabled"
-            );
-            // Seed from the node identity so each worker's jitter is distinct yet
-            // reproducible across restarts.
-            let seed = cfg
-                .node_id
-                .as_deref()
-                .unwrap_or(&cfg.advertise_addr)
-                .bytes()
-                .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-            Arc::new(talon_backend::DelayingHttpClient::new(base, delay, seed))
-        } else {
-            base
-        }
-    };
-
-    // Select the object-store backend from config (default: azure). Each backend
-    // reads its endpoint from config and its secret from the environment only.
-    let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
-    let backend: Arc<dyn BackendStore> = match backend_kind {
-        "azure" => Arc::new(build_azure_backend(&cfg, http)?),
-        "s3" => Arc::new(build_s3_backend(&cfg, http)?),
-        "gcs" => Arc::new(build_gcs_backend(&cfg, http)?),
-        other => {
-            anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
-        }
-    };
-    tracing::info!(backend = backend_kind, "object-store backend ready");
-
     // Local store stack rooted at the first cache dir.
     let root = cfg
         .cache_dirs
@@ -345,6 +327,92 @@ async fn main() -> anyhow::Result<()> {
     )?);
     observability.readiness().set_backend_ready(true);
     observability.readiness().set_store_ready(true);
+
+    // The networked HTTP client, shared by whichever backend is selected. Two
+    // decorators may wrap it, innermost first: retry (always on — a cache with
+    // no retry turns a routine 503 into a failed read) and, optionally, the
+    // latency injector for the test/latency lab.
+    //
+    // Retry is innermost so each attempt gets its own injected latency, which is
+    // what the lab is modeling; wrapping the other way would make the whole
+    // retry ladder share a single delay and understate the cost of a retry.
+    let http: Arc<dyn talon_backend::http::HttpClient> = {
+        let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(ReqwestClient::new());
+
+        // Seed from the node identity so each worker's jitter is distinct yet
+        // reproducible across restarts. Shared by both decorators.
+        let seed = cfg
+            .node_id
+            .as_deref()
+            .unwrap_or(&cfg.advertise_addr)
+            .bytes()
+            .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+
+        let defaults = talon_backend::RetryConfig::default();
+        let retry = talon_backend::RetryConfig {
+            max_retries: cfg.backend_max_retries.unwrap_or(defaults.max_retries),
+            base_delay: cfg
+                .backend_retry_base_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.base_delay),
+            max_delay: cfg
+                .backend_retry_max_delay_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.max_delay),
+            timeout_floor: cfg
+                .backend_timeout_floor_ms
+                .map(Duration::from_millis)
+                .unwrap_or(defaults.timeout_floor),
+            min_throughput_bytes_per_sec: cfg
+                .backend_min_throughput_bytes
+                .unwrap_or(defaults.min_throughput_bytes_per_sec),
+        };
+        tracing::info!(
+            max_retries = retry.max_retries,
+            base_delay_ms = retry.base_delay.as_millis(),
+            max_delay_ms = retry.max_delay.as_millis(),
+            timeout_floor_ms = retry.timeout_floor.as_millis(),
+            min_throughput_bytes = retry.min_throughput_bytes_per_sec,
+            "backend retry policy"
+        );
+        let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(
+            talon_backend::RetryingHttpClient::new(base, retry, seed).with_observer(Arc::new(
+                MetricsRetryObserver {
+                    observability: Arc::clone(&observability),
+                },
+            )),
+        );
+
+        let delay = talon_backend::DelayConfig {
+            base: Duration::from_millis(cfg.backend_delay_ms.unwrap_or(0)),
+            jitter: Duration::from_millis(cfg.backend_jitter_ms.unwrap_or(0)),
+            throughput_bytes_per_sec: cfg.backend_throughput_bytes.filter(|&b| b > 0),
+        };
+        if delay.is_active() {
+            tracing::info!(
+                base_ms = cfg.backend_delay_ms.unwrap_or(0),
+                jitter_ms = cfg.backend_jitter_ms.unwrap_or(0),
+                throughput_bytes = ?cfg.backend_throughput_bytes,
+                "synthetic backend latency enabled"
+            );
+            Arc::new(talon_backend::DelayingHttpClient::new(base, delay, seed))
+        } else {
+            base
+        }
+    };
+
+    // Select the object-store backend from config (default: azure). Each backend
+    // reads its endpoint from config and its secret from the environment only.
+    let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
+    let backend: Arc<dyn BackendStore> = match backend_kind {
+        "azure" => Arc::new(build_azure_backend(&cfg, http)?),
+        "s3" => Arc::new(build_s3_backend(&cfg, http)?),
+        "gcs" => Arc::new(build_gcs_backend(&cfg, http)?),
+        other => {
+            anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
+        }
+    };
+    tracing::info!(backend = backend_kind, "object-store backend ready");
 
     let worker = Arc::new(WorkerRuntime::new(
         store,
