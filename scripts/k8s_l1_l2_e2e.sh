@@ -172,6 +172,29 @@ rollout_workers() {
   assert_workers_spread
 }
 
+restart_worker_container() {
+  local pod="$1"
+  local node container_id
+  node="$(kubectl -n "$NAMESPACE" get pod "$pod" -o jsonpath='{.spec.nodeName}')"
+  container_id="$(kubectl -n "$NAMESPACE" get pod "$pod" \
+    -o jsonpath='{.status.containerStatuses[0].containerID}')"
+  container_id="${container_id#*://}"
+  [[ -n "$node" && -n "$container_id" ]] ||
+    fail "cannot resolve worker container runtime identity"
+
+  {
+    echo "pod=$pod"
+    echo "node=$node"
+    echo "container_id=$container_id"
+  } >"$ARTIFACT_DIR/restart-target.txt"
+
+  if docker inspect "$node" >/dev/null 2>&1; then
+    docker exec "$node" crictl stop --timeout 0 "$container_id"
+  else
+    kubectl -n "$NAMESPACE" exec "$pod" -- /bin/sh -c 'kill -9 1'
+  fi
+}
+
 set_cache_limits() {
   local l1="$1"
   local l2="$2"
@@ -476,7 +499,7 @@ start_worker_forward "$TARGET_POD"
 direct_read restart.bin 0 4096 "$ARTIFACT_DIR/restart-before.out" >/dev/null
 restart_before="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" \
   -o jsonpath='{.status.containerStatuses[0].restartCount}')"
-kubectl -n "$NAMESPACE" exec "$TARGET_POD" -- /bin/sh -c 'kill -9 1' >/dev/null 2>&1 || true
+restart_worker_container "$TARGET_POD"
 for _ in $(seq 1 120); do
   restart_after="$(kubectl -n "$NAMESPACE" get pod "$TARGET_POD" \
     -o jsonpath='{.status.containerStatuses[0].restartCount}' 2>/dev/null || echo 0)"
