@@ -776,10 +776,14 @@ impl WorkerConfig {
         let merged = cli.merge(env).merge(file);
         let d = WorkerConfig::default();
         let listen = merged.listen.unwrap_or(d.listen);
+        let advertise_addr = normalize_worker_advertise_addr(
+            merged.advertise_addr.unwrap_or_else(|| listen.clone()),
+            &listen,
+        );
         let cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
             // address (issue #118: never silently advertise a wildcard bind).
-            advertise_addr: merged.advertise_addr.unwrap_or_else(|| listen.clone()),
+            advertise_addr,
             listen,
             admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
@@ -915,6 +919,18 @@ impl WorkerConfig {
         }
         Ok(())
     }
+}
+
+/// The Kubernetes Downward API can expose a Pod IP but cannot append a port.
+/// Accept that common shape and inherit the configured data-plane listen port.
+fn normalize_worker_advertise_addr(advertise_addr: String, listen: &str) -> String {
+    let Ok(ip) = advertise_addr.parse::<std::net::IpAddr>() else {
+        return advertise_addr;
+    };
+    let Ok(listen) = listen.parse::<std::net::SocketAddr>() else {
+        return advertise_addr;
+    };
+    std::net::SocketAddr::new(ip, listen.port()).to_string()
 }
 
 /// Fully-resolved FUSE client configuration.
@@ -1335,6 +1351,24 @@ mod tests {
         };
         let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
         assert_eq!(cfg.advertise_addr, "10.0.0.5:7001");
+
+        // Kubernetes injects a bare Pod IP through the Downward API. It inherits
+        // the data-plane port so the registered address remains dialable.
+        let cli = WorkerConfigPatch {
+            listen: Some("0.0.0.0:7101".into()),
+            advertise_addr: Some("10.244.1.7".into()),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "10.244.1.7:7101");
+
+        let cli = WorkerConfigPatch {
+            listen: Some("[::]:7201".into()),
+            advertise_addr: Some("fd00::7".into()),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "[fd00::7]:7201");
 
         // A wildcard bind can be used for `listen` as long as `advertise_addr`
         // is a routable address.

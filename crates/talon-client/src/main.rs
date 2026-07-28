@@ -34,6 +34,9 @@ struct Args {
     /// Address of the coordinator to query for placement.
     #[arg(long, default_value = "127.0.0.1:7000")]
     coordinator: String,
+    /// Connect directly to one worker, bypassing placement (diagnostics/tests).
+    #[arg(long)]
+    worker: Option<String>,
     /// Object path, e.g. `/az/<container>/<blob>`.
     #[arg(long)]
     path: String,
@@ -65,18 +68,27 @@ async fn main() -> anyhow::Result<()> {
         Version::new(PLACEHOLDER_VERSION),
     );
 
-    // 1. Placement lookup: which worker owns this block?
-    let owners = placement_lookup(&args.coordinator, &block).await?;
-    let owner = owners
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("no worker owns this block (empty cluster?)"))?;
-    tracing::info!(owner = %owner, "resolved owner");
+    let worker_addr = match args.worker {
+        Some(worker) => {
+            tracing::info!(worker_addr = %worker, "using direct worker");
+            worker
+        }
+        None => {
+            // 1. Placement lookup: which worker owns this block?
+            let owners = placement_lookup(&args.coordinator, &block).await?;
+            let owner = owners
+                .first()
+                .ok_or_else(|| anyhow::anyhow!("no worker owns this block (empty cluster?)"))?;
+            tracing::info!(owner = %owner, "resolved owner");
 
-    // 2. Resolve the owner id to a worker address.
-    let worker_addr = resolve_address(&args.coordinator, owner).await?;
-    tracing::info!(%worker_addr, "resolved worker address");
+            // 2. Resolve the owner id to a worker address.
+            let worker_addr = resolve_address(&args.coordinator, owner).await?;
+            tracing::info!(%worker_addr, "resolved worker address");
+            worker_addr
+        }
+    };
 
-    // 3. Fetch the range from the worker.
+    // Fetch the range from the selected worker.
     let start = Instant::now();
     let bytes = fetch_range(&worker_addr, &object, args.offset, args.len).await?;
     let elapsed = start.elapsed();
@@ -191,4 +203,29 @@ fn hex_prefix(bytes: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser;
+
+    use super::Args;
+
+    #[test]
+    fn direct_worker_mode_is_parsed_without_changing_default_coordinator() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--worker",
+            "10.0.0.7:7001",
+            "--path",
+            "/s3/bucket/object",
+            "--len",
+            "4096",
+        ])
+        .unwrap();
+
+        assert_eq!(args.worker.as_deref(), Some("10.0.0.7:7001"));
+        assert_eq!(args.coordinator, "127.0.0.1:7000");
+        assert_eq!(args.len, 4096);
+    }
 }
