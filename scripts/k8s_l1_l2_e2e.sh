@@ -590,7 +590,7 @@ start_worker_forward "$TARGET_POD"
     --path "/s3/$BUCKET/bench" --len 65536 --out "$ARTIFACT_DIR/bench-warm.out"
 } 2>&1 | tee "$ARTIFACT_DIR/cold-warm.txt"
 target/release/talon-loadgen --addr "127.0.0.1:$WORKER_PORT" \
-  --container "$BUCKET" --object bench --range 65536 \
+  --backend s3 --container "$BUCKET" --object bench --range 65536 \
   --conns 1,32,128 --seconds "$BENCH_SECONDS" --warmup 2 --json |
   tee "$ARTIFACT_DIR/l1-benchmark.jsonl"
 [[ "$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l1"}')" -gt 0 ]] ||
@@ -602,7 +602,7 @@ start_coordinator_forward
 TARGET_POD="$(first_worker)"
 start_worker_forward "$TARGET_POD"
 target/release/talon-loadgen --addr "127.0.0.1:$WORKER_PORT" \
-  --container "$BUCKET" --object bench --range 65536 \
+  --backend s3 --container "$BUCKET" --object bench --range 65536 \
   --conns 1,32,128 --seconds "$BENCH_SECONDS" --warmup 2 --json |
   tee "$ARTIFACT_DIR/l2-benchmark.jsonl"
 [[ "$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l2"}')" -gt 0 ]] ||

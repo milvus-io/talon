@@ -255,7 +255,7 @@ CONNS=1,512,2048 SECONDS_PER=30 scripts/dataplane_loadtest.sh
 cargo bench -p talon-worker --bench dataplane_benches
 
 # Drive an already-running worker, sampling its CPU and RSS
-talon-loadgen --addr 127.0.0.1:7001 --conns 1024 --server-pid "$(pgrep -x talon-worker)"
+talon-loadgen --addr 127.0.0.1:7001 --backend az --conns 1024 --server-pid "$(pgrep -x talon-worker)"
 
 # Confirm SO_REUSEPORT: N listeners on one port
 talon-worker --data-plane-rings 2 --listen 127.0.0.1:7001
