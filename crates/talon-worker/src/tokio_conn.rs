@@ -9,8 +9,8 @@
 //! # Why this path pays for sendfile
 //!
 //! A Tokio `TcpStream` is non-blocking, so a blocking `sendfile(2)` on it would
-//! spuriously `EAGAIN`. [`sendfile_payload`] therefore round-trips the socket out
-//! of and back into the runtime on **every transfer**: `into_std`,
+//! spuriously `EAGAIN`. The `sendfile_payload` helper therefore round-trips the
+//! socket out of and back into the runtime on **every transfer**: `into_std`,
 //! `set_nonblocking(false)`, move to the blocking pool, move back,
 //! `set_nonblocking(true)`, `from_std`. The ring path needs none of that (see the
 //! module docs on `uring_conn`), which is a large part of why it is the default.
