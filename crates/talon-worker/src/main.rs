@@ -308,6 +308,7 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let inflight = Arc::new(InFlightLoads::new());
+    let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
     let node = NodeInfo {
         id: NodeId::new(
             cfg.node_id
@@ -319,11 +320,12 @@ async fn main() -> anyhow::Result<()> {
         address: cfg.advertise_addr.clone(),
         role: NodeRole::Worker,
     };
-    let observability = Arc::new(WorkerObservability::new(
+    let observability = Arc::new(WorkerObservability::new_with_backend(
         cfg.cluster_id.clone(),
         node.clone(),
         cfg.admin_listen.clone(),
         cfg.capacity_bytes,
+        backend_kind,
         Arc::clone(&index),
         Arc::clone(&inflight),
     )?);
@@ -408,7 +410,6 @@ async fn main() -> anyhow::Result<()> {
 
     // Select the object-store backend from config (default: azure). Each backend
     // reads its endpoint from config and its secret from the environment only.
-    let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
     let backend: Arc<dyn BackendStore> = match backend_kind {
         "azure" => Arc::new(build_azure_backend(&cfg, http)?),
         "s3" => Arc::new(build_s3_backend(&cfg, http)?),

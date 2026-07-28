@@ -22,8 +22,6 @@ use tokio::net::TcpListener;
 
 use crate::{BlockIndex, InFlightLoads};
 
-const BACKEND_LABELS: &[(&str, &str)] = &[("backend", "azure")];
-
 /// Pre-registered metric handles used on worker hot paths.
 #[derive(Clone)]
 pub struct WorkerMetrics {
@@ -80,7 +78,13 @@ impl Drop for ActiveConnectionGuard {
 impl WorkerMetrics {
     /// Create all worker metric families and initialize configured capacity.
     pub fn new(configured_capacity_bytes: u64) -> Self {
+        Self::new_with_backend(configured_capacity_bytes, "azure")
+    }
+
+    /// Create worker metrics labeled with the configured object-store backend.
+    pub fn new_with_backend(configured_capacity_bytes: u64, backend: &str) -> Self {
         let registry = Metrics::new();
+        let backend_labels = labels(&[("backend", backend)]);
         registry
             .gauge(
                 "talon_worker_build_info",
@@ -147,42 +151,42 @@ impl WorkerMetrics {
         let backend_fetch_bytes_total = registry.counter(
             "talon_worker_backend_fetch_bytes_total",
             "Bytes fetched from the origin backend.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_fetch_errors_total = registry.counter(
             "talon_worker_backend_fetch_errors_total",
             "Origin backend range fetch failures.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_retries_total = registry.counter(
             "talon_worker_backend_retries_total",
             "Origin backend requests re-issued after a transient failure.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_timeouts_total = registry.counter(
             "talon_worker_backend_timeouts_total",
             "Origin backend request attempts that exceeded their deadline.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_write_bytes_total = registry.counter(
             "talon_worker_backend_write_bytes_total",
             "Bytes written through to the origin backend.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_write_errors_total = registry.counter(
             "talon_worker_backend_write_errors_total",
             "Origin backend object PUT failures.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_delete_total = registry.counter(
             "talon_worker_backend_delete_total",
             "Objects deleted from the origin backend.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let backend_delete_errors_total = registry.counter(
             "talon_worker_backend_delete_errors_total",
             "Origin backend object DELETE failures.",
-            labels(BACKEND_LABELS),
+            backend_labels.clone(),
         );
         let evictions_total = registry.counter(
             "talon_worker_evictions_total",
@@ -207,7 +211,7 @@ impl WorkerMetrics {
         let backend_fetch_duration_seconds = registry.histogram(
             "talon_worker_backend_fetch_duration_seconds",
             "Origin backend range fetch latency in seconds.",
-            labels(BACKEND_LABELS),
+            backend_labels,
         );
         let active_connections = registry.gauge(
             "talon_worker_active_connections",
@@ -608,6 +612,27 @@ impl WorkerObservability {
         index: Arc<BlockIndex>,
         inflight: Arc<InFlightLoads>,
     ) -> std::io::Result<Self> {
+        Self::new_with_backend(
+            cluster_id,
+            node,
+            admin_address,
+            capacity_bytes,
+            "azure",
+            index,
+            inflight,
+        )
+    }
+
+    /// Create worker observability labeled with the selected object-store backend.
+    pub fn new_with_backend(
+        cluster_id: String,
+        node: NodeInfo,
+        admin_address: String,
+        capacity_bytes: u64,
+        backend: &str,
+        index: Arc<BlockIndex>,
+        inflight: Arc<InFlightLoads>,
+    ) -> std::io::Result<Self> {
         Ok(Self {
             node,
             cluster_id,
@@ -617,7 +642,7 @@ impl WorkerObservability {
             started_at_unix_ms: now_unix_ms(),
             started: Instant::now(),
             heartbeat_seq: AtomicU64::new(0),
-            metrics: WorkerMetrics::new(capacity_bytes),
+            metrics: WorkerMetrics::new_with_backend(capacity_bytes, backend),
             readiness: WorkerReadiness::default(),
             index,
             inflight,
@@ -798,6 +823,16 @@ mod tests {
             )
             .unwrap(),
         )
+    }
+
+    #[test]
+    fn backend_metrics_use_the_configured_backend_label() {
+        let metrics = WorkerMetrics::new_with_backend(4096, "s3");
+        metrics.record_backend_fetch_success(1024, Duration::from_millis(5));
+
+        let rendered = metrics.render();
+        assert!(rendered.contains("talon_worker_backend_fetch_bytes_total{backend=\"s3\"} 1024"));
+        assert!(!rendered.contains("backend=\"azure\""));
     }
 
     #[test]
