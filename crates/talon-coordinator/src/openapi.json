@@ -77,6 +77,19 @@
         }
       }
     },
+    "/api/v1/capabilities": {
+      "get": {
+        "summary": "Cluster capabilities",
+        "description": "Optional metadata-store capabilities this cluster offers, with their own revision. Capability is a property of the cluster, not of a mount: two Talon clusters may legitimately offer different POSIX semantics. The revision advances on configuration change and never on membership change, so it is distinct from the placement epoch.",
+        "responses": {
+          "200": {
+            "description": "Advertised capabilities.",
+            "content": { "application/json": { "schema": { "$ref": "#/components/schemas/CapabilitiesView" } } }
+          },
+          "503": { "$ref": "#/components/responses/BackendUnavailable" }
+        }
+      }
+    },
     "/api/v1/openapi.json": {
       "get": {
         "summary": "This OpenAPI document",
@@ -163,6 +176,27 @@
           "ready": { "type": "boolean" },
           "revision": { "type": "string" },
           "snapshot_age_ms": { "type": "integer", "format": "int64" },
+          "meta": { "$ref": "#/components/schemas/ResponseMeta" }
+        }
+      },
+      "CapabilitiesView": {
+        "type": "object",
+        "required": ["advertised", "revision", "store_reachable", "meta"],
+        "properties": {
+          "advertised": {
+            "type": "array",
+            "description": "Capabilities this cluster offers. Empty when no metadata store is configured, which remains a complete, supported deployment.",
+            "items": { "type": "string", "enum": ["locks", "hard_links", "write_back"] }
+          },
+          "revision": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Revision of the advertised set. Advances on configuration change, never on membership change."
+          },
+          "store_reachable": {
+            "type": "boolean",
+            "description": "Whether the metadata store is currently reachable. Always true when nothing is configured. Reported separately from the set so that 'not configured' and 'configured but unreachable' remain distinguishable."
+          },
           "meta": { "$ref": "#/components/schemas/ResponseMeta" }
         }
       },

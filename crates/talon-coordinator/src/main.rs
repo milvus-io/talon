@@ -91,6 +91,11 @@ struct Args {
 }
 
 impl Args {
+    // With neither `etcd` nor `kubernetes` enabled, every remaining field is
+    // listed explicitly below and the struct update becomes a no-op that clippy
+    // rejects under -D warnings. It is still required when either feature is
+    // on, so it cannot simply be deleted -- hence the allow rather than a fix.
+    #[allow(clippy::needless_update)]
     fn into_patch(self) -> CoordinatorConfigPatch {
         CoordinatorConfigPatch {
             listen: self.listen,

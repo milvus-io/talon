@@ -2537,6 +2537,7 @@ dependencies = [
  "serde",
  "serde_json",
  "talon-core",
+ "talon-metadata",
  "talon-transport",
  "thiserror 2.0.19",
  "tokio",
