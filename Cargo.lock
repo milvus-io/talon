@@ -2583,6 +2583,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-metadata"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "serde",
+ "thiserror 2.0.19",
+ "tracing",
+]
+
+[[package]]
 name = "talon-observability"
 version = "0.1.0"
 dependencies = [
