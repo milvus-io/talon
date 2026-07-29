@@ -10,6 +10,14 @@ This document records the v1 architecture decisions. It is intentionally scoped:
 several harder problems (replication, coordinator HA, write-back) are explicitly
 deferred until workload data justifies them.
 
+> **Status note.** This is a historical record of the v1 decisions, not a
+> description of current behaviour. The FUSE client has since grown a write
+> path — `create`, `write`, `mkdir`, `rename`, `unlink`, `symlink`, `link`,
+> `setattr`, and `fsync` are all implemented (`crates/talon-fuse/src/mount.rs`)
+> — so the "read-only" framing below applies to v1 only. Write-back to the
+> backing store and POSIX locking remain unimplemented; see
+> [ADR 0002](docs/adr/) and [ADR 0003](docs/adr/) for where that work stands.
+
 ## Goals
 
 - Cache large, immutable objects (checkpoints, datasets) close to compute.
