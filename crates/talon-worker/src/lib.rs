@@ -22,6 +22,7 @@ pub mod staging;
 pub mod tokio_conn;
 pub mod uring_conn;
 pub mod uring_serve;
+pub mod wal;
 pub mod write_cache;
 
 pub use block_store::WholeBlockStore;
