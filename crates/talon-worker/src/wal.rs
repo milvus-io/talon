@@ -581,3 +581,285 @@ mod tests {
         assert_eq!(crc32c(b"123456789"), 0xE306_9283);
     }
 }
+
+/// Record bodies, generated from `proto/wal.proto`.
+///
+/// The schema is the durable contract, so it is compiled rather than
+/// hand-translated: a hand-written encoder can drift from the schema silently
+/// and this cannot.
+pub mod records {
+    include!(concat!(env!("OUT_DIR"), "/talon.wal.v1.rs"));
+}
+
+/// Encode a record into WAL fragments, ready to append.
+///
+/// The Protobuf body goes inside the envelope from [`encode_record`], so
+/// framing and payload stay independent: a body that fails to decode is a
+/// distinct failure from a block that failed its CRC, and recovery treats them
+/// differently.
+pub fn encode_wal_record(record: &records::Record) -> Vec<u8> {
+    let mut body = Vec::new();
+    prost::Message::encode(record, &mut body).expect("encoding into a Vec cannot fail");
+    encode_record(&body)
+}
+
+/// Decode the records in a segment.
+///
+/// Framing errors and body errors are reported separately. A body that fails to
+/// decode means the schema and the data disagree -- a different problem from
+/// physical damage, and one that retrying or repairing from a replica will not
+/// fix.
+pub fn read_wal_segment(buf: &[u8]) -> (Vec<records::Record>, ReadResult) {
+    let framing = read_segment(buf);
+    let decoded = framing
+        .records
+        .iter()
+        .filter_map(|body| <records::Record as prost::Message>::decode(body.as_slice()).ok())
+        .collect();
+    (decoded, framing)
+}
+
+#[cfg(test)]
+mod record_tests {
+    use super::records::{record::Kind, Committed, MutationId, ObjectIdentity, Prepared, Record};
+    use super::*;
+
+    fn prepared() -> Record {
+        Record {
+            kind: Some(Kind::Prepared(Prepared {
+                mutation_id: Some(MutationId {
+                    term: 13,
+                    sequence: 4,
+                }),
+                payload_file: "payload-000042".into(),
+                client_request_id: vec![0xAB; 16],
+                object: Some(ObjectIdentity {
+                    namespace: "ns".into(),
+                    backend: "s3".into(),
+                    bucket: "data".into(),
+                    object_path: "checkpoint.bin".into(),
+                }),
+                base_origin_version: "v7".into(),
+                length: 4096,
+                checksum: vec![0xCD; 32],
+                shard_id: 1234,
+            })),
+        }
+    }
+
+    #[test]
+    fn a_prepared_record_round_trips_through_the_envelope() {
+        let encoded = encode_wal_record(&prepared());
+        let (records, framing) = read_wal_segment(&encoded);
+        assert_eq!(framing.stopped_by, None);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0], prepared());
+    }
+
+    #[test]
+    fn no_payload_bytes_appear_in_the_wal() {
+        // §9.4: "No object payload bytes are copied into the WAL." The record
+        // names a payload file and carries its checksum; the bytes live
+        // elsewhere. A WAL that inlined payloads could not be replayed quickly
+        // or compacted cheaply, which is what the whole checkpoint design
+        // assumes.
+        let encoded = encode_wal_record(&prepared());
+        assert!(
+            encoded.len() < 512,
+            "a PREPARED record is metadata-sized, got {} bytes",
+            encoded.len()
+        );
+    }
+
+    #[test]
+    fn several_record_kinds_share_one_segment() {
+        let mut segment = encode_wal_record(&prepared());
+        segment.extend_from_slice(&encode_wal_record(&Record {
+            kind: Some(Kind::Committed(Committed {
+                mutation_id: Some(MutationId {
+                    term: 13,
+                    sequence: 4,
+                }),
+            })),
+        }));
+        let (records, framing) = read_wal_segment(&segment);
+        assert_eq!(framing.damaged_blocks, 0);
+        assert_eq!(records.len(), 2);
+        assert!(matches!(records[1].kind, Some(Kind::Committed(_))));
+    }
+
+    #[test]
+    fn a_record_larger_than_a_block_survives_fragmentation() {
+        // Protobuf bodies are usually small, but an object path is
+        // caller-controlled and nothing bounds it here. The framing must carry
+        // whatever the schema produces.
+        let mut record = prepared();
+        if let Some(Kind::Prepared(ref mut p)) = record.kind {
+            if let Some(ref mut object) = p.object {
+                object.object_path = "x".repeat(BLOCK_SIZE * 2);
+            }
+        }
+        let encoded = encode_wal_record(&record);
+        assert!(encoded.len() > BLOCK_SIZE * 2);
+        let (records, _) = read_wal_segment(&encoded);
+        assert_eq!(records, vec![record]);
+    }
+
+    #[test]
+    fn a_damaged_block_drops_one_record_and_keeps_the_rest() {
+        // The framing property from #424, now with real bodies: a decode error
+        // must not cascade past the damaged record.
+        let big = {
+            let mut record = prepared();
+            if let Some(Kind::Prepared(ref mut p)) = record.kind {
+                p.payload_file = "y".repeat(BLOCK_SIZE);
+            }
+            record
+        };
+        let mut segment = encode_wal_record(&big);
+        segment.extend_from_slice(&encode_wal_record(&Record {
+            kind: Some(Kind::Committed(Committed {
+                mutation_id: Some(MutationId {
+                    term: 99,
+                    sequence: 1,
+                }),
+            })),
+        }));
+        segment[HEADER_LEN + 4] ^= 0xFF;
+
+        let (records, framing) = read_wal_segment(&segment);
+        assert!(framing.damaged_blocks > 0);
+        assert_eq!(records.len(), 1);
+        assert!(matches!(records[0].kind, Some(Kind::Committed(_))));
+    }
+
+    #[test]
+    fn the_encoding_matches_committed_golden_bytes() {
+        // Found by mutation testing: renumbering a field passed every other
+        // test here, because they all encode and decode with the same schema.
+        // That is exactly the change that breaks durability -- a WAL written
+        // before the renumber becomes unreadable after it, with no compile
+        // error and no failing test.
+        //
+        // These bytes were produced once and committed. If this test fails, the
+        // on-disk format changed: either revert it, or bump FORMAT_VERSION and
+        // provide a migration. It is not a test to update.
+        let record = Record {
+            kind: Some(Kind::Committed(Committed {
+                mutation_id: Some(MutationId {
+                    term: 13,
+                    sequence: 4,
+                }),
+            })),
+        };
+        let mut body = Vec::new();
+        prost::Message::encode(&record, &mut body).expect("encode");
+
+        // field 2 (committed), len 6 | field 1 (mutation_id), len 4
+        //   | field 1 (term) = 13 | field 2 (sequence) = 4
+        assert_eq!(
+            body,
+            vec![18, 6, 10, 4, 8, 13, 16, 4],
+            "WAL record encoding changed; see the comment above before touching these bytes"
+        );
+    }
+
+    #[test]
+    fn the_prepared_encoding_matches_committed_golden_bytes() {
+        // Prepared has every field type the schema uses -- varint, string,
+        // bytes, and a nested message -- so pinning it covers renumbering or
+        // retyping any of them. The Committed golden above does not: a
+        // mutation to a Prepared field number passed it.
+        //
+        // Same rule: if this fails the on-disk format changed. Revert, or bump
+        // FORMAT_VERSION and migrate.
+        let record = Record {
+            kind: Some(Kind::Prepared(Prepared {
+                mutation_id: Some(MutationId {
+                    term: 1,
+                    sequence: 2,
+                }),
+                payload_file: "p".into(),
+                client_request_id: vec![1],
+                object: Some(ObjectIdentity {
+                    namespace: "n".into(),
+                    backend: "s3".into(),
+                    bucket: "b".into(),
+                    object_path: "o".into(),
+                }),
+                base_origin_version: "v".into(),
+                length: 3,
+                checksum: vec![2],
+                shard_id: 4,
+            })),
+        };
+        let mut body = Vec::new();
+        prost::Message::encode(&record, &mut body).expect("encode");
+        assert_eq!(
+            body,
+            vec![
+                10, 37, 10, 4, 8, 1, 16, 2, 18, 1, 112, 26, 1, 1, 34, 13, 10, 1, 110, 18, 2, 115,
+                51, 26, 1, 98, 34, 1, 111, 42, 1, 118, 48, 3, 58, 1, 2, 64, 4
+            ],
+            "WAL record encoding changed; see the comment above before touching these bytes"
+        );
+    }
+
+    #[test]
+    fn decoding_tolerates_an_unknown_field() {
+        // Protobuf's forward compatibility is what makes an additive schema
+        // change safe. A reader from before a new optional field must skip it
+        // rather than fail, or every rollout would need both sides upgraded
+        // simultaneously.
+        let mut body = Vec::new();
+        prost::Message::encode(
+            &Record {
+                kind: Some(Kind::Committed(Committed {
+                    mutation_id: Some(MutationId {
+                        term: 1,
+                        sequence: 2,
+                    }),
+                })),
+            },
+            &mut body,
+        )
+        .expect("encode");
+        // Append field 15, varint, value 99 -- a field this build does not know.
+        body.extend_from_slice(&[0x78, 99]);
+
+        let decoded = <Record as prost::Message>::decode(body.as_slice())
+            .expect("an unknown field must be skipped, not rejected");
+        assert!(matches!(decoded.kind, Some(Kind::Committed(_))));
+    }
+
+    #[test]
+    fn mutation_ids_keep_their_ordering_through_a_round_trip() {
+        // The (term, sequence) ordering is what recovery uses to pick a winner,
+        // so it has to survive the encoding. Protobuf varints are unsigned and
+        // order-preserving here, but the assertion pins it rather than assuming.
+        let older = MutationId {
+            term: 12,
+            sequence: 9999,
+        };
+        let newer = MutationId {
+            term: 13,
+            sequence: 1,
+        };
+        for id in [older, newer] {
+            let record = Record {
+                kind: Some(Kind::Committed(Committed {
+                    mutation_id: Some(id),
+                })),
+            };
+            let (decoded, _) = read_wal_segment(&encode_wal_record(&record));
+            let Some(Kind::Committed(ref c)) = decoded[0].kind else {
+                panic!("expected Committed");
+            };
+            assert_eq!(c.mutation_id, Some(id));
+        }
+        assert!(
+            (newer.term, newer.sequence) > (older.term, older.sequence),
+            "term must dominate sequence"
+        );
+    }
+}

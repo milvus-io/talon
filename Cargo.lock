@@ -2645,6 +2645,8 @@ dependencies = [
  "divan",
  "libc",
  "monoio",
+ "prost",
+ "prost-build",
  "serde",
  "serde_json",
  "talon-backend",

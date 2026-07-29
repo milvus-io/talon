@@ -1,0 +1,164 @@
+// Durable record bodies for the write-back WAL (ADR 0003 §9.4).
+//
+// Protobuf rather than a derived Rust encoding, because the ADR requires it:
+//
+//   Rust `serde`/`bincode` and JSON are not durable on-disk formats for this
+//   protocol
+//
+// The reasoning is the same one that rules out DefaultHasher for shard
+// placement in §9.1. A derived encoding is whatever the current library version
+// emits; a dependency bump can change it with no compile error and no code
+// change here, which for durable data means silently failing to read what was
+// written yesterday. Protobuf's wire format is specified independently of any
+// implementation, and field numbers below are part of the on-disk contract.
+//
+// Rules for changing this file:
+//   - never reuse a field number, even for a field that was removed;
+//   - never change a field's type or number;
+//   - adding an optional field is safe, and old readers ignore it;
+//   - anything else needs a WAL format version bump in wal.rs.
+
+syntax = "proto3";
+
+package talon.wal.v1;
+
+// Identifies one mutation within a shard.
+//
+// Ordered lexicographically by (term, sequence). The term leads because a
+// worker's local sequence is process-monotonic and reseeded from a local scan,
+// so two workers' sequences are unrelated -- only a TMS compare-and-swap can
+// advance a term. See §9.4 and the ordering discussion in
+// talon-metadata::recovery.
+message MutationId {
+  uint64 term = 1;
+  uint64 sequence = 2;
+}
+
+// The object a mutation applies to.
+//
+// This is the write identity from §9.1: no version, ETag, offset, or block
+// size. Every generation of a file shares it.
+message ObjectIdentity {
+  string namespace = 1;
+  string backend = 2;
+  string bucket = 3;
+  string object_path = 4;
+}
+
+// A mutation whose payload and manifest are durable on this replica, but which
+// was not acknowledged to the client.
+//
+// §9.4: "The payload is durable before `PREPARED` can become durable." The
+// ordering matters for recovery -- a PREPARED record whose payload is missing
+// means the payload write was lost, not that the record is premature.
+//
+// No payload bytes appear here. §9.4: "No object payload bytes are copied into
+// the WAL." The WAL stays metadata-sized so it can be replayed quickly and
+// compacted cheaply.
+message Prepared {
+  MutationId mutation_id = 1;
+  // Name of the payload file this record refers to.
+  string payload_file = 2;
+  // 128-bit random value, so a retry after an ambiguous completion returns the
+  // existing result instead of creating a second mutation (§9.5).
+  bytes client_request_id = 3;
+  ObjectIdentity object = 4;
+  // Origin version this mutation was formed against, used as the conditional
+  // PUT precondition so accidental external modification is detected rather
+  // than silently overwritten (§9.9).
+  string base_origin_version = 5;
+  uint64 length = 6;
+  // BLAKE3 of the payload file.
+  bytes checksum = 7;
+  uint32 shard_id = 8;
+}
+
+// The mutation was acknowledged to the client: its commit record reached W
+// replicas.
+//
+// Recovery keeps committed mutations and discards uncommitted prepares (§9.8),
+// because discarding a prepare cannot break a promise while keeping it could
+// resurrect a write the client believes failed.
+message Committed {
+  MutationId mutation_id = 1;
+}
+
+// The mutation reached the origin.
+message Flushed {
+  MutationId mutation_id = 1;
+  // Version the origin returned, which fences later reads against serving an
+  // older cached block (§9.9).
+  string origin_version = 2;
+}
+
+// The bounded retry ladder was exhausted (§9.9).
+//
+// Attempt count is replicated state rather than a local counter, so owner
+// failover cannot reset the budget and create a retry-forever loop.
+message Failed {
+  MutationId mutation_id = 1;
+  uint32 attempts = 2;
+  // Classified error, not a raw message: it drives operator alerting and must
+  // stay stable across versions.
+  string error_class = 3;
+}
+
+// The origin rejected the conditional PUT because it changed underneath.
+//
+// Parked for an operator. No policy discards the acknowledged Talon version
+// automatically (§9.9).
+message Conflict {
+  MutationId mutation_id = 1;
+  // Version observed at the origin when the conflict was detected.
+  string observed_origin_version = 2;
+}
+
+// The payload was copied to the conflict prefix for inspection.
+//
+// Not a resolution: §9.9's export_then_manual "keeps serving the Talon version
+// until an operator resolves the conflict".
+message Exported {
+  MutationId mutation_id = 1;
+  string export_path = 2;
+}
+
+// An operator discarded the mutation and accepted the origin's version.
+//
+// The only path that destroys acknowledged data, which is why the record
+// carries who did it -- every resolution is audited with actor and result
+// (§9.9).
+message Abandoned {
+  MutationId mutation_id = 1;
+  string actor = 2;
+}
+
+// Names a checkpoint snapshot and the WAL position it covers.
+//
+// §9.4's compaction protocol writes the snapshot, fsyncs it, renames it,
+// fsyncs the directory, then appends this record -- and only then deletes
+// covered segments. A crash before this record leaves an ignorable snapshot; a
+// crash after it can replay the snapshot plus later WAL.
+message Checkpoint {
+  string snapshot_file = 1;
+  // Segment and offset the snapshot is current as of.
+  uint64 segment_index = 2;
+  uint64 segment_offset = 3;
+  bytes snapshot_checksum = 4;
+}
+
+// One WAL record.
+//
+// A oneof rather than a type tag plus opaque bytes, so an unknown variant is a
+// decode error at the boundary instead of a mis-parse deeper in.
+message Record {
+  oneof kind {
+    Prepared prepared = 1;
+    Committed committed = 2;
+    Flushed flushed = 3;
+    Failed failed = 4;
+    Conflict conflict = 5;
+    Exported exported = 6;
+    Abandoned abandoned = 7;
+    Checkpoint checkpoint = 8;
+  }
+}
