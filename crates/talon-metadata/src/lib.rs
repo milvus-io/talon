@@ -59,17 +59,22 @@
 #![warn(missing_docs)]
 
 mod capability;
+pub mod contract;
 mod error;
+mod memory;
 mod record;
 mod revision;
+mod transaction;
 
 pub use capability::{Capability, CapabilitySet};
 pub use error::{MetadataBackend, MetadataError, MetadataResult};
+pub use memory::{MemoryMetadataStore, NamespaceSnapshot};
 pub use record::{
     InodeNumber, InodeRecord, LinkCount, LinkTransition, LinkTransitionState, NamespaceId,
     PathIndexEntry,
 };
 pub use revision::{MappingRevision, StoreRevision};
+pub use transaction::{Operation, Precondition, Transaction, TransactionOutcome};
 
 use async_trait::async_trait;
 
