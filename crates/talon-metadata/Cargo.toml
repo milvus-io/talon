@@ -9,9 +9,17 @@ description = "Optional Metadata Store (TMS) for facts that cannot be derived fr
 
 [dependencies]
 thiserror.workspace = true
+etcd-client = { workspace = true, optional = true }
+tonic = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true, features = ["time"] }
 serde.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "time"] }
+
+[features]
+# Production etcd TMS backend. Off by default so non-etcd builds do not pull in
+# the gRPC/TLS stack, mirroring talon-coordinator's etcd feature.
+etcd = ["dep:etcd-client", "dep:tonic", "dep:tokio"]

@@ -94,18 +94,7 @@ impl MemoryMetadataStore {
         })
     }
 
-    /// Apply a transaction atomically.
-    ///
-    /// Every precondition is evaluated against one view before any operation is
-    /// applied, so a failure leaves the store untouched. This is the property
-    /// §5's promotion commit depends on.
-    ///
-    /// # Errors
-    ///
-    /// [`MetadataError::CompareAndSwapFailed`] when a precondition does not
-    /// hold, or [`MetadataError::CapabilityUnsupported`] when hard links are not
-    /// advertised.
-    pub fn commit(&self, transaction: &Transaction) -> MetadataResult<TransactionOutcome> {
+    fn commit_locked(&self, transaction: &Transaction) -> MetadataResult<TransactionOutcome> {
         self.require(Capability::HardLinks)?;
         let mut state = self.state.lock().expect("metadata state mutex poisoned");
 
@@ -369,5 +358,9 @@ impl MetadataStore for MemoryMetadataStore {
             .ok_or_else(|| MetadataError::NotFound {
                 key: format!("inode/{inode}"),
             })
+    }
+
+    async fn commit(&self, transaction: &Transaction) -> MetadataResult<TransactionOutcome> {
+        self.commit_locked(transaction)
     }
 }
