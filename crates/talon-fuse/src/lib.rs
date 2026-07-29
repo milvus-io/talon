@@ -5,6 +5,7 @@
 //! into object store operations against the cluster.
 
 pub mod block_reader;
+pub mod capability;
 pub mod coordinator_client;
 pub(crate) mod lock;
 pub mod mapping;
