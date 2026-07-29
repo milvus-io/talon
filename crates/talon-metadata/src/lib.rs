@@ -70,6 +70,7 @@ mod memory;
 mod record;
 mod revision;
 pub mod scrub;
+pub mod shard;
 mod transaction;
 
 pub use capability::{Capability, CapabilitySet};
