@@ -173,14 +173,9 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
         Ok(s) => s,
         Err(e) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {e}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&e, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {e}");
-            return;
         }
     };
 
@@ -210,6 +205,69 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
 
 /// Shared object store for the read-write mock worker: object path → bytes.
 type Store = Arc<Mutex<HashMap<String, Vec<u8>>>>;
+
+/// What the caller should do about a failed mount.
+enum MountFailure {
+    /// FUSE is unavailable and not required: the test returns without asserting.
+    Skip,
+}
+
+/// Classify a failed mount, distinguishing an environment that refuses from a
+/// mount that failed for some other reason.
+///
+/// Both arrive here as one `io::Error`, and until #405 they produced the same
+/// message. That mattered because a runner-side refusal fails *every* mount test
+/// in the same second, which reads exactly like a broad regression — so the
+/// signal has to say which one it is, and say it in a form that can be grepped
+/// out of a CI log.
+///
+/// `EPERM` from `fusermount3` means the environment declined: no `/dev/fuse`
+/// access, missing `SYS_ADMIN`, or a restricted sandbox. That is not a statement
+/// about Talon. Anything else is a genuine mount failure and must stay loud.
+#[must_use = "a skip must return from the test, not continue into the assertions"]
+fn classify_mount_failure(error: &std::io::Error, require_fuse: bool) -> MountFailure {
+    let text = error.to_string();
+    // fusermount3 reports the refusal in its message rather than in the errno of
+    // the spawn call, so match on both.
+    // Three shapes of "the environment cannot provide FUSE", all of which say
+    // nothing about Talon:
+    //   - EPERM: /dev/fuse exists but the mount is refused (missing SYS_ADMIN,
+    //     restricted sandbox). This is what the runner produces in #405.
+    //   - ENOENT: no /dev/fuse at all.
+    //   - EACCES: present but not openable by this user.
+    // fusermount3 reports some of these in its message rather than in the errno
+    // of the spawn call, so match on both.
+    let environment_refused = matches!(
+        error.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::NotFound
+    ) || text.contains("Operation not permitted")
+        || text.contains("Permission denied")
+        || text.contains("No such file or directory");
+
+    if !require_fuse {
+        // A skip is a pass by design: this suite is #[ignore]d and runs on
+        // machines that legitimately lack FUSE. The caller returns; panicking
+        // or exiting here would turn a supported configuration into a failure.
+        eprintln!("skipping: /dev/fuse unavailable: {error}");
+        return MountFailure::Skip;
+    }
+
+    if environment_refused {
+        panic!(
+            "TALON-FUSE-ENV-REFUSED: this environment cannot provide a FUSE mount \
+             ({error}). Not a Talon regression -- /dev/fuse is missing, not \
+             openable, or the mount was refused (no SYS_ADMIN, restricted \
+             sandbox). See #405. Expect every mount test in this job to fail \
+             identically and in the same second; a real regression looks \
+             different."
+        );
+    }
+    panic!(
+        "TALON-FUSE-MOUNT-FAILED: the FUSE mount failed for a reason other than \
+         environment refusal: {error}. This one is worth investigating as a real \
+         failure."
+    );
+}
 
 async fn serialize_mount_test() -> tokio::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
@@ -328,14 +386,9 @@ async fn mount_write_through_is_visible_in_backend() {
         Ok(s) => s,
         Err(e) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {e}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&e, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {e}");
-            return;
         }
     };
 
@@ -437,11 +490,9 @@ async fn mount_large_sparse_write_streams_without_whole_object_memory() {
             Ok(session) => session,
             Err(error) => {
                 std::fs::remove_dir_all(&mountpoint).ok();
-                if require_fuse {
-                    panic!("TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}");
+                match classify_mount_failure(&error, require_fuse) {
+                    MountFailure::Skip => return,
                 }
-                eprintln!("skipping: /dev/fuse unavailable: {error}");
-                return;
             }
         };
 
@@ -519,14 +570,9 @@ async fn mount_open_flags_preserve_and_replace_blob_contents() {
         Ok(s) => s,
         Err(e) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {e}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&e, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {e}");
-            return;
         }
     };
 
@@ -631,14 +677,9 @@ async fn mount_directory_markers_are_written_through() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -744,14 +785,9 @@ async fn mount_truncate_and_ftruncate_are_written_through() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -845,14 +881,9 @@ async fn mount_regular_file_rename_is_written_through() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -954,14 +985,9 @@ async fn mount_directory_tree_rename_is_written_through() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -1063,14 +1089,9 @@ async fn mount_unlink_preserves_open_descriptors_without_recreating_the_name() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -1182,14 +1203,9 @@ async fn mount_symbolic_links_are_written_through() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -1308,14 +1324,9 @@ async fn mount_hard_links_to_objects_are_refused() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -1468,14 +1479,9 @@ async fn mount_timestamp_updates_follow_utimens_semantics() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
@@ -1588,14 +1594,9 @@ async fn mount_special_nodes_are_namespace_only() {
         Ok(session) => session,
         Err(error) => {
             std::fs::remove_dir_all(&mountpoint).ok();
-            if require_fuse {
-                panic!(
-                    "TALON_REQUIRE_FUSE is set but the FUSE mount failed: {error}. \
-                     The runner must provide an accessible /dev/fuse."
-                );
+            match classify_mount_failure(&error, require_fuse) {
+                MountFailure::Skip => return,
             }
-            eprintln!("skipping: /dev/fuse unavailable: {error}");
-            return;
         }
     };
 
