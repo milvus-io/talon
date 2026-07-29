@@ -30,6 +30,7 @@ use crate::ops::{
 use crate::prefetch::Prefetcher;
 use crate::readahead::ReadaheadConfig;
 use talon_core::ObjectId;
+use talon_metadata::ClusterCapabilities;
 
 /// How long the kernel may cache a metadata reply before re-asking.
 ///
@@ -209,6 +210,12 @@ pub struct TalonFuse {
     /// Shared pool for write/delete connections to workers (mirrors the read
     /// pool). Reused across write handles.
     write_pool: Arc<crate::pool::ConnectionPool>,
+    /// What this cluster offers, as discovered from a coordinator.
+    ///
+    /// Defaults to [`ClusterCapabilities::none`], which is the honest answer for
+    /// a cluster with no metadata store and keeps today's behaviour exactly
+    /// (ADR 0003 §1). Set via [`with_capabilities`](Self::with_capabilities).
+    capabilities: ClusterCapabilities,
 }
 
 impl TalonFuse {
@@ -237,7 +244,44 @@ impl TalonFuse {
             prefetchers: Mutex::new(HashMap::new()),
             read_write: false,
             write_pool: Arc::new(crate::pool::ConnectionPool::new()),
+            capabilities: ClusterCapabilities::none(),
         }
+    }
+
+    /// The errno for a lock request, and the log line that explains it.
+    ///
+    /// `EOPNOTSUPP` when the cluster does not implement distributed locking,
+    /// `ENOLCK` when it offers locking but the store is unreachable. Never a
+    /// success: §4 requires that "Talon never turns either case into a
+    /// successful mount-local lock".
+    fn lock_refusal(&self, operation: &'static str) -> i32 {
+        let code = crate::capability::lock_errno(&self.capabilities).unwrap_or({
+            // The cluster advertises locking, but the distributed lock path does
+            // not exist yet -- it needs its own ADR defining byte-range
+            // representation, fairness, waiter recovery, and deadlock detection.
+            // Refusing is the only honest answer until then.
+            crate::capability::errno::EOPNOTSUPP
+        });
+        tracing::debug!(
+            operation,
+            errno = code,
+            capability_revision = self.capabilities.revision.get(),
+            store_reachable = self.capabilities.store_reachable,
+            "refusing lock request; distributed locking is not available"
+        );
+        code
+    }
+
+    /// Record the capabilities discovered from a coordinator.
+    ///
+    /// Capability is a property of the *cluster*, not of this mount. ADR 0003
+    /// §4 is explicit that a mount flag "cannot silently opt into a weaker
+    /// contract", so this exists to carry what the cluster reported -- never to
+    /// let an operator enable something the cluster does not offer.
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: ClusterCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
     }
 
     /// Enable the write path (create/write/setattr/unlink/flush). When disabled
@@ -938,15 +982,101 @@ impl fuser::Filesystem for TalonFuse {
                 Err(error) => reply.error(errno(error)),
             };
         }
-        // Object-backed kinds would need a copy per link path. See the method
-        // doc and #363: divergence is inherent to that representation, not a
-        // bug in the fan-out, so this refuses rather than approximating.
-        tracing::debug!(
-            source = %plan.source_path,
-            target = %plan.target_path,
-            "refusing hard link to an object-backed file; requires inode indirection (#363)"
-        );
-        reply.error(libc::EPERM);
+        // Object-backed kinds need inode indirection (ADR 0003 §5); without it,
+        // a copy per link path can diverge and nothing reconciles it (#363).
+        //
+        // The errno distinguishes two cases §4 requires an application to be
+        // able to tell apart: EPERM when the cluster does not offer hard links
+        // at all, EAGAIN when it does but the metadata store is unreachable.
+        // One says stop asking, the other says retry.
+        match crate::capability::hard_link_errno(&self.capabilities) {
+            Some(code) => {
+                tracing::debug!(
+                    source = %plan.source_path,
+                    target = %plan.target_path,
+                    errno = code,
+                    capability_revision = self.capabilities.revision.get(),
+                    store_reachable = self.capabilities.store_reachable,
+                    "refusing hard link to an object-backed file; requires inode indirection (#363)"
+                );
+                reply.error(code);
+            }
+            None => {
+                // The cluster advertises hard links, but the inode indirection
+                // state machine (§5) is not implemented yet. Refusing is
+                // correct: committing the copy-per-path fan-out here is exactly
+                // the divergence #363 reports.
+                tracing::warn!(
+                    source = %plan.source_path,
+                    target = %plan.target_path,
+                    "cluster advertises hard links but inode indirection is not implemented; refusing"
+                );
+                reply.error(libc::EOPNOTSUPP);
+            }
+        }
+    }
+
+    /// Test a POSIX byte-range lock.
+    ///
+    /// Implemented deliberately, even though it can only refuse today. ADR 0003
+    /// §4:
+    ///
+    /// > The FUSE implementation must explicitly implement the `getlk`, `setlk`,
+    /// > and `flock` callbacks and forward them to the distributed lock path. It
+    /// > must not omit those callbacks and rely on a kernel or libfuse fallback,
+    /// > because such a fallback can make locks appear to work while only
+    /// > coordinating processes on one mount.
+    ///
+    /// That fallback is the danger: an application taking a lock on a shared
+    /// mount would believe it holds cluster-wide exclusion while actually
+    /// coordinating only with processes on the same host. It is the shape of
+    /// defect #363 reports for `link()`, in a different syscall, and it is worse
+    /// than a plain refusal because applications build on it.
+    ///
+    /// `fuser`'s own documentation confirms the mechanism: "if the locking
+    /// methods are not implemented, the kernel will still allow file locking to
+    /// work locally. Hence these are only interesting for network filesystems
+    /// and similar." Talon is such a filesystem.
+    ///
+    /// `flock` is not covered here: the `Filesystem` trait only gains that
+    /// callback at `abi-7-17`, and this crate targets `abi-7-9`. BSD advisory
+    /// locks on a Talon mount therefore still fall back to kernel-local
+    /// behaviour. Raising the ABI level changes the mount protocol for every
+    /// callback, so it is deliberately left to a follow-up rather than smuggled
+    /// in here (tracked in #392).
+    fn getlk(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+        reply: fuser::ReplyLock,
+    ) {
+        reply.error(self.lock_refusal("getlk"));
+    }
+
+    /// Acquire or release a POSIX byte-range lock.
+    ///
+    /// See `getlk` above for why this refuses rather than falling back to the
+    /// kernel.
+    fn setlk(
+        &mut self,
+        _req: &fuser::Request<'_>,
+        _ino: u64,
+        _fh: u64,
+        _lock_owner: u64,
+        _start: u64,
+        _end: u64,
+        _typ: i32,
+        _pid: u32,
+        _sleep: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        reply.error(self.lock_refusal("setlk"));
     }
 
     /// Create a regular file or mount-local POSIX special node.
@@ -1799,5 +1929,59 @@ mod tests {
         assert!(!ro.read_write, "adapter must default to read-only");
         let rw = adapter_with_readahead(4).with_read_write(true);
         assert!(rw.read_write, "with_read_write(true) enables writes");
+    }
+
+    #[test]
+    fn capability_errnos_match_libc() {
+        // crate::capability defines these itself so the mapping is testable in
+        // the default build, where libc is not a dependency. This is the check
+        // that keeps the two definitions honest.
+        use crate::capability::errno;
+        assert_eq!(errno::EPERM, libc::EPERM);
+        assert_eq!(errno::EAGAIN, libc::EAGAIN);
+        assert_eq!(errno::ENOLCK, libc::ENOLCK);
+        assert_eq!(errno::EOPNOTSUPP, libc::EOPNOTSUPP);
+    }
+
+    #[tokio::test]
+    async fn a_mount_defaults_to_advertising_nothing() {
+        // ADR 0003 §1: a cluster with no metadata store is a complete, supported
+        // deployment. The mount must not assume capabilities it was never told
+        // about.
+        let adapter = adapter_with_readahead(4);
+        assert!(adapter.capabilities.advertised.is_empty());
+        assert!(adapter.capabilities.store_reachable);
+    }
+
+    #[tokio::test]
+    async fn lock_requests_are_refused_and_never_silently_succeed() {
+        // The load-bearing assertion of ADR 0003 §4. A None here would mean the
+        // callback returns success, letting an application believe it holds
+        // cluster-wide exclusion while the kernel coordinates only local
+        // processes -- the #363 defect in a different syscall.
+        let adapter = adapter_with_readahead(4);
+        assert_eq!(adapter.lock_refusal("getlk"), libc::EOPNOTSUPP);
+
+        let offering_but_down = adapter_with_readahead(4).with_capabilities(ClusterCapabilities {
+            advertised: talon_metadata::CapabilitySet::none()
+                .with(talon_metadata::Capability::Locks),
+            revision: talon_metadata::CapabilityRevision::new(4),
+            store_reachable: false,
+        });
+        assert_eq!(
+            offering_but_down.lock_refusal("setlk"),
+            libc::ENOLCK,
+            "an unreachable lock service is ENOLCK, not EOPNOTSUPP"
+        );
+
+        // Advertised and reachable still refuses: the distributed lock path does
+        // not exist yet, and inventing a local approximation is what §4 forbids.
+        let offering = adapter_with_readahead(4).with_capabilities(ClusterCapabilities {
+            advertised: talon_metadata::CapabilitySet::none()
+                .with(talon_metadata::Capability::Locks),
+            revision: talon_metadata::CapabilityRevision::new(5),
+            store_reachable: true,
+        });
+        assert_eq!(offering.lock_refusal("getlk"), libc::EOPNOTSUPP);
     }
 }

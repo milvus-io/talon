@@ -2575,6 +2575,7 @@ dependencies = [
  "fuser",
  "libc",
  "talon-core",
+ "talon-metadata",
  "talon-transport",
  "tempfile",
  "thiserror 2.0.19",
