@@ -73,7 +73,7 @@ impl fmt::Display for StoreRevision {
 /// stops a client holding a cached path mapping from writing to an object that
 /// a concurrent hard-link promotion has already moved to inode-addressed
 /// storage.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct MappingRevision(u64);
 
 impl MappingRevision {
