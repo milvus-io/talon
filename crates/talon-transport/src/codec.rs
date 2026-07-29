@@ -21,7 +21,7 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 /// Bumped when [`ControlMessage`] changes in an incompatible way. Carried in
 /// the envelope so a peer can reject a mismatched schema instead of
 /// misinterpreting bytes.
-pub const CONTROL_SCHEMA_VERSION: u16 = 2;
+pub const CONTROL_SCHEMA_VERSION: u16 = 3;
 
 /// Oldest control schema this build can decode.
 pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
@@ -129,6 +129,38 @@ pub enum ControlMessage {
         /// Matching objects as `(mount-relative path, size in bytes)` pairs.
         entries: Vec<ObjectEntry>,
     },
+    /// Client → coordinator: current mapping revision for a namespace.
+    ///
+    /// A client refreshes through this after a [`ControlMessage::StaleMapping`]
+    /// rather than polling, so a fenced operation costs one extra round trip
+    /// rather than a retry loop.
+    MappingRevisionQuery {
+        /// Namespace whose revision is requested.
+        namespace: String,
+    },
+    /// Coordinator → client: the namespace's current mapping revision.
+    MappingRevisionValue {
+        /// Namespace the revision belongs to.
+        namespace: String,
+        /// Current revision. Zero means the namespace has never had a hard-link
+        /// transition, which needs no stored record (ADR 0003 §3).
+        revision: u64,
+    },
+    /// Worker → client: the request carried a revision that is not current.
+    ///
+    /// ADR 0003 §5: "Stale clients receive `STALE_MAPPING`, refresh through any
+    /// coordinator, and retry."
+    ///
+    /// Carries the revision the worker holds so the client can decide what to
+    /// do without a second query: a *lower* value means the worker is behind and
+    /// the client should retry elsewhere or wait, while a *higher* one means the
+    /// client's cache is stale and must be refreshed.
+    StaleMapping {
+        /// Namespace the fence applies to.
+        namespace: String,
+        /// Revision the worker currently holds.
+        current: u64,
+    },
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -147,6 +179,13 @@ impl ControlMessage {
             Self::NodeStatusHeartbeat { .. } => 2,
             Self::StatObject { .. } | Self::ObjectStat { .. } => 2,
             Self::ListObjects { .. } | Self::ObjectList { .. } => 2,
+            // Schema 3: the ADR 0003 §5 mapping fence. A v2 peer cannot decode
+            // these, and must not silently treat a fenced operation as
+            // unfenced -- so they are rejected at the envelope rather than
+            // degraded.
+            Self::MappingRevisionQuery { .. }
+            | Self::MappingRevisionValue { .. }
+            | Self::StaleMapping { .. } => 3,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }
@@ -626,6 +665,49 @@ mod tests {
     }
 
     #[test]
+    fn a_schema_bump_does_not_change_how_older_messages_encode() {
+        // The property that keeps existing clients working. `encode` selects
+        // each message's own minimum_schema rather than the global maximum, so
+        // adding schema-3 variants must leave a PlacementResponse encoded
+        // exactly as a schema-1 message. A client that understands only v2 keeps
+        // interoperating; the Java client hard-codes its own maximum and would
+        // otherwise refuse every response after this bump.
+        let message = ControlMessage::PlacementResponse {
+            owners: vec![NodeId::new("w0")],
+            epoch: 7,
+        };
+        assert_eq!(message.minimum_schema(), MIN_CONTROL_SCHEMA_VERSION);
+
+        let encoded = encode(1, &message).expect("encode");
+        let (_, decoded) = decode(&encoded).expect("decode");
+        assert_eq!(decoded, message);
+
+        // And the envelope really does carry the old schema, not the new one.
+        let body = &encoded[HEADER_LEN..];
+        let schema = u16::from_le_bytes([body[0], body[1]]);
+        assert_eq!(
+            schema, MIN_CONTROL_SCHEMA_VERSION,
+            "an old message must not be tagged with a newer schema"
+        );
+    }
+
+    #[test]
+    fn the_mapping_fence_messages_require_schema_three() {
+        // They cannot be represented to a v2 peer. Silently degrading a fenced
+        // operation to an unfenced one is exactly the failure ADR 0003 §5's
+        // fence exists to prevent, so encoding must refuse rather than downgrade.
+        let stale = ControlMessage::StaleMapping {
+            namespace: "ns".into(),
+            current: 4,
+        };
+        assert_eq!(stale.minimum_schema(), 3);
+        assert!(matches!(
+            encode_for_schema(1, &stale, 2),
+            Err(CodecError::MessageRequiresSchema { .. })
+        ));
+    }
+
+    #[test]
     fn unknown_schema_rejected_not_panicked() {
         // Encode with a bumped schema and confirm decode reports it cleanly.
         let env = Envelope {
@@ -637,9 +719,15 @@ mod tests {
             .encode()
             .to_vec();
         buf.extend_from_slice(&body);
+        // `ours` reads the constant rather than a literal so a schema bump does
+        // not require editing this assertion -- the property under test is that
+        // an unknown schema is reported, not which version we happen to be on.
         assert!(matches!(
             decode(&buf),
-            Err(CodecError::UnsupportedSchema { got: 999, ours: 2 })
+            Err(CodecError::UnsupportedSchema {
+                got: 999,
+                ours
+            }) if ours == CONTROL_SCHEMA_VERSION
         ));
     }
 
