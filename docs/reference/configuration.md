@@ -168,6 +168,22 @@ PEM client key path; mutual TLS.
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `metadata.endpoints`
+
+Comma-separated etcd endpoints for the optional metadata store (TMS). Unset means no TMS: hard links and locks are refused with a distinct errno rather than approximated (ADR 0003 §4).
+
+- **Environment variable:** `TALON_COORDINATOR_METADATA_ENDPOINTS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `metadata.prefix`
+
+Keyspace prefix for metadata-store records. Must stay disjoint from the cluster-state prefix; the two stores have different durability invariants (ADR 0003 §7).
+
+- **Environment variable:** `TALON_COORDINATOR_METADATA_PREFIX`
+- **Default:** `/talon-metadata`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `kubernetes.namespace`
 
 Namespace holding Talon Lease objects.
