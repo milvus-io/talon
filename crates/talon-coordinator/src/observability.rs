@@ -13,7 +13,7 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
-use talon_metadata::ClusterCapabilities;
+use talon_metadata::{ClusterCapabilities, MetadataStore};
 
 use talon_core::metrics::labels;
 use talon_core::{
@@ -423,7 +423,23 @@ pub struct CoordinatorObservability {
     request_timeout: Duration,
     metrics: CoordinatorMetrics,
     store: Arc<dyn ClusterStateStore>,
+    /// What this cluster advertises, and the store that backs it.
+    ///
+    /// `advertised` and `revision` are fixed at construction: they describe the
+    /// deployment's configuration. Reachability is not part of that -- ADR 0003
+    /// §6 requires "not configured" and "configured but unreachable" to be
+    /// separable *during an incident*, which a value sampled once at startup
+    /// cannot do. So it lives in an atomic, refreshed on the readiness path.
     capabilities: ClusterCapabilities,
+    /// Current reachability of the metadata store.
+    ///
+    /// Kept beside `capabilities` rather than inside it so a reachability change
+    /// cannot be mistaken for a capability change: the revision must not advance
+    /// when a store blips, or every outage would look like a reconfiguration and
+    /// invalidate every client's cached capability set.
+    metadata_reachable: AtomicBool,
+    /// Handle used to sample reachability. `None` when no store is configured.
+    metadata_store: Option<Arc<dyn MetadataStore>>,
 }
 
 impl CoordinatorObservability {
@@ -453,6 +469,8 @@ impl CoordinatorObservability {
             // degraded one, so this is the correct default and not a
             // placeholder.
             capabilities: ClusterCapabilities::none(),
+            metadata_reachable: AtomicBool::new(true),
+            metadata_store: None,
         })
     }
 
@@ -462,7 +480,19 @@ impl CoordinatorObservability {
     /// omitting this leaves the empty set from [`ClusterCapabilities::none`].
     #[must_use]
     pub fn with_capabilities(mut self, capabilities: ClusterCapabilities) -> Self {
+        self.metadata_reachable = AtomicBool::new(capabilities.store_reachable);
         self.capabilities = capabilities;
+        self
+    }
+
+    /// Attach the metadata store used to sample reachability.
+    ///
+    /// Without this the advertised reachability stays at whatever
+    /// [`with_capabilities`](Self::with_capabilities) recorded, which is a
+    /// startup fact. §6 needs a current one.
+    #[must_use]
+    pub fn with_metadata_store(mut self, store: Arc<dyn MetadataStore>) -> Self {
+        self.metadata_store = Some(store);
         self
     }
 
@@ -470,8 +500,52 @@ impl CoordinatorObservability {
     ///
     /// ADR 0003 §4 requires these to be discoverable "without attempting an
     /// operation", which is what the management API endpoint is for.
-    pub fn capabilities(&self) -> &ClusterCapabilities {
-        &self.capabilities
+    pub fn capabilities(&self) -> ClusterCapabilities {
+        ClusterCapabilities {
+            advertised: self.capabilities.advertised,
+            // Deliberately unchanged by reachability: a store blip is not a
+            // reconfiguration, and advancing this would invalidate every
+            // client's cached capability set on every outage.
+            revision: self.capabilities.revision,
+            store_reachable: self.metadata_reachable.load(Ordering::Acquire),
+        }
+    }
+
+    /// Sample the metadata store and update advertised reachability.
+    ///
+    /// Runs on the readiness path, never on the read path. §6 is explicit that
+    /// "reads, cache hits and misses, placement lookups, and write-through
+    /// writes are unaffected. None consults TMS", so request handling reads the
+    /// cached atomic rather than probing the store.
+    ///
+    /// A cluster with no store keeps reporting reachable: an empty capability
+    /// set is always serviceable, and there is nothing that could be down.
+    async fn refresh_metadata_reachability(&self) {
+        let Some(store) = self.metadata_store.as_ref() else {
+            return;
+        };
+        let reachable = match tokio::time::timeout(self.request_timeout, store.check_ready()).await
+        {
+            Ok(Ok(health)) => health.ready,
+            Ok(Err(_)) | Err(_) => false,
+        };
+        let previous = self.metadata_reachable.swap(reachable, Ordering::AcqRel);
+        if previous != reachable {
+            // Logged at the transition rather than every sample, and separately
+            // from the "not configured" case, so an incident can tell an outage
+            // from a deployment choice (§6).
+            if reachable {
+                tracing::info!(
+                    capabilities = %self.capabilities.advertised,
+                    "metadata store reachable again; TMS-backed features restored"
+                );
+            } else {
+                tracing::warn!(
+                    capabilities = %self.capabilities.advertised,
+                    "metadata store became unreachable; TMS-backed features fail closed"
+                );
+            }
+        }
     }
 
     /// Coordinator metric handles.
@@ -507,6 +581,11 @@ impl CoordinatorObservability {
         self.metrics
             .record_state("readiness", &result, started.elapsed());
         self.ready.store(result.is_ok(), Ordering::Release);
+        // Sampled alongside cluster-state readiness so reachability tracks the
+        // present rather than startup. A metadata failure must not affect this
+        // result: §6 keeps TMS outages away from the read path, and readiness
+        // gates the read path.
+        self.refresh_metadata_reachability().await;
         result
     }
 
@@ -853,6 +932,191 @@ fn generate_incarnation_id() -> std::io::Result<String> {
         write!(id, "{byte:02x}").expect("writing to a String cannot fail");
     }
     Ok(id)
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::*;
+    use crate::MemoryStateStore;
+    use async_trait::async_trait;
+    use talon_core::{NodeId, NodeRole};
+    use talon_metadata::{
+        BackendHealth, Capability, CapabilityRevision, CapabilitySet, InodeNumber, InodeRecord,
+        MappingRevision, MetadataBackend, MetadataError, MetadataResult, NamespaceId,
+        PathIndexEntry, Transaction, TransactionOutcome,
+    };
+
+    /// A store whose reachability the test controls.
+    struct FlakyStore {
+        ready: AtomicBool,
+    }
+
+    #[async_trait]
+    impl MetadataStore for FlakyStore {
+        fn backend(&self) -> MetadataBackend {
+            MetadataBackend::Memory
+        }
+
+        fn capabilities(&self) -> CapabilitySet {
+            CapabilitySet::none().with(Capability::HardLinks)
+        }
+
+        async fn check_ready(&self) -> MetadataResult<BackendHealth> {
+            if self.ready.load(Ordering::Acquire) {
+                Ok(BackendHealth {
+                    ready: true,
+                    detail: "up".to_owned(),
+                })
+            } else {
+                Err(MetadataError::Unavailable {
+                    backend: MetadataBackend::Memory,
+                    detail: "simulated outage".to_owned(),
+                })
+            }
+        }
+
+        async fn mapping_revision(
+            &self,
+            _namespace: &NamespaceId,
+        ) -> MetadataResult<MappingRevision> {
+            Ok(MappingRevision::INITIAL)
+        }
+
+        async fn resolve_path(
+            &self,
+            _namespace: &NamespaceId,
+            _path: &str,
+        ) -> MetadataResult<Option<PathIndexEntry>> {
+            Ok(None)
+        }
+
+        async fn load_inode(
+            &self,
+            _namespace: &NamespaceId,
+            inode: InodeNumber,
+        ) -> MetadataResult<InodeRecord> {
+            Err(MetadataError::NotFound {
+                key: format!("inode/{inode}"),
+            })
+        }
+
+        async fn commit(&self, _transaction: &Transaction) -> MetadataResult<TransactionOutcome> {
+            Err(MetadataError::Unavailable {
+                backend: MetadataBackend::Memory,
+                detail: "not used in this test".to_owned(),
+            })
+        }
+    }
+
+    fn observability(store: Arc<dyn MetadataStore>) -> CoordinatorObservability {
+        CoordinatorObservability::new(
+            "c".into(),
+            NodeInfo {
+                id: NodeId::new("coord"),
+                address: "coord:7000".into(),
+                role: NodeRole::Coordinator,
+            },
+            "coord:8000".into(),
+            Duration::from_secs(1),
+            Arc::new(MemoryStateStore::new()),
+        )
+        .expect("observability")
+        .with_capabilities(ClusterCapabilities {
+            advertised: CapabilitySet::none().with(Capability::HardLinks),
+            revision: CapabilityRevision::new(3),
+            store_reachable: true,
+        })
+        .with_metadata_store(store)
+    }
+
+    #[tokio::test]
+    async fn reachability_tracks_the_present_not_startup() {
+        // ADR 0003 §6 requires "not configured" and "configured but unreachable"
+        // to be separable *during an incident* -- which is exactly when a value
+        // sampled once at startup is stale.
+        let store = Arc::new(FlakyStore {
+            ready: AtomicBool::new(true),
+        });
+        let obs = observability(store.clone());
+        obs.check_ready().await.expect("cluster state is ready");
+        assert!(obs.capabilities().store_reachable);
+
+        store.ready.store(false, Ordering::Release);
+        obs.check_ready()
+            .await
+            .expect("cluster state is still ready");
+        assert!(
+            !obs.capabilities().store_reachable,
+            "an outage after startup must be visible"
+        );
+
+        store.ready.store(true, Ordering::Release);
+        obs.check_ready().await.expect("cluster state is ready");
+        assert!(
+            obs.capabilities().store_reachable,
+            "recovery must be visible too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_store_outage_does_not_advance_the_capability_revision() {
+        // A blip is not a reconfiguration. Advancing the revision here would
+        // invalidate every client's cached capability set on every outage, and
+        // would make the revision useless as a change signal.
+        let store = Arc::new(FlakyStore {
+            ready: AtomicBool::new(true),
+        });
+        let obs = observability(store.clone());
+        obs.check_ready().await.expect("ready");
+        let before = obs.capabilities().revision;
+
+        store.ready.store(false, Ordering::Release);
+        obs.check_ready().await.expect("ready");
+
+        assert_eq!(obs.capabilities().revision, before);
+        assert_eq!(
+            obs.capabilities().advertised,
+            CapabilitySet::none().with(Capability::HardLinks),
+            "an unreachable store still advertises what it offers"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_metadata_outage_does_not_make_the_cluster_unready() {
+        // §6: "TMS unavailability degrades TMS-backed features; it must not
+        // affect the read path." Readiness gates the read path, so a metadata
+        // outage must not turn the coordinator unready.
+        let store = Arc::new(FlakyStore {
+            ready: AtomicBool::new(false),
+        });
+        let obs = observability(store);
+        obs.check_ready()
+            .await
+            .expect("a metadata outage must not fail cluster readiness");
+        assert!(obs.is_ready(), "the read path stays available");
+        assert!(!obs.capabilities().store_reachable);
+    }
+
+    #[tokio::test]
+    async fn a_cluster_without_a_metadata_store_stays_reachable() {
+        // An empty capability set is always serviceable: there is nothing that
+        // could be down, so reporting it unreachable would invent an outage.
+        let obs = CoordinatorObservability::new(
+            "c".into(),
+            NodeInfo {
+                id: NodeId::new("coord"),
+                address: "coord:7000".into(),
+                role: NodeRole::Coordinator,
+            },
+            "coord:8000".into(),
+            Duration::from_secs(1),
+            Arc::new(MemoryStateStore::new()),
+        )
+        .expect("observability");
+        obs.check_ready().await.expect("ready");
+        assert!(obs.capabilities().store_reachable);
+        assert!(obs.capabilities().advertised.is_empty());
+    }
 }
 
 #[cfg(test)]

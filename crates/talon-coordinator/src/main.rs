@@ -131,11 +131,16 @@ impl Args {
 /// So an unreachable store still advertises its capabilities, with
 /// `store_reachable` false. Refusing to start would turn a metadata outage into
 /// a cache outage, which is the opposite of what §6 requires.
-async fn build_capabilities(config: &CoordinatorConfig) -> ClusterCapabilities {
+async fn build_capabilities(
+    config: &CoordinatorConfig,
+) -> (
+    ClusterCapabilities,
+    Option<Arc<dyn talon_metadata::MetadataStore>>,
+) {
     #[cfg(feature = "etcd")]
     {
         let Some(metadata) = config.metadata.as_ref() else {
-            return ClusterCapabilities::none();
+            return (ClusterCapabilities::none(), None);
         };
         let store_config = talon_metadata::EtcdMetadataConfig {
             endpoints: metadata.endpoints.clone(),
@@ -163,11 +168,14 @@ async fn build_capabilities(config: &CoordinatorConfig) -> ClusterCapabilities {
                          TMS-backed features will fail closed"
                     );
                 }
-                ClusterCapabilities {
-                    advertised,
-                    revision: talon_metadata::CapabilityRevision::new(1),
-                    store_reachable,
-                }
+                (
+                    ClusterCapabilities {
+                        advertised,
+                        revision: talon_metadata::CapabilityRevision::new(1),
+                        store_reachable,
+                    },
+                    Some(Arc::new(store) as Arc<dyn talon_metadata::MetadataStore>),
+                )
             }
             Err(error) => {
                 tracing::warn!(
@@ -180,19 +188,26 @@ async fn build_capabilities(config: &CoordinatorConfig) -> ClusterCapabilities {
                 // unreachable rather than absent. Dropping them here would make
                 // this indistinguishable from an unconfigured cluster and send
                 // clients the wrong errno (§4).
-                ClusterCapabilities {
-                    advertised: talon_metadata::CapabilitySet::none()
-                        .with(talon_metadata::Capability::HardLinks),
-                    revision: talon_metadata::CapabilityRevision::new(1),
-                    store_reachable: false,
-                }
+                // No handle: the connection never succeeded, so there is
+                // nothing to sample. Reachability stays false until a restart,
+                // which is honest -- a store that was never reachable cannot be
+                // observed to recover through a handle that does not exist.
+                (
+                    ClusterCapabilities {
+                        advertised: talon_metadata::CapabilitySet::none()
+                            .with(talon_metadata::Capability::HardLinks),
+                        revision: talon_metadata::CapabilityRevision::new(1),
+                        store_reachable: false,
+                    },
+                    None,
+                )
             }
         }
     }
     #[cfg(not(feature = "etcd"))]
     {
         let _ = config;
-        ClusterCapabilities::none()
+        (ClusterCapabilities::none(), None)
     }
 }
 
@@ -563,17 +578,19 @@ async fn main() -> anyhow::Result<()> {
         address: config.listen.clone(),
         role: NodeRole::Coordinator,
     };
-    let capabilities = build_capabilities(&config).await;
-    let observability = Arc::new(
-        CoordinatorObservability::new(
-            config.cluster_id.clone(),
-            node,
-            config.admin_advertise.clone(),
-            Duration::from_millis(config.state.request_timeout_ms),
-            store,
-        )?
-        .with_capabilities(capabilities),
-    );
+    let (capabilities, metadata_store) = build_capabilities(&config).await;
+    let mut observability = CoordinatorObservability::new(
+        config.cluster_id.clone(),
+        node,
+        config.admin_advertise.clone(),
+        Duration::from_millis(config.state.request_timeout_ms),
+        store,
+    )?
+    .with_capabilities(capabilities);
+    if let Some(metadata_store) = metadata_store {
+        observability = observability.with_metadata_store(metadata_store);
+    }
+    let observability = Arc::new(observability);
     observability.check_ready().await?;
     let state = Coordinator::new(
         Arc::clone(&observability),
