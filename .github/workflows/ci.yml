@@ -73,13 +73,53 @@ jobs:
       TALON_REQUIRE_FUSE: "1"
     steps:
       - uses: actions/checkout@v4
-      - name: Verify /dev/fuse is available
+      - name: Verify the runner can actually mount FUSE
+        # /dev/fuse existing is necessary but not sufficient (#405). An
+        # unprivileged process mounts through the setuid fusermount3 helper, so
+        # a missing setuid bit, a restrictive /etc/fuse.conf, or an AppArmor
+        # policy denying the helper all produce EPERM while /dev/fuse looks
+        # fine. Capture the evidence unconditionally: when this job fails, the
+        # log should already say which of those it was rather than requiring a
+        # second run to find out.
         run: |
           if [ ! -e /dev/fuse ]; then
             echo "::error::/dev/fuse is missing on this runner; the FUSE mount test cannot run"
             exit 1
           fi
+          echo "--- identity (root skips fusermount3 entirely) ---"
+          id
+          echo "--- /dev/fuse ---"
           ls -l /dev/fuse
+          echo "--- fusermount3 (expect -rwsr-xr-x; a missing 's' is the bug) ---"
+          ls -l "$(command -v fusermount3 || echo /usr/bin/fusermount3)" || true
+          echo "--- /etc/fuse.conf ---"
+          cat /etc/fuse.conf 2>/dev/null || echo "(absent)"
+          echo "--- apparmor ---"
+          aa-status --enabled 2>/dev/null && echo "apparmor enabled" || echo "apparmor not enabled or unavailable"
+      - name: Ensure fusermount3 can mount as an unprivileged user
+        # The actual cause of #405. An unprivileged process mounts through the
+        # setuid fusermount3 helper; without the setuid bit it gets EPERM while
+        # /dev/fuse still looks perfectly healthy, so the pre-flight check above
+        # passes and every mount test then fails identically.
+        #
+        # Reproduced as a controlled experiment: same container, same non-root
+        # user, same code, with the bit the tests pass and without it they fail
+        # with the exact message CI produces.
+        #
+        # Restoring it here rather than waiting on the runner image keeps the
+        # job honest -- it still exercises the real unprivileged mount path,
+        # which is what makes this test worth running at all.
+        run: |
+          helper="$(command -v fusermount3 || echo /usr/bin/fusermount3)"
+          if [ ! -u "$helper" ]; then
+            echo "$helper is missing its setuid bit (see #405); restoring it"
+            sudo chmod u+s "$helper"
+          fi
+          ls -l "$helper"
+          if [ ! -u "$helper" ]; then
+            echo "::error::$helper still has no setuid bit; unprivileged mounts cannot work"
+            exit 1
+          fi
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
