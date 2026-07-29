@@ -66,6 +66,7 @@ mod error;
 #[cfg(feature = "etcd")]
 mod etcd;
 pub mod fence;
+pub mod flush;
 pub mod link;
 mod memory;
 mod record;
