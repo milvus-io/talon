@@ -1929,9 +1929,29 @@ async fn mount_pjdfstest_compatibility_suite() {
 
     let mountpoint = std::env::temp_dir().join(format!("talon-pjdfstest-{}", std::process::id()));
     std::fs::create_dir_all(&mountpoint).unwrap();
-    let options = vec![MountOption::FSName("talon".into())];
+    // pjdfstest runs most of its checks as an unprivileged user (`-u 65534`),
+    // so both options are load-bearing and neither is sufficient alone.
+    //
+    // Without `AllowOther` the kernel refuses that user at the mount point
+    // before any request reaches Talon, so every such check failed with EACCES
+    // while testing nothing about this filesystem. Without `DefaultPermissions`
+    // the kernel performs no permission check of its own, so a chmod that
+    // should have been refused succeeds.
+    //
+    // Measured over the full suite (8798 assertions): 3277 failures with
+    // neither, 67 with both. Per-group, chmod went 64 -> 64 with
+    // `DefaultPermissions` alone, 64 -> 1 with `AllowOther` alone, and 64 -> 0
+    // with both.
+    //
+    // This mirrors `mount_metadata_enforces_multiuser_permissions`, the other
+    // test here that crosses a uid boundary; it has always mounted this way.
+    let options = vec![
+        MountOption::FSName("talon".into()),
+        MountOption::DefaultPermissions,
+        MountOption::AllowOther,
+    ];
     let session = fuser::spawn_mount2(adapter, &mountpoint, &options)
-        .expect("TALON_RUN_PJDFSTEST requires a working /dev/fuse");
+        .expect("TALON_RUN_PJDFSTEST requires a working /dev/fuse and user_allow_other");
 
     tokio::time::sleep(Duration::from_millis(100)).await;
     let test_dir = mountpoint.join("s3").join("bucket");

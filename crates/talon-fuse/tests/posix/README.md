@@ -14,8 +14,18 @@ The runner requires:
 
 - Linux with a mounted Talon FUSE filesystem
 - root privileges
+- `user_allow_other` in `/etc/fuse.conf`
 - `git`, `autoconf`, `automake`, `make`, a C compiler, `perl`, `prove`,
   `openssl`, and `findmnt`
+
+The `user_allow_other` line is not optional. pjdfstest runs most of its checks
+as an unprivileged user, and without it the kernel refuses that user at the
+mount point before any request reaches Talon — so the suite reports thousands of
+`EACCES` failures that say nothing about this filesystem. Add it with:
+
+```sh
+echo user_allow_other | sudo tee -a /etc/fuse.conf
+```
 
 On Ubuntu, the required user-space packages can be installed with:
 
@@ -52,8 +62,11 @@ The runner downloads and builds the pinned pjdfstest revision under
 running destructive filesystem tests against the host filesystem.
 
 The complete suite is not expected to pass until Talon implements all covered
-operations. Add operation-specific invocations and expected-result tracking
-incrementally as support is added.
+operations. As of 2026-07-29, with the mount options above, 67 of 8798
+assertions fail (99.2% pass). Before those options were corrected the same run
+reported 3277 failures — almost all of them the kernel refusing an unprivileged
+user at the mount point, not Talon rejecting anything. Treat a large jump in
+this number as a mount-configuration problem before reading it as a regression.
 
 ## Run through the kernel-mount fixture
 
