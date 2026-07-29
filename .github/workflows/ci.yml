@@ -73,53 +73,61 @@ jobs:
       TALON_REQUIRE_FUSE: "1"
     steps:
       - uses: actions/checkout@v4
-      - name: Verify the runner can actually mount FUSE
-        # /dev/fuse existing is necessary but not sufficient (#405). An
-        # unprivileged process mounts through the setuid fusermount3 helper, so
-        # a missing setuid bit, a restrictive /etc/fuse.conf, or an AppArmor
-        # policy denying the helper all produce EPERM while /dev/fuse looks
-        # fine. Capture the evidence unconditionally: when this job fails, the
-        # log should already say which of those it was rather than requiring a
-        # second run to find out.
+      - name: Capture the FUSE environment
+        # /dev/fuse existing is necessary but not sufficient (#405). Capture
+        # everything that can make an unprivileged mount fail, so a failing run
+        # is diagnosable from its own log rather than from a second run.
         run: |
           if [ ! -e /dev/fuse ]; then
             echo "::error::/dev/fuse is missing on this runner; the FUSE mount test cannot run"
             exit 1
           fi
-          echo "--- identity (root skips fusermount3 entirely) ---"
+          echo "--- identity (root would bypass fusermount3 entirely) ---"
           id
           echo "--- /dev/fuse ---"
           ls -l /dev/fuse
-          echo "--- fusermount3 (expect -rwsr-xr-x; a missing 's' is the bug) ---"
-          ls -l "$(command -v fusermount3 || echo /usr/bin/fusermount3)" || true
+          echo "--- fusermount3 on PATH, and every copy of it ---"
+          ls -l "$(command -v fusermount3)" 2>/dev/null || echo "(none on PATH)"
+          ls -l /usr/bin/fusermount3 /usr/local/bin/fusermount3 2>/dev/null || true
           echo "--- /etc/fuse.conf ---"
           cat /etc/fuse.conf 2>/dev/null || echo "(absent)"
           echo "--- apparmor ---"
           aa-status --enabled 2>/dev/null && echo "apparmor enabled" || echo "apparmor not enabled or unavailable"
-      - name: Ensure fusermount3 can mount as an unprivileged user
-        # The actual cause of #405. An unprivileged process mounts through the
-        # setuid fusermount3 helper; without the setuid bit it gets EPERM while
-        # /dev/fuse still looks perfectly healthy, so the pre-flight check above
-        # passes and every mount test then fails identically.
+      - name: Ensure an unprivileged FUSE mount is possible
+        # Some runner images carry a second fusermount3 in /usr/local/bin, owned
+        # by the runner user and without the setuid bit, which shadows the
+        # system helper on PATH. An unprivileged process invoking it cannot
+        # mount, which is #405: every mount test then fails with EPERM in the
+        # same second while /dev/fuse looks perfectly healthy.
         #
-        # Reproduced as a controlled experiment: same container, same non-root
-        # user, same code, with the bit the tests pass and without it they fail
-        # with the exact message CI produces.
+        # Captured from a failing runner:
+        #   -rwxrwxrwx 1 runner runner /usr/local/bin/fusermount3
+        # against a passing one:
+        #   -rwsr-xr-x 1 root   root   /usr/bin/fusermount3
         #
-        # Restoring it here rather than waiting on the runner image keeps the
-        # job honest -- it still exercises the real unprivileged mount path,
-        # which is what makes this test worth running at all.
+        # Remove the shadow rather than chmod-ing it. Adding setuid to a
+        # runner-writable binary would be worse than the bug, and removing it
+        # keeps the job exercising the real system helper -- which is the only
+        # reason this test is worth running.
         run: |
-          helper="$(command -v fusermount3 || echo /usr/bin/fusermount3)"
-          if [ ! -u "$helper" ]; then
-            echo "$helper is missing its setuid bit (see #405); restoring it"
-            sudo chmod u+s "$helper"
+          shadow=/usr/local/bin/fusermount3
+          if [ -e "$shadow" ] && [ ! -u "$shadow" ]; then
+            echo "removing non-setuid $shadow which shadows the system helper (#405)"
+            sudo rm -f "$shadow"
+            hash -r 2>/dev/null || true
           fi
-          ls -l "$helper"
-          if [ ! -u "$helper" ]; then
-            echo "::error::$helper still has no setuid bit; unprivileged mounts cannot work"
+          helper="$(command -v fusermount3 || true)"
+          if [ -z "$helper" ] || [ ! -u "$helper" ]; then
+            echo "::error::no setuid fusermount3 on PATH (found: ${helper:-none}); unprivileged mounts cannot work"
+            ls -l "$helper" 2>/dev/null || true
             exit 1
           fi
+          ls -l "$helper"
+          # pjdfstest mounts with allow_other (#419), which needs this enabled.
+          if ! grep -q '^user_allow_other' /etc/fuse.conf 2>/dev/null; then
+            echo user_allow_other | sudo tee -a /etc/fuse.conf >/dev/null
+          fi
+          grep '^user_allow_other' /etc/fuse.conf
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
