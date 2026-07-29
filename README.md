@@ -38,21 +38,24 @@ with nothing to tune
 Read it through a FUSE mount, or use the [Python](docs/clients/python.md) /
 [Java](docs/clients/java.md) SDKs when a mount isn't the right fit.
 
-<!-- TODO(posix): POSIX compatibility is deliberately NOT claimed here yet.
-     Measured 2026-07-29 against a real kernel FUSE mount (pjdfstest, 238
-     files / 8798 assertions): roughly 2,540 assertions fail, i.e. ~71% pass.
-     Failures are dominated by two chmod/permission files (1284/2353 and
-     1106/2099); the rest are unlink/11 (90/270), rmdir/11 (15/47),
-     truncate/05, utimensat/07, rename/21+23, symlink/05+06.
-     The chmod concentration suggests a single root cause (mount options /
-     mode propagation) rather than 2,390 independent bugs — worth diagnosing
-     before publishing any number, since one fix may move the rate a lot.
-     Reproduce:
-       sudo TALON_REQUIRE_FUSE=1 TALON_RUN_PJDFSTEST=1 \
-         cargo test -p talon-fuse --features mount --test mount_e2e \
-         mount_pjdfstest_compatibility_suite -- --ignored --nocapture
-     When publishing: state the real rate and name the gaps. Hard links are
-     known-broken (ADR 0003 / #363 / #359); POSIX locking is unimplemented. -->
+**POSIX behaviour is measured, not asserted.** Against a real kernel mount,
+Talon passes **99.2% of pjdfstest** (8,731 of 8,798 assertions across 238 test
+files). Reproduce it in one command:
+
+```sh
+sudo TALON_REQUIRE_FUSE=1 TALON_RUN_PJDFSTEST=1 \
+  cargo test -p talon-fuse --features mount --test mount_e2e \
+  mount_pjdfstest_compatibility_suite -- --ignored --nocapture
+```
+
+The remaining 0.8% is one gap, not sixty-seven: **hard links to object-backed
+files are refused with `EPERM`**. A hard link would need a copy per path, and
+copies can diverge with nothing to reconcile them ([#363](https://github.com/milvus-io/talon/issues/363)),
+so Talon refuses rather than approximating. The fix is inode indirection
+([ADR 0003 §5](docs/adr/0003-optional-metadata-store.md)); until it lands, 51 of
+those 67 failures are that refusal and its cascade. **POSIX locking is likewise
+refused rather than faked** — `getlk`/`setlk` return `EOPNOTSUPP` instead of
+falling back to kernel-local locks that would look cluster-wide and not be.
 
 [![CI](https://github.com/milvus-io/talon/actions/workflows/ci.yml/badge.svg)](https://github.com/milvus-io/talon/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
