@@ -19,6 +19,17 @@ Backend status
 | `200` | [`BackendStatus`](#backendstatus) | Backend status. |
 | `503` | — | (see BackendUnavailable) |
 
+### `GET /api/v1/capabilities`
+
+Cluster capabilities
+
+**Responses:**
+
+| Status | Body | Description |
+|--------|------|-------------|
+| `200` | [`CapabilitiesView`](#capabilitiesview) | Advertised capabilities. |
+| `503` | — | (see BackendUnavailable) |
+
 ### `GET /api/v1/cluster`
 
 Cluster summary
@@ -96,6 +107,15 @@ This OpenAPI document
 | `ready` | boolean | yes |
 | `revision` | string | yes |
 | `snapshot_age_ms` | integer (int64) | yes |
+
+### CapabilitiesView
+
+| Field | Type | Required |
+|-------|------|----------|
+| `advertised` | array of string | yes |
+| `meta` | [`ResponseMeta`](#responsemeta) | yes |
+| `revision` | integer (int64) | yes |
+| `store_reachable` | boolean | yes |
 
 ### ClusterSummary
 

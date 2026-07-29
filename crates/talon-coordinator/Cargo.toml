@@ -33,6 +33,7 @@ etcd = ["dep:etcd-client", "dep:tonic"]
 
 [dependencies]
 talon-core.workspace = true
+talon-metadata.workspace = true
 talon-transport.workspace = true
 anyhow.workspace = true
 tokio.workspace = true

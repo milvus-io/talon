@@ -13,6 +13,8 @@ use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::{Json, Router};
+use talon_metadata::ClusterCapabilities;
+
 use talon_core::metrics::labels;
 use talon_core::{
     Counter, Gauge, Histogram, Metrics, NodeHealth, NodeInfo, NodeMetricsSnapshot, NodeRole,
@@ -421,6 +423,7 @@ pub struct CoordinatorObservability {
     request_timeout: Duration,
     metrics: CoordinatorMetrics,
     store: Arc<dyn ClusterStateStore>,
+    capabilities: ClusterCapabilities,
 }
 
 impl CoordinatorObservability {
@@ -445,7 +448,30 @@ impl CoordinatorObservability {
             request_timeout,
             metrics: CoordinatorMetrics::new(),
             store,
+            // A coordinator with no metadata store advertises nothing. ADR 0003
+            // §1 keeps that a complete, supported deployment rather than a
+            // degraded one, so this is the correct default and not a
+            // placeholder.
+            capabilities: ClusterCapabilities::none(),
         })
+    }
+
+    /// Attach the capability set this cluster advertises.
+    ///
+    /// Builder-style so a coordinator without a metadata store needs no change:
+    /// omitting this leaves the empty set from [`ClusterCapabilities::none`].
+    #[must_use]
+    pub fn with_capabilities(mut self, capabilities: ClusterCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self
+    }
+
+    /// Capabilities this cluster advertises.
+    ///
+    /// ADR 0003 §4 requires these to be discoverable "without attempting an
+    /// operation", which is what the management API endpoint is for.
+    pub fn capabilities(&self) -> &ClusterCapabilities {
+        &self.capabilities
     }
 
     /// Coordinator metric handles.

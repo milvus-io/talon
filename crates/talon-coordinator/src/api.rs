@@ -57,6 +57,38 @@ pub struct ResponseMeta {
     pub backend: String,
 }
 
+/// What this cluster offers, and whether it can serve it right now.
+///
+/// ADR 0003 §4 requires capabilities to be discoverable without attempting an
+/// operation, and to be understood as a property of the *cluster*:
+///
+/// > two Talon clusters may legitimately offer different POSIX semantics. That
+/// > is a product-level fact and must be documented as such, not buried in a
+/// > config reference.
+#[derive(Debug, Clone, Serialize)]
+pub struct CapabilitiesView {
+    /// Capabilities this cluster advertises, e.g. `["hard_links"]`.
+    ///
+    /// Empty for a cluster with no metadata store, which §1 keeps a complete,
+    /// supported deployment offering today's feature set.
+    pub advertised: Vec<String>,
+    /// Revision of the advertised set.
+    ///
+    /// Distinct from the placement epoch and from §9's write-routing revision.
+    /// It advances on configuration change, never on membership change, so a
+    /// worker joining or leaving must not move it.
+    pub revision: u64,
+    /// Whether the metadata store is currently reachable.
+    ///
+    /// Always `true` when nothing is configured: an empty set is always
+    /// serviceable. §6 requires "not configured" and "configured but
+    /// unreachable" to stay separable during an incident, which is why this is
+    /// reported alongside the set rather than folded into it.
+    pub store_reachable: bool,
+    /// Response metadata.
+    pub meta: ResponseMeta,
+}
+
 /// Cluster-level summary counts.
 #[derive(Debug, Clone, Serialize)]
 pub struct ClusterSummary {
@@ -225,6 +257,7 @@ pub fn router(state: Arc<CoordinatorObservability>) -> Router {
         .route("/api/v1/nodes", get(nodes_handler))
         .route("/api/v1/nodes/{node_id}", get(node_detail_handler))
         .route("/api/v1/backend", get(backend_handler))
+        .route("/api/v1/capabilities", get(capabilities_handler))
         .route("/api/v1/openapi.json", get(openapi_handler))
         .with_state(state)
 }
@@ -432,6 +465,34 @@ async fn backend_handler(State(state): State<Arc<CoordinatorObservability>>) -> 
     (cache_headers(&snapshot.revision.to_string()), Json(body)).into_response()
 }
 
+async fn capabilities_handler(State(state): State<Arc<CoordinatorObservability>>) -> Response {
+    let snapshot = match snapshot_or_error(&state).await {
+        Ok(s) => s,
+        Err(resp) => return resp,
+    };
+    let capabilities = state.capabilities();
+    let body = CapabilitiesView {
+        advertised: capabilities
+            .advertised
+            .iter()
+            .map(|capability| capability.as_str().to_owned())
+            .collect(),
+        revision: capabilities.revision.get(),
+        store_reachable: capabilities.store_reachable,
+        meta: build_meta(&state, &snapshot),
+    };
+    // The ETag is the capability revision, not the snapshot revision. Reusing
+    // the snapshot revision would make this response appear to change on every
+    // membership change and appear unchanged across an actual capability
+    // change -- exactly the conflation ADR 0003 §4 forbids by giving
+    // capabilities their own revision.
+    (
+        cache_headers(&capabilities.revision.to_string()),
+        Json(body),
+    )
+        .into_response()
+}
+
 async fn openapi_handler() -> Response {
     ([(header::CONTENT_TYPE, "application/json")], OPENAPI_JSON).into_response()
 }
@@ -476,6 +537,36 @@ mod tests {
             },
             labels: BTreeMap::new(),
         }
+    }
+
+    use talon_metadata::{Capability, CapabilityRevision, CapabilitySet, ClusterCapabilities};
+
+    /// Observability state carrying an explicit capability set.
+    async fn state_with_capabilities(
+        capabilities: ClusterCapabilities,
+    ) -> Arc<CoordinatorObservability> {
+        let store: Arc<dyn crate::ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        store
+            .upsert_node(worker("w00", 1000, 100, 10), Duration::from_secs(30))
+            .await
+            .unwrap();
+        let obs = Arc::new(
+            CoordinatorObservability::new(
+                "c".into(),
+                NodeInfo {
+                    id: NodeId::new("coord"),
+                    address: "coord:7000".into(),
+                    role: NodeRole::Coordinator,
+                },
+                "coord:8000".into(),
+                Duration::from_secs(1),
+                store,
+            )
+            .unwrap()
+            .with_capabilities(capabilities),
+        );
+        obs.check_ready().await.unwrap();
+        obs
     }
 
     async fn state_with_workers(n: usize) -> Arc<CoordinatorObservability> {
@@ -568,6 +659,68 @@ mod tests {
             .map(|n| n["node_id"].as_str().unwrap().to_string())
             .collect();
         assert_eq!(ids2, vec!["w02", "w03"]);
+    }
+
+    #[tokio::test]
+    async fn a_cluster_without_a_metadata_store_advertises_nothing() {
+        // ADR 0003 §1 keeps such a cluster "a complete, supported Talon
+        // deployment offering exactly today's feature set", so an empty set is
+        // the correct answer here -- not an error and not an omitted field.
+        let state = state_with_workers(1).await;
+        let (status, body) = get(state, "/api/v1/capabilities").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["advertised"].as_array().expect("array").len(), 0);
+        assert_eq!(body["revision"], 0);
+        assert_eq!(
+            body["store_reachable"], true,
+            "an empty capability set is always serviceable"
+        );
+    }
+
+    #[tokio::test]
+    async fn advertised_capabilities_are_listed_with_their_own_revision() {
+        let state = state_with_capabilities(ClusterCapabilities {
+            advertised: CapabilitySet::none().with(Capability::HardLinks),
+            revision: CapabilityRevision::new(7),
+            store_reachable: true,
+        })
+        .await;
+        let (status, body) = get(state, "/api/v1/capabilities").await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["advertised"][0], "hard_links");
+        assert_eq!(body["revision"], 7);
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_store_still_advertises_its_capabilities() {
+        // §6 requires "not configured" and "configured but unreachable" to be
+        // separable during an incident. If an unreachable store dropped its
+        // capabilities from this list, the two would look identical here and an
+        // operator could not tell an outage from a deployment choice.
+        let state = state_with_capabilities(ClusterCapabilities {
+            advertised: CapabilitySet::none().with(Capability::HardLinks),
+            revision: CapabilityRevision::new(2),
+            store_reachable: false,
+        })
+        .await;
+        let (_, body) = get(state, "/api/v1/capabilities").await;
+        assert_eq!(body["advertised"][0], "hard_links");
+        assert_eq!(body["store_reachable"], false);
+    }
+
+    #[tokio::test]
+    async fn the_capability_etag_tracks_the_capability_revision_not_membership() {
+        // §4 gives capabilities their own revision precisely so the two cannot
+        // be conflated. Two clusters differing only in worker count must return
+        // the same capability ETag.
+        let one = state_with_workers(1).await;
+        let many = state_with_workers(5).await;
+        let (_, first) = get(one, "/api/v1/capabilities").await;
+        let (_, second) = get(many, "/api/v1/capabilities").await;
+        assert_eq!(
+            first["revision"], second["revision"],
+            "membership changes must not advance the capability revision"
+        );
     }
 
     #[tokio::test]

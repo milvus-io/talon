@@ -59,6 +59,7 @@
 #![warn(missing_docs)]
 
 mod capability;
+mod cluster;
 pub mod contract;
 mod error;
 #[cfg(feature = "etcd")]
@@ -69,6 +70,7 @@ mod revision;
 mod transaction;
 
 pub use capability::{Capability, CapabilitySet};
+pub use cluster::{CapabilityRevision, CapabilityState, ClusterCapabilities};
 pub use error::{MetadataBackend, MetadataError, MetadataResult};
 pub use memory::{MemoryMetadataStore, NamespaceSnapshot};
 pub use record::{
