@@ -1,4 +1,4 @@
-//! Shared contract suite for [`MetadataStore`](crate::MetadataStore) backends.
+//! Shared contract suite for [`MetadataStore`] backends.
 //!
 //! Every backend runs these identical cases. The point is that ADR 0003's
 //! correctness arguments rest on *contract* properties, not on any one
