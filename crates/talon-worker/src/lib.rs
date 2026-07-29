@@ -10,6 +10,7 @@ pub mod eviction;
 pub mod flusher;
 pub mod index;
 pub mod loader;
+pub mod mapping_guard;
 pub mod memory_store;
 pub mod miss;
 pub mod observability;

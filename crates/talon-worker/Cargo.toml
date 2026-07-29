@@ -27,6 +27,7 @@ path = "src/bin/loadgen.rs"
 
 [dependencies]
 talon-core.workspace = true
+talon-metadata.workspace = true
 talon-transport.workspace = true
 talon-backend = { path = "../talon-backend" }
 anyhow.workspace = true
