@@ -64,6 +64,7 @@ pub mod contract;
 mod error;
 #[cfg(feature = "etcd")]
 mod etcd;
+pub mod link;
 mod memory;
 mod record;
 mod revision;
