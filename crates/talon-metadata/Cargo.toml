@@ -9,6 +9,7 @@ description = "Optional Metadata Store (TMS) for facts that cannot be derived fr
 
 [dependencies]
 thiserror.workspace = true
+xxhash-rust.workspace = true
 etcd-client = { workspace = true, optional = true }
 tonic = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true, features = ["time"] }
