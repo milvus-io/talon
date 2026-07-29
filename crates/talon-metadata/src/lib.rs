@@ -58,6 +58,7 @@
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
+pub mod assignment;
 mod capability;
 mod cluster;
 pub mod contract;

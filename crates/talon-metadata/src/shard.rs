@@ -87,6 +87,16 @@ impl WriteShard {
     pub const fn get(self) -> u32 {
         self.0
     }
+
+    /// Construct a shard index directly.
+    ///
+    /// Ordinary code obtains a shard from [`ShardConfig::shard_for`] so the
+    /// mapping stays the single source of truth. This exists for callers that
+    /// legitimately hold an index already — a descriptor loaded from TMS, a
+    /// shard id parsed off the wire, or a test naming a specific shard.
+    pub const fn from_index(index: u32) -> Self {
+        Self(index)
+    }
 }
 
 impl fmt::Display for WriteShard {
