@@ -69,6 +69,7 @@ pub mod fence;
 pub mod link;
 mod memory;
 mod record;
+pub mod recovery;
 mod revision;
 pub mod scrub;
 pub mod shard;
