@@ -69,6 +69,7 @@ pub mod link;
 mod memory;
 mod record;
 mod revision;
+pub mod scrub;
 mod transaction;
 
 pub use capability::{Capability, CapabilitySet};
