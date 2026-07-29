@@ -14,7 +14,19 @@ import java.util.List;
  */
 final class Messages {
 
-    /** Newest control schema this client understands. */
+    /**
+     * Newest control schema this client understands.
+     *
+     * <p>Deliberately behind the Rust {@code CONTROL_SCHEMA_VERSION}, which is
+     * at 3. Schema 3 adds the ADR 0003 §5 mapping-fence messages, which this
+     * client does not implement, so claiming 3 would mean accepting an envelope
+     * it cannot decode.
+     *
+     * <p>This does not break interoperation: the server encodes each message at
+     * its own minimum schema rather than the global maximum, so placement,
+     * membership and object messages still arrive tagged 1 or 2. Raise this only
+     * when the fence messages are implemented here.
+     */
     static final int CONTROL_SCHEMA_VERSION = 2;
     /** Oldest schema the protocol defines. */
     static final int MIN_CONTROL_SCHEMA_VERSION = 1;
