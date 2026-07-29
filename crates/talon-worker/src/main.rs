@@ -135,7 +135,7 @@ impl Args {
             cache_dirs: None,
             capacity_bytes: None,
             l1_capacity_bytes: None,
-            l1_max_entry_bytes: None,
+            l1_page_size_bytes: None,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
         cache_dirs = ?cfg.cache_dirs,
         capacity_bytes = cfg.capacity_bytes,
         l1_capacity_bytes = cfg.l1_capacity_bytes,
-        l1_max_entry_bytes = cfg.l1_max_entry_bytes,
+        l1_page_size_bytes = cfg.l1_page_size_bytes,
         azure_account = ?cfg.azure_account,
         azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
@@ -434,7 +434,7 @@ async fn main() -> anyhow::Result<()> {
             cfg.block_size,
             cfg.capacity_bytes,
             cfg.l1_capacity_bytes,
-            cfg.l1_max_entry_bytes,
+            cfg.l1_page_size_bytes,
             observability.metrics().clone(),
         )
         .with_backend_kind(configured_backend),

@@ -64,8 +64,8 @@ worker:
   capacityBytes: 8589934592
   # -- L1 DRAM cache capacity in bytes. Zero keeps L1 disabled.
   l1CapacityBytes: 0
-  # -- Largest whole block eligible for L1 admission.
-  l1MaxEntryBytes: 4194304
+  # -- Fixed L1 DRAM page size.
+  l1PageSizeBytes: 262144
   # -- Object-store credentials. Reference a Secret you create out-of-band (see
   # deploy/kubernetes/worker-secret.example.yaml).
   backend:

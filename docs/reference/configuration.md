@@ -266,12 +266,12 @@ L1 DRAM cache capacity in bytes; 0 disables L1.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
-### `l1_max_entry_bytes`
+### `l1_page_size_bytes`
 
-Largest whole block eligible for the L1 DRAM cache.
+Fixed L1 DRAM page size in bytes.
 
-- **Environment variable:** `TALON_WORKER_L1_MAX_ENTRY_BYTES`
-- **Default:** `4194304`
+- **Environment variable:** `TALON_WORKER_L1_PAGE_SIZE_BYTES`
+- **Default:** `262144`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `backend`

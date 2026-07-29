@@ -22,6 +22,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use talon_core::{
@@ -145,6 +146,36 @@ impl WholeBlockStore {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Read exactly one block-relative byte window into userspace.
+    ///
+    /// This is used to promote touched L2 regions into the finer-grained L1
+    /// page cache without reading the entire (256 MiB by default) block.
+    pub async fn get_range_bytes(&self, id: &BlockId, offset: u64, len: u64) -> Result<Bytes> {
+        let path = self.path_for(id);
+        let id = id.clone();
+        spawn_blocking_io(move || {
+            let file = match std::fs::File::open(&path) {
+                Ok(file) => file,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(Error::NotFound(id.to_string()));
+                }
+                Err(error) => return Err(error.into()),
+            };
+            let file_len = file.metadata()?.len();
+            if offset.checked_add(len).map_or(true, |end| end > file_len) {
+                return Err(Error::Other(format!(
+                    "range {offset}+{len} out of bounds for block of {file_len} bytes"
+                )));
+            }
+            let size = usize::try_from(len)
+                .map_err(|_| Error::Other(format!("range length {len} exceeds usize")))?;
+            let mut buffer = vec![0_u8; size];
+            file.read_exact_at(&mut buffer, offset)?;
+            Ok(Bytes::from(buffer))
+        })
+        .await
     }
 }
 
@@ -473,6 +504,24 @@ mod tests {
         ));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn get_range_bytes_reads_only_the_requested_window() {
+        let root = tmp_root();
+        let store = WholeBlockStore::open(&root).unwrap();
+        let id = block(42);
+        store
+            .put(&id, Bytes::from_static(b"0123456789abcdef"))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.get_range_bytes(&id, 5, 6).await.unwrap(),
+            Bytes::from_static(b"56789a")
+        );
+        assert!(store.get_range_bytes(&id, 15, 2).await.is_err());
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
