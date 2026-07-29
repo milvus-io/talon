@@ -61,6 +61,8 @@
 mod capability;
 pub mod contract;
 mod error;
+#[cfg(feature = "etcd")]
+mod etcd;
 mod memory;
 mod record;
 mod revision;
@@ -75,6 +77,9 @@ pub use record::{
 };
 pub use revision::{MappingRevision, StoreRevision};
 pub use transaction::{Operation, Precondition, Transaction, TransactionOutcome};
+
+#[cfg(feature = "etcd")]
+pub use etcd::{EtcdMetadataConfig, EtcdMetadataStore, DEFAULT_METADATA_PREFIX};
 
 use async_trait::async_trait;
 
@@ -185,6 +190,24 @@ pub trait MetadataStore: Send + Sync {
         namespace: &NamespaceId,
         inode: InodeNumber,
     ) -> MetadataResult<InodeRecord>;
+
+    /// Apply a transaction atomically.
+    ///
+    /// Every precondition is evaluated against one linearizable view before any
+    /// operation applies. A failure leaves the store untouched.
+    ///
+    /// This is on the trait rather than each backend because §5's promotion
+    /// commit depends on the property, and the shared contract suite has to be
+    /// able to assert it for *every* backend. A backend that cannot provide
+    /// cross-record atomicity must not advertise [`Capability::HardLinks`] and
+    /// must reject this call, per §7.
+    ///
+    /// # Errors
+    ///
+    /// [`MetadataError::CompareAndSwapFailed`] when a precondition does not
+    /// hold, or [`MetadataError::CapabilityUnsupported`] when the backend does
+    /// not advertise the capability the transaction requires.
+    async fn commit(&self, transaction: &Transaction) -> MetadataResult<TransactionOutcome>;
 }
 
 #[cfg(test)]
@@ -237,6 +260,13 @@ mod tests {
             _namespace: &NamespaceId,
             _inode: InodeNumber,
         ) -> MetadataResult<InodeRecord> {
+            Err(MetadataError::CapabilityUnsupported {
+                backend: self.backend(),
+                capability: Capability::HardLinks,
+            })
+        }
+
+        async fn commit(&self, _transaction: &Transaction) -> MetadataResult<TransactionOutcome> {
             Err(MetadataError::CapabilityUnsupported {
                 backend: self.backend(),
                 capability: Capability::HardLinks,

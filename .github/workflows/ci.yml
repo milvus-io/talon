@@ -200,6 +200,14 @@ jobs:
           cargo test -p talon-coordinator
           --features etcd,state-store-testkit
           --test etcd_contract --locked
+      - name: Run etcd metadata-store contract tests
+        # Same ephemeral etcd, different store. ADR 0003 §7 keeps TMS and
+        # ClusterStateStore as separate abstractions under separate prefixes,
+        # and one of these tests asserts the two cannot collide.
+        run: >-
+          cargo test -p talon-metadata
+          --features etcd
+          --test etcd_backend --locked
 
   docker-build:
     name: docker image build

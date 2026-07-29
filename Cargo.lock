@@ -2587,9 +2587,11 @@ name = "talon-metadata"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "etcd-client",
  "serde",
  "thiserror 2.0.19",
  "tokio",
+ "tonic",
  "tracing",
 ]
 
