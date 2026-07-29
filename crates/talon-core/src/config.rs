@@ -85,8 +85,8 @@ pub struct WorkerConfig {
     pub capacity_bytes: u64,
     /// L1 DRAM cache capacity in bytes. Zero disables L1.
     pub l1_capacity_bytes: u64,
-    /// Largest whole block eligible for admission into L1.
-    pub l1_max_entry_bytes: u64,
+    /// Fixed L1 DRAM page size in bytes.
+    pub l1_page_size_bytes: u64,
     /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
     /// per-backend endpoint/credential fields below apply to the selected one.
     pub backend: Option<String>,
@@ -210,7 +210,7 @@ impl Default for WorkerConfig {
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
             l1_capacity_bytes: 0,
-            l1_max_entry_bytes: 4 << 20,
+            l1_page_size_bytes: 256 << 10,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -261,8 +261,8 @@ pub struct WorkerConfigPatch {
     pub capacity_bytes: Option<u64>,
     /// Override for [`WorkerConfig::l1_capacity_bytes`].
     pub l1_capacity_bytes: Option<u64>,
-    /// Override for [`WorkerConfig::l1_max_entry_bytes`].
-    pub l1_max_entry_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::l1_page_size_bytes`].
+    pub l1_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::backend`].
     pub backend: Option<String>,
     /// Override for [`WorkerConfig::azure_account`].
@@ -313,7 +313,7 @@ impl Patch for WorkerConfigPatch {
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
             l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
-            l1_max_entry_bytes: self.l1_max_entry_bytes.or(base.l1_max_entry_bytes),
+            l1_page_size_bytes: self.l1_page_size_bytes.or(base.l1_page_size_bytes),
             backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
@@ -436,12 +436,12 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "L1 DRAM cache capacity in bytes; 0 disables L1.",
     },
     ConfigVar {
-        env: "TALON_WORKER_L1_MAX_ENTRY_BYTES",
-        key: "l1_max_entry_bytes",
-        default: Some("4194304"),
+        env: "TALON_WORKER_L1_PAGE_SIZE_BYTES",
+        key: "l1_page_size_bytes",
+        default: Some("262144"),
         cli: false,
         secret: false,
-        help: "Largest whole block eligible for the L1 DRAM cache.",
+        help: "Fixed L1 DRAM page size in bytes.",
     },
     ConfigVar {
         env: "TALON_WORKER_BACKEND",
@@ -625,7 +625,7 @@ pub(crate) mod worker_env {
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
     pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
-    pub const L1_MAX_ENTRY_BYTES: &str = "TALON_WORKER_L1_MAX_ENTRY_BYTES";
+    pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
     pub const BACKEND: &str = "TALON_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
@@ -717,8 +717,8 @@ impl WorkerConfigPatch {
             l1_capacity_bytes: get(worker_env::L1_CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::L1_CAPACITY_BYTES))
                 .transpose()?,
-            l1_max_entry_bytes: get(worker_env::L1_MAX_ENTRY_BYTES)
-                .map(|v| parse_u64(v, worker_env::L1_MAX_ENTRY_BYTES))
+            l1_page_size_bytes: get(worker_env::L1_PAGE_SIZE_BYTES)
+                .map(|v| parse_u64(v, worker_env::L1_PAGE_SIZE_BYTES))
                 .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
@@ -796,7 +796,7 @@ impl WorkerConfig {
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
             l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
-            l1_max_entry_bytes: merged.l1_max_entry_bytes.unwrap_or(d.l1_max_entry_bytes),
+            l1_page_size_bytes: merged.l1_page_size_bytes.unwrap_or(d.l1_page_size_bytes),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
             backend: merged.backend.or(d.backend),
@@ -905,15 +905,27 @@ impl WorkerConfig {
             )));
         }
         if self.l1_capacity_bytes > 0 {
-            if self.l1_max_entry_bytes == 0 {
+            if self.l1_page_size_bytes == 0 {
                 return Err(Error::Other(
-                    "l1_max_entry_bytes must be > 0 when L1 is enabled".into(),
+                    "l1_page_size_bytes must be > 0 when L1 is enabled".into(),
                 ));
             }
-            if self.l1_max_entry_bytes > self.l1_capacity_bytes {
+            if self.l1_page_size_bytes > self.l1_capacity_bytes {
                 return Err(Error::Other(format!(
-                    "l1_max_entry_bytes ({}) must be <= l1_capacity_bytes ({})",
-                    self.l1_max_entry_bytes, self.l1_capacity_bytes
+                    "l1_page_size_bytes ({}) must be <= l1_capacity_bytes ({})",
+                    self.l1_page_size_bytes, self.l1_capacity_bytes
+                )));
+            }
+            if self.l1_page_size_bytes > self.block_size as u64 {
+                return Err(Error::Other(format!(
+                    "l1_page_size_bytes ({}) must be <= block_size ({})",
+                    self.l1_page_size_bytes, self.block_size
+                )));
+            }
+            if u64::from(self.block_size) % self.l1_page_size_bytes != 0 {
+                return Err(Error::Other(format!(
+                    "block_size ({}) must be divisible by l1_page_size_bytes ({})",
+                    self.block_size, self.l1_page_size_bytes
                 )));
             }
         }
@@ -1152,18 +1164,52 @@ impl FuseConfig {
         if self.coordinator.is_empty() {
             return Err(Error::Other("coordinator address must not be empty".into()));
         }
-        let trimmed = self.namespace_prefix.trim_start_matches('/');
-        let mut parts = trimmed.split('/');
-        let backend = parts.next().unwrap_or_default();
-        if backend.parse::<crate::Backend>().is_err() {
+        // Accept the historical absolute-looking spelling (`/s3/bucket`), but
+        // otherwise require a canonical namespace path. Empty, `.` and `..`
+        // components are ambiguous once the prefix is mapped into the FUSE
+        // tree and can cause the mounted path to address a different object.
+        // One trailing slash is meaningful after a non-empty key prefix (for
+        // example, `s3/bucket/dir/` must not also match `dir2`) and is retained.
+        let trimmed = self
+            .namespace_prefix
+            .strip_prefix('/')
+            .unwrap_or(&self.namespace_prefix);
+        if trimmed.starts_with('/') {
+            return Err(Error::Other(format!(
+                "namespace_prefix must not contain multiple leading slashes: {:?}",
+                self.namespace_prefix
+            )));
+        }
+        let parts: Vec<&str> = trimmed.split('/').collect();
+        let backend = parts.first().copied().unwrap_or_default();
+        if !matches!(
+            backend.parse::<crate::Backend>(),
+            Ok(parsed) if parsed.prefix() == backend
+        ) {
             return Err(Error::Other(format!(
                 "namespace_prefix must start with a supported backend (s3, gcs, or az): {:?}",
                 self.namespace_prefix
             )));
         }
-        if !matches!(parts.next(), Some(bucket) if !bucket.is_empty()) {
+        let bucket = parts.get(1).copied().unwrap_or_default();
+        if matches!(bucket, "" | "." | "..") {
             return Err(Error::Other(format!(
                 "namespace_prefix must name a bucket/container (for example, az/container): {:?}",
+                self.namespace_prefix
+            )));
+        }
+        const MAX_FUSE_COMPONENT_BYTES: usize = 255;
+        let invalid_component = parts.iter().enumerate().any(|(index, component)| {
+            let is_key_trailing_slash =
+                index + 1 == parts.len() && index >= 3 && component.is_empty();
+            matches!(*component, "." | "..")
+                || (component.is_empty() && !is_key_trailing_slash)
+                || component.as_bytes().contains(&0)
+                || component.len() > MAX_FUSE_COMPONENT_BYTES
+        });
+        if invalid_component {
+            return Err(Error::Other(format!(
+                "namespace_prefix contains an empty, `.` or `..` component, a NUL byte, or a component longer than {MAX_FUSE_COMPONENT_BYTES} bytes: {:?}",
                 self.namespace_prefix
             )));
         }
@@ -1256,12 +1302,12 @@ mod tests {
     fn l1_config_respects_layer_precedence() {
         let file = WorkerConfigPatch {
             l1_capacity_bytes: Some(16 << 20),
-            l1_max_entry_bytes: Some(1 << 20),
+            l1_page_size_bytes: Some(1 << 20),
             ..Default::default()
         };
         let env = WorkerConfigPatch {
             l1_capacity_bytes: Some(32 << 20),
-            l1_max_entry_bytes: Some(2 << 20),
+            l1_page_size_bytes: Some(2 << 20),
             ..Default::default()
         };
         let cli = WorkerConfigPatch {
@@ -1271,20 +1317,20 @@ mod tests {
 
         let cfg = WorkerConfig::resolve(file, env, cli).unwrap();
         assert_eq!(cfg.l1_capacity_bytes, 64 << 20);
-        assert_eq!(cfg.l1_max_entry_bytes, 2 << 20);
+        assert_eq!(cfg.l1_page_size_bytes, 2 << 20);
     }
 
     #[test]
     fn from_toml_parses_and_rejects_unknown() {
         let patch = WorkerConfigPatch::from_toml(
             "listen = \"0.0.0.0:9000\"\ncache_dirs = [\"/a\", \"/b\"]\n\
-             l1_capacity_bytes = 67108864\nl1_max_entry_bytes = 1048576\n",
+             l1_capacity_bytes = 67108864\nl1_page_size_bytes = 1048576\n",
         )
         .unwrap();
         assert_eq!(patch.listen.as_deref(), Some("0.0.0.0:9000"));
         assert_eq!(patch.cache_dirs.unwrap().len(), 2);
         assert_eq!(patch.l1_capacity_bytes, Some(64 << 20));
-        assert_eq!(patch.l1_max_entry_bytes, Some(1 << 20));
+        assert_eq!(patch.l1_page_size_bytes, Some(1 << 20));
         assert!(WorkerConfigPatch::from_toml("bogus_key = 1").is_err());
     }
 
@@ -1300,7 +1346,7 @@ mod tests {
             "TALON_WORKER_BACKEND_JITTER_MS" => Some("50".to_string()),
             "TALON_WORKER_BACKEND_THROUGHPUT_BYTES" => Some("1048576".to_string()),
             "TALON_WORKER_L1_CAPACITY_BYTES" => Some("67108864".to_string()),
-            "TALON_WORKER_L1_MAX_ENTRY_BYTES" => Some("1048576".to_string()),
+            "TALON_WORKER_L1_PAGE_SIZE_BYTES" => Some("1048576".to_string()),
             "TALON_WORKER_BACKEND" => Some("s3".to_string()),
             "TALON_WORKER_S3_REGION" => Some("us-east-1".to_string()),
             "TALON_WORKER_S3_PATH_STYLE" => Some("true".to_string()),
@@ -1320,7 +1366,7 @@ mod tests {
         assert_eq!(patch.backend_jitter_ms, Some(50));
         assert_eq!(patch.backend_throughput_bytes, Some(1 << 20));
         assert_eq!(patch.l1_capacity_bytes, Some(64 << 20));
-        assert_eq!(patch.l1_max_entry_bytes, Some(1 << 20));
+        assert_eq!(patch.l1_page_size_bytes, Some(1 << 20));
         assert_eq!(patch.backend.as_deref(), Some("s3"));
         assert_eq!(patch.s3_region.as_deref(), Some("us-east-1"));
         assert_eq!(patch.s3_path_style, Some(true));
@@ -1366,19 +1412,39 @@ mod tests {
 
         let cli = WorkerConfigPatch {
             l1_capacity_bytes: Some(1024),
-            l1_max_entry_bytes: Some(2048),
+            l1_page_size_bytes: Some(2048),
             ..Default::default()
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
-        assert!(err.to_string().contains("l1_max_entry_bytes"));
+        assert!(err.to_string().contains("l1_page_size_bytes"));
 
         let cli = WorkerConfigPatch {
             l1_capacity_bytes: Some(1024),
-            l1_max_entry_bytes: Some(0),
+            l1_page_size_bytes: Some(0),
             ..Default::default()
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("must be > 0"));
+
+        let cli = WorkerConfigPatch {
+            block_size: Some(1024),
+            capacity_bytes: Some(1024),
+            l1_capacity_bytes: Some(4096),
+            l1_page_size_bytes: Some(2048),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("must be <= block_size"));
+
+        let cli = WorkerConfigPatch {
+            block_size: Some(1024),
+            capacity_bytes: Some(1024),
+            l1_capacity_bytes: Some(4096),
+            l1_page_size_bytes: Some(300),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("must be divisible"));
     }
 
     #[test]
@@ -1568,7 +1634,22 @@ mod tests {
 
     #[test]
     fn fuse_namespace_prefix_requires_backend_and_bucket() {
-        for invalid in ["", "unknown/bucket", "s3", "gcs/"] {
+        for invalid in [
+            "",
+            "unknown/bucket",
+            "azure/container",
+            "s3",
+            "gcs/",
+            "//az/container",
+            "s3/./key",
+            "s3/../key",
+            "s3/bucket/",
+            "s3/bucket//dir",
+            "s3/bucket/./dir",
+            "s3/bucket/../dir",
+            "s3/bucket/dir//",
+            "s3/buck\0et/dir",
+        ] {
             let cli = FuseConfigPatch {
                 namespace_prefix: Some(invalid.into()),
                 ..Default::default()
@@ -1583,8 +1664,10 @@ mod tests {
         for valid in [
             "s3/bucket",
             "gcs/bucket/dir",
+            "gcs/bucket/dir/",
             "az/container",
             "/az/container/prefix",
+            "/az/container/prefix/",
         ] {
             let cli = FuseConfigPatch {
                 namespace_prefix: Some(valid.into()),
@@ -1593,5 +1676,13 @@ mod tests {
             let cfg = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap();
             assert_eq!(cfg.namespace_prefix, valid);
         }
+
+        let too_long = format!("s3/bucket/{}", "x".repeat(256));
+        let cli = FuseConfigPatch {
+            namespace_prefix: Some(too_long),
+            ..Default::default()
+        };
+        let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("255"), "{err}");
     }
 }

@@ -146,12 +146,13 @@ public final class TalonClient implements AutoCloseable {
      * List objects beneath a mount-relative prefix.
      *
      * <p>The prefix names a backend and bucket ({@code az/container}),
-     * optionally followed by a key prefix. Returned paths are in the same
-     * namespace, so they can be passed straight to {@link #read}.
+     * optionally followed by a key prefix. Returned paths are mount-relative;
+     * convert, for example, {@code az/container/key} to
+     * {@code az://container/key} before passing it to {@link #read}.
      *
-     * <p>Large listings are truncated rather than paginated: the control
-     * protocol has no cursor, so the server caps both the object count and the
-     * number of backend round trips.
+     * <p>The control protocol carries one bounded response. If a prefix exceeds
+     * the server's object, page, or payload limit, the call fails explicitly
+     * instead of returning an incomplete list; use a narrower prefix.
      */
     public List<ObjectEntry> list(String prefix) throws IOException {
         int id = requestIds.getAndIncrement();

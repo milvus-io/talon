@@ -61,6 +61,9 @@ struct Args {
     /// Object key to read.
     #[arg(long, default_value = "bench")]
     object: String,
+    /// Object-store backend serving the target object.
+    #[arg(long, default_value = "az")]
+    backend: Backend,
     /// Container or bucket the object lives in.
     #[arg(long, default_value = "c")]
     container: String,
@@ -192,7 +195,7 @@ async fn drive_one(
 }
 
 async fn run_one(args: &Args, conns: usize) -> Run {
-    let object = ObjectId::new(Backend::Azure, &args.container, &args.object);
+    let object = ObjectId::new(args.backend, &args.container, &args.object);
     let stop = Arc::new(AtomicBool::new(false));
     let errors = Arc::new(AtomicU64::new(0));
     let warmup = Duration::from_secs(args.warmup);
@@ -321,4 +324,23 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn defaults_to_azure_backend() {
+        let args = Args::try_parse_from(["talon-loadgen"]).unwrap();
+
+        assert_eq!(args.backend, Backend::Azure);
+    }
+
+    #[test]
+    fn accepts_explicit_s3_backend() {
+        let args = Args::try_parse_from(["talon-loadgen", "--backend", "s3"]).unwrap();
+
+        assert_eq!(args.backend, Backend::S3);
+    }
 }

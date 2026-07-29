@@ -4,11 +4,9 @@
 //! **real loopback TCP** through the worker's serve logic, so they measure the
 //! actual wins from the epic:
 //!
-//! - `serve_whole_block_read` vs `serve_sendfile`: delivering a small sub-range
-//!   of a large *resident* block. The old byte path (`serve_range`) reads the
-//!   entire block into memory and writes the slice; the new path (`serve` →
-//!   `ServeOutcome::Sendfile`) streams exactly the requested window from the
-//!   block file's fd with `sendfile(2)`, never touching the whole block (#179).
+//! - `serve_userspace_range_read`, `serve_l1_page`, and `serve_sendfile`:
+//!   delivering a small sub-range of a large resident block through L2
+//!   userspace I/O, the fine-grained L1 page cache, or zero-copy L2 sendfile.
 //! - `fetch_unpooled` vs `fetch_pooled`: N sequential small round-trips to a
 //!   worker, dialing a fresh TCP connection each time vs reusing one pooled
 //!   connection — the handshake cost the client pool removes (#181).
@@ -97,10 +95,29 @@ async fn warm_runtime(root: &PathBuf) -> Arc<WorkerRuntime> {
     runtime
 }
 
-/// Spawn a server that, per connection, reads one RangeRequest and serves it
-/// with the OLD byte path: `serve_range` reads the whole block into memory, then
-/// we write header + bytes.
-async fn spawn_old_server(runtime: Arc<WorkerRuntime>) -> String {
+async fn warm_l1_runtime(root: &PathBuf) -> Arc<WorkerRuntime> {
+    let runtime = Arc::new(WorkerRuntime::new_with_l1(
+        WholeBlockStore::open(root).unwrap(),
+        Arc::new(BlockIndex::new()),
+        Arc::new(InFlightLoads::new()),
+        Arc::new(RampBackend) as Arc<dyn BackendStore>,
+        BLOCK_BYTES,
+        0,
+        8 << 20,
+        256 << 10,
+        WorkerMetrics::new(1 << 30),
+    ));
+    let warm = RangeRequest {
+        object: obj(),
+        offset: 0,
+        len: RANGE_LEN,
+    };
+    let _ = runtime.serve(&warm).await.unwrap();
+    runtime
+}
+
+/// Spawn a server that serves a request through the userspace byte path.
+async fn spawn_bytes_server(runtime: Arc<WorkerRuntime>) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
@@ -209,10 +226,9 @@ async fn client_fetch(addr: &str, req: &RangeRequest) -> usize {
     body.len()
 }
 
-/// Deliver a 64 KiB sub-range of a 32 MiB resident block via the OLD path (whole
-/// block read into memory), over real loopback TCP.
+/// Deliver a 64 KiB sub-range with a block-relative userspace L2 read.
 #[divan::bench]
-fn serve_whole_block_read(bencher: divan::Bencher) {
+fn serve_userspace_range_read(bencher: divan::Bencher) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -221,7 +237,33 @@ fn serve_whole_block_read(bencher: divan::Bencher) {
     let root = tmp_root("old");
     let (addr, req) = rt.block_on(async {
         let runtime = warm_runtime(&root).await;
-        let addr = spawn_old_server(runtime).await;
+        let addr = spawn_bytes_server(runtime).await;
+        let req = RangeRequest {
+            object: obj(),
+            offset: 4096,
+            len: RANGE_LEN,
+        };
+        (addr, req)
+    });
+    bencher.bench(|| {
+        let n = rt.block_on(client_fetch(&addr, &req));
+        assert_eq!(n, RANGE_LEN as usize);
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Deliver the same range from one resident 256 KiB L1 page.
+#[divan::bench]
+fn serve_l1_page(bencher: divan::Bencher) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let root = tmp_root("l1-page");
+    let (addr, req) = rt.block_on(async {
+        let runtime = warm_l1_runtime(&root).await;
+        let addr = spawn_bytes_server(runtime).await;
         let req = RangeRequest {
             object: obj(),
             offset: 4096,

@@ -102,9 +102,10 @@ Notes on running it:
 - **Warmup is excluded** from recorded samples, so the numbers describe the
   serve path rather than the first-fetch miss path.
 - **`talon-loadgen` can drive an existing worker** directly:
-  `talon-loadgen --addr host:7001 --conns 1024 --server-pid <pid>`. With
-  `--server-pid` it samples the worker's CPU and RSS from `/proc` across the
-  measured window; `--json` emits JSON Lines for scripted comparison.
+  `talon-loadgen --addr host:7001 --backend s3 --conns 1024 --server-pid <pid>`.
+  Set `--backend` to the backend configured on the target worker (the default is
+  `az`). With `--server-pid` it samples the worker's CPU and RSS from `/proc`
+  across the measured window; `--json` emits JSON Lines for scripted comparison.
 - A run that reports **no samples** is a failed run, not a fast one — the tool
   refuses to turn error frames into latency numbers and prints the first error
   verbatim.

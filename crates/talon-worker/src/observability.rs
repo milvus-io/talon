@@ -57,7 +57,7 @@ pub struct WorkerMetrics {
     block_count: Gauge,
     page_count: Gauge,
     resident_bytes: Gauge,
-    l1_blocks: Gauge,
+    l1_pages: Gauge,
     l1_resident_bytes: Gauge,
     l1_capacity_bytes: Gauge,
     ready: Gauge,
@@ -140,12 +140,12 @@ impl WorkerMetrics {
         );
         let l1_admissions_total = registry.counter(
             "talon_worker_l1_admissions_total",
-            "Blocks admitted or promoted into the L1 DRAM cache.",
+            "Pages admitted or promoted into the L1 DRAM cache.",
             BTreeMap::new(),
         );
         let l1_evictions_total = registry.counter(
             "talon_worker_l1_evictions_total",
-            "Blocks evicted from the L1 DRAM cache.",
+            "Pages evicted from the L1 DRAM cache.",
             BTreeMap::new(),
         );
         let backend_fetch_bytes_total = registry.counter(
@@ -238,9 +238,9 @@ impl WorkerMetrics {
             "Bytes currently resident in the worker cache.",
             BTreeMap::new(),
         );
-        let l1_blocks = registry.gauge(
-            "talon_worker_l1_blocks",
-            "Blocks currently resident in the L1 DRAM cache.",
+        let l1_pages = registry.gauge(
+            "talon_worker_l1_pages",
+            "Pages currently resident in the L1 DRAM cache.",
             BTreeMap::new(),
         );
         let l1_resident_bytes = registry.gauge(
@@ -303,7 +303,7 @@ impl WorkerMetrics {
             block_count,
             page_count,
             resident_bytes,
-            l1_blocks,
+            l1_pages,
             l1_resident_bytes,
             l1_capacity_bytes,
             ready,
@@ -355,7 +355,7 @@ impl WorkerMetrics {
         self.l2_misses_total.inc();
     }
 
-    /// Record a block admitted or promoted into L1.
+    /// Record a page admitted or promoted into L1.
     pub fn record_l1_admission(&self) {
         self.l1_admissions_total.inc();
     }
@@ -371,8 +371,8 @@ impl WorkerMetrics {
     }
 
     /// Publish current L1 entry and byte residency.
-    pub fn update_l1_residency(&self, blocks: u64, resident_bytes: u64) {
-        self.l1_blocks.set(blocks as f64);
+    pub fn update_l1_residency(&self, pages: u64, resident_bytes: u64) {
+        self.l1_pages.set(pages as f64);
         self.l1_resident_bytes.set(resident_bytes as f64);
     }
 

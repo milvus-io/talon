@@ -102,8 +102,8 @@ spec:
               value: {{ .Values.worker.capacityBytes | quote }}
             - name: TALON_WORKER_L1_CAPACITY_BYTES
               value: {{ .Values.worker.l1CapacityBytes | quote }}
-            - name: TALON_WORKER_L1_MAX_ENTRY_BYTES
-              value: {{ .Values.worker.l1MaxEntryBytes | quote }}
+            - name: TALON_WORKER_L1_PAGE_SIZE_BYTES
+              value: {{ .Values.worker.l1PageSizeBytes | quote }}
             - name: TALON_WORKER_AZURE_ACCOUNT
               valueFrom:
                 secretKeyRef:

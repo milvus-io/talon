@@ -15,7 +15,8 @@ BENCH_SECONDS="${BENCH_SECONDS:-5}"
 ARTIFACT_DIR="${ARTIFACT_DIR:-$ROOT/.artifacts/k8s-l1-l2}"
 COORD_PORT="${COORD_PORT:-17000}"
 WORKER_PORT="${WORKER_PORT:-17001}"
-BLOCK_SIZE=$((1024 * 1024))
+BLOCK_SIZE="${BLOCK_SIZE:-$((16 * 1024 * 1024))}"
+PAGE_SIZE="${PAGE_SIZE:-$((256 * 1024))}"
 MINIO_ACCESS_KEY="minioadmin"
 MINIO_SECRET_KEY="minioadmin"
 BUCKET="talon-e2e"
@@ -150,6 +151,28 @@ first_worker() {
   worker_pods | sort | head -1
 }
 
+second_worker() {
+  worker_pods | sort | sed -n '2p'
+}
+
+cluster_loadgen() {
+  local target_pod="$1"
+  local output="$2"
+  local bench_pod target_ip
+  bench_pod="$(second_worker)"
+  target_ip="$(kubectl -n "$NAMESPACE" get pod "$target_pod" -o jsonpath='{.status.podIP}')"
+  [[ -n "$bench_pod" && "$bench_pod" != "$target_pod" && -n "$target_ip" ]] ||
+    fail "cannot select a separate in-cluster load-generator pod"
+  kubectl -n "$NAMESPACE" exec -i "$bench_pod" -- \
+    sh -c 'cat >/tmp/talon-loadgen && chmod 755 /tmp/talon-loadgen' \
+    <target/release/talon-loadgen
+  kubectl -n "$NAMESPACE" exec "$bench_pod" -- \
+    /tmp/talon-loadgen --addr "$target_ip:7001" \
+    --backend s3 --container "$BUCKET" --object bench --range 65536 \
+    --conns 1,32,128 --seconds "$BENCH_SECONDS" --warmup 2 --json |
+    tee "$output"
+}
+
 assert_workers_spread() {
   local ready=0 nodes pod
   for _ in $(seq 1 60); do
@@ -200,7 +223,7 @@ set_cache_limits() {
   local l2="$2"
   kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
     "TALON_WORKER_L1_CAPACITY_BYTES=$l1" \
-    "TALON_WORKER_L1_MAX_ENTRY_BYTES=$BLOCK_SIZE" \
+    "TALON_WORKER_L1_PAGE_SIZE_BYTES=$PAGE_SIZE" \
     "TALON_WORKER_CAPACITY_BYTES=$l2" >/dev/null
   rollout_workers
 }
@@ -364,10 +387,10 @@ helm upgrade --install "$RELEASE" deploy/helm/talon -n "$NAMESPACE" \
   --set coordinator.clusterId=e2e \
   --set worker.replicas=3 \
   --set worker.topologySpreadWhenUnsatisfiable=DoNotSchedule \
-  --set worker.blockSizeBytes=$BLOCK_SIZE \
+  --set worker.blockSizeBytes="$BLOCK_SIZE" \
   --set worker.capacityBytes=$((64 * BLOCK_SIZE)) \
-  --set worker.l1CapacityBytes=$((32 * BLOCK_SIZE)) \
-  --set worker.l1MaxEntryBytes=$BLOCK_SIZE \
+  --set worker.l1CapacityBytes=$((32 * PAGE_SIZE)) \
+  --set worker.l1PageSizeBytes="$PAGE_SIZE" \
   --set worker.resources.requests.cpu=100m \
   --set worker.resources.requests.memory=128Mi \
   --set worker.resources.limits.cpu=2 \
@@ -435,14 +458,24 @@ start_coordinator_forward
 TARGET_POD="$(first_worker)"
 start_worker_forward "$TARGET_POD"
 head -c 65536 "$ARTIFACT_DIR/hot.bin" >"$ARTIFACT_DIR/hot.expected"
+hot_pages_before="$(metric_value "$TARGET_POD" talon_worker_l1_pages)"
 direct_read hot.bin 0 65536 "$ARTIFACT_DIR/hot-cold.out" |
   tee "$ARTIFACT_DIR/hot-cold.log"
+[[ "$(metric_value "$TARGET_POD" talon_worker_l1_pages)" -eq $((hot_pages_before + 1)) ]] ||
+  fail "first hot range admitted more than its single touched page"
 direct_read hot.bin 0 65536 "$ARTIFACT_DIR/hot-warm.out" |
   tee "$ARTIFACT_DIR/hot-warm.log"
 cmp "$ARTIFACT_DIR/hot.expected" "$ARTIFACT_DIR/hot-cold.out"
 cmp "$ARTIFACT_DIR/hot.expected" "$ARTIFACT_DIR/hot-warm.out"
 [[ "$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l1"}')" -ge 1 ]] ||
   fail "warm read did not register an L1 hit"
+HOT_SECOND_OFFSET=$((4 * PAGE_SIZE + 4096))
+dd if="$ARTIFACT_DIR/hot.bin" of="$ARTIFACT_DIR/hot-second.expected" \
+  bs=1 skip="$HOT_SECOND_OFFSET" count=65536 status=none
+direct_read hot.bin "$HOT_SECOND_OFFSET" 65536 "$ARTIFACT_DIR/hot-second.out" >/dev/null
+cmp "$ARTIFACT_DIR/hot-second.expected" "$ARTIFACT_DIR/hot-second.out"
+[[ "$(metric_value "$TARGET_POD" talon_worker_l1_pages)" -eq $((hot_pages_before + 2)) ]] ||
+  fail "a second range in the same block did not admit exactly one independent page"
 
 CROSS_OFFSET=$((BLOCK_SIZE - 32768))
 CROSS_LEN=65536
@@ -453,7 +486,7 @@ cmp "$ARTIFACT_DIR/cross.expected" "$ARTIFACT_DIR/cross.out"
 
 log "verifying L1 eviction falls back to L2 and L2 eviction invalidates L1"
 stop_port_forwards
-set_cache_limits $((2 * BLOCK_SIZE)) $((4 * BLOCK_SIZE))
+set_cache_limits $((2 * PAGE_SIZE)) $((4 * BLOCK_SIZE))
 start_coordinator_forward
 TARGET_POD="$(first_worker)"
 start_worker_forward "$TARGET_POD"
@@ -487,12 +520,12 @@ l1_hits_after="$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{
   fail "L2 eviction left an orphan L1 copy instead of refetching origin"
 [[ "$l1_hits_after" -eq "$l1_hits_before" ]] ||
   fail "L2-evicted block was incorrectly served from an orphan L1 copy"
-[[ "$(metric_value "$TARGET_POD" talon_worker_l1_blocks)" -le 2 ]] ||
-  fail "L1 exceeded its configured block capacity"
+[[ "$(metric_value "$TARGET_POD" talon_worker_l1_pages)" -le 2 ]] ||
+  fail "L1 exceeded its configured page capacity"
 
 log "verifying container restart rebuilds L2 and promotes into an empty L1"
 stop_port_forwards
-set_cache_limits $((32 * BLOCK_SIZE)) $((64 * BLOCK_SIZE))
+set_cache_limits $((32 * PAGE_SIZE)) $((64 * BLOCK_SIZE))
 start_coordinator_forward
 TARGET_POD="$(first_worker)"
 start_worker_forward "$TARGET_POD"
@@ -514,7 +547,7 @@ done
 stop_port_forwards
 start_coordinator_forward
 start_worker_forward "$TARGET_POD"
-[[ "$(metric_value "$TARGET_POD" talon_worker_l1_blocks)" -eq 0 ]] ||
+[[ "$(metric_value "$TARGET_POD" talon_worker_l1_pages)" -eq 0 ]] ||
   fail "L1 was not empty after process restart"
 direct_read restart.bin 0 4096 "$ARTIFACT_DIR/restart-after.out" >/dev/null
 cmp "$ARTIFACT_DIR/restart-before.out" "$ARTIFACT_DIR/restart-after.out"
@@ -522,7 +555,7 @@ cmp "$ARTIFACT_DIR/restart-before.out" "$ARTIFACT_DIR/restart-after.out"
   fail "restart promotion refetched the object body"
 [[ "$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l2"}')" -ge 1 ]] ||
   fail "restart read did not hit rebuilt L2"
-[[ "$(metric_value "$TARGET_POD" talon_worker_l1_blocks)" -eq 1 ]] ||
+[[ "$(metric_value "$TARGET_POD" talon_worker_l1_pages)" -eq 1 ]] ||
   fail "rebuilt L2 block was not promoted into L1"
 
 log "verifying concurrent cold misses collapse to one backend body fetch"
@@ -577,7 +610,7 @@ done
 
 log "benchmarking cold, warm L1, and warm L2 paths"
 stop_port_forwards
-set_cache_limits $((32 * BLOCK_SIZE)) $((64 * BLOCK_SIZE))
+set_cache_limits $((64 * PAGE_SIZE)) $((64 * BLOCK_SIZE))
 start_coordinator_forward
 TARGET_POD="$(first_worker)"
 start_worker_forward "$TARGET_POD"
@@ -589,10 +622,7 @@ start_worker_forward "$TARGET_POD"
     target/release/talon-client --worker "127.0.0.1:$WORKER_PORT" \
     --path "/s3/$BUCKET/bench" --len 65536 --out "$ARTIFACT_DIR/bench-warm.out"
 } 2>&1 | tee "$ARTIFACT_DIR/cold-warm.txt"
-target/release/talon-loadgen --addr "127.0.0.1:$WORKER_PORT" \
-  --container "$BUCKET" --object bench --range 65536 \
-  --conns 1,32,128 --seconds "$BENCH_SECONDS" --warmup 2 --json |
-  tee "$ARTIFACT_DIR/l1-benchmark.jsonl"
+cluster_loadgen "$TARGET_POD" "$ARTIFACT_DIR/l1-benchmark.jsonl"
 [[ "$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l1"}')" -gt 0 ]] ||
   fail "L1 benchmark produced no L1 hits"
 
@@ -601,10 +631,7 @@ set_cache_limits 0 $((64 * BLOCK_SIZE))
 start_coordinator_forward
 TARGET_POD="$(first_worker)"
 start_worker_forward "$TARGET_POD"
-target/release/talon-loadgen --addr "127.0.0.1:$WORKER_PORT" \
-  --container "$BUCKET" --object bench --range 65536 \
-  --conns 1,32,128 --seconds "$BENCH_SECONDS" --warmup 2 --json |
-  tee "$ARTIFACT_DIR/l2-benchmark.jsonl"
+cluster_loadgen "$TARGET_POD" "$ARTIFACT_DIR/l2-benchmark.jsonl"
 [[ "$(metric_value "$TARGET_POD" 'talon_worker_cache_tier_hits_total{tier="l2"}')" -gt 0 ]] ||
   fail "L2 benchmark produced no L2 hits"
 

@@ -32,7 +32,7 @@ use talon_backend::{
 };
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
-    BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
+    Backend, BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
 };
 use talon_transport::{codec, ControlMessage};
 use talon_worker::tokio_conn::{handle_conn, read_control};
@@ -135,7 +135,7 @@ impl Args {
             cache_dirs: None,
             capacity_bytes: None,
             l1_capacity_bytes: None,
-            l1_max_entry_bytes: None,
+            l1_page_size_bytes: None,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -271,7 +271,7 @@ async fn main() -> anyhow::Result<()> {
         cache_dirs = ?cfg.cache_dirs,
         capacity_bytes = cfg.capacity_bytes,
         l1_capacity_bytes = cfg.l1_capacity_bytes,
-        l1_max_entry_bytes = cfg.l1_max_entry_bytes,
+        l1_page_size_bytes = cfg.l1_page_size_bytes,
         azure_account = ?cfg.azure_account,
         azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
@@ -309,6 +309,11 @@ async fn main() -> anyhow::Result<()> {
     }
     let inflight = Arc::new(InFlightLoads::new());
     let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
+    let configured_backend: Backend = backend_kind.parse().map_err(|error| {
+        anyhow::anyhow!(
+            "unknown TALON_WORKER_BACKEND {backend_kind:?}; expected azure, s3, or gcs: {error}"
+        )
+    })?;
     let node = NodeInfo {
         id: NodeId::new(
             cfg.node_id
@@ -420,17 +425,20 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let worker = Arc::new(WorkerRuntime::new_with_l1(
-        store,
-        index,
-        inflight,
-        backend,
-        cfg.block_size,
-        cfg.capacity_bytes,
-        cfg.l1_capacity_bytes,
-        cfg.l1_max_entry_bytes,
-        observability.metrics().clone(),
-    ));
+    let worker = Arc::new(
+        WorkerRuntime::new_with_l1(
+            store,
+            index,
+            inflight,
+            backend,
+            cfg.block_size,
+            cfg.capacity_bytes,
+            cfg.l1_capacity_bytes,
+            cfg.l1_page_size_bytes,
+            observability.metrics().clone(),
+        )
+        .with_backend_kind(configured_backend),
+    );
 
     let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
     tracing::info!(listen = %cfg.admin_listen, "worker serving administration API");
