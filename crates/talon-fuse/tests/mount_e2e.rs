@@ -1413,24 +1413,32 @@ async fn mount_hard_links_to_objects_are_refused() {
         assert_eq!(retained, b"ne");
         drop(final_handle);
 
-        for _ in 0..100 {
-            let has_orphan = operation_store
+        // Orphan reclamation happens on a background task, so this polls rather
+        // than asserting immediately. The budget is deliberately generous: a
+        // fixed wall-clock window in a test that waits on background work will
+        // eventually find the slowest machine in the fleet, and when it does the
+        // failure looks like an orphan-handling regression rather than the
+        // timing artifact it is. Observed at 0.57s locally against a CI runner
+        // where the whole job took 122s (#423).
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let orphan_remains = || {
+            operation_store
                 .lock()
                 .unwrap()
                 .keys()
-                .any(|path| path.starts_with("/s3/bucket/.__talon_internal/unlinked/"));
-            if !has_orphan {
+                .any(|path| path.starts_with("/s3/bucket/.__talon_internal/unlinked/"))
+        };
+        let started = std::time::Instant::now();
+        while std::time::Instant::now() < deadline {
+            if !orphan_remains() {
                 break;
             }
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            !operation_store
-                .lock()
-                .unwrap()
-                .keys()
-                .any(|path| path.starts_with("/s3/bucket/.__talon_internal/unlinked/")),
-            "final release should delete the last-link orphan"
+            !orphan_remains(),
+            "final release should delete the last-link orphan; still present after {:?}",
+            started.elapsed()
         );
         Ok::<(), std::io::Error>(())
     })
