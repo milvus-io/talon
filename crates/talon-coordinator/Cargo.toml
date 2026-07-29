@@ -29,7 +29,7 @@ state-store-testkit = []
 kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:futures"]
 # Production etcd v3 ClusterStateStore backend. Kept off by default so
 # non-etcd builds do not pull in the gRPC/TLS stack.
-etcd = ["dep:etcd-client", "dep:tonic"]
+etcd = ["dep:etcd-client", "dep:tonic", "talon-metadata/etcd"]
 
 [dependencies]
 talon-core.workspace = true

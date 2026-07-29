@@ -32,6 +32,14 @@ pub struct CoordinatorConfig {
     /// Kubernetes backend settings, required when `state.backend` is kubernetes.
     #[cfg(feature = "kubernetes")]
     pub kubernetes: Option<KubernetesConfig>,
+    /// Optional metadata store (TMS) settings.
+    ///
+    /// Absent by default. ADR 0003 §1 keeps a cluster without one "a complete,
+    /// supported Talon deployment offering exactly today's feature set" -- TMS
+    /// is "the price of admission for a specific group of features, and clusters
+    /// that do not need those features must not pay it".
+    #[cfg(feature = "etcd")]
+    pub metadata: Option<MetadataConfig>,
 }
 
 impl Default for CoordinatorConfig {
@@ -47,6 +55,47 @@ impl Default for CoordinatorConfig {
             etcd: None,
             #[cfg(feature = "kubernetes")]
             kubernetes: None,
+            #[cfg(feature = "etcd")]
+            metadata: None,
+        }
+    }
+}
+
+/// Optional metadata store (TMS) connection settings.
+///
+/// ADR 0003 §7 names etcd as the first backend able to carry hard links, because
+/// it provides atomic transactions across the transition, inode, and path index
+/// records that §5's promotion commit needs. A lease-only backend cannot, and
+/// must not advertise that capability.
+#[cfg(feature = "etcd")]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetadataConfig {
+    /// etcd endpoints holding TMS records.
+    ///
+    /// May be the same cluster serving `ClusterStateStore`. §7 permits sharing
+    /// the physical cluster but keeps the two under separate prefixes, because
+    /// membership is ephemeral and rebuildable while TMS records are durable and
+    /// not.
+    pub endpoints: Vec<String>,
+    /// Keyspace prefix for TMS records.
+    ///
+    /// Defaults to `/talon-metadata`, disjoint from the cluster-state prefix.
+    #[serde(default = "default_metadata_prefix")]
+    pub prefix: String,
+}
+
+#[cfg(feature = "etcd")]
+fn default_metadata_prefix() -> String {
+    talon_metadata::DEFAULT_METADATA_PREFIX.to_string()
+}
+
+#[cfg(feature = "etcd")]
+impl Default for MetadataConfig {
+    fn default() -> Self {
+        Self {
+            endpoints: Vec::new(),
+            prefix: default_metadata_prefix(),
         }
     }
 }
@@ -110,6 +159,15 @@ pub struct CoordinatorConfigPatch {
     #[cfg(feature = "etcd")]
     #[serde(skip)]
     pub etcd_client_key_path: Option<String>,
+    /// Optional metadata store block from the config file.
+    #[cfg(feature = "etcd")]
+    pub metadata: Option<MetadataConfig>,
+    /// Metadata store endpoints override.
+    #[cfg(feature = "etcd")]
+    pub metadata_endpoints: Option<Vec<String>>,
+    /// Metadata store keyspace prefix override.
+    #[cfg(feature = "etcd")]
+    pub metadata_prefix: Option<String>,
     /// env/CLI-only override for `kubernetes.namespace` (never a TOML key).
     #[cfg(feature = "kubernetes")]
     #[serde(skip)]
@@ -147,6 +205,12 @@ impl Patch for CoordinatorConfigPatch {
             etcd_client_cert_path: self.etcd_client_cert_path.or(base.etcd_client_cert_path),
             #[cfg(feature = "etcd")]
             etcd_client_key_path: self.etcd_client_key_path.or(base.etcd_client_key_path),
+            #[cfg(feature = "etcd")]
+            metadata: self.metadata.or(base.metadata),
+            #[cfg(feature = "etcd")]
+            metadata_endpoints: self.metadata_endpoints.or(base.metadata_endpoints),
+            #[cfg(feature = "etcd")]
+            metadata_prefix: self.metadata_prefix.or(base.metadata_prefix),
             #[cfg(feature = "kubernetes")]
             kubernetes_namespace: self.kubernetes_namespace.or(base.kubernetes_namespace),
         }
@@ -324,6 +388,26 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "PEM client key path; mutual TLS.",
     },
+    ConfigVar {
+        env: "TALON_COORDINATOR_METADATA_ENDPOINTS",
+        key: "metadata.endpoints",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Comma-separated etcd endpoints for the optional metadata store (TMS). \
+               Unset means no TMS: hard links and locks are refused with a distinct \
+               errno rather than approximated (ADR 0003 §4).",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_METADATA_PREFIX",
+        key: "metadata.prefix",
+        default: Some("/talon-metadata"),
+        cli: false,
+        secret: false,
+        help: "Keyspace prefix for metadata-store records. Must stay disjoint from the \
+               cluster-state prefix; the two stores have different durability \
+               invariants (ADR 0003 §7).",
+    },
     #[cfg(feature = "kubernetes")]
     ConfigVar {
         env: "TALON_COORDINATOR_K8S_NAMESPACE",
@@ -364,6 +448,8 @@ pub mod env_names {
     pub const ETCD_CLIENT_CERT_PATH: &str = "TALON_COORDINATOR_ETCD_CLIENT_CERT_PATH";
     #[cfg(feature = "etcd")]
     pub const ETCD_CLIENT_KEY_PATH: &str = "TALON_COORDINATOR_ETCD_CLIENT_KEY_PATH";
+    pub const METADATA_ENDPOINTS: &str = "TALON_COORDINATOR_METADATA_ENDPOINTS";
+    pub const METADATA_PREFIX: &str = "TALON_COORDINATOR_METADATA_PREFIX";
     #[cfg(feature = "kubernetes")]
     pub const K8S_NAMESPACE: &str = "TALON_COORDINATOR_K8S_NAMESPACE";
 }
@@ -445,6 +531,19 @@ impl CoordinatorConfigPatch {
             etcd_client_cert_path: get(env_names::ETCD_CLIENT_CERT_PATH),
             #[cfg(feature = "etcd")]
             etcd_client_key_path: get(env_names::ETCD_CLIENT_KEY_PATH),
+            #[cfg(feature = "etcd")]
+            metadata: None,
+            #[cfg(feature = "etcd")]
+            metadata_endpoints: get(env_names::METADATA_ENDPOINTS).map(|value| {
+                value
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|entry| !entry.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            }),
+            #[cfg(feature = "etcd")]
+            metadata_prefix: get(env_names::METADATA_PREFIX),
             #[cfg(feature = "kubernetes")]
             kubernetes_namespace: get(env_names::K8S_NAMESPACE),
         })
@@ -526,6 +625,25 @@ impl CoordinatorConfig {
             kubernetes
         };
 
+        // The metadata block composes the same way the backend blocks do: a
+        // [metadata] table in the file, with environment scalars layered over
+        // it. Absent unless something asks for it -- ADR 0003 §1 keeps a cluster
+        // without TMS fully supported, so silence must not conjure a store.
+        #[cfg(feature = "etcd")]
+        let metadata = {
+            let mut metadata = merged.metadata;
+            if merged.metadata_endpoints.is_some() || merged.metadata_prefix.is_some() {
+                let block = metadata.get_or_insert_with(MetadataConfig::default);
+                if let Some(endpoints) = merged.metadata_endpoints {
+                    block.endpoints = endpoints;
+                }
+                if let Some(prefix) = merged.metadata_prefix {
+                    block.prefix = prefix;
+                }
+            }
+            metadata
+        };
+
         let config = Self {
             node_id: merged.node_id.unwrap_or_else(|| listen.clone()),
             admin_advertise: merged
@@ -555,6 +673,8 @@ impl CoordinatorConfig {
             etcd,
             #[cfg(feature = "kubernetes")]
             kubernetes,
+            #[cfg(feature = "etcd")]
+            metadata,
         };
         config.validate()?;
         Ok(config)
@@ -758,6 +878,77 @@ mod tests {
         );
         // Secret must never appear in Debug output.
         assert!(!format!("{config:?}").contains("s3cr3t"));
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn no_metadata_block_means_no_metadata_store() {
+        // ADR 0003 §1: a cluster without TMS "is a complete, supported Talon
+        // deployment offering exactly today's feature set". Silence in the
+        // config must not conjure a store, because configuring one commits the
+        // deployment to backing up non-rebuildable state.
+        let config = CoordinatorConfig::resolve(
+            CoordinatorConfigPatch::default(),
+            CoordinatorConfigPatch::default(),
+            CoordinatorConfigPatch::default(),
+        )
+        .unwrap();
+        assert!(config.metadata.is_none());
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn metadata_block_parses_from_toml_and_env_overrides_endpoints() {
+        let file = CoordinatorConfigPatch::from_toml(
+            "[metadata]\n\
+             endpoints = [\"https://etcd-a:2379\"]\n",
+        )
+        .unwrap();
+        let env = CoordinatorConfigPatch::from_env_with(|key| match key {
+            "TALON_COORDINATOR_METADATA_ENDPOINTS" => {
+                Some("https://tms-x:2379, https://tms-y:2379".into())
+            }
+            _ => None,
+        })
+        .unwrap();
+        let config =
+            CoordinatorConfig::resolve(file, env, CoordinatorConfigPatch::default()).unwrap();
+        let metadata = config.metadata.expect("metadata block present");
+        assert_eq!(
+            metadata.endpoints,
+            vec![
+                "https://tms-x:2379".to_string(),
+                "https://tms-y:2379".to_string()
+            ]
+        );
+        // The prefix defaults rather than being required.
+        assert_eq!(metadata.prefix, talon_metadata::DEFAULT_METADATA_PREFIX);
+    }
+
+    #[cfg(feature = "etcd")]
+    #[test]
+    fn the_metadata_prefix_stays_disjoint_from_cluster_state() {
+        // §7 permits sharing one physical etcd cluster but keeps the two stores
+        // separate, because membership is ephemeral and rebuildable while TMS
+        // records are durable and not. A shared prefix would make ADR 0001 §2's
+        // "bounded, rebuildable" invariant untrue by construction.
+        let config = CoordinatorConfig::resolve(
+            CoordinatorConfigPatch::from_toml(
+                "[metadata]\nendpoints = [\"https://etcd-a:2379\"]\n",
+            )
+            .unwrap(),
+            CoordinatorConfigPatch::default(),
+            CoordinatorConfigPatch::default(),
+        )
+        .unwrap();
+        let metadata = config.metadata.expect("metadata block present");
+        // Spelled out rather than imported: the point is that the two values
+        // must differ, so reading both from one constant would defeat the test.
+        let cluster_state_prefix = "/talon";
+        assert_ne!(metadata.prefix, cluster_state_prefix);
+        assert!(!metadata
+            .prefix
+            .starts_with(&format!("{cluster_state_prefix}/")));
     }
 
     #[cfg(feature = "kubernetes")]

@@ -11,6 +11,9 @@ use talon_coordinator::{
     WriteDisposition,
 };
 use talon_core::{NodeInfo, NodeRole};
+use talon_metadata::ClusterCapabilities;
+#[cfg(feature = "etcd")]
+use talon_metadata::MetadataStore as _;
 use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
 use tokio::io::AsyncWriteExt;
@@ -114,6 +117,82 @@ impl Args {
             // flags. Feature-gated fields default to None here.
             ..Default::default()
         }
+    }
+}
+
+/// Connect the optional metadata store and derive what this cluster advertises.
+///
+/// A failure to reach a *configured* store is not fatal. ADR 0003 §6:
+///
+/// > TMS unavailability degrades TMS-backed features; it must not affect the
+/// > read path. Reads, cache hits and misses, placement lookups, and
+/// > write-through writes are unaffected. None consults TMS.
+///
+/// So an unreachable store still advertises its capabilities, with
+/// `store_reachable` false. Refusing to start would turn a metadata outage into
+/// a cache outage, which is the opposite of what §6 requires.
+async fn build_capabilities(config: &CoordinatorConfig) -> ClusterCapabilities {
+    #[cfg(feature = "etcd")]
+    {
+        let Some(metadata) = config.metadata.as_ref() else {
+            return ClusterCapabilities::none();
+        };
+        let store_config = talon_metadata::EtcdMetadataConfig {
+            endpoints: metadata.endpoints.clone(),
+            prefix: metadata.prefix.clone(),
+        };
+        match talon_metadata::EtcdMetadataStore::connect(&store_config).await {
+            Ok(store) => {
+                let advertised = store.capabilities();
+                let health = store.check_ready().await;
+                let store_reachable = health.as_ref().map(|h| h.ready).unwrap_or(false);
+                if store_reachable {
+                    tracing::info!(
+                        capabilities = %advertised,
+                        prefix = %metadata.prefix,
+                        "metadata store connected"
+                    );
+                } else {
+                    // Distinct from the "not configured" path below, as §6
+                    // requires: an operator must be able to tell an outage from
+                    // a deployment choice.
+                    tracing::warn!(
+                        capabilities = %advertised,
+                        prefix = %metadata.prefix,
+                        "metadata store configured but not ready; \
+                         TMS-backed features will fail closed"
+                    );
+                }
+                ClusterCapabilities {
+                    advertised,
+                    revision: talon_metadata::CapabilityRevision::new(1),
+                    store_reachable,
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    prefix = %metadata.prefix,
+                    "metadata store configured but unreachable; \
+                     TMS-backed features will fail closed"
+                );
+                // The capabilities an etcd-backed store would offer, reported as
+                // unreachable rather than absent. Dropping them here would make
+                // this indistinguishable from an unconfigured cluster and send
+                // clients the wrong errno (§4).
+                ClusterCapabilities {
+                    advertised: talon_metadata::CapabilitySet::none()
+                        .with(talon_metadata::Capability::HardLinks),
+                    revision: talon_metadata::CapabilityRevision::new(1),
+                    store_reachable: false,
+                }
+            }
+        }
+    }
+    #[cfg(not(feature = "etcd"))]
+    {
+        let _ = config;
+        ClusterCapabilities::none()
     }
 }
 
@@ -484,13 +563,17 @@ async fn main() -> anyhow::Result<()> {
         address: config.listen.clone(),
         role: NodeRole::Coordinator,
     };
-    let observability = Arc::new(CoordinatorObservability::new(
-        config.cluster_id.clone(),
-        node,
-        config.admin_advertise.clone(),
-        Duration::from_millis(config.state.request_timeout_ms),
-        store,
-    )?);
+    let capabilities = build_capabilities(&config).await;
+    let observability = Arc::new(
+        CoordinatorObservability::new(
+            config.cluster_id.clone(),
+            node,
+            config.admin_advertise.clone(),
+            Duration::from_millis(config.state.request_timeout_ms),
+            store,
+        )?
+        .with_capabilities(capabilities),
+    );
     observability.check_ready().await?;
     let state = Coordinator::new(
         Arc::clone(&observability),
