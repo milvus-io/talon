@@ -256,8 +256,18 @@ make_repeated_file() {
 upload_file() {
   local source="$1"
   local key="$2"
-  kubectl -n "$NAMESPACE" exec -i minio-client -- \
-    mc pipe "local/$BUCKET/$key" <"$source"
+  # Stage to the pod's filesystem first, then have mc read from there, rather
+  # than piping the fixture straight into `mc pipe` over `kubectl exec`.
+  #
+  # The direct pipe held a single API-server stream open for the whole 16 MiB
+  # transfer while mc consumed it, and that stalled at 0 B and was SIGKILLed
+  # (exit 137) reproducibly (#426). The seeding path already stages the same way
+  # and moves several hundred MiB without trouble, so this uses the mechanism
+  # that is known to work here instead of a second one that is not.
+  stage_file "$source" "$key"
+  # shellcheck disable=SC2016 # $1 expands in the container shell.
+  kubectl -n "$NAMESPACE" exec minio-client -- \
+    sh -c 'mc cp "/tmp/fixtures/$1" "$2/$1"' sh "$key" "local/$BUCKET"
 }
 
 stage_file() {
