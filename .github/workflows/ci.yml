@@ -468,7 +468,11 @@ jobs:
         with:
           python-version: "3.11"
       - name: Install build and test tooling
-        run: python -m pip install --upgrade maturin pytest
+        run: |
+          # protoc compiles talon-worker's WAL record schema and the etcd
+          # client's generated code; both binaries below need it.
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          python -m pip install --upgrade maturin pytest
       - name: Build the release binaries the tests drive
         run: |
           cargo build --release --locked \
