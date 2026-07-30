@@ -145,16 +145,22 @@ impl Batcher {
     ///
     /// Everything appended up to here is covered; anything appended after is
     /// not, and waits for the next flush.
-    pub fn begin_flush(&mut self) -> WalPosition {
+    ///
+    /// Returns `None` when nothing is pending or another flush is already in
+    /// flight. Refusing a second flush is part of the durability contract: it
+    /// must not replace the position covered by the first fsync.
+    pub fn begin_flush(&mut self) -> Option<WalPosition> {
+        if self.in_flight.is_some() || !self.has_pending {
+            return None;
+        }
         let covered = self.appended;
         self.in_flight = Some(covered);
-        // The next batch's deadline starts now, not when its first record
-        // arrives during the flush. Otherwise a record appended mid-flush would
-        // start its window only at completion and see a longer delay than the
-        // bound promises.
+        // Discard the completed batch's elapsed time. If another record arrives
+        // during this flush, append() starts its deadline at that arrival rather
+        // than carrying time over from the batch now being synced.
         self.since_first_pending = Duration::ZERO;
         self.has_pending = false;
-        covered
+        Some(covered)
     }
 
     /// Report that the in-flight fsync completed.
@@ -264,7 +270,9 @@ mod tests {
             "an elapsed timer must not acknowledge anything"
         );
 
-        batcher.begin_flush();
+        batcher
+            .begin_flush()
+            .expect("pending record starts a flush");
         assert!(
             !batcher.is_durable(position),
             "a started fsync must not acknowledge anything either"
@@ -285,7 +293,7 @@ mod tests {
         // releasing on the timer, just harder to see.
         let mut batcher = Batcher::new();
         let first = batcher.append(64);
-        batcher.begin_flush();
+        batcher.begin_flush().expect("first record starts a flush");
         let second = batcher.append(64);
 
         batcher.complete_flush();
@@ -295,7 +303,7 @@ mod tests {
             "a record appended mid-flush is not covered by that flush"
         );
 
-        batcher.begin_flush();
+        batcher.begin_flush().expect("second record starts a flush");
         batcher.complete_flush();
         assert!(batcher.is_durable(second));
     }
@@ -306,7 +314,9 @@ mod tests {
         // more, and would complicate the watermark for nothing.
         let mut batcher = Batcher::new();
         batcher.append(FLUSH_BYTES * 2);
-        batcher.begin_flush();
+        batcher
+            .begin_flush()
+            .expect("pending records start a flush");
         assert_eq!(batcher.tick(Duration::from_millis(10)), None);
         assert!(batcher.is_flushing());
     }
@@ -317,15 +327,13 @@ mod tests {
         // should_flush passed every test, because they asserted only that no
         // trigger was returned in a case where nothing was pending anyway.
         //
-        // It is a real bug rather than an equivalent mutant. A second
-        // begin_flush overwrites `in_flight`, so when the *first* fsync
-        // completes it advances the durable watermark to the second flush's
-        // position -- acknowledging bytes that fsync never wrote. This asserts
-        // the guard holds with both thresholds far exceeded, which is when a
-        // missing guard would actually fire.
+        // It is a real bug rather than an equivalent mutant. Without the guard,
+        // the scheduler would repeatedly ask to flush while the first fsync is
+        // still running. This asserts the guard holds with both thresholds far
+        // exceeded, which is when a missing guard would actually fire.
         let mut batcher = Batcher::new();
         batcher.append(FLUSH_BYTES * 4);
-        batcher.begin_flush();
+        batcher.begin_flush().expect("first batch starts a flush");
         batcher.append(FLUSH_BYTES * 4);
         assert!(batcher.is_flushing());
         assert_eq!(
@@ -336,13 +344,36 @@ mod tests {
     }
 
     #[test]
+    fn begin_flush_cannot_replace_an_in_flight_boundary() {
+        let mut batcher = Batcher::new();
+        let first = batcher.append(64);
+        assert_eq!(batcher.begin_flush(), Some(first));
+
+        let second = batcher.append(128);
+        assert_eq!(
+            batcher.begin_flush(),
+            None,
+            "a second flush must not overwrite what the in-flight fsync covers"
+        );
+        assert_eq!(batcher.complete_flush(), first);
+        assert!(!batcher.is_durable(second));
+    }
+
+    #[test]
+    fn begin_flush_requires_pending_records() {
+        let mut batcher = Batcher::new();
+        assert_eq!(batcher.begin_flush(), None);
+        assert!(!batcher.is_flushing());
+    }
+
+    #[test]
     fn the_deadline_restarts_when_a_flush_begins() {
         // Otherwise a record appended during a flush would start its window
         // only at completion and could see a delay longer than the bound.
         let mut batcher = Batcher::new();
         batcher.append(64);
         batcher.tick(Duration::from_millis(5));
-        batcher.begin_flush();
+        batcher.begin_flush().expect("first batch starts a flush");
         batcher.append(64);
         batcher.complete_flush();
 
@@ -359,7 +390,9 @@ mod tests {
         let mut batcher = Batcher::new();
         batcher.append(100);
         assert_eq!(batcher.pending_bytes(), 100);
-        batcher.begin_flush();
+        batcher
+            .begin_flush()
+            .expect("pending records start a flush");
         batcher.append(50);
         assert_eq!(batcher.pending_bytes(), 150);
         batcher.complete_flush();
@@ -377,7 +410,9 @@ mod tests {
         // releasing on the timer.
         let mut batcher = Batcher::new();
         batcher.append(64);
-        batcher.begin_flush();
+        batcher
+            .begin_flush()
+            .expect("pending records start a flush");
         batcher.append(1_000_000);
         let durable = batcher.complete_flush();
         assert_eq!(durable, WalPosition::new(64));
