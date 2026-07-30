@@ -23,6 +23,7 @@ pub mod tokio_conn;
 pub mod uring_conn;
 pub mod uring_serve;
 pub mod wal;
+pub mod wal_commit;
 pub mod write_cache;
 
 pub use block_store::WholeBlockStore;
