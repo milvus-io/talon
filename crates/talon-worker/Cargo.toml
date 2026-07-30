@@ -28,6 +28,7 @@ path = "src/bin/loadgen.rs"
 [dependencies]
 talon-core.workspace = true
 talon-metadata.workspace = true
+prost.workspace = true
 talon-transport.workspace = true
 talon-backend = { path = "../talon-backend" }
 anyhow.workspace = true
@@ -52,3 +53,6 @@ tokio = { workspace = true, features = ["test-util"] }
 [[bench]]
 name = "dataplane_benches"
 harness = false
+
+[build-dependencies]
+prost-build.workspace = true

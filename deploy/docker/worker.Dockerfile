@@ -11,6 +11,13 @@
 # ---- build stage ---------------------------------------------------------
 FROM rust:1.96.1-bookworm AS build
 
+# protoc compiles the WAL record schema (proto/wal.proto). ADR 0003 §9.4
+# requires a specified on-disk format rather than a derived Rust encoding, so
+# the build now depends on it.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends protobuf-compiler \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /src
 COPY . .
 
