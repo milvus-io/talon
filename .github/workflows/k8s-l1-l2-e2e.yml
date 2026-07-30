@@ -33,6 +33,10 @@ jobs:
         with:
           version: v3.18.4
 
+      - name: Install protoc
+        # k8s_l1_l2_e2e.sh builds talon-worker, whose build script compiles the
+        # WAL record schema.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run multi-node Kubernetes E2E
         env:
           BENCH_SECONDS: "3"

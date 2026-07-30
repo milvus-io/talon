@@ -501,6 +501,10 @@ jobs:
           # Matches the pom's maven.compiler.release, so a source-level feature
           # newer than the declared minimum fails here rather than at a user.
           java-version: "17"
+      - name: Install protoc
+        # java_client_e2e.sh builds talon-worker, whose build script compiles
+        # the WAL record schema.
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Run conformance vectors and the end-to-end suite
         run: scripts/java_client_e2e.sh
 
