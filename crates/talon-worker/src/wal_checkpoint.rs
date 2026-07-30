@@ -132,8 +132,10 @@ pub fn should_compact(
     if total_records == 0 {
         return None;
     }
-    let obsolete = total_records.saturating_sub(live_records) as f64 / total_records as f64;
-    if obsolete > COMPACT_OBSOLETE_RATIO {
+    let obsolete = total_records.saturating_sub(live_records);
+    // More than half is equivalent to `obsolete / total > 0.5`, without
+    // converting counters to f64 and losing integer precision above 2^53.
+    if obsolete > total_records / 2 {
         return Some(CompactTrigger::Obsolescence);
     }
     None
@@ -290,6 +292,19 @@ mod tests {
         assert_eq!(should_compact(1024, 50, 100), None);
         assert_eq!(
             should_compact(1024, 49, 100),
+            Some(CompactTrigger::Obsolescence)
+        );
+    }
+
+    #[test]
+    fn obsolescence_keeps_exact_integer_boundaries_at_large_counts() {
+        // f64 rounds these adjacent u64 values together and would miss that the
+        // obsolete count is one record above half.
+        let total = u64::MAX;
+        let obsolete = total / 2 + 1;
+        let live = total - obsolete;
+        assert_eq!(
+            should_compact(0, live, total),
             Some(CompactTrigger::Obsolescence)
         );
     }
