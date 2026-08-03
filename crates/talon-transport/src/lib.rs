@@ -11,6 +11,7 @@
 //! See [`frame`] for the byte layout.
 
 pub mod codec;
+pub mod control_tls;
 pub mod data;
 pub mod frame;
 pub mod limits;

@@ -27,7 +27,7 @@ use talon_core::RequestId;
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
@@ -487,7 +487,10 @@ async fn sendfile_payload(
 }
 
 /// Read one framed control message (header + payload). `Ok(None)` on clean EOF.
-pub async fn read_control(stream: &mut TcpStream) -> anyhow::Result<Option<ControlMessage>> {
+pub async fn read_control<S>(stream: &mut S) -> anyhow::Result<Option<ControlMessage>>
+where
+    S: AsyncRead + Unpin,
+{
     let mut header_buf = [0u8; HEADER_LEN];
     match stream.read_exact(&mut header_buf).await {
         Ok(_) => {}

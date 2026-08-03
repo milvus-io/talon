@@ -33,17 +33,20 @@ use talon_backend::{
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
     Backend, BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
+    WorkloadIdentity, WorkloadRole,
 };
+use talon_transport::control_tls::ControlTlsChannel;
 use talon_transport::{codec, ControlMessage};
 use talon_worker::tokio_conn::{handle_conn, read_control};
 use talon_worker::uring_conn;
 use talon_worker::{
     serve_admin, BlockIndex, InFlightLoads, WholeBlockStore, WorkerObservability, WorkerRuntime,
 };
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
+const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Upper bound on concurrent data-plane connections. Beyond this, new peers wait
 /// for an in-flight connection to finish rather than each spawning an unbounded
@@ -99,6 +102,9 @@ struct Args {
     /// Address of the coordinator to register with.
     #[arg(long)]
     coordinator: Option<String>,
+    /// Dedicated coordinator-initiated mTLS control bind address.
+    #[arg(long)]
+    control_listen: Option<String>,
     /// Logical cluster advertised by worker status.
     #[arg(long)]
     cluster_id: Option<String>,
@@ -127,6 +133,7 @@ impl Args {
             advertise_addr: self.advertise_addr,
             admin_listen: self.admin_listen,
             coordinator: self.coordinator,
+            control_listen: self.control_listen,
             cluster_id: self.cluster_id,
             node_id: self.node_id,
             control_tls: None,
@@ -341,6 +348,23 @@ async fn main() -> anyhow::Result<()> {
         .metrics()
         .set_l1_capacity(cfg.l1_capacity_bytes);
 
+    let control_tls = if let Some(tls) = &cfg.control_tls {
+        let identity = WorkloadIdentity::new(
+            tls.trust_domain.clone(),
+            cfg.cluster_id.clone(),
+            WorkloadRole::Worker,
+            node.id.0.clone(),
+        )?;
+        Some(ControlTlsChannel::load(
+            tls.clone(),
+            identity,
+            WorkloadRole::Coordinator,
+            CONTROL_TLS_RELOAD_INTERVAL,
+        )?)
+    } else {
+        None
+    };
+
     // The networked HTTP client, shared by whichever backend is selected. Two
     // decorators may wrap it, innermost first: retry (always on — a cache with
     // no retry turns a routine 503 into a failed read) and, optionally, the
@@ -450,8 +474,20 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
+    if let (Some(control_listen), Some(channel)) = (&cfg.control_listen, &control_tls) {
+        let listener = TcpListener::bind(control_listen).await?;
+        tracing::info!(listen = %control_listen, "worker serving coordinator mTLS control plane");
+        let channel = channel.clone();
+        tokio::spawn(async move {
+            if let Err(error) = serve_control(listener, channel).await {
+                tracing::error!(%error, "worker coordinator mTLS control plane stopped");
+            }
+        });
+    }
+
     let _control_plane = spawn_control_plane(
         cfg.coordinator.clone(),
+        control_tls,
         node,
         Arc::clone(&worker),
         Arc::clone(&observability),
@@ -530,8 +566,27 @@ async fn main() -> anyhow::Result<()> {
 }
 
 /// Open a control connection to the coordinator and send `Register`.
-async fn register_with_coordinator(coordinator: &str, node: &NodeInfo) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect(coordinator).await?;
+async fn register_with_coordinator(
+    coordinator: &str,
+    channel: Option<&ControlTlsChannel>,
+    node: &NodeInfo,
+) -> anyhow::Result<()> {
+    if let Some(channel) = channel {
+        let authenticated = channel.connect(coordinator).await?;
+        tracing::debug!(identity = %authenticated.identity, "connected to coordinator mTLS control plane");
+        return register_on_stream(authenticated.stream, coordinator, node).await;
+    }
+    register_on_stream(TcpStream::connect(coordinator).await?, coordinator, node).await
+}
+
+async fn register_on_stream<S>(
+    mut stream: S,
+    coordinator: &str,
+    node: &NodeInfo,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let buf = codec::encode(0, &ControlMessage::Register { node: node.clone() })?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
@@ -553,6 +608,7 @@ async fn register_with_coordinator(coordinator: &str, node: &NodeInfo) -> anyhow
 /// Maintain registration and send legacy plus versioned status heartbeats.
 fn spawn_control_plane(
     coordinator: String,
+    channel: Option<ControlTlsChannel>,
     node: NodeInfo,
     worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
@@ -568,7 +624,7 @@ fn spawn_control_plane(
             if !registered {
                 match tokio::time::timeout(
                     CONTROL_OPERATION_TIMEOUT,
-                    register_with_coordinator(&coordinator, &node),
+                    register_with_coordinator(&coordinator, channel.as_ref(), &node),
                 )
                 .await
                 {
@@ -599,8 +655,8 @@ fn spawn_control_plane(
                 status: Box::new(observability.status()),
             };
             let heartbeat = tokio::time::timeout(CONTROL_OPERATION_TIMEOUT, async {
-                send_oneshot(&coordinator, &legacy).await?;
-                send_oneshot(&coordinator, &status).await
+                send_oneshot(&coordinator, channel.as_ref(), &legacy).await?;
+                send_oneshot(&coordinator, channel.as_ref(), &status).await
             })
             .await;
             match heartbeat {
@@ -623,12 +679,54 @@ fn spawn_control_plane(
 }
 
 /// Connect, send one control message, and drop (fire-and-forget over TCP).
-async fn send_oneshot(addr: &str, msg: &ControlMessage) -> anyhow::Result<()> {
-    let mut stream = TcpStream::connect(addr).await?;
+async fn send_oneshot(
+    addr: &str,
+    channel: Option<&ControlTlsChannel>,
+    msg: &ControlMessage,
+) -> anyhow::Result<()> {
+    if let Some(channel) = channel {
+        return send_on_stream(channel.connect(addr).await?.stream, msg).await;
+    }
+    send_on_stream(TcpStream::connect(addr).await?, msg).await
+}
+
+async fn send_on_stream<S>(mut stream: S, msg: &ControlMessage) -> anyhow::Result<()>
+where
+    S: AsyncWrite + Unpin,
+{
     let buf = codec::encode(0, msg)?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
     Ok(())
+}
+
+async fn serve_control(listener: TcpListener, channel: ControlTlsChannel) -> anyhow::Result<()> {
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let channel = channel.clone();
+        tokio::spawn(async move {
+            let result = async {
+                let mut authenticated = channel.accept(stream).await?;
+                tracing::debug!(identity = %authenticated.identity, %peer, "accepted coordinator mTLS connection");
+                if read_control(&mut authenticated.stream).await?.is_some() {
+                    let reply = ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("no coordinator-to-worker privileged messages are implemented".into()),
+                    };
+                    authenticated
+                        .stream
+                        .write_all(&codec::encode(0, &reply)?)
+                        .await?;
+                    authenticated.stream.flush().await?;
+                }
+                anyhow::Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::debug!(%peer, %error, "worker coordinator mTLS connection ended");
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -699,6 +797,7 @@ mod tests {
         observability.readiness().set_store_ready(true);
         let control = spawn_control_plane(
             coordinator.to_string(),
+            None,
             node.clone(),
             worker,
             Arc::clone(&observability),
@@ -752,6 +851,7 @@ mod tests {
         observability.readiness().set_store_ready(true);
         let control = spawn_control_plane(
             coordinator.to_string(),
+            None,
             node,
             worker,
             Arc::clone(&observability),

@@ -97,6 +97,8 @@ pub struct WorkerConfig {
     pub admin_listen: String,
     /// Address of the coordinator to register with.
     pub coordinator: String,
+    /// Dedicated mTLS listener for coordinator-initiated privileged traffic.
+    pub control_listen: Option<String>,
     /// Logical cluster advertised in node status.
     pub cluster_id: String,
     /// Optional mTLS material for the privileged coordinator-worker channel.
@@ -231,6 +233,7 @@ impl Default for WorkerConfig {
             advertise_addr: "127.0.0.1:7001".into(),
             admin_listen: "127.0.0.1:8001".into(),
             coordinator: "127.0.0.1:7000".into(),
+            control_listen: None,
             cluster_id: "default".into(),
             control_tls: None,
             node_id: None,
@@ -276,6 +279,8 @@ pub struct WorkerConfigPatch {
     pub admin_listen: Option<String>,
     /// Override for [`WorkerConfig::coordinator`].
     pub coordinator: Option<String>,
+    /// Override for [`WorkerConfig::control_listen`].
+    pub control_listen: Option<String>,
     /// Override for [`WorkerConfig::cluster_id`].
     pub cluster_id: Option<String>,
     /// Optional `[control_tls]` block.
@@ -337,6 +342,7 @@ impl Patch for WorkerConfigPatch {
             advertise_addr: self.advertise_addr.or(base.advertise_addr),
             admin_listen: self.admin_listen.or(base.admin_listen),
             coordinator: self.coordinator.or(base.coordinator),
+            control_listen: self.control_listen.or(base.control_listen),
             cluster_id: self.cluster_id.or(base.cluster_id),
             control_tls: merge_control_tls(self.control_tls, base.control_tls),
             node_id: self.node_id.or(base.node_id),
@@ -410,6 +416,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: true,
         secret: false,
         help: "Coordinator control-plane address to register with.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CONTROL_LISTEN",
+        key: "control_listen",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Dedicated mTLS control bind address; requires [control_tls].",
     },
     ConfigVar {
         env: "TALON_WORKER_CLUSTER_ID",
@@ -682,6 +696,7 @@ pub(crate) mod worker_env {
     pub const ADVERTISE_ADDR: &str = "TALON_WORKER_ADVERTISE_ADDR";
     pub const ADMIN_LISTEN: &str = "TALON_WORKER_ADMIN_LISTEN";
     pub const COORDINATOR: &str = "TALON_WORKER_COORDINATOR";
+    pub const CONTROL_LISTEN: &str = "TALON_WORKER_CONTROL_LISTEN";
     pub const CLUSTER_ID: &str = "TALON_WORKER_CLUSTER_ID";
     pub const NODE_ID: &str = "TALON_WORKER_NODE_ID";
     pub const CONTROL_TLS_CA_CERT_PATH: &str = "TALON_WORKER_CONTROL_TLS_CA_CERT_PATH";
@@ -769,6 +784,7 @@ impl WorkerConfigPatch {
             advertise_addr: get(worker_env::ADVERTISE_ADDR),
             admin_listen: get(worker_env::ADMIN_LISTEN),
             coordinator: get(worker_env::COORDINATOR),
+            control_listen: get(worker_env::CONTROL_LISTEN),
             cluster_id: get(worker_env::CLUSTER_ID),
             node_id: get(worker_env::NODE_ID),
             control_tls: optional_control_tls_patch(
@@ -862,6 +878,7 @@ impl WorkerConfig {
             listen,
             admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
+            control_listen: merged.control_listen.or(d.control_listen),
             cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
             control_tls,
             node_id: merged.node_id.or(d.node_id),
@@ -915,6 +932,16 @@ impl WorkerConfig {
         }
         if self.coordinator.is_empty() {
             return Err(Error::Other("coordinator address must not be empty".into()));
+        }
+        if self.control_listen.is_some() != self.control_tls.is_some() {
+            return Err(Error::Other(
+                "control_listen and [control_tls] must be configured together".into(),
+            ));
+        }
+        if self.control_listen.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::Other(
+                "control_listen address must not be empty when set".into(),
+            ));
         }
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
@@ -1347,6 +1374,29 @@ mod tests {
     }
 
     #[test]
+    fn worker_control_listener_and_tls_are_all_or_none() {
+        let listener = WorkerConfigPatch {
+            control_listen: Some("127.0.0.1:7002".into()),
+            ..Default::default()
+        };
+        assert!(WorkerConfig::resolve(Default::default(), Default::default(), listener).is_err());
+
+        let secure = WorkerConfigPatch {
+            control_listen: Some("127.0.0.1:7002".into()),
+            control_tls: Some(ControlTlsConfigPatch {
+                ca_cert_path: Some("/tls/ca.pem".into()),
+                cert_path: Some("/tls/worker.pem".into()),
+                key_path: Some("/tls/worker-key.pem".into()),
+                trust_domain: Some("cluster.example".into()),
+            }),
+            ..Default::default()
+        };
+        let config = WorkerConfig::resolve(Default::default(), Default::default(), secure).unwrap();
+        assert_eq!(config.control_listen.as_deref(), Some("127.0.0.1:7002"));
+        assert!(config.control_tls.is_some());
+    }
+
+    #[test]
     fn defaults_are_valid() {
         WorkerConfig::default().validate().unwrap();
     }
@@ -1625,7 +1675,8 @@ mod tests {
     #[test]
     fn worker_control_tls_composes_file_and_environment_layers() {
         let file = WorkerConfigPatch::from_toml(
-            "[control_tls]\n\
+            "control_listen = \"127.0.0.1:7002\"\n\
+             [control_tls]\n\
              ca_cert_path = \"/tls/ca.pem\"\n\
              cert_path = \"/tls/file-cert.pem\"\n\
              key_path = \"/tls/key.pem\"\n\
