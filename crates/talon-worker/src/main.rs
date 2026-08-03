@@ -129,6 +129,7 @@ impl Args {
             coordinator: self.coordinator,
             cluster_id: self.cluster_id,
             node_id: self.node_id,
+            control_tls: None,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             block_size: self.block_size,
             data_plane_rings: self.data_plane_rings,

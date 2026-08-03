@@ -2556,12 +2556,14 @@ dependencies = [
  "async-trait",
  "bytes",
  "divan",
+ "percent-encoding",
  "serde",
  "serde_json",
  "thiserror 2.0.19",
  "toml",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]
