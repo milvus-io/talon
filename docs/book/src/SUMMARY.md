@@ -48,6 +48,7 @@
 - [ADR 0001: Management-plane HA](./explanation/adr-0001-management-plane-ha.md)
 - [ADR 0002: Write-cache durability](./explanation/adr-0002-write-cache-durability.md)
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)
+- [ADR 0004: Control-plane workload identity](./explanation/adr-0004-control-plane-workload-identity.md)
 
 # Contributing
 
