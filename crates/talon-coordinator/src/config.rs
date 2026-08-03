@@ -3,13 +3,41 @@
 use std::path::Path;
 
 use serde::Deserialize;
-use talon_core::{ConfigVar, Patch, MAX_STATUS_FIELD_BYTES};
+use talon_core::{
+    ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, Patch, MAX_STATUS_FIELD_BYTES,
+};
 
 #[cfg(feature = "kubernetes")]
 use crate::KubernetesConfig;
 use crate::{ClusterStateConfig, StateBackend};
 #[cfg(feature = "etcd")]
 use crate::{EtcdConfig, EtcdTlsConfig};
+
+fn merge_control_tls(
+    higher: Option<ControlTlsConfigPatch>,
+    lower: Option<ControlTlsConfigPatch>,
+) -> Option<ControlTlsConfigPatch> {
+    match (higher, lower) {
+        (Some(higher), Some(lower)) => Some(higher.merge(lower)),
+        (Some(patch), None) | (None, Some(patch)) => Some(patch),
+        (None, None) => None,
+    }
+}
+
+fn optional_control_tls_patch(
+    ca_cert_path: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    trust_domain: Option<String>,
+) -> Option<ControlTlsConfigPatch> {
+    let patch = ControlTlsConfigPatch {
+        ca_cert_path: ca_cert_path.map(Into::into),
+        cert_path: cert_path.map(Into::into),
+        key_path: key_path.map(Into::into),
+        trust_domain,
+    };
+    (!patch.is_empty()).then_some(patch)
+}
 
 /// Fully resolved coordinator configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +52,8 @@ pub struct CoordinatorConfig {
     pub cluster_id: String,
     /// Stable coordinator node identity.
     pub node_id: String,
+    /// Optional mTLS material for the privileged coordinator-worker channel.
+    pub control_tls: Option<ControlTlsConfig>,
     /// Shared-state and lease settings.
     pub state: ClusterStateConfig,
     /// etcd backend connection settings, required when `state.backend` is etcd.
@@ -50,6 +80,7 @@ impl Default for CoordinatorConfig {
             admin_advertise: "127.0.0.1:8000".into(),
             cluster_id: "default".into(),
             node_id: "127.0.0.1:7000".into(),
+            control_tls: None,
             state: ClusterStateConfig::default(),
             #[cfg(feature = "etcd")]
             etcd: None,
@@ -114,6 +145,8 @@ pub struct CoordinatorConfigPatch {
     pub cluster_id: Option<String>,
     /// Override for [`CoordinatorConfig::node_id`].
     pub node_id: Option<String>,
+    /// Optional `[control_tls]` block.
+    pub control_tls: Option<ControlTlsConfigPatch>,
     /// Shared-state backend selector.
     pub state_backend: Option<StateBackend>,
     /// Whether active-active coordinator mode is requested.
@@ -182,6 +215,7 @@ impl Patch for CoordinatorConfigPatch {
             admin_advertise: self.admin_advertise.or(base.admin_advertise),
             cluster_id: self.cluster_id.or(base.cluster_id),
             node_id: self.node_id.or(base.node_id),
+            control_tls: merge_control_tls(self.control_tls, base.control_tls),
             state_backend: self.state_backend.or(base.state_backend),
             ha_enabled: self.ha_enabled.or(base.ha_enabled),
             coordinator_replicas: self.coordinator_replicas.or(base.coordinator_replicas),
@@ -261,6 +295,38 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         cli: true,
         secret: false,
         help: "Stable coordinator node identity.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CONTROL_TLS_CA_CERT_PATH",
+        key: "control_tls.ca_cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM CA bundle for the privileged coordinator-worker mTLS channel.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CONTROL_TLS_CERT_PATH",
+        key: "control_tls.cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM coordinator certificate chain for the privileged mTLS channel.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CONTROL_TLS_KEY_PATH",
+        key: "control_tls.key_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM coordinator private-key file path; key bytes never enter configuration.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CONTROL_TLS_TRUST_DOMAIN",
+        key: "control_tls.trust_domain",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Lowercase DNS trust domain required in peer workload URI SANs.",
     },
     ConfigVar {
         env: "TALON_COORDINATOR_STATE_BACKEND",
@@ -427,6 +493,10 @@ pub mod env_names {
     pub const ADMIN_ADVERTISE: &str = "TALON_COORDINATOR_ADMIN_ADVERTISE";
     pub const CLUSTER_ID: &str = "TALON_COORDINATOR_CLUSTER_ID";
     pub const NODE_ID: &str = "TALON_COORDINATOR_NODE_ID";
+    pub const CONTROL_TLS_CA_CERT_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_CA_CERT_PATH";
+    pub const CONTROL_TLS_CERT_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_CERT_PATH";
+    pub const CONTROL_TLS_KEY_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_KEY_PATH";
+    pub const CONTROL_TLS_TRUST_DOMAIN: &str = "TALON_COORDINATOR_CONTROL_TLS_TRUST_DOMAIN";
     pub const STATE_BACKEND: &str = "TALON_COORDINATOR_STATE_BACKEND";
     pub const HA_ENABLED: &str = "TALON_COORDINATOR_HA_ENABLED";
     pub const REPLICAS: &str = "TALON_COORDINATOR_REPLICAS";
@@ -488,6 +558,12 @@ impl CoordinatorConfigPatch {
             admin_advertise: get(env_names::ADMIN_ADVERTISE),
             cluster_id: get(env_names::CLUSTER_ID),
             node_id: get(env_names::NODE_ID),
+            control_tls: optional_control_tls_patch(
+                get(env_names::CONTROL_TLS_CA_CERT_PATH),
+                get(env_names::CONTROL_TLS_CERT_PATH),
+                get(env_names::CONTROL_TLS_KEY_PATH),
+                get(env_names::CONTROL_TLS_TRUST_DOMAIN),
+            ),
             state_backend: get(env_names::STATE_BACKEND)
                 .map(|value| parse(value, env_names::STATE_BACKEND))
                 .transpose()?,
@@ -563,6 +639,7 @@ impl CoordinatorConfig {
         let listen = merged.listen.unwrap_or(defaults.listen);
         let admin_listen = merged.admin_listen.unwrap_or(defaults.admin_listen);
         let cluster_id = merged.cluster_id.unwrap_or(defaults.cluster_id);
+        let control_tls = merged.control_tls.unwrap_or_default().resolve()?;
 
         // Fold backend blocks with their env/CLI scalar overrides. The block may
         // come entirely from an env override even with no `[etcd]`/`[kubernetes]`
@@ -652,6 +729,7 @@ impl CoordinatorConfig {
             listen,
             admin_listen,
             cluster_id,
+            control_tls,
             state: ClusterStateConfig {
                 backend: merged.state_backend.unwrap_or(default_state.backend),
                 ha_enabled: merged.ha_enabled.unwrap_or(default_state.ha_enabled),
@@ -700,6 +778,9 @@ impl CoordinatorConfig {
             }
         }
         self.state.validate()?;
+        if let Some(control_tls) = &self.control_tls {
+            control_tls.validate()?;
+        }
 
         // The selected backend must have a matching configuration block, and the
         // block itself must be valid. Memory needs no block.
@@ -770,6 +851,43 @@ mod tests {
         assert_eq!(config.admin_advertise, "public:8000");
         assert_eq!(config.node_id, "cli:7000");
         assert_eq!(config.cluster_id, "prod");
+    }
+
+    #[test]
+    fn control_tls_composes_file_and_environment_layers() {
+        let file = CoordinatorConfigPatch::from_toml(
+            "[control_tls]\n\
+             ca_cert_path = \"/tls/ca.pem\"\n\
+             cert_path = \"/tls/file-cert.pem\"\n\
+             key_path = \"/tls/key.pem\"\n\
+             trust_domain = \"prod.example.com\"\n",
+        )
+        .unwrap();
+        let env = CoordinatorConfigPatch::from_env_with(|key| {
+            (key == "TALON_COORDINATOR_CONTROL_TLS_CERT_PATH")
+                .then(|| "/tls/env-cert.pem".to_string())
+        })
+        .unwrap();
+        let config =
+            CoordinatorConfig::resolve(file, env, CoordinatorConfigPatch::default()).unwrap();
+        let tls = config.control_tls.expect("control TLS configured");
+        assert_eq!(tls.ca_cert_path, std::path::Path::new("/tls/ca.pem"));
+        assert_eq!(tls.cert_path, std::path::Path::new("/tls/env-cert.pem"));
+        assert_eq!(tls.key_path, std::path::Path::new("/tls/key.pem"));
+        assert_eq!(tls.trust_domain, "prod.example.com");
+
+        let partial = CoordinatorConfigPatch::from_env_with(|key| {
+            (key == "TALON_COORDINATOR_CONTROL_TLS_TRUST_DOMAIN")
+                .then(|| "prod.example.com".to_string())
+        })
+        .unwrap();
+        let error = CoordinatorConfig::resolve(
+            CoordinatorConfigPatch::default(),
+            partial,
+            CoordinatorConfigPatch::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ca_cert_path"));
     }
 
     #[test]

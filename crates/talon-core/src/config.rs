@@ -22,7 +22,7 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
-use crate::{Error, Result};
+use crate::{ControlTlsConfig, ControlTlsConfigPatch, Error, Result};
 
 /// A configuration patch: a set of optionally-present overrides.
 ///
@@ -31,6 +31,32 @@ use crate::{Error, Result};
 pub trait Patch {
     /// Overlay `self` onto `base`, letting `self`'s set fields win.
     fn merge(self, base: Self) -> Self;
+}
+
+fn merge_control_tls(
+    higher: Option<ControlTlsConfigPatch>,
+    lower: Option<ControlTlsConfigPatch>,
+) -> Option<ControlTlsConfigPatch> {
+    match (higher, lower) {
+        (Some(higher), Some(lower)) => Some(higher.merge(lower)),
+        (Some(patch), None) | (None, Some(patch)) => Some(patch),
+        (None, None) => None,
+    }
+}
+
+fn optional_control_tls_patch(
+    ca_cert_path: Option<String>,
+    cert_path: Option<String>,
+    key_path: Option<String>,
+    trust_domain: Option<String>,
+) -> Option<ControlTlsConfigPatch> {
+    let patch = ControlTlsConfigPatch {
+        ca_cert_path: ca_cert_path.map(PathBuf::from),
+        cert_path: cert_path.map(PathBuf::from),
+        key_path: key_path.map(PathBuf::from),
+        trust_domain,
+    };
+    (!patch.is_empty()).then_some(patch)
 }
 
 /// One configurable setting, described once and reused by both the runtime
@@ -73,6 +99,8 @@ pub struct WorkerConfig {
     pub coordinator: String,
     /// Logical cluster advertised in node status.
     pub cluster_id: String,
+    /// Optional mTLS material for the privileged coordinator-worker channel.
+    pub control_tls: Option<ControlTlsConfig>,
     /// Stable node identity; defaults to the RPC listen address when unset.
     pub node_id: Option<String>,
     /// Control-plane heartbeat interval in milliseconds.
@@ -204,6 +232,7 @@ impl Default for WorkerConfig {
             admin_listen: "127.0.0.1:8001".into(),
             coordinator: "127.0.0.1:7000".into(),
             cluster_id: "default".into(),
+            control_tls: None,
             node_id: None,
             heartbeat_interval_ms: 5_000,
             block_size: 256 << 20,
@@ -249,6 +278,8 @@ pub struct WorkerConfigPatch {
     pub coordinator: Option<String>,
     /// Override for [`WorkerConfig::cluster_id`].
     pub cluster_id: Option<String>,
+    /// Optional `[control_tls]` block.
+    pub control_tls: Option<ControlTlsConfigPatch>,
     /// Override for [`WorkerConfig::node_id`].
     pub node_id: Option<String>,
     /// Override for [`WorkerConfig::heartbeat_interval_ms`].
@@ -307,6 +338,7 @@ impl Patch for WorkerConfigPatch {
             admin_listen: self.admin_listen.or(base.admin_listen),
             coordinator: self.coordinator.or(base.coordinator),
             cluster_id: self.cluster_id.or(base.cluster_id),
+            control_tls: merge_control_tls(self.control_tls, base.control_tls),
             node_id: self.node_id.or(base.node_id),
             heartbeat_interval_ms: self.heartbeat_interval_ms.or(base.heartbeat_interval_ms),
             block_size: self.block_size.or(base.block_size),
@@ -394,6 +426,38 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: true,
         secret: false,
         help: "Stable worker node identity.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CONTROL_TLS_CA_CERT_PATH",
+        key: "control_tls.ca_cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM CA bundle for the privileged coordinator-worker mTLS channel.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CONTROL_TLS_CERT_PATH",
+        key: "control_tls.cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM worker certificate chain for the privileged mTLS channel.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CONTROL_TLS_KEY_PATH",
+        key: "control_tls.key_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM worker private-key file path; key bytes never enter configuration.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_CONTROL_TLS_TRUST_DOMAIN",
+        key: "control_tls.trust_domain",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Lowercase DNS trust domain required in peer workload URI SANs.",
     },
     ConfigVar {
         env: "TALON_WORKER_HEARTBEAT_INTERVAL_MS",
@@ -620,6 +684,10 @@ pub(crate) mod worker_env {
     pub const COORDINATOR: &str = "TALON_WORKER_COORDINATOR";
     pub const CLUSTER_ID: &str = "TALON_WORKER_CLUSTER_ID";
     pub const NODE_ID: &str = "TALON_WORKER_NODE_ID";
+    pub const CONTROL_TLS_CA_CERT_PATH: &str = "TALON_WORKER_CONTROL_TLS_CA_CERT_PATH";
+    pub const CONTROL_TLS_CERT_PATH: &str = "TALON_WORKER_CONTROL_TLS_CERT_PATH";
+    pub const CONTROL_TLS_KEY_PATH: &str = "TALON_WORKER_CONTROL_TLS_KEY_PATH";
+    pub const CONTROL_TLS_TRUST_DOMAIN: &str = "TALON_WORKER_CONTROL_TLS_TRUST_DOMAIN";
     pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_WORKER_HEARTBEAT_INTERVAL_MS";
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
@@ -703,6 +771,12 @@ impl WorkerConfigPatch {
             coordinator: get(worker_env::COORDINATOR),
             cluster_id: get(worker_env::CLUSTER_ID),
             node_id: get(worker_env::NODE_ID),
+            control_tls: optional_control_tls_patch(
+                get(worker_env::CONTROL_TLS_CA_CERT_PATH),
+                get(worker_env::CONTROL_TLS_CERT_PATH),
+                get(worker_env::CONTROL_TLS_KEY_PATH),
+                get(worker_env::CONTROL_TLS_TRUST_DOMAIN),
+            ),
             heartbeat_interval_ms: get(worker_env::HEARTBEAT_INTERVAL_MS)
                 .map(|v| parse_u64(v, worker_env::HEARTBEAT_INTERVAL_MS))
                 .transpose()?,
@@ -780,6 +854,7 @@ impl WorkerConfig {
             merged.advertise_addr.unwrap_or_else(|| listen.clone()),
             &listen,
         );
+        let control_tls = merged.control_tls.unwrap_or_default().resolve()?;
         let cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
             // address (issue #118: never silently advertise a wildcard bind).
@@ -788,6 +863,7 @@ impl WorkerConfig {
             admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
             cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
+            control_tls,
             node_id: merged.node_id.or(d.node_id),
             heartbeat_interval_ms: merged
                 .heartbeat_interval_ms
@@ -891,6 +967,9 @@ impl WorkerConfig {
                     node_id.len()
                 )));
             }
+        }
+        if let Some(control_tls) = &self.control_tls {
+            control_tls.validate()?;
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
@@ -1541,6 +1620,40 @@ mod tests {
         };
         let patch = WorkerConfigPatch::from_env_with(map).unwrap();
         assert_eq!(patch.advertise_addr.as_deref(), Some("worker-1.svc:7001"));
+    }
+
+    #[test]
+    fn worker_control_tls_composes_file_and_environment_layers() {
+        let file = WorkerConfigPatch::from_toml(
+            "[control_tls]\n\
+             ca_cert_path = \"/tls/ca.pem\"\n\
+             cert_path = \"/tls/file-cert.pem\"\n\
+             key_path = \"/tls/key.pem\"\n\
+             trust_domain = \"prod.example.com\"\n",
+        )
+        .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_CONTROL_TLS_CERT_PATH").then(|| "/tls/env-cert.pem".to_string())
+        })
+        .unwrap();
+        let config = WorkerConfig::resolve(file, env, WorkerConfigPatch::default()).unwrap();
+        let tls = config.control_tls.expect("control TLS configured");
+        assert_eq!(tls.ca_cert_path, PathBuf::from("/tls/ca.pem"));
+        assert_eq!(tls.cert_path, PathBuf::from("/tls/env-cert.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("/tls/key.pem"));
+        assert_eq!(tls.trust_domain, "prod.example.com");
+
+        let partial = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_CONTROL_TLS_KEY_PATH").then(|| "/tls/key.pem".to_string())
+        })
+        .unwrap();
+        let error = WorkerConfig::resolve(
+            WorkerConfigPatch::default(),
+            partial,
+            WorkerConfigPatch::default(),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("ca_cert_path"));
     }
 
     #[test]

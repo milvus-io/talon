@@ -46,6 +46,38 @@ Stable coordinator node identity.
 - **Default:** `<listen>`
 - **CLI flag:** `--node-id`
 
+### `control_tls.ca_cert_path`
+
+PEM CA bundle for the privileged coordinator-worker mTLS channel.
+
+- **Environment variable:** `TALON_COORDINATOR_CONTROL_TLS_CA_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.cert_path`
+
+PEM coordinator certificate chain for the privileged mTLS channel.
+
+- **Environment variable:** `TALON_COORDINATOR_CONTROL_TLS_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.key_path`
+
+PEM coordinator private-key file path; key bytes never enter configuration.
+
+- **Environment variable:** `TALON_COORDINATOR_CONTROL_TLS_KEY_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.trust_domain`
+
+Lowercase DNS trust domain required in peer workload URI SANs.
+
+- **Environment variable:** `TALON_COORDINATOR_CONTROL_TLS_TRUST_DOMAIN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `state_backend`
 
 Shared-state backend: memory | etcd | kubernetes.
@@ -241,6 +273,38 @@ Stable worker node identity.
 - **Environment variable:** `TALON_WORKER_NODE_ID`
 - **Default:** `<listen>`
 - **CLI flag:** `--node-id`
+
+### `control_tls.ca_cert_path`
+
+PEM CA bundle for the privileged coordinator-worker mTLS channel.
+
+- **Environment variable:** `TALON_WORKER_CONTROL_TLS_CA_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.cert_path`
+
+PEM worker certificate chain for the privileged mTLS channel.
+
+- **Environment variable:** `TALON_WORKER_CONTROL_TLS_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.key_path`
+
+PEM worker private-key file path; key bytes never enter configuration.
+
+- **Environment variable:** `TALON_WORKER_CONTROL_TLS_KEY_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.trust_domain`
+
+Lowercase DNS trust domain required in peer workload URI SANs.
+
+- **Environment variable:** `TALON_WORKER_CONTROL_TLS_TRUST_DOMAIN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `heartbeat_interval_ms`
 
