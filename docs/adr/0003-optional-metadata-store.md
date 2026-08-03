@@ -2,7 +2,7 @@
 
 - Status: Proposed
 - Date: 2026-07-28
-- Last revised: 2026-07-29 (§3, §4, §5, §6, §7, §9 — hard-link promotion uses
+- Last revised: 2026-08-03 (§3, §4, §5, §6, §7, §9 — hard-link promotion uses
   a crash-safe TMS transition and reconciles through a background scrubber plus
   `talon fsck`; distributed lock errors distinguish unsupported capability,
   unavailable TMS, contention, and deadlock; clients proxy TMS operations
@@ -12,7 +12,8 @@
   resharding; `fsync` reaches the origin, identity-changing namespace operations
   use a flush barrier, recovery and routing deadlines are fixed, origin conflict
   policy is configurable, and the local WAL and dirty-capacity defaults are
-  specified)
+  specified; mapping revisions propagate from TMS through active-active
+  coordinators to workers, preserving the management-tier credential boundary)
 - Tracking issue: #274 (roadmap items 4 and 7)
 - Motivating defects: #363 (hard links cannot be made write-atomic), #359
 - Prerequisite for: write-back (ADR 0002 §2), POSIX locking
@@ -329,16 +330,33 @@ monotonically increasing `MappingRevision` and a TMS-backed mutation guard:
 - FUSE clients cache sparse path mappings plus the namespace revision obtained
   from a coordinator. Every read, write, and namespace mutation in that
   namespace carries that revision.
-- Workers watch TMS and validate the revision against local state before
-  resolving a path or accepting a mutation. This is a local hot-path check, not
-  a TMS round trip per operation.
+- Active coordinators watch TMS and push namespace revisions over the
+  coordinator-worker control plane. Enabling the hard-link capability requires
+  mutual authentication on this revision channel and authorization for the
+  namespace; an unauthenticated push or acknowledgement cannot participate in
+  the fence. Workers never receive TMS credentials or connect to TMS. A worker
+  accepts monotonic revision updates from any active coordinator, records the
+  revision in its local mutation guard, and acknowledges the revision and its
+  worker incarnation. Request validation remains a local hot-path check, not a
+  coordinator or TMS round trip per operation.
 - Creating a transition advances the revision. Before copying data, the
-  coordinator waits until every healthy mutation-serving worker has observed
-  the fence, or its previous guard has expired and been fenced. A worker that
-  cannot keep its guard current stops accepting mutations for that namespace.
+  initiating coordinator pushes that revision and waits until every healthy
+  mutation-serving worker in its authoritative membership snapshot has
+  acknowledged the fence, or the worker's previous guard has expired and the
+  worker has been removed from the mutation-serving set. A worker that cannot
+  keep its guard current stops accepting mutations for that namespace.
 - Stale clients receive `STALE_MAPPING`, refresh through any coordinator, and
   retry. A current negative mapping proves that an ordinary unlinked object
   still uses its visible path.
+
+Revision acknowledgements are transient coordination state, not durable TMS
+records. The transition and its revision are already durable. If the initiating
+coordinator fails while waiting, another coordinator reads the transition,
+repeats the push, and collects a fresh acknowledgement set before assigning or
+resuming the copy. Coordinators periodically refresh an unchanged revision so a
+healthy worker's guard remains current; workers ignore lower revisions, making
+duplicate or reordered pushes harmless. This keeps propagation active-active
+without making a coordinator or its acknowledgement set authoritative.
 
 This namespace-wide revision may cause unrelated writers to refresh after the
 rare link transition, but it avoids a per-object TMS record and closes the race
@@ -459,10 +477,11 @@ their current path or bytes may exist only in TMS-backed state or on the acting
 replicas.
 
 A namespace that enables hard links adds one narrower availability dependency:
-workers must keep §5's mutation guard current to accept writes and namespace
-mutations. They do not contact TMS per operation, but they fail such mutations
-with `EAGAIN` after the guard expires during a TMS outage. Ordinary reads of
-unlinked path-addressed objects remain available.
+workers must keep §5's coordinator-fed mutation guard current to accept writes
+and namespace mutations. They do not contact either a coordinator or TMS per
+operation, but they fail such mutations with `EAGAIN` after the guard expires
+during a TMS or propagation outage. Ordinary reads of unlinked path-addressed
+objects remain available.
 
 This section concerns TMS failure only. Failure of `ClusterStateStore` retains
 ADR 0001 §8's fail-closed behavior for new authoritative membership and
@@ -519,8 +538,9 @@ write-back by itself. The first hard-link and write-back TMS implementation
 therefore targets etcd; a lease-only backend may still provide locking if it
 meets the locking contract.
 
-FUSE clients never receive TMS credentials or connect to TMS directly.
-Hard-link and lock operations are proxied through any active coordinator:
+FUSE clients and workers never receive TMS credentials or connect to TMS
+directly. Hard-link and lock operations are proxied through any active
+coordinator:
 
 ```text
 FUSE client -> any coordinator -> TMS
@@ -538,6 +558,14 @@ coordinator failure does not transfer or drop its locks. If the client stops
 renewing, TMS expiry releases them. If renewal fails, the client must assume the
 session and all of its locks are lost. This keeps coordinators stateless while
 confining TMS credentials and network access to the management tier.
+
+The same boundary applies to §5's mapping fence. Coordinators watch TMS and
+push revision-only guard updates to workers; workers acknowledge over the
+control plane and retain only the current revision plus its freshness deadline.
+They cannot read or mutate mappings, transitions, locks, or any other TMS
+record. A compromised worker can therefore stop acknowledging or serving its
+own mutations, but cannot forge a TMS mapping revision or expand its authority
+to another worker or namespace.
 
 Coordinators arbitrate and record transitions but do not receive object-store
 credentials solely for TMS features and do not proxy payload bytes. A worker
