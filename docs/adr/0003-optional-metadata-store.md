@@ -334,7 +334,8 @@ monotonically increasing `MappingRevision` and a TMS-backed mutation guard:
   coordinator-worker control plane. Enabling the hard-link capability requires
   mutual authentication on this revision channel and authorization for the
   namespace; an unauthenticated push or acknowledgement cannot participate in
-  the fence. Workers never receive TMS credentials or connect to TMS. A worker
+  the fence. ADR 0004 defines the workload identity, channel, and authorization
+  contract. Workers never receive TMS credentials or connect to TMS. A worker
   accepts monotonic revision updates from any active coordinator, records the
   revision in its local mutation guard, and acknowledges the revision and its
   worker incarnation. Request validation remains a local hot-path check, not a
