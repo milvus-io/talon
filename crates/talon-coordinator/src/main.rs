@@ -10,18 +10,21 @@ use talon_coordinator::{
     Membership, MemoryStateStore, PlacementService, RendezvousPlacement, StateBackend,
     WriteDisposition,
 };
-use talon_core::{NodeInfo, NodeRole};
+use talon_core::{NodeInfo, NodeRole, WorkloadIdentity, WorkloadRole};
 use talon_metadata::ClusterCapabilities;
 #[cfg(feature = "etcd")]
 use talon_metadata::MetadataStore as _;
+use talon_transport::control_tls::ControlTlsChannel;
 use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 /// Upper bound on concurrent control-plane connections (issue #111). Beyond
 /// this, new peers wait for an in-flight connection to finish.
 const MAX_CONTROL_CONNECTIONS: usize = 1024;
+
+const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Bound on establishing a proxied worker connection (#318). Keep this short:
 /// trying the next worker beats waiting on an unreachable one.
@@ -58,6 +61,9 @@ struct Args {
     /// Control-plane bind address.
     #[arg(long)]
     listen: Option<String>,
+    /// Dedicated worker-service mTLS bind address.
+    #[arg(long)]
+    control_listen: Option<String>,
     /// Administration HTTP bind address.
     #[arg(long)]
     admin_listen: Option<String>,
@@ -102,6 +108,7 @@ impl Args {
     fn into_patch(self) -> CoordinatorConfigPatch {
         CoordinatorConfigPatch {
             listen: self.listen,
+            control_listen: self.control_listen,
             admin_listen: self.admin_listen,
             admin_advertise: self.admin_advertise,
             cluster_id: self.cluster_id,
@@ -637,8 +644,33 @@ async fn main() -> anyhow::Result<()> {
         Duration::from_millis(config.state.heartbeat_interval_ms),
     );
 
+    let secure_control_enabled = config.control_tls.is_some();
+    if let (Some(control_listen), Some(control_tls)) = (&config.control_listen, &config.control_tls)
+    {
+        let identity = WorkloadIdentity::new(
+            control_tls.trust_domain.clone(),
+            config.cluster_id.clone(),
+            WorkloadRole::Coordinator,
+            config.node_id.clone(),
+        )?;
+        let channel = ControlTlsChannel::load(
+            control_tls.clone(),
+            identity,
+            WorkloadRole::Worker,
+            CONTROL_TLS_RELOAD_INTERVAL,
+        )?;
+        let listener = TcpListener::bind(control_listen).await?;
+        tracing::info!(listen = %control_listen, "coordinator serving worker mTLS control plane");
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            if let Err(error) = serve_worker_control(listener, channel, state).await {
+                tracing::error!(%error, "coordinator worker mTLS control plane stopped");
+            }
+        });
+    }
+
     let listener = TcpListener::bind(&config.listen).await?;
-    tracing::info!(listen = %config.listen, "coordinator serving control plane");
+    tracing::info!(listen = %config.listen, "coordinator serving public control plane");
     // Bound concurrent control connections so a flood of idle peers cannot
     // exhaust memory/FDs (issue #111).
     let conn_limit = talon_transport::ConnectionLimit::new(MAX_CONTROL_CONNECTIONS);
@@ -655,7 +687,12 @@ async fn main() -> anyhow::Result<()> {
                 // waits for a slot instead, keeping the select! responsive.
                 tokio::spawn(async move {
                     let _permit = conn_limit.acquire().await;
-                    if let Err(error) = handle_conn(stream, state).await {
+                    let access = if secure_control_enabled {
+                        ControlAccess::PublicOnly
+                    } else {
+                        ControlAccess::Legacy
+                    };
+                    if let Err(error) = handle_conn(stream, state, access).await {
                         tracing::debug!(%peer, %error, "coordinator connection ended");
                     }
                 });
@@ -796,7 +833,57 @@ fn spawn_self_heartbeat(
     })
 }
 
-async fn handle_conn(mut stream: TcpStream, state: Arc<Coordinator>) -> anyhow::Result<()> {
+#[derive(Clone, Copy)]
+enum ControlAccess {
+    Legacy,
+    PublicOnly,
+    WorkerService,
+}
+
+impl ControlAccess {
+    fn allows(self, worker_service: bool) -> bool {
+        match self {
+            Self::Legacy => true,
+            Self::PublicOnly => !worker_service,
+            Self::WorkerService => worker_service,
+        }
+    }
+}
+
+async fn serve_worker_control(
+    listener: TcpListener,
+    channel: ControlTlsChannel,
+    state: Arc<Coordinator>,
+) -> anyhow::Result<()> {
+    let conn_limit = talon_transport::ConnectionLimit::new(MAX_CONTROL_CONNECTIONS);
+    loop {
+        let (stream, peer) = listener.accept().await?;
+        let conn_limit = conn_limit.clone();
+        let channel = channel.clone();
+        let state = Arc::clone(&state);
+        tokio::spawn(async move {
+            let _permit = conn_limit.acquire().await;
+            let result = async {
+                let authenticated = channel.accept(stream).await?;
+                tracing::debug!(identity = %authenticated.identity, %peer, "accepted worker mTLS connection");
+                handle_conn(authenticated.stream, state, ControlAccess::WorkerService).await
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::debug!(%peer, %error, "coordinator worker mTLS connection ended");
+            }
+        });
+    }
+}
+
+async fn handle_conn<S>(
+    mut stream: S,
+    state: Arc<Coordinator>,
+    access: ControlAccess,
+) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     let _connection = state.observability.metrics().track_connection();
     loop {
         let message = match read_control(&mut stream).await {
@@ -807,9 +894,23 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<Coordinator>) -> anyhow::
                 return Err(error);
             }
         };
+        let worker_service = matches!(
+            message,
+            ControlMessage::Register { .. }
+                | ControlMessage::Heartbeat { .. }
+                | ControlMessage::NodeStatusHeartbeat { .. }
+        );
+        let allowed = access.allows(worker_service);
         let operation = talon_coordinator::ControlOperation::from_message(&message);
         let started = Instant::now();
-        let reply = state.dispatch(message).await;
+        let reply = if allowed {
+            state.dispatch(message).await
+        } else {
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some("message is not allowed on this control listener".into()),
+            }
+        };
         let error = matches!(&reply, ControlMessage::Ack { ok: false, .. });
         state
             .observability
@@ -827,9 +928,10 @@ async fn handle_conn(mut stream: TcpStream, state: Arc<Coordinator>) -> anyhow::
     }
 }
 
-async fn read_control(
-    stream: &mut TcpStream,
-) -> anyhow::Result<Option<(FrameHeader, ControlMessage)>> {
+async fn read_control<S>(stream: &mut S) -> anyhow::Result<Option<(FrameHeader, ControlMessage)>>
+where
+    S: AsyncRead + Unpin,
+{
     // Read one frame with the per-type size cap (control frames are capped at
     // 1 MiB, far below the 320 MiB data-plane max) enforced before allocation,
     // plus a read timeout, so a peer cannot pin a large buffer by advertising a
@@ -857,6 +959,16 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn dedicated_listener_routes_worker_service_messages_only() {
+        assert!(ControlAccess::Legacy.allows(true));
+        assert!(ControlAccess::Legacy.allows(false));
+        assert!(ControlAccess::WorkerService.allows(true));
+        assert!(!ControlAccess::WorkerService.allows(false));
+        assert!(!ControlAccess::PublicOnly.allows(true));
+        assert!(ControlAccess::PublicOnly.allows(false));
+    }
 
     #[tokio::test]
     async fn status_heartbeat_updates_store_and_worker_membership() {

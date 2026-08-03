@@ -44,6 +44,8 @@ fn optional_control_tls_patch(
 pub struct CoordinatorConfig {
     /// Control-plane bind address.
     pub listen: String,
+    /// Dedicated mTLS bind address for coordinator-worker service traffic.
+    pub control_listen: Option<String>,
     /// Administration HTTP bind address.
     pub admin_listen: String,
     /// Administration address advertised in node status.
@@ -76,6 +78,7 @@ impl Default for CoordinatorConfig {
     fn default() -> Self {
         Self {
             listen: "127.0.0.1:7000".into(),
+            control_listen: None,
             admin_listen: "127.0.0.1:8000".into(),
             admin_advertise: "127.0.0.1:8000".into(),
             cluster_id: "default".into(),
@@ -137,6 +140,8 @@ impl Default for MetadataConfig {
 pub struct CoordinatorConfigPatch {
     /// Override for [`CoordinatorConfig::listen`].
     pub listen: Option<String>,
+    /// Override for [`CoordinatorConfig::control_listen`].
+    pub control_listen: Option<String>,
     /// Override for [`CoordinatorConfig::admin_listen`].
     pub admin_listen: Option<String>,
     /// Override for [`CoordinatorConfig::admin_advertise`].
@@ -211,6 +216,7 @@ impl Patch for CoordinatorConfigPatch {
     fn merge(self, base: Self) -> Self {
         Self {
             listen: self.listen.or(base.listen),
+            control_listen: self.control_listen.or(base.control_listen),
             admin_listen: self.admin_listen.or(base.admin_listen),
             admin_advertise: self.admin_advertise.or(base.admin_advertise),
             cluster_id: self.cluster_id.or(base.cluster_id),
@@ -263,6 +269,14 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         cli: true,
         secret: false,
         help: "Control-plane bind address (workers/clients).",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CONTROL_LISTEN",
+        key: "control_listen",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Dedicated worker-service mTLS bind address; requires [control_tls].",
     },
     ConfigVar {
         env: "TALON_COORDINATOR_ADMIN_LISTEN",
@@ -489,6 +503,7 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
 /// below so the two can never disagree on a name.
 pub mod env_names {
     pub const LISTEN: &str = "TALON_COORDINATOR_LISTEN";
+    pub const CONTROL_LISTEN: &str = "TALON_COORDINATOR_CONTROL_LISTEN";
     pub const ADMIN_LISTEN: &str = "TALON_COORDINATOR_ADMIN_LISTEN";
     pub const ADMIN_ADVERTISE: &str = "TALON_COORDINATOR_ADMIN_ADVERTISE";
     pub const CLUSTER_ID: &str = "TALON_COORDINATOR_CLUSTER_ID";
@@ -554,6 +569,7 @@ impl CoordinatorConfigPatch {
 
         Ok(Self {
             listen: get(env_names::LISTEN),
+            control_listen: get(env_names::CONTROL_LISTEN),
             admin_listen: get(env_names::ADMIN_LISTEN),
             admin_advertise: get(env_names::ADMIN_ADVERTISE),
             cluster_id: get(env_names::CLUSTER_ID),
@@ -637,6 +653,7 @@ impl CoordinatorConfig {
         let defaults = Self::default();
         let default_state = defaults.state;
         let listen = merged.listen.unwrap_or(defaults.listen);
+        let control_listen = merged.control_listen.or(defaults.control_listen);
         let admin_listen = merged.admin_listen.unwrap_or(defaults.admin_listen);
         let cluster_id = merged.cluster_id.unwrap_or(defaults.cluster_id);
         let control_tls = merged.control_tls.unwrap_or_default().resolve()?;
@@ -727,6 +744,7 @@ impl CoordinatorConfig {
                 .admin_advertise
                 .unwrap_or_else(|| admin_listen.clone()),
             listen,
+            control_listen,
             admin_listen,
             cluster_id,
             control_tls,
@@ -776,6 +794,12 @@ impl CoordinatorConfig {
                     value.len()
                 );
             }
+        }
+        if self.control_listen.is_some() != self.control_tls.is_some() {
+            anyhow::bail!("control_listen and [control_tls] must be configured together");
+        }
+        if self.control_listen.as_ref().is_some_and(String::is_empty) {
+            anyhow::bail!("control_listen address must not be empty when set");
         }
         self.state.validate()?;
         if let Some(control_tls) = &self.control_tls {
@@ -854,9 +878,36 @@ mod tests {
     }
 
     #[test]
+    fn control_listener_and_tls_are_all_or_none() {
+        let listener = CoordinatorConfigPatch {
+            control_listen: Some("127.0.0.1:7002".into()),
+            ..Default::default()
+        };
+        assert!(
+            CoordinatorConfig::resolve(Default::default(), Default::default(), listener).is_err()
+        );
+
+        let secure = CoordinatorConfigPatch {
+            control_listen: Some("127.0.0.1:7002".into()),
+            control_tls: Some(ControlTlsConfigPatch {
+                ca_cert_path: Some("/tls/ca.pem".into()),
+                cert_path: Some("/tls/coordinator.pem".into()),
+                key_path: Some("/tls/coordinator-key.pem".into()),
+                trust_domain: Some("cluster.example".into()),
+            }),
+            ..Default::default()
+        };
+        let config =
+            CoordinatorConfig::resolve(Default::default(), Default::default(), secure).unwrap();
+        assert_eq!(config.control_listen.as_deref(), Some("127.0.0.1:7002"));
+        assert!(config.control_tls.is_some());
+    }
+
+    #[test]
     fn control_tls_composes_file_and_environment_layers() {
         let file = CoordinatorConfigPatch::from_toml(
-            "[control_tls]\n\
+            "control_listen = \"127.0.0.1:7002\"\n\
+             [control_tls]\n\
              ca_cert_path = \"/tls/ca.pem\"\n\
              cert_path = \"/tls/file-cert.pem\"\n\
              key_path = \"/tls/key.pem\"\n\

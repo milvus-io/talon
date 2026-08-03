@@ -21,6 +21,13 @@ bincode.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 monoio.workspace = true
+rustls.workspace = true
+rustls-webpki.workspace = true
+tokio-rustls.workspace = true
+x509-cert.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
 serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }

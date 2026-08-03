@@ -14,6 +14,14 @@ Control-plane bind address (workers/clients).
 - **Default:** `127.0.0.1:7000`
 - **CLI flag:** `--listen`
 
+### `control_listen`
+
+Dedicated worker-service mTLS bind address; requires [control_tls].
+
+- **Environment variable:** `TALON_COORDINATOR_CONTROL_LISTEN`
+- **Default:** none
+- **CLI flag:** `--control-listen`
+
 ### `admin_listen`
 
 Admin HTTP bind address: metrics, health, API, UI.
@@ -257,6 +265,14 @@ Coordinator control-plane address to register with.
 - **Environment variable:** `TALON_WORKER_COORDINATOR`
 - **Default:** `127.0.0.1:7000`
 - **CLI flag:** `--coordinator`
+
+### `control_listen`
+
+Dedicated mTLS control bind address; requires [control_tls].
+
+- **Environment variable:** `TALON_WORKER_CONTROL_LISTEN`
+- **Default:** none
+- **CLI flag:** `--control-listen`
 
 ### `cluster_id`
 
