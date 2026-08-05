@@ -2546,8 +2546,11 @@ dependencies = [
 name = "talon-async-worker"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "bytes",
  "talon-core",
+ "talon-transport",
  "tokio",
  "tracing",
  "xxhash-rust",
