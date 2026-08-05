@@ -25,5 +25,7 @@
 
 pub mod cache;
 
+pub use cache::ids::StreamIds;
 pub use cache::memory::{EvictionSink, MemoryCache, MemoryCacheStats};
+pub use cache::region::{ExtentRun, PinnedExtent, ShardFile, ShardStats, REGION_SIZE};
 pub use cache::ExtentKey;
