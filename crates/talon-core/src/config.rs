@@ -22,7 +22,9 @@ use serde::Deserialize;
 use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
-use crate::{ControlTlsConfig, ControlTlsConfigPatch, Error, Result};
+use crate::{
+    ControlTlsConfig, ControlTlsConfigPatch, Error, NamespacePolicy, ObjectNamespace, Result,
+};
 
 /// A configuration patch: a set of optionally-present overrides.
 ///
@@ -103,6 +105,8 @@ pub struct WorkerConfig {
     pub cluster_id: String,
     /// Optional mTLS material for the privileged coordinator-worker channel.
     pub control_tls: Option<ControlTlsConfig>,
+    /// Operator-owned grants loaded from mounted static policy data.
+    pub namespace_policy: Option<NamespacePolicy>,
     /// Stable node identity; defaults to the RPC listen address when unset.
     pub node_id: Option<String>,
     /// Control-plane heartbeat interval in milliseconds.
@@ -236,6 +240,7 @@ impl Default for WorkerConfig {
             control_listen: None,
             cluster_id: "default".into(),
             control_tls: None,
+            namespace_policy: None,
             node_id: None,
             heartbeat_interval_ms: 5_000,
             block_size: 256 << 20,
@@ -285,6 +290,8 @@ pub struct WorkerConfigPatch {
     pub cluster_id: Option<String>,
     /// Optional `[control_tls]` block.
     pub control_tls: Option<ControlTlsConfigPatch>,
+    /// Path to a static namespace authorization policy.
+    pub namespace_policy_path: Option<PathBuf>,
     /// Override for [`WorkerConfig::node_id`].
     pub node_id: Option<String>,
     /// Override for [`WorkerConfig::heartbeat_interval_ms`].
@@ -345,6 +352,7 @@ impl Patch for WorkerConfigPatch {
             control_listen: self.control_listen.or(base.control_listen),
             cluster_id: self.cluster_id.or(base.cluster_id),
             control_tls: merge_control_tls(self.control_tls, base.control_tls),
+            namespace_policy_path: self.namespace_policy_path.or(base.namespace_policy_path),
             node_id: self.node_id.or(base.node_id),
             heartbeat_interval_ms: self.heartbeat_interval_ms.or(base.heartbeat_interval_ms),
             block_size: self.block_size.or(base.block_size),
@@ -472,6 +480,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: false,
         secret: false,
         help: "Lowercase DNS trust domain required in peer workload URI SANs.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_NAMESPACE_POLICY_PATH",
+        key: "namespace_policy_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Mounted static namespace authorization policy (TOML).",
     },
     ConfigVar {
         env: "TALON_WORKER_HEARTBEAT_INTERVAL_MS",
@@ -703,6 +719,7 @@ pub(crate) mod worker_env {
     pub const CONTROL_TLS_CERT_PATH: &str = "TALON_WORKER_CONTROL_TLS_CERT_PATH";
     pub const CONTROL_TLS_KEY_PATH: &str = "TALON_WORKER_CONTROL_TLS_KEY_PATH";
     pub const CONTROL_TLS_TRUST_DOMAIN: &str = "TALON_WORKER_CONTROL_TLS_TRUST_DOMAIN";
+    pub const NAMESPACE_POLICY_PATH: &str = "TALON_WORKER_NAMESPACE_POLICY_PATH";
     pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_WORKER_HEARTBEAT_INTERVAL_MS";
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
@@ -793,6 +810,7 @@ impl WorkerConfigPatch {
                 get(worker_env::CONTROL_TLS_KEY_PATH),
                 get(worker_env::CONTROL_TLS_TRUST_DOMAIN),
             ),
+            namespace_policy_path: get(worker_env::NAMESPACE_POLICY_PATH).map(PathBuf::from),
             heartbeat_interval_ms: get(worker_env::HEARTBEAT_INTERVAL_MS)
                 .map(|v| parse_u64(v, worker_env::HEARTBEAT_INTERVAL_MS))
                 .transpose()?,
@@ -871,6 +889,11 @@ impl WorkerConfig {
             &listen,
         );
         let control_tls = merged.control_tls.unwrap_or_default().resolve()?;
+        let namespace_policy = merged
+            .namespace_policy_path
+            .as_deref()
+            .map(NamespacePolicy::from_file)
+            .transpose()?;
         let cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
             // address (issue #118: never silently advertise a wildcard bind).
@@ -881,6 +904,7 @@ impl WorkerConfig {
             control_listen: merged.control_listen.or(d.control_listen),
             cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
             control_tls,
+            namespace_policy,
             node_id: merged.node_id.or(d.node_id),
             heartbeat_interval_ms: merged
                 .heartbeat_interval_ms
@@ -918,6 +942,16 @@ impl WorkerConfig {
         };
         cfg.validate()?;
         Ok(cfg)
+    }
+
+    /// Check this worker's operator-owned grant for a privileged namespace.
+    ///
+    /// No loaded policy is an explicit deny-all state.
+    pub fn authorizes_namespace(&self, target: &ObjectNamespace) -> bool {
+        let node_id = self.node_id.as_deref().unwrap_or(&self.listen);
+        self.namespace_policy
+            .as_ref()
+            .is_some_and(|policy| policy.authorizes(node_id, target))
     }
 
     /// Fail fast on invalid configuration with an actionable message.
@@ -1394,6 +1428,41 @@ mod tests {
         let config = WorkerConfig::resolve(Default::default(), Default::default(), secure).unwrap();
         assert_eq!(config.control_listen.as_deref(), Some("127.0.0.1:7002"));
         assert!(config.control_tls.is_some());
+    }
+
+    #[test]
+    fn worker_namespace_authorization_uses_its_stable_node_id() {
+        let mut config = WorkerConfig::default();
+        let target = "s3/data/models/v1".parse().unwrap();
+        assert!(!config.authorizes_namespace(&target));
+
+        config.node_id = Some("worker-a".into());
+        config.namespace_policy = Some(
+            NamespacePolicy::from_toml(
+                "version = 1\n\
+                 [[workers]]\n\
+                 node_id = \"worker-a\"\n\
+                 grants = [\"s3/data/models\"]\n",
+            )
+            .unwrap(),
+        );
+        assert!(config.authorizes_namespace(&target));
+        assert!(!config.authorizes_namespace(&"s3/data/private".parse().unwrap()));
+    }
+
+    #[test]
+    fn worker_namespace_policy_path_parses_from_file_and_environment_layers() {
+        let file = WorkerConfigPatch::from_toml("namespace_policy_path = \"/policy/file.toml\"\n")
+            .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_NAMESPACE_POLICY_PATH").then(|| "/policy/env.toml".to_string())
+        })
+        .unwrap();
+        let merged = env.merge(file);
+        assert_eq!(
+            merged.namespace_policy_path.as_deref(),
+            Some(std::path::Path::new("/policy/env.toml"))
+        );
     }
 
     #[test]

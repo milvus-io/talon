@@ -10,6 +10,7 @@ pub mod control_identity;
 pub mod error;
 pub mod key;
 pub mod metrics;
+pub mod namespace_policy;
 pub mod node;
 pub mod status;
 pub mod store;
@@ -28,6 +29,7 @@ pub use control_identity::{
 pub use error::{Error, Result};
 pub use key::{Backend, BlockId, ObjectId, PageIndex, Version};
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
+pub use namespace_policy::{NamespacePolicy, ObjectNamespace};
 pub use node::{NodeId, NodeInfo, NodeRole};
 pub use status::{
     NodeHealth, NodeMetricsSnapshot, NodeStatus, NodeStatusError, MAX_NODE_STATUS_BYTES,

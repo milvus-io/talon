@@ -1,10 +1,11 @@
 //! Layered coordinator configuration.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use talon_core::{
-    ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, Patch, MAX_STATUS_FIELD_BYTES,
+    ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, NamespacePolicy, ObjectNamespace, Patch,
+    MAX_STATUS_FIELD_BYTES,
 };
 
 #[cfg(feature = "kubernetes")]
@@ -56,6 +57,8 @@ pub struct CoordinatorConfig {
     pub node_id: String,
     /// Optional mTLS material for the privileged coordinator-worker channel.
     pub control_tls: Option<ControlTlsConfig>,
+    /// Operator-owned worker grants loaded from mounted static policy data.
+    pub namespace_policy: Option<NamespacePolicy>,
     /// Shared-state and lease settings.
     pub state: ClusterStateConfig,
     /// etcd backend connection settings, required when `state.backend` is etcd.
@@ -84,6 +87,7 @@ impl Default for CoordinatorConfig {
             cluster_id: "default".into(),
             node_id: "127.0.0.1:7000".into(),
             control_tls: None,
+            namespace_policy: None,
             state: ClusterStateConfig::default(),
             #[cfg(feature = "etcd")]
             etcd: None,
@@ -152,6 +156,8 @@ pub struct CoordinatorConfigPatch {
     pub node_id: Option<String>,
     /// Optional `[control_tls]` block.
     pub control_tls: Option<ControlTlsConfigPatch>,
+    /// Path to a static namespace authorization policy.
+    pub namespace_policy_path: Option<PathBuf>,
     /// Shared-state backend selector.
     pub state_backend: Option<StateBackend>,
     /// Whether active-active coordinator mode is requested.
@@ -222,6 +228,7 @@ impl Patch for CoordinatorConfigPatch {
             cluster_id: self.cluster_id.or(base.cluster_id),
             node_id: self.node_id.or(base.node_id),
             control_tls: merge_control_tls(self.control_tls, base.control_tls),
+            namespace_policy_path: self.namespace_policy_path.or(base.namespace_policy_path),
             state_backend: self.state_backend.or(base.state_backend),
             ha_enabled: self.ha_enabled.or(base.ha_enabled),
             coordinator_replicas: self.coordinator_replicas.or(base.coordinator_replicas),
@@ -341,6 +348,14 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         cli: false,
         secret: false,
         help: "Lowercase DNS trust domain required in peer workload URI SANs.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_NAMESPACE_POLICY_PATH",
+        key: "namespace_policy_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Mounted static namespace authorization policy (TOML).",
     },
     ConfigVar {
         env: "TALON_COORDINATOR_STATE_BACKEND",
@@ -512,6 +527,7 @@ pub mod env_names {
     pub const CONTROL_TLS_CERT_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_CERT_PATH";
     pub const CONTROL_TLS_KEY_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_KEY_PATH";
     pub const CONTROL_TLS_TRUST_DOMAIN: &str = "TALON_COORDINATOR_CONTROL_TLS_TRUST_DOMAIN";
+    pub const NAMESPACE_POLICY_PATH: &str = "TALON_COORDINATOR_NAMESPACE_POLICY_PATH";
     pub const STATE_BACKEND: &str = "TALON_COORDINATOR_STATE_BACKEND";
     pub const HA_ENABLED: &str = "TALON_COORDINATOR_HA_ENABLED";
     pub const REPLICAS: &str = "TALON_COORDINATOR_REPLICAS";
@@ -580,6 +596,7 @@ impl CoordinatorConfigPatch {
                 get(env_names::CONTROL_TLS_KEY_PATH),
                 get(env_names::CONTROL_TLS_TRUST_DOMAIN),
             ),
+            namespace_policy_path: get(env_names::NAMESPACE_POLICY_PATH).map(PathBuf::from),
             state_backend: get(env_names::STATE_BACKEND)
                 .map(|value| parse(value, env_names::STATE_BACKEND))
                 .transpose()?,
@@ -657,6 +674,11 @@ impl CoordinatorConfig {
         let admin_listen = merged.admin_listen.unwrap_or(defaults.admin_listen);
         let cluster_id = merged.cluster_id.unwrap_or(defaults.cluster_id);
         let control_tls = merged.control_tls.unwrap_or_default().resolve()?;
+        let namespace_policy = merged
+            .namespace_policy_path
+            .as_deref()
+            .map(NamespacePolicy::from_file)
+            .transpose()?;
 
         // Fold backend blocks with their env/CLI scalar overrides. The block may
         // come entirely from an env override even with no `[etcd]`/`[kubernetes]`
@@ -748,6 +770,7 @@ impl CoordinatorConfig {
             admin_listen,
             cluster_id,
             control_tls,
+            namespace_policy,
             state: ClusterStateConfig {
                 backend: merged.state_backend.unwrap_or(default_state.backend),
                 ha_enabled: merged.ha_enabled.unwrap_or(default_state.ha_enabled),
@@ -774,6 +797,15 @@ impl CoordinatorConfig {
         };
         config.validate()?;
         Ok(config)
+    }
+
+    /// Check the operator policy before targeting a worker for a namespace.
+    ///
+    /// No loaded policy is an explicit deny-all state.
+    pub fn authorizes_worker_namespace(&self, worker_id: &str, target: &ObjectNamespace) -> bool {
+        self.namespace_policy
+            .as_ref()
+            .is_some_and(|policy| policy.authorizes(worker_id, target))
     }
 
     /// Validate addresses, bounded identity fields, and state timing.
@@ -901,6 +933,42 @@ mod tests {
             CoordinatorConfig::resolve(Default::default(), Default::default(), secure).unwrap();
         assert_eq!(config.control_listen.as_deref(), Some("127.0.0.1:7002"));
         assert!(config.control_tls.is_some());
+    }
+
+    #[test]
+    fn coordinator_namespace_authorization_is_worker_scoped() {
+        let mut config = CoordinatorConfig::default();
+        let target = "s3/data/models/v1".parse().unwrap();
+        assert!(!config.authorizes_worker_namespace("worker-a", &target));
+
+        config.namespace_policy = Some(
+            NamespacePolicy::from_toml(
+                "version = 1\n\
+                 [[workers]]\n\
+                 node_id = \"worker-a\"\n\
+                 grants = [\"s3/data/models\"]\n",
+            )
+            .unwrap(),
+        );
+        assert!(config.authorizes_worker_namespace("worker-a", &target));
+        assert!(!config.authorizes_worker_namespace("worker-b", &target));
+    }
+
+    #[test]
+    fn coordinator_namespace_policy_path_parses_from_file_and_environment_layers() {
+        let file =
+            CoordinatorConfigPatch::from_toml("namespace_policy_path = \"/policy/file.toml\"\n")
+                .unwrap();
+        let env = CoordinatorConfigPatch::from_env_with(|key| {
+            (key == "TALON_COORDINATOR_NAMESPACE_POLICY_PATH")
+                .then(|| "/policy/env.toml".to_string())
+        })
+        .unwrap();
+        let merged = env.merge(file);
+        assert_eq!(
+            merged.namespace_policy_path.as_deref(),
+            Some(std::path::Path::new("/policy/env.toml"))
+        );
     }
 
     #[test]

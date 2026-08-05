@@ -86,6 +86,14 @@ Lowercase DNS trust domain required in peer workload URI SANs.
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `namespace_policy_path`
+
+Mounted static namespace authorization policy (TOML).
+
+- **Environment variable:** `TALON_COORDINATOR_NAMESPACE_POLICY_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `state_backend`
 
 Shared-state backend: memory | etcd | kubernetes.
@@ -319,6 +327,14 @@ PEM worker private-key file path; key bytes never enter configuration.
 Lowercase DNS trust domain required in peer workload URI SANs.
 
 - **Environment variable:** `TALON_WORKER_CONTROL_TLS_TRUST_DOMAIN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `namespace_policy_path`
+
+Mounted static namespace authorization policy (TOML).
+
+- **Environment variable:** `TALON_WORKER_NAMESPACE_POLICY_PATH`
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 
