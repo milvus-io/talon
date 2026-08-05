@@ -24,7 +24,10 @@
 #![deny(missing_docs)]
 
 pub mod cache;
+pub mod conn;
+pub mod metrics;
 pub mod runtime;
+pub mod sendfile;
 
 pub use cache::ids::StreamIds;
 pub use cache::memory::{EvictionSink, MemoryCache, MemoryCacheStats};
@@ -32,4 +35,7 @@ pub use cache::region::{ExtentRun, PinnedExtent, ShardFile, ShardStats, REGION_S
 pub use cache::store::{ExtentStore, ExtentStoreConfig, ExtentStoreStats};
 pub use cache::tiered::{ExtentCacheConfig, ExtentCacheStats, TieredExtentCache, MIN_L1_HITS};
 pub use cache::ExtentKey;
+pub use conn::handle_conn;
+pub use metrics::{AsyncWorkerMetrics, ConnectionGuard};
 pub use runtime::{AsyncWorkerRuntime, ServeOutcome, ServeStats};
+pub use sendfile::{send_file_range, DEFAULT_CHUNK};

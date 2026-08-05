@@ -194,6 +194,16 @@ impl AsyncWorkerRuntime {
         ))
     }
 
+    /// Resolve an object's size and version for a client.
+    ///
+    /// Shares the read path's TTL cache, so a stat immediately followed by a
+    /// read does not pay a second HEAD. Read-only, so this worker serves it.
+    pub async fn stat_object(&self, object: &ObjectId) -> anyhow::Result<talon_core::ObjectStat> {
+        self.ensure_configured_backend(object.backend)?;
+        let (version, len) = self.resolve(object, false).await?;
+        Ok(talon_core::ObjectStat { len, version })
+    }
+
     /// Serve one range read.
     ///
     /// Resolves the object's version, then serves from cache or fills from the
