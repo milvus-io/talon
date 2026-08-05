@@ -833,21 +833,81 @@ fn spawn_self_heartbeat(
     })
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ControlAccess {
     Legacy,
     PublicOnly,
-    WorkerService,
+    WorkerService(WorkloadIdentity),
 }
 
 impl ControlAccess {
-    fn allows(self, worker_service: bool) -> bool {
+    fn allows(&self, worker_service: bool) -> bool {
         match self {
             Self::Legacy => true,
             Self::PublicOnly => !worker_service,
-            Self::WorkerService => worker_service,
+            Self::WorkerService(_) => worker_service,
         }
     }
+
+    fn authorize(&self, message: &ControlMessage) -> Result<(), String> {
+        let Self::WorkerService(identity) = self else {
+            return Ok(());
+        };
+        match message {
+            ControlMessage::Register { node } => {
+                validate_worker_node(identity, &node.id, node.role, "registration")
+            }
+            ControlMessage::Heartbeat { node, .. } => {
+                validate_worker_node_id(identity, node, "legacy heartbeat")
+            }
+            ControlMessage::NodeStatusHeartbeat { status } => {
+                if status.cluster_id != identity.cluster_id() {
+                    return Err("status cluster does not match authenticated worker".into());
+                }
+                validate_worker_node(
+                    identity,
+                    &status.node.id,
+                    status.node.role,
+                    "status heartbeat",
+                )
+            }
+            _ => Ok(()),
+        }
+    }
+
+    fn identity(&self) -> Option<&WorkloadIdentity> {
+        match self {
+            Self::WorkerService(identity) => Some(identity),
+            _ => None,
+        }
+    }
+}
+
+fn validate_worker_node(
+    identity: &WorkloadIdentity,
+    node_id: &talon_core::NodeId,
+    role: NodeRole,
+    message: &str,
+) -> Result<(), String> {
+    if role != NodeRole::Worker {
+        return Err(format!(
+            "{message} role does not match authenticated worker"
+        ));
+    }
+    validate_worker_node_id(identity, node_id, message)
+}
+
+fn validate_worker_node_id(
+    identity: &WorkloadIdentity,
+    node_id: &talon_core::NodeId,
+    message: &str,
+) -> Result<(), String> {
+    if node_id.0 != identity.node_id() {
+        return Err(format!(
+            "{message} node ID does not match authenticated worker"
+        ));
+    }
+    Ok(())
 }
 
 async fn serve_worker_control(
@@ -866,7 +926,12 @@ async fn serve_worker_control(
             let result = async {
                 let authenticated = channel.accept(stream).await?;
                 tracing::debug!(identity = %authenticated.identity, %peer, "accepted worker mTLS connection");
-                handle_conn(authenticated.stream, state, ControlAccess::WorkerService).await
+                handle_conn(
+                    authenticated.stream,
+                    state,
+                    ControlAccess::WorkerService(authenticated.identity),
+                )
+                .await
             }
             .await;
             if let Err(error) = result {
@@ -903,13 +968,23 @@ where
         let allowed = access.allows(worker_service);
         let operation = talon_coordinator::ControlOperation::from_message(&message);
         let started = Instant::now();
-        let reply = if allowed {
-            state.dispatch(message).await
-        } else {
+        let reply = if !allowed {
             ControlMessage::Ack {
                 ok: false,
                 detail: Some("message is not allowed on this control listener".into()),
             }
+        } else if let Err(error) = access.authorize(&message) {
+            tracing::warn!(
+                identity = ?access.identity(),
+                %error,
+                "rejected worker control identity mismatch"
+            );
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some(error),
+            }
+        } else {
+            state.dispatch(message).await
         };
         let error = matches!(&reply, ControlMessage::Ack { ok: false, .. });
         state
@@ -960,14 +1035,132 @@ mod tests {
 
     use super::*;
 
+    fn worker_identity(id: &str) -> WorkloadIdentity {
+        WorkloadIdentity::new("cluster.example", "cluster-a", WorkloadRole::Worker, id).unwrap()
+    }
+
     #[test]
     fn dedicated_listener_routes_worker_service_messages_only() {
+        let worker = ControlAccess::WorkerService(worker_identity("worker-1"));
         assert!(ControlAccess::Legacy.allows(true));
         assert!(ControlAccess::Legacy.allows(false));
-        assert!(ControlAccess::WorkerService.allows(true));
-        assert!(!ControlAccess::WorkerService.allows(false));
+        assert!(worker.allows(true));
+        assert!(!worker.allows(false));
         assert!(!ControlAccess::PublicOnly.allows(true));
         assert!(ControlAccess::PublicOnly.allows(false));
+    }
+
+    #[test]
+    fn authenticated_worker_fields_must_match_the_certificate_identity() {
+        let access = ControlAccess::WorkerService(worker_identity("worker-1"));
+        let matching = NodeInfo {
+            id: NodeId::new("worker-1"),
+            address: "127.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        assert!(access
+            .authorize(&ControlMessage::Register {
+                node: matching.clone(),
+            })
+            .is_ok());
+        assert!(access
+            .authorize(&ControlMessage::Heartbeat {
+                node: matching.id.clone(),
+                block_count: 1,
+            })
+            .is_ok());
+
+        let mut wrong_node = matching.clone();
+        wrong_node.id = NodeId::new("worker-2");
+        assert!(access
+            .authorize(&ControlMessage::Register { node: wrong_node })
+            .is_err());
+        let mut wrong_role = matching;
+        wrong_role.role = NodeRole::Coordinator;
+        assert!(access
+            .authorize(&ControlMessage::Register { node: wrong_role })
+            .is_err());
+        assert!(access
+            .authorize(&ControlMessage::Heartbeat {
+                node: NodeId::new("worker-2"),
+                block_count: 1,
+            })
+            .is_err());
+
+        let mut status = worker_status("cluster-a", "worker-1", "inc-1", "127.0.0.1:7001");
+        assert!(access
+            .authorize(&ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(status.clone()),
+            })
+            .is_ok());
+        status.cluster_id = "cluster-b".into();
+        assert!(access
+            .authorize(&ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(status.clone()),
+            })
+            .is_err());
+        status.cluster_id = "cluster-a".into();
+        status.node.role = NodeRole::Coordinator;
+        assert!(access
+            .authorize(&ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(status),
+            })
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn secure_listener_binds_status_incarnation_before_dispatch() {
+        let store = Arc::new(MemoryStateStore::new());
+        let observability = observability_over(
+            Arc::clone(&store) as Arc<dyn ClusterStateStore>,
+            "coordinator-1",
+        );
+        observability.check_ready().await.unwrap();
+        let coordinator = Coordinator::new(Arc::clone(&observability), Duration::from_secs(30));
+        let (mut client, server) = tokio::io::duplex(64 * 1024);
+        let connection = tokio::spawn(handle_conn(
+            server,
+            coordinator,
+            ControlAccess::WorkerService(worker_identity("worker-1")),
+        ));
+
+        let spoofed = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(worker_status(
+                "cluster-a",
+                "worker-2",
+                "spoofed-incarnation",
+                "127.0.0.1:7002",
+            )),
+        };
+        client
+            .write_all(&codec::encode(0, &spoofed).unwrap())
+            .await
+            .unwrap();
+        let (_, reply) = read_control(&mut client).await.unwrap().unwrap();
+        assert!(matches!(reply, ControlMessage::Ack { ok: false, .. }));
+        assert!(store.snapshot("cluster-a").await.unwrap().nodes.is_empty());
+
+        let bound = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(worker_status(
+                "cluster-a",
+                "worker-1",
+                "bound-incarnation",
+                "127.0.0.1:7001",
+            )),
+        };
+        client
+            .write_all(&codec::encode(0, &bound).unwrap())
+            .await
+            .unwrap();
+        let (_, reply) = read_control(&mut client).await.unwrap().unwrap();
+        assert!(matches!(reply, ControlMessage::Ack { ok: true, .. }));
+        let snapshot = store.snapshot("cluster-a").await.unwrap();
+        assert_eq!(snapshot.nodes.len(), 1);
+        assert_eq!(snapshot.nodes[0].node.id, NodeId::new("worker-1"));
+        assert_eq!(snapshot.nodes[0].incarnation_id, "bound-incarnation");
+
+        drop(client);
+        connection.await.unwrap().unwrap();
     }
 
     #[tokio::test]
