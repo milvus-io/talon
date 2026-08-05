@@ -38,6 +38,7 @@
 # Reference
 
 - [Configuration reference](./reference/configuration.md)
+- [Namespace authorization policy](./reference/namespace-policy.md)
 - [REST API reference](./reference/rest-api.md)
 - [Wire protocol reference](./reference/wire-protocol.md)
 

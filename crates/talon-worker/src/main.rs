@@ -137,6 +137,7 @@ impl Args {
             cluster_id: self.cluster_id,
             node_id: self.node_id,
             control_tls: None,
+            namespace_policy_path: None,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             block_size: self.block_size,
             data_plane_rings: self.data_plane_rings,
