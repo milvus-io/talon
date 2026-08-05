@@ -2543,6 +2543,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-async-worker"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "talon-core",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "talon-backend"
 version = "0.1.0"
 dependencies = [

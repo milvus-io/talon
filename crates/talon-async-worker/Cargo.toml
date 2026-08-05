@@ -1,0 +1,17 @@
+[package]
+name = "talon-async-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Async worker: an extent cache for selective reads over columnar data"
+
+[dependencies]
+talon-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

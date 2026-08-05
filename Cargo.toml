@@ -4,6 +4,7 @@ members = [
     "crates/talon-core",
     "crates/talon-coordinator",
     "crates/talon-worker",
+    "crates/talon-async-worker",
     "crates/talon-fuse",
     "crates/talon-transport",
     "crates/talon-backend",
