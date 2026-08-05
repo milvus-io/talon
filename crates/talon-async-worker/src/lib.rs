@@ -28,4 +28,6 @@ pub mod cache;
 pub use cache::ids::StreamIds;
 pub use cache::memory::{EvictionSink, MemoryCache, MemoryCacheStats};
 pub use cache::region::{ExtentRun, PinnedExtent, ShardFile, ShardStats, REGION_SIZE};
+pub use cache::store::{ExtentStore, ExtentStoreConfig, ExtentStoreStats};
+pub use cache::tiered::{ExtentCacheConfig, ExtentCacheStats, TieredExtentCache, MIN_L1_HITS};
 pub use cache::ExtentKey;

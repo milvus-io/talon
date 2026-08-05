@@ -169,6 +169,35 @@ manifest — meaningful machinery to add before the read path has demonstrated i
 value. The consequence is bounded: a restarted worker refetches on demand, one
 extent at a time rather than one 256MB block at a time. Cold, not incorrect.
 
+### 8. The async worker is read-only
+
+`talon-worker` accepts writes. `WorkerRuntime::write_object` PUTs to the origin,
+treats that acknowledgement as the durability point, and only then commits the
+bytes to the local cache; it is reachable over the wire on both transports. ADR
+0002 fixed that contract as write-through only.
+
+The async worker rejects the write op with `Error::Unsupported`. Write traffic
+goes to a `talon-worker` pool.
+
+The reason is that a write is the one operation an extent cache gains nothing
+from. This cache exists to avoid over-fetching on *selective* reads; a write
+arrives as a whole object body, which is the shape the block worker already
+handles well. Supporting it would mean duplicating the durability sequencing —
+PUT first, cache second, never cache a failed write — in a second place, for no
+benefit beyond making one read-after-write a hit instead of a miss.
+
+The cost is that an async worker is not a drop-in replacement for a block
+worker, only for the read half. A deployment that writes through Talon needs
+both pools, and clients must route accordingly. Since section 6 already gives
+async workers their own cluster, that routing decision exists regardless.
+
+This also means the invalidation entry points (`invalidate_superseded`,
+`invalidate_object`) have no caller on the serve path. They stay because
+correctness does not depend on them — a republished object interns a new
+`stream_id` and cannot reach the old version's extents either way, per section 3
+— but they let a future control-plane notification reclaim the space instead of
+waiting for region reclamation to find it.
+
 ## Consequences
 
 ### Positive
@@ -195,6 +224,8 @@ extent at a time rather than one 256MB block at a time. Cold, not incorrect.
 - **Object routing concentrates load.** One very large, very hot object is
   served by one worker.
 - **Cold restart** for the NVMe tier, per section 7.
+- **Reads only.** An async worker cannot replace a block worker outright; a
+  deployment that writes through Talon runs both pools, per section 8.
 - **Operators must choose** which worker fits a workload; a wrong choice is a
   performance cliff rather than an error.
 

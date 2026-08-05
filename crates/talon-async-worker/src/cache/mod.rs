@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The two-tier extent cache.
 //!
-//! [`memory`] is the L1 DRAM tier and [`region`] the L2 NVMe tier; [`ids`]
-//! interns the `(object, version)` pairs both are keyed by. The facade that
-//! tiers one over the other lands in a later change; until then each tier is
-//! usable on its own.
+//! [`memory`] is the L1 DRAM tier and [`region`]/[`store`] the L2 NVMe tier;
+//! [`ids`] interns the `(object, version)` pairs both are keyed by.
+//! [`tiered`] stacks them and decides what earns a place on disk.
 
 pub mod ids;
 pub mod memory;
 pub mod region;
+pub mod store;
+pub mod tiered;
 
 /// Identifies one cached extent: an interned `(object, version)` stream plus a
 /// byte offset within that object.

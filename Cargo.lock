@@ -2550,6 +2550,7 @@ dependencies = [
  "talon-core",
  "tokio",
  "tracing",
+ "xxhash-rust",
 ]
 
 [[package]]
