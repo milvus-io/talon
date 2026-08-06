@@ -3,9 +3,9 @@
 //! Both the [`CoordinatorClient`](crate::CoordinatorClient) and the
 //! [`WorkerClient`](crate::WorkerClient) previously dialed a **fresh** TCP
 //! connection per request and dropped it after one exchange. On the read hot
-//! path — a placement lookup plus a range fetch per block, many blocks per file
-//! — that pays a full TCP handshake (and the server's connection-limit permit
-//! dance) every time. This pool lets warm requests reuse an established
+//! path - periodic membership requests plus range fetches for many blocks per
+//! file - that pays a full TCP handshake (and the server's connection-limit
+//! permit dance) every time. This pool lets warm requests reuse an established
 //! connection (issue #181).
 //!
 //! # Model: exclusive checkout, not multiplexing

@@ -9,6 +9,7 @@ pub mod capability;
 pub mod coordinator_client;
 pub(crate) mod lock;
 pub mod mapping;
+pub mod membership_cache;
 pub mod metrics;
 #[cfg(feature = "mount")]
 pub mod mount;

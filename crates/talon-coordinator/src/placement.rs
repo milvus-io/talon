@@ -6,9 +6,7 @@
 //! ordered replica list; RF stays 1 in v1, but the ordering reserves a stable
 //! replica sequence for a future RF=2.
 
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
-use talon_core::{BlockId, NodeId, NodeInfo};
+use talon_core::{rank_cache_workers, BlockId, NodeId, NodeInfo};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// A content-derived version of the placement/node set.
@@ -124,39 +122,13 @@ pub trait Placement {
 #[derive(Default)]
 pub struct RendezvousPlacement;
 
-impl RendezvousPlacement {
-    fn weight(block: &BlockId, node: &NodeId) -> u64 {
-        let mut hasher = DefaultHasher::new();
-        block.hash(&mut hasher);
-        node.0.hash(&mut hasher);
-        hasher.finish()
-    }
-}
-
 impl Placement for RendezvousPlacement {
     fn locate(&self, block: &BlockId, nodes: &[NodeInfo]) -> Option<NodeId> {
-        nodes
-            .iter()
-            .max_by_key(|n| Self::weight(block, &n.id))
-            .map(|n| n.id.clone())
+        rank_cache_workers(block, nodes, 1).into_iter().next()
     }
 
     fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId> {
-        if k == 0 {
-            return Vec::new();
-        }
-        let mut ranked: Vec<(u64, &NodeId)> = nodes
-            .iter()
-            .map(|n| (Self::weight(block, &n.id), &n.id))
-            .collect();
-        // Sort by descending weight; break ties on the node id so the order is
-        // fully deterministic even when two nodes hash to the same weight.
-        ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
-        ranked
-            .into_iter()
-            .take(k)
-            .map(|(_, id)| id.clone())
-            .collect()
+        rank_cache_workers(block, nodes, k)
     }
 }
 

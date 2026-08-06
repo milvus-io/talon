@@ -6,9 +6,9 @@
 //! and no cloud backend. It asserts the behaviors the unit tests cover in
 //! isolation actually compose end to end:
 //!
-//! 1. A cold read is a cache **miss** → coordinator lookup → worker fetch →
-//!    bytes; the second read of the same block is a cache **hit** (no second
-//!    coordinator round-trip) and returns identical bytes.
+//! 1. A cold read is a cache **miss** -> membership fetch -> local placement ->
+//!    worker fetch -> bytes; the second read of the same block is a cache
+//!    **hit** (no second coordinator round-trip) and returns identical bytes.
 //! 2. A multi-block read splits across block boundaries and **stitches** the
 //!    per-block results into one contiguous buffer.
 //! 3. When the primary replica reports the block missing, the reader **falls
@@ -40,6 +40,12 @@ fn content_byte(abs_offset: u64) -> u8 {
 #[derive(Default)]
 struct WorkerCounters {
     fetches: AtomicU32,
+}
+
+#[derive(Default)]
+struct CoordinatorCounters {
+    membership_queries: AtomicU32,
+    placement_lookups: AtomicU32,
 }
 
 /// Spawn a mock worker that serves deterministic bytes for any range request,
@@ -85,11 +91,11 @@ async fn spawn_worker(counters: Arc<WorkerCounters>, fail_all: bool) -> String {
     addr
 }
 
-/// Spawn a mock coordinator that places every block on `owners` (in order),
-/// resolving each id to the paired worker address. Counts placement lookups so
-/// a test can prove the second read was a cache hit (no new lookup).
-async fn spawn_coordinator(owners: Vec<(String, String)>, lookups: Arc<AtomicU32>) -> String {
-    // owners: (node_id, worker_addr) in priority order.
+/// Spawn a mock coordinator that advertises the supplied worker membership.
+async fn spawn_coordinator(
+    owners: Vec<(String, String)>,
+    counters: Arc<CoordinatorCounters>,
+) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap().to_string();
     tokio::spawn(async move {
@@ -99,7 +105,7 @@ async fn spawn_coordinator(owners: Vec<(String, String)>, lookups: Arc<AtomicU32
                 Err(_) => return,
             };
             let owners = owners.clone();
-            let lookups = Arc::clone(&lookups);
+            let counters = Arc::clone(&counters);
             tokio::spawn(async move {
                 let mut hdr = [0u8; HEADER_LEN];
                 if sock.read_exact(&mut hdr).await.is_err() {
@@ -113,22 +119,25 @@ async fn spawn_coordinator(owners: Vec<(String, String)>, lookups: Arc<AtomicU32
                 let (_h, msg) = talon_transport::decode(&full).unwrap();
                 let reply = match msg {
                     ControlMessage::PlacementLookup { .. } => {
-                        lookups.fetch_add(1, Ordering::SeqCst);
+                        counters.placement_lookups.fetch_add(1, Ordering::SeqCst);
                         ControlMessage::PlacementResponse {
                             owners: owners.iter().map(|(id, _)| NodeId::new(id)).collect(),
                             epoch: 1,
                         }
                     }
-                    ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                        nodes: owners
-                            .iter()
-                            .map(|(id, a)| NodeInfo {
-                                id: NodeId::new(id),
-                                address: a.clone(),
-                                role: NodeRole::Worker,
-                            })
-                            .collect(),
-                    },
+                    ControlMessage::MembershipQuery {} => {
+                        counters.membership_queries.fetch_add(1, Ordering::SeqCst);
+                        ControlMessage::MembershipList {
+                            nodes: owners
+                                .iter()
+                                .map(|(id, a)| NodeInfo {
+                                    id: NodeId::new(id),
+                                    address: a.clone(),
+                                    role: NodeRole::Worker,
+                                })
+                                .collect(),
+                        }
+                    }
                     _ => ControlMessage::Ack {
                         ok: false,
                         detail: None,
@@ -151,8 +160,8 @@ fn object() -> ObjectId {
 async fn cold_read_miss_then_warm_hit_same_bytes() {
     let wc = Arc::new(WorkerCounters::default());
     let worker = spawn_worker(Arc::clone(&wc), false).await;
-    let lookups = Arc::new(AtomicU32::new(0));
-    let coord = spawn_coordinator(vec![("w1".into(), worker)], Arc::clone(&lookups)).await;
+    let counters = Arc::new(CoordinatorCounters::default());
+    let coord = spawn_coordinator(vec![("w1".into(), worker)], Arc::clone(&counters)).await;
 
     let cache = Arc::new(PlacementCache::new(10_000));
     let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
@@ -166,27 +175,29 @@ async fn cold_read_miss_then_warm_hit_same_bytes() {
         size: 1_000_000,
     };
 
-    // Cold read: miss → coordinator lookup → worker fetch. Kept within a single
-    // block (block 3 spans 3072..4096) so exactly one placement lookup happens.
+    // Cold read: membership fetch, local placement, then worker fetch. This stays
+    // within one block (block 3 spans 3072..4096).
     let first = reader.read(&view, 3100, 256, 0).await.unwrap();
     assert_eq!(first.len(), 256);
     for (i, b) in first.iter().enumerate() {
         assert_eq!(*b, content_byte(3100 + i as u64));
     }
     assert_eq!(
-        lookups.load(Ordering::SeqCst),
+        counters.membership_queries.load(Ordering::SeqCst),
         1,
-        "one placement lookup on miss"
+        "one membership query on miss"
     );
+    assert_eq!(counters.placement_lookups.load(Ordering::SeqCst), 0);
 
     // Warm read of the same block: cache hit, no new coordinator lookup.
     let second = reader.read(&view, 3100, 256, 1).await.unwrap();
     assert_eq!(second, first, "warm read returns identical bytes");
     assert_eq!(
-        lookups.load(Ordering::SeqCst),
+        counters.membership_queries.load(Ordering::SeqCst),
         1,
         "warm read must not re-query the coordinator"
     );
+    assert_eq!(counters.placement_lookups.load(Ordering::SeqCst), 0);
 
     let snap = reader.stats().snapshot();
     assert_eq!(snap.cache_misses, 1);
@@ -197,8 +208,8 @@ async fn cold_read_miss_then_warm_hit_same_bytes() {
 async fn multi_block_read_stitches_contiguous_bytes() {
     let wc = Arc::new(WorkerCounters::default());
     let worker = spawn_worker(Arc::clone(&wc), false).await;
-    let lookups = Arc::new(AtomicU32::new(0));
-    let coord = spawn_coordinator(vec![("w1".into(), worker)], lookups).await;
+    let counters = Arc::new(CoordinatorCounters::default());
+    let coord = spawn_coordinator(vec![("w1".into(), worker)], counters).await;
 
     let cache = Arc::new(PlacementCache::new(10_000));
     let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
@@ -235,10 +246,10 @@ async fn falls_back_to_healthy_replica() {
     let good = Arc::new(WorkerCounters::default());
     let w1 = spawn_worker(Arc::clone(&bad), true).await;
     let w2 = spawn_worker(Arc::clone(&good), false).await;
-    let lookups = Arc::new(AtomicU32::new(0));
+    let counters = Arc::new(CoordinatorCounters::default());
     let coord = spawn_coordinator(
         vec![("w1".into(), w1), ("w2".into(), w2)],
-        Arc::clone(&lookups),
+        Arc::clone(&counters),
     )
     .await;
 
@@ -260,10 +271,11 @@ async fn falls_back_to_healthy_replica() {
         assert_eq!(*b, content_byte(i as u64));
     }
     // Primary was tried once and failed; secondary served it — within the same
-    // cached placement (a single coordinator lookup, no refresh).
+    // locally cached placement (a single membership query, no refresh).
     assert_eq!(bad.fetches.load(Ordering::SeqCst), 1);
     assert_eq!(good.fetches.load(Ordering::SeqCst), 1);
-    assert_eq!(lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.membership_queries.load(Ordering::SeqCst), 1);
+    assert_eq!(counters.placement_lookups.load(Ordering::SeqCst), 0);
 
     let snap = reader.stats().snapshot();
     assert_eq!(snap.worker_failures, 1);
