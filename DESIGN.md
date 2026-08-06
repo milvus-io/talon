@@ -336,7 +336,16 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   block granularity. The cache key includes
   `source_uri + offset + block_size + etag/version` so a source update never
   serves a stale block.
-- **Block materialization — whole vs paged:** block size stays fixed at 256MB,
+- **Block materialization — whole vs paged:** *superseded for selective reads by
+  ADR 0005.* The paged form below was never wired into the serve path; the
+  primitives exist but have no caller. Its goal — a point query fetching only
+  what it touches — is met instead by `talon-async-worker`, which caches
+  variable-length extents with no block or page granularity at all, so there is
+  no page size to get wrong. The whole-block form below is what `talon-worker`
+  ships and remains correct for sequential scans. The rest of this bullet
+  records the original plan.
+
+  Block size stays fixed at 256MB,
   but a block has two physical forms, chosen per block. This decouples the
   *logical addressing unit* from the *physical caching granularity* so a single
   scheme adapts to different workloads without changing placement or the key
@@ -434,9 +443,11 @@ Decisions above that diverge from the current code, to be addressed in later PRs
   (cache access) — S3 / GCS / Azure Blob implementations to follow.
 - Adjust `ObjectStore` for block-level, byte-accounted access and an fd/offset
   path for `sendfile`, rather than only returning `Bytes`.
-- Model block materialization as `enum { Whole, Paged { page_size,
+- ~~Model block materialization as `enum { Whole, Paged { page_size,
   present_bitmap } }` in the block index, decided by a LOAD-time hint; add
-  page-level miss / in-flight / eviction for paged blocks.
+  page-level miss / in-flight / eviction for paged blocks.~~ Superseded by
+  ADR 0005: `talon-async-worker` caches variable-length extents instead, which
+  removes the fixed granularity rather than shrinking it.
 - Replace control-plane `serde_json` with framed `bincode`; define a data-plane
   frame header.
 - Extend `RendezvousPlacement` to top-K + epoch.

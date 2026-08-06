@@ -28,4 +28,9 @@ tracing-subscriber.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
+divan.workspace = true
 tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "extent_cache_benches"
+harness = false

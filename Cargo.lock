@@ -2551,6 +2551,7 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "divan",
  "libc",
  "serde_json",
  "talon-backend",

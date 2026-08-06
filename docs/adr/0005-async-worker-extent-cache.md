@@ -336,14 +336,22 @@ the message variant selects the ring without adding a wire field.
    interning.
 3. The tiered facade: L1 over L2 over backend, with frequency-gated admission
    and the L1-disabled fallback.
-4. The serve path on the existing wire protocol, the binary, configuration, and
-   observability.
-5. Benchmarks against `talon-worker` on the selective-read shape, measuring
-   origin bytes fetched rather than latency alone, and documentation.
+4. The serve path on the existing wire protocol, the ring split, the binary,
+   configuration, and observability.
+5. Benchmarks on the selective-read shape, measuring origin bytes fetched rather
+   than latency alone, and documentation.
+
+Step 5's comparison is not a head-to-head against a running `talon-worker`. It
+replays one Parquet-shaped trace at two granularities over the same cache and
+origin, so the fetch unit is the only variable — which is the one thing the two
+designs disagree about. Comparing the two binaries on wall-clock latency would
+need a real object store and would mostly measure everything they have in
+common.
 
 ## References
 
 - `DESIGN.md` section 3, block materialization — the plan this supersedes
 - `docs/reference/wire-protocol.md`, for the data plane's block-free shape
-- `docs/use-cases/analytics.md`, current limitation: block granularity
+- `docs/use-cases/analytics.md`, on choosing between the two workers
+- `docs/operations/async-worker.md`, for running one
 - ADR 0002, for the write-through contract this worker inherits unchanged

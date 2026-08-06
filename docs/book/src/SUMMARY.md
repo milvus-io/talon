@@ -26,6 +26,7 @@
 
 - [Operator runbook](./operations/runbook.md)
 - [Cloud backends (S3/GCS/Azure)](./operations/cloud-backends.md)
+- [The async worker](./operations/async-worker.md)
 - [Security hardening](./operations/security.md)
 - [Latency lab](./testing/latency-lab.md)
 
