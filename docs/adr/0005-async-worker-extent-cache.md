@@ -174,15 +174,39 @@ coordinator sees only a byte range. Letting the client name the ring keeps the
 coordinator a pure placement function and puts the choice where the knowledge
 is.
 
-**Compatibility.** The ring is selected by a new `AsyncPlacementLookup` message
-at `CONTROL_SCHEMA_VERSION = 4` — a new variant rather than a field on
-`PlacementLookup`, because bincode is positional and adding a field would change
-how every existing client's lookup decodes. The message variant is the selector,
-so there is nothing extra on the wire. `PlacementLookup` keeps its schema-1
-encoding and its meaning, the block ring. Both are answered with the same
-`PlacementResponse`, so a client learns one reply shape. The Java client is
-pinned at schema 2 by design and only ever receives `PlacementResponse`, so it
+**Compatibility.** The ring travels as a `Ring` enum — `Block` (the default) or
+`Async` — carried on a *new* message, `RingPlacementLookup { block, ring, k }`,
+at `CONTROL_SCHEMA_VERSION = 4`.
+
+The enum is what a third ring should cost: one value, not a message variant plus
+a dispatch arm at every call site. But it rides a new message rather than being
+added to `PlacementLookup`, because bincode 1.3 is positional and not
+self-describing. A `ring` field between `block` and `k` shifts `k` four bytes
+along; an old client's frame then runs out of buffer where the new coordinator
+expects a tag, and a new client's frame leaves four trailing bytes an old
+coordinator never reads. `#[serde(default)]` cannot rescue it — there is no
+field name on the wire to be absent. With `MIN_CONTROL_SCHEMA_VERSION = 1` still
+in force, that would break the FUSE mount, the Python client, the CLI, and the
+Java client, which is pinned at schema 2.
+
+So `PlacementLookup` keeps its schema-1 encoding, byte for byte, and its
+meaning: the block ring. `RingPlacementLookup { ring: Block }` is defined to be
+the same request, and is required to place identically — clients migrate one at
+a time, and a fleet that split across two owner sets for the same block would
+double every worker's cache footprint. Both messages answer with the same
+`PlacementResponse`, so a client learns one reply shape.
+
+The schema-4 floor applies to the new message on *either* ring, including
+`Block`. The fence is on the encoding, not on the ring: a v3 coordinator cannot
+decode the message at all, and must fail rather than fall back to the block
+lookup — on the async ring that fallback would return a block worker, which
+holds no extents. The Java client only ever receives `PlacementResponse`, so it
 needs no change.
+
+`Ring` is `#[non_exhaustive]` and its variants are append-only, since the
+discriminant is the wire encoding. A coordinator that receives a ring it
+predates answers with no owners rather than falling through to the block pool,
+for the same reason.
 
 **Why the rings are disjoint rather than one ring with two key functions.** The
 coordinator filters placement candidates by role, so an async worker either

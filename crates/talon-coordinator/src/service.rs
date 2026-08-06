@@ -10,9 +10,14 @@
 //! [`ControlMessage::PlacementLookup`] into a [`ControlMessage::PlacementResponse`],
 //! keeping the service usable directly (via [`lookup`](PlacementService::lookup))
 //! or over the wire.
+//!
+//! There are two rings. Which one a lookup resolves against is the client's
+//! choice, carried as a [`Ring`] on the request: the coordinator sees only a
+//! byte range and would have to guess, while the caller knows what it is about
+//! to read.
 
-use talon_core::{BlockId, NodeRole};
-use talon_transport::ControlMessage;
+use talon_core::BlockId;
+use talon_transport::{ControlMessage, Ring};
 
 use crate::{Epoch, Membership, ObjectPlacement, Placement};
 
@@ -55,26 +60,43 @@ impl<P: Placement> PlacementService<P> {
     ///
     /// The returned epoch is read together with the node snapshot so the
     /// answer is internally consistent for the client to cache.
+    ///
+    /// Equivalent to [`lookup_on`](Self::lookup_on) with [`Ring::Block`], which
+    /// is what an unqualified "lookup" has always meant.
     pub fn lookup(&self, block: &BlockId, k: usize) -> PlacementResult {
-        self.resolve(&self.placement, NodeRole::Worker, block, k)
+        self.lookup_on(Ring::Block, block, k)
     }
 
-    /// Locate up to `k` ordered async workers for `block`'s object.
+    /// Locate up to `k` ordered owners for `block` on `ring`.
     ///
-    /// Resolves against the async ring: a disjoint node set, hashed on the
-    /// object identity alone, so every range of one object resolves to the
-    /// same worker and stays there across a republish. Answers with no owners
-    /// — rather than falling back to a block worker — when no async worker is
-    /// registered, because a block worker holds no extents and would refuse
-    /// the read.
-    pub fn lookup_async(&self, block: &BlockId, k: usize) -> PlacementResult {
-        self.resolve(&self.async_placement, NodeRole::AsyncWorker, block, k)
+    /// [`Ring::Block`] hashes the whole [`BlockId`], spreading a large object's
+    /// ranges across the fleet. [`Ring::Async`] hashes the object identity
+    /// alone against a disjoint node set, so every range of one object resolves
+    /// to the same worker and stays there across a republish.
+    ///
+    /// A lookup never crosses rings. An async lookup against a cluster with no
+    /// async workers answers with no owners rather than substituting a block
+    /// worker, which holds no extents and would refuse the read a round trip
+    /// later.
+    pub fn lookup_on(&self, ring: Ring, block: &BlockId, k: usize) -> PlacementResult {
+        // The strategy and the node set move together — that pairing *is* the
+        // ring, and splitting it is how a lookup would come to cross pools.
+        match ring {
+            Ring::Block => self.resolve(&self.placement, ring, block, k),
+            Ring::Async => self.resolve(&self.async_placement, ring, block, k),
+            // `Ring` is `#[non_exhaustive]`: a ring this coordinator predates
+            // must answer "nobody" rather than fall through to the block pool.
+            _ => PlacementResult {
+                owners: Vec::new(),
+                epoch: self.membership.epoch(),
+            },
+        }
     }
 
     fn resolve<R: Placement>(
         &self,
-        ring: &R,
-        role: NodeRole,
+        strategy: &R,
+        ring: Ring,
         block: &BlockId,
         k: usize,
     ) -> PlacementResult {
@@ -88,8 +110,8 @@ impl<P: Placement> PlacementService<P> {
         // which epoch is current. The cost is a spurious refresh when the
         // other ring changes, which is exactly the harmless case above.
         let epoch = self.membership.epoch();
-        let nodes = self.membership.snapshot_for_role(role);
-        let owners = ring
+        let nodes = self.membership.snapshot_for_role(ring.role());
+        let owners = strategy
             .locate_top_k(block, &nodes, k)
             .into_iter()
             .map(|n| n.0)
@@ -100,7 +122,7 @@ impl<P: Placement> PlacementService<P> {
     /// Handle a transport [`ControlMessage`].
     ///
     /// Answers [`ControlMessage::PlacementLookup`] and
-    /// [`ControlMessage::AsyncPlacementLookup`] with a
+    /// [`ControlMessage::RingPlacementLookup`] with a
     /// [`ControlMessage::PlacementResponse`]; any other message yields an
     /// [`ControlMessage::Ack`] with `ok: false` describing the mismatch.
     pub fn handle(&self, msg: ControlMessage) -> ControlMessage {
@@ -109,10 +131,10 @@ impl<P: Placement> PlacementService<P> {
             // block ring. Keeping that mapping is what makes a pre-schema-4
             // client see no behaviour change.
             ControlMessage::PlacementLookup { block, k } => {
-                response(self.lookup(&block, k as usize))
+                response(self.lookup_on(Ring::Block, &block, k as usize))
             }
-            ControlMessage::AsyncPlacementLookup { block, k } => {
-                response(self.lookup_async(&block, k as usize))
+            ControlMessage::RingPlacementLookup { block, ring, k } => {
+                response(self.lookup_on(ring, &block, k as usize))
             }
             other => ControlMessage::Ack {
                 ok: false,
@@ -235,7 +257,7 @@ mod tests {
                 blocks.iter().all(|o| o.starts_with("blk-")),
                 "block lookup returned an async worker: {blocks:?}"
             );
-            let extents = s.lookup_async(&block(i), 2).owners;
+            let extents = s.lookup_on(Ring::Async, &block(i), 2).owners;
             assert!(
                 extents.iter().all(|o| o.starts_with("ext-")),
                 "async lookup returned a block worker: {extents:?}"
@@ -247,7 +269,7 @@ mod tests {
     #[test]
     fn an_async_lookup_against_a_block_only_cluster_has_no_owners() {
         let s = svc(&["a", "b", "c"]);
-        let res = s.lookup_async(&block(1), 2);
+        let res = s.lookup_on(Ring::Async, &block(1), 2);
         assert!(res.owners.is_empty());
         // The epoch still reflects the real membership, so the client caches a
         // valid epoch and refreshes when async workers actually arrive.
@@ -280,14 +302,42 @@ mod tests {
             other => panic!("expected PlacementResponse, got {other:?}"),
         }
 
-        match s.handle(ControlMessage::AsyncPlacementLookup {
-            block: block(3),
-            k: 2,
-        }) {
-            ControlMessage::PlacementResponse { owners, .. } => {
-                assert_eq!(owners, vec![NodeId::new("ext-a")]);
+        for ring in [Ring::Block, Ring::Async] {
+            let expected = match ring {
+                Ring::Async => NodeId::new("ext-a"),
+                _ => NodeId::new("blk-a"),
+            };
+            match s.handle(ControlMessage::RingPlacementLookup {
+                block: block(3),
+                ring,
+                k: 2,
+            }) {
+                ControlMessage::PlacementResponse { owners, .. } => {
+                    assert_eq!(owners, vec![expected], "{ring} ring");
+                }
+                other => panic!("expected PlacementResponse, got {other:?}"),
             }
-            other => panic!("expected PlacementResponse, got {other:?}"),
+        }
+    }
+
+    /// The explicit block ring and the legacy unqualified lookup must be the
+    /// same answer, or a client that upgrades to the ring-aware message would
+    /// silently start reading from different workers.
+    #[test]
+    fn naming_the_block_ring_matches_the_legacy_lookup() {
+        let s = svc(&["a", "b", "c", "d"]);
+        for i in 0..50 {
+            assert_eq!(
+                s.handle(ControlMessage::PlacementLookup {
+                    block: block(i),
+                    k: 2
+                }),
+                s.handle(ControlMessage::RingPlacementLookup {
+                    block: block(i),
+                    ring: Ring::Block,
+                    k: 2
+                }),
+            );
         }
     }
 

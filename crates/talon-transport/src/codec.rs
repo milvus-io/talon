@@ -11,7 +11,8 @@
 
 use serde::{Deserialize, Serialize};
 use talon_core::{
-    BlockId, NodeId, NodeInfo, NodeStatus, NodeStatusError, ObjectId, MAX_NODE_STATUS_BYTES,
+    BlockId, NodeId, NodeInfo, NodeRole, NodeStatus, NodeStatusError, ObjectId,
+    MAX_NODE_STATUS_BYTES,
 };
 
 use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
@@ -25,6 +26,59 @@ pub const CONTROL_SCHEMA_VERSION: u16 = 5;
 
 /// Oldest control schema this build can decode.
 pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
+
+/// Which rendezvous ring a placement lookup resolves against.
+///
+/// The rings are disjoint node sets with different hash keys, selected by node
+/// role. See ADR 0005 §6.
+///
+/// Carried as a field on [`ControlMessage::RingPlacementLookup`] rather than
+/// encoded as one message variant per ring, so a third ring costs an enum
+/// value instead of a variant plus a dispatch arm at every call site.
+///
+/// Variants are appended, never reordered: bincode serializes the position.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub enum Ring {
+    /// Block workers, hashed on the whole [`BlockId`].
+    ///
+    /// The default, and what an unadorned [`ControlMessage::PlacementLookup`]
+    /// has always meant.
+    #[default]
+    Block,
+    /// Async workers, hashed on the object identity alone, so every range of
+    /// one object resolves to the same worker and stays there across a
+    /// republish.
+    Async,
+}
+
+impl Ring {
+    /// The node role this ring draws its candidates from.
+    ///
+    /// Lives here rather than in the coordinator so a client filtering a
+    /// membership snapshot and the coordinator filtering placement candidates
+    /// cannot disagree about which pool a ring means.
+    pub fn role(self) -> NodeRole {
+        match self {
+            Ring::Block => NodeRole::Worker,
+            Ring::Async => NodeRole::AsyncWorker,
+        }
+    }
+
+    /// The label for logs and metrics.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Ring::Block => "block",
+            Ring::Async => "async",
+        }
+    }
+}
+
+impl std::fmt::Display for Ring {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
 
 /// A single control-plane message.
 ///
@@ -187,11 +241,13 @@ pub enum ControlMessage {
         /// Current worker process incarnation.
         worker_incarnation: String,
     },
-    /// Client → coordinator: which async worker holds this object's extents?
+    /// Client → coordinator: which workers answer for this read, on `ring`?
     ///
-    /// [`PlacementLookup`](Self::PlacementLookup) resolves against the block
-    /// worker ring and always has. This resolves against the async worker
-    /// ring: a disjoint node set, hashed on the object identity alone.
+    /// The general form of [`PlacementLookup`](Self::PlacementLookup), which
+    /// predates the ring split and permanently means [`Ring::Block`]. That
+    /// message keeps its schema-1 encoding untouched: bincode is positional,
+    /// so adding a field to it would shift `k` by four bytes and break every
+    /// client already in the field. This variant carries the ring instead.
     ///
     /// # Why the client picks the ring, and not the coordinator
     ///
@@ -199,7 +255,7 @@ pub enum ControlMessage {
     /// per-prefix rule — but every one of those is a policy guess made by the
     /// process with the least information. The caller knows whether it is
     /// about to read a Parquet footer or stream a whole partition; the
-    /// coordinator only sees a byte range. A separate message keeps the
+    /// coordinator only sees a byte range. Naming the ring keeps the
     /// coordinator a pure placement function and puts the choice where the
     /// knowledge is.
     ///
@@ -209,13 +265,15 @@ pub enum ControlMessage {
     ///
     /// Answered with the same [`PlacementResponse`](Self::PlacementResponse) as
     /// the block lookup — a client only has to learn one reply shape.
-    AsyncPlacementLookup {
-        /// The object being located. Only `block.object` is hashed; the
-        /// offset, block size, and version are carried for symmetry with
-        /// [`PlacementLookup`](Self::PlacementLookup) but do not affect the
-        /// answer, so every range of one object resolves to the same async
-        /// worker and stays there across a republish.
+    RingPlacementLookup {
+        /// The block being located. On [`Ring::Async`] only `block.object` is
+        /// hashed; the offset, block size, and version are carried for
+        /// symmetry with [`PlacementLookup`](Self::PlacementLookup) but do not
+        /// affect the answer.
         block: BlockId,
+        /// Which ring answers. [`Ring::Block`] reproduces
+        /// [`PlacementLookup`](Self::PlacementLookup) exactly.
+        ring: Ring,
         /// Number of replicas requested (RF=1 → 1 in v1).
         k: u8,
     },
@@ -245,10 +303,12 @@ impl ControlMessage {
             | Self::MappingRevisionValue { .. }
             | Self::StaleMapping { .. } => 3,
             Self::MappingRevisionUpdate { .. } | Self::MappingRevisionAck { .. } => 4,
-            // Schema 5: the async worker ring. A v4 coordinator cannot decode
-            // this, and must not fall back to the block lookup -- that would
-            // silently answer with a block worker, which holds no extents.
-            Self::AsyncPlacementLookup { .. } => 5,
+            // Schema 5: ring-aware placement. A v4 coordinator cannot decode
+            // this, and must not fall back to the block lookup -- on the async
+            // ring that would silently answer with a block worker, which holds
+            // no extents. Fenced even when ring == Block, because the encoding
+            // is what a v4 peer cannot read, not the ring.
+            Self::RingPlacementLookup { .. } => 5,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }
@@ -527,8 +587,14 @@ mod tests {
                 worker_id: "worker-1".into(),
                 worker_incarnation: "worker-inc-1".into(),
             },
-            ControlMessage::AsyncPlacementLookup {
+            ControlMessage::RingPlacementLookup {
                 block: block.clone(),
+                ring: Ring::Async,
+                k: 1,
+            },
+            ControlMessage::RingPlacementLookup {
+                block: block.clone(),
+                ring: Ring::Block,
                 k: 1,
             },
         ]
@@ -823,34 +889,108 @@ mod tests {
         }
     }
 
-    #[test]
-    fn the_async_lookup_requires_schema_five() {
-        // A v3 coordinator cannot decode this variant, and must not fall back
-        // to the block lookup: that would answer with a block worker, which
-        // holds no extents. Failing at the envelope keeps the mistake visible.
-        let lookup = ControlMessage::AsyncPlacementLookup {
+    fn ring_lookup(ring: Ring) -> ControlMessage {
+        ControlMessage::RingPlacementLookup {
             block: BlockId::new(
                 ObjectId::new(Backend::S3, "bkt", "obj.parquet"),
                 0,
                 256 << 20,
                 Version::new("etag"),
             ),
+            ring,
             k: 1,
+        }
+    }
+
+    #[test]
+    fn the_ring_lookup_requires_schema_five_on_either_ring() {
+        // A v4 coordinator cannot decode this variant, and must not fall back
+        // to the block lookup: on the async ring that would answer with a
+        // block worker, which holds no extents. The fence is on the encoding,
+        // not the ring, so Ring::Block is fenced too even though it means the
+        // same thing as a schema-1 PlacementLookup.
+        for ring in [Ring::Block, Ring::Async] {
+            let lookup = ring_lookup(ring);
+            assert_eq!(lookup.minimum_schema(), 5, "{ring}");
+            assert!(matches!(
+                encode_for_schema(1, &lookup, 4),
+                Err(CodecError::MessageRequiresSchema {
+                    required: 5,
+                    selected: 4
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn the_ring_field_defaults_to_the_block_ring() {
+        // A caller that constructs a lookup without thinking about rings must
+        // get the pre-split behaviour, not the async pool.
+        assert_eq!(Ring::default(), Ring::Block);
+    }
+
+    #[test]
+    fn ring_discriminants_are_append_only() {
+        // The ring rides the wire as a bincode u32 tag inside the lookup.
+        // Reordering these silently reroutes every client's reads to the wrong
+        // pool, which fails at read time rather than at lookup time.
+        let tag = |ring: Ring| {
+            let buf = bincode::serialize(&ring).unwrap();
+            u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]])
         };
-        assert_eq!(lookup.minimum_schema(), 5);
-        assert!(matches!(
-            encode_for_schema(1, &lookup, 4),
-            Err(CodecError::MessageRequiresSchema {
-                required: 5,
-                selected: 4
-            })
-        ));
+        assert_eq!(tag(Ring::Block), 0);
+        assert_eq!(tag(Ring::Async), 1);
+    }
+
+    #[test]
+    fn each_ring_draws_from_its_own_role() {
+        // Both the client (filtering membership) and the coordinator
+        // (filtering placement candidates) read this mapping, so it lives in
+        // one place and cannot drift between them.
+        assert_eq!(Ring::Block.role(), talon_core::NodeRole::Worker);
+        assert_eq!(Ring::Async.role(), talon_core::NodeRole::AsyncWorker);
+        assert_ne!(Ring::Block.role(), Ring::Async.role());
+    }
+
+    /// The reason the ring is on a new variant rather than a field on
+    /// `PlacementLookup`: bincode is positional, so a `ring` field would land
+    /// between `block` and `k` and shift `k` by four bytes. Every schema-1
+    /// client already in the field would fail to decode.
+    #[test]
+    fn the_ring_lookup_does_not_disturb_the_legacy_lookup_encoding() {
+        let block = BlockId::new(
+            ObjectId::new(Backend::S3, "bkt", "obj.parquet"),
+            0,
+            256 << 20,
+            Version::new("etag"),
+        );
+        let legacy = encode(
+            1,
+            &ControlMessage::PlacementLookup {
+                block: block.clone(),
+                k: 1,
+            },
+        )
+        .unwrap();
+        let ringed = encode(
+            1,
+            &ControlMessage::RingPlacementLookup {
+                block,
+                ring: Ring::Block,
+                k: 1,
+            },
+        )
+        .unwrap();
+        // Same logical request, deliberately different bytes: the legacy
+        // encoding is frozen and the new one is a distinct variant.
+        assert_ne!(legacy, ringed);
+        assert_eq!(ringed.len(), legacy.len() + 4, "the ring tag is four bytes");
     }
 
     #[test]
     fn the_block_lookup_still_encodes_at_schema_one() {
         // The compatibility guarantee for every client that predates the
-        // async worker: adding AsyncPlacementLookup must not retag the lookup
+        // async worker: adding RingPlacementLookup must not retag the lookup
         // they already send.
         let legacy = ControlMessage::PlacementLookup {
             block: BlockId::new(

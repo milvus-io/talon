@@ -513,11 +513,12 @@ impl Coordinator {
                     }
                 }
             }
-            // Both rings arrive here. The message variant selects which one —
-            // block or async — and `PlacementService::handle` maps it; they
-            // share this arm because they share the readiness rule.
+            // Both rings arrive here. Which one is selected by the `ring`
+            // field on the ring-aware variant, or implicitly by the legacy
+            // variant; `PlacementService::handle` maps both. They share this
+            // arm because they share the readiness rule.
             lookup @ (ControlMessage::PlacementLookup { .. }
-            | ControlMessage::AsyncPlacementLookup { .. }) => {
+            | ControlMessage::RingPlacementLookup { .. }) => {
                 // Fail closed: without a fresh authoritative snapshot we must not
                 // answer placement from possibly-stale local membership (#73).
                 if !self.observability.is_ready() {
@@ -1278,6 +1279,7 @@ mod tests {
     use talon_core::{
         NodeHealth, NodeId, NodeMetricsSnapshot, NodeStatus, NODE_STATUS_SCHEMA_VERSION,
     };
+    use talon_transport::Ring;
 
     use super::*;
 
@@ -2068,8 +2070,9 @@ mod tests {
         }
 
         match coord
-            .dispatch(ControlMessage::AsyncPlacementLookup {
+            .dispatch(ControlMessage::RingPlacementLookup {
                 block: sample_block(),
+                ring: Ring::Async,
                 k: 1,
             })
             .await
@@ -2078,6 +2081,22 @@ mod tests {
                 assert_eq!(owners, vec![NodeId::new("ext-1")]);
             }
             other => panic!("async ring: expected PlacementResponse, got {other:?}"),
+        }
+
+        // The ring-aware variant naming the block ring must reach the block
+        // pool through this same arm, not fall through to the catch-all.
+        match coord
+            .dispatch(ControlMessage::RingPlacementLookup {
+                block: sample_block(),
+                ring: Ring::Block,
+                k: 1,
+            })
+            .await
+        {
+            ControlMessage::PlacementResponse { owners, .. } => {
+                assert_eq!(owners, vec![NodeId::new("blk-1")]);
+            }
+            other => panic!("explicit block ring: expected PlacementResponse, got {other:?}"),
         }
     }
 
@@ -2103,8 +2122,9 @@ mod tests {
         assert!(!obs.is_ready());
 
         let reply = coord
-            .dispatch(ControlMessage::AsyncPlacementLookup {
+            .dispatch(ControlMessage::RingPlacementLookup {
                 block: sample_block(),
+                ring: Ring::Async,
                 k: 1,
             })
             .await;

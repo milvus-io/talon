@@ -30,7 +30,7 @@ use talon_core::{
     ObjectId, Version, NODE_STATUS_SCHEMA_VERSION,
 };
 use talon_transport::frame::HEADER_LEN;
-use talon_transport::{codec, ControlMessage, FrameHeader};
+use talon_transport::{codec, ControlMessage, FrameHeader, Ring};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -163,8 +163,9 @@ async fn block_owners(addr: &str, object: &str, offset: u64) -> Vec<String> {
 async fn async_owners(addr: &str, object: &str, offset: u64) -> Vec<String> {
     owners(
         addr,
-        ControlMessage::AsyncPlacementLookup {
+        ControlMessage::RingPlacementLookup {
             block: block(object, offset),
+            ring: Ring::Async,
             k: 1,
         },
     )
@@ -318,12 +319,48 @@ async fn both_rings_report_the_same_epoch() {
         k: 1,
     })
     .await;
-    let a = epoch_of(ControlMessage::AsyncPlacementLookup {
+    let a = epoch_of(ControlMessage::RingPlacementLookup {
         block: block("part-00000.parquet", 0),
+        ring: Ring::Async,
         k: 1,
     })
     .await;
     assert_eq!(a, b, "the epoch covers the whole membership, not one ring");
+}
+
+/// Naming the block ring explicitly must be indistinguishable from the legacy
+/// message. Clients migrate to the ring-aware variant one at a time, and a
+/// mid-migration fleet that split across two different owner sets for the same
+/// block would double every worker's cache footprint.
+#[tokio::test]
+async fn the_explicit_block_ring_places_exactly_where_the_legacy_lookup_does() {
+    let addr = "127.0.0.1:7427";
+    let _coordinator = coordinator(addr, "127.0.0.1:8427").await;
+    for id in ["blk-a", "blk-b", "blk-c", "blk-d"] {
+        register(addr, id, NodeRole::Worker).await;
+    }
+    // An async worker is present too, so a coordinator that ignored the ring
+    // field and resolved against the whole membership would be caught here.
+    register(addr, "ext-a", NodeRole::AsyncWorker).await;
+
+    for i in 0..40u64 {
+        let object = format!("part-{i:05}.parquet");
+        let legacy = block_owners(addr, &object, 0).await;
+        let explicit = owners(
+            addr,
+            ControlMessage::RingPlacementLookup {
+                block: block(&object, 0),
+                ring: Ring::Block,
+                k: 1,
+            },
+        )
+        .await;
+        assert_eq!(
+            legacy, explicit,
+            "the ring-aware block lookup moved {object}"
+        );
+        assert!(legacy[0].starts_with("blk-"), "{legacy:?}");
+    }
 }
 
 /// An async worker must reach the membership feed, or a client that resolves
