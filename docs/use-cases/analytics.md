@@ -88,6 +88,11 @@ does not guess. Two consequences to plan for: an async worker's NVMe tier is
 cold after a restart, and one very large hot object is served by one node rather
 than spread across the fleet.
 
+**Today only `talon-client --ring async` opts in.** The FUSE mount, the Python
+bindings, and the Java client all resolve to the block pool, so a mounted
+analytics workload still reads at block granularity. See
+[current limitations](../operations/async-worker.md#current-limitations).
+
 See [the async worker guide](../operations/async-worker.md) for how to run it,
 and ADR 0005 for why it is a separate worker rather than a mode.
 

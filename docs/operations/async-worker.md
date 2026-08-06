@@ -69,6 +69,43 @@ A lookup never crosses pools. If no async worker is registered, an async lookup
 returns **no owners** rather than quietly handing back a block worker that holds
 no extents.
 
+## Current limitations
+
+This worker runs end to end and the over-fetch claim is measured, but it is not
+yet something to put in front of production traffic. Four gaps, in the order
+they bite.
+
+**Only the CLI can reach the async ring.** `talon-client --ring async` is the
+one thing that sends a ring-aware lookup. The FUSE mount and the Python
+bindings are the same Rust code and send `PlacementLookup`, so they always
+resolve to the block pool. The Java client's encoder *could* send the new
+message — its schema field describes the message rather than the sender, so its
+schema-2 pin is not in the way — but the message is not implemented there.
+
+For FUSE it is not only the lookup. The read path splits a request into
+block-aligned `BlockId`s *before* it resolves placement, so pointing it at the
+async ring unchanged would ask an async worker for block-shaped ranges and
+reintroduce the exact over-fetch this worker exists to remove. Nor has anything
+decided *which* ring a mount should use: the CLI defers that to a human flag,
+and a filesystem has no human per read.
+
+**The NVMe tier has never written a byte outside tests.** Admissions are staged
+and flushed once `FLUSH_BYTES` (4 MiB) has accumulated. There is no timer and no
+drain on shutdown; the only other trigger is a `flush()` called from unit tests.
+A deployment that admits less than 4 MiB therefore leaves L2 empty
+indefinitely — and with `l1_capacity_bytes = 0`, repeated reads of one small
+extent go to the origin every time. Everything downstream of that flush —
+region packing, pin counts, checksum verification, region reclamation, and the
+zero-copy `sendfile` response — has only ever executed under unit tests.
+
+**No Helm template.** `deploy/helm/*/templates/` has `coordinator.yaml` and
+`worker.yaml` only. A Kubernetes deployment needs a hand-written manifest.
+
+**Never run on Linux, never against a real object store.** Development and
+testing were on macOS against an in-process origin that ignores SigV4 entirely.
+Real NVMe, a real S3 endpoint, and credential handling under load are all
+unexercised.
+
 ## Running it
 
 ### Docker Compose
@@ -92,6 +129,11 @@ talon-async-worker \
 
 Ports default to 7101 (data) and 8101 (admin), deliberately offset from the
 block worker's 7001/8001 so both can run on one host during a migration.
+
+A non-AWS `--s3-endpoint` also needs `TALON_ASYNC_WORKER_S3_PATH_STYLE=true`.
+Without it the virtual-hosted form builds an invalid host and the worker exits
+with `backend error: builder error`. This is shared with the block worker, not
+specific to this one.
 
 Every setting is in the
 [configuration reference](../reference/configuration.md) under **Async worker**;
