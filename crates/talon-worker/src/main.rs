@@ -42,7 +42,8 @@ use talon_worker::mapping_guard::MappingGuard;
 use talon_worker::tokio_conn::{handle_conn, read_control};
 use talon_worker::uring_conn;
 use talon_worker::{
-    serve_admin, BlockIndex, InFlightLoads, WholeBlockStore, WorkerObservability, WorkerRuntime,
+    serve_admin, BlockIndex, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerObservability,
+    WorkerRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -147,6 +148,7 @@ impl Args {
             capacity_bytes: None,
             l1_capacity_bytes: None,
             l1_page_size_bytes: None,
+            l2_page_size_bytes: None,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -283,6 +285,7 @@ async fn main() -> anyhow::Result<()> {
         capacity_bytes = cfg.capacity_bytes,
         l1_capacity_bytes = cfg.l1_capacity_bytes,
         l1_page_size_bytes = cfg.l1_page_size_bytes,
+        l2_page_size_bytes = cfg.l2_page_size_bytes,
         azure_account = ?cfg.azure_account,
         azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
@@ -296,10 +299,40 @@ async fn main() -> anyhow::Result<()> {
         .unwrap_or_else(|| PathBuf::from("/tmp/talon-cache"));
     std::fs::create_dir_all(&root)?;
     let store = WholeBlockStore::open(&root)?;
+    // Paged L2 is opt-in: with `l2_page_size_bytes` set, a miss materializes only
+    // the pages a read touches, under `<root>/paged`, instead of whole blocks.
+    let paged = match u32::try_from(cfg.l2_page_size_bytes) {
+        Ok(page_size) if page_size > 0 => {
+            Some(PagedBlockStore::open(root.join("paged"), page_size)?)
+        }
+        _ => None,
+    };
 
     // Rebuild the in-memory index from blocks already on local disk so a restart
     // does not re-download the resident working set (issue #114).
     let index = Arc::new(BlockIndex::new());
+    if let Some(paged) = &paged {
+        // Rebuild paged entries first; their present bitmaps come from the page
+        // files actually on disk.
+        match paged.scan() {
+            Ok(metas) => {
+                let count = metas.len();
+                for meta in metas {
+                    index.commit(meta);
+                }
+                if count > 0 {
+                    tracing::info!(
+                        blocks = count,
+                        pages = index.page_count(),
+                        "rebuilt paged block index from on-disk cache"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to scan on-disk paged cache");
+            }
+        }
+    }
     match store.scan() {
         Ok(metas) => {
             let count = metas.len();
@@ -453,20 +486,22 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let worker = Arc::new(
-        WorkerRuntime::new_with_l1(
-            store,
-            index,
-            inflight,
-            backend,
-            cfg.block_size,
-            cfg.capacity_bytes,
-            cfg.l1_capacity_bytes,
-            cfg.l1_page_size_bytes,
-            observability.metrics().clone(),
-        )
-        .with_backend_kind(configured_backend),
-    );
+    let mut runtime = WorkerRuntime::new_with_l1(
+        store,
+        index,
+        inflight,
+        backend,
+        cfg.block_size,
+        cfg.capacity_bytes,
+        cfg.l1_capacity_bytes,
+        cfg.l1_page_size_bytes,
+        observability.metrics().clone(),
+    )
+    .with_backend_kind(configured_backend);
+    if let Some(paged) = paged {
+        runtime = runtime.with_paged_store(paged);
+    }
+    let worker = Arc::new(runtime);
 
     let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
     tracing::info!(listen = %cfg.admin_listen, "worker serving administration API");

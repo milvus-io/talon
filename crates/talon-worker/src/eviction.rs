@@ -149,30 +149,30 @@ impl Lru {
         Some(e.bytes)
     }
 
-    /// Evict and return every *superseded* whole-block unit for the same
-    /// `(object, offset, block_size)` as `keep` but a different version.
+    /// Evict and return every *superseded* unit — whole block or page — for the
+    /// same `(object, offset, block_size)` as `keep` but a different version.
     ///
     /// When an object is overwritten its new ETag yields a new [`BlockId`] and a
-    /// new `.blk` file, while the old version's file would otherwise stay
-    /// resident forever (issue #159, compounding #119). Called on commit of a
-    /// fresh version, this reclaims the stale sibling(s) immediately. Pinned
-    /// units (an in-flight reader still serving the old bytes) are left alone.
+    /// new `.blk` file (or `.pages` directory), while the old version's files
+    /// would otherwise stay resident forever (issue #159, compounding #119).
+    /// Called on commit of a fresh version, this reclaims the stale sibling(s)
+    /// immediately. Pinned units (an in-flight reader still serving the old
+    /// bytes) are left alone.
     pub fn evict_superseded(&self, keep: &BlockId) -> Vec<CacheUnit> {
         let mut g = self.inner.lock().unwrap();
         let victims: Vec<CacheUnit> = g
             .entries
             .iter()
             .filter(|(unit, e)| {
+                let id = match unit {
+                    CacheUnit::Whole(id) => id,
+                    CacheUnit::Page(id, _) => id,
+                };
                 e.pins == 0
-                    && match unit {
-                        CacheUnit::Whole(id) => {
-                            id.object == keep.object
-                                && id.offset == keep.offset
-                                && id.block_size == keep.block_size
-                                && id.version != keep.version
-                        }
-                        CacheUnit::Page(..) => false,
-                    }
+                    && id.object == keep.object
+                    && id.offset == keep.offset
+                    && id.block_size == keep.block_size
+                    && id.version != keep.version
             })
             .map(|(unit, _)| unit.clone())
             .collect();

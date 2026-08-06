@@ -26,8 +26,33 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::fd::OwnedFd;
+use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
-use talon_core::{BlockHandle, BlockId, Error, PageIndex, Result};
+use std::sync::atomic::{AtomicU64, Ordering};
+use talon_core::{
+    BlockForm, BlockHandle, BlockId, BlockMeta, Error, PageIndex, PresentBitmap, Result,
+};
+
+/// Process-wide counter making staging temp filenames unique, so two concurrent
+/// writers of the same page never share a `.tmp` path (mirrors the whole-block
+/// store's discipline, issue #113).
+static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Run blocking filesystem work on Tokio's blocking pool, so page I/O never
+/// stalls the async reactor thread and the connections multiplexed on it
+/// (issue #115).
+async fn spawn_blocking_io<F, T>(f: F) -> Result<T>
+where
+    F: FnOnce() -> Result<T> + Send + 'static,
+    T: Send + 'static,
+{
+    match tokio::task::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(join_error) => Err(Error::Backend(format!(
+            "blocking store task failed: {join_error}"
+        ))),
+    }
+}
 
 /// A local, file-backed store for paged blocks (per-page files).
 pub struct PagedBlockStore {
@@ -71,24 +96,228 @@ impl PagedBlockStore {
         self.dir_for(id).join(format!("{}.page", page.0))
     }
 
+    /// Sidecar metadata path for a paged block: `<block dir>/block.meta`.
+    ///
+    /// The directory name is a one-way digest of the [`BlockId`], so the id
+    /// cannot be recovered from the page files alone. This sidecar records the
+    /// block's id, page size, and logical length so [`scan`](Self::scan) can
+    /// rebuild the index (and the present bitmap, from the page files actually
+    /// on disk) after a restart — the paged analogue of issue #114.
+    fn meta_path_for(&self, id: &BlockId) -> PathBuf {
+        self.dir_for(id).join("block.meta")
+    }
+
+    /// Record a paged block's identity so a restart can rebuild its index entry.
+    ///
+    /// Called once when a paged block is first touched. Best-effort: a missing
+    /// sidecar only costs a re-fetch of that block's pages after a restart.
+    pub fn write_sidecar(&self, id: &BlockId, len: u64) -> Result<()> {
+        let dir = self.dir_for(id);
+        std::fs::create_dir_all(&dir)?;
+        let meta_path = self.meta_path_for(id);
+        if meta_path.exists() {
+            return Ok(());
+        }
+        // The bitmap is not persisted: page files on disk are the source of
+        // truth, so a crash between a page rename and a bitmap write cannot
+        // desynchronize them. `scan` reconstructs presence by listing `.page`s.
+        let meta = BlockMeta {
+            id: id.clone(),
+            form: BlockForm::Paged {
+                page_size: self.page_size,
+                present: PresentBitmap::new(id.page_count(self.page_size)),
+            },
+            len,
+        };
+        let encoded = serde_json::to_vec(&meta)
+            .map_err(|e| Error::Other(format!("encode paged block sidecar: {e}")))?;
+        let pid = std::process::id();
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("block.meta.tmp.{pid}.{seq}"));
+        match (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            f.write_all(&encoded)?;
+            f.sync_all()?;
+            std::fs::rename(&tmp, &meta_path)
+        })() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.into())
+            }
+        }
+    }
+
+    /// Scan the cache root and return the [`BlockMeta`] of every paged block,
+    /// with each present bitmap reconstructed from the `.page` files on disk.
+    ///
+    /// A block directory without a readable sidecar is skipped (its pages are
+    /// unaddressable), as is one with no page files at all.
+    pub fn scan(&self) -> Result<Vec<BlockMeta>> {
+        let mut out = Vec::new();
+        let shards = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => return Err(e.into()),
+        };
+        for shard in shards.flatten() {
+            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let Ok(entries) = std::fs::read_dir(shard.path()) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let dir = entry.path();
+                if dir.extension().and_then(|e| e.to_str()) != Some("pages") {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(dir.join("block.meta")) else {
+                    continue;
+                };
+                let mut meta = match serde_json::from_slice::<BlockMeta>(&bytes) {
+                    Ok(meta) => meta,
+                    Err(error) => {
+                        tracing::warn!(path = %dir.display(), %error, "skipping malformed paged sidecar");
+                        continue;
+                    }
+                };
+                let BlockForm::Paged { page_size, present } = &mut meta.form else {
+                    continue;
+                };
+                // A sidecar written under a different page size cannot be
+                // reinterpreted at the current one; drop it rather than serve
+                // misaligned pages.
+                if *page_size != self.page_size {
+                    tracing::warn!(
+                        path = %dir.display(),
+                        sidecar_page_size = *page_size,
+                        configured_page_size = self.page_size,
+                        "skipping paged block written under a different page size"
+                    );
+                    continue;
+                }
+                let Ok(pages) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                for page_file in pages.flatten() {
+                    let path = page_file.path();
+                    if path.extension().and_then(|e| e.to_str()) != Some("page") {
+                        continue;
+                    }
+                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                        continue;
+                    };
+                    if let Ok(index) = stem.parse::<u32>() {
+                        present.set(PageIndex(index));
+                    }
+                }
+                if present.count() > 0 {
+                    out.push(meta);
+                }
+            }
+        }
+        Ok(out)
+    }
+
     /// Whether a specific page is resident.
     pub fn has_page(&self, id: &BlockId, page: PageIndex) -> bool {
         self.page_path(id, page).exists()
     }
 
     /// Materialize (commit) one page's bytes via temp-file + rename.
+    ///
+    /// The temp name carries pid + a process-wide sequence so two concurrent
+    /// writers of the same page cannot clobber each other's staging file and
+    /// commit a torn page (issue #113).
     pub fn put_page(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<()> {
         let dir = self.dir_for(id);
         std::fs::create_dir_all(&dir)?;
         let path = self.page_path(id, page);
-        let tmp = path.with_extension("page.tmp");
-        {
+        let pid = std::process::id();
+        let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = dir.join(format!("{}.page.tmp.{pid}.{seq}", page.0));
+        match (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&value)?;
             f.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })() {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(e.into())
+            }
         }
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+    }
+
+    /// Commit one page's bytes off the async reactor thread.
+    pub async fn put_page_async(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<()> {
+        let dir = self.dir_for(id);
+        let path = self.page_path(id, page);
+        spawn_blocking_io(move || {
+            std::fs::create_dir_all(&dir)?;
+            let pid = std::process::id();
+            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = path.with_extension(format!("page.tmp.{pid}.{seq}"));
+            match (|| -> std::io::Result<()> {
+                let mut f = std::fs::File::create(&tmp)?;
+                f.write_all(&value)?;
+                f.sync_all()?;
+                std::fs::rename(&tmp, &path)
+            })() {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    let _ = std::fs::remove_file(&tmp);
+                    Err(e.into())
+                }
+            }
+        })
+        .await
+    }
+
+    /// Read one page's bytes into userspace, off the async reactor thread.
+    ///
+    /// Returns [`Error::NotFound`] if the page is absent, so the caller can
+    /// trigger a page-level miss.
+    pub async fn get_page_bytes(&self, id: &BlockId, page: PageIndex) -> Result<Bytes> {
+        let path = self.page_path(id, page);
+        let label = format!("{id} page {}", page.0);
+        spawn_blocking_io(move || match std::fs::File::open(&path) {
+            Ok(f) => {
+                let len = f.metadata()?.len();
+                let size = usize::try_from(len)
+                    .map_err(|_| Error::Other(format!("page length {len} exceeds usize")))?;
+                let mut buffer = vec![0_u8; size];
+                f.read_exact_at(&mut buffer, 0)?;
+                Ok(Bytes::from(buffer))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::NotFound(label)),
+            Err(e) => Err(e.into()),
+        })
+        .await
+    }
+
+    /// Remove a single page off the async reactor thread. Idempotent.
+    pub async fn evict_page_async(&self, id: &BlockId, page: PageIndex) -> Result<()> {
+        let path = self.page_path(id, page);
+        spawn_blocking_io(move || match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        })
+        .await
+    }
+
+    /// Remove an entire paged block off the async reactor thread. Idempotent.
+    pub async fn delete_block_async(&self, id: &BlockId) -> Result<()> {
+        let dir = self.dir_for(id);
+        spawn_blocking_io(move || match std::fs::remove_dir_all(&dir) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        })
+        .await
     }
 
     /// Open a resident page as a zero-copy handle over its whole file.
@@ -277,6 +506,73 @@ mod tests {
         store.delete_block(&id).unwrap();
         assert!(!store.has_page(&id, PageIndex(1)));
         store.delete_block(&id).unwrap(); // idempotent
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_rebuilds_presence_from_the_page_files_on_disk() {
+        let root = tmp_root();
+        let store = PagedBlockStore::open(&root, 4).unwrap();
+        let id = block(5);
+        store.write_sidecar(&id, 20).unwrap();
+        store
+            .put_page(&id, PageIndex(1), Bytes::from_static(b"efgh"))
+            .unwrap();
+        store
+            .put_page(&id, PageIndex(3), Bytes::from_static(b"mnop"))
+            .unwrap();
+
+        let metas = store.scan().unwrap();
+        assert_eq!(metas.len(), 1);
+        let meta = &metas[0];
+        assert_eq!(meta.id, id);
+        assert_eq!(meta.len, 20);
+        let BlockForm::Paged { page_size, present } = &meta.form else {
+            panic!("expected a paged form");
+        };
+        assert_eq!(*page_size, 4);
+        // Exactly the pages with files on disk are marked present.
+        assert!(!present.is_present(PageIndex(0)));
+        assert!(present.is_present(PageIndex(1)));
+        assert!(!present.is_present(PageIndex(2)));
+        assert!(present.is_present(PageIndex(3)));
+        assert_eq!(present.count(), 2);
+        // Only present pages are charged, not the block's full length.
+        assert_eq!(meta.resident_bytes(), 8);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_skips_a_block_written_under_a_different_page_size() {
+        let root = tmp_root();
+        {
+            let store = PagedBlockStore::open(&root, 4).unwrap();
+            let id = block(6);
+            store.write_sidecar(&id, 20).unwrap();
+            store
+                .put_page(&id, PageIndex(0), Bytes::from_static(b"abcd"))
+                .unwrap();
+            assert_eq!(store.scan().unwrap().len(), 1);
+        }
+        // Reopening at a different page size must not reinterpret those pages:
+        // page 1 at 4 bytes is not page 1 at 8 bytes.
+        let store = PagedBlockStore::open(&root, 8).unwrap();
+        assert!(store.scan().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn scan_ignores_a_block_with_a_sidecar_but_no_pages() {
+        let root = tmp_root();
+        let store = PagedBlockStore::open(&root, 4).unwrap();
+        let id = block(7);
+        store.write_sidecar(&id, 20).unwrap();
+
+        // A sidecar alone contributes nothing resident.
+        assert!(store.scan().unwrap().is_empty());
 
         std::fs::remove_dir_all(&root).ok();
     }

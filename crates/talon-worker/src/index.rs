@@ -96,51 +96,120 @@ impl BlockIndex {
             .collect()
     }
 
+    /// Snapshot every resident cache *unit* and its byte cost: one entry per
+    /// whole block, one per present page of a paged block.
+    ///
+    /// Seeds the eviction tracker at startup so a rebuilt paged block charges
+    /// capacity per resident page rather than for its full logical length.
+    pub fn snapshot_units(&self) -> Vec<(BlockId, Option<PageIndex>, u64)> {
+        let g = self.inner.read().unwrap();
+        let mut out = Vec::new();
+        for meta in g.map.values() {
+            match &meta.form {
+                BlockForm::Whole => out.push((meta.id.clone(), None, meta.len)),
+                BlockForm::Paged { page_size, present } => {
+                    for p in 0..present.len() {
+                        let page = PageIndex(p);
+                        if present.is_present(page) {
+                            out.push((
+                                meta.id.clone(),
+                                Some(page),
+                                talon_core::page_len(meta.len, *page_size, page),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
     /// Commit a fully-materialized block (whole or a complete paged set).
     ///
     /// Called by PUT and by loader completion. Replaces any existing entry;
-    /// byte accounting is adjusted by the delta between old and new `len`.
+    /// byte accounting is adjusted by the delta between the old and new entry's
+    /// *resident* bytes — a paged block only charges for its present pages.
     pub fn commit(&self, meta: BlockMeta) {
         let mut g = self.inner.write().unwrap();
-        if let Some(prev) = g.map.insert(meta.id.clone(), meta.clone()) {
-            g.resident_bytes = g.resident_bytes.saturating_sub(prev.len);
+        let added = meta.resident_bytes();
+        if let Some(prev) = g.map.insert(meta.id.clone(), meta) {
+            g.resident_bytes = g.resident_bytes.saturating_sub(prev.resident_bytes());
         }
-        g.resident_bytes = g.resident_bytes.saturating_add(meta.len);
+        g.resident_bytes = g.resident_bytes.saturating_add(added);
     }
 
-    /// Insert (or reset) a paged block with an empty presence bitmap.
+    /// Insert a paged block with an empty presence bitmap, unless one is already
+    /// tracked.
     ///
     /// Used when a paged load begins: pages are then filled in with
     /// [`mark_page`](Self::mark_page). `len` is the block's logical length.
-    pub fn init_paged(&self, id: BlockId, page_size: u32, len: u64) {
+    /// Idempotent by design — a second concurrent page miss on the same block
+    /// must not reset the bitmap and lose the pages the first one materialized.
+    /// Returns `true` if a new entry was created.
+    pub fn init_paged(&self, id: BlockId, page_size: u32, len: u64) -> bool {
+        let mut g = self.inner.write().unwrap();
+        if g.map.contains_key(&id) {
+            // Already tracked — either paged (keep its bitmap) or whole (fully
+            // resident, nothing to page in). Either way, do not reset it.
+            return false;
+        }
         let page_count = id.page_count(page_size);
-        let meta = BlockMeta {
-            id,
-            form: BlockForm::Paged {
-                page_size,
-                present: PresentBitmap::new(page_count),
+        g.map.insert(
+            id.clone(),
+            BlockMeta {
+                id,
+                form: BlockForm::Paged {
+                    page_size,
+                    present: PresentBitmap::new(page_count),
+                },
+                len,
             },
-            len,
-        };
-        self.commit(meta);
+        );
+        // A fresh paged entry has no present pages, so it adds no resident bytes.
+        true
     }
 
-    /// Mark a page present on an existing paged block.
+    /// Mark a page present on an existing paged block, charging its bytes.
     ///
-    /// Returns `true` if the block exists and is paged; `false` otherwise
-    /// (whole blocks and unknown blocks are ignored).
+    /// Returns `true` if the block exists, is paged, and the page went from
+    /// absent to present; `false` otherwise (whole blocks, unknown blocks, and
+    /// already-present pages), so byte accounting is never double-counted.
     pub fn mark_page(&self, id: &BlockId, page: PageIndex) -> bool {
         let mut g = self.inner.write().unwrap();
-        match g.map.get_mut(id) {
-            Some(meta) => match &mut meta.form {
-                BlockForm::Paged { present, .. } => {
-                    present.set(page);
-                    true
-                }
-                BlockForm::Whole => false,
-            },
-            None => false,
+        let Some(meta) = g.map.get_mut(id) else {
+            return false;
+        };
+        let BlockForm::Paged { page_size, present } = &mut meta.form else {
+            return false;
+        };
+        if present.is_present(page) {
+            return false;
         }
+        present.set(page);
+        let bytes = talon_core::page_len(meta.len, *page_size, page);
+        g.resident_bytes = g.resident_bytes.saturating_add(bytes);
+        true
+    }
+
+    /// Mark a page absent on a paged block, refunding its bytes.
+    ///
+    /// Used by page-level eviction: the block entry (and its other pages) stays
+    /// intact. Returns `true` if the page was present and is now cleared.
+    pub fn clear_page(&self, id: &BlockId, page: PageIndex) -> bool {
+        let mut g = self.inner.write().unwrap();
+        let Some(meta) = g.map.get_mut(id) else {
+            return false;
+        };
+        let BlockForm::Paged { page_size, present } = &mut meta.form else {
+            return false;
+        };
+        if !present.is_present(page) {
+            return false;
+        }
+        present.clear(page);
+        let bytes = talon_core::page_len(meta.len, *page_size, page);
+        g.resident_bytes = g.resident_bytes.saturating_sub(bytes);
+        true
     }
 
     /// Decide how a read over `[start_page, end_page)` should be served.
@@ -166,12 +235,12 @@ impl BlockIndex {
 
     /// Remove a block from the index, returning its metadata if present.
     ///
-    /// Byte accounting is decremented by the removed block's `len`.
+    /// Byte accounting is decremented by the removed block's resident bytes.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut g = self.inner.write().unwrap();
         let removed = g.map.remove(id);
         if let Some(meta) = &removed {
-            g.resident_bytes = g.resident_bytes.saturating_sub(meta.len);
+            g.resident_bytes = g.resident_bytes.saturating_sub(meta.resident_bytes());
         }
         removed
     }
@@ -241,7 +310,10 @@ mod tests {
             Presence::Whole
         );
 
-        // Paged block: pages absent -> miss, then present -> hit.
+        // Paged block: pages absent -> miss, then present -> hit. Uses a fresh
+        // id — `init_paged` deliberately does not downgrade an existing whole
+        // entry, which is already fully resident.
+        let id = block(8);
         let page_size = 256 * 1024;
         idx.init_paged(id.clone(), page_size, 256 << 20);
         assert_eq!(

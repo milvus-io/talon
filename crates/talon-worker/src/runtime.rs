@@ -14,8 +14,8 @@ use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LEN};
 
 use crate::{
-    BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert, MemoryStore, Presence,
-    WholeBlockStore, WorkerMetrics,
+    miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
+    MemoryStore, PagedBlockStore, Presence, WholeBlockStore, WorkerMetrics,
 };
 
 /// Default lifetime of a cached resolved object version.
@@ -39,6 +39,10 @@ const LIST_PAGE_SIZE: u32 = 1000;
 /// A per-object resolved version with the instant it was resolved.
 struct CachedVersion {
     version: Version,
+    /// Total object length reported by the same `HEAD`, so the paged path can
+    /// compute a block's logical length (the last block is usually short)
+    /// without a second round trip.
+    object_len: u64,
     resolved_at: Instant,
 }
 
@@ -65,6 +69,10 @@ pub struct WorkerRuntime {
     l1: Arc<MemoryStore>,
     /// Persistent local-NVMe cache.
     store: WholeBlockStore,
+    /// Per-page L2 cache, enabled when the worker runs in paged mode. When set,
+    /// a miss materializes only the pages a read touches instead of the whole
+    /// (256 MiB default) block, and eviction reclaims individual pages.
+    paged: Option<PagedBlockStore>,
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
     backend: Arc<dyn BackendStore>,
@@ -129,8 +137,12 @@ impl WorkerRuntime {
         metrics: WorkerMetrics,
     ) -> Self {
         let lru = Arc::new(Lru::new());
-        for (id, len) in index.snapshot_lens() {
-            lru.insert(CacheUnit::Whole(id), len);
+        for (id, page, bytes) in index.snapshot_units() {
+            let unit = match page {
+                Some(page) => CacheUnit::Page(id, page),
+                None => CacheUnit::Whole(id),
+            };
+            lru.insert(unit, bytes);
         }
         let l1 = Arc::new(MemoryStore::with_limits(
             l1_capacity_bytes,
@@ -141,6 +153,7 @@ impl WorkerRuntime {
         Self {
             l1,
             store,
+            paged: None,
             index,
             inflight,
             backend,
@@ -154,7 +167,23 @@ impl WorkerRuntime {
         }
     }
 
-    /// Record the backend selected by the worker process.
+    /// Enable paged L2: cache individual pages instead of whole blocks.
+    ///
+    /// With this set, a read that misses fetches only the pages it touches from
+    /// the origin and commits them as per-page files, so a point query into a
+    /// 256 MiB block costs one page (256 KiB by default) of backend traffic and
+    /// of local disk rather than the whole block. Eviction reclaims individual
+    /// pages, leaving the block's other pages intact.
+    pub fn with_paged_store(mut self, paged: PagedBlockStore) -> Self {
+        self.paged = Some(paged);
+        self
+    }
+
+    /// The paged L2 page size, or `None` when paged mode is off.
+    fn paged_page_size(&self) -> Option<u32> {
+        self.paged.as_ref().map(|p| p.page_size())
+    }
+
     ///
     /// Requests carry a backend either directly in their [`ObjectId`] or in a
     /// namespace prefix (`s3`, `gcs`, or `az`). A worker has exactly one
@@ -295,6 +324,38 @@ impl WorkerRuntime {
         if end <= start_block + block_size {
             let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
+            // Paged mode: a resident page can be served straight from its own
+            // file with sendfile, provided the read stays inside one page (the
+            // common point-query shape). Anything wider goes through the byte
+            // path, which stitches pages together.
+            if let (Some(paged), false) = (&self.paged, self.l1.is_enabled()) {
+                let page_size = u64::from(paged.page_size());
+                let page = PageIndex((offset_in_block / page_size) as u32);
+                let within_one_page =
+                    offset_in_block + request.len <= (u64::from(page.0) + 1) * page_size;
+                if within_one_page
+                    && matches!(
+                        self.index.presence(&block, page, PageIndex(page.0 + 1)),
+                        Presence::PageHit
+                    )
+                {
+                    match paged.get_range(&block, offset_in_block, request.len) {
+                        Ok(mut handles) if handles.len() == 1 => {
+                            let handle = handles.pop().expect("one handle");
+                            self.metrics.record_l2_hit();
+                            self.metrics.record_cache_hit();
+                            self.lru.touch(&CacheUnit::Page(block.clone(), page));
+                            tracing::info!(
+                                block = %block, page = page.0, tier = "l2", "HIT (sendfile)"
+                            );
+                            return Ok(ServeOutcome::Sendfile(handle));
+                        }
+                        // Lost the race with page eviction, or a multi-handle
+                        // result; fall through to the byte path, which re-fetches.
+                        Ok(_) | Err(_) => {}
+                    }
+                }
+            }
             if self.l1.is_enabled() {
                 return Ok(ServeOutcome::Bytes(
                     self.block_range_bytes(request, &block, offset_in_block, request.len)
@@ -490,7 +551,7 @@ impl WorkerRuntime {
         }
         // Reuse the read path's cache so a stat immediately followed by a read
         // does not pay a second HEAD.
-        self.store_version(object, &stat.version);
+        self.store_version(object, &stat.version, stat.len);
         Ok(stat)
     }
 
@@ -517,7 +578,7 @@ impl WorkerRuntime {
                 "backend returned no version/etag for {object}; refusing to cache without a version"
             );
         }
-        self.store_version(object, &stat.version);
+        self.store_version(object, &stat.version, stat.len);
         Ok(stat.version)
     }
 
@@ -532,12 +593,23 @@ impl WorkerRuntime {
         }
     }
 
+    /// Total object length recorded alongside a cached version, if any.
+    ///
+    /// The paged path uses this to size the last (short) block of an object, so
+    /// it never charges capacity for — or tries to read — pages past EOF.
+    fn cached_object_len(&self, object: &ObjectId, version: &Version) -> Option<u64> {
+        let cache = self.version_cache.lock().unwrap();
+        let entry = cache.get(object)?;
+        (entry.version == *version).then_some(entry.object_len)
+    }
+
     /// Record a freshly-resolved version for `object`.
-    fn store_version(&self, object: &ObjectId, version: &Version) {
+    fn store_version(&self, object: &ObjectId, version: &Version, object_len: u64) {
         self.version_cache.lock().unwrap().insert(
             object.clone(),
             CachedVersion {
                 version: version.clone(),
+                object_len,
                 resolved_at: Instant::now(),
             },
         );
@@ -564,12 +636,275 @@ impl WorkerRuntime {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
+        if self.paged.is_some() {
+            return self.paged_block_range(request, block, offset, len).await;
+        }
         if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
             return Ok(bytes);
         }
 
         self.metrics.record_cache_miss();
         self.load_block_range(request, block, offset, len).await
+    }
+
+    /// Serve a block-relative range in paged mode: L1, then per-page L2 files,
+    /// then a per-page origin fetch for whatever is still absent.
+    ///
+    /// Unlike the whole-block path this never materializes the full block: only
+    /// the pages the read actually touches are fetched and committed, so a point
+    /// query costs one page rather than 256 MiB of backend traffic and disk.
+    async fn paged_block_range(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let page_size = self
+            .paged_page_size()
+            .ok_or_else(|| anyhow::anyhow!("paged read on a runtime without a paged store"))?;
+
+        // A write-through commits the whole block as one file (read-after-write
+        // must hit). Serve such a block from the whole-block store rather than
+        // re-fetching it a page at a time from the origin.
+        if matches!(
+            self.index.presence(block, PageIndex(0), PageIndex(1)),
+            Presence::Whole
+        ) {
+            if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
+                return Ok(bytes);
+            }
+        }
+
+        let block_len = self.block_len(&request.object, block).await?;
+        let len = available_range_len(block_len, offset, len)?;
+        if len == 0 {
+            return Ok(bytes::Bytes::new());
+        }
+
+        // Ensure the block has an index entry so page presence can be tracked.
+        // Idempotent: a concurrent reader's entry (and its bitmap) is preserved.
+        self.index.init_paged(block.clone(), page_size, block_len);
+
+        let mut out = bytes::BytesMut::with_capacity(len as usize);
+        let mut hit_all = true;
+        for page in touched_pages(offset, len, page_size) {
+            let page_start = u64::from(page.0) * u64::from(page_size);
+            let page_bytes_len = talon_core::page_len(block_len, page_size, page);
+            // Intersect the requested window with this page's span.
+            let from = offset.max(page_start);
+            let to = (offset + len).min(page_start + page_bytes_len);
+            if to <= from {
+                continue;
+            }
+            let (page_bytes, hit) = self.page_bytes(request, block, page, block_len).await?;
+            hit_all &= hit;
+            out.extend_from_slice(&slice(&page_bytes, from - page_start, to - from)?);
+        }
+        if hit_all {
+            self.metrics.record_cache_hit();
+        } else {
+            self.metrics.record_cache_miss();
+        }
+        Ok(out.freeze())
+    }
+
+    /// Return one page's bytes, and whether it was served from cache.
+    ///
+    /// Tries L1, then the on-disk page file, then a deduplicated origin fetch of
+    /// just that page. Concurrent misses for the same `(block, page)` collapse
+    /// to a single backend request via [`LoadKey::Page`], mirroring the
+    /// whole-block leader/follower protocol (issues #113, #162).
+    async fn page_bytes(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        page: PageIndex,
+        block_len: u64,
+    ) -> anyhow::Result<(bytes::Bytes, bool)> {
+        if let Some(bytes) = self.cached_page(block, page).await? {
+            return Ok((bytes, true));
+        }
+        let key = LoadKey::Page(block.clone(), page);
+        match self.inflight.admit_owned(key.clone()) {
+            Some(guard) => {
+                let result = self
+                    .fetch_and_commit_page(request, block, page, block_len)
+                    .await;
+                drop(guard);
+                Ok((result?, false))
+            }
+            None => {
+                // A peer is fetching this exact page; wait and serve from cache.
+                self.inflight.wait(&key).await;
+                if let Some(bytes) = self.cached_page(block, page).await? {
+                    return Ok((bytes, true));
+                }
+                // The leader's load failed; fetch it ourselves rather than
+                // looping on admission, which could wait unboundedly.
+                let bytes = self
+                    .fetch_and_commit_page(request, block, page, block_len)
+                    .await?;
+                Ok((bytes, false))
+            }
+        }
+    }
+
+    /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.
+    async fn cached_page(
+        &self,
+        block: &BlockId,
+        page: PageIndex,
+    ) -> anyhow::Result<Option<bytes::Bytes>> {
+        if self.l1.is_enabled() {
+            if let Some(bytes) = self.l1.get_page(block, page) {
+                self.metrics.record_l1_hit();
+                self.lru.touch(&CacheUnit::Page(block.clone(), page));
+                tracing::debug!(block = %block, page = page.0, tier = "l1", "HIT");
+                return Ok(Some(bytes));
+            }
+            self.metrics.record_l1_miss();
+        }
+        if !matches!(
+            self.index.presence(block, page, PageIndex(page.0 + 1)),
+            Presence::PageHit
+        ) {
+            self.metrics.record_l2_miss();
+            return Ok(None);
+        }
+        let paged = self.paged.as_ref().expect("paged store");
+        match paged.get_page_bytes(block, page).await {
+            Ok(bytes) => {
+                self.metrics.record_l2_hit();
+                self.lru.touch(&CacheUnit::Page(block.clone(), page));
+                tracing::debug!(block = %block, page = page.0, tier = "l2", "HIT");
+                if self.l1.is_enabled() {
+                    self.admit_l1_page(block, page, bytes.clone());
+                }
+                Ok(Some(bytes))
+            }
+            Err(Error::NotFound(_)) => {
+                // Index said present but the file is gone — an eviction race.
+                // Drop the stale bit so the miss path re-fetches it.
+                self.index.clear_page(block, page);
+                self.lru.remove(&CacheUnit::Page(block.clone(), page));
+                self.metrics.record_l2_miss();
+                Ok(None)
+            }
+            Err(error) => Err(anyhow::anyhow!("read cached page: {error}")),
+        }
+    }
+
+    /// Fetch one page from the origin and commit it as a per-page file.
+    async fn fetch_and_commit_page(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        page: PageIndex,
+        block_len: u64,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let page_size = self.paged_page_size().expect("paged store");
+        let page_start = u64::from(page.0) * u64::from(page_size);
+        let want = talon_core::page_len(block_len, page_size, page);
+        tracing::info!(block = %block, page = page.0, "MISS -> backend page fetch");
+        let started = Instant::now();
+        // Same If-Match precondition as the whole-block path: an overwrite
+        // between version resolution and this GET must be rejected rather than
+        // committing newer bytes under the older version's key (issue #163).
+        let fetched = self
+            .backend
+            .fetch_range_if_match(
+                &request.object,
+                block.offset + page_start,
+                want,
+                Some(&block.version),
+            )
+            .await;
+        let bytes = match fetched {
+            Ok(bytes) => {
+                self.metrics
+                    .record_backend_fetch_success(bytes.len() as u64, started.elapsed());
+                bytes
+            }
+            Err(error) => {
+                self.metrics.record_backend_fetch_error(started.elapsed());
+                return Err(error.into());
+            }
+        };
+
+        let paged = self.paged.as_ref().expect("paged store");
+        // Record the block's identity once so a restart can rebuild its index
+        // entry from the page files on disk.
+        if let Err(error) = paged.write_sidecar(block, block_len) {
+            tracing::warn!(block = %block, %error, "failed to write paged sidecar");
+        }
+        paged
+            .put_page_async(block, page, bytes.clone())
+            .await
+            .map_err(|error| anyhow::anyhow!("commit page failed: {error}"))?;
+        self.index.init_paged(block.clone(), page_size, block_len);
+        self.index.mark_page(block, page);
+
+        let unit = CacheUnit::Page(block.clone(), page);
+        self.lru.insert(unit.clone(), bytes.len() as u64);
+        self.lru.pin(&unit);
+        let superseded = self.lru.evict_superseded(block);
+        self.unlink_units(superseded).await;
+        self.enforce_capacity().await;
+        self.lru.unpin(&unit);
+        if !self.l1.remove_superseded(block).is_empty() {
+            self.refresh_l1_metrics();
+        }
+        if self.l1.is_enabled() {
+            self.admit_l1_page(block, page, bytes.clone());
+        }
+        tracing::info!(block = %block, page = page.0, bytes = bytes.len(), "committed page");
+        Ok(bytes)
+    }
+
+    /// Admit one page into L1, recording admissions and evictions.
+    fn admit_l1_page(&self, block: &BlockId, page: PageIndex, bytes: bytes::Bytes) {
+        match self.l1.insert_page(block.clone(), page, bytes) {
+            MemoryInsert::Inserted { evicted } => {
+                self.metrics.record_l1_admission();
+                for victim in evicted {
+                    self.metrics.record_l1_eviction();
+                    tracing::debug!(
+                        block = %victim.block,
+                        page = victim.page.0,
+                        tier = "l1",
+                        "evicted page"
+                    );
+                }
+                self.refresh_l1_metrics();
+            }
+            MemoryInsert::Disabled | MemoryInsert::TooLarge => {}
+        }
+    }
+
+    /// The logical byte length of `block` — `block_size`, except for an object's
+    /// last block, which is short.
+    ///
+    /// Uses the length recorded alongside the cached version when available, so
+    /// a warm read pays no extra `HEAD`; falls back to the index entry, then to
+    /// a `HEAD`.
+    async fn block_len(&self, object: &ObjectId, block: &BlockId) -> anyhow::Result<u64> {
+        let block_size = self.block_size as u64;
+        if let Some(meta) = self.index.get(block) {
+            return Ok(meta.len);
+        }
+        let object_len = match self.cached_object_len(object, &block.version) {
+            Some(len) => len,
+            None => {
+                let stat =
+                    self.backend.head(object).await.map_err(|error| {
+                        anyhow::anyhow!("resolve object length (HEAD): {error}")
+                    })?;
+                self.store_version(object, &stat.version, stat.len);
+                stat.len
+            }
+        };
+        Ok(object_len.saturating_sub(block.offset).min(block_size))
     }
 
     /// Load one block after both L1 and L2 have missed.
@@ -891,7 +1226,7 @@ impl WorkerRuntime {
         };
         // Refresh the version cache so a subsequent read resolves the new version
         // without a HEAD, and addresses the just-written block correctly (#163).
-        self.store_version(object, &version);
+        self.store_version(object, &version, body.len() as u64);
         // Commit the written bytes to the local cache under the new version, so
         // read-after-write is a hit. Mirrors the miss-commit path.
         let block = self.block_for(object, 0, &version);
@@ -958,7 +1293,7 @@ impl WorkerRuntime {
             let old_block = self.block_for(object, 0, &old_version);
             self.unlink_units(vec![CacheUnit::Whole(old_block)]).await;
         }
-        self.store_version(object, &version);
+        self.store_version(object, &version, len);
         tracing::info!(
             object = %object.to_path(),
             bytes = len,
@@ -1015,16 +1350,61 @@ impl WorkerRuntime {
     /// pass or restart scan).
     async fn unlink_units(&self, units: Vec<CacheUnit>) {
         for unit in units {
-            let CacheUnit::Whole(id) = unit else {
-                continue;
-            };
-            self.invalidate_l1(&id);
-            if let Err(error) = self.store.delete(&id).await {
-                tracing::warn!(block = %id, %error, "failed to unlink evicted block");
+            match unit {
+                CacheUnit::Whole(id) => {
+                    self.invalidate_l1(&id);
+                    if let Err(error) = self.store.delete(&id).await {
+                        tracing::warn!(block = %id, %error, "failed to unlink evicted block");
+                    }
+                    // A paged block's directory shares the block identity; drop
+                    // it too so a whole-block eviction cannot leave orphaned
+                    // pages behind.
+                    if let Some(paged) = &self.paged {
+                        if let Err(error) = paged.delete_block_async(&id).await {
+                            tracing::warn!(block = %id, %error, "failed to unlink evicted pages");
+                        }
+                    }
+                    self.index.remove(&id);
+                    self.metrics.record_eviction();
+                    tracing::info!(block = %id, "evicted block");
+                }
+                CacheUnit::Page(id, page) => {
+                    // Page-level eviction: unlink just this page file and clear
+                    // its bit. The block entry and its other pages stay intact.
+                    self.l1.remove_page(&id, page);
+                    if let Some(paged) = &self.paged {
+                        if let Err(error) = paged.evict_page_async(&id, page).await {
+                            tracing::warn!(
+                                block = %id, page = page.0, %error,
+                                "failed to unlink evicted page"
+                            );
+                        }
+                    }
+                    self.index.clear_page(&id, page);
+                    self.metrics.record_eviction();
+                    self.refresh_l1_metrics();
+                    tracing::info!(block = %id, page = page.0, "evicted page");
+                    // Evicting the last page leaves an empty entry that would
+                    // otherwise linger in the index (and its `.pages` directory
+                    // on disk) forever. Drop both once nothing is resident.
+                    if self
+                        .index
+                        .get(&id)
+                        .is_some_and(|meta| meta.resident_bytes() == 0)
+                    {
+                        if let Some(paged) = &self.paged {
+                            if let Err(error) = paged.delete_block_async(&id).await {
+                                tracing::warn!(
+                                    block = %id, %error,
+                                    "failed to remove emptied paged block directory"
+                                );
+                            }
+                        }
+                        self.index.remove(&id);
+                        tracing::debug!(block = %id, "dropped paged block with no resident pages");
+                    }
+                }
             }
-            self.index.remove(&id);
-            self.metrics.record_eviction();
-            tracing::info!(block = %id, "evicted block");
         }
     }
 
@@ -1641,7 +2021,7 @@ mod tests {
             PAGE_SIZE,
             WorkerMetrics::new(BLOCK_SIZE as u64),
         );
-        runtime.store_version(&object, &Version::new("v1"));
+        runtime.store_version(&object, &Version::new("v1"), 0);
         let request = RangeRequest {
             object,
             offset: PAGE_SIZE + 17,
@@ -2696,6 +3076,453 @@ mod tests {
             let _ = runtime.serve_range(&req).await.unwrap();
         }
         assert_eq!(runtime.block_count(), 4, "no eviction with zero capacity");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    // ---- paged L2 -------------------------------------------------------
+
+    /// A backend recording every `(offset, len)` fetched, so a test can assert
+    /// that a paged miss pulled only the pages it needed.
+    struct PagedRampBackend {
+        object_len: u64,
+        ranges: Mutex<Vec<(u64, u64)>>,
+    }
+
+    impl PagedRampBackend {
+        fn new(object_len: u64) -> Self {
+            Self {
+                object_len,
+                ranges: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn ranges(&self) -> Vec<(u64, u64)> {
+            self.ranges.lock().unwrap().clone()
+        }
+
+        fn fetched_bytes(&self) -> u64 {
+            self.ranges.lock().unwrap().iter().map(|(_, l)| l).sum()
+        }
+    }
+
+    #[async_trait]
+    impl BackendStore for PagedRampBackend {
+        async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            self.ranges.lock().unwrap().push((offset, len));
+            let end = (offset + len).min(self.object_len);
+            let n = end.saturating_sub(offset) as usize;
+            Ok(Bytes::from(
+                (0..n)
+                    .map(|i| ((offset + i as u64) % 251) as u8)
+                    .collect::<Vec<u8>>(),
+            ))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: self.object_len,
+                version: Version::new("v1"),
+            })
+        }
+    }
+
+    /// Build a paged-mode runtime: `block_size`-byte blocks split into
+    /// `page_size`-byte pages, L1 disabled so L2 behavior is observable.
+    fn paged_runtime<B: BackendStore + 'static>(
+        backend: Arc<B>,
+        root: &Path,
+        block_size: u32,
+        page_size: u32,
+        capacity_bytes: u64,
+        metrics: WorkerMetrics,
+    ) -> WorkerRuntime {
+        WorkerRuntime::new(
+            WholeBlockStore::open(root.join("whole")).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            block_size,
+            capacity_bytes,
+            metrics,
+        )
+        .with_paged_store(PagedBlockStore::open(root.join("paged"), page_size).unwrap())
+        .with_version_ttl(Duration::ZERO)
+    }
+
+    fn req(object: &ObjectId, offset: u64, len: u64) -> RangeRequest {
+        RangeRequest {
+            object: object.clone(),
+            offset,
+            len,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_point_read_fetches_one_page_not_the_whole_block() {
+        let root = tmp_root();
+        // 1 KiB blocks, 64-byte pages: a 16-page block.
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Read 8 bytes in the middle of page 5 of block 0.
+        let got = runtime
+            .serve_range(&req(&object, 5 * 64 + 8, 8))
+            .await
+            .unwrap();
+
+        assert_eq!(got, expected(5 * 64 + 8, 8));
+        // Exactly one page fetched — not the 1 KiB block.
+        assert_eq!(backend.ranges(), vec![(5 * 64, 64)]);
+        assert_eq!(backend.fetched_bytes(), 64);
+        // Only that page is resident, so capacity accounting charges 64 bytes.
+        assert_eq!(runtime.resident_bytes(), 64);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_second_read_of_the_same_page_hits_cache() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        let first = runtime.serve_range(&req(&object, 100, 16)).await.unwrap();
+        let second = runtime.serve_range(&req(&object, 100, 16)).await.unwrap();
+
+        assert_eq!(first, expected(100, 16));
+        assert_eq!(second, first);
+        // The second read touched the same page; no new backend traffic.
+        assert_eq!(backend.ranges().len(), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_read_spanning_pages_stitches_them_and_fetches_only_those_pages() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Straddle the page 1/2/3 boundaries: from mid-page-1 to mid-page-3.
+        let got = runtime
+            .serve_range(&req(&object, 64 + 32, 128))
+            .await
+            .unwrap();
+
+        assert_eq!(got, expected(64 + 32, 128));
+        let mut ranges = backend.ranges();
+        ranges.sort();
+        assert_eq!(ranges, vec![(64, 64), (128, 64), (192, 64)]);
+        assert_eq!(runtime.resident_bytes(), 3 * 64);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn the_last_page_of_a_short_object_is_truncated_not_padded() {
+        let root = tmp_root();
+        // 100-byte object with 64-byte pages: page 1 holds only 36 bytes.
+        let backend = Arc::new(PagedRampBackend::new(100));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Ask for more than remains; the read is clamped to EOF.
+        let got = runtime.serve_range(&req(&object, 90, 64)).await.unwrap();
+
+        assert_eq!(got, expected(90, 10));
+        assert_eq!(backend.ranges(), vec![(64, 36)]);
+        // Only the 36 real bytes are charged, not a full 64-byte page.
+        assert_eq!(runtime.resident_bytes(), 36);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn evicting_a_cold_page_leaves_the_blocks_other_pages_intact() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        // Capacity for exactly two 64-byte pages.
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            128,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Fill pages 0 and 1, then touch page 0 so page 1 is coldest.
+        runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+        runtime.serve_range(&req(&object, 64, 8)).await.unwrap();
+        runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+        // Admitting page 2 must evict page 1, the coldest.
+        runtime.serve_range(&req(&object, 128, 8)).await.unwrap();
+
+        assert_eq!(runtime.resident_bytes(), 128, "back under capacity");
+        // The block entry survives: page 0 is still a cache hit.
+        let before = backend.ranges().len();
+        assert_eq!(
+            runtime.serve_range(&req(&object, 0, 8)).await.unwrap(),
+            expected(0, 8)
+        );
+        assert_eq!(backend.ranges().len(), before, "page 0 still cached");
+        // Page 1 was evicted, so re-reading it costs a fresh fetch.
+        assert_eq!(
+            runtime.serve_range(&req(&object, 64, 8)).await.unwrap(),
+            expected(64, 8)
+        );
+        assert_eq!(backend.ranges().len(), before + 1, "page 1 refetched");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn concurrent_reads_of_one_page_trigger_a_single_backend_fetch() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = Arc::new(paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        ));
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        let mut handles = Vec::new();
+        for i in 0..8 {
+            let runtime = Arc::clone(&runtime);
+            let object = object.clone();
+            handles.push(tokio::spawn(async move {
+                runtime.serve_range(&req(&object, 64 + i, 4)).await.unwrap()
+            }));
+        }
+        for (i, handle) in handles.into_iter().enumerate() {
+            assert_eq!(handle.await.unwrap(), expected(64 + i as u64, 4));
+        }
+
+        // All eight readers touched page 1; exactly one fetch was issued.
+        assert_eq!(backend.ranges(), vec![(64, 64)]);
+        assert_eq!(runtime.inflight_loads(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_restart_rebuilds_paged_residency_from_the_page_files_on_disk() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let metrics = WorkerMetrics::new(1024);
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        {
+            let runtime = paged_runtime(Arc::clone(&backend), &root, 1024, 64, 0, metrics.clone());
+            runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+            runtime.serve_range(&req(&object, 128, 8)).await.unwrap();
+        }
+        let fetches_before = backend.ranges().len();
+
+        // Restart: a fresh index rebuilt from the on-disk paged cache.
+        let paged = PagedBlockStore::open(root.join("paged"), 64).unwrap();
+        let index = Arc::new(BlockIndex::new());
+        let metas = paged.scan().unwrap();
+        assert_eq!(metas.len(), 1, "one paged block on disk");
+        for meta in metas {
+            index.commit(meta);
+        }
+        assert_eq!(index.page_count(), 2, "pages 0 and 2 rebuilt");
+        assert_eq!(index.resident_bytes(), 128);
+
+        let runtime = WorkerRuntime::new(
+            WholeBlockStore::open(root.join("whole")).unwrap(),
+            index,
+            Arc::new(InFlightLoads::new()),
+            Arc::clone(&backend) as Arc<dyn BackendStore>,
+            1024,
+            0,
+            metrics,
+        )
+        .with_paged_store(paged)
+        .with_version_ttl(Duration::ZERO);
+
+        // Both previously-cached pages serve without new backend traffic.
+        assert_eq!(
+            runtime.serve_range(&req(&object, 0, 8)).await.unwrap(),
+            expected(0, 8)
+        );
+        assert_eq!(
+            runtime.serve_range(&req(&object, 128, 8)).await.unwrap(),
+            expected(128, 8)
+        );
+        assert_eq!(backend.ranges().len(), fetches_before, "served from disk");
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn an_index_hit_with_a_deleted_page_file_refetches_instead_of_failing() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+
+        // Simulate an out-of-band deletion of the page file while the index
+        // still believes the page is resident.
+        let mut removed = 0;
+        for shard in std::fs::read_dir(root.join("paged")).unwrap().flatten() {
+            if !shard.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for dir in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                let page = dir.path().join("0.page");
+                if page.exists() {
+                    std::fs::remove_file(&page).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        assert_eq!(removed, 1, "found the page file to delete");
+
+        // The read recovers by re-fetching rather than surfacing an error.
+        let got = runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+        assert_eq!(got, expected(0, 8));
+        assert_eq!(backend.ranges().len(), 2);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn paged_mode_serves_a_within_page_read_via_sendfile() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        let request = req(&object, 70, 10);
+
+        // First read is a miss and comes back as bytes.
+        assert!(matches!(
+            runtime.serve(&request).await.unwrap(),
+            ServeOutcome::Bytes(_)
+        ));
+        // Once resident, the same within-page read is served zero-copy.
+        match runtime.serve(&request).await.unwrap() {
+            ServeOutcome::Sendfile(handle) => {
+                let mut buf = vec![0u8; handle.len as usize];
+                let file = std::fs::File::from(handle.fd);
+                file.read_exact_at(&mut buf, handle.offset).unwrap();
+                assert_eq!(Bytes::from(buf), expected(70, 10));
+            }
+            ServeOutcome::Bytes(_) => panic!("expected a sendfile handle for a resident page"),
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn overwriting_an_object_reclaims_the_old_versions_pages() {
+        let root = tmp_root();
+        let backend = Arc::new(VersionedBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"aaaaaaaa")),
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+        assert_eq!(runtime.block_count(), 1);
+
+        // The source is overwritten: a new etag yields a new BlockId.
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"bbbbbbbb");
+        let got = runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
+
+        assert_eq!(got, Bytes::from_static(b"bbbbbbbb"));
+        // The superseded version's pages were reclaimed, not left resident.
+        assert_eq!(runtime.block_count(), 1, "old version dropped");
+        assert_eq!(runtime.resident_bytes(), 8);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_paged_read_after_write_hits_the_whole_block_the_write_committed() {
+        let root = tmp_root();
+        let backend = Arc::new(MutableBackend {
+            body: std::sync::Mutex::new(None),
+            version: std::sync::Mutex::new("v1".into()),
+            fetches: AtomicUsize::new(0),
+            puts: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+        });
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        let body = Bytes::from((0..200u32).map(|i| (i % 251) as u8).collect::<Vec<u8>>());
+
+        runtime.write_object(&object, body.clone()).await.unwrap();
+        let fetches_before = backend.fetches.load(Ordering::SeqCst);
+
+        // The write committed a whole block; a paged read must serve from it
+        // rather than going back to the origin.
+        let got = runtime.serve_range(&req(&object, 70, 10)).await.unwrap();
+
+        assert_eq!(got, body.slice(70..80));
+        assert_eq!(
+            backend.fetches.load(Ordering::SeqCst),
+            fetches_before,
+            "read-after-write must hit"
+        );
         std::fs::remove_dir_all(root).ok();
     }
 }

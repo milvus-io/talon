@@ -17,7 +17,7 @@ pub mod store;
 pub mod trace;
 
 pub use backend::{BackendStore, ListPage, ListedObject, ObjectStat};
-pub use block::{BlockForm, BlockMeta, LoadHint, PresentBitmap};
+pub use block::{page_len, BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
     ConfigVar, FuseConfig, FuseConfigPatch, Patch, WorkerConfig, WorkerConfigPatch,

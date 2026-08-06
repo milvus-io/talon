@@ -112,6 +112,44 @@ pub struct BlockMeta {
     pub len: u64,
 }
 
+impl BlockMeta {
+    /// Bytes actually materialized in the cache for this block.
+    ///
+    /// For [`BlockForm::Whole`] this is the whole logical length. For
+    /// [`BlockForm::Paged`] only *present* pages occupy space, so a paged block
+    /// with an empty bitmap costs nothing — capacity accounting must not charge
+    /// a 256 MiB block for one resident 256 KiB page.
+    pub fn resident_bytes(&self) -> u64 {
+        match &self.form {
+            BlockForm::Whole => self.len,
+            BlockForm::Paged { page_size, present } => (0..present.len())
+                .filter(|p| present.is_present(PageIndex(*p)))
+                .map(|p| page_len(self.len, *page_size, PageIndex(p)))
+                .sum(),
+        }
+    }
+
+    /// Byte length of `page` within this block (the last page may be short).
+    pub fn page_len(&self, page: PageIndex) -> u64 {
+        match &self.form {
+            BlockForm::Whole => 0,
+            BlockForm::Paged { page_size, .. } => page_len(self.len, *page_size, page),
+        }
+    }
+}
+
+/// Byte length of `page` in a block of `len` bytes with `page_size` pages.
+///
+/// Returns 0 for a page beyond the block's end; the final page is truncated to
+/// whatever remains, so pages of a short trailing block are accounted exactly.
+pub fn page_len(len: u64, page_size: u32, page: PageIndex) -> u64 {
+    if page_size == 0 {
+        return 0;
+    }
+    let start = u64::from(page.0) * u64::from(page_size);
+    len.saturating_sub(start).min(u64::from(page_size))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
