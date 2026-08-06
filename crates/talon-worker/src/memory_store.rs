@@ -230,6 +230,24 @@ impl MemoryStore {
         MemoryInsert::Inserted { evicted }
     }
 
+    /// Remove one page. Returns whether it was resident.
+    pub fn remove_page(&self, block: &BlockId, page: PageIndex) -> bool {
+        let mut inner = self.inner.lock().unwrap();
+        let key = MemoryPageKey {
+            block: block.clone(),
+            page,
+        };
+        match inner.entries.remove(&key) {
+            Some(entry) => {
+                inner.resident_bytes = inner
+                    .resident_bytes
+                    .saturating_sub(entry.value.len() as u64);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Remove every page belonging to one block.
     pub fn remove_block(&self, block: &BlockId) -> Vec<MemoryPageKey> {
         let mut inner = self.inner.lock().unwrap();

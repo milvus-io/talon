@@ -121,6 +121,11 @@ pub struct WorkerConfig {
     pub l1_capacity_bytes: u64,
     /// Fixed L1 DRAM page size in bytes.
     pub l1_page_size_bytes: u64,
+    /// L2 page size in bytes. Zero (default) keeps whole-block L2: a miss
+    /// materializes the entire block as one file. Non-zero enables *paged* L2,
+    /// where a miss fetches and stores only the pages a read touches — far less
+    /// backend traffic and disk for point-query workloads.
+    pub l2_page_size_bytes: u64,
     /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
     /// per-backend endpoint/credential fields below apply to the selected one.
     pub backend: Option<String>,
@@ -248,6 +253,7 @@ impl Default for WorkerConfig {
             capacity_bytes: 64 << 30,
             l1_capacity_bytes: 0,
             l1_page_size_bytes: 256 << 10,
+            l2_page_size_bytes: 0,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -306,6 +312,8 @@ pub struct WorkerConfigPatch {
     pub l1_capacity_bytes: Option<u64>,
     /// Override for [`WorkerConfig::l1_page_size_bytes`].
     pub l1_page_size_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::l2_page_size_bytes`].
+    pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::backend`].
     pub backend: Option<String>,
     /// Override for [`WorkerConfig::azure_account`].
@@ -360,6 +368,7 @@ impl Patch for WorkerConfigPatch {
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
             l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
             l1_page_size_bytes: self.l1_page_size_bytes.or(base.l1_page_size_bytes),
+            l2_page_size_bytes: self.l2_page_size_bytes.or(base.l2_page_size_bytes),
             backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
@@ -536,6 +545,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: false,
         secret: false,
         help: "Fixed L1 DRAM page size in bytes.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_L2_PAGE_SIZE_BYTES",
+        key: "l2_page_size_bytes",
+        default: Some("0"),
+        cli: false,
+        secret: false,
+        help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
     ConfigVar {
         env: "TALON_WORKER_BACKEND",
@@ -726,6 +743,7 @@ pub(crate) mod worker_env {
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
     pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
+    pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const BACKEND: &str = "TALON_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
@@ -828,6 +846,9 @@ impl WorkerConfigPatch {
             l1_page_size_bytes: get(worker_env::L1_PAGE_SIZE_BYTES)
                 .map(|v| parse_u64(v, worker_env::L1_PAGE_SIZE_BYTES))
                 .transpose()?,
+            l2_page_size_bytes: get(worker_env::L2_PAGE_SIZE_BYTES)
+                .map(|v| parse_u64(v, worker_env::L2_PAGE_SIZE_BYTES))
+                .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
             backend: get(worker_env::BACKEND),
@@ -914,6 +935,7 @@ impl WorkerConfig {
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
             l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
             l1_page_size_bytes: merged.l1_page_size_bytes.unwrap_or(d.l1_page_size_bytes),
+            l2_page_size_bytes: merged.l2_page_size_bytes.unwrap_or(d.l2_page_size_bytes),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
             backend: merged.backend.or(d.backend),
@@ -1066,6 +1088,30 @@ impl WorkerConfig {
                 return Err(Error::Other(format!(
                     "block_size ({}) must be divisible by l1_page_size_bytes ({})",
                     self.block_size, self.l1_page_size_bytes
+                )));
+            }
+        }
+        if self.l2_page_size_bytes > 0 {
+            if self.l2_page_size_bytes > self.block_size as u64 {
+                return Err(Error::Other(format!(
+                    "l2_page_size_bytes ({}) must be <= block_size ({})",
+                    self.l2_page_size_bytes, self.block_size
+                )));
+            }
+            if u64::from(self.block_size) % self.l2_page_size_bytes != 0 {
+                return Err(Error::Other(format!(
+                    "block_size ({}) must be divisible by l2_page_size_bytes ({})",
+                    self.block_size, self.l2_page_size_bytes
+                )));
+            }
+            // L1 sits above L2 and is filled one L2 page at a time. Differing
+            // page sizes would make an L1 admission span several L2 pages, so a
+            // single-page L2 hit could never fill an L1 entry.
+            if self.l1_capacity_bytes > 0 && self.l1_page_size_bytes != self.l2_page_size_bytes {
+                return Err(Error::Other(format!(
+                    "l1_page_size_bytes ({}) must equal l2_page_size_bytes ({}) when both \
+                     tiers are enabled",
+                    self.l1_page_size_bytes, self.l2_page_size_bytes
                 )));
             }
         }
@@ -1643,6 +1689,58 @@ mod tests {
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("must be divisible"));
+    }
+
+    #[test]
+    fn paged_l2_page_size_is_validated_against_block_and_l1() {
+        // A page larger than a block cannot be addressed.
+        let cli = WorkerConfigPatch {
+            block_size: Some(1024),
+            capacity_bytes: Some(1024),
+            l2_page_size_bytes: Some(2048),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("l2_page_size_bytes"));
+
+        // A block must divide evenly into pages.
+        let cli = WorkerConfigPatch {
+            block_size: Some(1024),
+            capacity_bytes: Some(1024),
+            l2_page_size_bytes: Some(300),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("must be divisible"));
+
+        // With both tiers on, the page sizes must agree.
+        let cli = WorkerConfigPatch {
+            block_size: Some(1024),
+            capacity_bytes: Some(1024),
+            l1_capacity_bytes: Some(4096),
+            l1_page_size_bytes: Some(512),
+            l2_page_size_bytes: Some(256),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("must equal l2_page_size_bytes"));
+
+        // Matching page sizes across both tiers is accepted.
+        let cli = WorkerConfigPatch {
+            block_size: Some(1024),
+            capacity_bytes: Some(1024),
+            l1_capacity_bytes: Some(4096),
+            l1_page_size_bytes: Some(256),
+            l2_page_size_bytes: Some(256),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.l2_page_size_bytes, 256);
+
+        // Zero (the default) keeps whole-block L2 and imposes no constraints.
+        let cfg = WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+            .unwrap();
+        assert_eq!(cfg.l2_page_size_bytes, 0);
     }
 
     #[test]

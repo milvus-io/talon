@@ -386,6 +386,14 @@ Fixed L1 DRAM page size in bytes.
 - **Default:** `262144`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `l2_page_size_bytes`
+
+L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
+
+- **Environment variable:** `TALON_WORKER_L2_PAGE_SIZE_BYTES`
+- **Default:** `0`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `backend`
 
 Object-store backend: azure (default), s3, or gcs.

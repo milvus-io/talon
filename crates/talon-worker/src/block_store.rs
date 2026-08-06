@@ -14,7 +14,9 @@
 //! unbounded.
 //!
 //! Paging is not handled here — [`get_page`](WholeBlockStore::get_page) returns
-//! [`Error::NotFound`]; the per-page store lands separately (see #15).
+//! [`Error::NotFound`]. Per-page caching lives in
+//! [`PagedBlockStore`](crate::PagedBlockStore), which the worker uses instead of
+//! this store when `l2_page_size_bytes` is set.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -187,7 +189,8 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_page(&self, id: &BlockId, _page: PageIndex) -> Result<BlockHandle> {
-        // Whole-block store has no per-page granularity; paged store is #15.
+        // Whole-block store has no per-page granularity; a paged worker uses
+        // PagedBlockStore for page reads instead.
         Err(Error::NotFound(id.to_string()))
     }
 
