@@ -513,7 +513,11 @@ impl Coordinator {
                     }
                 }
             }
-            lookup @ ControlMessage::PlacementLookup { .. } => {
+            // Both rings arrive here. The message variant selects which one —
+            // block or async — and `PlacementService::handle` maps it; they
+            // share this arm because they share the readiness rule.
+            lookup @ (ControlMessage::PlacementLookup { .. }
+            | ControlMessage::AsyncPlacementLookup { .. }) => {
                 // Fail closed: without a fresh authoritative snapshot we must not
                 // answer placement from possibly-stale local membership (#73).
                 if !self.observability.is_ready() {
@@ -2017,6 +2021,94 @@ mod tests {
             coord_a.service.membership().epoch(),
             coord_b.service.membership().epoch()
         );
+    }
+
+    /// The serve loop must route *both* lookup variants.
+    ///
+    /// `PlacementService::handle` maps them, but the binary matches on the
+    /// message before calling it, so an arm that lists only `PlacementLookup`
+    /// answers the async ring with "unexpected control message" and the whole
+    /// split is dead in production while every unit test still passes.
+    #[tokio::test]
+    async fn the_serve_loop_answers_both_placement_rings() {
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store), "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(Arc::clone(&obs), Duration::from_secs(30));
+
+        let mut block = worker_status("cluster-a", "blk-1", "inc-1", "127.0.0.1:7001");
+        coord
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(block.clone()),
+            })
+            .await;
+        block.node = NodeInfo {
+            id: NodeId::new("ext-1"),
+            address: "127.0.0.1:7101".into(),
+            role: NodeRole::AsyncWorker,
+        };
+        block.incarnation_id = "inc-2".into();
+        coord
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(block),
+            })
+            .await;
+
+        match coord
+            .dispatch(ControlMessage::PlacementLookup {
+                block: sample_block(),
+                k: 1,
+            })
+            .await
+        {
+            ControlMessage::PlacementResponse { owners, .. } => {
+                assert_eq!(owners, vec![NodeId::new("blk-1")]);
+            }
+            other => panic!("block ring: expected PlacementResponse, got {other:?}"),
+        }
+
+        match coord
+            .dispatch(ControlMessage::AsyncPlacementLookup {
+                block: sample_block(),
+                k: 1,
+            })
+            .await
+        {
+            ControlMessage::PlacementResponse { owners, .. } => {
+                assert_eq!(owners, vec![NodeId::new("ext-1")]);
+            }
+            other => panic!("async ring: expected PlacementResponse, got {other:?}"),
+        }
+    }
+
+    /// Both rings fail closed on the same condition. A ring that kept answering
+    /// from stale local membership during a state-store outage would hand out
+    /// owners the cluster no longer has (#73).
+    #[tokio::test]
+    async fn the_async_ring_fails_closed_with_the_block_ring() {
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store) as Arc<dyn ClusterStateStore>, "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(Arc::clone(&obs), Duration::from_secs(30));
+        let mut status = worker_status("cluster-a", "ext-1", "inc-1", "127.0.0.1:7101");
+        status.node.role = NodeRole::AsyncWorker;
+        coord
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(status),
+            })
+            .await;
+
+        store.set_available(false);
+        let _ = obs.reconcile_membership(coord.service.membership()).await;
+        assert!(!obs.is_ready());
+
+        let reply = coord
+            .dispatch(ControlMessage::AsyncPlacementLookup {
+                block: sample_block(),
+                k: 1,
+            })
+            .await;
+        assert!(matches!(reply, ControlMessage::Ack { ok: false, .. }));
     }
 
     #[tokio::test]
