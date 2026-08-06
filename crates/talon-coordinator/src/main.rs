@@ -1,5 +1,6 @@
 //! Talon coordinator control and administration servers.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -10,10 +11,11 @@ use talon_coordinator::{
     Membership, MemoryStateStore, PlacementService, RendezvousPlacement, StateBackend,
     WriteDisposition,
 };
-use talon_core::{NodeInfo, NodeRole, WorkloadIdentity, WorkloadRole};
-use talon_metadata::ClusterCapabilities;
-#[cfg(feature = "etcd")]
-use talon_metadata::MetadataStore as _;
+use talon_core::{
+    NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace, WorkloadIdentity,
+    WorkloadRole,
+};
+use talon_metadata::{ClusterCapabilities, MappingRevision, MetadataStore, NamespaceId};
 use talon_transport::control_tls::ControlTlsChannel;
 use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -25,6 +27,7 @@ use tokio::net::{TcpListener, TcpStream};
 const MAX_CONTROL_CONNECTIONS: usize = 1024;
 
 const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
+const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Bound on establishing a proxied worker connection (#318). Keep this short:
 /// trying the next worker beats waiting on an unreachable one.
@@ -594,7 +597,7 @@ async fn main() -> anyhow::Result<()> {
         store,
     )?
     .with_capabilities(capabilities);
-    if let Some(metadata_store) = metadata_store {
+    if let Some(metadata_store) = metadata_store.clone() {
         observability = observability.with_metadata_store(metadata_store);
     }
     let observability = Arc::new(observability);
@@ -661,6 +664,17 @@ async fn main() -> anyhow::Result<()> {
         )?;
         let listener = TcpListener::bind(control_listen).await?;
         tracing::info!(listen = %control_listen, "coordinator serving worker mTLS control plane");
+        if let (Some(metadata), Some(policy)) =
+            (metadata_store.clone(), config.namespace_policy.clone())
+        {
+            spawn_revision_propagation(
+                Arc::clone(&observability),
+                metadata,
+                channel.clone(),
+                policy,
+                Duration::from_millis(config.state.heartbeat_interval_ms),
+            );
+        }
         let state = Arc::clone(&state);
         tokio::spawn(async move {
             if let Err(error) = serve_worker_control(listener, channel, state).await {
@@ -831,6 +845,229 @@ fn spawn_self_heartbeat(
             }
         }
     })
+}
+
+fn spawn_revision_propagation(
+    observability: Arc<CoordinatorObservability>,
+    metadata: Arc<dyn MetadataStore>,
+    channel: ControlTlsChannel,
+    policy: NamespacePolicy,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) =
+                propagate_mapping_revisions(&observability, metadata.as_ref(), &channel, &policy)
+                    .await
+            {
+                tracing::warn!(%error, "mapping revision propagation pass failed closed");
+            }
+        }
+    })
+}
+
+async fn propagate_mapping_revisions(
+    observability: &CoordinatorObservability,
+    metadata: &dyn MetadataStore,
+    channel: &ControlTlsChannel,
+    policy: &NamespacePolicy,
+) -> anyhow::Result<()> {
+    let snapshot = observability.snapshot_for_api().await?;
+    let mut revisions = HashMap::<ObjectNamespace, MappingRevision>::new();
+    let mut unavailable = HashSet::<ObjectNamespace>::new();
+
+    for target in revision_targets(&snapshot, policy) {
+        let status = &target.worker;
+        let worker_id = status.node.id.0.as_str();
+        let address = target.address.as_str();
+        let namespace = &target.namespace;
+        if unavailable.contains(namespace) {
+            continue;
+        }
+        let revision = if let Some(revision) = revisions.get(namespace) {
+            *revision
+        } else {
+            let namespace_id = NamespaceId::new(namespace.to_string())?;
+            let revision = match metadata.mapping_revision(&namespace_id).await {
+                Ok(revision) => revision,
+                Err(error) => {
+                    tracing::warn!(
+                        namespace = %namespace,
+                        %error,
+                        "mapping revision lookup failed closed"
+                    );
+                    unavailable.insert(namespace.clone());
+                    continue;
+                }
+            };
+            revisions.insert(namespace.clone(), revision);
+            revision
+        };
+        let update = RevisionUpdate {
+            cluster_id: observability.cluster_id(),
+            coordinator_id: observability.node_id(),
+            coordinator_incarnation: observability.incarnation_id(),
+            namespace,
+            revision,
+        };
+        let result = tokio::time::timeout(
+            CONTROL_OPERATION_TIMEOUT,
+            push_mapping_revision(channel, address, status, update),
+        )
+        .await;
+        match result {
+            Ok(Ok(ack_revision)) => tracing::debug!(
+                worker_id,
+                namespace = %namespace,
+                revision = ack_revision.get(),
+                "worker acknowledged mapping revision"
+            ),
+            Ok(Err(error)) => tracing::warn!(
+                worker_id,
+                namespace = %namespace,
+                %error,
+                "worker mapping revision update rejected"
+            ),
+            Err(_) => tracing::warn!(
+                worker_id,
+                namespace = %namespace,
+                "worker mapping revision update timed out"
+            ),
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct RevisionTarget {
+    worker: talon_core::NodeStatus,
+    address: String,
+    namespace: ObjectNamespace,
+}
+
+fn revision_targets(
+    snapshot: &talon_coordinator::ClusterSnapshot,
+    policy: &NamespacePolicy,
+) -> Vec<RevisionTarget> {
+    snapshot
+        .nodes
+        .iter()
+        .filter(|status| {
+            status.node.role == NodeRole::Worker
+                && status.health == NodeHealth::Healthy
+                && status.ready
+        })
+        .flat_map(|status| {
+            let worker_id = status.node.id.0.as_str();
+            let address = policy.control_address(worker_id).map(str::to_owned);
+            policy
+                .grants(worker_id)
+                .iter()
+                .filter_map(move |namespace| {
+                    address.as_ref().map(|address| RevisionTarget {
+                        worker: status.clone(),
+                        address: address.clone(),
+                        namespace: namespace.clone(),
+                    })
+                })
+        })
+        .collect()
+}
+
+struct RevisionUpdate<'a> {
+    cluster_id: &'a str,
+    coordinator_id: &'a str,
+    coordinator_incarnation: &'a str,
+    namespace: &'a ObjectNamespace,
+    revision: MappingRevision,
+}
+
+async fn push_mapping_revision(
+    channel: &ControlTlsChannel,
+    address: &str,
+    worker: &talon_core::NodeStatus,
+    update: RevisionUpdate<'_>,
+) -> anyhow::Result<MappingRevision> {
+    let mut authenticated = channel.connect(address).await?;
+    if authenticated.identity.cluster_id() != update.cluster_id
+        || authenticated.identity.node_id() != worker.node.id.0
+    {
+        anyhow::bail!("connected worker identity does not match authoritative membership");
+    }
+    let message = ControlMessage::MappingRevisionUpdate {
+        cluster_id: update.cluster_id.to_owned(),
+        namespace: update.namespace.to_string(),
+        revision: update.revision.get(),
+        coordinator_id: update.coordinator_id.to_owned(),
+        coordinator_incarnation: update.coordinator_incarnation.to_owned(),
+    };
+    authenticated
+        .stream
+        .write_all(&codec::encode(0, &message)?)
+        .await?;
+    authenticated.stream.flush().await?;
+    let reply = read_control_reply(&mut authenticated.stream).await?;
+    validate_revision_ack(
+        reply,
+        &authenticated.identity,
+        worker,
+        update.cluster_id,
+        update.namespace,
+        update.revision,
+    )
+}
+
+async fn read_control_reply<S>(stream: &mut S) -> anyhow::Result<ControlMessage>
+where
+    S: AsyncRead + Unpin,
+{
+    let (header, payload) = talon_transport::read_frame(stream, CONTROL_OPERATION_TIMEOUT)
+        .await
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(&payload);
+    Ok(codec::decode(&full)?.1)
+}
+
+fn validate_revision_ack(
+    reply: ControlMessage,
+    peer: &WorkloadIdentity,
+    worker: &talon_core::NodeStatus,
+    cluster_id: &str,
+    namespace: &ObjectNamespace,
+    requested: MappingRevision,
+) -> anyhow::Result<MappingRevision> {
+    let ControlMessage::MappingRevisionAck {
+        cluster_id: ack_cluster,
+        namespace: ack_namespace,
+        revision,
+        worker_id,
+        worker_incarnation,
+    } = reply
+    else {
+        anyhow::bail!("worker returned a non-revision acknowledgement");
+    };
+    if ack_cluster != cluster_id || peer.cluster_id() != cluster_id {
+        anyhow::bail!("revision acknowledgement cluster mismatch");
+    }
+    if ack_namespace != namespace.to_string() {
+        anyhow::bail!("revision acknowledgement namespace mismatch");
+    }
+    if worker_id != worker.node.id.0 || worker_id != peer.node_id() {
+        anyhow::bail!("revision acknowledgement worker identity mismatch");
+    }
+    if worker_incarnation != worker.incarnation_id {
+        anyhow::bail!("revision acknowledgement came from a stale worker incarnation");
+    }
+    let revision = MappingRevision::new(revision);
+    if revision < requested {
+        anyhow::bail!("worker acknowledged a revision below the requested fence");
+    }
+    Ok(revision)
 }
 
 #[derive(Clone)]
@@ -1037,6 +1274,171 @@ mod tests {
 
     fn worker_identity(id: &str) -> WorkloadIdentity {
         WorkloadIdentity::new("cluster.example", "cluster-a", WorkloadRole::Worker, id).unwrap()
+    }
+
+    fn revision_policy() -> NamespacePolicy {
+        NamespacePolicy::from_toml(
+            "version = 1\n\
+             [[workers]]\n\
+             node_id = \"worker-1\"\n\
+             control_address = \"worker-1:7002\"\n\
+             grants = [\"s3/data/models\"]\n\
+             [[workers]]\n\
+             node_id = \"worker-no-address\"\n\
+             grants = [\"s3/data/models\"]\n",
+        )
+        .unwrap()
+    }
+
+    fn revision_ack(
+        cluster_id: &str,
+        namespace: &str,
+        revision: u64,
+        worker_id: &str,
+        incarnation: &str,
+    ) -> ControlMessage {
+        ControlMessage::MappingRevisionAck {
+            cluster_id: cluster_id.into(),
+            namespace: namespace.into(),
+            revision,
+            worker_id: worker_id.into(),
+            worker_incarnation: incarnation.into(),
+        }
+    }
+
+    #[test]
+    fn revision_ack_must_match_membership_and_requested_fence() {
+        let worker = worker_status(
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation-1",
+            "127.0.0.1:7001",
+        );
+        let namespace = "s3/data/models".parse().unwrap();
+        let requested = MappingRevision::new(7);
+        let valid = || {
+            revision_ack(
+                "cluster-a",
+                "s3/data/models",
+                7,
+                "worker-1",
+                "worker-incarnation-1",
+            )
+        };
+
+        assert_eq!(
+            validate_revision_ack(
+                valid(),
+                &worker_identity("worker-1"),
+                &worker,
+                "cluster-a",
+                &namespace,
+                requested,
+            )
+            .unwrap(),
+            requested
+        );
+        assert!(validate_revision_ack(
+            revision_ack(
+                "cluster-a",
+                "s3/data/models",
+                7,
+                "worker-1",
+                "stale-incarnation",
+            ),
+            &worker_identity("worker-1"),
+            &worker,
+            "cluster-a",
+            &namespace,
+            requested,
+        )
+        .is_err());
+        assert!(validate_revision_ack(
+            revision_ack(
+                "cluster-a",
+                "s3/other",
+                7,
+                "worker-1",
+                "worker-incarnation-1",
+            ),
+            &worker_identity("worker-1"),
+            &worker,
+            "cluster-a",
+            &namespace,
+            requested,
+        )
+        .is_err());
+        assert!(validate_revision_ack(
+            valid(),
+            &worker_identity("worker-2"),
+            &worker,
+            "cluster-a",
+            &namespace,
+            requested,
+        )
+        .is_err());
+        assert!(validate_revision_ack(
+            revision_ack(
+                "cluster-a",
+                "s3/data/models",
+                6,
+                "worker-1",
+                "worker-incarnation-1",
+            ),
+            &worker_identity("worker-1"),
+            &worker,
+            "cluster-a",
+            &namespace,
+            requested,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn revision_targets_require_healthy_ready_workers_and_control_addresses() {
+        let mut unhealthy = worker_status(
+            "cluster-a",
+            "worker-1",
+            "unhealthy-incarnation",
+            "127.0.0.1:7001",
+        );
+        unhealthy.health = NodeHealth::Unhealthy;
+        let mut unready = worker_status(
+            "cluster-a",
+            "worker-1",
+            "unready-incarnation",
+            "127.0.0.1:7001",
+        );
+        unready.ready = false;
+        let no_address = worker_status(
+            "cluster-a",
+            "worker-no-address",
+            "no-address-incarnation",
+            "127.0.0.1:7001",
+        );
+        let unknown = worker_status(
+            "cluster-a",
+            "worker-unknown",
+            "unknown-incarnation",
+            "127.0.0.1:7001",
+        );
+        let healthy = worker_status(
+            "cluster-a",
+            "worker-1",
+            "healthy-incarnation",
+            "127.0.0.1:7001",
+        );
+        let snapshot = talon_coordinator::ClusterSnapshot {
+            nodes: vec![unhealthy, unready, no_address, unknown, healthy],
+            revision: talon_coordinator::StoreRevision::new("1").unwrap(),
+            observed_at_unix_ms: 1,
+        };
+
+        let targets = revision_targets(&snapshot, &revision_policy());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].worker.incarnation_id, "healthy-incarnation");
+        assert_eq!(targets[0].address, "worker-1:7002");
+        assert_eq!(targets[0].namespace.to_string(), "s3/data/models");
     }
 
     #[test]

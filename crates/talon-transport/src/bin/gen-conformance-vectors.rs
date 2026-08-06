@@ -154,6 +154,30 @@ fn vectors() -> Vec<Vector> {
                 ],
             },
         ),
+        control(
+            "control.mapping_revision_update",
+            "Coordinator to worker: refresh the local namespace mapping fence",
+            5,
+            &ControlMessage::MappingRevisionUpdate {
+                cluster_id: "cluster-a".into(),
+                namespace: "s3/datasets/training".into(),
+                revision: 7,
+                coordinator_id: "coordinator-a".into(),
+                coordinator_incarnation: "coordinator-incarnation-1".into(),
+            },
+        ),
+        control(
+            "control.mapping_revision_ack",
+            "Worker to coordinator: acknowledge the actual held mapping revision",
+            5,
+            &ControlMessage::MappingRevisionAck {
+                cluster_id: "cluster-a".into(),
+                namespace: "s3/datasets/training".into(),
+                revision: 7,
+                worker_id: "worker-a".into(),
+                worker_incarnation: "worker-incarnation-1".into(),
+            },
+        ),
         // --- Data plane -----------------------------------------------------
         Vector {
             name: "data.range_request",

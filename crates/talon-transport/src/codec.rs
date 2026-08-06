@@ -21,7 +21,7 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 /// Bumped when [`ControlMessage`] changes in an incompatible way. Carried in
 /// the envelope so a peer can reject a mismatched schema instead of
 /// misinterpreting bytes.
-pub const CONTROL_SCHEMA_VERSION: u16 = 3;
+pub const CONTROL_SCHEMA_VERSION: u16 = 4;
 
 /// Oldest control schema this build can decode.
 pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
@@ -161,6 +161,32 @@ pub enum ControlMessage {
         /// Revision the worker currently holds.
         current: u64,
     },
+    /// Coordinator → worker: refresh a namespace's authoritative mapping revision.
+    MappingRevisionUpdate {
+        /// Logical cluster containing both workloads.
+        cluster_id: String,
+        /// Canonical object-store namespace.
+        namespace: String,
+        /// Authoritative TMS mapping revision.
+        revision: u64,
+        /// Stable coordinator identity bound to its URI SAN.
+        coordinator_id: String,
+        /// Current coordinator process incarnation.
+        coordinator_incarnation: String,
+    },
+    /// Worker → coordinator: actual locally-held revision after an update.
+    MappingRevisionAck {
+        /// Logical cluster containing both workloads.
+        cluster_id: String,
+        /// Canonical object-store namespace.
+        namespace: String,
+        /// Worker's actual held revision, which may exceed the update.
+        revision: u64,
+        /// Stable worker identity bound to its URI SAN.
+        worker_id: String,
+        /// Current worker process incarnation.
+        worker_incarnation: String,
+    },
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -186,6 +212,7 @@ impl ControlMessage {
             Self::MappingRevisionQuery { .. }
             | Self::MappingRevisionValue { .. }
             | Self::StaleMapping { .. } => 3,
+            Self::MappingRevisionUpdate { .. } | Self::MappingRevisionAck { .. } => 4,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }
@@ -450,6 +477,20 @@ mod tests {
                     },
                 ],
             },
+            ControlMessage::MappingRevisionUpdate {
+                cluster_id: "cluster-a".into(),
+                namespace: "s3/bkt/models".into(),
+                revision: 7,
+                coordinator_id: "coordinator-1".into(),
+                coordinator_incarnation: "coord-inc-1".into(),
+            },
+            ControlMessage::MappingRevisionAck {
+                cluster_id: "cluster-a".into(),
+                namespace: "s3/bkt/models".into(),
+                revision: 7,
+                worker_id: "worker-1".into(),
+                worker_incarnation: "worker-inc-1".into(),
+            },
         ]
     }
 
@@ -705,6 +746,41 @@ mod tests {
             encode_for_schema(1, &stale, 2),
             Err(CodecError::MessageRequiresSchema { .. })
         ));
+    }
+
+    #[test]
+    fn revision_propagation_messages_require_schema_four() {
+        let update = ControlMessage::MappingRevisionUpdate {
+            cluster_id: "cluster-a".into(),
+            namespace: "s3/bucket/models".into(),
+            revision: 4,
+            coordinator_id: "coordinator-1".into(),
+            coordinator_incarnation: "coordinator-incarnation-1".into(),
+        };
+        let ack = ControlMessage::MappingRevisionAck {
+            cluster_id: "cluster-a".into(),
+            namespace: "s3/bucket/models".into(),
+            revision: 4,
+            worker_id: "worker-1".into(),
+            worker_incarnation: "worker-incarnation-1".into(),
+        };
+
+        for message in [update, ack] {
+            assert_eq!(message.minimum_schema(), 4);
+            let encoded = encode(1, &message).unwrap();
+            assert_eq!(peek_schema(&encoded[HEADER_LEN..]).unwrap(), 4);
+            assert!(matches!(
+                decode_with_max_schema(&encoded, 3),
+                Err(CodecError::UnsupportedSchema { got: 4, ours: 3 })
+            ));
+            assert!(matches!(
+                encode_for_schema(1, &message, 3),
+                Err(CodecError::MessageRequiresSchema {
+                    required: 4,
+                    selected: 3
+                })
+            ));
+        }
     }
 
     #[test]
