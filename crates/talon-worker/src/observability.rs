@@ -664,6 +664,11 @@ impl WorkerObservability {
         self.readiness.is_ready()
     }
 
+    /// Current process incarnation bound into control acknowledgements.
+    pub fn incarnation_id(&self) -> &str {
+        &self.incarnation_id
+    }
+
     /// Build a fresh bounded status snapshot.
     pub fn status(&self) -> NodeStatus {
         let ready = self.readiness.is_ready();

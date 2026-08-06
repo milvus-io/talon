@@ -9,6 +9,7 @@ version = 1
 
 [[workers]]
 node_id = "worker-a"
+control_address = "worker-a.talon.svc:7002"
 grants = [
   "s3/datasets/training",
   "gcs/checkpoints",
@@ -16,6 +17,7 @@ grants = [
 
 [[workers]]
 node_id = "worker-b"
+control_address = "worker-b.talon.svc:7002"
 grants = ["az/models"]
 ```
 
@@ -28,3 +30,8 @@ The `node_id` must match the worker's stable configured identity. A missing
 policy, an unknown worker, an empty grant list, or a namespace outside every
 grant denies authorization. A configured file that is missing or malformed
 prevents the process from starting.
+
+`control_address` is the worker's privileged mTLS listener used by coordinators
+to propagate mapping revisions. It is optional for compatibility, but a worker
+without it receives no revision updates and therefore cannot safely activate
+revision-fenced namespace operations.

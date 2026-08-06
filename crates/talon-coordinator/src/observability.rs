@@ -563,6 +563,16 @@ impl CoordinatorObservability {
         &self.cluster_id
     }
 
+    /// Current process incarnation bound into privileged control updates.
+    pub fn incarnation_id(&self) -> &str {
+        &self.incarnation_id
+    }
+
+    /// Stable coordinator node identity.
+    pub fn node_id(&self) -> &str {
+        &self.node.id.0
+    }
+
     /// Whether authoritative shared state is currently ready.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire) && !self.shutting_down.load(Ordering::Acquire)

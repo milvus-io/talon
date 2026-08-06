@@ -32,11 +32,13 @@ use talon_backend::{
 };
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
-    Backend, BackendStore, NodeId, NodeInfo, NodeRole, WorkerConfig, WorkerConfigPatch,
-    WorkloadIdentity, WorkloadRole,
+    Backend, BackendStore, NamespacePolicy, NodeId, NodeInfo, NodeRole, ObjectNamespace,
+    WorkerConfig, WorkerConfigPatch, WorkloadIdentity, WorkloadRole,
 };
+use talon_metadata::MappingRevision;
 use talon_transport::control_tls::ControlTlsChannel;
 use talon_transport::{codec, ControlMessage};
+use talon_worker::mapping_guard::MappingGuard;
 use talon_worker::tokio_conn::{handle_conn, read_control};
 use talon_worker::uring_conn;
 use talon_worker::{
@@ -479,8 +481,25 @@ async fn main() -> anyhow::Result<()> {
         let listener = TcpListener::bind(control_listen).await?;
         tracing::info!(listen = %control_listen, "worker serving coordinator mTLS control plane");
         let channel = channel.clone();
+        let cluster_id = cfg.cluster_id.clone();
+        let worker_id = node.id.0.clone();
+        let worker_incarnation = observability.incarnation_id().to_owned();
+        let policy = cfg.namespace_policy.clone();
+        let guard = Arc::new(MappingGuard::new(Duration::from_millis(
+            cfg.heartbeat_interval_ms.saturating_mul(3),
+        )));
         tokio::spawn(async move {
-            if let Err(error) = serve_control(listener, channel).await {
+            if let Err(error) = serve_control(
+                listener,
+                channel,
+                cluster_id,
+                worker_id,
+                worker_incarnation,
+                policy,
+                guard,
+            )
+            .await
+            {
                 tracing::error!(%error, "worker coordinator mTLS control plane stopped");
             }
         });
@@ -701,19 +720,41 @@ where
     Ok(())
 }
 
-async fn serve_control(listener: TcpListener, channel: ControlTlsChannel) -> anyhow::Result<()> {
+async fn serve_control(
+    listener: TcpListener,
+    channel: ControlTlsChannel,
+    cluster_id: String,
+    worker_id: String,
+    worker_incarnation: String,
+    policy: Option<NamespacePolicy>,
+    guard: Arc<MappingGuard>,
+) -> anyhow::Result<()> {
     loop {
         let (stream, peer) = listener.accept().await?;
         let channel = channel.clone();
+        let cluster_id = cluster_id.clone();
+        let worker_id = worker_id.clone();
+        let worker_incarnation = worker_incarnation.clone();
+        let policy = policy.clone();
+        let guard = Arc::clone(&guard);
         tokio::spawn(async move {
             let result = async {
                 let mut authenticated = channel.accept(stream).await?;
                 tracing::debug!(identity = %authenticated.identity, %peer, "accepted coordinator mTLS connection");
-                if read_control(&mut authenticated.stream).await?.is_some() {
-                    let reply = ControlMessage::Ack {
+                if let Some(message) = read_control(&mut authenticated.stream).await? {
+                    let reply = handle_revision_update(
+                        message,
+                        &authenticated.identity,
+                        &cluster_id,
+                        &worker_id,
+                        &worker_incarnation,
+                        policy.as_ref(),
+                        &guard,
+                    )
+                    .unwrap_or_else(|detail| ControlMessage::Ack {
                         ok: false,
-                        detail: Some("no coordinator-to-worker privileged messages are implemented".into()),
-                    };
+                        detail: Some(detail),
+                    });
                     authenticated
                         .stream
                         .write_all(&codec::encode(0, &reply)?)
@@ -728,6 +769,55 @@ async fn serve_control(listener: TcpListener, channel: ControlTlsChannel) -> any
             }
         });
     }
+}
+
+fn handle_revision_update(
+    message: ControlMessage,
+    peer: &WorkloadIdentity,
+    cluster_id: &str,
+    worker_id: &str,
+    worker_incarnation: &str,
+    policy: Option<&NamespacePolicy>,
+    guard: &MappingGuard,
+) -> Result<ControlMessage, String> {
+    let ControlMessage::MappingRevisionUpdate {
+        cluster_id: message_cluster,
+        namespace,
+        revision,
+        coordinator_id,
+        coordinator_incarnation,
+    } = message
+    else {
+        return Err("expected mapping revision update".into());
+    };
+    if message_cluster != cluster_id || peer.cluster_id() != cluster_id {
+        return Err("revision update cluster does not match authenticated session".into());
+    }
+    if coordinator_id != peer.node_id() {
+        return Err("revision update coordinator ID does not match authenticated peer".into());
+    }
+    if coordinator_incarnation.is_empty() {
+        return Err("revision update coordinator incarnation must not be empty".into());
+    }
+    let target = namespace
+        .parse::<ObjectNamespace>()
+        .map_err(|error| format!("invalid revision namespace: {error}"))?;
+    if !policy.is_some_and(|policy| policy.authorizes(worker_id, &target)) {
+        return Err("worker is not authorized for revision namespace".into());
+    }
+
+    guard.observe(&namespace, MappingRevision::new(revision));
+    let held = guard
+        .held(&namespace)
+        .unwrap_or(MappingRevision::INITIAL)
+        .get();
+    Ok(ControlMessage::MappingRevisionAck {
+        cluster_id: cluster_id.to_owned(),
+        namespace,
+        revision: held,
+        worker_id: worker_id.to_owned(),
+        worker_incarnation: worker_incarnation.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -747,6 +837,125 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    fn coordinator_identity(cluster_id: &str, node_id: &str) -> WorkloadIdentity {
+        WorkloadIdentity::new(
+            "cluster.example",
+            cluster_id,
+            WorkloadRole::Coordinator,
+            node_id,
+        )
+        .unwrap()
+    }
+
+    fn revision_policy() -> NamespacePolicy {
+        NamespacePolicy::from_toml(
+            "version = 1\n\
+             [[workers]]\n\
+             node_id = \"worker-1\"\n\
+             grants = [\"s3/data/models\"]\n",
+        )
+        .unwrap()
+    }
+
+    fn revision_update(cluster_id: &str, coordinator_id: &str, revision: u64) -> ControlMessage {
+        ControlMessage::MappingRevisionUpdate {
+            cluster_id: cluster_id.into(),
+            namespace: "s3/data/models".into(),
+            revision,
+            coordinator_id: coordinator_id.into(),
+            coordinator_incarnation: "coordinator-incarnation-1".into(),
+        }
+    }
+
+    #[test]
+    fn authorized_revision_update_returns_worker_ack() {
+        let guard = MappingGuard::new(Duration::from_secs(30));
+        let reply = handle_revision_update(
+            revision_update("cluster-a", "coordinator-1", 7),
+            &coordinator_identity("cluster-a", "coordinator-1"),
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation-1",
+            Some(&revision_policy()),
+            &guard,
+        )
+        .unwrap();
+
+        assert_eq!(
+            reply,
+            ControlMessage::MappingRevisionAck {
+                cluster_id: "cluster-a".into(),
+                namespace: "s3/data/models".into(),
+                revision: 7,
+                worker_id: "worker-1".into(),
+                worker_incarnation: "worker-incarnation-1".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn stale_revision_update_acks_the_higher_held_revision() {
+        let guard = MappingGuard::new(Duration::from_secs(30));
+        guard.observe("s3/data/models", MappingRevision::new(9));
+        let reply = handle_revision_update(
+            revision_update("cluster-a", "coordinator-1", 7),
+            &coordinator_identity("cluster-a", "coordinator-1"),
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation-1",
+            Some(&revision_policy()),
+            &guard,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            reply,
+            ControlMessage::MappingRevisionAck { revision: 9, .. }
+        ));
+        assert_eq!(guard.held("s3/data/models"), Some(MappingRevision::new(9)));
+    }
+
+    #[test]
+    fn revision_update_rejects_unauthorized_namespace_and_spoofed_identity() {
+        let policy = revision_policy();
+        let guard = MappingGuard::new(Duration::from_secs(30));
+        let peer = coordinator_identity("cluster-a", "coordinator-1");
+        let mut unauthorized = revision_update("cluster-a", "coordinator-1", 7);
+        if let ControlMessage::MappingRevisionUpdate { namespace, .. } = &mut unauthorized {
+            *namespace = "s3/private/models".into();
+        }
+        assert!(handle_revision_update(
+            unauthorized,
+            &peer,
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation-1",
+            Some(&policy),
+            &guard,
+        )
+        .is_err());
+        assert!(handle_revision_update(
+            revision_update("cluster-b", "coordinator-1", 7),
+            &peer,
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation-1",
+            Some(&policy),
+            &guard,
+        )
+        .is_err());
+        assert!(handle_revision_update(
+            revision_update("cluster-a", "coordinator-2", 7),
+            &peer,
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation-1",
+            Some(&policy),
+            &guard,
+        )
+        .is_err());
+    }
 
     struct MockBackend {
         _calls: AtomicUsize,

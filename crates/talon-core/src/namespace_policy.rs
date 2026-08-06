@@ -127,7 +127,7 @@ impl<'de> Deserialize<'de> for ObjectNamespace {
 /// Operator-owned namespace grants indexed by stable worker node ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespacePolicy {
-    workers: HashMap<String, Vec<ObjectNamespace>>,
+    workers: HashMap<String, WorkerPolicy>,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +143,14 @@ struct PolicyFile {
 struct WorkerGrants {
     node_id: String,
     #[serde(default)]
+    control_address: Option<String>,
+    #[serde(default)]
+    grants: Vec<ObjectNamespace>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WorkerPolicy {
+    control_address: Option<String>,
     grants: Vec<ObjectNamespace>,
 }
 
@@ -164,10 +172,21 @@ impl NamespacePolicy {
                     "namespace policy worker node_id must not be empty".into(),
                 ));
             }
-            if workers
-                .insert(worker.node_id.clone(), worker.grants)
-                .is_some()
+            if worker
+                .control_address
+                .as_ref()
+                .is_some_and(String::is_empty)
             {
+                return Err(Error::Other(format!(
+                    "namespace policy worker {:?} has an empty control_address",
+                    worker.node_id
+                )));
+            }
+            let policy = WorkerPolicy {
+                control_address: worker.control_address,
+                grants: worker.grants,
+            };
+            if workers.insert(worker.node_id.clone(), policy).is_some() {
                 return Err(Error::Other(format!(
                     "namespace policy contains duplicate worker node_id {:?}",
                     worker.node_id
@@ -192,7 +211,21 @@ impl NamespacePolicy {
     pub fn authorizes(&self, worker_id: &str, target: &ObjectNamespace) -> bool {
         self.workers
             .get(worker_id)
-            .is_some_and(|grants| grants.iter().any(|grant| grant.contains(target)))
+            .is_some_and(|worker| worker.grants.iter().any(|grant| grant.contains(target)))
+    }
+
+    /// Configured privileged control address for a worker, if any.
+    pub fn control_address(&self, worker_id: &str) -> Option<&str> {
+        self.workers
+            .get(worker_id)
+            .and_then(|worker| worker.control_address.as_deref())
+    }
+
+    /// Canonical namespaces configured for a worker.
+    pub fn grants(&self, worker_id: &str) -> &[ObjectNamespace] {
+        self.workers
+            .get(worker_id)
+            .map_or(&[], |worker| worker.grants.as_slice())
     }
 }
 
@@ -242,12 +275,15 @@ mod tests {
             "version = 1\n\
              [[workers]]\n\
              node_id = \"worker-a\"\n\
+             control_address = \"worker-a:7002\"\n\
              grants = [\"s3/data/models\", \"gcs/checkpoints\"]\n",
         )
         .unwrap();
         assert!(policy.authorizes("worker-a", &"s3/data/models/v1".parse().unwrap()));
         assert!(!policy.authorizes("worker-a", &"s3/data/private".parse().unwrap()));
         assert!(!policy.authorizes("worker-b", &"s3/data/models".parse().unwrap()));
+        assert_eq!(policy.control_address("worker-a"), Some("worker-a:7002"));
+        assert_eq!(policy.grants("worker-a").len(), 2);
     }
 
     #[test]
@@ -257,6 +293,17 @@ mod tests {
             "version = 1\n\
              [[workers]]\nnode_id = \"same\"\n\
              [[workers]]\nnode_id = \"same\"\n"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn policy_rejects_an_empty_control_address() {
+        assert!(NamespacePolicy::from_toml(
+            "version = 1\n\
+             [[workers]]\n\
+             node_id = \"worker-a\"\n\
+             control_address = \"\"\n"
         )
         .is_err());
     }

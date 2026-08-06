@@ -119,6 +119,18 @@ impl MappingGuard {
             .map(|entry| entry.revision)
     }
 
+    /// Revision held for `namespace`, including an expired entry.
+    ///
+    /// Used for acknowledgements so a stale update receives the worker's higher
+    /// actual revision without falsely refreshing the guard deadline.
+    pub fn held(&self, namespace: &str) -> Option<MappingRevision> {
+        self.namespaces
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(namespace)
+            .map(|entry| entry.revision)
+    }
+
     /// Whether the guard for `namespace` is fresh enough to serve from.
     pub fn is_current(&self, namespace: &str) -> bool {
         self.current(namespace).is_some()
