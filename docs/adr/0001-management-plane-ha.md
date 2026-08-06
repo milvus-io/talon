@@ -201,14 +201,15 @@ for this feature.
 ### 7. Clients compute immutable cache-block placement
 
 **Amended 2026-08-06.** Read-path clients fetch a bounded healthy-worker
-membership snapshot and run deterministic HRW locally. Coordinators retain
+membership snapshot and build a deterministic Maglev table locally. Coordinators retain
 `PlacementLookup` for rolling compatibility, but current clients do not put a
 coordinator on each block-placement cache miss.
 
-The cross-language score is SHA-256 over the domain
-`talon-cache-placement-v1\0`, the canonical length-delimited `BlockId` fields,
-and the stable worker ID. Scores sort as unsigned 32-byte big-endian values in
-descending order, with ascending worker ID as the collision tie-breaker.
+Workers sort by stable ID before table construction. SHA-256 with separate
+worker and block domains derives each worker's Maglev permutation and each
+block's table slot. The table is rebuilt only when membership identity changes;
+while membership is stable, primary lookup is one block hash and one array
+access rather than a worker-list scan.
 
 Clients cache the last successful membership. TTL expiry attempts a refresh;
 if the management plane is unavailable, an existing client continues using the
@@ -401,7 +402,8 @@ sequenceDiagram
     S-->>C: live node records + opaque revision
     C->>C: filter healthy and ready workers
     C-->>F: worker membership
-    F->>F: cache membership and run deterministic HRW per block
+    F->>F: build Maglev table when membership changes
+    F->>F: O(1) table lookup per block
 ```
 
 ### Coordinator failure

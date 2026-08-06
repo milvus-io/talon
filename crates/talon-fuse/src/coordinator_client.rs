@@ -32,7 +32,7 @@ use crate::pool::ConnectionPool;
 /// Placement answer for a block: ordered owners + the epoch they hold at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Placement {
-    /// Ordered replica node ids (highest HRW weight first). Empty if no nodes.
+    /// Ordered replica node ids (primary first). Empty if no nodes.
     pub owners: Vec<NodeId>,
     /// Placement epoch these owners were computed against.
     pub epoch: u64,
@@ -181,7 +181,7 @@ impl CoordinatorClient {
     /// Locate `block` and resolve the primary owner to a worker address.
     /// Combines [`placement_lookup`](Self::placement_lookup) with a
     /// [`membership`](Self::membership) resolution so a caller gets a directly
-    /// dialable `host:port` for the highest-weight owner. Returns `Ok(None)`
+    /// dialable `host:port` for the primary owner. Returns `Ok(None)`
     /// when there are no owners (empty cluster). Returns the resolved address
     /// plus the full ordered owner list and epoch so the caller can cache the
     /// placement and fall back to other replicas.

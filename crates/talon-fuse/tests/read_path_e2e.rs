@@ -22,7 +22,9 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use talon_core::{Backend, NodeId, NodeInfo, NodeRole, ObjectId, Version};
+use talon_core::{
+    Backend, BlockId, CachePlacementTable, NodeId, NodeInfo, NodeRole, ObjectId, Version,
+};
 use talon_fuse::{BlockReader, CoordinatorClient, FileView, PlacementCache};
 use talon_transport::frame::{FrameHeader, HEADER_LEN};
 use talon_transport::{
@@ -241,11 +243,35 @@ async fn multi_block_read_stitches_contiguous_bytes() {
 
 #[tokio::test]
 async fn falls_back_to_healthy_replica() {
-    // Primary w1 always fails; secondary w2 serves the bytes.
+    // Whichever stable ID Maglev selects as primary always fails; the other
+    // worker serves the bytes.
     let bad = Arc::new(WorkerCounters::default());
     let good = Arc::new(WorkerCounters::default());
-    let w1 = spawn_worker(Arc::clone(&bad), true).await;
-    let w2 = spawn_worker(Arc::clone(&good), false).await;
+    let primary = spawn_worker(Arc::clone(&bad), true).await;
+    let secondary = spawn_worker(Arc::clone(&good), false).await;
+    let candidates = vec![
+        NodeInfo {
+            id: NodeId::new("w1"),
+            address: String::new(),
+            role: NodeRole::Worker,
+        },
+        NodeInfo {
+            id: NodeId::new("w2"),
+            address: String::new(),
+            role: NodeRole::Worker,
+        },
+    ];
+    let block = BlockId::new(object(), 0, 1024, Version::new("v1"));
+    let first = CachePlacementTable::new(&candidates)
+        .primary(&block)
+        .unwrap()
+        .id
+        .clone();
+    let (w1, w2) = if first == NodeId::new("w1") {
+        (primary, secondary)
+    } else {
+        (secondary, primary)
+    };
     let counters = Arc::new(CoordinatorCounters::default());
     let coord = spawn_coordinator(
         vec![("w1".into(), w1), ("w2".into(), w2)],

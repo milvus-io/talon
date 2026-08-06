@@ -156,7 +156,7 @@ pub(crate) fn to_file_attr(attr: Attr, _request_uid: u32, _request_gid: u32) -> 
 ///
 /// **Placement is version-independent on the mount path in v1, by design.** The
 /// coordinator locates a block by hashing the [`BlockId`](talon_core::BlockId) the client sends
-/// (rendezvous/HRW), and the worker is the sole authority on *freshness*: it
+/// (Maglev), and the worker is the sole authority on *freshness*: it
 /// resolves each object's real ETag itself and refuses to serve stale bytes
 /// (issues #119, #163). The client never transmits a version to the worker —
 /// [`RangeRequest`](talon_transport::RangeRequest) carries only `object` +
@@ -191,7 +191,7 @@ pub struct TalonFuse {
     ///
     /// The mount path is version-independent by design (see
     /// [`CANONICAL_MOUNT_VERSION`]): this value only keys the client's placement
-    /// cache and feeds the HRW hash, never the bytes the worker returns. It is
+    /// cache and feeds the Maglev hash, never the bytes the worker returns. It is
     /// normally [`CANONICAL_MOUNT_VERSION`].
     version: talon_core::Version,
     /// Readahead tuning (sequential-run trigger + prefetch window). The window

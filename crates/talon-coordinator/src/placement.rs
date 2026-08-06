@@ -1,10 +1,8 @@
 //! Object placement strategy.
 //!
-//! Placement uses rendezvous (highest-random-weight, HRW) hashing so that the
-//! set of blocks that must move when a node joins or leaves is minimized. On
-//! top of the single-owner `locate`, [`Placement::locate_top_k`] returns an
-//! ordered replica list; RF stays 1 in v1, but the ordering reserves a stable
-//! replica sequence for a future RF=2.
+//! Current clients prebuild a deterministic Maglev table when membership
+//! changes, making per-block primary lookup O(1). This module retains the
+//! coordinator lookup adapter for older clients.
 
 use talon_core::{rank_cache_workers, BlockId, NodeId, NodeInfo};
 use xxhash_rust::xxh3::xxh3_64;
@@ -107,18 +105,15 @@ pub trait Placement {
     /// `k = 1`.
     fn locate(&self, block: &BlockId, nodes: &[NodeInfo]) -> Option<NodeId>;
 
-    /// Return up to `k` nodes for `block`, ordered by descending HRW weight.
+    /// Return up to `k` deterministic nodes for `block`, primary first.
     ///
-    /// The ordering is deterministic and stable under membership changes: the
-    /// relative order of any two surviving nodes never changes when a third
-    /// node is added or removed (the HRW property). `k = 1` yields the same
-    /// result as [`Placement::locate`].
+    /// `k = 1` yields the same result as [`Placement::locate`].
     fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId>;
 }
 
-/// Rendezvous (highest random weight) hashing placement.
+/// Compatibility adapter using the same deterministic Maglev mapping as clients.
 ///
-/// Minimizes reassignment when nodes join or leave the cluster.
+/// The historical type name is retained to avoid breaking coordinator callers.
 #[derive(Default)]
 pub struct RendezvousPlacement;
 
@@ -185,21 +180,18 @@ mod tests {
     }
 
     #[test]
-    fn top_k_stable_under_membership_change() {
-        // Removing a node never reorders the two surviving nodes (HRW property).
+    fn membership_change_never_returns_a_removed_worker() {
         let p = RendezvousPlacement;
         let full = nodes(&["a", "b", "c", "d", "e"]);
         for i in 0..100 {
             let blk = block(i);
             let full_rank = p.locate_top_k(&blk, &full, full.len());
-            // Drop the top-ranked node and re-rank.
             let dropped = &full_rank[0];
             let survivors: Vec<NodeInfo> =
                 full.iter().filter(|n| &n.id != dropped).cloned().collect();
             let sub_rank = p.locate_top_k(&blk, &survivors, survivors.len());
-            let expected: Vec<&NodeId> = full_rank.iter().skip(1).collect();
-            let got: Vec<&NodeId> = sub_rank.iter().collect();
-            assert_eq!(expected, got, "surviving order changed for block {i}");
+            assert!(!sub_rank.contains(dropped));
+            assert_eq!(sub_rank.len(), survivors.len());
         }
     }
 

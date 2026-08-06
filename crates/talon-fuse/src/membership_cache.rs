@@ -1,16 +1,16 @@
 //! Last-good worker membership used for client-side block placement.
 
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
-use talon_core::{cache_membership_epoch, NodeInfo};
+use talon_core::{cache_membership_epoch, CachePlacementTable, NodeInfo};
 
 use crate::lock::RwLockExt;
 
 /// One immutable membership view and its equality-only content token.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct MembershipSnapshot {
-    /// Healthy, ready workers advertised by the management plane.
-    pub nodes: Vec<NodeInfo>,
+    /// Prebuilt O(1) placement index for the advertised healthy workers.
+    pub placement: Arc<CachePlacementTable>,
     /// Content-derived token used to invalidate per-block placements.
     pub epoch: u64,
 }
@@ -53,14 +53,19 @@ impl MembershipCache {
 
     /// Store a successful refresh and return whether membership changed.
     pub fn replace(&self, nodes: Vec<NodeInfo>, now_ms: u64) -> (MembershipSnapshot, bool) {
-        let snapshot = MembershipSnapshot {
-            epoch: cache_membership_epoch(&nodes),
-            nodes,
-        };
+        let epoch = cache_membership_epoch(&nodes);
         let mut entry = self.entry.write_recover();
-        let changed = entry
-            .as_ref()
-            .is_some_and(|old| old.snapshot.epoch != snapshot.epoch);
+        if let Some(current) = entry.as_mut() {
+            if current.snapshot.epoch == epoch {
+                current.refreshed_ms = now_ms;
+                return (current.snapshot.clone(), false);
+            }
+        }
+        let snapshot = MembershipSnapshot {
+            epoch,
+            placement: Arc::new(CachePlacementTable::new(&nodes)),
+        };
+        let changed = entry.is_some();
         *entry = Some(Entry {
             snapshot: snapshot.clone(),
             refreshed_ms: now_ms,
@@ -88,14 +93,18 @@ mod tests {
         cache.replace(vec![worker("old:7001")], 10);
         assert!(cache.fresh(110).is_some());
         assert!(cache.fresh(111).is_none());
-        assert_eq!(cache.last_good().unwrap().nodes[0].address, "old:7001");
+        assert_eq!(
+            cache.last_good().unwrap().placement.workers()[0].address,
+            "old:7001"
+        );
     }
 
     #[test]
     fn address_change_advances_the_equality_token() {
         let cache = MembershipCache::new(100);
-        assert!(!cache.replace(vec![worker("old:7001")], 0).1);
-        assert!(!cache.replace(vec![worker("old:7001")], 1).1);
+        let first = cache.replace(vec![worker("old:7001")], 0).0;
+        let unchanged = cache.replace(vec![worker("old:7001")], 1).0;
+        assert!(Arc::ptr_eq(&first.placement, &unchanged.placement));
         assert!(cache.replace(vec![worker("new:7001")], 2).1);
     }
 }

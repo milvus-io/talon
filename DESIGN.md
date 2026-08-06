@@ -289,12 +289,11 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
 
 ## 2. Coordinator
 
-- **Placement:** clients cache healthy worker membership and run stable,
-  cross-language rendezvous (HRW) hashing locally, extended to **top-K** to
-  reserve a replica ordering for later. The coordinator retains the same
-  implementation for legacy lookup compatibility. Assumes stable worker IDs.
-  Consistent-hashing rings / virtual nodes are deferred until worker capacities
-  diverge enough to need weighting.
+- **Placement:** clients build a deterministic cross-language **Maglev table**
+  when healthy worker membership changes. Stable membership makes primary block
+  lookup O(1), independent of worker count; top-K probes the same table for
+  distinct fallback workers. The coordinator retains equivalent legacy lookup
+  compatibility. Assumes stable worker IDs.
 - **Replication:** **RF=1** in v1 — the backing store is the durable source.
   Hot blocks may get RF=2 later once miss cost is measured. Avoid blanket
   multi-copy; it burns NVMe.
@@ -417,7 +416,7 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
 
 ## v1 summary
 
-Single coordinator, K8s membership, rendezvous / top-K placement, RF=1, NVMe
+Single coordinator, K8s membership, Maglev / top-K placement, RF=1, NVMe
 block cache, custom TCP data plane, read-only FUSE, and pluggable blob backends
 (S3 / GCS / Azure Blob).
 

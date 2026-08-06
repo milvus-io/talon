@@ -1,13 +1,15 @@
-//! Microbenchmarks for the coordinator placement hot path.
+//! Microbenchmarks for cache placement and membership reconciliation.
 //!
-//! - `RendezvousPlacement::locate` / `locate_top_k` run on every client
-//!   placement lookup, scaling with cluster size.
+//! - `CachePlacementTable::primary` is the stable-membership client hot path.
+//!   Table construction is deliberately outside the timed loop.
 //! - `Epoch::for_nodes` computes the deterministic placement version (a content
 //!   hash of the healthy node set) on every membership reconcile, so it is
 //!   benchmarked across representative cluster sizes too (#80).
 
-use talon_coordinator::{Epoch, Placement, RendezvousPlacement};
-use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
+use talon_coordinator::Epoch;
+use talon_core::{
+    Backend, BlockId, CachePlacementTable, NodeId, NodeInfo, NodeRole, ObjectId, Version,
+};
 
 fn main() {
     divan::main();
@@ -32,21 +34,19 @@ fn block(i: u64) -> BlockId {
     )
 }
 
-#[divan::bench(args = [8, 64, 256])]
-fn locate(bencher: divan::Bencher, node_count: u32) {
-    let placement = RendezvousPlacement;
-    let nodes = nodes(node_count);
+#[divan::bench(args = [8, 64, 256, 10_000])]
+fn primary(bencher: divan::Bencher, node_count: u32) {
+    let table = CachePlacementTable::new(&nodes(node_count));
     let id = block(42);
-    bencher.bench(|| placement.locate(divan::black_box(&id), divan::black_box(&nodes)));
+    bencher.bench(|| table.primary(divan::black_box(&id)));
 }
 
 /// Top-3 replica ordering (the shape a RF>1 lookup would use).
-#[divan::bench(args = [8, 64, 256])]
-fn locate_top_k(bencher: divan::Bencher, node_count: u32) {
-    let placement = RendezvousPlacement;
-    let nodes = nodes(node_count);
+#[divan::bench(args = [8, 64, 256, 10_000])]
+fn top_k(bencher: divan::Bencher, node_count: u32) {
+    let table = CachePlacementTable::new(&nodes(node_count));
     let id = block(42);
-    bencher.bench(|| placement.locate_top_k(divan::black_box(&id), divan::black_box(&nodes), 3));
+    bencher.bench(|| table.rank(divan::black_box(&id), 3));
 }
 
 /// Deterministic placement-version hash over the node set (per reconcile).

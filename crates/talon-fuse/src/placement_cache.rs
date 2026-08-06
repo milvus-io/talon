@@ -1,7 +1,7 @@
 //! Client-side placement cache with refresh and replica fallback.
 //!
 //! The FUSE client caches each block's ordered replica list + epoch for a short
-//! TTL, so most reads skip membership access and local HRW ranking. A cached
+//! TTL, so most reads skip membership access and local Maglev lookup. A cached
 //! entry is refreshed (evicted, forcing a re-rank) on any staleness trigger:
 //!
 //! - **TTL expiry** — the cached entry aged out.
