@@ -269,6 +269,7 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose --profile ha config --quiet
+          docker compose --profile extents config --quiet
           # The latency lab is a standalone stack; validate it parses too.
           docker compose -f deploy/testenv/docker-compose.yml config --quiet
           docker compose -f deploy/testenv/docker-compose.yml --profile tools config --quiet
@@ -288,6 +289,14 @@ jobs:
           push: false
           cache-from: type=gha,scope=worker
           cache-to: type=gha,scope=worker,mode=max
+      - name: Build async worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/async-worker.Dockerfile
+          push: false
+          cache-from: type=gha,scope=async-worker
+          cache-to: type=gha,scope=async-worker,mode=max
       - name: Build fuse image
         uses: docker/build-push-action@v6
         with:

@@ -26,6 +26,7 @@
 pub mod cache;
 pub mod conn;
 pub mod metrics;
+pub mod observability;
 pub mod runtime;
 pub mod sendfile;
 
@@ -37,5 +38,6 @@ pub use cache::tiered::{ExtentCacheConfig, ExtentCacheStats, TieredExtentCache, 
 pub use cache::ExtentKey;
 pub use conn::handle_conn;
 pub use metrics::{AsyncWorkerMetrics, ConnectionGuard};
+pub use observability::{serve_admin, AsyncWorkerObservability, AsyncWorkerReadiness};
 pub use runtime::{AsyncWorkerRuntime, ServeOutcome, ServeStats};
 pub use sendfile::{send_file_range, DEFAULT_CHUNK};

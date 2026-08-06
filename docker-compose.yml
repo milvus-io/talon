@@ -4,6 +4,10 @@
 #   docker compose up
 #   # UI + API: http://127.0.0.1:8000/ui
 #
+# With the async worker (extent cache for selective columnar reads):
+#   docker compose --profile extents up
+#   # cache detail: http://127.0.0.1:8101/api/v1/cache
+#
 # HA (etcd backend, 3 coordinators + worker):
 #   docker compose --profile ha up
 #   # UI + API (any coordinator): http://127.0.0.1:8000/ui
@@ -56,6 +60,43 @@ services:
       TALON_WORKER_AZURE_SAS: "sv=demo&sig=demo"
     ports:
       - "8001:8001" # worker admin (metrics/health/status)
+    depends_on:
+      coordinator:
+        condition: service_healthy
+
+  # --- async worker: the extent cache, opt-in ------------------------------
+  # Behind a profile because it is an addition to the default topology, not a
+  # replacement: it serves reads only, so a deployment that writes through
+  # Talon runs both pools (ADR 0005 section 8).
+  #
+  #   docker compose --profile extents up
+  #   curl -s localhost:8101/api/v1/cache
+  async-worker:
+    image: ghcr.io/milvus-io/talon-async-worker:latest
+    build:
+      context: .
+      dockerfile: deploy/docker/async-worker.Dockerfile
+    profiles: ["extents"]
+    command:
+      - "--coordinator"
+      - "coordinator:7000"
+      - "--cluster-id"
+      - "demo"
+      - "--node-id"
+      - "async-worker-0"
+      # 1 GiB over 8 shards is two 64 MiB regions per shard: enough to exercise
+      # region reclamation in a demo without reserving real capacity.
+      - "--capacity-bytes"
+      - "1073741824"
+      - "--l1-capacity-bytes"
+      - "67108864"
+    environment:
+      # Placeholder object-store credentials so the worker starts; reading real
+      # objects needs real ones.
+      TALON_ASYNC_WORKER_AZURE_ACCOUNT: demo
+      TALON_ASYNC_WORKER_AZURE_SAS: "sv=demo&sig=demo"
+    ports:
+      - "8101:8101" # async worker admin (metrics/health/status/cache)
     depends_on:
       coordinator:
         condition: service_healthy
