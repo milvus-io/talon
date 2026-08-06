@@ -63,7 +63,7 @@ public final class ConformanceTest {
     // --- the checks --------------------------------------------------------
 
     private static void localPlacementMatchesRust() {
-        check("client-side HRW ranking matches Rust", () -> {
+        check("client-side Maglev ranking matches Rust", () -> {
             BlockId block =
                     new BlockId(
                             new ObjectId(
@@ -79,9 +79,13 @@ public final class ConformanceTest {
                             new NodeInfo("worker-b", "10.0.0.2:7001", true),
                             new NodeInfo("worker-c", "10.0.0.3:7001", true));
             List<NodeInfo> ranked = Placement.rank(block, nodes, 3);
-            assertEquals("worker-b", ranked.get(0).id(), "primary");
+            assertEquals("worker-c", ranked.get(0).id(), "primary");
             assertEquals("worker-a", ranked.get(1).id(), "secondary");
-            assertEquals("worker-c", ranked.get(2).id(), "tertiary");
+            assertEquals("worker-b", ranked.get(2).id(), "tertiary");
+            assertEquals("worker-c", Placement.rank(block, nodes, 1).get(0).id(), "top one");
+            List<NodeInfo> topTwo = Placement.rank(block, nodes, 2);
+            assertEquals("worker-c", topTwo.get(0).id(), "top-two primary");
+            assertEquals("worker-a", topTwo.get(1).id(), "top-two secondary");
         });
     }
 

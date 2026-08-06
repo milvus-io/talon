@@ -19,7 +19,7 @@ use crate::{Epoch, Membership, Placement};
 /// The result of a placement lookup: ordered owners at a given epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PlacementResult {
-    /// Ordered replica node ids (highest HRW weight first). Empty if no nodes.
+    /// Ordered replica node ids (primary first). Empty if no nodes.
     pub owners: Vec<String>,
     /// The placement epoch these owners were computed at.
     pub epoch: Epoch,

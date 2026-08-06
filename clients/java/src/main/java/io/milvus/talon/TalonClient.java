@@ -233,12 +233,16 @@ public final class TalonClient implements AutoCloseable {
     }
 
     private static final class CachedMembership {
-        final List<NodeInfo> nodes;
+        final Placement.Table placement;
         final String identity;
         final long expiresAtMs;
 
         CachedMembership(List<NodeInfo> nodes, String identity, long expiresAtMs) {
-            this.nodes = nodes;
+            this(new Placement.Table(nodes), identity, expiresAtMs);
+        }
+
+        CachedMembership(Placement.Table placement, String identity, long expiresAtMs) {
+            this.placement = placement;
             this.identity = identity;
             this.expiresAtMs = expiresAtMs;
         }
@@ -288,7 +292,15 @@ public final class TalonClient implements AutoCloseable {
         }
 
         CachedMembership members = membership(forceRefresh, now);
-        List<NodeInfo> owners = Placement.rank(block, members.nodes, REPLICAS_K);
+        List<NodeInfo> owners;
+        if (REPLICAS_K == 1) {
+            NodeInfo primary = members.placement.primary(block);
+            owners = primary == null
+                    ? java.util.Collections.emptyList()
+                    : java.util.Collections.singletonList(primary);
+        } else {
+            owners = members.placement.rank(block, REPLICAS_K);
+        }
         List<String> addresses = new ArrayList<>(owners.size());
         for (NodeInfo owner : owners) {
             addresses.add(owner.address());
@@ -328,6 +340,12 @@ public final class TalonClient implements AutoCloseable {
 
             String identity = membershipIdentity(nodes);
             boolean changed = membership != null && !membership.identity.equals(identity);
+            if (membership != null && !changed) {
+                membership =
+                        new CachedMembership(
+                                membership.placement, identity, now + PLACEMENT_TTL_MS);
+                return membership;
+            }
             if (changed) {
                 synchronized (placementCache) {
                     placementCache.clear();

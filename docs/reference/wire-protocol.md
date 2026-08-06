@@ -152,15 +152,18 @@ reconnect**, not attempt to resynchronise.
 A correct client does more than encode messages:
 
 **Client-side placement.** Current clients cache the healthy workers returned by
-`MembershipList` and rank them locally for each immutable cache block. The HRW
-score is SHA-256 over `talon-cache-placement-v1\0`, the canonical
-length-delimited `BlockId` fields, and the stable worker ID. Scores sort in
-descending unsigned byte order, with ascending worker ID as the tie-breaker.
-`PlacementLookup` remains a compatibility operation for older clients.
+`MembershipList` and build a deterministic Maglev table when that membership
+changes. Workers sort by stable ID. The table size is the next power of two at
+or above `max(4096, 64 * worker_count)`; SHA-256 domains
+`talon-cache-maglev-worker-v1\0` and `talon-cache-maglev-block-v1\0` derive
+worker permutations and block slots from the same canonical length-delimited
+fields in every language. A primary lookup is one block hash and one table
+access, O(1) regardless of worker count. `PlacementLookup` remains a
+compatibility operation for older clients.
 
 **Placement caching.** Cache locally ranked worker addresses rather than node
 IDs. When membership identity or address changes, invalidate affected placement
-entries and re-rank them against the new snapshot.
+entries and resolve them against the rebuilt table.
 
 **Replica fallback.** On a fetch failure, walk the cached replicas in order. If
 all are exhausted, invalidate the entry, refresh membership once, and retry

@@ -4,7 +4,7 @@
 //! sandbox has no `/dev/fuse`):
 //!
 //! 1. Parse `/az/<container>/<blob>` into an [`ObjectId`].
-//! 2. Fetch worker membership and compute HRW placement locally.
+//! 2. Fetch worker membership and compute Maglev placement locally.
 //! 3. Send a data-plane [`RangeRequest`] to the selected worker.
 //!
 //! Prints byte count + elapsed time; writes the bytes to `--out` when given so
@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use clap::Parser;
-use talon_core::{rank_cache_workers, BlockId, NodeRole, ObjectId, Version};
+use talon_core::{BlockId, CachePlacementTable, NodeRole, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -21,7 +21,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 /// Block size used only to compute the placement key (must match the worker's
-/// so HRW selects the same owner; with a single worker any value works).
+/// so Maglev selects the same owner; with a single worker any value works).
 const PLACEMENT_BLOCK_SIZE: u32 = 256 << 20;
 /// Placeholder version matching the worker's block identity.
 const PLACEHOLDER_VERSION: &str = "e2e-v1";
@@ -102,17 +102,12 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             let membership = membership_lookup(&args.coordinator).await?;
-            let owners = rank_cache_workers(&block, &membership, 1);
-            let owner = owners
-                .first()
+            let placement = CachePlacementTable::new(&membership);
+            let owner = placement
+                .primary(&block)
                 .ok_or_else(|| anyhow::anyhow!("no worker owns this block (empty cluster?)"))?;
-            tracing::info!(owner = %owner, "resolved owner");
-
-            let worker_addr = membership
-                .into_iter()
-                .find(|node| node.id == *owner)
-                .map(|node| node.address)
-                .ok_or_else(|| anyhow::anyhow!("owner {owner} not in membership list"))?;
+            tracing::info!(owner = %owner.id, "resolved owner");
+            let worker_addr = owner.address.clone();
             tracing::info!(%worker_addr, "resolved worker address");
             worker_addr
         }

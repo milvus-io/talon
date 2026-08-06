@@ -10,7 +10,7 @@
 //!
 //! The placement cache stores an ordered list of **worker addresses** (what the
 //! client actually dials), derived from the same membership snapshot used for
-//! local HRW ranking. Storing the dialable address keeps the hot path
+//! local Maglev lookup. Storing the dialable address keeps the hot path
 //! allocation-light and makes replica fallback a simple walk down the ordered
 //! list.
 //!
@@ -23,7 +23,7 @@
 
 use std::sync::Arc;
 
-use talon_core::{rank_cache_workers, BlockId, ObjectId, Version};
+use talon_core::{BlockId, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::membership_cache::{MembershipCache, MembershipSnapshot};
@@ -132,7 +132,7 @@ impl BlockReader {
 
     /// Read `len` bytes at `offset_in_block` within `block`.
     ///
-    /// Resolves placement (cache hit, else local HRW over cached membership),
+    /// Resolves placement (cache hit, else local Maglev lookup),
     /// then fetches the sub-range from an owner. The
     /// absolute object offset handed to the worker is
     /// `block.offset + offset_in_block`.
@@ -342,20 +342,20 @@ impl BlockReader {
         let membership = self
             .membership_snapshot(now_ms, force_membership_refresh)
             .await?;
-        let owners = rank_cache_workers(block, &membership.nodes, self.replicas_k as usize);
-        if owners.is_empty() {
-            return Err(BlockReadError::NoOwners);
-        }
-        let replicas: Vec<String> = owners
-            .iter()
-            .filter_map(|id| {
-                membership
-                    .nodes
-                    .iter()
-                    .find(|node| &node.id == id)
-                    .map(|node| node.address.clone())
-            })
-            .collect();
+        let replicas = if self.replicas_k == 1 {
+            vec![membership
+                .placement
+                .primary(block)
+                .ok_or(BlockReadError::NoOwners)?
+                .address
+                .clone()]
+        } else {
+            let owners = membership.placement.rank(block, self.replicas_k as usize);
+            if owners.is_empty() {
+                return Err(BlockReadError::NoOwners);
+            }
+            owners.iter().map(|node| node.address.clone()).collect()
+        };
         if replicas.is_empty() {
             return Err(BlockReadError::UnresolvedOwner);
         }
@@ -588,7 +588,11 @@ mod tests {
                 role: NodeRole::Worker,
             },
         ];
-        let first = rank_cache_workers(&block(), &candidates, 1).remove(0);
+        let first = talon_core::CachePlacementTable::new(&candidates)
+            .primary(&block())
+            .unwrap()
+            .id
+            .clone();
         let (w1, w2) = if first == NodeId::new("w1") {
             (primary, secondary)
         } else {

@@ -27,7 +27,7 @@ straight from the block file into the socket — the block is never copied into 
 buffer on the way past. See [Data-plane runtime](../explanation/data-plane-runtime.md).
 
 **Scales cache capacity with the fleet.** Blocks are placed across workers by
-rendezvous hashing, so adding a worker adds capacity and moves a minimal share
+deterministic Maglev placement, so adding a worker adds capacity and remaps a bounded share
 of existing placements. A dataset larger than one node's NVMe is still fully
 cacheable.
 
