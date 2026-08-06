@@ -1,12 +1,14 @@
 //! Control-plane client for talking to the coordinator.
 //!
-//! The FUSE client needs two answers from the coordinator on its read path:
+//! The FUSE read path fetches one answer from the coordinator:
 //!
-//! - **placement** — given a [`BlockId`], which worker(s) hold it, and at what
-//!   [`epoch`](ControlMessage::PlacementResponse)? ([`CoordinatorClient::placement_lookup`])
-//! - **membership** — a placement response names owners by [`NodeId`]; the
-//!   client resolves those ids to concrete `host:port` worker addresses with a
-//!   [`MembershipQuery`](ControlMessage::MembershipQuery). ([`CoordinatorClient::membership`])
+//! - **membership** - the client caches healthy worker IDs and addresses from a
+//!   [`MembershipQuery`](ControlMessage::MembershipQuery), then computes block
+//!   placement locally. ([`CoordinatorClient::membership`])
+//!
+//! [`CoordinatorClient::placement_lookup`] and
+//! [`CoordinatorClient::locate_primary`] remain available for wire compatibility
+//! with older callers, but the current read path does not use them.
 //!
 //! Both are single request/response round-trips over the control plane: write
 //! one [`MsgType::Control`] frame carrying a bincode [`ControlMessage`], read

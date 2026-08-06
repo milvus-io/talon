@@ -4,9 +4,8 @@
 //! sandbox has no `/dev/fuse`):
 //!
 //! 1. Parse `/az/<container>/<blob>` into an [`ObjectId`].
-//! 2. Ask the coordinator (`PlacementLookup`) which worker owns the block.
-//! 3. Resolve that owner id to an address (`MembershipQuery`).
-//! 4. Send a data-plane [`RangeRequest`] to the worker and read the raw bytes.
+//! 2. Fetch worker membership and compute HRW placement locally.
+//! 3. Send a data-plane [`RangeRequest`] to the selected worker.
 //!
 //! Prints byte count + elapsed time; writes the bytes to `--out` when given so
 //! the caller can `cmp` two reads for byte-exactness.
@@ -14,7 +13,7 @@
 use std::time::Instant;
 
 use clap::Parser;
-use talon_core::{BlockId, NodeRole, ObjectId, Version};
+use talon_core::{rank_cache_workers, BlockId, NodeRole, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -102,15 +101,18 @@ async fn main() -> anyhow::Result<()> {
             worker
         }
         None => {
-            // 1. Placement lookup: which worker owns this block?
-            let owners = placement_lookup(&args.coordinator, &block).await?;
+            let membership = membership_lookup(&args.coordinator).await?;
+            let owners = rank_cache_workers(&block, &membership, 1);
             let owner = owners
                 .first()
                 .ok_or_else(|| anyhow::anyhow!("no worker owns this block (empty cluster?)"))?;
             tracing::info!(owner = %owner, "resolved owner");
 
-            // 2. Resolve the owner id to a worker address.
-            let worker_addr = resolve_address(&args.coordinator, owner).await?;
+            let worker_addr = membership
+                .into_iter()
+                .find(|node| node.id == *owner)
+                .map(|node| node.address)
+                .ok_or_else(|| anyhow::anyhow!("owner {owner} not in membership list"))?;
             tracing::info!(%worker_addr, "resolved worker address");
             worker_addr
         }
@@ -152,30 +154,6 @@ async fn main() -> anyhow::Result<()> {
         println!("first {n} bytes (hex): {}", hex_prefix(&bytes[..n]));
     }
     Ok(())
-}
-
-/// Send a `PlacementLookup` and return the ordered owner ids.
-async fn placement_lookup(coordinator: &str, block: &BlockId) -> anyhow::Result<Vec<String>> {
-    let req = ControlMessage::PlacementLookup {
-        block: block.clone(),
-        k: 1,
-    };
-    match request_control(coordinator, &req).await? {
-        ControlMessage::PlacementResponse { owners, .. } => {
-            Ok(owners.into_iter().map(|n| n.0).collect())
-        }
-        other => anyhow::bail!("unexpected placement reply: {other:?}"),
-    }
-}
-
-/// Send a `MembershipQuery` and resolve `owner_id` to its worker address.
-async fn resolve_address(coordinator: &str, owner_id: &str) -> anyhow::Result<String> {
-    membership_lookup(coordinator)
-        .await?
-        .into_iter()
-        .find(|n| n.id.0 == owner_id)
-        .map(|n| n.address)
-        .ok_or_else(|| anyhow::anyhow!("owner {owner_id} not in membership list"))
 }
 
 /// Return the coordinator's current membership snapshot.

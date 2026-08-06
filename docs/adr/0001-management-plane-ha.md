@@ -30,7 +30,7 @@ metadata owner or route data-plane bytes through it.
 Every coordinator can serve all control and management operations:
 
 - worker registration and heartbeat;
-- membership and placement lookup;
+- membership snapshots and legacy placement lookup;
 - health, readiness, and Prometheus metrics;
 - management API and UI.
 
@@ -198,7 +198,25 @@ by the deployment's naming and label conventions.
 Talon does not introduce a custom resource definition or require an operator
 for this feature.
 
-### 7. Placement uses an opaque membership version
+### 7. Clients compute immutable cache-block placement
+
+**Amended 2026-08-06.** Read-path clients fetch a bounded healthy-worker
+membership snapshot and run deterministic HRW locally. Coordinators retain
+`PlacementLookup` for rolling compatibility, but current clients do not put a
+coordinator on each block-placement cache miss.
+
+The cross-language score is SHA-256 over the domain
+`talon-cache-placement-v1\0`, the canonical length-delimited `BlockId` fields,
+and the stable worker ID. Scores sort as unsigned 32-byte big-endian values in
+descending order, with ascending worker ID as the collision tie-breaker.
+
+Clients cache the last successful membership. TTL expiry attempts a refresh;
+if the management plane is unavailable, an existing client continues using the
+last-good snapshot and normal worker fallback. This is safe for immutable cache
+blocks because the origin remains authoritative. It does not apply to the
+TMS-confirmed durable write ownership defined by ADR 0003.
+
+### 7.1 Legacy placement responses use an opaque membership version
 
 The current wall-clock-seeded numeric epoch is process-specific. It cannot be
 the cross-coordinator source of truth.
@@ -253,9 +271,10 @@ If a coordinator cannot obtain a snapshot within its configured timeout:
 - the UI may retain the last successful response locally but must mark it stale
   with its observation time.
 
-Existing clients may continue using their short-lived placement cache and
-normal replica fallback. A coordinator-local last-good snapshot may be exposed
-for diagnostics but is not used as an unmarked authoritative response.
+Existing clients continue using their short-lived placement and membership
+caches with normal replica fallback. A coordinator-local last-good snapshot may
+be exposed for diagnostics but is not used as an unmarked authoritative
+response.
 
 Liveness remains true while the process can run its event loop and serve the
 liveness endpoint. This distinction lets an orchestrator remove an unready
@@ -376,12 +395,13 @@ sequenceDiagram
     participant C as Any Coordinator
     participant S as ClusterStateStore
 
-    F->>LB: PlacementLookup(block, replica count)
+    F->>LB: MembershipQuery (on startup/TTL refresh)
     LB->>C: Route request
     C->>S: linearizable snapshot(cluster)
     S-->>C: live node records + opaque revision
-    C->>C: filter healthy workers and run deterministic HRW
-    C-->>F: owners + PlacementVersion
+    C->>C: filter healthy and ready workers
+    C-->>F: worker membership
+    F->>F: cache membership and run deterministic HRW per block
 ```
 
 ### Coordinator failure

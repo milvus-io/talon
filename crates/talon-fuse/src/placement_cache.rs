@@ -1,8 +1,8 @@
 //! Client-side placement cache with refresh and replica fallback.
 //!
 //! The FUSE client caches each block's ordered replica list + epoch for a short
-//! TTL, so most reads skip a coordinator round-trip. A cached entry is refreshed
-//! (evicted, forcing a re-lookup) on any staleness trigger:
+//! TTL, so most reads skip membership access and local HRW ranking. A cached
+//! entry is refreshed (evicted, forcing a re-rank) on any staleness trigger:
 //!
 //! - **TTL expiry** — the cached entry aged out.
 //! - **Version mismatch** — a response carried a different placement version.
@@ -39,9 +39,9 @@ pub struct Cached {
     pub replicas: Vec<String>,
     /// Placement version token these replicas were computed against.
     ///
-    /// This is an opaque coordinator-issued token (a content hash of the node
-    /// set), **not** a monotonically increasing counter. Clients compare it for
-    /// equality only — see [`PlacementCache::observe_epoch`].
+    /// This is a client-derived content token for the membership snapshot,
+    /// **not** a monotonically increasing counter. Clients compare it for
+    /// equality only - see [`PlacementCache::observe_epoch`].
     pub epoch: u64,
 }
 
@@ -63,6 +63,16 @@ impl PlacementCache {
             ttl_ms,
             entries: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Configured freshness window, also used for membership refreshes.
+    pub fn ttl_ms(&self) -> u64 {
+        self.ttl_ms
+    }
+
+    /// Invalidate all placements after a membership snapshot changes.
+    pub fn clear(&self) {
+        self.entries.write_recover().clear();
     }
 
     /// Insert/replace a fresh placement for `block` observed at `now_ms`.
@@ -105,15 +115,13 @@ impl PlacementCache {
 
     /// Reconcile against an observed placement version: if the cached entry's
     /// version differs from `observed_epoch`, drop it so the next access
-    /// re-looks-up.
+    /// re-ranks against membership.
     ///
-    /// The version is an opaque token (a content hash of the coordinator's node
-    /// set), not an ordered counter, so this compares for **inequality** rather
-    /// than `<`. Any difference — a membership change on one coordinator, or a
-    /// response served by a peer that observed a different set — invalidates the
-    /// entry. Because identical membership always hashes to the identical token
-    /// (issue #80), a client load-balanced across active-active coordinators
-    /// with a stable cluster sees no spurious invalidations.
+    /// The version is a content hash of the membership snapshot, not an ordered
+    /// counter, so this compares for **inequality** rather than `<`. Any
+    /// membership difference invalidates the entry. Identical membership always
+    /// hashes to the same token, so a client load-balanced across active-active
+    /// coordinators sees no spurious invalidations for a stable cluster.
     ///
     /// Returns `true` if the entry was invalidated by the version check.
     pub fn observe_epoch(&self, block: &BlockId, observed_epoch: u64) -> bool {

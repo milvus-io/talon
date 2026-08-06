@@ -122,8 +122,9 @@ enum NodeRole { Coordinator = 0, Worker = 1 }  // u32 tag
 // NodeId and Version are newtypes over String: encoded exactly as a String.
 ```
 
-`PlacementResponse` returns node **ids**; a client resolves those to dialable
-addresses through `MembershipList`.
+For legacy placement lookup, `PlacementResponse` returns node **ids** that the
+caller resolves to dialable addresses through `MembershipList`. Current clients
+use `MembershipList` directly and compute placement locally.
 
 ## Data plane
 
@@ -150,24 +151,30 @@ reconnect**, not attempt to resynchronise.
 
 A correct client does more than encode messages:
 
-**Placement caching.** `PlacementLookup` returns owners in preference order.
-Cache the resolved addresses rather than the node ids, so a fetch does not
-re-resolve membership.
+**Client-side placement.** Current clients cache the healthy workers returned by
+`MembershipList` and rank them locally for each immutable cache block. The HRW
+score is SHA-256 over `talon-cache-placement-v1\0`, the canonical
+length-delimited `BlockId` fields, and the stable worker ID. Scores sort in
+descending unsigned byte order, with ascending worker ID as the tie-breaker.
+`PlacementLookup` remains a compatibility operation for older clients.
+
+**Placement caching.** Cache locally ranked worker addresses rather than node
+IDs. When membership identity or address changes, invalidate affected placement
+entries and re-rank them against the new snapshot.
 
 **Replica fallback.** On a fetch failure, walk the cached replicas in order. If
-all are exhausted, invalidate the entry, refresh from the coordinator once, and
-retry before giving up.
+all are exhausted, invalidate the entry, refresh membership once, and retry
+before giving up. If membership refresh fails, an existing client retains its
+last-good snapshot so a coordinator outage does not interrupt cached data-plane
+placement.
 
-**Epoch reconciliation.** `PlacementResponse` carries the epoch its owners were
-computed at. Observing a different epoch means the cached placement may be
-stale; invalidate it rather than continuing to use it. Failing to do this is the
-subtle bug — reads keep succeeding, from the wrong worker, until something else
-forces a refresh.
+**Legacy epoch reconciliation.** `PlacementResponse` carries the epoch its
+owners were computed at. Clients still using this compatibility operation must
+invalidate a cached placement when they observe a different epoch.
 
 **Multi-block ranges.** A range spanning block boundaries splits into one fetch
 per block, each addressed by its own `BlockId`. Block size is a worker
-configuration value; a client learns the object's layout from the block ids the
-coordinator returns.
+configuration value and is part of every locally constructed `BlockId`.
 
 ## Conformance vectors
 

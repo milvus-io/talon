@@ -45,6 +45,7 @@ public final class ConformanceTest {
         objectListPreservesMultiByteUtf8(byName);
         placementLookupEncodesIdentically(byName);
         membershipQueryEncodesIdentically(byName);
+        localPlacementMatchesRust();
         statObjectEncodesIdentically(byName);
         listObjectsEncodesEmptyPrefix(byName);
         errorResponseIsFlaggedAndCarriesAMessage(byName);
@@ -60,6 +61,29 @@ public final class ConformanceTest {
     }
 
     // --- the checks --------------------------------------------------------
+
+    private static void localPlacementMatchesRust() {
+        check("client-side HRW ranking matches Rust", () -> {
+            BlockId block =
+                    new BlockId(
+                            new ObjectId(
+                                    ObjectId.Backend.S3,
+                                    "datasets",
+                                    "training/part-0001"),
+                            268_435_456L,
+                            256 << 20,
+                            "etag-v7");
+            List<NodeInfo> nodes =
+                    Arrays.asList(
+                            new NodeInfo("worker-a", "10.0.0.1:7001", true),
+                            new NodeInfo("worker-b", "10.0.0.2:7001", true),
+                            new NodeInfo("worker-c", "10.0.0.3:7001", true));
+            List<NodeInfo> ranked = Placement.rank(block, nodes, 3);
+            assertEquals("worker-b", ranked.get(0).id(), "primary");
+            assertEquals("worker-a", ranked.get(1).id(), "secondary");
+            assertEquals("worker-c", ranked.get(2).id(), "tertiary");
+        });
+    }
 
     /** A header decodes to the fields the generator encoded. */
     private static void frameHeaderDecodes(Map<String, byte[]> v) {

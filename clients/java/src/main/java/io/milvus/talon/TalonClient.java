@@ -8,6 +8,7 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -41,9 +42,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class TalonClient implements AutoCloseable {
 
-    /** Placement entries older than this are re-resolved. Matches the Rust default. */
+    /** Membership and placement freshness window. Matches the Rust default. */
     private static final long PLACEMENT_TTL_MS = 30_000;
-    /** Replicas requested per lookup. RF=1 in v1. */
+    /** Workers retained from the local ranking. RF=1 in v1. */
     private static final int REPLICAS_K = 1;
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 30_000;
@@ -52,6 +53,8 @@ public final class TalonClient implements AutoCloseable {
     private final int blockSize;
     private final AtomicInteger requestIds = new AtomicInteger(1);
     private final Map<BlockId, CachedPlacement> placementCache = new HashMap<>();
+    private final Object membershipLock = new Object();
+    private CachedMembership membership;
 
     private TalonClient(String coordinator, int blockSize) {
         this.coordinator = coordinator;
@@ -221,12 +224,22 @@ public final class TalonClient implements AutoCloseable {
 
     private static final class CachedPlacement {
         final List<String> addresses;
-        final long epoch;
         final long expiresAtMs;
 
-        CachedPlacement(List<String> addresses, long epoch, long expiresAtMs) {
+        CachedPlacement(List<String> addresses, long expiresAtMs) {
             this.addresses = addresses;
-            this.epoch = epoch;
+            this.expiresAtMs = expiresAtMs;
+        }
+    }
+
+    private static final class CachedMembership {
+        final List<NodeInfo> nodes;
+        final String identity;
+        final long expiresAtMs;
+
+        CachedMembership(List<NodeInfo> nodes, String identity, long expiresAtMs) {
+            this.nodes = nodes;
+            this.identity = identity;
             this.expiresAtMs = expiresAtMs;
         }
     }
@@ -274,55 +287,68 @@ public final class TalonClient implements AutoCloseable {
             }
         }
 
-        int id = requestIds.getAndIncrement();
-        Messages.Response resp =
-                controlRoundTrip(Messages.placementLookup(id, block, REPLICAS_K));
-        if (resp.tag != Messages.TAG_PLACEMENT_RESPONSE) {
-            throw unexpected("PlacementLookup", resp);
-        }
-        Placement placement = Messages.readPlacementResponse(resp.body);
-
-        // Owners are node ids; the data plane needs addresses.
-        Map<String, String> members = membershipByNodeId();
-        List<String> addresses = new ArrayList<>(placement.owners().size());
-        for (String owner : placement.owners()) {
-            String address = members.get(owner);
-            if (address != null) {
-                addresses.add(address);
-            }
+        CachedMembership members = membership(forceRefresh, now);
+        List<NodeInfo> owners = Placement.rank(block, members.nodes, REPLICAS_K);
+        List<String> addresses = new ArrayList<>(owners.size());
+        for (NodeInfo owner : owners) {
+            addresses.add(owner.address());
         }
         if (addresses.isEmpty()) {
-            throw new IOException(
-                    "no owner of " + block + " resolved to a dialable address (owners="
-                            + placement.owners() + ")");
+            throw new IOException("membership contains no worker for " + block);
         }
 
         synchronized (placementCache) {
-            // A different epoch means every cached entry may be stale, not just
-            // this one, so drop the lot rather than serving from the wrong
-            // worker until each entry happens to expire.
-            CachedPlacement previous = placementCache.get(block);
-            if (previous != null && previous.epoch != placement.epoch()) {
-                placementCache.clear();
-            }
             placementCache.put(
                     block,
-                    new CachedPlacement(addresses, placement.epoch(), now + PLACEMENT_TTL_MS));
+                    new CachedPlacement(addresses, now + PLACEMENT_TTL_MS));
         }
         return addresses;
     }
 
-    private Map<String, String> membershipByNodeId() throws IOException {
-        int id = requestIds.getAndIncrement();
-        Messages.Response resp = controlRoundTrip(Messages.membershipQuery(id));
-        if (resp.tag != Messages.TAG_MEMBERSHIP_LIST) {
-            throw unexpected("MembershipQuery", resp);
+    private CachedMembership membership(boolean forceRefresh, long now) throws IOException {
+        synchronized (membershipLock) {
+            if (!forceRefresh && membership != null && membership.expiresAtMs > now) {
+                return membership;
+            }
+
+            List<NodeInfo> nodes;
+            try {
+                int id = requestIds.getAndIncrement();
+                Messages.Response resp = controlRoundTrip(Messages.membershipQuery(id));
+                if (resp.tag != Messages.TAG_MEMBERSHIP_LIST) {
+                    throw unexpected("MembershipQuery", resp);
+                }
+                nodes = Messages.readMembershipList(resp.body);
+            } catch (IOException refreshFailure) {
+                if (membership != null) {
+                    return membership;
+                }
+                throw refreshFailure;
+            }
+
+            String identity = membershipIdentity(nodes);
+            boolean changed = membership != null && !membership.identity.equals(identity);
+            if (changed) {
+                synchronized (placementCache) {
+                    placementCache.clear();
+                }
+            }
+            membership =
+                    new CachedMembership(List.copyOf(nodes), identity, now + PLACEMENT_TTL_MS);
+            return membership;
         }
-        Map<String, String> byId = new HashMap<>();
-        for (NodeInfo node : Messages.readMembershipList(resp.body)) {
-            byId.put(node.id(), node.address());
+    }
+
+    private static String membershipIdentity(List<NodeInfo> nodes) {
+        List<String> fields = new ArrayList<>();
+        for (NodeInfo node : nodes) {
+            if (node.isWorker()) {
+                fields.add(node.id().length() + ":" + node.id() + node.address().length() + ":"
+                        + node.address());
+            }
         }
-        return byId;
+        fields.sort(Comparator.naturalOrder());
+        return String.join("|", fields);
     }
 
     // --- transport ---------------------------------------------------------

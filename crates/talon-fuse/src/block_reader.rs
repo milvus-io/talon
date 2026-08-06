@@ -1,30 +1,32 @@
-//! Block read orchestration: placement cache → coordinator → worker.
+//! Block read orchestration: local placement cache -> membership -> worker.
 //!
 //! [`BlockReader`] is the heart of the FUSE read path. Given a [`BlockId`] and a
 //! sub-range within it, it answers "where does this block live?" from the
-//! client-side [`PlacementCache`] when warm, or falls back to a
-//! [`CoordinatorClient`] lookup on a miss, then fetches the bytes from the
-//! owning worker with a [`WorkerClient`].
+//! client-side [`PlacementCache`] when warm. On a miss it ranks a cached worker
+//! membership snapshot locally, then fetches the bytes from the owning worker
+//! with a [`WorkerClient`].
 //!
 //! # Cached addresses, not node ids
 //!
 //! The placement cache stores an ordered list of **worker addresses** (what the
-//! client actually dials), derived by resolving the coordinator's owner
-//! [`NodeId`](talon_core::NodeId)s through the membership snapshot. Storing the
-//! dialable address keeps the hot path allocation-light and makes replica
-//! fallback a simple walk down the ordered list.
+//! client actually dials), derived from the same membership snapshot used for
+//! local HRW ranking. Storing the dialable address keeps the hot path
+//! allocation-light and makes replica fallback a simple walk down the ordered
+//! list.
 //!
 //! On a fetch failure the reader walks the cached replicas in order; if all are
-//! exhausted it invalidates the entry and performs one coordinator refresh
-//! before giving up. [`BlockReader::observe_epoch`] reconciles the cache when a
-//! different placement version is seen. Multi-block splitting is handled by
+//! exhausted it invalidates the entry and attempts one membership refresh
+//! before giving up. A failed refresh keeps using the last-good snapshot.
+//! [`BlockReader::observe_epoch`] reconciles the cache when a different
+//! membership token is seen. Multi-block splitting is handled by
 //! [`crate::read_plan`] and readahead by [`crate::prefetch`].
 
 use std::sync::Arc;
 
-use talon_core::{BlockId, ObjectId, Version};
+use talon_core::{rank_cache_workers, BlockId, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
+use crate::membership_cache::{MembershipCache, MembershipSnapshot};
 use crate::metrics::ReadStats;
 use crate::placement_cache::{Cached, PlacementCache, RefreshReason};
 use crate::pool::ConnectionPool;
@@ -34,7 +36,7 @@ use crate::worker_client::{WorkerClient, WorkerError};
 /// Errors from a block read.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockReadError {
-    /// The coordinator lookup failed.
+    /// Membership refresh failed before any snapshot was cached.
     #[error(transparent)]
     Coordinator(#[from] CoordinatorError),
     /// The worker fetch failed.
@@ -46,7 +48,7 @@ pub enum BlockReadError {
     /// An owner id had no resolvable worker address in membership.
     #[error("owner has no known worker address")]
     UnresolvedOwner,
-    /// Every replica failed, including after a coordinator refresh.
+    /// Every replica failed, including after a membership refresh.
     #[error("all replicas failed after refresh")]
     AllReplicasFailed,
 }
@@ -68,25 +70,29 @@ pub struct FileView<'a> {
     pub size: u64,
 }
 
-/// Orchestrates block reads against the coordinator + workers with caching.
+/// Orchestrates local block placement and worker reads with caching.
 #[derive(Clone)]
 pub struct BlockReader {
     coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
-    /// Number of replicas to request from the coordinator (RF=1 → 1 in v1).
+    /// Number of workers retained from local ranking (RF=1 -> 1 in v1).
     replicas_k: u8,
     /// Read-path counters (cache hit/miss, worker fetches, bytes served).
     stats: ReadStats,
     /// Shared pool of worker connections, so warm fetches skip the TCP handshake
     /// (issue #181).
     worker_pool: Arc<ConnectionPool>,
+    /// Last authoritative worker set; stale snapshots remain usable on outage.
+    membership: Arc<MembershipCache>,
+    /// Serializes cold refreshes so an expired snapshot causes one control request.
+    membership_refresh: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl BlockReader {
     /// Create a reader over the given coordinator client and placement cache.
     ///
-    /// `replicas_k` is how many owners to request per placement lookup; with
-    /// RF=1 this is `1`, but requesting more reserves an ordered fallback list.
+    /// `replicas_k` is how many owners to retain from local placement; with RF=1
+    /// this is `1`, but a larger value reserves an ordered fallback list.
     /// Metrics are collected into a fresh [`ReadStats`]; use
     /// [`with_stats`](Self::with_stats) to share an existing one.
     pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
@@ -102,12 +108,15 @@ impl BlockReader {
         replicas_k: u8,
         stats: ReadStats,
     ) -> Self {
+        let membership = Arc::new(MembershipCache::new(cache.ttl_ms()));
         Self {
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
             stats,
             worker_pool: Arc::new(ConnectionPool::new()),
+            membership,
+            membership_refresh: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -123,8 +132,8 @@ impl BlockReader {
 
     /// Read `len` bytes at `offset_in_block` within `block`.
     ///
-    /// Resolves placement (cache hit, else coordinator lookup that populates the
-    /// cache at `now_ms`), then fetches the sub-range from an owner. The
+    /// Resolves placement (cache hit, else local HRW over cached membership),
+    /// then fetches the sub-range from an owner. The
     /// absolute object offset handed to the worker is
     /// `block.offset + offset_in_block`.
     ///
@@ -135,8 +144,8 @@ impl BlockReader {
     /// ([`WorkerError::Remote`], a [`RefreshReason::WrongOwner`]) does not fail
     /// the read outright: the reader walks the ordered replica list from the
     /// cached placement. If every cached replica is exhausted, it invalidates
-    /// the entry and performs **one** coordinator refresh (which may return a
-    /// newer epoch / different owners), then retries against the fresh primary.
+    /// the entry and performs **one** membership refresh (which may return a
+    /// different worker set), then retries against the fresh primary.
     /// Only if that also fails does the error propagate.
     pub async fn read_block(
         &self,
@@ -168,14 +177,14 @@ impl BlockReader {
             }
             Err(reason) => {
                 // Every cached replica failed; drop the stale placement and do a
-                // single coordinator refresh before giving up.
+                // single membership refresh before giving up.
                 tracing::debug!(%block, ?reason, "all cached replicas failed; refreshing placement");
                 self.cache.invalidate(block, reason);
                 self.stats.record_coordinator_refresh();
             }
         }
 
-        let fresh = self.resolve_and_cache(block, now_ms).await?;
+        let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
         let bytes = self
             .try_replicas(block, &fresh.replicas, abs_offset, len)
             .await
@@ -285,7 +294,7 @@ impl BlockReader {
     ///
     /// Placement is by `BlockId`; a write addresses the object's first block
     /// under `version` (the mount uses a canonical version, #182), so this
-    /// resolves the primary owner of block 0 through the same coordinator +
+    /// resolves the primary owner of block 0 through the same client-side
     /// placement path reads use, reusing the placement cache. Returns the
     /// dialable `host:port` of the primary owner.
     pub async fn resolve_owner(
@@ -307,33 +316,90 @@ impl BlockReader {
             .ok_or(BlockReadError::UnresolvedOwner)
     }
 
-    /// Look the block up via the coordinator and insert the resolved,
-    /// address-ordered placement into the cache.
+    /// Rank the block against cached membership and cache the ordered addresses.
     async fn resolve_and_cache(
         &self,
         block: &BlockId,
         now_ms: u64,
     ) -> Result<Cached, BlockReadError> {
-        let resolved = self
-            .coordinator
-            .locate_primary(block, self.replicas_k)
-            .await?
-            .ok_or(BlockReadError::NoOwners)?;
-        // Map ordered owner ids → dialable worker addresses, preserving order.
-        let replicas: Vec<String> = resolved
-            .owners
+        self.resolve_and_cache_inner(block, now_ms, false).await
+    }
+
+    async fn resolve_and_cache_forced(
+        &self,
+        block: &BlockId,
+        now_ms: u64,
+    ) -> Result<Cached, BlockReadError> {
+        self.resolve_and_cache_inner(block, now_ms, true).await
+    }
+
+    async fn resolve_and_cache_inner(
+        &self,
+        block: &BlockId,
+        now_ms: u64,
+        force_membership_refresh: bool,
+    ) -> Result<Cached, BlockReadError> {
+        let membership = self
+            .membership_snapshot(now_ms, force_membership_refresh)
+            .await?;
+        let owners = rank_cache_workers(block, &membership.nodes, self.replicas_k as usize);
+        if owners.is_empty() {
+            return Err(BlockReadError::NoOwners);
+        }
+        let replicas: Vec<String> = owners
             .iter()
-            .filter_map(|id| resolved.address_of(id).map(String::from))
+            .filter_map(|id| {
+                membership
+                    .nodes
+                    .iter()
+                    .find(|node| &node.id == id)
+                    .map(|node| node.address.clone())
+            })
             .collect();
         if replicas.is_empty() {
             return Err(BlockReadError::UnresolvedOwner);
         }
         let cached = Cached {
             replicas,
-            epoch: resolved.epoch,
+            epoch: membership.epoch,
         };
         self.cache.insert(block.clone(), cached.clone(), now_ms);
         Ok(cached)
+    }
+
+    async fn membership_snapshot(
+        &self,
+        now_ms: u64,
+        force_refresh: bool,
+    ) -> Result<MembershipSnapshot, BlockReadError> {
+        if !force_refresh {
+            if let Some(snapshot) = self.membership.fresh(now_ms) {
+                return Ok(snapshot);
+            }
+        }
+        let _refresh = self.membership_refresh.lock().await;
+        if !force_refresh {
+            if let Some(snapshot) = self.membership.fresh(now_ms) {
+                return Ok(snapshot);
+            }
+        }
+        match self.coordinator.membership().await {
+            Ok(nodes) => {
+                let (snapshot, changed) = self.membership.replace(nodes, now_ms);
+                if changed {
+                    self.cache.clear();
+                }
+                Ok(snapshot)
+            }
+            Err(error) => {
+                if let Some(snapshot) = self.membership.last_good() {
+                    tracing::warn!(%error, "membership refresh failed; using last-good snapshot");
+                    Ok(snapshot)
+                } else {
+                    Err(error.into())
+                }
+            }
+        }
     }
 }
 
@@ -357,8 +423,7 @@ mod tests {
         )
     }
 
-    /// A mock coordinator that answers PlacementLookup then MembershipQuery,
-    /// pointing the single owner `w1` at `worker_addr`.
+    /// A mock coordinator that advertises one worker membership entry.
     async fn mock_coordinator(worker_addr: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -381,12 +446,6 @@ mod tests {
                     full.extend_from_slice(&body);
                     let (_h, msg) = talon_transport::decode(&full).unwrap();
                     let reply = match msg {
-                        ControlMessage::PlacementLookup { .. } => {
-                            ControlMessage::PlacementResponse {
-                                owners: vec![NodeId::new("w1")],
-                                epoch: 3,
-                            }
-                        }
                         ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
                             nodes: vec![NodeInfo {
                                 id: NodeId::new("w1"),
@@ -514,9 +573,27 @@ mod tests {
         addr
     }
 
-    /// A mock coordinator that returns two ordered owners (w1, w2) and resolves
-    /// their addresses via membership.
-    async fn mock_coordinator_two(w1: String, w2: String) -> String {
+    /// Advertise two workers while assigning `primary` to whichever stable ID
+    /// ranks first for the test block.
+    async fn mock_coordinator_two(primary: String, secondary: String) -> String {
+        let candidates = vec![
+            NodeInfo {
+                id: NodeId::new("w1"),
+                address: String::new(),
+                role: NodeRole::Worker,
+            },
+            NodeInfo {
+                id: NodeId::new("w2"),
+                address: String::new(),
+                role: NodeRole::Worker,
+            },
+        ];
+        let first = rank_cache_workers(&block(), &candidates, 1).remove(0);
+        let (w1, w2) = if first == NodeId::new("w1") {
+            (primary, secondary)
+        } else {
+            (secondary, primary)
+        };
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -538,12 +615,6 @@ mod tests {
                     full.extend_from_slice(&body);
                     let (_h, msg) = talon_transport::decode(&full).unwrap();
                     let reply = match msg {
-                        ControlMessage::PlacementLookup { .. } => {
-                            ControlMessage::PlacementResponse {
-                                owners: vec![NodeId::new("w1"), NodeId::new("w2")],
-                                epoch: 3,
-                            }
-                        }
                         ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
                             nodes: vec![
                                 NodeInfo {
@@ -606,7 +677,7 @@ mod tests {
 
     #[tokio::test]
     async fn empty_cluster_yields_no_owners() {
-        // Coordinator answers with zero owners.
+        // Coordinator advertises an empty worker membership.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -616,10 +687,7 @@ mod tests {
             let h = FrameHeader::decode(&hdr).unwrap();
             let mut body = vec![0u8; h.length as usize];
             s.read_exact(&mut body).await.unwrap();
-            let reply = ControlMessage::PlacementResponse {
-                owners: vec![],
-                epoch: 0,
-            };
+            let reply = ControlMessage::MembershipList { nodes: Vec::new() };
             s.write_all(&talon_transport::encode(0, &reply).unwrap())
                 .await
                 .unwrap();
@@ -629,6 +697,45 @@ mod tests {
         let reader = BlockReader::new(CoordinatorClient::new(addr), cache, 1);
         let err = reader.read_block(&block(), 0, 16, 0).await.unwrap_err();
         assert!(matches!(err, BlockReadError::NoOwners));
+    }
+
+    #[tokio::test]
+    async fn coordinator_outage_uses_last_good_membership_for_a_new_block() {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_addr = mock_worker(Arc::clone(&hits)).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut header = [0u8; HEADER_LEN];
+            stream.read_exact(&mut header).await.unwrap();
+            let header = FrameHeader::decode(&header).unwrap();
+            let mut body = vec![0u8; header.length as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            let reply = ControlMessage::MembershipList {
+                nodes: vec![NodeInfo {
+                    id: NodeId::new("worker-a"),
+                    address: worker_addr,
+                    role: NodeRole::Worker,
+                }],
+            };
+            stream
+                .write_all(&talon_transport::encode(0, &reply).unwrap())
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            // Dropping the listener simulates the complete management-plane outage.
+        });
+
+        let cache = Arc::new(PlacementCache::new(0));
+        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1);
+        reader.read_block(&block(), 0, 16, 0).await.unwrap();
+        let mut next = block();
+        next.offset += u64::from(next.block_size);
+        let bytes = reader.read_block(&next, 0, 16, 1).await.unwrap();
+
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -727,14 +834,15 @@ mod tests {
         let cache = Arc::new(PlacementCache::new(10_000));
         let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
 
-        // Warm the cache (mock_coordinator answers epoch=3).
+        // Warm the cache from the locally versioned membership snapshot.
         let _ = reader.read_block(&block(), 0, 8, 0).await.unwrap();
         assert_eq!(cache.len(), 1);
+        let epoch = cache.get(&block(), 0).unwrap().epoch;
         // The identical version token does not invalidate.
-        assert!(!reader.observe_epoch(&block(), 3));
+        assert!(!reader.observe_epoch(&block(), epoch));
         assert_eq!(cache.len(), 1);
         // A different token drops the entry so the next read re-looks-up.
-        assert!(reader.observe_epoch(&block(), 4));
+        assert!(reader.observe_epoch(&block(), epoch.wrapping_add(1)));
         assert_eq!(cache.len(), 0);
     }
 

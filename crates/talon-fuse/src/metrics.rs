@@ -1,7 +1,7 @@
 //! Read-path metrics.
 //!
 //! [`ReadStats`] is a small bundle of atomic counters the read path bumps as it
-//! serves blocks: placement-cache hits and misses, coordinator refreshes,
+//! serves blocks: placement-cache hits and misses, membership refreshes,
 //! per-replica worker fetch attempts and failures, and bytes served. It is
 //! cheap to share (all `Relaxed` atomics behind an `Arc`) and lets the mount
 //! layer expose live read-path health without threading a metrics facade
@@ -41,12 +41,14 @@ impl ReadStats {
         self.inner.cache_hits.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a placement-cache miss (a coordinator lookup was needed).
+    /// Record a placement-cache miss (local ranking was needed).
     pub fn record_cache_miss(&self) {
         self.inner.cache_misses.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a coordinator refresh after all cached replicas failed.
+    /// Record a forced membership refresh after all cached replicas failed.
+    ///
+    /// The method name is retained for metrics API compatibility.
     pub fn record_coordinator_refresh(&self) {
         self.inner
             .coordinator_refreshes
@@ -86,9 +88,11 @@ impl ReadStats {
 pub struct ReadStatsSnapshot {
     /// Placement-cache hits.
     pub cache_hits: u64,
-    /// Placement-cache misses (coordinator lookups triggered).
+    /// Placement-cache misses (local rankings triggered).
     pub cache_misses: u64,
-    /// Coordinator refreshes after all cached replicas failed.
+    /// Forced membership refreshes after all cached replicas failed.
+    ///
+    /// The field name is retained for metrics API compatibility.
     pub coordinator_refreshes: u64,
     /// Worker fetch attempts (per-replica dials).
     pub worker_fetches: u64,

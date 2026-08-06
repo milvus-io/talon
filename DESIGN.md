@@ -36,11 +36,11 @@ deferred until workload data justifies them.
 
 ```
           +-------------------+
-          |    Coordinator    |   placement, membership, epoch
+          |    Coordinator    |   membership, metadata, compatibility lookup
           +-------------------+
              ^   (control)   ^
              |               |
-   heartbeat |               | placement lookup
+   heartbeat |               | membership snapshot
    inventory |               |
              |               |
    +---------+--+       +----+---------+
@@ -289,10 +289,12 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
 
 ## 2. Coordinator
 
-- **Placement:** rendezvous (HRW) hashing, extended to **top-K** to reserve a
-  replica-ordering for later. Assumes stable worker IDs. Consistent-hashing
-  rings / virtual nodes deferred until worker capacities diverge enough to need
-  weighting.
+- **Placement:** clients cache healthy worker membership and run stable,
+  cross-language rendezvous (HRW) hashing locally, extended to **top-K** to
+  reserve a replica ordering for later. The coordinator retains the same
+  implementation for legacy lookup compatibility. Assumes stable worker IDs.
+  Consistent-hashing rings / virtual nodes are deferred until worker capacities
+  diverge enough to need weighting.
 - **Replication:** **RF=1** in v1 — the backing store is the durable source.
   Hot blocks may get RF=2 later once miss cost is measured. Avoid blanket
   multi-copy; it burns NVMe.

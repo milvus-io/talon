@@ -12,6 +12,7 @@ pub mod key;
 pub mod metrics;
 pub mod namespace_policy;
 pub mod node;
+pub mod placement;
 pub mod status;
 pub mod store;
 pub mod trace;
@@ -31,6 +32,7 @@ pub use key::{Backend, BlockId, ObjectId, PageIndex, Version};
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use namespace_policy::{NamespacePolicy, ObjectNamespace};
 pub use node::{NodeId, NodeInfo, NodeRole};
+pub use placement::{cache_membership_epoch, cache_placement_score, rank_cache_workers};
 pub use status::{
     NodeHealth, NodeMetricsSnapshot, NodeStatus, NodeStatusError, MAX_NODE_STATUS_BYTES,
     MAX_STATUS_FIELD_BYTES, MAX_STATUS_LABELS, MAX_STATUS_LABEL_KEY_BYTES,
