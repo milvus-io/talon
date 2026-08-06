@@ -1406,9 +1406,1104 @@ impl FuseConfig {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Async worker
+// ---------------------------------------------------------------------------
+
+/// Fully-resolved async worker configuration.
+///
+/// Deliberately its own type rather than a mode on [`WorkerConfig`]: the two
+/// workers size entirely different things. A block worker is configured in
+/// blocks and pages; this one is configured in regions and shards, and has no
+/// block size at all. Sharing a struct would mean half the knobs being inert
+/// depending on which binary read them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AsyncWorkerConfig {
+    /// Address the data plane binds to.
+    pub listen: String,
+    /// Routable address advertised to the coordinator. Defaults to `listen`.
+    pub advertise_addr: String,
+    /// Address the HTTP administration service binds to.
+    pub admin_listen: String,
+    /// Address of the coordinator to register with.
+    pub coordinator: String,
+    /// Dedicated mTLS listener for coordinator-initiated privileged traffic.
+    pub control_listen: Option<String>,
+    /// Logical cluster advertised in node status.
+    pub cluster_id: String,
+    /// Optional mTLS material for the privileged coordinator-worker channel.
+    pub control_tls: Option<ControlTlsConfig>,
+    /// Stable node identity; defaults to the advertised address when unset.
+    pub node_id: Option<String>,
+    /// Control-plane heartbeat interval in milliseconds.
+    pub heartbeat_interval_ms: u64,
+    /// Directory holding the region-packed shard files.
+    ///
+    /// Wiped and recreated at startup: run descriptors live only in memory, so
+    /// whatever is on disk from a previous process is unaddressable (ADR 0005
+    /// section 7). Point this at a dedicated directory, never a shared one.
+    pub cache_dir: PathBuf,
+    /// Ceiling on total NVMe bytes, rounded down to whole 64 MiB regions.
+    pub capacity_bytes: u64,
+    /// Number of shard files. Must be a power of two.
+    pub disk_shards: usize,
+    /// Verify a digest on every NVMe read that passes through userspace.
+    ///
+    /// Defaults on. A region is shared by many extents, so a torn write
+    /// silently returns another extent's bytes rather than obvious garbage,
+    /// and that is worth a digest. Zero-copy `sendfile` responses bypass
+    /// userspace and are not covered either way.
+    pub checksums_enabled: bool,
+    /// L1 DRAM ceiling in bytes. Zero disables L1 and switches the NVMe tier
+    /// to admitting on first miss.
+    pub l1_capacity_bytes: u64,
+    /// L1 shard count. Must be a power of two.
+    pub l1_shards: usize,
+    /// Object-store backend selector: `azure`, `s3`, or `gcs`.
+    pub backend: Option<String>,
+    /// Azure Blob storage account for the backend origin.
+    pub azure_account: Option<String>,
+    /// Optional Azure endpoint host overriding the public cloud endpoint.
+    pub azure_endpoint: Option<String>,
+    /// S3 region. Required when `backend = s3`.
+    pub s3_region: Option<String>,
+    /// S3 endpoint host override (MinIO/LocalStack).
+    pub s3_endpoint: Option<String>,
+    /// S3 access key id. The secret key is env-only.
+    pub s3_access_key_id: Option<String>,
+    /// Use S3 path-style addressing. Required by most S3-compatible emulators.
+    pub s3_path_style: Option<bool>,
+    /// GCS endpoint host override (fake-gcs-server).
+    pub gcs_endpoint: Option<String>,
+    /// Retries after the initial attempt for a transient backend failure.
+    pub backend_max_retries: Option<u32>,
+    /// Base of the exponential backoff between retries, in milliseconds.
+    pub backend_retry_base_ms: Option<u64>,
+    /// Ceiling on any single backoff wait, in milliseconds.
+    pub backend_retry_max_delay_ms: Option<u64>,
+    /// Fixed part of the per-attempt deadline, in milliseconds.
+    pub backend_timeout_floor_ms: Option<u64>,
+    /// Throughput floor (bytes/second) extending the per-attempt deadline by
+    /// transfer size.
+    pub backend_min_throughput_bytes: Option<u64>,
+}
+
+impl Default for AsyncWorkerConfig {
+    fn default() -> Self {
+        Self {
+            // Distinct from the block worker's 7001/8001 so both can run on one
+            // host during a migration without a port collision.
+            listen: "127.0.0.1:7101".into(),
+            advertise_addr: "127.0.0.1:7101".into(),
+            admin_listen: "127.0.0.1:8101".into(),
+            coordinator: "127.0.0.1:7000".into(),
+            control_listen: None,
+            cluster_id: "default".into(),
+            control_tls: None,
+            node_id: None,
+            heartbeat_interval_ms: 5_000,
+            cache_dir: PathBuf::from("/var/cache/talon-extents"),
+            capacity_bytes: 64 << 30,
+            disk_shards: 8,
+            checksums_enabled: true,
+            l1_capacity_bytes: 0,
+            l1_shards: 16,
+            backend: None,
+            azure_account: None,
+            azure_endpoint: None,
+            s3_region: None,
+            s3_endpoint: None,
+            s3_access_key_id: None,
+            s3_path_style: None,
+            gcs_endpoint: None,
+            backend_max_retries: None,
+            backend_retry_base_ms: None,
+            backend_retry_max_delay_ms: None,
+            backend_timeout_floor_ms: None,
+            backend_min_throughput_bytes: None,
+        }
+    }
+}
+
+/// An optional-field overlay for [`AsyncWorkerConfig`].
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AsyncWorkerConfigPatch {
+    /// Override for [`AsyncWorkerConfig::listen`].
+    pub listen: Option<String>,
+    /// Override for [`AsyncWorkerConfig::advertise_addr`].
+    pub advertise_addr: Option<String>,
+    /// Override for [`AsyncWorkerConfig::admin_listen`].
+    pub admin_listen: Option<String>,
+    /// Override for [`AsyncWorkerConfig::coordinator`].
+    pub coordinator: Option<String>,
+    /// Override for [`AsyncWorkerConfig::control_listen`].
+    pub control_listen: Option<String>,
+    /// Override for [`AsyncWorkerConfig::cluster_id`].
+    pub cluster_id: Option<String>,
+    /// Optional `[control_tls]` block.
+    pub control_tls: Option<ControlTlsConfigPatch>,
+    /// Override for [`AsyncWorkerConfig::node_id`].
+    pub node_id: Option<String>,
+    /// Override for [`AsyncWorkerConfig::heartbeat_interval_ms`].
+    pub heartbeat_interval_ms: Option<u64>,
+    /// Override for [`AsyncWorkerConfig::cache_dir`].
+    pub cache_dir: Option<PathBuf>,
+    /// Override for [`AsyncWorkerConfig::capacity_bytes`].
+    pub capacity_bytes: Option<u64>,
+    /// Override for [`AsyncWorkerConfig::disk_shards`].
+    pub disk_shards: Option<usize>,
+    /// Override for [`AsyncWorkerConfig::checksums_enabled`].
+    pub checksums_enabled: Option<bool>,
+    /// Override for [`AsyncWorkerConfig::l1_capacity_bytes`].
+    pub l1_capacity_bytes: Option<u64>,
+    /// Override for [`AsyncWorkerConfig::l1_shards`].
+    pub l1_shards: Option<usize>,
+    /// Override for [`AsyncWorkerConfig::backend`].
+    pub backend: Option<String>,
+    /// Override for [`AsyncWorkerConfig::azure_account`].
+    pub azure_account: Option<String>,
+    /// Override for [`AsyncWorkerConfig::azure_endpoint`].
+    pub azure_endpoint: Option<String>,
+    /// Override for [`AsyncWorkerConfig::s3_region`].
+    pub s3_region: Option<String>,
+    /// Override for [`AsyncWorkerConfig::s3_endpoint`].
+    pub s3_endpoint: Option<String>,
+    /// Override for [`AsyncWorkerConfig::s3_access_key_id`].
+    pub s3_access_key_id: Option<String>,
+    /// Override for [`AsyncWorkerConfig::s3_path_style`].
+    pub s3_path_style: Option<bool>,
+    /// Override for [`AsyncWorkerConfig::gcs_endpoint`].
+    pub gcs_endpoint: Option<String>,
+    /// Override for [`AsyncWorkerConfig::backend_max_retries`].
+    pub backend_max_retries: Option<u32>,
+    /// Override for [`AsyncWorkerConfig::backend_retry_base_ms`].
+    pub backend_retry_base_ms: Option<u64>,
+    /// Override for [`AsyncWorkerConfig::backend_retry_max_delay_ms`].
+    pub backend_retry_max_delay_ms: Option<u64>,
+    /// Override for [`AsyncWorkerConfig::backend_timeout_floor_ms`].
+    pub backend_timeout_floor_ms: Option<u64>,
+    /// Override for [`AsyncWorkerConfig::backend_min_throughput_bytes`].
+    pub backend_min_throughput_bytes: Option<u64>,
+}
+
+impl Patch for AsyncWorkerConfigPatch {
+    fn merge(self, base: Self) -> Self {
+        Self {
+            listen: self.listen.or(base.listen),
+            advertise_addr: self.advertise_addr.or(base.advertise_addr),
+            admin_listen: self.admin_listen.or(base.admin_listen),
+            coordinator: self.coordinator.or(base.coordinator),
+            control_listen: self.control_listen.or(base.control_listen),
+            cluster_id: self.cluster_id.or(base.cluster_id),
+            control_tls: merge_control_tls(self.control_tls, base.control_tls),
+            node_id: self.node_id.or(base.node_id),
+            heartbeat_interval_ms: self.heartbeat_interval_ms.or(base.heartbeat_interval_ms),
+            cache_dir: self.cache_dir.or(base.cache_dir),
+            capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            disk_shards: self.disk_shards.or(base.disk_shards),
+            checksums_enabled: self.checksums_enabled.or(base.checksums_enabled),
+            l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
+            l1_shards: self.l1_shards.or(base.l1_shards),
+            backend: self.backend.or(base.backend),
+            azure_account: self.azure_account.or(base.azure_account),
+            azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
+            s3_region: self.s3_region.or(base.s3_region),
+            s3_endpoint: self.s3_endpoint.or(base.s3_endpoint),
+            s3_access_key_id: self.s3_access_key_id.or(base.s3_access_key_id),
+            s3_path_style: self.s3_path_style.or(base.s3_path_style),
+            gcs_endpoint: self.gcs_endpoint.or(base.gcs_endpoint),
+            backend_max_retries: self.backend_max_retries.or(base.backend_max_retries),
+            backend_retry_base_ms: self.backend_retry_base_ms.or(base.backend_retry_base_ms),
+            backend_retry_max_delay_ms: self
+                .backend_retry_max_delay_ms
+                .or(base.backend_retry_max_delay_ms),
+            backend_timeout_floor_ms: self
+                .backend_timeout_floor_ms
+                .or(base.backend_timeout_floor_ms),
+            backend_min_throughput_bytes: self
+                .backend_min_throughput_bytes
+                .or(base.backend_min_throughput_bytes),
+        }
+    }
+}
+
+/// Single source of truth for the async worker's `TALON_ASYNC_WORKER_*`
+/// environment variables, shared by the parser and the documentation generator.
+pub const ASYNC_WORKER_ENV_SCHEMA: &[ConfigVar] = &[
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_LISTEN",
+        key: "listen",
+        default: Some("127.0.0.1:7101"),
+        cli: true,
+        secret: false,
+        help: "Data-plane bind address.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_ADVERTISE_ADDR",
+        key: "advertise_addr",
+        default: Some("<listen>"),
+        cli: true,
+        secret: false,
+        help: "Routable address advertised to the coordinator.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_ADMIN_LISTEN",
+        key: "admin_listen",
+        default: Some("127.0.0.1:8101"),
+        cli: true,
+        secret: false,
+        help: "Admin HTTP bind address: metrics, health, ready.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_COORDINATOR",
+        key: "coordinator",
+        default: Some("127.0.0.1:7000"),
+        cli: true,
+        secret: false,
+        help: "Coordinator control-plane address to register with.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CONTROL_LISTEN",
+        key: "control_listen",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Dedicated mTLS listener for privileged coordinator traffic.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CONTROL_TLS_CA_CERT_PATH",
+        key: "control_tls.ca_cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM bundle of CAs trusted on the control listener.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CONTROL_TLS_CERT_PATH",
+        key: "control_tls.cert_path",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "PEM certificate chain presented on the control listener.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CONTROL_TLS_KEY_PATH",
+        key: "control_tls.key_path",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "PEM private key for the control listener certificate.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CONTROL_TLS_TRUST_DOMAIN",
+        key: "control_tls.trust_domain",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "SPIFFE trust domain required of the coordinator's identity.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CLUSTER_ID",
+        key: "cluster_id",
+        default: Some("default"),
+        cli: true,
+        secret: false,
+        help: "Logical cluster advertised in node status.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_NODE_ID",
+        key: "node_id",
+        default: Some("<advertise_addr>"),
+        cli: true,
+        secret: false,
+        help: "Stable node identity.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_HEARTBEAT_INTERVAL_MS",
+        key: "heartbeat_interval_ms",
+        default: Some("5000"),
+        cli: false,
+        secret: false,
+        help: "Control-plane heartbeat interval (ms).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CACHE_DIR",
+        key: "cache_dir",
+        default: Some("/var/cache/talon-extents"),
+        cli: true,
+        secret: false,
+        help: "Directory for region-packed shard files. Wiped at startup.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CAPACITY_BYTES",
+        key: "capacity_bytes",
+        default: Some("68719476736"),
+        cli: true,
+        secret: false,
+        help: "NVMe ceiling (bytes), rounded down to whole 64 MiB regions.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_DISK_SHARDS",
+        key: "disk_shards",
+        default: Some("8"),
+        cli: false,
+        secret: false,
+        help: "Number of shard files. Must be a power of two.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_CHECKSUMS_ENABLED",
+        key: "checksums_enabled",
+        default: Some("true"),
+        cli: false,
+        secret: false,
+        help: "Verify a digest on every NVMe read through userspace.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_L1_CAPACITY_BYTES",
+        key: "l1_capacity_bytes",
+        default: Some("0"),
+        cli: true,
+        secret: false,
+        help: "DRAM tier ceiling (bytes). Zero disables L1.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_L1_SHARDS",
+        key: "l1_shards",
+        default: Some("16"),
+        cli: false,
+        secret: false,
+        help: "DRAM tier shard count. Must be a power of two.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_BACKEND",
+        key: "backend",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Object-store backend: azure, s3, or gcs.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_AZURE_ACCOUNT",
+        key: "azure_account",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Azure Blob storage account.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_AZURE_ENDPOINT",
+        key: "azure_endpoint",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "Azure endpoint host override (Azurite/proxy).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_AZURE_SAS",
+        key: "azure_sas",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "Azure SAS token. Environment only; never logged.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_S3_REGION",
+        key: "s3_region",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "S3 region. Required when backend = s3.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_S3_ENDPOINT",
+        key: "s3_endpoint",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "S3 endpoint host override (MinIO/LocalStack).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_S3_ACCESS_KEY_ID",
+        key: "s3_access_key_id",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "S3 access key id.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_S3_SECRET_ACCESS_KEY",
+        key: "s3_secret_access_key",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "S3 secret access key. Environment only; never logged.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_S3_SESSION_TOKEN",
+        key: "s3_session_token",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "S3 session token for STS credentials. Environment only.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_S3_PATH_STYLE",
+        key: "s3_path_style",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Use S3 path-style addressing (endpoint/bucket/key).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_GCS_ENDPOINT",
+        key: "gcs_endpoint",
+        default: None,
+        cli: true,
+        secret: false,
+        help: "GCS endpoint host override (fake-gcs-server).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_GCS_BEARER_TOKEN",
+        key: "gcs_bearer_token",
+        default: None,
+        cli: false,
+        secret: true,
+        help: "GCS OAuth2 bearer token. Environment only; never logged.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_BACKEND_MAX_RETRIES",
+        key: "backend_max_retries",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Retries after the initial attempt on a transient failure.",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_BACKEND_RETRY_BASE_MS",
+        key: "backend_retry_base_ms",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Exponential backoff base between retries (ms).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_BACKEND_RETRY_MAX_DELAY_MS",
+        key: "backend_retry_max_delay_ms",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Ceiling on any single backoff wait (ms).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_BACKEND_TIMEOUT_FLOOR_MS",
+        key: "backend_timeout_floor_ms",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Fixed part of the per-attempt deadline (ms).",
+    },
+    ConfigVar {
+        env: "TALON_ASYNC_WORKER_BACKEND_MIN_THROUGHPUT_BYTES",
+        key: "backend_min_throughput_bytes",
+        default: None,
+        cli: false,
+        secret: false,
+        help: "Throughput floor extending the deadline by transfer size.",
+    },
+];
+
+pub(crate) mod async_worker_env {
+    pub const LISTEN: &str = "TALON_ASYNC_WORKER_LISTEN";
+    pub const ADVERTISE_ADDR: &str = "TALON_ASYNC_WORKER_ADVERTISE_ADDR";
+    pub const ADMIN_LISTEN: &str = "TALON_ASYNC_WORKER_ADMIN_LISTEN";
+    pub const COORDINATOR: &str = "TALON_ASYNC_WORKER_COORDINATOR";
+    pub const CONTROL_LISTEN: &str = "TALON_ASYNC_WORKER_CONTROL_LISTEN";
+    pub const CLUSTER_ID: &str = "TALON_ASYNC_WORKER_CLUSTER_ID";
+    pub const CONTROL_TLS_CA_CERT_PATH: &str = "TALON_ASYNC_WORKER_CONTROL_TLS_CA_CERT_PATH";
+    pub const CONTROL_TLS_CERT_PATH: &str = "TALON_ASYNC_WORKER_CONTROL_TLS_CERT_PATH";
+    pub const CONTROL_TLS_KEY_PATH: &str = "TALON_ASYNC_WORKER_CONTROL_TLS_KEY_PATH";
+    pub const CONTROL_TLS_TRUST_DOMAIN: &str = "TALON_ASYNC_WORKER_CONTROL_TLS_TRUST_DOMAIN";
+    pub const NODE_ID: &str = "TALON_ASYNC_WORKER_NODE_ID";
+    pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_ASYNC_WORKER_HEARTBEAT_INTERVAL_MS";
+    pub const CACHE_DIR: &str = "TALON_ASYNC_WORKER_CACHE_DIR";
+    pub const CAPACITY_BYTES: &str = "TALON_ASYNC_WORKER_CAPACITY_BYTES";
+    pub const DISK_SHARDS: &str = "TALON_ASYNC_WORKER_DISK_SHARDS";
+    pub const CHECKSUMS_ENABLED: &str = "TALON_ASYNC_WORKER_CHECKSUMS_ENABLED";
+    pub const L1_CAPACITY_BYTES: &str = "TALON_ASYNC_WORKER_L1_CAPACITY_BYTES";
+    pub const L1_SHARDS: &str = "TALON_ASYNC_WORKER_L1_SHARDS";
+    pub const BACKEND: &str = "TALON_ASYNC_WORKER_BACKEND";
+    pub const AZURE_ACCOUNT: &str = "TALON_ASYNC_WORKER_AZURE_ACCOUNT";
+    pub const AZURE_ENDPOINT: &str = "TALON_ASYNC_WORKER_AZURE_ENDPOINT";
+    pub const AZURE_SAS: &str = "TALON_ASYNC_WORKER_AZURE_SAS";
+    pub const S3_REGION: &str = "TALON_ASYNC_WORKER_S3_REGION";
+    pub const S3_ENDPOINT: &str = "TALON_ASYNC_WORKER_S3_ENDPOINT";
+    pub const S3_ACCESS_KEY_ID: &str = "TALON_ASYNC_WORKER_S3_ACCESS_KEY_ID";
+    pub const S3_SECRET_ACCESS_KEY: &str = "TALON_ASYNC_WORKER_S3_SECRET_ACCESS_KEY";
+    pub const S3_SESSION_TOKEN: &str = "TALON_ASYNC_WORKER_S3_SESSION_TOKEN";
+    pub const S3_PATH_STYLE: &str = "TALON_ASYNC_WORKER_S3_PATH_STYLE";
+    pub const GCS_ENDPOINT: &str = "TALON_ASYNC_WORKER_GCS_ENDPOINT";
+    pub const GCS_BEARER_TOKEN: &str = "TALON_ASYNC_WORKER_GCS_BEARER_TOKEN";
+    pub const BACKEND_MAX_RETRIES: &str = "TALON_ASYNC_WORKER_BACKEND_MAX_RETRIES";
+    pub const BACKEND_RETRY_BASE_MS: &str = "TALON_ASYNC_WORKER_BACKEND_RETRY_BASE_MS";
+    pub const BACKEND_RETRY_MAX_DELAY_MS: &str = "TALON_ASYNC_WORKER_BACKEND_RETRY_MAX_DELAY_MS";
+    pub const BACKEND_TIMEOUT_FLOOR_MS: &str = "TALON_ASYNC_WORKER_BACKEND_TIMEOUT_FLOOR_MS";
+    pub const BACKEND_MIN_THROUGHPUT_BYTES: &str =
+        "TALON_ASYNC_WORKER_BACKEND_MIN_THROUGHPUT_BYTES";
+}
+
+/// Read the async worker's Azure SAS token from the environment.
+///
+/// Kept out of [`AsyncWorkerConfig`] so the secret is never serialized,
+/// printed via `Debug`, or logged.
+pub fn async_azure_sas_from_env() -> Option<String> {
+    std::env::var(async_worker_env::AZURE_SAS)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the async worker's S3 secret access key from the environment.
+pub fn async_s3_secret_key_from_env() -> Option<String> {
+    std::env::var(async_worker_env::S3_SECRET_ACCESS_KEY)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the async worker's S3 session token from the environment.
+pub fn async_s3_session_token_from_env() -> Option<String> {
+    std::env::var(async_worker_env::S3_SESSION_TOKEN)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+/// Read the async worker's GCS bearer token from the environment.
+pub fn async_gcs_bearer_from_env() -> Option<String> {
+    std::env::var(async_worker_env::GCS_BEARER_TOKEN)
+        .ok()
+        .filter(|s| !s.is_empty())
+}
+
+impl AsyncWorkerConfigPatch {
+    /// Parse a patch from a TOML config-file string.
+    pub fn from_toml(s: &str) -> Result<Self> {
+        toml::from_str(s).map_err(|e| Error::Other(format!("invalid config file: {e}")))
+    }
+
+    /// Read a patch from a TOML file path. A missing file yields an empty patch.
+    pub fn from_file(path: &std::path::Path) -> Result<Self> {
+        match std::fs::read_to_string(path) {
+            Ok(s) => Self::from_toml(&s),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Assemble a patch from `TALON_ASYNC_WORKER_*` environment variables.
+    pub fn from_env() -> Result<Self> {
+        Self::from_env_with(|k| std::env::var(k).ok())
+    }
+
+    /// Like [`from_env`](Self::from_env) but with an injectable lookup, for tests.
+    pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let parse_u32 = |v: String, k: &str| {
+            v.parse::<u32>()
+                .map_err(|_| Error::Other(format!("{k}: invalid u32: {v:?}")))
+        };
+        let parse_u64 = |v: String, k: &str| {
+            v.parse::<u64>()
+                .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
+        };
+        let parse_usize = |v: String, k: &str| {
+            v.parse::<usize>()
+                .map_err(|_| Error::Other(format!("{k}: invalid usize: {v:?}")))
+        };
+        let parse_bool = |v: String, k: &str| match v.as_str() {
+            "1" | "true" | "TRUE" | "yes" => Ok(true),
+            "0" | "false" | "FALSE" | "no" => Ok(false),
+            _ => Err(Error::Other(format!("{k}: invalid bool: {v:?}"))),
+        };
+        let e = async_worker_env::CAPACITY_BYTES;
+        Ok(Self {
+            listen: get(async_worker_env::LISTEN),
+            advertise_addr: get(async_worker_env::ADVERTISE_ADDR),
+            admin_listen: get(async_worker_env::ADMIN_LISTEN),
+            coordinator: get(async_worker_env::COORDINATOR),
+            control_listen: get(async_worker_env::CONTROL_LISTEN),
+            cluster_id: get(async_worker_env::CLUSTER_ID),
+            control_tls: optional_control_tls_patch(
+                get(async_worker_env::CONTROL_TLS_CA_CERT_PATH),
+                get(async_worker_env::CONTROL_TLS_CERT_PATH),
+                get(async_worker_env::CONTROL_TLS_KEY_PATH),
+                get(async_worker_env::CONTROL_TLS_TRUST_DOMAIN),
+            ),
+            node_id: get(async_worker_env::NODE_ID),
+            heartbeat_interval_ms: get(async_worker_env::HEARTBEAT_INTERVAL_MS)
+                .map(|v| parse_u64(v, async_worker_env::HEARTBEAT_INTERVAL_MS))
+                .transpose()?,
+            cache_dir: get(async_worker_env::CACHE_DIR).map(PathBuf::from),
+            capacity_bytes: get(e).map(|v| parse_u64(v, e)).transpose()?,
+            disk_shards: get(async_worker_env::DISK_SHARDS)
+                .map(|v| parse_usize(v, async_worker_env::DISK_SHARDS))
+                .transpose()?,
+            checksums_enabled: get(async_worker_env::CHECKSUMS_ENABLED)
+                .map(|v| parse_bool(v, async_worker_env::CHECKSUMS_ENABLED))
+                .transpose()?,
+            l1_capacity_bytes: get(async_worker_env::L1_CAPACITY_BYTES)
+                .map(|v| parse_u64(v, async_worker_env::L1_CAPACITY_BYTES))
+                .transpose()?,
+            l1_shards: get(async_worker_env::L1_SHARDS)
+                .map(|v| parse_usize(v, async_worker_env::L1_SHARDS))
+                .transpose()?,
+            backend: get(async_worker_env::BACKEND),
+            azure_account: get(async_worker_env::AZURE_ACCOUNT),
+            azure_endpoint: get(async_worker_env::AZURE_ENDPOINT),
+            s3_region: get(async_worker_env::S3_REGION),
+            s3_endpoint: get(async_worker_env::S3_ENDPOINT),
+            s3_access_key_id: get(async_worker_env::S3_ACCESS_KEY_ID),
+            s3_path_style: get(async_worker_env::S3_PATH_STYLE)
+                .map(|v| parse_bool(v, async_worker_env::S3_PATH_STYLE))
+                .transpose()?,
+            gcs_endpoint: get(async_worker_env::GCS_ENDPOINT),
+            backend_max_retries: get(async_worker_env::BACKEND_MAX_RETRIES)
+                .map(|v| parse_u32(v, async_worker_env::BACKEND_MAX_RETRIES))
+                .transpose()?,
+            backend_retry_base_ms: get(async_worker_env::BACKEND_RETRY_BASE_MS)
+                .map(|v| parse_u64(v, async_worker_env::BACKEND_RETRY_BASE_MS))
+                .transpose()?,
+            backend_retry_max_delay_ms: get(async_worker_env::BACKEND_RETRY_MAX_DELAY_MS)
+                .map(|v| parse_u64(v, async_worker_env::BACKEND_RETRY_MAX_DELAY_MS))
+                .transpose()?,
+            backend_timeout_floor_ms: get(async_worker_env::BACKEND_TIMEOUT_FLOOR_MS)
+                .map(|v| parse_u64(v, async_worker_env::BACKEND_TIMEOUT_FLOOR_MS))
+                .transpose()?,
+            backend_min_throughput_bytes: get(async_worker_env::BACKEND_MIN_THROUGHPUT_BYTES)
+                .map(|v| parse_u64(v, async_worker_env::BACKEND_MIN_THROUGHPUT_BYTES))
+                .transpose()?,
+        })
+    }
+}
+
+impl AsyncWorkerConfig {
+    /// Resolve config across all layers: defaults < file < env < CLI.
+    pub fn resolve(
+        file: AsyncWorkerConfigPatch,
+        env: AsyncWorkerConfigPatch,
+        cli: AsyncWorkerConfigPatch,
+    ) -> Result<Self> {
+        let merged = cli.merge(env).merge(file);
+        let d = AsyncWorkerConfig::default();
+        let listen = merged.listen.unwrap_or(d.listen);
+        let cfg = AsyncWorkerConfig {
+            // advertise defaults to listen, so a wildcard bind still advertises
+            // something dialable when the operator sets only one of them.
+            advertise_addr: merged.advertise_addr.unwrap_or_else(|| listen.clone()),
+            listen,
+            admin_listen: merged.admin_listen.unwrap_or(d.admin_listen),
+            coordinator: merged.coordinator.unwrap_or(d.coordinator),
+            control_listen: merged.control_listen.or(d.control_listen),
+            cluster_id: merged.cluster_id.unwrap_or(d.cluster_id),
+            control_tls: merged.control_tls.unwrap_or_default().resolve()?,
+            node_id: merged.node_id.or(d.node_id),
+            heartbeat_interval_ms: merged
+                .heartbeat_interval_ms
+                .unwrap_or(d.heartbeat_interval_ms),
+            cache_dir: merged.cache_dir.unwrap_or(d.cache_dir),
+            capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
+            disk_shards: merged.disk_shards.unwrap_or(d.disk_shards),
+            checksums_enabled: merged.checksums_enabled.unwrap_or(d.checksums_enabled),
+            l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
+            l1_shards: merged.l1_shards.unwrap_or(d.l1_shards),
+            backend: merged.backend.or(d.backend),
+            azure_account: merged.azure_account.or(d.azure_account),
+            azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
+            s3_region: merged.s3_region.or(d.s3_region),
+            s3_endpoint: merged.s3_endpoint.or(d.s3_endpoint),
+            s3_access_key_id: merged.s3_access_key_id.or(d.s3_access_key_id),
+            s3_path_style: merged.s3_path_style.or(d.s3_path_style),
+            gcs_endpoint: merged.gcs_endpoint.or(d.gcs_endpoint),
+            backend_max_retries: merged.backend_max_retries.or(d.backend_max_retries),
+            backend_retry_base_ms: merged.backend_retry_base_ms.or(d.backend_retry_base_ms),
+            backend_retry_max_delay_ms: merged
+                .backend_retry_max_delay_ms
+                .or(d.backend_retry_max_delay_ms),
+            backend_timeout_floor_ms: merged
+                .backend_timeout_floor_ms
+                .or(d.backend_timeout_floor_ms),
+            backend_min_throughput_bytes: merged
+                .backend_min_throughput_bytes
+                .or(d.backend_min_throughput_bytes),
+        };
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// The effective node identity: the explicit id, else the advertised address.
+    pub fn effective_node_id(&self) -> String {
+        self.node_id
+            .clone()
+            .unwrap_or_else(|| self.advertise_addr.clone())
+    }
+
+    /// Fail fast on invalid configuration with an actionable message.
+    pub fn validate(&self) -> Result<()> {
+        if self.listen.is_empty() {
+            return Err(Error::Other("listen must not be empty".into()));
+        }
+        if self.advertise_addr.is_empty() {
+            return Err(Error::Other("advertise_addr must not be empty".into()));
+        }
+        if self.coordinator.is_empty() {
+            return Err(Error::Other("coordinator address must not be empty".into()));
+        }
+        if self.cluster_id.is_empty() {
+            return Err(Error::Other("cluster_id must not be empty".into()));
+        }
+        // A control listener without TLS material would accept unauthenticated
+        // privileged traffic; TLS material without a listener is dead config
+        // that reads as if the listener were protected.
+        if self.control_listen.is_some() != self.control_tls.is_some() {
+            return Err(Error::Other(
+                "control_listen and [control_tls] must be configured together".into(),
+            ));
+        }
+        if self.control_listen.as_ref().is_some_and(String::is_empty) {
+            return Err(Error::Other(
+                "control_listen address must not be empty when set".into(),
+            ));
+        }
+        if let Some(control_tls) = &self.control_tls {
+            control_tls.validate()?;
+        }
+        if self.cache_dir.as_os_str().is_empty() {
+            return Err(Error::Other("cache_dir must not be empty".into()));
+        }
+        if self.heartbeat_interval_ms == 0 {
+            return Err(Error::Other("heartbeat_interval_ms must be > 0".into()));
+        }
+        // Both shard counts index by mask, so a non-power-of-two silently drops
+        // part of the keyspace onto shard 0 instead of failing.
+        if !self.disk_shards.is_power_of_two() {
+            return Err(Error::Other(format!(
+                "disk_shards must be a power of two, got {}",
+                self.disk_shards
+            )));
+        }
+        if !self.l1_shards.is_power_of_two() {
+            return Err(Error::Other(format!(
+                "l1_shards must be a power of two, got {}",
+                self.l1_shards
+            )));
+        }
+        // A capacity below one region rounds down to zero regions, which would
+        // start a worker whose NVMe tier silently accepts nothing.
+        const REGION_BYTES: u64 = 64 << 20;
+        if self.capacity_bytes < REGION_BYTES {
+            return Err(Error::Other(format!(
+                "capacity_bytes must be at least one 64 MiB region ({REGION_BYTES}), got {}",
+                self.capacity_bytes
+            )));
+        }
+        if self.capacity_bytes / REGION_BYTES < self.disk_shards as u64 {
+            return Err(Error::Other(format!(
+                "capacity_bytes {} is fewer than one 64 MiB region per shard ({} shards); \
+                 raise the capacity or lower disk_shards",
+                self.capacity_bytes, self.disk_shards
+            )));
+        }
+        if let Some(backend) = &self.backend {
+            if backend.parse::<crate::Backend>().is_err() {
+                return Err(Error::Other(format!(
+                    "backend must be one of azure, s3, gcs; got {backend:?}"
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -----------------------------------------------------------------
+    // Async worker
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn async_worker_defaults_are_valid_and_do_not_collide_with_the_block_worker() {
+        let a = AsyncWorkerConfig::default();
+        a.validate().expect("defaults must validate");
+
+        // Both binaries must be able to run on one host during a migration, so
+        // no default port may be shared with the block worker.
+        let w = WorkerConfig::default();
+        assert_ne!(a.listen, w.listen);
+        assert_ne!(a.admin_listen, w.admin_listen);
+        // The coordinator is the one address they deliberately agree on.
+        assert_eq!(a.coordinator, w.coordinator);
+        // And they must not fight over the same cache directory.
+        assert_ne!(
+            a.cache_dir.as_path(),
+            w.cache_dirs.first().map(PathBuf::as_path).unwrap()
+        );
+    }
+
+    #[test]
+    fn async_worker_precedence_is_cli_over_env_over_file_over_default() {
+        let file = AsyncWorkerConfigPatch {
+            listen: Some("0.0.0.0:1".into()),
+            cluster_id: Some("from-file".into()),
+            capacity_bytes: Some(8 << 30),
+            ..Default::default()
+        };
+        let env = AsyncWorkerConfigPatch {
+            listen: Some("0.0.0.0:2".into()),
+            cluster_id: Some("from-env".into()),
+            ..Default::default()
+        };
+        let cli = AsyncWorkerConfigPatch {
+            listen: Some("0.0.0.0:3".into()),
+            ..Default::default()
+        };
+        let cfg = AsyncWorkerConfig::resolve(file, env, cli).unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:3", "CLI wins");
+        assert_eq!(cfg.cluster_id, "from-env", "env beats file");
+        assert_eq!(cfg.capacity_bytes, 8 << 30, "file beats default");
+        assert_eq!(cfg.disk_shards, 8, "untouched keys keep the default");
+    }
+
+    #[test]
+    fn async_worker_advertise_addr_defaults_to_listen() {
+        let cli = AsyncWorkerConfigPatch {
+            listen: Some("10.0.0.7:7101".into()),
+            ..Default::default()
+        };
+        let cfg = AsyncWorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.advertise_addr, "10.0.0.7:7101");
+        // And with no explicit node id, identity follows the advertised address.
+        assert_eq!(cfg.effective_node_id(), "10.0.0.7:7101");
+    }
+
+    #[test]
+    fn async_worker_node_id_overrides_the_advertised_address() {
+        let cli = AsyncWorkerConfigPatch {
+            node_id: Some("aw-3".into()),
+            ..Default::default()
+        };
+        let cfg = AsyncWorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap();
+        assert_eq!(cfg.effective_node_id(), "aw-3");
+    }
+
+    #[test]
+    fn async_worker_from_env_parses_typed_fields() {
+        let vars = [
+            (async_worker_env::LISTEN, "0.0.0.0:7101"),
+            (async_worker_env::CAPACITY_BYTES, "2147483648"),
+            (async_worker_env::DISK_SHARDS, "4"),
+            (async_worker_env::CHECKSUMS_ENABLED, "false"),
+            (async_worker_env::L1_CAPACITY_BYTES, "1048576"),
+            (async_worker_env::L1_SHARDS, "32"),
+            (async_worker_env::S3_PATH_STYLE, "true"),
+            (async_worker_env::BACKEND_MAX_RETRIES, "7"),
+            (async_worker_env::BACKEND_MIN_THROUGHPUT_BYTES, "1000000"),
+        ];
+        let patch = AsyncWorkerConfigPatch::from_env_with(|k| {
+            vars.iter()
+                .find(|(name, _)| *name == k)
+                .map(|(_, v)| (*v).to_string())
+        })
+        .unwrap();
+        let cfg =
+            AsyncWorkerConfig::resolve(Default::default(), patch, Default::default()).unwrap();
+        assert_eq!(cfg.listen, "0.0.0.0:7101");
+        assert_eq!(cfg.capacity_bytes, 2 << 30);
+        assert_eq!(cfg.disk_shards, 4);
+        assert!(!cfg.checksums_enabled);
+        assert_eq!(cfg.l1_capacity_bytes, 1 << 20);
+        assert_eq!(cfg.l1_shards, 32);
+        assert_eq!(cfg.s3_path_style, Some(true));
+        assert_eq!(cfg.backend_max_retries, Some(7));
+        assert_eq!(cfg.backend_min_throughput_bytes, Some(1_000_000));
+    }
+
+    #[test]
+    fn async_worker_rejects_a_malformed_environment_value() {
+        let err = AsyncWorkerConfigPatch::from_env_with(|k| {
+            (k == async_worker_env::DISK_SHARDS).then(|| "eight".to_string())
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("DISK_SHARDS"),
+            "the error must name the offending variable, got {err}"
+        );
+    }
+
+    #[test]
+    fn async_worker_from_toml_parses_and_rejects_unknown() {
+        let patch = AsyncWorkerConfigPatch::from_toml(
+            "listen = \"0.0.0.0:7101\"\n\
+             cache_dir = \"/mnt/nvme/extents\"\n\
+             capacity_bytes = 1073741824\n",
+        )
+        .unwrap();
+        let cfg =
+            AsyncWorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+        assert_eq!(cfg.cache_dir, PathBuf::from("/mnt/nvme/extents"));
+        assert_eq!(cfg.capacity_bytes, 1 << 30);
+
+        // A typo must fail loudly rather than silently keeping the default.
+        assert!(AsyncWorkerConfigPatch::from_toml("block_size = 1024").is_err());
+    }
+
+    #[test]
+    fn async_worker_shard_counts_must_be_powers_of_two() {
+        // Both tiers index by mask, so a non-power-of-two silently folds part
+        // of the keyspace onto shard 0 rather than failing.
+        for patch in [
+            AsyncWorkerConfigPatch {
+                disk_shards: Some(6),
+                ..Default::default()
+            },
+            AsyncWorkerConfigPatch {
+                l1_shards: Some(10),
+                ..Default::default()
+            },
+        ] {
+            assert!(
+                AsyncWorkerConfig::resolve(Default::default(), Default::default(), patch).is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn async_worker_capacity_must_cover_a_region_per_shard() {
+        // Below one region the NVMe tier rounds down to zero and silently
+        // accepts nothing, which looks like a cache that never warms.
+        let tiny = AsyncWorkerConfigPatch {
+            capacity_bytes: Some(1 << 20),
+            ..Default::default()
+        };
+        assert!(AsyncWorkerConfig::resolve(Default::default(), Default::default(), tiny).is_err());
+
+        // One region total but eight shards is the subtler version of the same
+        // mistake: seven shards would get nothing.
+        let lopsided = AsyncWorkerConfigPatch {
+            capacity_bytes: Some(64 << 20),
+            ..Default::default()
+        };
+        assert!(
+            AsyncWorkerConfig::resolve(Default::default(), Default::default(), lopsided).is_err()
+        );
+
+        // Lowering the shard count instead of raising capacity also resolves it.
+        let narrowed = AsyncWorkerConfigPatch {
+            capacity_bytes: Some(64 << 20),
+            disk_shards: Some(1),
+            ..Default::default()
+        };
+        assert!(
+            AsyncWorkerConfig::resolve(Default::default(), Default::default(), narrowed).is_ok()
+        );
+    }
+
+    #[test]
+    fn async_worker_rejects_an_unknown_backend() {
+        let patch = AsyncWorkerConfigPatch {
+            backend: Some("ceph".into()),
+            ..Default::default()
+        };
+        let err = AsyncWorkerConfig::resolve(Default::default(), Default::default(), patch)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("azure"),
+            "error should list the options: {err}"
+        );
+
+        for name in ["azure", "s3", "gcs"] {
+            let patch = AsyncWorkerConfigPatch {
+                backend: Some(name.into()),
+                ..Default::default()
+            };
+            assert!(
+                AsyncWorkerConfig::resolve(Default::default(), Default::default(), patch).is_ok(),
+                "{name} must be accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn async_worker_control_listener_and_tls_are_all_or_none() {
+        let listener = AsyncWorkerConfigPatch {
+            control_listen: Some("127.0.0.1:7102".into()),
+            ..Default::default()
+        };
+        assert!(
+            AsyncWorkerConfig::resolve(Default::default(), Default::default(), listener).is_err()
+        );
+
+        let secure = AsyncWorkerConfigPatch {
+            control_listen: Some("127.0.0.1:7102".into()),
+            control_tls: Some(ControlTlsConfigPatch {
+                ca_cert_path: Some("/tls/ca.pem".into()),
+                cert_path: Some("/tls/aw.pem".into()),
+                key_path: Some("/tls/aw-key.pem".into()),
+                trust_domain: Some("talon.internal".into()),
+            }),
+            ..Default::default()
+        };
+        let cfg = AsyncWorkerConfig::resolve(Default::default(), Default::default(), secure)
+            .expect("listener plus TLS material resolves");
+        assert!(cfg.control_tls.is_some());
+    }
+
+    #[test]
+    fn async_worker_control_tls_composes_file_and_environment_layers() {
+        // The TLS block is the one nested patch, so it merges field-by-field
+        // rather than being replaced wholesale by the higher layer.
+        let file = AsyncWorkerConfigPatch::from_toml(
+            "control_listen = \"127.0.0.1:7102\"\n\
+             [control_tls]\n\
+             ca_cert_path = \"/tls/ca.pem\"\n\
+             cert_path = \"/tls/aw.pem\"\n",
+        )
+        .unwrap();
+        let env = AsyncWorkerConfigPatch::from_env_with(|k| match k {
+            async_worker_env::CONTROL_TLS_KEY_PATH => Some("/tls/aw-key.pem".to_string()),
+            async_worker_env::CONTROL_TLS_TRUST_DOMAIN => Some("talon.internal".to_string()),
+            _ => None,
+        })
+        .unwrap();
+        let cfg = AsyncWorkerConfig::resolve(file, env, Default::default()).unwrap();
+        let tls = cfg.control_tls.expect("control TLS configured");
+        assert_eq!(tls.ca_cert_path, PathBuf::from("/tls/ca.pem"));
+        assert_eq!(tls.key_path, PathBuf::from("/tls/aw-key.pem"));
+        assert_eq!(tls.trust_domain, "talon.internal");
+    }
+
+    #[test]
+    fn async_worker_secrets_are_read_only_from_the_environment() {
+        // Every secret is env-only by construction: it has a schema entry (so
+        // it is documented) but no field on the patch (so no config file can
+        // carry it).
+        for name in [
+            "azure_sas",
+            "s3_secret_access_key",
+            "s3_session_token",
+            "gcs_bearer_token",
+        ] {
+            let var = ASYNC_WORKER_ENV_SCHEMA
+                .iter()
+                .find(|v| v.key == name)
+                .unwrap_or_else(|| panic!("{name} missing from the schema"));
+            assert!(var.secret, "{name} must be marked secret");
+            assert!(!var.cli, "{name} must not be settable on the command line");
+            assert!(
+                AsyncWorkerConfigPatch::from_toml(&format!("{name} = \"x\"")).is_err(),
+                "{name} must not be accepted from a config file"
+            );
+        }
+    }
 
     #[test]
     fn env_schemas_are_wellformed() {
@@ -1416,6 +2511,11 @@ mod tests {
         // generated reference and the parser stay in lockstep.
         for (label, schema, prefix) in [
             ("worker", WORKER_ENV_SCHEMA, "TALON_WORKER_"),
+            (
+                "async-worker",
+                ASYNC_WORKER_ENV_SCHEMA,
+                "TALON_ASYNC_WORKER_",
+            ),
             ("fuse", FUSE_ENV_SCHEMA, "TALON_FUSE_"),
         ] {
             let mut seen = std::collections::HashSet::new();
@@ -1439,6 +2539,16 @@ mod tests {
             assert!(
                 WORKER_ENV_SCHEMA.iter().any(|v| v.env == name),
                 "worker schema missing {name}"
+            );
+        }
+        for name in [
+            async_worker_env::LISTEN,
+            async_worker_env::CACHE_DIR,
+            async_worker_env::S3_SECRET_ACCESS_KEY,
+        ] {
+            assert!(
+                ASYNC_WORKER_ENV_SCHEMA.iter().any(|v| v.env == name),
+                "async worker schema missing {name}"
             );
         }
         for name in [

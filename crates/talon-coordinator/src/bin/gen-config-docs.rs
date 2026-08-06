@@ -16,7 +16,7 @@
 use std::io::Write;
 
 use talon_coordinator::COORDINATOR_ENV_SCHEMA;
-use talon_core::{ConfigVar, FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA};
+use talon_core::{ConfigVar, ASYNC_WORKER_ENV_SCHEMA, FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA};
 
 fn main() -> std::io::Result<()> {
     let mut out = String::new();
@@ -50,6 +50,7 @@ environment and are never written to a config file or logged.\n\n",
 
     section(&mut s, "Coordinator", COORDINATOR_ENV_SCHEMA);
     section(&mut s, "Worker", WORKER_ENV_SCHEMA);
+    section(&mut s, "Async worker", ASYNC_WORKER_ENV_SCHEMA);
     section(&mut s, "FUSE client", FUSE_ENV_SCHEMA);
     s
 }
