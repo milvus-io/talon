@@ -77,6 +77,32 @@ fn vectors() -> Vec<Vector> {
             },
         ),
         control(
+            "control.async_placement_lookup",
+            "Schema 4: the async worker ring. Same body shape as placement_lookup, different variant tag; only the object is hashed, so offset and version do not affect the answer",
+            1,
+            &ControlMessage::AsyncPlacementLookup {
+                block: BlockId::new(
+                    object("container", "path/to/object.parquet"),
+                    268_435_456,
+                    256 << 20,
+                    Version::new("v1"),
+                ),
+                k: 1,
+            },
+        ),
+        control(
+            "control.membership_list.async_worker",
+            "NodeRole discriminant 2: appended after Coordinator (0) and Worker (1), which must keep their tags",
+            2,
+            &ControlMessage::MembershipList {
+                nodes: vec![NodeInfo {
+                    id: NodeId::new("async-worker-a"),
+                    address: "10.0.0.9:7001".into(),
+                    role: NodeRole::AsyncWorker,
+                }],
+            },
+        ),
+        control(
             "control.placement_response",
             "Coordinator reply: ordered owners plus the epoch they were computed at",
             1,

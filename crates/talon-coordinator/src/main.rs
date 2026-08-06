@@ -306,6 +306,11 @@ impl Coordinator {
             .membership()
             .snapshot()
             .into_iter()
+            // Block workers only, on purpose. This proxies the whole control
+            // surface -- StatObject *and* ListObjects -- and an async worker
+            // implements only the former (ADR 0005 §8). Including one would
+            // turn some readdirs into errors for no gain: both roles hold the
+            // same backend credentials, so a block worker answers just as well.
             .filter(|node| node.role == NodeRole::Worker)
             .collect();
         if workers.is_empty() {
@@ -488,7 +493,7 @@ impl Coordinator {
                         // placement (issue #118); the store reconcile remains the
                         // authoritative source and will drop it otherwise.
                         if result.disposition == WriteDisposition::Applied
-                            && node.role == NodeRole::Worker
+                            && node.role.is_worker()
                             && healthy_ready
                         {
                             self.service.membership().register(node);
@@ -1126,7 +1131,7 @@ fn validate_worker_node(
     role: NodeRole,
     message: &str,
 ) -> Result<(), String> {
-    if role != NodeRole::Worker {
+    if !role.is_worker() {
         return Err(format!(
             "{message} role does not match authenticated worker"
         ));

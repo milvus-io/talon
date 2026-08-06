@@ -4,6 +4,9 @@
 //! changes, making per-block primary lookup O(1). This module retains the
 //! coordinator lookup adapter for older clients.
 
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+
 use talon_core::{rank_cache_workers, BlockId, NodeId, NodeInfo};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -79,6 +82,7 @@ impl Epoch {
             let role = match node.role {
                 talon_core::NodeRole::Coordinator => 0u8,
                 talon_core::NodeRole::Worker => 1u8,
+                talon_core::NodeRole::AsyncWorker => 2u8,
             };
             push_field(&mut buf, node.id.0.as_bytes());
             push_field(&mut buf, node.address.as_bytes());
@@ -98,8 +102,22 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 }
 
 /// Decides which node(s) should hold a given block.
+///
+/// # Two rings, not one
+///
+/// The cluster runs two disjoint rendezvous rings, one per worker pool, and a
+/// lookup is resolved against exactly one of them:
+///
+/// | Ring | Node set | Hash key |
+/// |---|---|---|
+/// | [`RendezvousPlacement`] | [`NodeRole::Worker`](talon_core::NodeRole::Worker) | the whole [`BlockId`] (offset included) |
+/// | [`ObjectPlacement`] | [`NodeRole::AsyncWorker`](talon_core::NodeRole::AsyncWorker) | the object identity alone |
+///
+/// Both implement this trait, so the caller picks a ring by picking a strategy
+/// and passing the matching node set — see
+/// [`Membership::snapshot_for_role`](crate::Membership::snapshot_for_role).
 pub trait Placement {
-    /// Return the node responsible for `block`, given the current node set.
+    /// Return the node responsible for `block`, given the node set.
     ///
     /// Equivalent to the first element of [`Placement::locate_top_k`] with
     /// `k = 1`.
@@ -111,9 +129,37 @@ pub trait Placement {
     fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId>;
 }
 
+/// Rank `nodes` by descending HRW weight under `weight`, taking the top `k`.
+///
+/// Used by the async ring only. The block ring resolves through
+/// [`talon_core::CachePlacementTable`]'s Maglev mapping instead, so that a
+/// client can compute the same answer locally without asking the coordinator
+/// (#455). The async ring has no client-side equivalent yet.
+fn rank_top_k<W>(nodes: &[NodeInfo], k: usize, weight: W) -> Vec<NodeId>
+where
+    W: Fn(&NodeId) -> u64,
+{
+    if k == 0 {
+        return Vec::new();
+    }
+    let mut ranked: Vec<(u64, &NodeId)> = nodes.iter().map(|n| (weight(&n.id), &n.id)).collect();
+    // Sort by descending weight; break ties on the node id so the order is
+    // fully deterministic even when two nodes hash to the same weight.
+    ranked.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(&b.1 .0)));
+    ranked
+        .into_iter()
+        .take(k)
+        .map(|(_, id)| id.clone())
+        .collect()
+}
+
 /// Compatibility adapter using the same deterministic Maglev mapping as clients.
 ///
 /// The historical type name is retained to avoid breaking coordinator callers.
+///
+/// Because the offset is part of the key, consecutive blocks of one object land
+/// on different nodes and a parallel scan fans out across the fleet — which is
+/// what a block worker wants, and exactly what an extent cache does not.
 #[derive(Default)]
 pub struct RendezvousPlacement;
 
@@ -124,6 +170,59 @@ impl Placement for RendezvousPlacement {
 
     fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId> {
         rank_cache_workers(block, nodes, k)
+    }
+}
+
+/// The async worker ring: rendezvous hashing over the object identity alone.
+///
+/// # What is in the key
+///
+/// [`BlockId`] has four fields — object, offset, block size, and version. This
+/// ring hashes only the object identity (backend, bucket, path) and drops the
+/// other three, so the key is "which name is being read", with no notion of
+/// position and no notion of which revision.
+///
+/// **Why the offset is dropped.** A columnar reader fetches a footer and then
+/// cherry-picks column chunks at unrelated offsets. If those hash apart, the
+/// footer fetch warms a cache nobody else reads and every chunk pays a cold
+/// miss. Whole-object affinity is the entire reason a footer is worth caching,
+/// and dropping the offset is what produces it.
+///
+/// **Why the version is dropped.** With the version in the key, republishing an
+/// object under a new ETag relocates it: the new owner starts cold while the
+/// previous owner still holds every warm extent of the old revision. Nothing is
+/// gained by the move, because coherence is already handled a layer down — the
+/// worker interns `(ObjectId, Version)` into a `stream_id`, so a new ETag
+/// produces new cache entries regardless of which node serves them. Dropping
+/// the version keeps the object on the worker that has been serving it, and the
+/// superseded extents age out through normal region reclamation.
+///
+/// The tradeoff is that one very large object is served by one async worker
+/// rather than spread across the fleet. That is the right trade for
+/// many-small-objects columnar workloads and an argument for sizing this pool
+/// separately — not for merging the rings.
+#[derive(Default)]
+pub struct ObjectPlacement;
+
+impl ObjectPlacement {
+    fn weight(block: &BlockId, node: &NodeId) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        block.object.hash(&mut hasher);
+        node.0.hash(&mut hasher);
+        hasher.finish()
+    }
+}
+
+impl Placement for ObjectPlacement {
+    fn locate(&self, block: &BlockId, nodes: &[NodeInfo]) -> Option<NodeId> {
+        nodes
+            .iter()
+            .max_by_key(|n| Self::weight(block, &n.id))
+            .map(|n| n.id.clone())
+    }
+
+    fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId> {
+        rank_top_k(nodes, k, |id| Self::weight(block, id))
     }
 }
 
@@ -192,6 +291,155 @@ mod tests {
             let sub_rank = p.locate_top_k(&blk, &survivors, survivors.len());
             assert!(!sub_rank.contains(dropped));
             assert_eq!(sub_rank.len(), survivors.len());
+        }
+    }
+
+    /// The negative control: the block ring must still fan out.
+    ///
+    /// Object affinity is right for an extent cache and wrong for a block
+    /// worker, where spreading consecutive blocks is what lets a parallel scan
+    /// use the whole fleet. If this ever starts behaving like the test above,
+    /// the two rings have collapsed into one.
+    #[test]
+    fn the_block_ring_still_spreads_offsets_across_the_fleet() {
+        let p = RendezvousPlacement;
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let base = block(1);
+
+        let mut owners = std::collections::HashSet::new();
+        for i in 0..32u64 {
+            let mut at = base.clone();
+            at.offset = i * (256 << 20);
+            owners.insert(p.locate(&at, &ns).unwrap().0);
+        }
+        assert!(
+            owners.len() > 1,
+            "the block ring collapsed to one node: {owners:?}"
+        );
+    }
+
+    /// Every range of one object must resolve to a single async worker.
+    ///
+    /// Dropping the offset is what buys this. A Parquet reader fetches the
+    /// footer, then cherry-picks column chunks at unrelated offsets; if those
+    /// hash to different nodes, the footer fetch warms a cache nobody else
+    /// reads and each chunk pays a cold miss.
+    #[test]
+    fn the_object_ring_pins_a_whole_object_to_one_node() {
+        let p = ObjectPlacement;
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let base = block(1);
+
+        let owner = p.locate(&base, &ns).unwrap();
+        for offset in [0, 4 << 10, 1 << 20, 256 << 20, 900 << 20] {
+            let mut at = base.clone();
+            at.offset = offset;
+            // The block size travels with the offset in a real BlockId, so
+            // vary it too: neither may reach the key.
+            at.block_size = 64 << 20;
+            assert_eq!(
+                p.locate(&at, &ns),
+                Some(owner.clone()),
+                "offset {offset} left the object's node"
+            );
+        }
+    }
+
+    /// Republishing an object must not move it.
+    ///
+    /// `BlockId` derives `Hash` over all four fields, version included, so
+    /// hashing the whole id would relocate an object on every overwrite and
+    /// hand it to a worker with a cold cache — for nothing, since coherence is
+    /// already handled by the worker interning `(ObjectId, Version)` into a
+    /// `stream_id`. Placement stays put; the superseded extents age out.
+    #[test]
+    fn the_object_ring_survives_a_republish() {
+        let p = ObjectPlacement;
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+
+        for i in 0..50 {
+            let mut v1 = block(i);
+            let mut v2 = v1.clone();
+            v2.version = Version("etag-after-overwrite".into());
+            // Offset differs too: neither field may reach the key.
+            v1.offset = 0;
+            v2.offset = 512 << 20;
+
+            assert_eq!(
+                p.locate(&v1, &ns),
+                p.locate(&v2, &ns),
+                "object {i} migrated on republish"
+            );
+        }
+    }
+    /// The block ring must hash exactly as it did before the split.
+    ///
+    /// A drift here silently remaps every block in every existing cluster, so
+    /// this pins the hash rather than trusting that nothing touched it.
+    #[test]
+    fn the_block_ring_is_unchanged_by_the_split() {
+        fn legacy_weight(block: &BlockId, node: &NodeId) -> u64 {
+            let mut hasher = DefaultHasher::new();
+            block.hash(&mut hasher);
+            node.0.hash(&mut hasher);
+            hasher.finish()
+        }
+
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        for i in 0..50 {
+            let blk = block(i);
+            let expected = ns
+                .iter()
+                .max_by_key(|n| legacy_weight(&blk, &n.id))
+                .map(|n| n.id.clone());
+            assert_eq!(
+                RendezvousPlacement.locate(&blk, &ns),
+                expected,
+                "block {i} moved"
+            );
+        }
+    }
+
+    /// The two rings must disagree, or the object ring is doing nothing.
+    #[test]
+    fn the_rings_are_genuinely_different() {
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let differs = (0..200u64).any(|i| {
+            let mut blk = block(i);
+            blk.offset = 256 << 20;
+            RendezvousPlacement.locate(&blk, &ns) != ObjectPlacement.locate(&blk, &ns)
+        });
+        assert!(
+            differs,
+            "both rings produced identical placement everywhere"
+        );
+    }
+
+    /// Distinct objects should still spread across the async pool.
+    #[test]
+    fn the_object_ring_spreads_distinct_objects() {
+        let p = ObjectPlacement;
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let owners: std::collections::HashSet<String> = (0..200)
+            .map(|i| p.locate(&block(i), &ns).unwrap().0)
+            .collect();
+        assert_eq!(owners.len(), ns.len(), "an async worker got no objects");
+    }
+
+    /// HRW stability must hold on the object ring too.
+    #[test]
+    fn the_object_ring_is_stable_under_membership_change() {
+        let p = ObjectPlacement;
+        let full = nodes(&["a", "b", "c", "d", "e"]);
+        for i in 0..100 {
+            let blk = block(i);
+            let full_rank = p.locate_top_k(&blk, &full, full.len());
+            let dropped = &full_rank[0];
+            let survivors: Vec<NodeInfo> =
+                full.iter().filter(|n| &n.id != dropped).cloned().collect();
+            let sub_rank = p.locate_top_k(&blk, &survivors, survivors.len());
+            let expected: Vec<&NodeId> = full_rank.iter().skip(1).collect();
+            assert_eq!(expected, sub_rank.iter().collect::<Vec<_>>(), "object {i}");
         }
     }
 

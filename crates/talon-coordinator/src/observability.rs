@@ -366,7 +366,11 @@ impl CoordinatorMetrics {
             now.saturating_sub(snapshot.observed_at_unix_ms),
             Ordering::Relaxed,
         );
-        for role in [NodeRole::Coordinator, NodeRole::Worker] {
+        for role in [
+            NodeRole::Coordinator,
+            NodeRole::Worker,
+            NodeRole::AsyncWorker,
+        ] {
             for health in [
                 NodeHealth::Healthy,
                 NodeHealth::Degraded,
@@ -691,7 +695,13 @@ impl CoordinatorObservability {
                     .nodes
                     .iter()
                     .filter(|status| {
-                        status.node.role == NodeRole::Worker
+                        // Both worker roles: membership carries the union and
+                        // Membership::snapshot_for splits it by placement
+                        // class at lookup time. Filtering to NodeRole::Worker
+                        // here would keep async workers out of the registry
+                        // entirely, so every extent lookup would answer "no
+                        // owners" with nothing in the logs to explain it.
+                        status.node.role.is_worker()
                             && status.health == NodeHealth::Healthy
                             && status.ready
                     })
@@ -912,10 +922,7 @@ fn state_error_kind(error: &StateStoreError) -> &'static str {
 }
 
 fn role_label(role: NodeRole) -> &'static str {
-    match role {
-        NodeRole::Coordinator => "coordinator",
-        NodeRole::Worker => "worker",
-    }
+    role.as_str()
 }
 
 fn health_label(health: NodeHealth) -> &'static str {

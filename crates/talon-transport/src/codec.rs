@@ -21,7 +21,7 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 /// Bumped when [`ControlMessage`] changes in an incompatible way. Carried in
 /// the envelope so a peer can reject a mismatched schema instead of
 /// misinterpreting bytes.
-pub const CONTROL_SCHEMA_VERSION: u16 = 4;
+pub const CONTROL_SCHEMA_VERSION: u16 = 5;
 
 /// Oldest control schema this build can decode.
 pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
@@ -187,6 +187,38 @@ pub enum ControlMessage {
         /// Current worker process incarnation.
         worker_incarnation: String,
     },
+    /// Client → coordinator: which async worker holds this object's extents?
+    ///
+    /// [`PlacementLookup`](Self::PlacementLookup) resolves against the block
+    /// worker ring and always has. This resolves against the async worker
+    /// ring: a disjoint node set, hashed on the object identity alone.
+    ///
+    /// # Why the client picks the ring, and not the coordinator
+    ///
+    /// The coordinator could infer it — by file extension, by read size, by a
+    /// per-prefix rule — but every one of those is a policy guess made by the
+    /// process with the least information. The caller knows whether it is
+    /// about to read a Parquet footer or stream a whole partition; the
+    /// coordinator only sees a byte range. A separate message keeps the
+    /// coordinator a pure placement function and puts the choice where the
+    /// knowledge is.
+    ///
+    /// A worker in one ring cannot serve the other: an async worker refuses
+    /// writes and holds no blocks (ADR 0005 §8), so guessing wrong would fail
+    /// at read time rather than at lookup time.
+    ///
+    /// Answered with the same [`PlacementResponse`](Self::PlacementResponse) as
+    /// the block lookup — a client only has to learn one reply shape.
+    AsyncPlacementLookup {
+        /// The object being located. Only `block.object` is hashed; the
+        /// offset, block size, and version are carried for symmetry with
+        /// [`PlacementLookup`](Self::PlacementLookup) but do not affect the
+        /// answer, so every range of one object resolves to the same async
+        /// worker and stays there across a republish.
+        block: BlockId,
+        /// Number of replicas requested (RF=1 → 1 in v1).
+        k: u8,
+    },
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -213,6 +245,10 @@ impl ControlMessage {
             | Self::MappingRevisionValue { .. }
             | Self::StaleMapping { .. } => 3,
             Self::MappingRevisionUpdate { .. } | Self::MappingRevisionAck { .. } => 4,
+            // Schema 5: the async worker ring. A v4 coordinator cannot decode
+            // this, and must not fall back to the block lookup -- that would
+            // silently answer with a block worker, which holds no extents.
+            Self::AsyncPlacementLookup { .. } => 5,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }
@@ -490,6 +526,10 @@ mod tests {
                 revision: 7,
                 worker_id: "worker-1".into(),
                 worker_incarnation: "worker-inc-1".into(),
+            },
+            ControlMessage::AsyncPlacementLookup {
+                block: block.clone(),
+                k: 1,
             },
         ]
     }
@@ -781,6 +821,64 @@ mod tests {
                 })
             ));
         }
+    }
+
+    #[test]
+    fn the_async_lookup_requires_schema_five() {
+        // A v3 coordinator cannot decode this variant, and must not fall back
+        // to the block lookup: that would answer with a block worker, which
+        // holds no extents. Failing at the envelope keeps the mistake visible.
+        let lookup = ControlMessage::AsyncPlacementLookup {
+            block: BlockId::new(
+                ObjectId::new(Backend::S3, "bkt", "obj.parquet"),
+                0,
+                256 << 20,
+                Version::new("etag"),
+            ),
+            k: 1,
+        };
+        assert_eq!(lookup.minimum_schema(), 5);
+        assert!(matches!(
+            encode_for_schema(1, &lookup, 4),
+            Err(CodecError::MessageRequiresSchema {
+                required: 5,
+                selected: 4
+            })
+        ));
+    }
+
+    #[test]
+    fn the_block_lookup_still_encodes_at_schema_one() {
+        // The compatibility guarantee for every client that predates the
+        // async worker: adding AsyncPlacementLookup must not retag the lookup
+        // they already send.
+        let legacy = ControlMessage::PlacementLookup {
+            block: BlockId::new(
+                ObjectId::new(Backend::S3, "bkt", "obj.bin"),
+                0,
+                256 << 20,
+                Version::new("etag"),
+            ),
+            k: 1,
+        };
+        assert_eq!(legacy.minimum_schema(), MIN_CONTROL_SCHEMA_VERSION);
+        let encoded = encode(1, &legacy).expect("encode");
+        let body = &encoded[HEADER_LEN..];
+        assert_eq!(
+            u16::from_le_bytes([body[0], body[1]]),
+            MIN_CONTROL_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn node_role_discriminants_are_append_only() {
+        // NodeRole rides the wire inside NodeInfo as a bincode u32 tag. The
+        // Java and Python clients decode it positionally, so Coordinator and
+        // Worker must stay 0 and 1 forever; AsyncWorker is appended at 2.
+        let tag = |role: NodeRole| bincode::serialize(&role).unwrap();
+        assert_eq!(tag(NodeRole::Coordinator), 0u32.to_le_bytes());
+        assert_eq!(tag(NodeRole::Worker), 1u32.to_le_bytes());
+        assert_eq!(tag(NodeRole::AsyncWorker), 2u32.to_le_bytes());
     }
 
     #[test]

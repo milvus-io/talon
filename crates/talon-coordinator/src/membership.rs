@@ -18,7 +18,7 @@
 
 use std::collections::HashMap;
 use std::sync::RwLock;
-use talon_core::{NodeId, NodeInfo};
+use talon_core::{NodeId, NodeInfo, NodeRole};
 
 use crate::Epoch;
 
@@ -57,6 +57,23 @@ impl Membership {
     /// Return a snapshot of all currently known nodes.
     pub fn snapshot(&self) -> Vec<NodeInfo> {
         self.inner.read().unwrap().values().cloned().collect()
+    }
+
+    /// Return only the nodes in one ring.
+    ///
+    /// The two rings are disjoint by role, and this is what keeps a block off
+    /// an async worker. Placement itself has no way to tell — hand
+    /// [`Placement::locate`](crate::Placement::locate) a mixed set and it will
+    /// happily name an async worker as the owner of a block, with the failure
+    /// surfacing one round trip later as a refused read.
+    pub fn snapshot_for_role(&self, role: NodeRole) -> Vec<NodeInfo> {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .filter(|node| node.role == role)
+            .cloned()
+            .collect()
     }
 
     /// The current placement version, derived from the node set.
@@ -152,7 +169,6 @@ where
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use talon_core::NodeRole;
 
     fn worker(id: &str, addr: &str) -> NodeInfo {
         NodeInfo {
@@ -160,6 +176,55 @@ mod tests {
             address: addr.into(),
             role: NodeRole::Worker,
         }
+    }
+
+    fn async_worker(id: &str, addr: &str) -> NodeInfo {
+        NodeInfo {
+            id: NodeId::new(id),
+            address: addr.into(),
+            role: NodeRole::AsyncWorker,
+        }
+    }
+
+    #[test]
+    fn a_ring_snapshot_sees_only_its_own_pool() {
+        let m = Membership::new();
+        m.reconcile(vec![
+            worker("blk-a", "1"),
+            worker("blk-b", "2"),
+            async_worker("ext-a", "3"),
+            NodeInfo {
+                id: NodeId::new("coord"),
+                address: "4".into(),
+                role: NodeRole::Coordinator,
+            },
+        ]);
+
+        let block: Vec<String> = ids(m.snapshot_for_role(NodeRole::Worker));
+        assert_eq!(block, vec!["blk-a", "blk-b"]);
+
+        let async_pool: Vec<String> = ids(m.snapshot_for_role(NodeRole::AsyncWorker));
+        assert_eq!(async_pool, vec!["ext-a"]);
+
+        // The unfiltered snapshot still carries everything, coordinator
+        // included -- it is what the epoch is computed over.
+        assert_eq!(m.snapshot().len(), 4);
+    }
+
+    #[test]
+    fn an_empty_ring_yields_an_empty_snapshot_not_the_other_ring() {
+        // The failure this guards against is a fallback: answering an async
+        // lookup with a block worker when no async worker is registered. That
+        // node holds no extents and would refuse the read, so "no owners" is
+        // the honest answer and lets the client fall back deliberately.
+        let m = Membership::new();
+        m.reconcile(vec![worker("blk-a", "1")]);
+        assert!(m.snapshot_for_role(NodeRole::AsyncWorker).is_empty());
+    }
+
+    fn ids(mut nodes: Vec<NodeInfo>) -> Vec<String> {
+        nodes.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        nodes.into_iter().map(|n| n.id.0).collect()
     }
 
     #[test]

@@ -135,28 +135,79 @@ When L1 is disabled there is no hit history to gate on, and extents are admitted
 on first miss. Gating unconditionally would mean an L1-less deployment never
 writes to NVMe at all.
 
-### 6. Placement routes whole objects, with no coordinator change
+### 6. A separate rendezvous ring, keyed on the object
 
-Clients route by asking placement for `BlockId { object, offset: 0, .. }`
-regardless of the read offset, so every read of one object version resolves to
-the same worker. A columnar reader making many small scattered reads across one
-file talks to one worker and warms one cache, instead of scattering across the
-fleet by block.
+Two disjoint rings run behind one coordinator, selected by node role. There is
+no placement-class enum: the ring *is* the distinction, and a second enum
+shadowing `NodeRole` one-to-one would only be a synonym to keep in sync.
 
-This is a client-side convention, not a protocol change: the control message,
-the schema version, and the conformance vectors are all untouched, and the
-coordinator's rendezvous hashing is used exactly as it already works.
+| Ring | Node set | Hash key |
+|---|---|---|
+| `RendezvousPlacement` | `NodeRole::Worker` | the whole `BlockId` |
+| `ObjectPlacement` | `NodeRole::AsyncWorker` | the object identity alone |
 
-The tradeoff is losing the spread that block routing gives for very large
-objects — one enormous object is served by one worker rather than distributed.
-That is the right trade for many-small-objects columnar workloads and the wrong
-one for a few enormous ones, which is a reason to run this worker as its own
-deployment rather than mixed into a block-routed fleet.
+**What the async ring drops.** `BlockId` has four fields — object, offset, block
+size, and version. The async ring hashes only the object identity (backend,
+bucket, path). The key is therefore "which name is being read", with no notion
+of position and no notion of which revision.
 
-For the first implementation, async workers form their own cluster. Mixing
-block-routed and object-routed workers behind one coordinator would need a new
-`NodeRole` variant, a schema bump, and placement that models two pools; that is
-deferred until there is a deployment that wants it.
+*Dropping the offset* is what buys whole-object affinity. A columnar reader
+fetches a footer and then cherry-picks column chunks at unrelated offsets; on the
+block ring those hash apart, so the footer fetch warms a cache nobody else reads
+and every chunk pays a cold miss. On the async ring they all resolve to one
+worker, and one reader's fetch warms the next reader's hit. This is the whole
+reason the ring exists.
+
+*Dropping the version* keeps the object where it already is. With the version in
+the key, republishing under a new ETag relocates the object: the new owner starts
+cold while the previous owner still holds every warm extent of the old revision,
+and nothing is gained by the move — coherence is already handled a layer down,
+where the worker interns `(ObjectId, Version)` into a `stream_id` (§3), so a new
+ETag produces new cache entries regardless of which node serves them. Placement
+stays put and the superseded extents age out through normal region reclamation.
+
+**Why the client picks the ring.** The coordinator could infer it — by file
+extension, by read size, by a per-prefix rule — but each of those is a policy
+guess made by the process with the least information. The caller knows whether
+it is about to read a Parquet footer or stream a whole partition; the
+coordinator sees only a byte range. Letting the client name the ring keeps the
+coordinator a pure placement function and puts the choice where the knowledge
+is.
+
+**Compatibility.** The ring is selected by a new `AsyncPlacementLookup` message
+at `CONTROL_SCHEMA_VERSION = 4` — a new variant rather than a field on
+`PlacementLookup`, because bincode is positional and adding a field would change
+how every existing client's lookup decodes. The message variant is the selector,
+so there is nothing extra on the wire. `PlacementLookup` keeps its schema-1
+encoding and its meaning, the block ring. Both are answered with the same
+`PlacementResponse`, so a client learns one reply shape. The Java client is
+pinned at schema 2 by design and only ever receives `PlacementResponse`, so it
+needs no change.
+
+**Why the rings are disjoint rather than one ring with two key functions.** The
+coordinator filters placement candidates by role, so an async worker either
+never reaches membership at all or silently joins the block ring and receives
+blocks it cannot serve — failing at read time rather than at lookup time.
+Splitting by role also means an async lookup against a cluster with no async
+workers answers "no owners" instead of quietly handing back a block worker.
+
+**Reversal of the original decision.** The first revision of this ADR routed by
+asking for `BlockId { object, offset: 0, .. }` as a client-side convention and
+deferred the split, calling it "a new `NodeRole` variant, a schema bump, and
+placement that models two pools ... deferred until there is a deployment that
+wants it." Pinning the offset to zero does approximate the key this ring
+settled on, but as a convention it is unenforceable — nothing stops a client
+from passing its real offset, and the failure is silent cache fragmentation
+rather than an error. It also leaves the version in the hash, so an object still
+migrates on every republish. And it does nothing about the pool: the coordinator
+filters placement candidates by role, so an async worker would still either miss
+membership entirely or join the block ring. All three are now properties of the
+ring instead of hopes about client behaviour.
+
+**What the split costs.** One very large object is served by one async worker
+rather than spread across the fleet. That is the right trade for
+many-small-objects columnar workloads and an argument for sizing the async pool
+separately, not for merging the rings.
 
 ### 7. The NVMe tier is cold after restart
 
@@ -247,20 +298,34 @@ One binary, one crate, a flag selecting the cache. Rejected per section 1: the
 runtime would branch on cache model throughout, and the two eviction policies
 would share one capacity budget with no coherent way to divide it.
 
-### Extending the wire protocol with a load hint
+### Extending the wire protocol with a per-request access-pattern hint
 
-Let clients declare selective versus sequential intent per request. Rejected as
-premature: it needs a new field, a `CONTROL_SCHEMA_VERSION` bump, regenerated
-conformance vectors, and matching Python and Java client changes, before any of
-this is proven. Choosing a worker at deploy time carries the same information
-today, and a hint can be added later without changing the storage design.
+Let clients declare selective versus sequential *intent* per request, and have
+the coordinator or worker adapt. Still rejected, and note this is a different
+thing from the ring selection in §6: the ring names **which pool** answers,
+which the caller knows unambiguously, while a hint describes **how the caller
+will read**, which is a prediction. A wrong ring is a routing error the client
+can correct; a wrong hint silently degrades the cache. Choosing a ring already
+carries the useful part of the signal, and a finer hint can be added later
+without changing the storage design.
 
 ### Block-level placement for the async worker
 
 Keeps fleet-wide spread for large objects. Rejected for this worker because it
 scatters a single columnar file's many small reads across the fleet, so every
 worker holds a cold partial copy of the same file — the opposite of what a
-footer-then-column-chunk pattern wants.
+footer-then-column-chunk pattern wants. It would also put the version back in
+the key, relocating an object on every republish.
+
+### A `PlacementClass` enum carried on the lookup
+
+An earlier revision of this change added `PlacementClass { Block, Extent }` as a
+request field selecting both the pool and the key function. Dropped: the enum
+mapped one-to-one onto `NodeRole`, so it was a synonym that every call site had
+to thread through and keep in sync, and it pushed a `class` parameter into the
+`Placement` trait that only one implementation ever branched on. Two ring types
+over two role-filtered node sets say the same thing with no new vocabulary, and
+the message variant selects the ring without adding a wire field.
 
 ## Implementation sequence
 

@@ -11,10 +11,10 @@
 //! keeping the service usable directly (via [`lookup`](PlacementService::lookup))
 //! or over the wire.
 
-use talon_core::BlockId;
+use talon_core::{BlockId, NodeRole};
 use talon_transport::ControlMessage;
 
-use crate::{Epoch, Membership, Placement};
+use crate::{Epoch, Membership, ObjectPlacement, Placement};
 
 /// The result of a placement lookup: ordered owners at a given epoch.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,9 +26,14 @@ pub struct PlacementResult {
 }
 
 /// Answers placement lookups from the current membership + strategy.
+///
+/// Holds both rings. The generic `P` is the block ring, so existing
+/// constructions are unchanged; the async ring is always [`ObjectPlacement`],
+/// which is a unit struct and costs nothing to carry.
 pub struct PlacementService<P: Placement> {
     membership: Membership,
     placement: P,
+    async_placement: ObjectPlacement,
 }
 
 impl<P: Placement> PlacementService<P> {
@@ -37,6 +42,7 @@ impl<P: Placement> PlacementService<P> {
         Self {
             membership,
             placement,
+            async_placement: ObjectPlacement,
         }
     }
 
@@ -45,18 +51,45 @@ impl<P: Placement> PlacementService<P> {
         &self.membership
     }
 
-    /// Locate up to `k` ordered owners for `block` at the current epoch.
+    /// Locate up to `k` ordered block workers for `block`, at the current epoch.
     ///
     /// The returned epoch is read together with the node snapshot so the
     /// answer is internally consistent for the client to cache.
     pub fn lookup(&self, block: &BlockId, k: usize) -> PlacementResult {
+        self.resolve(&self.placement, NodeRole::Worker, block, k)
+    }
+
+    /// Locate up to `k` ordered async workers for `block`'s object.
+    ///
+    /// Resolves against the async ring: a disjoint node set, hashed on the
+    /// object identity alone, so every range of one object resolves to the
+    /// same worker and stays there across a republish. Answers with no owners
+    /// — rather than falling back to a block worker — when no async worker is
+    /// registered, because a block worker holds no extents and would refuse
+    /// the read.
+    pub fn lookup_async(&self, block: &BlockId, k: usize) -> PlacementResult {
+        self.resolve(&self.async_placement, NodeRole::AsyncWorker, block, k)
+    }
+
+    fn resolve<R: Placement>(
+        &self,
+        ring: &R,
+        role: NodeRole,
+        block: &BlockId,
+        k: usize,
+    ) -> PlacementResult {
         // Read the epoch first, then the nodes; membership only advances the
         // epoch, so a concurrent change can only make the epoch we return
         // conservatively old, prompting a harmless client refresh.
+        //
+        // The epoch covers the *whole* membership, not just this ring: a
+        // client caches one epoch and compares it for equality, so scoping it
+        // per ring would leave clients of different rings disagreeing about
+        // which epoch is current. The cost is a spurious refresh when the
+        // other ring changes, which is exactly the harmless case above.
         let epoch = self.membership.epoch();
-        let nodes = self.membership.snapshot();
-        let owners = self
-            .placement
+        let nodes = self.membership.snapshot_for_role(role);
+        let owners = ring
             .locate_top_k(block, &nodes, k)
             .into_iter()
             .map(|n| n.0)
@@ -66,24 +99,33 @@ impl<P: Placement> PlacementService<P> {
 
     /// Handle a transport [`ControlMessage`].
     ///
-    /// Answers [`ControlMessage::PlacementLookup`] with a
+    /// Answers [`ControlMessage::PlacementLookup`] and
+    /// [`ControlMessage::AsyncPlacementLookup`] with a
     /// [`ControlMessage::PlacementResponse`]; any other message yields an
     /// [`ControlMessage::Ack`] with `ok: false` describing the mismatch.
     pub fn handle(&self, msg: ControlMessage) -> ControlMessage {
         match msg {
+            // This message predates the async worker and has always meant the
+            // block ring. Keeping that mapping is what makes a pre-schema-4
+            // client see no behaviour change.
             ControlMessage::PlacementLookup { block, k } => {
-                let res = self.lookup(&block, k as usize);
-                let owners = res.owners.into_iter().map(talon_core::NodeId).collect();
-                ControlMessage::PlacementResponse {
-                    owners,
-                    epoch: res.epoch.0,
-                }
+                response(self.lookup(&block, k as usize))
+            }
+            ControlMessage::AsyncPlacementLookup { block, k } => {
+                response(self.lookup_async(&block, k as usize))
             }
             other => ControlMessage::Ack {
                 ok: false,
                 detail: Some(format!("unexpected control message: {other:?}")),
             },
         }
+    }
+}
+
+fn response(res: PlacementResult) -> ControlMessage {
+    ControlMessage::PlacementResponse {
+        owners: res.owners.into_iter().map(talon_core::NodeId).collect(),
+        epoch: res.epoch.0,
     }
 }
 
@@ -157,6 +199,93 @@ mod tests {
             ControlMessage::PlacementResponse { owners, epoch } => {
                 assert_eq!(owners.len(), 1);
                 assert_eq!(epoch, expected);
+            }
+            other => panic!("expected PlacementResponse, got {other:?}"),
+        }
+    }
+
+    /// A lookup must never cross pools.
+    ///
+    /// This is the guarantee the role split exists to provide. Without it an
+    /// extent lookup can return a block worker, which holds no extents, and
+    /// the mistake surfaces as a failed read one round trip later instead of
+    /// as an empty owner list here.
+    #[test]
+    fn a_lookup_never_crosses_rings() {
+        let m = Membership::new();
+        for id in ["blk-a", "blk-b"] {
+            m.register(NodeInfo {
+                id: NodeId::new(id),
+                address: format!("{id}:7001"),
+                role: NodeRole::Worker,
+            });
+        }
+        for id in ["ext-a", "ext-b"] {
+            m.register(NodeInfo {
+                id: NodeId::new(id),
+                address: format!("{id}:7001"),
+                role: NodeRole::AsyncWorker,
+            });
+        }
+        let s = PlacementService::new(m, RendezvousPlacement);
+
+        for i in 0..50 {
+            let blocks = s.lookup(&block(i), 2).owners;
+            assert!(
+                blocks.iter().all(|o| o.starts_with("blk-")),
+                "block lookup returned an async worker: {blocks:?}"
+            );
+            let extents = s.lookup_async(&block(i), 2).owners;
+            assert!(
+                extents.iter().all(|o| o.starts_with("ext-")),
+                "async lookup returned a block worker: {extents:?}"
+            );
+        }
+    }
+
+    /// A cluster with no async workers answers "nobody", not "a block worker".
+    #[test]
+    fn an_async_lookup_against_a_block_only_cluster_has_no_owners() {
+        let s = svc(&["a", "b", "c"]);
+        let res = s.lookup_async(&block(1), 2);
+        assert!(res.owners.is_empty());
+        // The epoch still reflects the real membership, so the client caches a
+        // valid epoch and refreshes when async workers actually arrive.
+        assert_ne!(res.epoch, Epoch::EMPTY);
+    }
+
+    /// The wire path: an unclassed lookup still means the block pool.
+    #[test]
+    fn each_lookup_message_resolves_against_its_own_ring() {
+        let m = Membership::new();
+        m.register(NodeInfo {
+            id: NodeId::new("blk-a"),
+            address: "blk-a:7001".into(),
+            role: NodeRole::Worker,
+        });
+        m.register(NodeInfo {
+            id: NodeId::new("ext-a"),
+            address: "ext-a:7001".into(),
+            role: NodeRole::AsyncWorker,
+        });
+        let s = PlacementService::new(m, RendezvousPlacement);
+
+        match s.handle(ControlMessage::PlacementLookup {
+            block: block(3),
+            k: 2,
+        }) {
+            ControlMessage::PlacementResponse { owners, .. } => {
+                assert_eq!(owners, vec![NodeId::new("blk-a")]);
+            }
+            other => panic!("expected PlacementResponse, got {other:?}"),
+        }
+
+        match s.handle(ControlMessage::AsyncPlacementLookup {
+            block: block(3),
+            k: 2,
+        }) {
+            ControlMessage::PlacementResponse { owners, .. } => {
+                assert_eq!(owners, vec![NodeId::new("ext-a")]);
             }
             other => panic!("expected PlacementResponse, got {other:?}"),
         }
