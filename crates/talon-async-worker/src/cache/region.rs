@@ -1111,4 +1111,118 @@ mod tests {
         };
         assert_eq!(run.file_offset(), 2 * REGION_SIZE + 1024);
     }
+
+    /// A shard file whose path cannot be created must report the error, not
+    /// panic and not silently degrade to a cache that drops everything.
+    #[test]
+    fn creating_a_shard_on_an_unusable_path_fails() {
+        let dir = tmp_dir("badpath");
+        // A regular file, then a path *inside* it: ENOTDIR on open.
+        let blocker = dir.join("not-a-directory");
+        std::fs::write(&blocker, b"x").unwrap();
+
+        let result = ShardFile::create(blocker.join("extents_0.bin"), 1, false);
+        assert!(result.is_err(), "expected an error for an unusable path");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Extents are variable length by design, so the packing arithmetic has to
+    /// hold across sizes that differ by orders of magnitude — a 2KB footer and
+    /// a 128KB column chunk land in the same region.
+    #[test]
+    fn extents_of_very_different_sizes_all_round_trip() {
+        let dir = tmp_dir("sizes");
+        let s = shard(&dir, 4, true);
+
+        let small = 2048u64;
+        let large = 128u64 << 10;
+        for i in 0..8u64 {
+            s.insert_many(vec![(
+                key(1, i * small),
+                extent((i * 17 % 256) as u8, small as usize),
+            )])
+            .unwrap();
+        }
+        for i in 0..4u64 {
+            s.insert_many(vec![(
+                key(2, i * large),
+                extent((i * 31 % 256) as u8, large as usize),
+            )])
+            .unwrap();
+        }
+
+        for i in 0..8u64 {
+            let got = s.get_bytes(&key(1, i * small), small).unwrap().unwrap();
+            assert_eq!(got.len(), small as usize, "small extent {i} length");
+            assert!(
+                got.iter().all(|&b| b == (i * 17 % 256) as u8),
+                "small extent {i} contents"
+            );
+        }
+        for i in 0..4u64 {
+            let got = s.get_bytes(&key(2, i * large), large).unwrap().unwrap();
+            assert_eq!(got.len(), large as usize, "large extent {i} length");
+            assert!(
+                got.iter().all(|&b| b == (i * 31 % 256) as u8),
+                "large extent {i} contents"
+            );
+        }
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    /// Readers and writers run concurrently against one shard file. A reader
+    /// must see either the whole extent or nothing — never a half-written one,
+    /// and never bytes belonging to a different extent.
+    ///
+    /// This is the pread/pwrite race the region pin counts exist to prevent.
+    #[test]
+    fn concurrent_writers_and_readers_never_see_a_torn_extent() {
+        let dir = tmp_dir("concurrent");
+        let s = shard(&dir, 8, true);
+        let size = 4096u64;
+        let n = 64u64;
+        let rounds = 8;
+
+        std::thread::scope(|scope| {
+            let writer = &s;
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    for i in 0..n {
+                        writer
+                            .insert_many(vec![(
+                                key(0, i * size),
+                                extent((i % 256) as u8, size as usize),
+                            )])
+                            .unwrap();
+                    }
+                }
+            });
+
+            for _ in 0..3 {
+                let reader = &s;
+                scope.spawn(move || {
+                    for _ in 0..rounds {
+                        for i in 0..n {
+                            if let Some(got) = reader.get_bytes(&key(0, i * size), size).unwrap() {
+                                assert_eq!(got.len(), size as usize, "extent {i} torn length");
+                                let want = (i % 256) as u8;
+                                assert!(
+                                    got.iter().all(|&b| b == want),
+                                    "extent {i} contains bytes from another extent"
+                                );
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let st = s.stats();
+        assert!(st.extents_written > 0, "the writer wrote nothing");
+        assert_eq!(st.checksum_failures, 0, "a read observed a torn write");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
 }

@@ -970,4 +970,275 @@ mod tests {
         );
         assert!(s.evictions > 0);
     }
+
+    // ---- shard configuration ------------------------------------------
+
+    #[test]
+    fn the_default_constructor_uses_the_default_shard_count() {
+        assert_eq!(MemoryCache::new(1 << 20).shards.len(), DEFAULT_NUM_SHARDS);
+    }
+
+    #[test]
+    fn an_explicit_power_of_two_shard_count_is_honoured() {
+        for n in [1usize, 2, 4, 8, 64] {
+            assert_eq!(MemoryCache::with_shards(1 << 20, n).shards.len(), n);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "num_shards must be positive")]
+    fn a_zero_shard_count_is_rejected() {
+        MemoryCache::with_shards(1 << 20, 0);
+    }
+
+    #[tokio::test]
+    async fn a_single_shard_cache_still_hits() {
+        // shard_mask is num_shards - 1, so one shard means a mask of zero.
+        // Every key must still route, rather than dividing by the mask.
+        let cache = MemoryCache::with_shards(10 << 20, 1);
+        let k = key(0, 0);
+
+        assert_eq!(
+            cache.get_or_load(k, 2, loader(b"hi")).await.unwrap(),
+            Bytes::from_static(b"hi")
+        );
+        assert_eq!(
+            cache.get_or_load(k, 2, loader(b"NO")).await.unwrap(),
+            Bytes::from_static(b"hi")
+        );
+        assert_eq!(cache.stats().hits, 1);
+    }
+
+    // ---- byte accounting ----------------------------------------------
+
+    /// `total_bytes` is an `AtomicU64` decremented on eviction. Subtracting
+    /// more than was added wraps to something near `u64::MAX` rather than
+    /// going negative, and the cache then believes it is permanently full.
+    #[tokio::test]
+    async fn byte_accounting_never_underflows_under_eviction() {
+        let cap = 2 << 20;
+        let size = 128 << 10;
+        let cache = MemoryCache::new(cap);
+
+        for i in 0..(cap / size) * 8 {
+            let data = Bytes::from(vec![0u8; size as usize]);
+            cache
+                .get_or_load(key(1, i * size), size, Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        let s = cache.stats();
+        assert!(s.evictions > 0, "expected eviction under pressure");
+        assert!(
+            s.current_bytes < cap * 2,
+            "accounting wrapped: current_bytes={}",
+            s.current_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn refilling_past_capacity_does_not_double_count() {
+        let cap = 256 << 10;
+        let size = 128 << 10;
+        let cache = MemoryCache::new(cap);
+
+        for i in 0..4u64 {
+            let data = Bytes::from(vec![i as u8; size as usize]);
+            cache
+                .get_or_load(key(0, i * size), size, Box::pin(async move { Ok(data) }))
+                .await
+                .unwrap();
+        }
+
+        let s = cache.stats();
+        assert!(s.evictions > 0);
+        assert!(
+            s.current_bytes < cap * 4,
+            "bytes counted more than once: {}",
+            s.current_bytes
+        );
+    }
+
+    #[tokio::test]
+    async fn stats_report_max_and_current_bytes() {
+        let cap = 2 << 20;
+        let size = 256u64 << 10;
+        let cache = MemoryCache::with_shards(cap, 1);
+
+        for pass in 0..2 {
+            for i in 0..4u64 {
+                let data = Bytes::from(vec![i as u8; size as usize]);
+                cache
+                    .get_or_load(key(12, i * size), size, Box::pin(async move { Ok(data) }))
+                    .await
+                    .unwrap();
+            }
+            let _ = pass;
+        }
+
+        let s = cache.stats();
+        assert_eq!(s.misses, 4, "first pass misses");
+        assert_eq!(s.hits, 4, "second pass hits");
+        assert_eq!(s.max_bytes, cap);
+        assert_eq!(s.current_bytes, 4 * size);
+    }
+
+    #[tokio::test]
+    async fn one_miss_then_every_repeat_is_a_hit() {
+        let cache = MemoryCache::new(10 << 20);
+        let k = key(6, 0);
+        for _ in 0..10 {
+            cache.get_or_load(k, 1, loader(b"x")).await.unwrap();
+        }
+
+        let s = cache.stats();
+        assert_eq!((s.misses, s.hits), (1, 9));
+        assert_eq!(s.current_bytes, 1);
+    }
+
+    // ---- eviction edge cases -------------------------------------------
+
+    /// An entry still loading has no bytes to reclaim. A sweep that finds
+    /// nothing but loading entries must return rather than spin looking for a
+    /// victim it can never find.
+    #[tokio::test]
+    async fn eviction_is_graceful_when_every_entry_is_loading() {
+        let size = 128u64 << 10;
+        let cache = MemoryCache::new(size);
+
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let loading = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(
+                        key(99, 0),
+                        size,
+                        Box::pin(async move {
+                            // The entry is in the ring from here on.
+                            started_tx.send(()).ok();
+                            release_rx.await.ok();
+                            Ok(Bytes::from(vec![0u8; size as usize]))
+                        }),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+
+        started_rx.await.ok();
+
+        // This insert needs the whole budget, and the only candidate is the
+        // in-flight load above.
+        let data = Bytes::from(vec![1u8; size as usize]);
+        cache
+            .get_or_load(key(99, size), size, Box::pin(async move { Ok(data) }))
+            .await
+            .unwrap();
+
+        release_tx.send(()).ok();
+        loading.await.unwrap();
+    }
+
+    // ---- concurrency ----------------------------------------------------
+
+    /// A waiter must receive the loader's own allocation, not a second copy.
+    ///
+    /// The existing hit test covers a sequential hit; this covers the
+    /// exclusive-to-shared transition, where the second caller arrives while
+    /// the first is still loading.
+    #[tokio::test]
+    async fn a_waiter_receives_the_loaders_allocation() {
+        let cache = MemoryCache::new(10 << 20);
+        let k = key(13, 0);
+        let (loading_tx, loading_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let first = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(
+                        k,
+                        9,
+                        Box::pin(async move {
+                            loading_tx.send(()).ok();
+                            tokio::task::yield_now().await;
+                            Ok(Bytes::from_static(b"exclusive"))
+                        }),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+
+        loading_rx.await.ok();
+
+        let second = {
+            let cache = Arc::clone(&cache);
+            tokio::spawn(async move {
+                cache
+                    .get_or_load(
+                        k,
+                        9,
+                        Box::pin(async { panic!("a waiter must not run its own loader") }),
+                    )
+                    .await
+                    .unwrap()
+            })
+        };
+
+        let a = first.await.unwrap();
+        let b = second.await.unwrap();
+        assert_eq!(a, Bytes::from_static(b"exclusive"));
+        assert_eq!(b, Bytes::from_static(b"exclusive"));
+        assert_eq!(a.as_ptr(), b.as_ptr(), "the waiter copied the bytes");
+    }
+
+    /// Many workers over a small hot keyspace, mixing hits, misses and
+    /// eviction. Deterministic (a fixed-seed LCG) so a failure reproduces.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_mixed_access_stays_within_capacity() {
+        let cap = 8u64 << 20;
+        let size = 64u64 << 10;
+        let cache = MemoryCache::new(cap);
+
+        let mut handles = Vec::new();
+        for worker in 0..8u64 {
+            let cache = Arc::clone(&cache);
+            handles.push(tokio::spawn(async move {
+                let mut rng = worker.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+                for _ in 0..400 {
+                    rng = rng
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1_442_695_040_888_963_407);
+                    let stream = (rng >> 33) % 5;
+                    let slot = (rng >> 11) % 20;
+                    let data = Bytes::from(vec![(stream ^ slot) as u8; size as usize]);
+                    cache
+                        .get_or_load(
+                            key(stream, slot * size),
+                            size,
+                            Box::pin(async move { Ok(data) }),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+
+        let s = cache.stats();
+        assert!(s.hits > 0, "expected hits over a 100-key working set");
+        assert!(s.misses > 0, "expected misses");
+        assert!(
+            s.current_bytes <= cap,
+            "exceeded capacity: {} > {cap}",
+            s.current_bytes
+        );
+    }
 }
