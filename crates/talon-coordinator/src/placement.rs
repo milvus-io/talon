@@ -7,7 +7,7 @@
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
-use talon_core::{rank_cache_workers, BlockId, NodeId, NodeInfo};
+use talon_core::{rank_cache_workers, BlockId, ClusterType, NodeId, NodeInfo};
 use xxhash_rust::xxh3::xxh3_64;
 
 /// A content-derived version of the placement/node set.
@@ -103,19 +103,18 @@ fn push_field(buf: &mut Vec<u8>, bytes: &[u8]) {
 
 /// Decides which node(s) should hold a given block.
 ///
-/// # Two rings, not one
+/// # One ring per cluster
 ///
-/// The cluster runs two disjoint rendezvous rings, one per worker pool, and a
-/// lookup is resolved against exactly one of them:
+/// Two strategies exist, and a cluster runs exactly one of them:
 ///
-/// | Ring | Node set | Hash key |
-/// |---|---|---|
-/// | [`RendezvousPlacement`] | [`NodeRole::Worker`](talon_core::NodeRole::Worker) | the whole [`BlockId`] (offset included) |
-/// | [`ObjectPlacement`] | [`NodeRole::AsyncWorker`](talon_core::NodeRole::AsyncWorker) | the object identity alone |
+/// | Strategy | Cluster type | Node set | Hash key |
+/// |---|---|---|---|
+/// | [`RendezvousPlacement`] | [`ClusterType::Block`] | [`NodeRole::Worker`](talon_core::NodeRole::Worker) | the whole [`BlockId`] (offset included) |
+/// | [`ObjectPlacement`] | [`ClusterType::Async`] | [`NodeRole::AsyncWorker`](talon_core::NodeRole::AsyncWorker) | the object identity alone |
 ///
-/// Both implement this trait, so the caller picks a ring by picking a strategy
-/// and passing the matching node set — see
-/// [`Membership::snapshot_for_role`](crate::Membership::snapshot_for_role).
+/// [`ClusterPlacement`] pairs a strategy with its cluster type so the two can
+/// never be picked independently. Both used to live in one coordinator,
+/// selected per request; ADR 0006 says why that changed.
 pub trait Placement {
     /// Return the node responsible for `block`, given the node set.
     ///
@@ -160,7 +159,7 @@ where
 /// Because the offset is part of the key, consecutive blocks of one object land
 /// on different nodes and a parallel scan fans out across the fleet — which is
 /// what a block worker wants, and exactly what an extent cache does not.
-#[derive(Default)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct RendezvousPlacement;
 
 impl Placement for RendezvousPlacement {
@@ -191,17 +190,16 @@ impl Placement for RendezvousPlacement {
 /// **Why the version is dropped.** With the version in the key, republishing an
 /// object under a new ETag relocates it: the new owner starts cold while the
 /// previous owner still holds every warm extent of the old revision. Nothing is
-/// gained by the move, because coherence is already handled a layer down — the
-/// worker interns `(ObjectId, Version)` into a `stream_id`, so a new ETag
-/// produces new cache entries regardless of which node serves them. Dropping
-/// the version keeps the object on the worker that has been serving it, and the
-/// superseded extents age out through normal region reclamation.
+/// gained by the move, because the worker's own cache does not distinguish
+/// revisions either — it interns the `ObjectId` alone, and assumes the objects
+/// it serves are immutable (ADR 0005 §3). Relocating would buy a cold cache and
+/// no coherence.
 ///
 /// The tradeoff is that one very large object is served by one async worker
 /// rather than spread across the fleet. That is the right trade for
-/// many-small-objects columnar workloads and an argument for sizing this pool
-/// separately — not for merging the rings.
-#[derive(Default)]
+/// many-small-objects columnar workloads and an argument for sizing this
+/// cluster separately — not for putting both rings in one cluster.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct ObjectPlacement;
 
 impl ObjectPlacement {
@@ -223,6 +221,58 @@ impl Placement for ObjectPlacement {
 
     fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId> {
         rank_top_k(nodes, k, |id| Self::weight(block, id))
+    }
+}
+
+/// The one ring a cluster serves, chosen once from its [`ClusterType`].
+///
+/// An enum rather than a `Box<dyn Placement>` or a pair of fields: both
+/// variants are unit structs, so this costs nothing at runtime, and it makes
+/// "a cluster has exactly one ring" a fact the type system holds rather than an
+/// invariant every call site has to remember. The previous shape — a service
+/// carrying both strategies and picking per request — is what ADR 0006
+/// replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterPlacement {
+    /// The block ring: hashes the whole [`BlockId`], so a parallel scan fans
+    /// out across the fleet.
+    Block(RendezvousPlacement),
+    /// The object ring: hashes the object identity, so every range of one
+    /// object lands on one worker.
+    Async(ObjectPlacement),
+}
+
+impl ClusterPlacement {
+    /// The ring a cluster of this type places on.
+    pub fn for_type(cluster: ClusterType) -> Self {
+        match cluster {
+            ClusterType::Block => ClusterPlacement::Block(RendezvousPlacement),
+            ClusterType::Async => ClusterPlacement::Async(ObjectPlacement),
+        }
+    }
+
+    /// The cluster type this ring belongs to.
+    pub fn cluster_type(&self) -> ClusterType {
+        match self {
+            ClusterPlacement::Block(_) => ClusterType::Block,
+            ClusterPlacement::Async(_) => ClusterType::Async,
+        }
+    }
+}
+
+impl Placement for ClusterPlacement {
+    fn locate(&self, block: &BlockId, nodes: &[NodeInfo]) -> Option<NodeId> {
+        match self {
+            ClusterPlacement::Block(p) => p.locate(block, nodes),
+            ClusterPlacement::Async(p) => p.locate(block, nodes),
+        }
+    }
+
+    fn locate_top_k(&self, block: &BlockId, nodes: &[NodeInfo], k: usize) -> Vec<NodeId> {
+        match self {
+            ClusterPlacement::Block(p) => p.locate_top_k(block, nodes, k),
+            ClusterPlacement::Async(p) => p.locate_top_k(block, nodes, k),
+        }
     }
 }
 
@@ -349,9 +399,10 @@ mod tests {
     ///
     /// `BlockId` derives `Hash` over all four fields, version included, so
     /// hashing the whole id would relocate an object on every overwrite and
-    /// hand it to a worker with a cold cache — for nothing, since coherence is
-    /// already handled by the worker interning `(ObjectId, Version)` into a
-    /// `stream_id`. Placement stays put; the superseded extents age out.
+    /// hand it to a worker with a cold cache. Nothing is bought by that: the
+    /// async worker's own cache does not distinguish revisions either — it
+    /// interns the `ObjectId` alone and assumes immutability (ADR 0005 §3) —
+    /// so the move would cost a cold cache and buy no coherence.
     #[test]
     fn the_object_ring_survives_a_republish() {
         let p = ObjectPlacement;
@@ -411,6 +462,59 @@ mod tests {
         assert!(
             differs,
             "both rings produced identical placement everywhere"
+        );
+    }
+
+    /// A cluster type selects its ring, and only its ring.
+    ///
+    /// The pairing used to be made by hand at each call site — a strategy here,
+    /// a role filter there — which is how a lookup could come to cross pools.
+    #[test]
+    fn a_cluster_type_selects_its_own_ring() {
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let blocks = ClusterPlacement::for_type(ClusterType::Block);
+        let extents = ClusterPlacement::for_type(ClusterType::Async);
+
+        assert_eq!(blocks.cluster_type(), ClusterType::Block);
+        assert_eq!(extents.cluster_type(), ClusterType::Async);
+
+        for i in 0..50 {
+            let blk = block(i);
+            assert_eq!(
+                blocks.locate(&blk, &ns),
+                RendezvousPlacement.locate(&blk, &ns)
+            );
+            assert_eq!(extents.locate(&blk, &ns), ObjectPlacement.locate(&blk, &ns));
+            assert_eq!(
+                blocks.locate_top_k(&blk, &ns, 3),
+                RendezvousPlacement.locate_top_k(&blk, &ns, 3)
+            );
+            assert_eq!(
+                extents.locate_top_k(&blk, &ns, 3),
+                ObjectPlacement.locate_top_k(&blk, &ns, 3)
+            );
+        }
+    }
+
+    /// Each cluster type keeps the behaviour its ring exists for.
+    #[test]
+    fn the_block_cluster_spreads_offsets_and_the_async_cluster_does_not() {
+        let ns = nodes(&["a", "b", "c", "d", "e"]);
+        let offsets = |p: &ClusterPlacement| -> std::collections::HashSet<String> {
+            (0..32u64)
+                .map(|i| {
+                    let mut at = block(1);
+                    at.offset = i * (256 << 20);
+                    p.locate(&at, &ns).unwrap().0
+                })
+                .collect()
+        };
+
+        assert!(offsets(&ClusterPlacement::for_type(ClusterType::Block)).len() > 1);
+        assert_eq!(
+            offsets(&ClusterPlacement::for_type(ClusterType::Async)).len(),
+            1,
+            "the async cluster must pin a whole object to one worker"
         );
     }
 

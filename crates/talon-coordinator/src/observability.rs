@@ -695,12 +695,10 @@ impl CoordinatorObservability {
                     .nodes
                     .iter()
                     .filter(|status| {
-                        // Both worker roles: membership carries the union and
-                        // Membership::snapshot_for splits it by placement
-                        // class at lookup time. Filtering to NodeRole::Worker
-                        // here would keep async workers out of the registry
-                        // entirely, so every extent lookup would answer "no
-                        // owners" with nothing in the logs to explain it.
+                        // Still the union of worker roles: `Membership` now
+                        // knows its cluster type and drops what it does not
+                        // admit, so narrowing here would only move the same
+                        // decision somewhere it cannot be logged.
                         status.node.role.is_worker()
                             && status.health == NodeHealth::Healthy
                             && status.ready
@@ -1214,7 +1212,7 @@ mod tests {
                 .unwrap();
         }
 
-        let membership = Membership::new();
+        let membership = Membership::default();
         observability
             .reconcile_membership(&membership)
             .await

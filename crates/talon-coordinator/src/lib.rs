@@ -23,7 +23,7 @@ pub use observability::{
     serve_admin as serve_coordinator_admin, ControlOperation, CoordinatorMetrics,
     CoordinatorObservability,
 };
-pub use placement::{Epoch, ObjectPlacement, Placement, RendezvousPlacement};
+pub use placement::{ClusterPlacement, Epoch, ObjectPlacement, Placement, RendezvousPlacement};
 pub use service::{PlacementResult, PlacementService};
 pub use state_store::{
     BackendHealth, ClusterSnapshot, ClusterStateConfig, ClusterStateStore, ClusterStateWatch,
