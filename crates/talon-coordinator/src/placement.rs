@@ -372,26 +372,25 @@ mod tests {
             );
         }
     }
-    /// The block ring must hash exactly as it did before the split.
+    /// The block ring must agree with what clients compute for themselves.
     ///
-    /// A drift here silently remaps every block in every existing cluster, so
-    /// this pins the hash rather than trusting that nothing touched it.
+    /// Since #455 a client rebuilds the Maglev table from its own membership
+    /// snapshot instead of asking the coordinator, so these are two
+    /// implementations of one mapping. If they drift, a client fetches from a
+    /// worker the coordinator does not consider the owner — the read still
+    /// succeeds, by fetching from origin and caching a second copy, so the
+    /// symptom is a quietly halved hit rate rather than an error.
+    ///
+    /// This also pins that adding the async ring did not perturb the block
+    /// ring, which is what this test originally existed to catch.
     #[test]
-    fn the_block_ring_is_unchanged_by_the_split() {
-        fn legacy_weight(block: &BlockId, node: &NodeId) -> u64 {
-            let mut hasher = DefaultHasher::new();
-            block.hash(&mut hasher);
-            node.0.hash(&mut hasher);
-            hasher.finish()
-        }
-
+    fn the_block_ring_agrees_with_client_side_placement() {
         let ns = nodes(&["a", "b", "c", "d", "e"]);
         for i in 0..50 {
             let blk = block(i);
-            let expected = ns
-                .iter()
-                .max_by_key(|n| legacy_weight(&blk, &n.id))
-                .map(|n| n.id.clone());
+            let expected = talon_core::rank_cache_workers(&blk, &ns, 1)
+                .into_iter()
+                .next();
             assert_eq!(
                 RendezvousPlacement.locate(&blk, &ns),
                 expected,

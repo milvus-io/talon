@@ -78,7 +78,7 @@ fn vectors() -> Vec<Vector> {
         ),
         control(
             "control.ring_placement_lookup.async",
-            "Schema 4: ring-aware placement on the async ring. Only the object is hashed, so offset and version do not affect the answer",
+            "Schema 5: ring-aware placement on the async ring. Only the object is hashed, so offset and version do not affect the answer",
             1,
             &ControlMessage::RingPlacementLookup {
                 block: BlockId::new(

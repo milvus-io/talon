@@ -73,8 +73,8 @@ impl From<RingArg> for Ring {
 /// The block ring deliberately keeps sending the legacy `PlacementLookup`.
 /// That message has meant the block ring since schema 1 and every coordinator
 /// understands it; sending the ring-aware variant instead would demand a
-/// schema-4 peer for an identical answer. Only the async ring — which no
-/// pre-schema-4 coordinator can serve at all — pays that cost.
+/// schema-5 peer for an identical answer. Only the async ring — which no
+/// pre-schema-5 coordinator can serve at all — pays that cost.
 fn lookup_for(ring: Ring, block: &BlockId) -> ControlMessage {
     let block = block.clone();
     match ring {
@@ -400,7 +400,7 @@ mod tests {
 
     /// The block ring must keep sending the schema-1 message. Upgrading it to
     /// the ring-aware variant would make the default invocation fail against
-    /// every coordinator older than schema 4, for an identical answer.
+    /// every coordinator older than schema 5, for an identical answer.
     #[test]
     fn the_block_ring_still_sends_the_legacy_lookup() {
         assert!(matches!(
@@ -423,7 +423,7 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(msg.minimum_schema(), 4);
+        assert_eq!(msg.minimum_schema(), 5);
     }
 
     /// The flag and the wire enum must stay in step. A ring reachable on the

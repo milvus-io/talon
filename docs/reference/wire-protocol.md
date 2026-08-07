@@ -109,7 +109,7 @@ Variant tags are the enum's declaration order. The read path needs these:
 | 13 | `ObjectList` | coordinator → client | `entries: Vec<ObjectEntry>` |
 | 17 | `RingPlacementLookup` | client → coordinator | `block: BlockId`, `ring: Ring`, `k: u8` |
 
-`RingPlacementLookup` requires schema 4 and is only needed to reach the async
+`RingPlacementLookup` requires schema 5 and is only needed to reach the async
 worker pool; see [Choosing a ring](#choosing-a-ring). A client that reads whole
 blocks needs `PlacementLookup` alone, exactly as before.
 
@@ -201,7 +201,7 @@ extents and would fail the read a round trip later.
 The two block-ring forms are defined to place identically, so a client may
 migrate to the ring-aware message without moving any data. Prefer
 `PlacementLookup` for the block ring anyway: it has meant the block ring since
-schema 1, and it works against coordinators older than schema 4.
+schema 1, and it works against coordinators older than schema 5.
 
 Both forms answer with the same `PlacementResponse`, so a client decodes one
 reply shape either way. The data plane is identical: both worker types serve the

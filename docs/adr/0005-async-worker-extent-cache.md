@@ -176,7 +176,7 @@ is.
 
 **Compatibility.** The ring travels as a `Ring` enum — `Block` (the default) or
 `Async` — carried on a *new* message, `RingPlacementLookup { block, ring, k }`,
-at `CONTROL_SCHEMA_VERSION = 4`.
+at `CONTROL_SCHEMA_VERSION = 5`.
 
 The enum is what a third ring should cost: one value, not a message variant plus
 a dispatch arm at every call site. But it rides a new message rather than being
@@ -196,7 +196,7 @@ a time, and a fleet that split across two owner sets for the same block would
 double every worker's cache footprint. Both messages answer with the same
 `PlacementResponse`, so a client learns one reply shape.
 
-The schema-4 floor applies to the new message on *either* ring, including
+The schema-5 floor applies to the new message on *either* ring, including
 `Block`. The fence is on the encoding, not on the ring: a v3 coordinator cannot
 decode the message at all, and must fail rather than fall back to the block
 lookup — on the async ring that fallback would return a block worker, which
