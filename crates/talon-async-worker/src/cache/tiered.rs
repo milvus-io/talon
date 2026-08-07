@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
-use talon_core::{ObjectId, Result, Version};
+use talon_core::{ObjectId, Result};
 
 use super::ids::StreamIds;
 use super::memory::{EvictionSink, MemoryCache, MemoryCacheStats};
@@ -306,9 +306,14 @@ impl TieredExtentCache {
         }))
     }
 
-    /// Resolve `(object, version)` to the stream id its extents are keyed by.
-    pub fn intern(&self, object: &ObjectId, version: &Version) -> u64 {
-        self.streams.get_or_intern(object, version)
+    /// Resolve `object` to the stream id its extents are keyed by.
+    ///
+    /// The version is deliberately not part of this: see [`StreamIds`]. A
+    /// republish therefore reuses the id, and staleness is bounded by the
+    /// runtime purging through [`invalidate_object`](Self::invalidate_object)
+    /// when the version-TTL refresh sees a new ETag.
+    pub fn intern(&self, object: &ObjectId) -> u64 {
+        self.streams.get_or_intern(object)
     }
 
     /// Serve `len` bytes at `offset` of `stream_id`, loading on a miss.
@@ -349,18 +354,15 @@ impl TieredExtentCache {
         self.memory.get_or_load(key, len, through_disk).await
     }
 
-    /// Make every extent of `object`'s superseded versions unreachable.
+    /// Make every extent of `object` unreachable.
     ///
-    /// Called when a commit republishes an object. The new ETag already interns
-    /// to a fresh stream id, so correctness does not depend on this — it
-    /// reclaims the old version's space rather than waiting for region
-    /// reclamation to find it.
-    pub fn invalidate_superseded(&self, object: &ObjectId, keep: &Version) -> u64 {
-        let released = self.streams.release_superseded(object, keep);
-        self.forget(&released)
-    }
-
-    /// Make every extent of `object` unreachable, for an outright delete.
+    /// Two callers, and the first is load-bearing:
+    ///
+    /// 1. A republish observed at version-TTL refresh. Since the stream id no
+    ///    longer carries the version, nothing else makes the previous
+    ///    contents unreachable — without this call a same-path overwrite is
+    ///    served stale indefinitely rather than for one TTL.
+    /// 2. An outright delete.
     pub fn invalidate_object(&self, object: &ObjectId) -> u64 {
         let released = self.streams.release_object(object);
         self.forget(&released)
@@ -701,24 +703,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_new_version_cannot_read_the_old_version_bytes() {
-        // The no-stale-reads guarantee, end to end through interning.
+    async fn a_republish_shares_the_streams_extents_until_it_is_invalidated() {
+        // The shape of the immutability assumption, end to end through
+        // interning: nothing about a new version makes the old extents
+        // unreachable, so `invalidate_object` is load-bearing rather than
+        // housekeeping. The runtime calls it from the version-TTL refresh.
         let root = tmp_root("versions");
         let cache = TieredExtentCache::new(&config(&root, 0)).await.unwrap();
         let obj = ObjectId::new(Backend::S3, "bucket", "part.parquet");
 
-        let v1 = cache.intern(&obj, &Version::new("etag-1"));
+        let stream = cache.intern(&obj);
         cache
-            .get_or_load(v1, 0, 3, Box::pin(async { Ok(Bytes::from_static(b"old")) }))
+            .get_or_load(
+                stream,
+                0,
+                3,
+                Box::pin(async { Ok(Bytes::from_static(b"old")) }),
+            )
             .await
             .unwrap();
         cache.flush().await;
 
-        let v2 = cache.intern(&obj, &Version::new("etag-2"));
-        assert_ne!(v1, v2, "a new etag must intern to a new stream");
+        assert_eq!(cache.intern(&obj), stream, "a republish reuses the id");
 
+        // The loader here would return "new", but it never runs: the extent
+        // cached under the old version answers first. That is the staleness the
+        // TTL-bounded purge exists to close.
+        let stale = cache
+            .get_or_load(
+                stream,
+                0,
+                3,
+                Box::pin(async { Ok(Bytes::from_static(b"new")) }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(stale, Bytes::from_static(b"old"));
+
+        cache.invalidate_object(&obj);
         let fresh = cache
-            .get_or_load(v2, 0, 3, Box::pin(async { Ok(Bytes::from_static(b"new")) }))
+            .get_or_load(
+                cache.intern(&obj),
+                0,
+                3,
+                Box::pin(async { Ok(Bytes::from_static(b"new")) }),
+            )
             .await
             .unwrap();
         assert_eq!(fresh, Bytes::from_static(b"new"));
@@ -727,16 +756,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidating_a_superseded_version_frees_its_extents() {
+    async fn invalidating_an_object_frees_its_extents() {
         let root = tmp_root("invalidate");
         let cache = TieredExtentCache::new(&config(&root, 0)).await.unwrap();
         let obj = ObjectId::new(Backend::S3, "bucket", "part.parquet");
 
-        let v1 = cache.intern(&obj, &Version::new("etag-1"));
+        let stream = cache.intern(&obj);
         for i in 0..3u64 {
             cache
                 .get_or_load(
-                    v1,
+                    stream,
                     i * 64,
                     64,
                     Box::pin(async move { Ok(Bytes::from(vec![1u8; 64])) }),
@@ -747,7 +776,7 @@ mod tests {
         cache.flush().await;
         assert_eq!(cache.disk().unwrap().extent_count(), 3);
 
-        let dropped = cache.invalidate_superseded(&obj, &Version::new("etag-2"));
+        let dropped = cache.invalidate_object(&obj);
         assert_eq!(dropped, 3);
         assert_eq!(cache.disk().unwrap().extent_count(), 0);
 

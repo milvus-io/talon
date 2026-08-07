@@ -675,8 +675,9 @@ mod tests {
 
     #[tokio::test]
     async fn different_streams_never_collide() {
-        // Same offset, different object version -> different entry. This is the
-        // no-stale-reads guarantee at the L1 level.
+        // Same offset, different object -> different entry. Two objects sharing
+        // an L1 slot would be a cross-object read, which is the one failure this
+        // tier must never have.
         let cache = MemoryCache::new(1 << 20);
         cache
             .get_or_load(key(1, 0), 3, loader(b"old"))

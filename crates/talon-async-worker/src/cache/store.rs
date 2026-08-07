@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //! The L2 tier as a whole: a set of [`ShardFile`]s behind an async API.
 //!
-//! Sharding is by `stream_id`, so every extent of one object version lands in
-//! one shard file and a multi-extent read touches one fd. All file I/O runs on
-//! the blocking pool — a `pread` against NVMe is microseconds, but microseconds
-//! on a reactor thread is still a stall, and this worker's whole point is
-//! serving many small reads concurrently.
+//! Sharding is by `stream_id`, so every extent of one object lands in one shard
+//! file and a multi-extent read touches one fd. All file I/O runs on the
+//! blocking pool — a `pread` against NVMe is microseconds, but microseconds on a
+//! reactor thread is still a stall, and this worker's whole point is serving
+//! many small reads concurrently.
 //!
 //! The tier is cold after a restart. Run descriptors live only in memory, so a
 //! pre-existing shard file's bytes are unaddressable and the directory is wiped
@@ -296,7 +296,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stream_always_lands_in_one_shard() {
-        // Every extent of one object version shares an fd, so a multi-extent
+        // Every extent of one object shares an fd, so a multi-extent
         // read touches a single file.
         let root = tmp_root("affinity");
         let s = store(&root, 4).await;

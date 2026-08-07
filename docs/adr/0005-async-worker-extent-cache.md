@@ -80,20 +80,49 @@ reader has asked for. Nothing is rounded up, so nothing is over-fetched.
 
 This is the property paged blocks could not deliver: a 4KB footer read costs 4KB.
 
-### 3. `stream_id` interns `(ObjectId, Version)` together
+### 3. `stream_id` interns the `ObjectId` alone, and the version is not in the key
 
-Talon's cache coherence rests on the origin ETag being part of the cache key, so
-republishing an object at the same path yields a different key and stale bytes
-are unreachable with no invalidation protocol. A key of `(object, offset)` alone
-would be weaker than what Talon already promises.
+Carrying object identity literally in every extent key is expensive — an
+`ObjectId` is a backend discriminant plus two `String`s — so it interns to one
+`u64` on first sight. An extent key is then two integers. Ids are retired rather
+than recycled, so a key holding a released id can never alias a live object.
 
-Carrying the identity literally is expensive — an `ObjectId` is a backend
-discriminant plus two `String`s, and a `Version` is a third — so
-`(ObjectId, Version)` interns to one `u64` on first sight. A new ETag allocates
-a new id, so every extent of the superseded version becomes unreachable at once.
-Ids are retired rather than recycled, so a stale key can never alias a live
-object. Interned entries are released when a version is superseded, so churn
-does not grow the table without bound.
+The `Version` is deliberately **not** part of that identity, and this is the one
+place where the async worker's coherence is weaker than the block worker's.
+
+`talon-worker` puts the ETag in its `BlockId`, so republishing an object at the
+same path yields a different key and the superseded bytes are unreachable with
+no invalidation step at all. Keying on `(ObjectId, Version)` here would give the
+same property. It was rejected because the price is paid on every read of every
+object — a `Version` clone and hash on the interning path, plus a version string
+per stream in every checkpoint (section 9) — to defend against something that
+does not happen to the objects this worker caches. Analytics files are written
+once and read many times; a partition is replaced by writing a new path, not by
+overwriting an old one.
+
+So immutability is a **performance assumption backed by a bounded check**, not a
+correctness requirement:
+
+- A republish reuses the stream id, so the previously cached extents stay
+  reachable. Nothing about the overwrite makes them go away.
+- The runtime re-HEADs an object whenever its cached version resolution passes
+  the version TTL (60s by default), and when the origin rejects a ranged GET
+  mid-read. Either path compares the ETag it got against the one it held, and on
+  a difference purges every extent of that object before serving.
+- Staleness is therefore bounded by the version TTL rather than eliminated. A
+  reader inside that window sees the old bytes.
+
+`talon_async_worker_republish_purges_total` counts the purges. It is expected to
+stay at zero; a non-zero value says something is overwriting objects in place,
+and that reads of those objects were served stale for up to one TTL. Deployments
+that cannot accept that window should lower the version TTL, which trades HEAD
+volume for a shorter window, or route the traffic to a block-worker pool, which
+removes the window entirely.
+
+Section 7's restart behaviour follows from this too: whatever an async worker
+recovers across a restart is subject to the same TTL-bounded check as a live
+entry, because the version cache does not survive the restart and the first read
+of an object re-HEADs it.
 
 ### 4. Two tiers: a CLOCK memory tier over a region-packed NVMe tier
 
@@ -159,12 +188,12 @@ worker, and one reader's fetch warms the next reader's hit. This is the whole
 reason the ring exists.
 
 *Dropping the version* keeps the object where it already is. With the version in
-the key, republishing under a new ETag relocates the object: the new owner starts
-cold while the previous owner still holds every warm extent of the old revision,
-and nothing is gained by the move — coherence is already handled a layer down,
-where the worker interns `(ObjectId, Version)` into a `stream_id` (§3), so a new
-ETag produces new cache entries regardless of which node serves them. Placement
-stays put and the superseded extents age out through normal region reclamation.
+the placement key, republishing under a new ETag relocates the object: the new
+owner starts cold while the previous owner still holds every warm extent of the
+old revision, and nothing is gained by the move — coherence is handled a layer
+down, in the worker's own cache (§3), which purges an object's extents when it
+observes a new ETag. Placement stays put and the purge runs wherever the object
+already lives.
 
 **Why the client picks the ring.** The coordinator could infer it — by file
 extension, by read size, by a per-prefix rule — but each of those is a policy
@@ -266,12 +295,12 @@ worker, only for the read half. A deployment that writes through Talon needs
 both pools, and clients must route accordingly. Since section 6 already gives
 async workers their own cluster, that routing decision exists regardless.
 
-This also means the invalidation entry points (`invalidate_superseded`,
-`invalidate_object`) have no caller on the serve path. They stay because
-correctness does not depend on them — a republished object interns a new
-`stream_id` and cannot reach the old version's extents either way, per section 3
-— but they let a future control-plane notification reclaim the space instead of
-waiting for region reclamation to find it.
+This also means invalidation has no *write*-path caller. `invalidate_object` is
+nevertheless on the serve path, called from the version-TTL refresh described in
+section 3: with the version out of the cache key it is what bounds staleness
+after a republish, so it is load-bearing rather than housekeeping. A future
+control-plane invalidation notification would call the same entry point to
+reclaim the space immediately instead of waiting for the TTL.
 
 ## Consequences
 
@@ -299,6 +328,9 @@ waiting for region reclamation to find it.
 - **Object routing concentrates load.** One very large, very hot object is
   served by one worker.
 - **Cold restart** for the NVMe tier, per section 7.
+- **Coherence is TTL-bounded, not absolute.** Unlike the block worker, a
+  republished object can be served stale for up to one version TTL, per
+  section 3. This is the one guarantee the async worker gives up.
 - **Reads only.** An async worker cannot replace a block worker outright; a
   deployment that writes through Talon runs both pools, per section 8.
 - **Operators must choose** which worker fits a workload; a wrong choice is a
@@ -356,8 +388,7 @@ the message variant selects the ring without adding a wire field.
 1. The crate, and the L1 memory tier: sharded CLOCK eviction, watch-channel load
    coalescing, per-entry hit counts, an eviction sink.
 2. The L2 region tier: shard files, regions, run descriptors, pin counts, decay
-   scoring, batched writes, optional checksums, and `(ObjectId, Version)`
-   interning.
+   scoring, batched writes, optional checksums, and `ObjectId` interning.
 3. The tiered facade: L1 over L2 over backend, with frequency-gated admission
    and the L1-disabled fallback.
 4. The serve path on the existing wire protocol, the ring split, the binary,

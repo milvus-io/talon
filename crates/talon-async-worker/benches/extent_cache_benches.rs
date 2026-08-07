@@ -305,13 +305,13 @@ fn l1_hit_column_chunk(bencher: divan::Bencher) {
     });
 }
 
-/// Interning `(ObjectId, Version)` to a `stream_id`. Every read pays it, and it
-/// is on the path before any cache lookup, so a regression here is a regression
+/// Interning an [`ObjectId`] to a `stream_id`. Every read pays it, and it is on
+/// the path before any cache lookup, so a regression here is a regression
 /// everywhere.
 #[divan::bench]
 fn intern_stream_id(bencher: divan::Bencher) {
     let rt = tokio::runtime::Runtime::new().unwrap();
-    let (cache, object, version) = rt.block_on(async {
+    let (cache, object) = rt.block_on(async {
         let cache = TieredExtentCache::new(&ExtentCacheConfig {
             memory_bytes: 1 << 20,
             memory_shards: 8,
@@ -320,11 +320,10 @@ fn intern_stream_id(bencher: divan::Bencher) {
         .await
         .unwrap();
         let object = object(0);
-        let version = Version::new("v1");
-        cache.intern(&object, &version);
-        (cache, object, version)
+        cache.intern(&object);
+        (cache, object)
     });
-    bencher.bench_local(|| cache.intern(divan::black_box(&object), divan::black_box(&version)));
+    bencher.bench_local(|| cache.intern(divan::black_box(&object)));
 }
 
 /// The full per-file trace on a cold cache, at each granularity.

@@ -97,6 +97,13 @@ pub struct ServeStats {
     pub version_cache_hits: u64,
     /// Reads retried after the origin reported a version mismatch.
     pub version_mismatch_retries: u64,
+    /// Objects whose extents were purged because a HEAD saw a new version.
+    ///
+    /// Expected to stay at zero: the extent cache is keyed on the object alone
+    /// and assumes the objects it caches are immutable. A rising count means
+    /// something is overwriting in place, and that reads of it were served
+    /// stale for up to one version TTL before this fired.
+    pub republish_purges: u64,
     /// Reads clamped because they ran past the end of the object.
     pub reads_clamped: u64,
     /// Bytes fetched from the origin. The number this worker exists to lower.
@@ -111,6 +118,7 @@ struct Counters {
     version_lookups: AtomicU64,
     version_cache_hits: AtomicU64,
     version_mismatch_retries: AtomicU64,
+    republish_purges: AtomicU64,
     reads_clamped: AtomicU64,
     origin_bytes_fetched: AtomicU64,
 }
@@ -177,6 +185,7 @@ impl AsyncWorkerRuntime {
             version_lookups: c.version_lookups.load(Ordering::Relaxed),
             version_cache_hits: c.version_cache_hits.load(Ordering::Relaxed),
             version_mismatch_retries: c.version_mismatch_retries.load(Ordering::Relaxed),
+            republish_purges: c.republish_purges.load(Ordering::Relaxed),
             reads_clamped: c.reads_clamped.load(Ordering::Relaxed),
             origin_bytes_fetched: c.origin_bytes_fetched.load(Ordering::Relaxed),
         }
@@ -227,7 +236,10 @@ impl AsyncWorkerRuntime {
                     object = %request.object.to_path(),
                     "version mismatch mid-read; re-resolving"
                 );
-                self.invalidate_version(&request.object);
+                // `force` already bypasses the TTL cache, so the stale entry is
+                // left in place on purpose: `resolve` compares against it to
+                // notice the republish and purge the object's extents. Clearing
+                // it first would hide the very change that got us here.
                 let (version, object_len) = self.resolve(&request.object, true).await?;
                 self.serve_at(request, &version, object_len).await?
             }
@@ -267,7 +279,7 @@ impl AsyncWorkerRuntime {
             self.counters.reads_clamped.fetch_add(1, Ordering::Relaxed);
         }
 
-        let stream_id = self.cache.intern(&request.object, version);
+        let stream_id = self.cache.intern(&request.object);
         let key = ExtentKey::new(stream_id, request.offset);
 
         // Zero-copy is only reachable with the DRAM tier off. With L1 on, an L2
@@ -339,7 +351,7 @@ impl AsyncWorkerRuntime {
             );
         }
 
-        self.versions.lock().unwrap().insert(
+        let previous = self.versions.lock().unwrap().insert(
             object.clone(),
             ResolvedObject {
                 version: stat.version.clone(),
@@ -347,6 +359,28 @@ impl AsyncWorkerRuntime {
                 at: Instant::now(),
             },
         );
+
+        // The stream id is keyed on the object alone, so an overwrite at the
+        // same path reuses it and the superseded extents stay reachable.
+        // Nothing else makes them unreachable — this purge is what turns
+        // "stale forever" into "stale for at most one version TTL".
+        //
+        // `previous` is None only the first time an object is seen, which is
+        // not a republish: purging there would drop nothing and cost a lock.
+        // Every later resolution, TTL-expired or forced, compares against a
+        // real entry — which is why the forced path no longer clears it first.
+        if previous.is_some_and(|old| old.version != stat.version) {
+            let dropped = self.cache.invalidate_object(object);
+            self.counters
+                .republish_purges
+                .fetch_add(1, Ordering::Relaxed);
+            tracing::info!(
+                object = %object.to_path(),
+                extents = dropped,
+                "object republished at the same path; purged its cached extents"
+            );
+        }
+
         Ok((stat.version, stat.len))
     }
 
@@ -354,10 +388,6 @@ impl AsyncWorkerRuntime {
         let cache = self.versions.lock().unwrap();
         let entry = cache.get(object)?;
         (entry.at.elapsed() < self.version_ttl).then(|| (entry.version.clone(), entry.len))
-    }
-
-    fn invalidate_version(&self, object: &ObjectId) {
-        self.versions.lock().unwrap().remove(object);
     }
 
     fn ensure_configured_backend(&self, requested: Backend) -> anyhow::Result<()> {
@@ -661,9 +691,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_republished_object_never_serves_the_old_bytes() {
-        // The no-stale-reads guarantee end to end: a new etag interns a new
-        // stream, so the old version's extents are unreachable.
+    async fn a_republished_object_is_purged_at_the_next_version_refresh() {
+        // The extent key is the object alone, so a republish reuses the stream
+        // id and the old bytes stay reachable. What makes this correct is the
+        // purge in `resolve`: the refresh sees an etag it has not seen and drops
+        // the object's extents before the read is served.
         let root = tmp_root("republish");
         let backend = RecordingBackend::new(b"aaaaaaaa");
         let rt = runtime(&root, 1 << 20, Arc::clone(&backend))
@@ -673,6 +705,11 @@ mod tests {
 
         let old = rt.serve(&req(&obj, 0, 8)).await.unwrap();
         assert_eq!(body_of(&old), Bytes::from_static(b"aaaaaaaa"));
+        assert_eq!(
+            rt.stats().republish_purges,
+            0,
+            "first sight is no republish"
+        );
 
         backend.republish(b"bbbbbbbb", "etag-2");
         let new = rt.serve(&req(&obj, 0, 8)).await.unwrap();
@@ -681,6 +718,57 @@ mod tests {
             Bytes::from_static(b"bbbbbbbb"),
             "served the superseded version"
         );
+        assert_eq!(rt.stats().republish_purges, 1);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_republish_inside_the_version_ttl_still_serves_the_old_bytes() {
+        // The accepted limitation, pinned so it is a decision rather than a
+        // surprise: with the version in the key this could not happen, and the
+        // trade is recorded in ADR 0005 §3. Nothing re-HEADs inside the TTL, so
+        // nothing can notice the republish, so the cached extent answers.
+        let root = tmp_root("republish-window");
+        let backend = RecordingBackend::new(b"aaaaaaaa");
+        let rt = runtime(&root, 1 << 20, Arc::clone(&backend))
+            .await
+            .with_version_ttl(Duration::from_secs(3600));
+        let obj = object("f.parquet");
+
+        rt.serve(&req(&obj, 0, 8)).await.unwrap();
+        backend.republish(b"bbbbbbbb", "etag-2");
+
+        let stale = rt.serve(&req(&obj, 0, 8)).await.unwrap();
+        assert_eq!(body_of(&stale), Bytes::from_static(b"aaaaaaaa"));
+        assert_eq!(backend.heads.load(Ordering::Relaxed), 1, "no refresh yet");
+        assert_eq!(rt.stats().republish_purges, 0);
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn re_resolving_the_same_version_leaves_the_cache_warm() {
+        // The purge must key on a *changed* version, not on any refresh:
+        // expiring the TTL on an unchanged object must not throw away its
+        // extents and send the next read back to the origin.
+        let root = tmp_root("refresh-warm");
+        let backend = RecordingBackend::new(b"aaaaaaaa");
+        let rt = runtime(&root, 1 << 20, Arc::clone(&backend))
+            .await
+            .with_version_ttl(Duration::ZERO);
+        let obj = object("f.parquet");
+
+        rt.serve(&req(&obj, 0, 8)).await.unwrap();
+        rt.serve(&req(&obj, 0, 8)).await.unwrap();
+
+        assert_eq!(
+            backend.heads.load(Ordering::Relaxed),
+            2,
+            "TTL expired twice"
+        );
+        assert_eq!(rt.stats().republish_purges, 0);
+        assert_eq!(backend.fetches(), 1, "the second read was a cache hit");
 
         std::fs::remove_dir_all(root).ok();
     }
@@ -698,6 +786,38 @@ mod tests {
         assert_eq!(body_of(&out), Bytes::from_static(b"hello world"));
         assert_eq!(rt.stats().version_mismatch_retries, 1);
         assert_eq!(backend.heads.load(Ordering::Relaxed), 2, "re-resolved");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_mismatch_mid_read_purges_when_the_object_really_changed() {
+        // The forced re-resolve must go through the same purge as a TTL
+        // refresh. It used to clear the version cache first, which made the
+        // comparison in `resolve` see no previous entry and skip the purge --
+        // exactly backwards, since the origin had just said the object moved.
+        let root = tmp_root("mismatch-purge");
+        let backend = RecordingBackend::new(b"aaaaaaaaaaaaaaaa");
+        let rt = runtime(&root, 1 << 20, Arc::clone(&backend)).await;
+        let obj = object("f.parquet");
+
+        rt.serve(&req(&obj, 0, 8)).await.unwrap();
+
+        backend.republish(b"bbbbbbbbbbbbbbbb", "etag-2");
+        *backend.fail_once_with_mismatch.lock().unwrap() = true;
+        // Offset 8 rather than 0: a read of the already-cached extent would be
+        // answered from cache and never reach the backend to fail.
+        let out = rt.serve(&req(&obj, 8, 8)).await.unwrap();
+
+        assert_eq!(rt.stats().version_mismatch_retries, 1);
+        assert_eq!(rt.stats().republish_purges, 1);
+        assert_eq!(body_of(&out), Bytes::from_static(b"bbbbbbbb"));
+        // The purge reached the extent cached under the old version, so the
+        // read that started this is not the only one now serving fresh bytes.
+        assert_eq!(
+            body_of(&rt.serve(&req(&obj, 0, 8)).await.unwrap()),
+            Bytes::from_static(b"bbbbbbbb")
+        );
 
         std::fs::remove_dir_all(root).ok();
     }

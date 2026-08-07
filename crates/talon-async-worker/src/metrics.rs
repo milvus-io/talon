@@ -40,6 +40,7 @@ pub struct AsyncWorkerMetrics {
     version_lookups_total: Counter,
     version_cache_hits_total: Counter,
     version_mismatch_retries_total: Counter,
+    republish_purges_total: Counter,
     reads_clamped_total: Counter,
 
     l1_hits_total: Counter,
@@ -128,6 +129,13 @@ impl AsyncWorkerMetrics {
             version_mismatch_retries_total: c(
                 "talon_async_worker_version_mismatch_retries_total",
                 "Reads retried after the origin reported a version mismatch.",
+            ),
+            republish_purges_total: c(
+                "talon_async_worker_republish_purges_total",
+                "Objects whose cached extents were dropped because a HEAD saw a \
+                 new version. Expected to stay at zero: the extent cache assumes \
+                 the objects it caches are immutable, and a non-zero count means \
+                 reads were served stale for up to one version TTL.",
             ),
             reads_clamped_total: c(
                 "talon_async_worker_reads_clamped_total",
@@ -230,6 +238,7 @@ impl AsyncWorkerMetrics {
             &self.version_mismatch_retries_total,
             serve.version_mismatch_retries,
         );
+        set_counter(&self.republish_purges_total, serve.republish_purges);
         set_counter(&self.reads_clamped_total, serve.reads_clamped);
 
         set_counter(&self.l1_hits_total, c.memory_hits);

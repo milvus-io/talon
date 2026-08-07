@@ -11,11 +11,11 @@
 //! for, so a 4KB footer read costs 4KB.
 //!
 //! There is no block concept here at all. A cache entry is keyed by
-//! [`ExtentKey`] — an interned `(object, version)` stream id plus a byte offset
-//! — and holds whatever length was fetched. Blocks survive only where Talon
-//! actually needs them, between the coordinator and the client for placement;
-//! the data-plane protocol already speaks `(object, offset, len)` and is
-//! unchanged, so this worker is wire-compatible with existing clients.
+//! [`ExtentKey`] — an interned object id plus a byte offset — and holds
+//! whatever length was fetched. Blocks survive only where Talon actually needs
+//! them, between the coordinator and the client for placement; the data-plane
+//! protocol already speaks `(object, offset, len)` and is unchanged, so this
+//! worker is wire-compatible with existing clients.
 //!
 //! See ADR 0005 for the design and the tradeoffs it accepts.
 //!

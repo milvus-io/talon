@@ -161,6 +161,34 @@ refetches on demand, one extent at a time rather than one 256 MiB block at a
 time — but plan rolling restarts with it in mind, and do not point `cache_dir`
 at anything you want to keep.
 
+### Republishing an object can serve stale bytes for one version TTL
+
+This is the one correctness guarantee the async worker gives up relative to the
+block worker, so read it before pointing production traffic at it.
+
+`talon-worker` puts the origin ETag in its cache key, so republishing an object
+at the same path makes the old bytes unreachable with no invalidation step. The
+async worker keys extents on the object alone — the objects it targets are
+analytics files that are written once, and paying a version clone on every read
+to defend against an overwrite that does not happen was the wrong trade (ADR
+0005 §3).
+
+What backs that assumption is a check, not a hope. The worker caches an object's
+resolved version for 60 s; when that expires, or when the origin rejects a ranged
+GET mid-read, it re-HEADs, and an ETag different from the one it held purges
+every cached extent of that object before the read is served.
+
+So:
+
+- an object overwritten in place can be served stale for **up to 60 s**, and
+- after that window the purge fires and readers see the new bytes.
+
+`talon_async_worker_republish_purges_total` counts the purges and should stay at
+zero. A non-zero value means something is overwriting objects in place, and that
+reads were served stale before it fired — alert on it. If a workload genuinely
+overwrites in place and cannot accept the window, route it to a block-worker
+pool.
+
 ### Writes are refused
 
 A `Put` or `Delete` gets an error frame naming `talon-worker` as the
@@ -215,6 +243,7 @@ Others worth alerting on:
 | `talon_async_worker_admissions_rejected_total` | Extents that never reached the DRAM hit threshold. High is normal on scan-heavy traffic — that is the frequency gate working. |
 | `talon_async_worker_admissions_dropped_total` | Extents dropped because the staging buffer was full. Sustained non-zero means NVMe writes cannot keep up. |
 | `talon_async_worker_l2_extents_evicted_total` | Extents lost to region reclamation. |
+| `talon_async_worker_republish_purges_total` | Objects whose extents were dropped because a HEAD saw a new version. Should be zero; see [above](#republishing-an-object-can-serve-stale-bytes-for-one-version-ttl). |
 
 ### Status reporting
 
