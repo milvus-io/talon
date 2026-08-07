@@ -12,8 +12,8 @@ use talon_coordinator::{
     WriteDisposition,
 };
 use talon_core::{
-    NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace, WorkloadIdentity,
-    WorkloadRole,
+    ClusterType, NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace,
+    WorkloadIdentity, WorkloadRole,
 };
 use talon_metadata::{ClusterCapabilities, MappingRevision, MetadataStore, NamespaceId};
 use talon_transport::control_tls::ControlTlsChannel;
@@ -76,6 +76,13 @@ struct Args {
     /// Logical cluster identity.
     #[arg(long)]
     cluster_id: Option<String>,
+    /// Which cache this cluster is: `block` or `async`.
+    ///
+    /// Fixes the placement ring and the one worker role admitted. Parsed
+    /// through `ClusterType`'s `FromStr` rather than a mirrored `ValueEnum`,
+    /// so there is one list of valid values, not two.
+    #[arg(long)]
+    cluster_type: Option<ClusterType>,
     /// Stable coordinator node identity.
     #[arg(long)]
     node_id: Option<String>,
@@ -115,6 +122,7 @@ impl Args {
             admin_listen: self.admin_listen,
             admin_advertise: self.admin_advertise,
             cluster_id: self.cluster_id,
+            cluster_type: self.cluster_type,
             node_id: self.node_id,
             state_backend: self.state_backend,
             ha_enabled: self.ha_enabled,

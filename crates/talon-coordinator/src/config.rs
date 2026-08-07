@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use talon_core::{
-    ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, NamespacePolicy, ObjectNamespace, Patch,
-    MAX_STATUS_FIELD_BYTES,
+    ClusterType, ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, NamespacePolicy,
+    ObjectNamespace, Patch, MAX_STATUS_FIELD_BYTES,
 };
 
 #[cfg(feature = "kubernetes")]
@@ -53,6 +53,13 @@ pub struct CoordinatorConfig {
     pub admin_advertise: String,
     /// Logical cluster identity.
     pub cluster_id: String,
+    /// Which cache this cluster is, and therefore which placement ring it
+    /// serves and which worker role it admits.
+    ///
+    /// A cluster runs one ring. Changing this on a running cluster is a
+    /// re-deployment, not a rolling config change: every worker of the old
+    /// role is refused at its next heartbeat. See ADR 0006.
+    pub cluster_type: ClusterType,
     /// Stable coordinator node identity.
     pub node_id: String,
     /// Optional mTLS material for the privileged coordinator-worker channel.
@@ -85,6 +92,7 @@ impl Default for CoordinatorConfig {
             admin_listen: "127.0.0.1:8000".into(),
             admin_advertise: "127.0.0.1:8000".into(),
             cluster_id: "default".into(),
+            cluster_type: ClusterType::default(),
             node_id: "127.0.0.1:7000".into(),
             control_tls: None,
             namespace_policy: None,
@@ -152,6 +160,8 @@ pub struct CoordinatorConfigPatch {
     pub admin_advertise: Option<String>,
     /// Override for [`CoordinatorConfig::cluster_id`].
     pub cluster_id: Option<String>,
+    /// Override for [`CoordinatorConfig::cluster_type`].
+    pub cluster_type: Option<ClusterType>,
     /// Override for [`CoordinatorConfig::node_id`].
     pub node_id: Option<String>,
     /// Optional `[control_tls]` block.
@@ -226,6 +236,7 @@ impl Patch for CoordinatorConfigPatch {
             admin_listen: self.admin_listen.or(base.admin_listen),
             admin_advertise: self.admin_advertise.or(base.admin_advertise),
             cluster_id: self.cluster_id.or(base.cluster_id),
+            cluster_type: self.cluster_type.or(base.cluster_type),
             node_id: self.node_id.or(base.node_id),
             control_tls: merge_control_tls(self.control_tls, base.control_tls),
             namespace_policy_path: self.namespace_policy_path.or(base.namespace_policy_path),
@@ -308,6 +319,15 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         cli: true,
         secret: false,
         help: "Logical cluster identity.",
+    },
+    ConfigVar {
+        env: "TALON_COORDINATOR_CLUSTER_TYPE",
+        key: "cluster_type",
+        default: Some("block"),
+        cli: true,
+        secret: false,
+        help: "Which cache this cluster is: block or async. Fixes the placement \
+               ring and the one worker role the cluster admits.",
     },
     ConfigVar {
         env: "TALON_COORDINATOR_NODE_ID",
@@ -522,6 +542,7 @@ pub mod env_names {
     pub const ADMIN_LISTEN: &str = "TALON_COORDINATOR_ADMIN_LISTEN";
     pub const ADMIN_ADVERTISE: &str = "TALON_COORDINATOR_ADMIN_ADVERTISE";
     pub const CLUSTER_ID: &str = "TALON_COORDINATOR_CLUSTER_ID";
+    pub const CLUSTER_TYPE: &str = "TALON_COORDINATOR_CLUSTER_TYPE";
     pub const NODE_ID: &str = "TALON_COORDINATOR_NODE_ID";
     pub const CONTROL_TLS_CA_CERT_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_CA_CERT_PATH";
     pub const CONTROL_TLS_CERT_PATH: &str = "TALON_COORDINATOR_CONTROL_TLS_CERT_PATH";
@@ -589,6 +610,16 @@ impl CoordinatorConfigPatch {
             admin_listen: get(env_names::ADMIN_LISTEN),
             admin_advertise: get(env_names::ADMIN_ADVERTISE),
             cluster_id: get(env_names::CLUSTER_ID),
+            cluster_type: get(env_names::CLUSTER_TYPE)
+                .map(|value| {
+                    // Not the shared `parse` helper: that discards the inner
+                    // error, and `ClusterType`'s names the two valid values,
+                    // which is the whole use of it on a typo.
+                    value
+                        .parse::<ClusterType>()
+                        .map_err(|error| anyhow::anyhow!("{}: {error}", env_names::CLUSTER_TYPE))
+                })
+                .transpose()?,
             node_id: get(env_names::NODE_ID),
             control_tls: optional_control_tls_patch(
                 get(env_names::CONTROL_TLS_CA_CERT_PATH),
@@ -673,6 +704,7 @@ impl CoordinatorConfig {
         let control_listen = merged.control_listen.or(defaults.control_listen);
         let admin_listen = merged.admin_listen.unwrap_or(defaults.admin_listen);
         let cluster_id = merged.cluster_id.unwrap_or(defaults.cluster_id);
+        let cluster_type = merged.cluster_type.unwrap_or(defaults.cluster_type);
         let control_tls = merged.control_tls.unwrap_or_default().resolve()?;
         let namespace_policy = merged
             .namespace_policy_path
@@ -769,6 +801,7 @@ impl CoordinatorConfig {
             control_listen,
             admin_listen,
             cluster_id,
+            cluster_type,
             control_tls,
             namespace_policy,
             state: ClusterStateConfig {
@@ -907,6 +940,58 @@ mod tests {
         assert_eq!(config.admin_advertise, "public:8000");
         assert_eq!(config.node_id, "cli:7000");
         assert_eq!(config.cluster_id, "prod");
+    }
+
+    #[test]
+    fn the_cluster_type_defaults_to_block_and_obeys_precedence() {
+        // Unset must stay Block: an existing deployment that names no type
+        // keeps the ring it already had.
+        let bare = CoordinatorConfig::resolve(
+            CoordinatorConfigPatch::default(),
+            CoordinatorConfigPatch::default(),
+            CoordinatorConfigPatch::default(),
+        )
+        .unwrap();
+        assert_eq!(bare.cluster_type, ClusterType::Block);
+
+        let file = CoordinatorConfigPatch {
+            cluster_type: Some(ClusterType::Block),
+            ..Default::default()
+        };
+        let cli = CoordinatorConfigPatch {
+            cluster_type: Some(ClusterType::Async),
+            ..Default::default()
+        };
+        let config =
+            CoordinatorConfig::resolve(file, CoordinatorConfigPatch::default(), cli).unwrap();
+        assert_eq!(config.cluster_type, ClusterType::Async, "CLI must win");
+    }
+
+    #[test]
+    fn the_cluster_type_is_read_from_toml_and_env() {
+        let file: CoordinatorConfigPatch =
+            toml::from_str("cluster_type = \"async\"\n").expect("parse TOML");
+        assert_eq!(file.cluster_type, Some(ClusterType::Async));
+
+        let env = CoordinatorConfigPatch::from_env_with(|name| {
+            (name == env_names::CLUSTER_TYPE).then(|| "async".to_string())
+        })
+        .unwrap();
+        assert_eq!(env.cluster_type, Some(ClusterType::Async));
+    }
+
+    #[test]
+    fn an_unparseable_cluster_type_in_env_names_the_valid_values() {
+        // A typo here silently choosing a ring would send every worker to the
+        // wrong pool, so it must fail startup and say what was expected.
+        let error = CoordinatorConfigPatch::from_env_with(|name| {
+            (name == env_names::CLUSTER_TYPE).then(|| "extent".to_string())
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains(env_names::CLUSTER_TYPE), "{error}");
+        assert!(error.contains("block"), "{error}");
+        assert!(error.contains("async"), "{error}");
     }
 
     #[test]

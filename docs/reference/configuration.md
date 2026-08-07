@@ -46,6 +46,14 @@ Logical cluster identity.
 - **Default:** `default`
 - **CLI flag:** `--cluster-id`
 
+### `cluster_type`
+
+Which cache this cluster is: block or async. Fixes the placement ring and the one worker role the cluster admits.
+
+- **Environment variable:** `TALON_COORDINATOR_CLUSTER_TYPE`
+- **Default:** `block`
+- **CLI flag:** `--cluster-type`
+
 ### `node_id`
 
 Stable coordinator node identity.
