@@ -1,8 +1,13 @@
 Talon has been deployed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
 
+Cluster type: {{ .Values.coordinator.clusterType }}
 Coordinator backend: {{ .Values.coordinator.backend }}
 Coordinator replicas: {{ include "talon.coordinatorReplicas" . }}
+{{- if eq .Values.coordinator.clusterType "async" }}
+Async workers enabled: {{ .Values.asyncWorker.enabled }}
+{{- else }}
 Worker enabled: {{ .Values.worker.enabled }}
+{{- end }}
 
 {{- if eq .Values.coordinator.backend "etcd" }}
 
@@ -15,6 +20,16 @@ deploy/kubernetes/etcd-secret.example.yaml.
 NOTE: workers expect a Secret named "{{ .Values.worker.backend.existingSecret }}"
 with the object-store credentials. Create it before the pods start — see
 deploy/kubernetes/worker-secret.example.yaml.
+{{- end }}
+{{- if .Values.asyncWorker.enabled }}
+
+NOTE: async workers expect a Secret named "{{ .Values.asyncWorker.backend.existingSecret }}"
+with the object-store credentials. Create it before the pods start — see
+deploy/kubernetes/worker-secret.example.yaml.
+
+This cluster serves reads and stats only: writes and directory listings are
+refused. Point those workloads at a separate release with
+coordinator.clusterType=block.
 {{- end }}
 
 Reach the management API/UI via the coordinator Service:

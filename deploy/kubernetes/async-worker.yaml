@@ -1,0 +1,171 @@
+# Talon async-worker Deployment — cache nodes that hold variable-length
+# extents (the exact byte ranges asked for) rather than fixed 256 MiB blocks.
+# For Parquet/Lance footer reads and column-chunk projection, where a block
+# worker fetches 256 MiB to serve 4 KiB.
+#
+# THIS NEEDS AN ASYNC COORDINATOR. A cluster runs one placement ring and
+# refuses to register a worker of the other kind (ADR 0006), so applying this
+# next to a stock coordinator produces pods that come up healthy and are turned
+# away at every heartbeat. Set the coordinator's cluster type first:
+#
+#   kubectl set env -n talon deployment/talon-coordinator \
+#     TALON_COORDINATOR_CLUSTER_TYPE=async
+#
+# Serving both access patterns means TWO clusters — a second namespace with its
+# own coordinator and Service — not both worker Deployments in one namespace:
+#
+#   kubectl create namespace talon-async
+#   kubectl apply -n talon-async -f rbac.yaml -f service.yaml \
+#     -f coordinator-kubernetes.yaml -f async-worker.yaml
+#   kubectl set env -n talon-async deployment/talon-coordinator \
+#     TALON_COORDINATOR_CLUSTER_TYPE=async
+#
+# Read-only: writes and directory listings are refused (ADR 0005 §8), so a
+# FUSE mount or a write path still needs the block cluster.
+#
+# Object-store credentials (Azure account + SAS) come from the same Secret
+# shape as the block worker (talon-worker-backend, see
+# worker-secret.example.yaml), read under TALON_ASYNC_WORKER_* names — never
+# baked into the image or committed. The cache is an emptyDir here; swap in a
+# PVC for a node-local SSD in production, which is also what makes the warm
+# restart below worth having.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: talon-async-worker
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: async-worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: talon-async-worker
+  namespace: talon
+  labels:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: async-worker
+spec:
+  replicas: 3
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: talon
+      app.kubernetes.io/component: async-worker
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: talon
+        app.kubernetes.io/component: async-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: talon-async-worker
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      # Placement pins a whole object to one worker, so spreading the pool
+      # across nodes is what keeps one hot object from sharing a node with
+      # another.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: talon
+              app.kubernetes.io/component: async-worker
+      volumes:
+        # NVMe tier. Swap this emptyDir for a PVC (node-local SSD) in
+        # production; with an emptyDir the warm restart below has nothing to
+        # recover from, since the volume dies with the pod.
+        - name: cache
+          emptyDir: {}
+      containers:
+        - name: async-worker
+          image: ghcr.io/milvus-io/talon-async-worker:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - "--coordinator"
+            - "talon-coordinator:7000"
+            - "--listen"
+            - "0.0.0.0:7001"
+            - "--admin-listen"
+            - "0.0.0.0:8001"
+          ports:
+            - name: data
+              containerPort: 7001
+            - name: admin
+              containerPort: 8001
+          env:
+            - name: TALON_ASYNC_WORKER_CLUSTER_ID
+              value: "talon"
+            - name: TALON_ASYNC_WORKER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            # Advertise the pod IP so the coordinator routes clients here.
+            - name: TALON_ASYNC_WORKER_ADVERTISE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: TALON_ASYNC_WORKER_CACHE_DIR
+              value: /var/cache/talon
+            # NVMe ceiling (8 GiB). Keep this below the emptyDir/PVC size.
+            - name: TALON_ASYNC_WORKER_CAPACITY_BYTES
+              value: "8589934592"
+            # Optional L1 DRAM tier. Keep disabled unless the pod memory limit
+            # covers this capacity plus the worker's normal runtime use.
+            - name: TALON_ASYNC_WORKER_L1_CAPACITY_BYTES
+              value: "0"
+            # Bytes between NVMe checkpoints. Without them a restarted shard
+            # holds regions of perfectly good bytes that nothing can name, so
+            # the directory is wiped instead (ADR 0005 §7). Zero turns this off.
+            - name: TALON_ASYNC_WORKER_CHECKPOINT_INTERVAL_BYTES
+              value: "268435456"
+            # Object-store backend credentials from the Secret — never logged.
+            - name: TALON_ASYNC_WORKER_AZURE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: talon-worker-backend
+                  key: azure-account
+            - name: TALON_ASYNC_WORKER_AZURE_SAS
+              valueFrom:
+                secretKeyRef:
+                  name: talon-worker-backend
+                  key: azure-sas
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/talon
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "256Mi"
+            limits:
+              cpu: "2"
+              memory: "1Gi"
