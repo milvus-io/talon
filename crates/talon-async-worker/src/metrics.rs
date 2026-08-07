@@ -37,10 +37,8 @@ pub struct AsyncWorkerMetrics {
     request_duration: Histogram,
 
     origin_bytes_fetched_total: Counter,
-    version_lookups_total: Counter,
-    version_cache_hits_total: Counter,
-    version_mismatch_retries_total: Counter,
-    republish_purges_total: Counter,
+    size_lookups_total: Counter,
+    size_cache_hits_total: Counter,
     reads_clamped_total: Counter,
 
     l1_hits_total: Counter,
@@ -123,24 +121,14 @@ impl AsyncWorkerMetrics {
                 "Bytes fetched from the origin store. Against bytes_served_total, \
                  this is what the cache saved.",
             ),
-            version_lookups_total: c(
-                "talon_async_worker_version_lookups_total",
-                "Object versions resolved by a backend HEAD.",
+            size_lookups_total: c(
+                "talon_async_worker_size_lookups_total",
+                "Object sizes resolved by a backend HEAD. At most one per object \
+                 per process, since objects are assumed immutable.",
             ),
-            version_cache_hits_total: c(
-                "talon_async_worker_version_cache_hits_total",
-                "Version resolutions answered from the TTL cache.",
-            ),
-            version_mismatch_retries_total: c(
-                "talon_async_worker_version_mismatch_retries_total",
-                "Reads retried after the origin reported a version mismatch.",
-            ),
-            republish_purges_total: c(
-                "talon_async_worker_republish_purges_total",
-                "Objects whose cached extents were dropped because a HEAD saw a \
-                 new version. Expected to stay at zero: the extent cache assumes \
-                 the objects it caches are immutable, and a non-zero count means \
-                 reads were served stale for up to one version TTL.",
+            size_cache_hits_total: c(
+                "talon_async_worker_size_cache_hits_total",
+                "Size resolutions answered from memory.",
             ),
             reads_clamped_total: c(
                 "talon_async_worker_reads_clamped_total",
@@ -257,13 +245,8 @@ impl AsyncWorkerMetrics {
         let c = cache.stats();
 
         set_counter(&self.origin_bytes_fetched_total, serve.origin_bytes_fetched);
-        set_counter(&self.version_lookups_total, serve.version_lookups);
-        set_counter(&self.version_cache_hits_total, serve.version_cache_hits);
-        set_counter(
-            &self.version_mismatch_retries_total,
-            serve.version_mismatch_retries,
-        );
-        set_counter(&self.republish_purges_total, serve.republish_purges);
+        set_counter(&self.size_lookups_total, serve.size_lookups);
+        set_counter(&self.size_cache_hits_total, serve.size_cache_hits);
         set_counter(&self.reads_clamped_total, serve.reads_clamped);
 
         set_counter(&self.l1_hits_total, c.memory_hits);

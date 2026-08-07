@@ -21,9 +21,9 @@ pub mod tiered;
 /// whatever was fetched.
 ///
 /// The object's version is deliberately *not* folded in, unlike the block
-/// worker's `BlockId`: a republish reuses the stream id, and staleness is
-/// bounded by the runtime's version-TTL purge rather than made impossible. See
-/// ADR 0005 §2 and §3.
+/// worker's `BlockId`: a republish reuses the stream id and keeps hitting the
+/// extents cached before it. This worker assumes its objects are immutable.
+/// See ADR 0005 §2 and §3.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ExtentKey {
     /// Interned [`ObjectId`](talon_core::ObjectId).

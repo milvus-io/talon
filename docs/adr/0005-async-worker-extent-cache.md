@@ -100,29 +100,41 @@ does not happen to the objects this worker caches. Analytics files are written
 once and read many times; a partition is replaced by writing a new path, not by
 overwriting an old one.
 
-So immutability is a **performance assumption backed by a bounded check**, not a
-correctness requirement:
+So **immutability is an assumption, not a checked property**. There is no
+version TTL, no conditional GET, no mismatch retry, and no purge:
 
 - A republish reuses the stream id, so the previously cached extents stay
   reachable. Nothing about the overwrite makes them go away.
-- The runtime re-HEADs an object whenever its cached version resolution passes
-  the version TTL (60s by default), and when the origin rejects a ranged GET
-  mid-read. Either path compares the ETag it got against the one it held, and on
-  a difference purges every extent of that object before serving.
-- Staleness is therefore bounded by the version TTL rather than eliminated. A
-  reader inside that window sees the old bytes.
+- Nothing re-reads the origin's ETag on the serve path, so nothing can observe
+  that the overwrite happened.
+- An object overwritten in place is therefore served from cache
+  **indefinitely** — until its extents are evicted for capacity, or the worker
+  restarts cold, or an operator invalidates it explicitly.
 
-`talon_async_worker_republish_purges_total` counts the purges. It is expected to
-stay at zero; a non-zero value says something is overwriting objects in place,
-and that reads of those objects were served stale for up to one TTL. Deployments
-that cannot accept that window should lower the version TTL, which trades HEAD
-volume for a shorter window, or route the traffic to a block-worker pool, which
-removes the window entirely.
+An earlier revision of this ADR specified a version TTL that re-HEADed the
+origin and purged on an ETag change, bounding staleness at 60s. That was
+removed. It is a real defence only against a case the assumption above already
+excludes, and it charged every read of every object a periodic HEAD plus a
+version compare to buy it. Half-holding the assumption cost more than either
+holding it or abandoning it: a deployment that overwrites objects in place is
+not made correct by a 60s window, and one that does not overwrite them gains
+nothing from the check. **Deployments that overwrite objects in place should
+route that traffic to a block-worker pool**, which keys on the ETag and has no
+window at all.
 
-Section 7's restart behaviour follows from this too: whatever an async worker
-recovers across a restart is subject to the same TTL-bounded check as a live
-entry, because the version cache does not survive the restart and the first read
-of an object re-HEADs it.
+The one place an ETag survives is `stat_object`, which proxies a client's
+metadata request straight to the origin rather than answering from any cache.
+
+Section 7's restart behaviour follows from this too: a recovered extent is
+indistinguishable from a live one, because there was never a version bound to
+it in the first place.
+
+The only remaining origin round trip on the read path that is not a cache fill
+is one HEAD per object, for its length — needed to clamp a read at EOF so a
+past-the-end read does not store a short extent under a full-length key and
+refetch forever. An immutable object's size cannot change, so that answer is
+kept for the life of the process. `talon_async_worker_size_lookups_total`
+against `talon_async_worker_size_cache_hits_total` shows the ratio.
 
 ### 4. Two tiers: a CLOCK memory tier over a region-packed NVMe tier
 
@@ -190,10 +202,9 @@ reason the ring exists.
 *Dropping the version* keeps the object where it already is. With the version in
 the placement key, republishing under a new ETag relocates the object: the new
 owner starts cold while the previous owner still holds every warm extent of the
-old revision, and nothing is gained by the move — coherence is handled a layer
-down, in the worker's own cache (§3), which purges an object's extents when it
-observes a new ETag. Placement stays put and the purge runs wherever the object
-already lives.
+old revision, and nothing is gained by the move — the worker's own cache does
+not distinguish revisions either (§3), so the relocation would buy a cold cache
+and no coherence. Placement stays put.
 
 **Why the client picks the ring.** The coordinator could infer it — by file
 extension, by read size, by a per-prefix rule — but each of those is a policy
@@ -348,12 +359,11 @@ worker, only for the read half. A deployment that writes through Talon needs
 both pools, and clients must route accordingly. Since section 6 already gives
 async workers their own cluster, that routing decision exists regardless.
 
-This also means invalidation has no *write*-path caller. `invalidate_object` is
-nevertheless on the serve path, called from the version-TTL refresh described in
-section 3: with the version out of the cache key it is what bounds staleness
-after a republish, so it is load-bearing rather than housekeeping. A future
-control-plane invalidation notification would call the same entry point to
-reclaim the space immediately instead of waiting for the TTL.
+This also means invalidation has no *write*-path caller — and, since section 3
+removed the version refresh, no read-path caller either. `invalidate_object`
+remains as the explicit entry point: the mechanism an outright delete needs, and
+the one a future control-plane invalidation notification would call. Nothing in
+the worker invokes it on its own.
 
 ## Consequences
 
@@ -383,9 +393,10 @@ reclaim the space immediately instead of waiting for the TTL.
 - **Warm restart depends on the 4 MiB staging trigger being crossed**, per
   section 7. Light selective-read traffic never fills the disk tier, so there is
   nothing for a checkpoint to record.
-- **Coherence is TTL-bounded, not absolute.** Unlike the block worker, a
-  republished object can be served stale for up to one version TTL, per
-  section 3. This is the one guarantee the async worker gives up.
+- **Objects must actually be immutable.** Unlike the block worker, an object
+  overwritten in place is served stale indefinitely, per section 3. This is the
+  one guarantee the async worker gives up, and it gives it up completely rather
+  than partially.
 - **Reads only.** An async worker cannot replace a block worker outright; a
   deployment that writes through Talon runs both pools, per section 8.
 - **Operators must choose** which worker fits a workload; a wrong choice is a

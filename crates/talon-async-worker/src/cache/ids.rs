@@ -10,27 +10,25 @@
 //! [`StreamIds`] allocates a stable `u64` per object on first sight, so an
 //! extent key is two integers instead of three heap allocations.
 //!
-//! # Why the version is *not* part of the identity
+//! # Why there is no version here
 //!
-//! It used to be. Keying on `(ObjectId, Version)` made a republish allocate a
-//! new id, which made every extent of the superseded version unreachable for
+//! There used to be. Keying on `(ObjectId, Version)` made a republish allocate
+//! a new id, which made every extent of the superseded version unreachable for
 //! free — invalidation that could not be missed because there was no
 //! invalidation step.
 //!
-//! That is traded away deliberately (ADR 0005 §3): the objects this worker
-//! caches are read-only, so a republish is the rare case rather than the
-//! common one, and paying a `Version` clone on every lookup plus a `Version`
-//! string per stream in every checkpoint to guard against it is the wrong
-//! trade.
+//! That is traded away deliberately (ADR 0005 §3): this worker assumes the
+//! objects it caches are immutable, and under that assumption the whole
+//! apparatus buys nothing. A `Version` clone on every lookup and a `Version`
+//! string per stream in every checkpoint is real cost paid against a case that
+//! is defined not to happen.
 //!
-//! The consequence is that a republish is **not** self-healing here. Nothing
-//! about a same-path overwrite changes the id, so the stale extents stay
-//! reachable until something purges them. `AsyncWorkerRuntime::resolve` does
-//! that: when the version-TTL refresh observes an ETag it has not seen, it
-//! calls [`release_object`](Self::release_object) before serving. Staleness is
-//! therefore bounded by the version TTL rather than eliminated.
-//!
-//! `talon-worker` keeps the version in its `BlockId`, so the two workers differ
+//! The consequence is stated plainly rather than mitigated: a same-path
+//! overwrite reuses the id, so the stale extents stay reachable, and nothing
+//! in this worker will ever notice. There is no TTL refresh, no conditional
+//! GET, and no purge — a republished object is served from cache
+//! **indefinitely**. Deployments that overwrite in place want the block
+//! worker, which keeps the version in its `BlockId`. The two workers differ
 //! here on purpose. See ADR 0005 §3.
 //!
 //! # Ids outlive the process
@@ -97,9 +95,13 @@ impl StreamIds {
 
     /// Drop `object`'s interned id, returning it if it was interned.
     ///
-    /// The caller purges the returned id's extents. Called on an outright
-    /// delete, and on a republish detected at version-TTL refresh — which is
-    /// what bounds staleness now that the version is not in the key.
+    /// The caller purges the returned id's extents.
+    ///
+    /// Nothing in this crate calls this on the read path — with objects assumed
+    /// immutable there is no republish to react to. It is the mechanism an
+    /// explicit purge needs, and the one a sweep of unreferenced ids will need:
+    /// the table grows with every distinct object seen and is otherwise never
+    /// pruned.
     pub fn release_object(&self, object: &ObjectId) -> Vec<u64> {
         let mut map = self.map.lock().unwrap();
         map.remove(object).into_iter().collect()
@@ -271,17 +273,16 @@ mod tests {
     /// The deliberate reversal: an overwrite at the same path resolves to the
     /// *same* id, so the cached extents stay reachable.
     ///
-    /// This is what makes a republish non-self-healing, and it is why
-    /// `AsyncWorkerRuntime::resolve` must purge on a version change. If this
-    /// test ever flips back to `assert_ne!`, that purge is dead code and the
-    /// checkpoint format is carrying a `Version` again.
+    /// This is the whole shape of the immutability assumption, in one
+    /// assertion. If it ever flips back to `assert_ne!`, the checkpoint format
+    /// is carrying a `Version` again and ADR 0005 §3 has been reversed.
     #[test]
     fn a_republish_reuses_the_objects_id() {
         let ids = StreamIds::new();
         let first = ids.get_or_intern(&object("a.parquet"));
         let after_republish = ids.get_or_intern(&object("a.parquet"));
         assert_eq!(first, after_republish);
-        assert_eq!(ids.len(), 1, "one object, one id, regardless of version");
+        assert_eq!(ids.len(), 1, "one object, one id, regardless of content");
     }
 
     #[test]
@@ -308,8 +309,7 @@ mod tests {
 
     #[test]
     fn releasing_an_unknown_object_is_a_no_op() {
-        // The purge path fires on every observed version change, including for
-        // objects this worker has never cached.
+        // A purge may name an object this worker has never cached.
         let ids = StreamIds::new();
         assert!(ids.release_object(&object("never-seen.parquet")).is_empty());
         assert!(ids.is_empty());

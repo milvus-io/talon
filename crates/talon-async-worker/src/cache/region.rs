@@ -1415,8 +1415,8 @@ mod tests {
 
     #[test]
     fn forget_streams_makes_extents_unaddressable() {
-        // How a republished object's bytes go away: the new version interns a
-        // new stream id, and the old id's extents are forgotten wholesale.
+        // How an invalidated object's bytes go away: its stream id is released
+        // and that id's extents are forgotten wholesale.
         let dir = tmp_dir("forget");
         let s = shard(&dir, 1, false);
         s.insert_many(vec![

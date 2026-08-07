@@ -184,7 +184,7 @@ deliberately, since changing any of them throws the cache away. Watch
 `talon_async_worker_checkpoints_read_total` against your shard count after a
 restart: below it means some shards did not recover.
 
-### Republishing an object can serve stale bytes for one version TTL
+### Objects must be immutable, or you will serve stale bytes forever
 
 This is the one correctness guarantee the async worker gives up relative to the
 block worker, so read it before pointing production traffic at it.
@@ -196,21 +196,26 @@ analytics files that are written once, and paying a version clone on every read
 to defend against an overwrite that does not happen was the wrong trade (ADR
 0005 §3).
 
-What backs that assumption is a check, not a hope. The worker caches an object's
-resolved version for 60 s; when that expires, or when the origin rejects a ranged
-GET mid-read, it re-HEADs, and an ETag different from the one it held purges
-every cached extent of that object before the read is served.
+Nothing backs that assumption. There is no version TTL, no conditional GET, and
+no purge: the worker never re-reads an object's ETag on the serve path, so it
+cannot notice an overwrite. An object republished at the same path is served
+from cache **indefinitely** — until its extents are evicted for capacity, or the
+worker restarts cold.
 
 So:
 
-- an object overwritten in place can be served stale for **up to 60 s**, and
-- after that window the purge fires and readers see the new bytes.
+- treat "objects at these paths are never overwritten" as a **precondition** for
+  running this worker, not as an optimisation, and
+- if a workload overwrites in place, route it to a block-worker pool. There is
+  no setting here that makes it safe.
 
-`talon_async_worker_republish_purges_total` counts the purges and should stay at
-zero. A non-zero value means something is overwriting objects in place, and that
-reads were served stale before it fired — alert on it. If a workload genuinely
-overwrites in place and cannot accept the window, route it to a block-worker
-pool.
+An earlier build had a 60 s version TTL that re-HEADed and purged on an ETag
+change. It was removed: it did not make overwrite-in-place workloads correct,
+and it charged every read of every object a periodic HEAD to buy a window nobody
+could rely on. If you were relying on that window, you want the block worker.
+
+The one exception is `Stat`, which proxies straight to the origin — a client
+asking for size and ETag always gets the current answer.
 
 ### Writes are refused
 
@@ -266,7 +271,7 @@ Others worth alerting on:
 | `talon_async_worker_admissions_rejected_total` | Extents that never reached the DRAM hit threshold. High is normal on scan-heavy traffic — that is the frequency gate working. |
 | `talon_async_worker_admissions_dropped_total` | Extents dropped because the staging buffer was full. Sustained non-zero means NVMe writes cannot keep up. |
 | `talon_async_worker_l2_extents_evicted_total` | Extents lost to region reclamation. |
-| `talon_async_worker_republish_purges_total` | Objects whose extents were dropped because a HEAD saw a new version. Should be zero; see [above](#republishing-an-object-can-serve-stale-bytes-for-one-version-ttl). |
+| `talon_async_worker_size_lookups_total` | Object sizes resolved by a HEAD — at most one per object per process. Against `size_cache_hits_total`, how much of the read path is still paying for metadata. |
 | `talon_async_worker_checkpoints_read_total` | Shards that recovered at startup. Below your shard count means some started cold. |
 | `talon_async_worker_extents_recovered_total` | Extents warm restart saved refetching. |
 | `talon_async_worker_checkpoint_errors_total` | Checkpoint or eviction-log failures. Not fatal, but sustained non-zero means warm restart is not working. |

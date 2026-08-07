@@ -258,9 +258,8 @@ impl ExtentStore {
     /// Make every extent of `stream_ids` unaddressable, returning how many were
     /// dropped.
     ///
-    /// Called when an object is deleted or superseded by a new ETag. The bytes
-    /// stay on disk until their region is reclaimed; unreachability is what
-    /// matters.
+    /// Called when an object is explicitly invalidated. The bytes stay on disk
+    /// until their region is reclaimed; unreachability is what matters.
     pub fn forget_streams(&self, stream_ids: &[u64]) -> u64 {
         self.shards
             .iter()

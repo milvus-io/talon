@@ -25,9 +25,10 @@ fetch rather than one per reader.
 **Caches by object version.** Blocks are keyed by the origin's ETag, so
 republishing a partition at the same key does not serve stale data to a query.
 The [async worker](../operations/async-worker.md) is the exception: it keys
-extents on the object alone and re-checks the ETag when its version cache
-expires, so a republish there can be served stale for up to one version TTL
-(60s by default). See [ADR 0005 §3](../adr/0005-async-worker-extent-cache.md).
+extents on the object alone and never re-checks the ETag, so an object
+overwritten in place is served stale there indefinitely. Send overwrite-in-place
+traffic to a block-worker pool. See
+[ADR 0005 §3](../adr/0005-async-worker-extent-cache.md).
 
 **Reachable from a JVM engine without a mount.** The
 [Java client](../clients/java.md) is a native-free jar, so a query engine can

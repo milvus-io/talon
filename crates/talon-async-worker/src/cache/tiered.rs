@@ -330,9 +330,9 @@ impl TieredExtentCache {
     /// Resolve `object` to the stream id its extents are keyed by.
     ///
     /// The version is deliberately not part of this: see [`StreamIds`]. A
-    /// republish therefore reuses the id, and staleness is bounded by the
-    /// runtime purging through [`invalidate_object`](Self::invalidate_object)
-    /// when the version-TTL refresh sees a new ETag.
+    /// republish therefore reuses the id and its cached extents keep
+    /// answering, which is only correct because this worker assumes the
+    /// objects it caches are immutable.
     pub fn intern(&self, object: &ObjectId) -> u64 {
         self.streams.get_or_intern(object)
     }
@@ -375,15 +375,15 @@ impl TieredExtentCache {
         self.memory.get_or_load(key, len, through_disk).await
     }
 
-    /// Make every extent of `object` unreachable.
+    /// Make every extent of `object` unreachable, returning how many were
+    /// dropped.
     ///
-    /// Two callers, and the first is load-bearing:
-    ///
-    /// 1. A republish observed at version-TTL refresh. Since the stream id no
-    ///    longer carries the version, nothing else makes the previous
-    ///    contents unreachable — without this call a same-path overwrite is
-    ///    served stale indefinitely rather than for one TTL.
-    /// 2. An outright delete.
+    /// Nothing on the read path calls this. Under the immutability assumption
+    /// there is no republish to react to, so this is the explicit escape
+    /// hatch — for an outright delete, or for an operator who knows an object
+    /// was overwritten and wants the worker to forget it. Without such a call
+    /// a same-path overwrite is served from cache indefinitely; that is the
+    /// documented behaviour, not an accident. See ADR 0005 §3.
     pub fn invalidate_object(&self, object: &ObjectId) -> u64 {
         let released = self.streams.release_object(object);
         self.forget(&released)
@@ -731,9 +731,9 @@ mod tests {
     #[tokio::test]
     async fn a_republish_shares_the_streams_extents_until_it_is_invalidated() {
         // The shape of the immutability assumption, end to end through
-        // interning: nothing about a new version makes the old extents
-        // unreachable, so `invalidate_object` is load-bearing rather than
-        // housekeeping. The runtime calls it from the version-TTL refresh.
+        // interning: nothing about an overwrite makes the old extents
+        // unreachable, so the only way back to fresh bytes is an explicit
+        // `invalidate_object`. No read-path caller makes that call.
         let root = tmp_root("versions");
         let cache = TieredExtentCache::new(&config(&root, 0)).await.unwrap();
         let obj = ObjectId::new(Backend::S3, "bucket", "part.parquet");
@@ -753,8 +753,8 @@ mod tests {
         assert_eq!(cache.intern(&obj), stream, "a republish reuses the id");
 
         // The loader here would return "new", but it never runs: the extent
-        // cached under the old version answers first. That is the staleness the
-        // TTL-bounded purge exists to close.
+        // cached before the overwrite answers first. Served indefinitely, by
+        // design — ADR 0005 §3.
         let stale = cache
             .get_or_load(
                 stream,
