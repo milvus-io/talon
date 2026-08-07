@@ -27,6 +27,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use talon_core::{
     BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result,
 };
@@ -52,9 +53,94 @@ where
     }
 }
 
+/// Number of shards in the open-fd cache. Sharding keeps the per-request
+/// lookup off a single global mutex when many connections hit distinct blocks.
+const FD_CACHE_SHARDS: usize = 16;
+
+/// Per-shard capacity of the open-fd cache. The cache holds one descriptor per
+/// resident block, so the process-wide ceiling is
+/// `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY` = 1024 descriptors on top of the
+/// connection and listener fds.
+///
+/// Blocks default to 256 MiB, so 1024 cached descriptors already covers a
+/// ~256 GiB resident working set — well past the point where the per-request
+/// `openat` was measurable. The bound matters because an unbounded cache would
+/// pin one fd per block ever touched; capping it keeps worst-case fd usage
+/// predictable and independent of cache size.
+const FD_CACHE_SHARD_CAPACITY: usize = 64;
+
+/// A cached, shared descriptor for an immutable block file.
+#[derive(Clone)]
+struct CachedFd {
+    fd: Arc<OwnedFd>,
+    len: u64,
+}
+
+/// A sharded, bounded cache of open `.blk` descriptors.
+///
+/// Block files are immutable and content-addressed: once written and committed
+/// under `<root>/<shard>/<digest>.blk`, the bytes at a given path never change.
+/// That makes the `openat` + `statx` pair on the serving path pure overhead —
+/// path resolution, inode lookup, and `stx_size` all return the same answer
+/// every time, while contending on the same inode/dentry across every worker
+/// thread.
+///
+/// Eviction is a simple random-ish replacement within a shard (drop one
+/// arbitrary entry when full). Blocks are equally hot in the steady state and
+/// the cost of a miss is exactly the old behaviour — one `openat` — so a
+/// precise LRU is not worth the extra bookkeeping on this path.
+struct FdCache {
+    shards: Vec<Mutex<std::collections::HashMap<PathBuf, CachedFd>>>,
+}
+
+impl FdCache {
+    fn new() -> Self {
+        Self {
+            shards: (0..FD_CACHE_SHARDS)
+                .map(|_| Mutex::new(std::collections::HashMap::new()))
+                .collect(),
+        }
+    }
+
+    fn shard_for(&self, path: &Path) -> &Mutex<std::collections::HashMap<PathBuf, CachedFd>> {
+        let mut hasher = DefaultHasher::new();
+        path.hash(&mut hasher);
+        &self.shards[(hasher.finish() as usize) % FD_CACHE_SHARDS]
+    }
+
+    fn get(&self, path: &Path) -> Option<CachedFd> {
+        let shard = self.shard_for(path);
+        let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(path).cloned()
+    }
+
+    fn insert(&self, path: PathBuf, entry: CachedFd) {
+        let shard = self.shard_for(&path);
+        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= FD_CACHE_SHARD_CAPACITY && !guard.contains_key(&path) {
+            if let Some(victim) = guard.keys().next().cloned() {
+                guard.remove(&victim);
+            }
+        }
+        guard.insert(path, entry);
+    }
+
+    /// Drop any cached descriptor for `path`.
+    ///
+    /// Called when a block is removed so the cache does not pin an unlinked
+    /// inode. In-flight handles keep the file alive until they complete, which
+    /// is exactly the pre-existing behaviour for a block evicted mid-request.
+    fn invalidate(&self, path: &Path) {
+        let shard = self.shard_for(path);
+        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        guard.remove(path);
+    }
+}
+
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
     root: PathBuf,
+    fd_cache: FdCache,
 }
 
 impl WholeBlockStore {
@@ -62,7 +148,10 @@ impl WholeBlockStore {
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root })
+        Ok(Self {
+            root,
+            fd_cache: FdCache::new(),
+        })
     }
 
     /// The cache root directory.
@@ -135,13 +224,31 @@ impl WholeBlockStore {
         Ok(out)
     }
 
-    /// Open a present block file read-only, returning its fd and byte length.
-    fn open_ro(&self, id: &BlockId) -> Result<(OwnedFd, u64)> {
+    /// Open a present block file read-only, returning a shared fd and its byte
+    /// length.
+    ///
+    /// Backed by [`FdCache`]: a repeat read of a resident block reuses the
+    /// already-open descriptor instead of issuing `openat` + `statx` + `close`
+    /// per request. Under load that trio dominated the serving path — it does
+    /// not scale with threads (all callers serialize on the same inode and
+    /// dentry), and measured ~50x the cost of the data access it guards.
+    fn open_ro(&self, id: &BlockId) -> Result<(Arc<OwnedFd>, u64)> {
         let path = self.path_for(id);
+        if let Some(hit) = self.fd_cache.get(&path) {
+            return Ok((hit.fd, hit.len));
+        }
         match std::fs::File::open(&path) {
             Ok(f) => {
                 let len = f.metadata()?.len();
-                Ok((OwnedFd::from(f), len))
+                let fd = Arc::new(OwnedFd::from(f));
+                self.fd_cache.insert(
+                    path,
+                    CachedFd {
+                        fd: Arc::clone(&fd),
+                        len,
+                    },
+                );
+                Ok((fd, len))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::NotFound(id.to_string()))
@@ -154,6 +261,12 @@ impl WholeBlockStore {
     ///
     /// This is used to promote touched L2 regions into the finer-grained L1
     /// page cache without reading the entire (256 MiB by default) block.
+    ///
+    /// Unlike [`get_block`](ObjectStore::get_block) and
+    /// [`get_range`](ObjectStore::get_range) this still opens the file per
+    /// call. Promotion happens once per region rather than once per request, so
+    /// it is not on the hot serving path that motivated the fd cache; routing it
+    /// through the cache is a follow-up, not a correctness matter.
     pub async fn get_range_bytes(&self, id: &BlockId, offset: u64, len: u64) -> Result<Bytes> {
         let path = self.path_for(id);
         let id = id.clone();
@@ -185,7 +298,7 @@ impl WholeBlockStore {
 impl ObjectStore for WholeBlockStore {
     async fn get_block(&self, id: &BlockId) -> Result<BlockHandle> {
         let (fd, len) = self.open_ro(id)?;
-        Ok(BlockHandle::new(fd, 0, len))
+        Ok(BlockHandle::from_shared(fd, 0, len))
     }
 
     async fn get_page(&self, id: &BlockId, _page: PageIndex) -> Result<BlockHandle> {
@@ -201,7 +314,7 @@ impl ObjectStore for WholeBlockStore {
                 "range {offset}+{len} out of bounds for block of {file_len} bytes"
             )));
         }
-        Ok(vec![BlockHandle::new(fd, offset, len)])
+        Ok(vec![BlockHandle::from_shared(fd, offset, len)])
     }
 
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
@@ -234,6 +347,7 @@ impl ObjectStore for WholeBlockStore {
         };
         // The write + fsync of a whole block is blocking disk I/O; keep it off
         // the reactor thread (issue #115).
+        let commit_path = path.clone();
         spawn_blocking_io(move || {
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
@@ -281,13 +395,23 @@ impl ObjectStore for WholeBlockStore {
             }
             Ok(())
         })
-        .await
+        .await?;
+        // The commit renamed a fresh file over `path`, so it is a NEW inode and
+        // any descriptor cached for the superseded file is stale. Invalidate
+        // AFTER the rename: doing it before would leave a window in which a
+        // concurrent reader re-caches the old inode and then serves its bytes
+        // indefinitely. Readers racing this call either miss (and open the
+        // committed file) or hold a handle on the previous inode, which stays
+        // readable until they finish — the same semantics as before the cache.
+        self.fd_cache.invalidate(&commit_path);
+        Ok(())
     }
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
-        spawn_blocking_io(move || {
+        let cached_path = path.clone();
+        let result = spawn_blocking_io(move || {
             // Remove the sidecar too so a deleted block is not resurrected by a
             // startup scan.
             let _ = std::fs::remove_file(&meta_path);
@@ -297,7 +421,14 @@ impl ObjectStore for WholeBlockStore {
                 Err(e) => Err(e.into()),
             }
         })
-        .await
+        .await;
+        // Drop the cached descriptor after the unlink, so the cache cannot pin
+        // an unlinked inode and a reader racing the delete cannot re-cache the
+        // doomed file. Invalidate even on error: the entry may already be
+        // stale. Handles already in flight keep the file alive until they
+        // finish, matching the pre-cache behaviour of a mid-request eviction.
+        self.fd_cache.invalidate(&cached_path);
+        result
     }
 
     async fn contains(&self, id: &BlockId) -> Result<bool> {
@@ -477,7 +608,9 @@ mod tests {
         assert!(handle.fd.as_raw_fd() >= 0);
 
         // The fd is readable and yields the stored bytes.
-        let mut f = std::fs::File::from(handle.fd);
+        // The handle shares its descriptor with the store's fd cache, so dup
+        // it rather than taking ownership (which would close the cached fd).
+        let mut f = std::fs::File::from(handle.fd.try_clone().unwrap());
         let mut buf = Vec::new();
         f.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, data);
@@ -537,6 +670,78 @@ mod tests {
             store.get_page(&id, PageIndex(0)).await,
             Err(Error::NotFound(_))
         ));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The open-fd cache must not let a stale descriptor outlive the file it
+    /// was opened for. A rewritten block renames a new inode over the path, and
+    /// a deleted block unlinks it; both must be reflected by subsequent reads.
+    #[tokio::test]
+    async fn fd_cache_does_not_serve_stale_bytes_after_rewrite_or_delete() {
+        use std::io::Read;
+        let root = tmp_root();
+        let store = WholeBlockStore::open(&root).unwrap();
+        let id = block(42);
+
+        let read_handle = |h: BlockHandle| {
+            let mut f = std::fs::File::from(h.fd.try_clone().unwrap());
+            let mut buf = vec![0u8; h.len as usize];
+            use std::io::{Seek, SeekFrom};
+            f.seek(SeekFrom::Start(h.offset)).unwrap();
+            f.read_exact(&mut buf).unwrap();
+            buf
+        };
+
+        store.put(&id, Bytes::from_static(b"aaaa")).await.unwrap();
+        // Populate the cache, then read again to exercise the hit path.
+        assert_eq!(read_handle(store.get_block(&id).await.unwrap()), b"aaaa");
+        assert_eq!(read_handle(store.get_block(&id).await.unwrap()), b"aaaa");
+
+        // Rewrite with different content and length: the cached fd points at
+        // the superseded inode and must have been invalidated.
+        store
+            .put(&id, Bytes::from_static(b"bbbbbbbb"))
+            .await
+            .unwrap();
+        let h = store.get_block(&id).await.unwrap();
+        assert_eq!(h.len, 8, "cached len must refresh after rewrite");
+        assert_eq!(read_handle(h), b"bbbbbbbb");
+
+        // A range read goes through the same cache.
+        let ranged = store.get_range(&id, 2, 3).await.unwrap();
+        assert_eq!(read_handle(ranged.into_iter().next().unwrap()), b"bbb");
+
+        // After delete the block is gone, not served from a pinned fd.
+        store.delete(&id).await.unwrap();
+        assert!(matches!(
+            store.get_block(&id).await,
+            Err(Error::NotFound(_))
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An in-flight handle keeps the bytes readable even if the block is
+    /// deleted mid-request, matching the pre-cache ownership semantics.
+    #[tokio::test]
+    async fn handle_outlives_delete() {
+        use std::io::Read;
+        let root = tmp_root();
+        let store = WholeBlockStore::open(&root).unwrap();
+        let id = block(43);
+        store
+            .put(&id, Bytes::from_static(b"payload"))
+            .await
+            .unwrap();
+
+        let handle = store.get_block(&id).await.unwrap();
+        store.delete(&id).await.unwrap();
+
+        let mut f = std::fs::File::from(handle.fd.try_clone().unwrap());
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"payload");
+
         std::fs::remove_dir_all(&root).ok();
     }
 }

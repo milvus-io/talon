@@ -365,7 +365,7 @@ impl PagedBlockStore {
                                                    // Clamp to the actually-present bytes of the page file.
             let avail = handle.len.saturating_sub(in_page_off);
             let serve = in_page_len.min(avail);
-            handles.push(BlockHandle::new(handle.fd, in_page_off, serve));
+            handles.push(BlockHandle::from_shared(handle.fd, in_page_off, serve));
         }
         Ok(handles)
     }
@@ -415,7 +415,8 @@ mod tests {
     }
 
     fn read_all(h: BlockHandle) -> Vec<u8> {
-        let mut f = std::fs::File::from(h.fd);
+        // Dup: the descriptor is shared, so this reader must not close it.
+        let mut f = std::fs::File::from(h.fd.try_clone().unwrap());
         use std::io::Seek;
         f.seek(std::io::SeekFrom::Start(h.offset)).unwrap();
         let mut buf = vec![0u8; h.len as usize];
