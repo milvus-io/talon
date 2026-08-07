@@ -58,6 +58,11 @@ pub struct AsyncWorkerMetrics {
     admissions_rejected_total: Counter,
     admissions_dropped_total: Counter,
 
+    checkpoints_written_total: Counter,
+    checkpoints_read_total: Counter,
+    extents_recovered_total: Counter,
+    checkpoint_errors_total: Counter,
+
     active_connections: Gauge,
     active_connection_count: Arc<AtomicU64>,
 }
@@ -184,6 +189,26 @@ impl AsyncWorkerMetrics {
                 "Extents dropped because the admission staging buffer was full.",
             ),
 
+            checkpoints_written_total: c(
+                "talon_async_worker_checkpoints_written_total",
+                "NVMe shard checkpoints written. Warm restart recovers from these.",
+            ),
+            checkpoints_read_total: c(
+                "talon_async_worker_checkpoints_read_total",
+                "NVMe shards that recovered a checkpoint at startup. Below the shard \
+                 count means some shards started cold.",
+            ),
+            extents_recovered_total: c(
+                "talon_async_worker_extents_recovered_total",
+                "Extents made addressable again by a recovered checkpoint — the \
+                 origin fetches warm restart avoided.",
+            ),
+            checkpoint_errors_total: c(
+                "talon_async_worker_checkpoint_errors_total",
+                "Checkpoint writes, reads, or eviction-log appends that failed. Not \
+                 fatal, but sustained non-zero means warm restart is not working.",
+            ),
+
             active_connections: g(
                 "talon_async_worker_active_connections",
                 "Data-plane connections currently open.",
@@ -252,6 +277,10 @@ impl AsyncWorkerMetrics {
         set_counter(&self.l2_extents_evicted_total, c.disk_extents_evicted);
         set_counter(&self.admissions_rejected_total, c.admissions_rejected);
         set_counter(&self.admissions_dropped_total, c.admissions_dropped);
+        set_counter(&self.checkpoints_written_total, c.checkpoints_written);
+        set_counter(&self.checkpoints_read_total, c.checkpoints_read);
+        set_counter(&self.extents_recovered_total, c.extents_recovered);
+        set_counter(&self.checkpoint_errors_total, c.checkpoint_errors);
 
         if let Some(disk) = cache.disk() {
             self.l2_extents.set(disk.extent_count() as f64);

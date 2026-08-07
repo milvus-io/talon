@@ -713,6 +713,14 @@ DRAM tier shard count. Must be a power of two.
 - **Default:** `16`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `checkpoint_interval_bytes`
+
+Bytes an NVMe shard writes between checkpoints. Zero disables warm restart and wipes the cache directory at every start.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CHECKPOINT_INTERVAL_BYTES`
+- **Default:** `67108864`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `backend`
 
 Object-store backend: azure, s3, or gcs.

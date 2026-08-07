@@ -521,6 +521,7 @@ mod tests {
             disk_bytes: crate::cache::region::REGION_SIZE * 2,
             disk_shards: 1,
             disk_checksums: false,
+            checkpoint_interval_bytes: 0,
         })
         .await
         .unwrap();

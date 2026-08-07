@@ -30,7 +30,8 @@ pub mod observability;
 pub mod runtime;
 pub mod sendfile;
 
-pub use cache::ids::StreamIds;
+pub use cache::checkpoint::{CheckpointData, CheckpointError, EvictionLog};
+pub use cache::ids::{Recovery, StreamIds};
 pub use cache::memory::{EvictionSink, MemoryCache, MemoryCacheStats};
 pub use cache::region::{ExtentRun, PinnedExtent, ShardFile, ShardStats, REGION_SIZE};
 pub use cache::store::{ExtentStore, ExtentStoreConfig, ExtentStoreStats};

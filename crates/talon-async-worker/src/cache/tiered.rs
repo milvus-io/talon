@@ -87,6 +87,9 @@ pub struct ExtentCacheConfig {
     pub disk_shards: usize,
     /// Verify a digest on every L2 read that passes through userspace.
     pub disk_checksums: bool,
+    /// Bytes an L2 shard writes between checkpoints. Zero disables warm
+    /// restart; the tier is then wiped at every start.
+    pub checkpoint_interval_bytes: u64,
 }
 
 impl Default for ExtentCacheConfig {
@@ -98,6 +101,7 @@ impl Default for ExtentCacheConfig {
             disk_bytes: 0,
             disk_shards: super::store::DEFAULT_NUM_SHARDS,
             disk_checksums: false,
+            checkpoint_interval_bytes: 0,
         }
     }
 }
@@ -127,6 +131,14 @@ pub struct ExtentCacheStats {
     pub admissions_rejected: u64,
     /// Extents dropped because the staging buffer was full.
     pub admissions_dropped: u64,
+    /// Checkpoints written across every NVMe shard.
+    pub checkpoints_written: u64,
+    /// NVMe shards that recovered a checkpoint at startup.
+    pub checkpoints_read: u64,
+    /// Extents made addressable again by a recovered checkpoint.
+    pub extents_recovered: u64,
+    /// Checkpoint or eviction-log operations that failed.
+    pub checkpoint_errors: u64,
 }
 
 /// Feeds extents to L2, applying the admission policy.
@@ -259,14 +271,23 @@ impl TieredExtentCache {
     /// # Errors
     /// If the L2 directory cannot be prepared.
     pub async fn new(config: &ExtentCacheConfig) -> Result<Arc<Self>> {
+        // Built before the disk tier, not after: recovery binds checkpointed
+        // stream ids into this table, and a table created afterwards would
+        // allocate fresh ids that no recovered extent key refers to.
+        let streams = Arc::new(StreamIds::new());
+
         let disk = match &config.disk_dir {
             Some(dir) if config.disk_bytes > 0 => Some(
-                ExtentStore::new(ExtentStoreConfig {
-                    dir: dir.clone(),
-                    max_bytes: config.disk_bytes,
-                    num_shards: config.disk_shards,
-                    checksums_enabled: config.disk_checksums,
-                })
+                ExtentStore::new(
+                    ExtentStoreConfig {
+                        dir: dir.clone(),
+                        max_bytes: config.disk_bytes,
+                        num_shards: config.disk_shards,
+                        checksums_enabled: config.disk_checksums,
+                        checkpoint_interval_bytes: config.checkpoint_interval_bytes,
+                    },
+                    Arc::clone(&streams),
+                )
                 .await?,
             ),
             Some(_) => {
@@ -302,7 +323,7 @@ impl TieredExtentCache {
             disk,
             writer,
             direct_admission,
-            streams: Arc::new(StreamIds::new()),
+            streams,
         }))
     }
 
@@ -428,6 +449,10 @@ impl TieredExtentCache {
             disk_extents_evicted: disk.extents_evicted,
             admissions_rejected: rejected,
             admissions_dropped: dropped,
+            checkpoints_written: disk.checkpoints_written,
+            checkpoints_read: disk.checkpoints_read,
+            extents_recovered: disk.extents_recovered,
+            checkpoint_errors: disk.checkpoint_errors,
         }
     }
 
@@ -474,6 +499,7 @@ mod tests {
             disk_bytes: super::super::region::REGION_SIZE * 4,
             disk_shards: 1,
             disk_checksums: false,
+            checkpoint_interval_bytes: 0,
         }
     }
 

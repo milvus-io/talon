@@ -1459,6 +1459,18 @@ pub struct AsyncWorkerConfig {
     pub l1_capacity_bytes: u64,
     /// L1 shard count. Must be a power of two.
     pub l1_shards: usize,
+    /// Bytes an NVMe shard writes between checkpoints, for warm restart.
+    ///
+    /// A checkpoint records the run descriptors that make packed extents
+    /// addressable, so a restart recovers what is on disk instead of wiping it.
+    /// Zero disables warm restart, and the cache directory is then cleared at
+    /// every start.
+    ///
+    /// Byte-triggered rather than time-triggered: the cost tracks how much
+    /// there would be to lose, and an idle shard never rewrites a checkpoint it
+    /// has not invalidated. Lower it to shorten the window of extents a crash
+    /// discards, at one `fsync` plus a small write per interval per shard.
+    pub checkpoint_interval_bytes: u64,
     /// Object-store backend selector: `azure`, `s3`, or `gcs`.
     pub backend: Option<String>,
     /// Azure Blob storage account for the backend origin.
@@ -1508,6 +1520,7 @@ impl Default for AsyncWorkerConfig {
             checksums_enabled: true,
             l1_capacity_bytes: 0,
             l1_shards: 16,
+            checkpoint_interval_bytes: 64 << 20,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -1559,6 +1572,8 @@ pub struct AsyncWorkerConfigPatch {
     pub l1_capacity_bytes: Option<u64>,
     /// Override for [`AsyncWorkerConfig::l1_shards`].
     pub l1_shards: Option<usize>,
+    /// Override for [`AsyncWorkerConfig::checkpoint_interval_bytes`].
+    pub checkpoint_interval_bytes: Option<u64>,
     /// Override for [`AsyncWorkerConfig::backend`].
     pub backend: Option<String>,
     /// Override for [`AsyncWorkerConfig::azure_account`].
@@ -1605,6 +1620,9 @@ impl Patch for AsyncWorkerConfigPatch {
             checksums_enabled: self.checksums_enabled.or(base.checksums_enabled),
             l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
             l1_shards: self.l1_shards.or(base.l1_shards),
+            checkpoint_interval_bytes: self
+                .checkpoint_interval_bytes
+                .or(base.checkpoint_interval_bytes),
             backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
@@ -1776,6 +1794,15 @@ pub const ASYNC_WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "DRAM tier shard count. Must be a power of two.",
     },
     ConfigVar {
+        env: "TALON_ASYNC_WORKER_CHECKPOINT_INTERVAL_BYTES",
+        key: "checkpoint_interval_bytes",
+        default: Some("67108864"),
+        cli: false,
+        secret: false,
+        help: "Bytes an NVMe shard writes between checkpoints. \
+               Zero disables warm restart and wipes the cache directory at every start.",
+    },
+    ConfigVar {
         env: "TALON_ASYNC_WORKER_BACKEND",
         key: "backend",
         default: None,
@@ -1932,6 +1959,7 @@ pub(crate) mod async_worker_env {
     pub const CHECKSUMS_ENABLED: &str = "TALON_ASYNC_WORKER_CHECKSUMS_ENABLED";
     pub const L1_CAPACITY_BYTES: &str = "TALON_ASYNC_WORKER_L1_CAPACITY_BYTES";
     pub const L1_SHARDS: &str = "TALON_ASYNC_WORKER_L1_SHARDS";
+    pub const CHECKPOINT_INTERVAL_BYTES: &str = "TALON_ASYNC_WORKER_CHECKPOINT_INTERVAL_BYTES";
     pub const BACKEND: &str = "TALON_ASYNC_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_ASYNC_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_ASYNC_WORKER_AZURE_ENDPOINT";
@@ -2054,6 +2082,9 @@ impl AsyncWorkerConfigPatch {
             l1_shards: get(async_worker_env::L1_SHARDS)
                 .map(|v| parse_usize(v, async_worker_env::L1_SHARDS))
                 .transpose()?,
+            checkpoint_interval_bytes: get(async_worker_env::CHECKPOINT_INTERVAL_BYTES)
+                .map(|v| parse_u64(v, async_worker_env::CHECKPOINT_INTERVAL_BYTES))
+                .transpose()?,
             backend: get(async_worker_env::BACKEND),
             azure_account: get(async_worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(async_worker_env::AZURE_ENDPOINT),
@@ -2113,6 +2144,9 @@ impl AsyncWorkerConfig {
             checksums_enabled: merged.checksums_enabled.unwrap_or(d.checksums_enabled),
             l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
             l1_shards: merged.l1_shards.unwrap_or(d.l1_shards),
+            checkpoint_interval_bytes: merged
+                .checkpoint_interval_bytes
+                .unwrap_or(d.checkpoint_interval_bytes),
             backend: merged.backend.or(d.backend),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
@@ -2208,6 +2242,17 @@ impl AsyncWorkerConfig {
                 "capacity_bytes {} is fewer than one 64 MiB region per shard ({} shards); \
                  raise the capacity or lower disk_shards",
                 self.capacity_bytes, self.disk_shards
+            )));
+        }
+        // A non-zero interval below one region would checkpoint several times
+        // per region packed, which is pure write amplification against a file
+        // that only becomes more valuable as it fills. Zero is the way to turn
+        // checkpointing off.
+        if self.checkpoint_interval_bytes != 0 && self.checkpoint_interval_bytes < REGION_BYTES {
+            return Err(Error::Other(format!(
+                "checkpoint_interval_bytes must be 0 (disabled) or at least one 64 MiB \
+                 region ({REGION_BYTES}), got {}",
+                self.checkpoint_interval_bytes
             )));
         }
         if let Some(backend) = &self.backend {

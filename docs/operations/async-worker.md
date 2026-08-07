@@ -95,8 +95,10 @@ drain on shutdown; the only other trigger is a `flush()` called from unit tests.
 A deployment that admits less than 4 MiB therefore leaves L2 empty
 indefinitely — and with `l1_capacity_bytes = 0`, repeated reads of one small
 extent go to the origin every time. Everything downstream of that flush —
-region packing, pin counts, checksum verification, region reclamation, and the
-zero-copy `sendfile` response — has only ever executed under unit tests.
+region packing, pin counts, checksum verification, region reclamation, the
+checkpoint and its recovery, and the zero-copy `sendfile` response — has only
+ever executed under unit tests. Warm restart inherits this limitation directly:
+nothing on disk means nothing to checkpoint.
 
 **No Helm template.** `deploy/helm/*/templates/` has `coordinator.yaml` and
 `worker.yaml` only. A Kubernetes deployment needs a hand-written manifest.
@@ -141,25 +143,46 @@ they all use the `TALON_ASYNC_WORKER_` prefix. The ones that matter most:
 
 | Setting | Notes |
 |---|---|
-| `cache_dir` | Dedicated directory. **Wiped at every start** — see below. |
-| `capacity_bytes` | NVMe ceiling. Must cover at least one 64 MiB region per shard. |
-| `disk_shards` | Power of two. Default 8. |
-| `l1_capacity_bytes` | DRAM tier. `0` disables it and admits to NVMe on first miss. |
-| `checksums_enabled` | On by default; see the note under *Checksums*. |
+| `cache_dir` | Dedicated directory. Recovered across restarts unless `checkpoint_interval_bytes = 0`, which wipes it — see below. |
+| `capacity_bytes` | NVMe ceiling. Must cover at least one 64 MiB region per shard. Changing it discards the cache. |
+| `disk_shards` | Power of two. Default 8. Changing it discards the cache. |
+| `l1_capacity_bytes` | DRAM tier. `0` disables it and admits to NVMe on first miss. Never persisted. |
+| `checksums_enabled` | On by default; see the note under *Checksums*. Changing it discards the cache. |
+| `checkpoint_interval_bytes` | Bytes between checkpoints. Default 64 MiB; `0` disables warm restart. |
 
 ## Operational differences from the block worker
 
-### The NVMe tier is cold after restart
+### Warm restart, and the traffic shape it needs
 
-Run descriptors live only in memory, so the cache directory is **wiped** at
-startup rather than scanned. Whatever survived on disk is unaddressable, and
-keeping it would consume the whole capacity budget with bytes nothing can read.
+The NVMe tier checkpoints its extent map, so a restart recovers what is on disk
+instead of refetching it. Three files per shard:
 
-`talon-worker` rebuilds its index from `.meta` sidecars and is warm
-immediately. This worker is not. The consequence is bounded — a restarted worker
-refetches on demand, one extent at a time rather than one 256 MiB block at a
-time — but plan rolling restarts with it in mind, and do not point `cache_dir`
-at anything you want to keep.
+```text
+extents_N.bin       the region file
+extents_N.bin.cpt   the entry map
+extents_N.bin.log   regions reclaimed since that checkpoint
+```
+
+`checkpoint_interval_bytes` (default 64 MiB) is how much a shard writes between
+checkpoints. A crash discards whatever was written since the last one, so
+lowering it shortens that window at the cost of one `fsync` plus a small write
+per interval per shard. Setting it to `0` disables warm restart entirely, and
+the cache directory is then wiped at every start as it used to be.
+
+**The catch: the disk tier has to be non-empty first.** Admissions stage in
+memory and reach disk only once 4 MiB has accumulated — there is no timer and no
+drain at shutdown. On light selective-read traffic (4 KiB footers need 1024
+reads to cross the threshold) nothing reaches disk, so a checkpoint records
+nothing and a restart is cold no matter what this is set to. Warm restart pays
+off for deployments whose admission volume regularly crosses 4 MiB; below that
+it is inert rather than harmful.
+
+Recovery never fails a startup. A checkpoint that is missing, torn, or written
+under a different `capacity_bytes`, `disk_shards`, or `checksums_enabled` is
+discarded and that shard starts cold — so those three are the settings to change
+deliberately, since changing any of them throws the cache away. Watch
+`talon_async_worker_checkpoints_read_total` against your shard count after a
+restart: below it means some shards did not recover.
 
 ### Republishing an object can serve stale bytes for one version TTL
 
@@ -244,6 +267,9 @@ Others worth alerting on:
 | `talon_async_worker_admissions_dropped_total` | Extents dropped because the staging buffer was full. Sustained non-zero means NVMe writes cannot keep up. |
 | `talon_async_worker_l2_extents_evicted_total` | Extents lost to region reclamation. |
 | `talon_async_worker_republish_purges_total` | Objects whose extents were dropped because a HEAD saw a new version. Should be zero; see [above](#republishing-an-object-can-serve-stale-bytes-for-one-version-ttl). |
+| `talon_async_worker_checkpoints_read_total` | Shards that recovered at startup. Below your shard count means some started cold. |
+| `talon_async_worker_extents_recovered_total` | Extents warm restart saved refetching. |
+| `talon_async_worker_checkpoint_errors_total` | Checkpoint or eviction-log failures. Not fatal, but sustained non-zero means warm restart is not working. |
 
 ### Status reporting
 

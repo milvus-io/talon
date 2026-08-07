@@ -262,16 +262,69 @@ rather than spread across the fleet. That is the right trade for
 many-small-objects columnar workloads and an argument for sizing the async pool
 separately, not for merging the rings.
 
-### 7. The NVMe tier is cold after restart
+### 7. The NVMe tier is checkpointed for warm restart
 
-Run descriptors live only in memory, so shard files are truncated on open.
+Run descriptors are what make packed extents addressable, so a shard opened
+without them holds 64 MiB regions of perfectly good bytes that nothing can name.
+Each shard therefore writes a checkpoint of its entry map — three files, as in
+Velox's `SsdFile`, which solves this for the cache this tier is modelled on:
 
-`talon-worker` rebuilds its index from `.meta` sidecars and is warm immediately;
-this worker is not. Persisting run descriptors means writing and fsyncing a
-manifest, validating it against region contents on load, and handling a torn
-manifest — meaningful machinery to add before the read path has demonstrated its
-value. The consequence is bounded: a restarted worker refetches on demand, one
-extent at a time rather than one 256MB block at a time. Cold, not incorrect.
+```text
+extents_N.bin       the region file
+extents_N.bin.cpt   the entry map, the stream names it refers to, region scores
+extents_N.bin.log   regions reclaimed since that checkpoint
+```
+
+**The format is hand-rolled**, not `serde`: fixed little-endian records behind a
+magic, an explicit version, an xxh3 digest, and an end marker. ADR 0003 §9.4
+already rules out `serde`/`bincode`/JSON as durable on-disk formats, and the
+reason applies here too — a derive-driven layout changes silently when a field
+is added, and this file is read by a future binary that need not match the one
+that wrote it. An explicit version makes that a rejection rather than a
+misparse.
+
+**The write ordering** is Velox's, with one change:
+
+1. `fsync` the region file, so the checkpoint never names bytes that are not
+   durable;
+2. write, `fsync`, and **rename** the checkpoint — Velox truncates in place;
+   renaming keeps the previous checkpoint valid until the new one is complete;
+3. clear the eviction log, whose records the new checkpoint supersedes.
+
+Both crash windows leave a consistent pair: the old checkpoint with a full log,
+or the new checkpoint with a stale-but-harmless one, since replaying evictions of
+regions the new checkpoint already excludes is idempotent.
+
+**The eviction log is what makes a stale checkpoint safe.** Reclaiming region R
+and packing new extents into it invalidates every checkpointed entry naming R,
+but the checkpoint is only rewritten periodically. The log records the
+reclamation and is `fsync`ed *before* the region is reused — one sync of a few
+bytes per 64 MiB reclaimed. Velox leaves this gap to the extent checksum; that
+only covers the checksums-on, non-zero-copy path, which is not a guarantee worth
+resting correctness on for the cost of a sync this rare.
+
+**Recovery never fails a startup.** A checkpoint that is absent, torn,
+digest-mismatched, from a different format version, or written under a different
+capacity or checksum mode means that shard starts cold and truncates. A cache
+that refuses to start is worse than one that starts empty. Entries in
+logged-evicted regions are dropped, and stream ids are rebound through a
+recovery-wide table that rejects an id claimed by two objects — an id resolving
+to the wrong object is a cross-object read, which is the one failure this cache
+must not have.
+
+`checkpoint_interval_bytes` (default 64 MiB, `0` disables) is byte-triggered
+rather than timed, so the cost tracks how much there is to lose and an idle shard
+never rewrites a checkpoint it has not invalidated. A crash discards whatever was
+written since the last checkpoint; that window is the knob.
+
+The **L1 DRAM tier is not persisted**, as in Velox. It is refilled from L2 on
+demand, and writing it down would cost more than the promotion it saves.
+
+The residual limitation is upstream of all this: admissions stage in memory and
+reach disk only once 4 MiB has accumulated, with no timer and no shutdown drain.
+On light selective-read traffic the disk tier stays empty and a checkpoint
+records nothing, so warm restart only benefits deployments whose admission volume
+regularly crosses that threshold.
 
 ### 8. The async worker is read-only
 
@@ -327,7 +380,9 @@ reclaim the space immediately instead of waiting for the TTL.
   the region is reclaimed.
 - **Object routing concentrates load.** One very large, very hot object is
   served by one worker.
-- **Cold restart** for the NVMe tier, per section 7.
+- **Warm restart depends on the 4 MiB staging trigger being crossed**, per
+  section 7. Light selective-read traffic never fills the disk tier, so there is
+  nothing for a checkpoint to record.
 - **Coherence is TTL-bounded, not absolute.** Unlike the block worker, a
   republished object can be served stale for up to one version TTL, per
   section 3. This is the one guarantee the async worker gives up.

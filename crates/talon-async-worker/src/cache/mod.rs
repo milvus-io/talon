@@ -2,9 +2,11 @@
 //! The two-tier extent cache.
 //!
 //! [`memory`] is the L1 DRAM tier and [`region`]/[`store`] the L2 NVMe tier;
-//! [`ids`] interns the objects both are keyed by. [`tiered`] stacks them and
-//! decides what earns a place on disk.
+//! [`ids`] interns the objects both are keyed by, and [`checkpoint`] is what
+//! lets the NVMe tier survive a restart. [`tiered`] stacks them and decides
+//! what earns a place on disk.
 
+pub mod checkpoint;
 pub mod ids;
 pub mod memory;
 pub mod region;

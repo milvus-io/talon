@@ -34,7 +34,24 @@
 //! skips any region with a live pin. A `pwrite` packing a new extent therefore
 //! can never land on a region an in-flight `pread` or `sendfile` is reading.
 //!
-//! See ADR 0005 §4.
+//! # Surviving a restart
+//!
+//! Run descriptors are what make packed bytes addressable, so a shard opened
+//! without them holds 64 MiB regions of unreachable data. [`ShardFile::open`]
+//! recovers them from a checkpoint written alongside the shard, and
+//! [`ShardFile::checkpoint`] writes one. Three files per shard, as in Velox:
+//!
+//! ```text
+//! extents_0.bin       the region file
+//! extents_0.bin.cpt   the entry map, stream names, and region bookkeeping
+//! extents_0.bin.log   regions reclaimed since that checkpoint
+//! ```
+//!
+//! Recovery never fails a startup. A checkpoint that is absent, torn, or
+//! written under a different configuration means a cold shard, which costs
+//! refetches; refusing to start costs the whole cache.
+//!
+//! See ADR 0005 §4 and §7.
 
 use std::collections::HashMap;
 use std::os::fd::OwnedFd;
@@ -46,6 +63,8 @@ use std::sync::{Arc, RwLock};
 use bytes::Bytes;
 use talon_core::{BlockHandle, Error, Result};
 
+use super::checkpoint::{self, CheckpointData, EvictionLog};
+use super::ids::{Recovery, StreamIds};
 use super::ExtentKey;
 
 /// Size of one region within a shard file.
@@ -171,6 +190,12 @@ struct ShardState {
     num_regions: u32,
     tracker: RegionTracker,
     stats: ShardStats,
+    /// Regions reclaimed since the last checkpoint. `None` when checkpointing
+    /// is disabled, in which case reclamation has nothing to record.
+    log: Option<EvictionLog>,
+    /// Bytes packed since the last checkpoint, against
+    /// [`ShardFile::checkpoint_interval_bytes`].
+    bytes_since_checkpoint: u64,
 }
 
 impl ShardState {
@@ -182,6 +207,8 @@ impl ShardState {
             num_regions: 0,
             tracker: RegionTracker::new(),
             stats: ShardStats::default(),
+            log: None,
+            bytes_since_checkpoint: 0,
         }
     }
 
@@ -235,6 +262,30 @@ impl ShardState {
             .retain(|_, run| !candidates.contains(&run.region));
         self.stats.extents_evicted += (before - self.entries.len()) as u64;
         self.stats.regions_evicted += candidates.len() as u64;
+
+        // Durable *before* the region is reused. The checkpoint on disk still
+        // names entries in these regions; if the bytes were overwritten and the
+        // process died before the next checkpoint, recovery would resurrect
+        // descriptors pointing at unrelated data. The extent digest usually
+        // catches that, but only when checksums are on and only off the
+        // zero-copy path — not a guarantee to rest correctness on.
+        //
+        // One `fsync` of a few bytes per 64 MiB reclaimed. An `fsync` under the
+        // write lock is a stall, and this is the deliberate place to take one:
+        // reclamation already holds the lock and already discards a region.
+        if let Some(log) = self.log.as_mut() {
+            if let Err(error) = log.append(&candidates) {
+                // Reusing the region anyway would be the unsafe direction: the
+                // stale checkpoint would outlive the eviction unrecorded. Drop
+                // the write instead and let the next admission try again.
+                tracing::error!(
+                    %error,
+                    "extent store shard: eviction log append failed; refusing to reuse the region"
+                );
+                self.stats.checkpoint_errors += 1;
+                return Ok(false);
+            }
+        }
 
         for &r in &candidates {
             self.region_sizes[r as usize] = 0;
@@ -329,6 +380,17 @@ pub struct ShardStats {
     pub regions_evicted: u64,
     /// Reads rejected because the stored digest did not match.
     pub checksum_failures: u64,
+    /// Checkpoints written successfully.
+    pub checkpoints_written: u64,
+    /// Checkpoints recovered at startup. Zero or one per shard.
+    pub checkpoints_read: u64,
+    /// Extents made addressable again by a recovered checkpoint.
+    pub extents_recovered: u64,
+    /// Checkpoint writes, reads, or eviction-log appends that failed.
+    ///
+    /// None of these are fatal — the worst case is a cold shard — but a
+    /// sustained non-zero value means warm restart is not actually working.
+    pub checkpoint_errors: u64,
 }
 
 /// A pinned, zero-copy view of one extent, safe to `sendfile` from.
@@ -383,6 +445,10 @@ pub struct ShardFile {
     file: Arc<std::fs::File>,
     max_regions: u32,
     checksums_enabled: bool,
+    /// Bytes packed between checkpoints. Zero disables checkpointing, and with
+    /// it the eviction log — a shard that never writes a checkpoint has nothing
+    /// for a log to protect.
+    checkpoint_interval_bytes: u64,
     state: RwLock<ShardState>,
     /// One pin counter per region, pre-allocated to `max_regions`.
     region_pins: Vec<AtomicU32>,
@@ -399,27 +465,361 @@ impl std::fmt::Debug for ShardFile {
     }
 }
 
+/// Checkpoint path for a shard file.
+fn checkpoint_path(shard: &Path) -> PathBuf {
+    let mut p = shard.as_os_str().to_os_string();
+    p.push(".cpt");
+    PathBuf::from(p)
+}
+
+/// Eviction-log path for a shard file.
+fn log_path(shard: &Path) -> PathBuf {
+    let mut p = shard.as_os_str().to_os_string();
+    p.push(".log");
+    PathBuf::from(p)
+}
+
 impl ShardFile {
     /// Create (truncating any previous content) a shard file at `path`.
     ///
-    /// Truncating is deliberate: run descriptors live only in memory, so a
-    /// pre-existing file's bytes are unaddressable. This tier is cold after
-    /// restart — see ADR 0005 §7.
+    /// The cold-start constructor: run descriptors start empty, so any
+    /// pre-existing bytes are unaddressable and keeping them would consume the
+    /// capacity budget for nothing.
     pub fn create(path: PathBuf, max_regions: u32, checksums_enabled: bool) -> Result<Arc<Self>> {
+        Self::open(path, max_regions, checksums_enabled, 0, None)
+    }
+
+    /// Open a shard file, recovering its extent map from a checkpoint when one
+    /// is usable.
+    ///
+    /// Passing a [`Recovery`] opts into warm restart. Recovery is abandoned —
+    /// and the shard truncated to a cold start — when the checkpoint is absent,
+    /// torn, digest-mismatched, or was written under a configuration this shard
+    /// does not share. Never an error: a cache that refuses to start is worse
+    /// than a cache that starts empty.
+    ///
+    /// `checkpoint_interval_bytes` of zero disables checkpoint writing, which
+    /// also means no eviction log. Recovery is still attempted if a `Recovery`
+    /// is supplied, so the interval can be lowered to zero without discarding
+    /// what a previous run left behind.
+    pub fn open(
+        path: PathBuf,
+        max_regions: u32,
+        checksums_enabled: bool,
+        checkpoint_interval_bytes: u64,
+        recovery: Option<&mut Recovery<'_>>,
+    ) -> Result<Arc<Self>> {
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .truncate(true)
+            .truncate(false)
             .open(&path)?;
+
+        let mut state = ShardState::new();
+        let mut recovered = false;
+        if let Some(recovery) = recovery {
+            match Self::recover(&path, &file, max_regions, checksums_enabled, recovery) {
+                Ok(Some(from_checkpoint)) => {
+                    state = from_checkpoint;
+                    recovered = true;
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "extent store shard: checkpoint unusable; starting cold"
+                    );
+                    state.stats.checkpoint_errors += 1;
+                }
+            }
+        }
+
+        // A shard that recovered nothing must not inherit the previous run's
+        // bytes: nothing can address them, and they would count against the
+        // capacity budget until reclamation happened to reach them.
+        //
+        // Keyed on whether recovery *ran*, not on whether it produced regions:
+        // an empty-but-valid checkpoint is a successful recovery of a shard that
+        // held nothing, and deleting it would make the next start report a
+        // missing checkpoint instead.
+        if !recovered {
+            file.set_len(0)?;
+            let _ = std::fs::remove_file(checkpoint_path(&path));
+            let _ = std::fs::remove_file(log_path(&path));
+        }
+
+        if checkpoint_interval_bytes > 0 {
+            match EvictionLog::open(log_path(&path)) {
+                Ok(log) => state.log = Some(log),
+                Err(error) => {
+                    // Without a log, reclamation cannot invalidate the entries a
+                    // stale checkpoint names, so checkpointing has to be off
+                    // rather than merely unprotected.
+                    tracing::error!(
+                        path = %path.display(),
+                        %error,
+                        "extent store shard: cannot open eviction log; \
+                         checkpointing disabled for this shard"
+                    );
+                    state.stats.checkpoint_errors += 1;
+                }
+            }
+        }
+        let checkpoint_interval_bytes = if state.log.is_some() {
+            checkpoint_interval_bytes
+        } else {
+            0
+        };
+
         Ok(Arc::new(Self {
             path,
             file: Arc::new(file),
             max_regions,
             checksums_enabled,
-            state: RwLock::new(ShardState::new()),
+            checkpoint_interval_bytes,
+            state: RwLock::new(state),
             region_pins: (0..max_regions).map(|_| AtomicU32::new(0)).collect(),
         }))
+    }
+
+    /// Rebuild shard state from a checkpoint, or `None` when there is none.
+    fn recover(
+        path: &Path,
+        file: &std::fs::File,
+        max_regions: u32,
+        checksums_enabled: bool,
+        recovery: &mut Recovery<'_>,
+    ) -> Result<Option<ShardState>> {
+        let cpt_path = checkpoint_path(path);
+        let bytes = match std::fs::read(&cpt_path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(Error::Io(e)),
+        };
+        let data = checkpoint::decode(&bytes)
+            .map_err(|e| Error::Other(format!("{}: {e}", cpt_path.display())))?;
+
+        // Configuration checks, before any entry is trusted. Region indices only
+        // mean something under the capacity they were written with, and a
+        // checkpoint from the other checksum mode carries digests this shard
+        // would either ignore or compare against nothing.
+        if data.max_regions != max_regions {
+            return Err(Error::Other(format!(
+                "capacity changed: checkpoint holds {} regions per shard, configured for {}",
+                data.max_regions, max_regions
+            )));
+        }
+        if data.checksums_enabled != checksums_enabled {
+            return Err(Error::Other(format!(
+                "checksum mode changed: checkpoint was written with checksums {}",
+                if data.checksums_enabled { "on" } else { "off" }
+            )));
+        }
+
+        let num_regions = data.num_regions() as u32;
+        let needed = num_regions as u64 * REGION_SIZE;
+        if file.metadata()?.len() < needed {
+            return Err(Error::Other(format!(
+                "shard file is {} bytes, shorter than the {needed} the checkpoint describes",
+                file.metadata()?.len()
+            )));
+        }
+
+        // Regions reclaimed after the checkpoint was written. Their bytes have
+        // been overwritten, so every entry naming one is a dangling descriptor.
+        let evicted = EvictionLog::read(&log_path(path))?;
+        let accepted = recovery.accept(&data.streams);
+
+        let CheckpointData {
+            mut region_sizes,
+            region_scores,
+            entries,
+            ..
+        } = data;
+
+        let total = entries.len();
+        let live: HashMap<ExtentKey, ExtentRun> = entries
+            .into_iter()
+            .filter(|(key, run)| {
+                !evicted.contains(&run.region) && accepted.contains(&key.stream_id)
+            })
+            .collect();
+
+        let mut tracker = RegionTracker::new();
+        tracker.scores = region_scores;
+        tracker.ensure_capacity(num_regions as usize);
+
+        // Only the reclaimed regions are writable, as in Velox. The tail of a
+        // partially filled region is given up rather than packed into: a
+        // partially filled region may hold post-checkpoint extents this
+        // recovery does not know about, and writing over them would corrupt
+        // nothing but would make the region's high-water mark a lie.
+        let mut writable: Vec<u32> = evicted
+            .iter()
+            .copied()
+            .filter(|r| *r < num_regions)
+            .collect();
+        writable.sort_unstable();
+        writable.dedup();
+        for &r in &writable {
+            region_sizes[r as usize] = 0;
+            tracker.scores[r as usize] = 0.0;
+        }
+
+        tracing::info!(
+            path = %path.display(),
+            regions = num_regions,
+            extents = live.len(),
+            dropped = total - live.len(),
+            reclaimed_regions = writable.len(),
+            "extent store shard recovered from checkpoint"
+        );
+
+        Ok(Some(ShardState {
+            stats: ShardStats {
+                checkpoints_read: 1,
+                extents_recovered: live.len() as u64,
+                ..ShardStats::default()
+            },
+            entries: live,
+            region_sizes,
+            writable_regions: writable,
+            num_regions,
+            tracker,
+            log: None,
+            bytes_since_checkpoint: 0,
+        }))
+    }
+
+    /// Write a checkpoint, making everything currently addressable recoverable.
+    ///
+    /// The ordering is Velox's, with one change — the checkpoint is written to a
+    /// temporary name and renamed, rather than truncated in place, so the
+    /// previous checkpoint stays valid until the new one is complete:
+    ///
+    /// 1. `fsync` the region file, so the checkpoint never names bytes that are
+    ///    not durable;
+    /// 2. write, `fsync`, and rename the checkpoint;
+    /// 3. clear the eviction log, whose records the new checkpoint supersedes.
+    ///
+    /// Both crash windows leave a consistent pair: the old checkpoint with a
+    /// full log, or the new checkpoint with a stale-but-harmless one — replaying
+    /// evictions of regions the new checkpoint already excludes is idempotent.
+    ///
+    /// Runs under the write lock for its whole duration, which is what makes
+    /// step 3 safe: an eviction slipping in between the snapshot and the clear
+    /// would have its log record erased while the new checkpoint still named its
+    /// entries.
+    ///
+    /// A no-op when checkpointing is disabled.
+    pub fn checkpoint(&self, ids: &StreamIds) -> Result<()> {
+        let mut state = self.state.write().unwrap();
+        if state.log.is_none() {
+            return Ok(());
+        }
+
+        self.file.sync_data()?;
+
+        // The id table is the only thing that can turn a `stream_id` back into
+        // an object, so it travels with the entry map. Only the streams this
+        // shard actually refers to: the table is process-wide and most of it
+        // belongs to other shards.
+        let mut referenced: Vec<u64> = state.entries.keys().map(|k| k.stream_id).collect();
+        referenced.sort_unstable();
+        referenced.dedup();
+        let streams = ids.names_of(&referenced);
+
+        // An entry whose stream is no longer interned — released between the
+        // two steps above — would recover into a key nothing can name. Drop it
+        // here rather than write a checkpoint that recovery has to repair.
+        let named: std::collections::HashSet<u64> = streams.iter().map(|(id, _)| *id).collect();
+        let mut region_scores = state.tracker.scores.clone();
+        region_scores.resize(state.region_sizes.len(), 0.0);
+
+        let data = CheckpointData {
+            max_regions: self.max_regions,
+            checksums_enabled: self.checksums_enabled,
+            region_sizes: state.region_sizes.clone(),
+            region_scores,
+            streams,
+            entries: state
+                .entries
+                .iter()
+                .filter(|(k, _)| named.contains(&k.stream_id))
+                .map(|(k, v)| (*k, *v))
+                .collect(),
+        };
+
+        let encoded = checkpoint::encode(&data);
+        let cpt = checkpoint_path(&self.path);
+        let tmp = {
+            let mut p = cpt.as_os_str().to_os_string();
+            p.push(".tmp");
+            PathBuf::from(p)
+        };
+
+        let result = (|| -> std::io::Result<()> {
+            let mut f = std::fs::File::create(&tmp)?;
+            std::io::Write::write_all(&mut f, &encoded)?;
+            f.sync_data()?;
+            drop(f);
+            std::fs::rename(&tmp, &cpt)
+        })();
+        if let Err(error) = result {
+            let _ = std::fs::remove_file(&tmp);
+            state.stats.checkpoint_errors += 1;
+            return Err(Error::Io(error));
+        }
+
+        if let Some(log) = state.log.as_mut() {
+            if let Err(error) = log.clear() {
+                // The checkpoint is already durable and correct; a log that
+                // still names those regions only costs recoverable extents next
+                // time, so this is worth counting but not worth failing.
+                tracing::warn!(
+                    path = %self.path.display(),
+                    %error,
+                    "extent store shard: could not clear the eviction log"
+                );
+                state.stats.checkpoint_errors += 1;
+            }
+        }
+
+        state.bytes_since_checkpoint = 0;
+        state.stats.checkpoints_written += 1;
+        tracing::debug!(
+            path = %self.path.display(),
+            extents = data.entries.len(),
+            bytes = encoded.len(),
+            "extent store shard checkpointed"
+        );
+        Ok(())
+    }
+
+    /// Checkpoint if enough has been written since the last one.
+    ///
+    /// Called after every admission batch. Byte-triggered rather than
+    /// time-triggered so the cost tracks how much there is to lose: an idle
+    /// shard never rewrites a checkpoint it has not invalidated.
+    pub fn checkpoint_if_due(&self, ids: &StreamIds) -> Result<bool> {
+        if self.checkpoint_interval_bytes == 0 {
+            return Ok(false);
+        }
+        {
+            let state = self.state.read().unwrap();
+            if state.bytes_since_checkpoint < self.checkpoint_interval_bytes {
+                return Ok(false);
+            }
+        }
+        self.checkpoint(ids)?;
+        Ok(true)
+    }
+
+    /// Whether this shard writes checkpoints.
+    pub fn checkpointing(&self) -> bool {
+        self.checkpoint_interval_bytes > 0
     }
 
     fn unpin(&self, region: u32) {
@@ -596,6 +996,7 @@ impl ShardFile {
                 }
                 state.stats.bytes_written += bytes;
                 state.stats.extents_written += count;
+                state.bytes_since_checkpoint += bytes;
             }
 
             i = packed.next;
@@ -1222,6 +1623,344 @@ mod tests {
         let st = s.stats();
         assert!(st.extents_written > 0, "the writer wrote nothing");
         assert_eq!(st.checksum_failures, 0, "a read observed a torn write");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    // -----------------------------------------------------------------
+    // Warm restart
+    //
+    // A restart is modelled by dropping a `ShardFile` and reopening the same
+    // path, which is the whole of what a process boundary changes here — the
+    // file survives, everything in memory does not.
+    // -----------------------------------------------------------------
+
+    const CPT_INTERVAL: u64 = REGION_SIZE;
+
+    fn warm_shard(
+        dir: &Path,
+        max_regions: u32,
+        checksums: bool,
+        ids: &StreamIds,
+    ) -> Arc<ShardFile> {
+        let mut recovery = Recovery::new(ids);
+        ShardFile::open(
+            dir.join("extents_0.bin"),
+            max_regions,
+            checksums,
+            CPT_INTERVAL,
+            Some(&mut recovery),
+        )
+        .unwrap()
+    }
+
+    fn object(path: &str) -> talon_core::ObjectId {
+        talon_core::ObjectId::new(talon_core::Backend::S3, "wh", path)
+    }
+
+    #[test]
+    fn a_checkpointed_extent_reads_back_byte_exact_after_a_reopen() {
+        let dir = tmp_dir("cpt-roundtrip");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 4096), extent(0x7E, 8192))])
+                .unwrap();
+            s.checkpoint(&ids).unwrap();
+            assert_eq!(s.stats().checkpoints_written, 1);
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        let got = s.get_bytes(&key(id, 4096), 8192).unwrap().unwrap();
+        assert_eq!(got.len(), 8192);
+        assert!(got.iter().all(|&b| b == 0x7E), "recovered bytes differ");
+        assert_eq!(s.stats().extents_recovered, 1);
+        assert_eq!(s.stats().checkpoints_read, 1);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn writes_after_the_last_checkpoint_are_not_recovered() {
+        // The accepted loss, pinned so it is a decision rather than a surprise:
+        // a crash discards everything written since the last checkpoint, which
+        // is what bounds the checkpoint interval's cost.
+        let dir = tmp_dir("cpt-window");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(1, 512))]).unwrap();
+            s.checkpoint(&ids).unwrap();
+            s.insert_many(vec![(key(id, 512), extent(2, 512))]).unwrap();
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        assert!(
+            s.contains(&key(id, 0)),
+            "the checkpointed extent must survive"
+        );
+        assert!(!s.contains(&key(id, 512)), "the later write must be gone");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_extent_in_a_logged_evicted_region_is_not_recovered() {
+        // The eviction log's reason for existing. Region 0's bytes were
+        // overwritten after the checkpoint named them, so recovering that
+        // descriptor would read whatever landed there instead.
+        let dir = tmp_dir("cpt-evicted");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(1, 512))]).unwrap();
+            s.checkpoint(&ids).unwrap();
+        }
+        // Reclamation of region 0, as the shard would have recorded it.
+        {
+            let mut log = EvictionLog::open(log_path(&dir.join("extents_0.bin"))).unwrap();
+            log.append(&[0]).unwrap();
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        assert!(
+            !s.contains(&key(id, 0)),
+            "a reclaimed region must not recover"
+        );
+        assert_eq!(s.stats().extents_recovered, 0);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_checkpoint_truncated_at_any_length_yields_a_cold_shard_not_a_bad_read() {
+        // The crash-safety test at the file level: every prefix of a real
+        // checkpoint must either be rejected outright or, if some prefix ever
+        // did parse, never make an extent readable that is not byte-exact.
+        let dir = tmp_dir("cpt-torn");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+        let cpt = {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(0x33, 1024))])
+                .unwrap();
+            s.checkpoint(&ids).unwrap();
+            std::fs::read(checkpoint_path(&dir.join("extents_0.bin"))).unwrap()
+        };
+        let region_file = std::fs::read(dir.join("extents_0.bin")).unwrap();
+        let cpt_path = checkpoint_path(&dir.join("extents_0.bin"));
+
+        for cut in 0..cpt.len() {
+            std::fs::write(dir.join("extents_0.bin"), &region_file).unwrap();
+            std::fs::write(&cpt_path, &cpt[..cut]).unwrap();
+
+            let s = warm_shard(&dir, 2, false, &ids);
+            match s.get_bytes(&key(id, 0), 1024).unwrap() {
+                None => {}
+                Some(got) => panic!(
+                    "a checkpoint cut at {cut} bytes served {} bytes; \
+                     a partial checkpoint must never be believed",
+                    got.len()
+                ),
+            }
+        }
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_checkpoint_written_with_checksums_off_is_rejected_when_they_are_on() {
+        // The digests in the entry map mean different things in the two modes,
+        // so adopting the map across a mode change would either verify against
+        // zeros or skip verification silently.
+        let dir = tmp_dir("cpt-checksum-mode");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(4, 512))]).unwrap();
+            s.checkpoint(&ids).unwrap();
+        }
+
+        let s = warm_shard(&dir, 2, true, &ids);
+        assert!(!s.contains(&key(id, 0)));
+        assert_eq!(s.stats().checkpoint_errors, 1);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_capacity_change_is_rejected() {
+        let dir = tmp_dir("cpt-capacity");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(4, 512))]).unwrap();
+            s.checkpoint(&ids).unwrap();
+        }
+
+        let s = warm_shard(&dir, 4, false, &ids);
+        assert!(!s.contains(&key(id, 0)));
+        assert_eq!(s.stats().checkpoints_read, 0);
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn region_scores_survive_a_checkpoint() {
+        // Reclamation restarting from a flat distribution would evict a region
+        // that is hot but young, which is the choice the decay scoring exists
+        // to avoid.
+        let dir = tmp_dir("cpt-scores");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(1, 4096))]).unwrap();
+            for _ in 0..20 {
+                s.get_bytes(&key(id, 0), 4096).unwrap().unwrap();
+            }
+            s.checkpoint(&ids).unwrap();
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        let score = s.state.read().unwrap().tracker.scores[0];
+        assert!(score > 0.0, "region 0 recovered with a score of {score}");
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_shard_with_no_checkpoint_starts_cold_and_truncates() {
+        // Bytes with no descriptor are unaddressable; leaving them would charge
+        // the capacity budget for a region nothing can read.
+        let dir = tmp_dir("cpt-absent");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![(key(id, 0), extent(1, 4096))]).unwrap();
+            // No checkpoint call.
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        assert!(!s.contains(&key(id, 0)));
+        assert_eq!(s.allocated_bytes(), 0);
+        assert_eq!(
+            std::fs::metadata(dir.join("extents_0.bin")).unwrap().len(),
+            0,
+            "an unrecoverable shard file must be truncated"
+        );
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn checkpointing_is_a_no_op_when_the_interval_is_zero() {
+        let dir = tmp_dir("cpt-disabled");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+
+        let s = ShardFile::create(dir.join("extents_0.bin"), 2, false).unwrap();
+        assert!(!s.checkpointing());
+        s.insert_many(vec![(key(id, 0), extent(1, 512))]).unwrap();
+        s.checkpoint(&ids).unwrap();
+
+        assert_eq!(s.stats().checkpoints_written, 0);
+        assert!(!checkpoint_path(&dir.join("extents_0.bin")).exists());
+        assert!(!log_path(&dir.join("extents_0.bin")).exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn a_checkpoint_is_written_once_the_interval_is_passed() {
+        let dir = tmp_dir("cpt-due");
+        let ids = StreamIds::new();
+        let id = ids.get_or_intern(&object("part-0.parquet"));
+        let mut recovery = Recovery::new(&ids);
+        let s = ShardFile::open(
+            dir.join("extents_0.bin"),
+            2,
+            false,
+            4096,
+            Some(&mut recovery),
+        )
+        .unwrap();
+
+        s.insert_many(vec![(key(id, 0), extent(1, 2048))]).unwrap();
+        assert!(!s.checkpoint_if_due(&ids).unwrap(), "2 KiB is under 4 KiB");
+
+        s.insert_many(vec![(key(id, 2048), extent(2, 2048))])
+            .unwrap();
+        assert!(
+            s.checkpoint_if_due(&ids).unwrap(),
+            "4 KiB reaches the interval"
+        );
+        assert_eq!(s.stats().checkpoints_written, 1);
+
+        // And the counter restarts, rather than checkpointing on every write
+        // from here on.
+        assert!(!s.checkpoint_if_due(&ids).unwrap());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_empty_but_valid_checkpoint_is_a_successful_recovery() {
+        // A shard that held nothing still recovers: deleting its checkpoint
+        // would make the next start report a *missing* one, which reads as
+        // damage rather than as an empty cache.
+        let dir = tmp_dir("cpt-empty");
+        let ids = StreamIds::new();
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.checkpoint(&ids).unwrap();
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        assert_eq!(s.stats().checkpoints_read, 1);
+        assert_eq!(s.stats().checkpoint_errors, 0);
+        assert!(checkpoint_path(&dir.join("extents_0.bin")).exists());
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn an_extent_whose_stream_was_released_is_not_checkpointed() {
+        // A checkpointed key whose id is no longer interned would recover into
+        // an entry nothing can name — dead weight against the capacity budget.
+        let dir = tmp_dir("cpt-released");
+        let ids = StreamIds::new();
+        let live = ids.get_or_intern(&object("live.parquet"));
+        let gone = ids.get_or_intern(&object("gone.parquet"));
+
+        {
+            let s = warm_shard(&dir, 2, false, &ids);
+            s.insert_many(vec![
+                (key(live, 0), extent(1, 512)),
+                (key(gone, 0), extent(2, 512)),
+            ])
+            .unwrap();
+            ids.release_object(&object("gone.parquet"));
+            s.checkpoint(&ids).unwrap();
+        }
+
+        let s = warm_shard(&dir, 2, false, &ids);
+        assert!(s.contains(&key(live, 0)));
+        assert!(!s.contains(&key(gone, 0)));
 
         std::fs::remove_dir_all(dir).ok();
     }

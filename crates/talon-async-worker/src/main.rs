@@ -11,9 +11,9 @@
 //! - Placement resolves on a **separate rendezvous ring** keyed on the object
 //!   identity, so every range of one object lands on one worker. The
 //!   coordinator selects it by node role; see ADR 0005 §6.
-//! - The NVMe tier is **cold after restart**. Run descriptors live only in
-//!   memory, so the cache directory is wiped at startup rather than scanned
-//!   (ADR 0005 §7). A restart refetches on demand, one extent at a time.
+//! - The NVMe tier survives a restart by **checkpointing** its extent map, so
+//!   the cache directory is recovered rather than wiped (ADR 0005 §7). Setting
+//!   `checkpoint_interval_bytes = 0` turns that off and restores the wipe.
 //! - **Reads only.** A write or delete is refused with an error frame, after
 //!   the body is drained so the connection stays in sync (ADR 0005 §8).
 //! - The data plane runs on Tokio only. There is no io_uring path here: the
@@ -140,6 +140,7 @@ impl Args {
             disk_shards: None,
             checksums_enabled: None,
             l1_shards: None,
+            checkpoint_interval_bytes: None,
             s3_path_style: None,
             backend_max_retries: None,
             backend_retry_base_ms: None,
@@ -272,11 +273,22 @@ fn build_http_client(cfg: &AsyncWorkerConfig) -> Arc<dyn talon_backend::http::Ht
 
 /// Prepare the cache directory.
 ///
-/// Wiped, not scanned. Run descriptors live only in memory, so whatever regions
-/// survive on disk from a previous process are unaddressable — keeping them
-/// would consume the whole capacity budget with bytes nothing can ever read
-/// (ADR 0005 §7).
-fn prepare_cache_dir(dir: &std::path::Path) -> std::io::Result<()> {
+/// With warm restart on, the directory is created but never cleared: the shard
+/// files and their checkpoints are exactly what recovery reads, and each shard
+/// truncates itself if its own checkpoint turns out to be unusable. Wiping here
+/// would defeat the feature before it ran.
+///
+/// With `checkpoint_interval_bytes = 0` nothing was ever written down, so
+/// surviving regions are unaddressable and keeping them would consume the whole
+/// capacity budget with bytes nothing can read (ADR 0005 §7).
+fn prepare_cache_dir(dir: &std::path::Path, warm_restart: bool) -> std::io::Result<()> {
+    if warm_restart {
+        tracing::info!(
+            dir = %dir.display(),
+            "warm restart enabled; keeping the extent cache directory"
+        );
+        return std::fs::create_dir_all(dir);
+    }
     match std::fs::remove_dir_all(dir) {
         Ok(()) => tracing::info!(dir = %dir.display(), "cleared the extent cache directory"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -335,7 +347,7 @@ async fn main() -> anyhow::Result<()> {
 
     let metrics = Arc::new(AsyncWorkerMetrics::new(backend_kind));
 
-    prepare_cache_dir(&cfg.cache_dir)?;
+    prepare_cache_dir(&cfg.cache_dir, cfg.checkpoint_interval_bytes > 0)?;
     let cache = TieredExtentCache::new(&ExtentCacheConfig {
         memory_bytes: cfg.l1_capacity_bytes,
         memory_shards: cfg.l1_shards,
@@ -343,11 +355,13 @@ async fn main() -> anyhow::Result<()> {
         disk_bytes: cfg.capacity_bytes,
         disk_shards: cfg.disk_shards,
         disk_checksums: cfg.checksums_enabled,
+        checkpoint_interval_bytes: cfg.checkpoint_interval_bytes,
     })
     .await?;
     tracing::info!(
         l1_enabled = cache.memory().is_enabled(),
         l2_enabled = cache.disk().is_some(),
+        extents_recovered = cache.stats().extents_recovered,
         "extent cache ready"
     );
 
@@ -817,17 +831,17 @@ mod tests {
             .contains(&"coordinator_not_registered"));
     }
 
-    /// The cache directory is wiped, not scanned. Run descriptors live only in
-    /// memory, so surviving regions are unaddressable bytes that would consume
-    /// the capacity budget forever.
+    /// With warm restart off the cache directory is wiped, not scanned: nothing
+    /// wrote the run descriptors down, so surviving regions are unaddressable
+    /// bytes that would consume the capacity budget forever.
     #[test]
-    fn the_cache_directory_is_cleared_at_startup() {
+    fn the_cache_directory_is_cleared_at_startup_without_warm_restart() {
         let dir = tmp_dir("clear");
         std::fs::create_dir_all(dir.join("nested")).unwrap();
         std::fs::write(dir.join("extents_0.bin"), b"stale region data").unwrap();
         std::fs::write(dir.join("nested/other"), b"x").unwrap();
 
-        prepare_cache_dir(&dir).unwrap();
+        prepare_cache_dir(&dir, false).unwrap();
 
         assert!(dir.is_dir(), "the directory must exist afterwards");
         assert_eq!(
@@ -838,11 +852,28 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// With warm restart on the opposite is required: the shard files and their
+    /// checkpoints *are* the recovery input, and each shard truncates itself if
+    /// its own checkpoint turns out to be unusable.
+    #[test]
+    fn the_cache_directory_survives_when_warm_restart_is_on() {
+        let dir = tmp_dir("keep");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("extents_0.bin"), b"region data").unwrap();
+        std::fs::write(dir.join("extents_0.bin.cpt"), b"checkpoint").unwrap();
+
+        prepare_cache_dir(&dir, true).unwrap();
+
+        assert!(dir.join("extents_0.bin").exists());
+        assert!(dir.join("extents_0.bin.cpt").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[test]
     fn preparing_a_missing_cache_directory_creates_it() {
         let dir = tmp_dir("create").join("deep/er");
         std::fs::remove_dir_all(&dir).ok();
-        prepare_cache_dir(&dir).unwrap();
+        prepare_cache_dir(&dir, false).unwrap();
         assert!(dir.is_dir());
         std::fs::remove_dir_all(tmp_dir("create")).ok();
     }
