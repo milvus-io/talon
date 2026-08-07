@@ -86,16 +86,19 @@ It is an addition rather than a replacement, and the choice is per workload:
 | Footer reads, column-chunk projection, point lookups | `talon-async-worker` |
 | Writes | `talon-worker` — the async worker is read-only |
 
-Async workers register on a **separate placement ring** keyed on the object, so
-every range of one file lands on the same node and one reader's footer fetch
-warms the next reader's chunk read. Clients opt in per request; the coordinator
-does not guess. Two consequences to plan for: an async worker's NVMe tier is
-cold after a restart, and one very large hot object is served by one node rather
-than spread across the fleet.
+Async workers run in a **separate cluster** whose placement ring is keyed on the
+object, so every range of one file lands on the same node and one reader's
+footer fetch warms the next reader's chunk read. A deployment that needs both
+access patterns runs two clusters and points each workload at the right
+coordinator. Three consequences to plan for: an async worker's NVMe tier is
+cold after a restart, one very large hot object is served by one node rather
+than spread across the fleet, and an async cluster cannot serve directory
+listings.
 
-**Today only `talon-client --ring async` opts in.** The FUSE mount, the Python
-bindings, and the Java client all resolve to the block pool, so a mounted
-analytics workload still reads at block granularity. See
+**Today only the CLI is ready for it.** The FUSE mount and the Python bindings
+split reads into block-aligned ranges before resolving placement, so pointing
+them at an async cluster would reintroduce the over-fetch it exists to remove.
+A mounted analytics workload still reads at block granularity. See
 [current limitations](../operations/async-worker.md#current-limitations).
 
 See [the async worker guide](../operations/async-worker.md) for how to run it,

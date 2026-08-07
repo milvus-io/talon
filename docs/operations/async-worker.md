@@ -17,7 +17,7 @@ page is how to run it.
 | Full-partition scans, training data, checkpoint restore | `talon-worker` |
 | Parquet/Lance footer reads, column-chunk projection, point lookups | `talon-async-worker` |
 | Writes of any kind | `talon-worker` — the async worker refuses them |
-| One very large, very hot object read by the whole fleet | `talon-worker` — the async ring pins it to one node |
+| One very large, very hot object read by the whole fleet | `talon-worker` — an async cluster pins it to one node |
 
 The difference is over-fetch. A block worker materialises a whole block on any
 touch, so a 4 KiB footer read costs a 256 MiB transfer and the next column chunk
@@ -42,32 +42,44 @@ object to one worker, a single enormous hot object is served by a single node
 rather than spread across the fleet. Size the async pool for object count and
 read concurrency, not for total bytes.
 
-## Placement: a second ring
+## Placement: a separate cluster
 
-Async workers sit on their own rendezvous ring, disjoint from the block ring.
+Async workers are not a second pool inside a block cluster. They are a
+**separate cluster** — its own coordinator, started with
+`--cluster-type async`, running its own ring
+([ADR 0006](../explanation/adr-0006-one-ring-per-cluster.md)).
 
-| Ring | Node role | Hash key |
+| Cluster type | Node role admitted | Hash key |
 |---|---|---|
-| block | `worker` | the whole `BlockId` — object, offset, size, version |
-| async | `async_worker` | the object identity alone |
+| `block` | `worker` | the whole `BlockId` — object, offset, size, version |
+| `async` | `async_worker` | the object identity alone |
 
 Dropping the offset is the point: every range of one file resolves to the same
 worker, so one reader's footer fetch warms the next reader's column-chunk read.
-On the block ring those hash apart and each chunk pays a cold miss somewhere
+In a block cluster those hash apart and each chunk pays a cold miss somewhere
 else.
 
-**The client chooses the ring.** The coordinator sees only a byte range and
-would have to guess; the caller knows what it is about to read. With the CLI
-client:
+Start the coordinator for the type of worker you are running:
 
 ```sh
-talon-client --ring async --path /s3/warehouse/sales/part-00000.parquet \
+talon-coordinator --cluster-type async --listen 0.0.0.0:7000
+```
+
+Then point the client at that coordinator. `--cluster-type` tells the client
+how to resolve placement — a block cluster's ring is recomputed locally, an
+async cluster's must be asked — so it has to match the coordinator:
+
+```sh
+talon-client --coordinator async-coord:7000 --cluster-type async \
+  --path /s3/warehouse/sales/part-00000.parquet \
   --offset 536866816 --len 4096
 ```
 
-A lookup never crosses pools. If no async worker is registered, an async lookup
-returns **no owners** rather than quietly handing back a block worker that holds
-no extents.
+A worker of the wrong kind is **refused at registration**, with a reason in the
+heartbeat ack, so a misconfigured pod fails loudly instead of sitting idle with
+a cache that never warms. A cluster with no workers yet returns no owners.
+
+Running both means running two clusters, each with its own coordinator address.
 
 ## Current limitations
 
@@ -75,19 +87,18 @@ This worker runs end to end and the over-fetch claim is measured, but it is not
 yet something to put in front of production traffic. Four gaps, in the order
 they bite.
 
-**Only the CLI can reach the async ring.** `talon-client --ring async` is the
-one thing that sends a ring-aware lookup. The FUSE mount and the Python
-bindings are the same Rust code and send `PlacementLookup`, so they always
-resolve to the block pool. The Java client's encoder *could* send the new
-message — its schema field describes the message rather than the sender, so its
-schema-2 pin is not in the way — but the message is not implemented there.
+**Only the CLI is ready to talk to an async cluster.** Since the lookup message
+no longer names a ring, every client can *reach* one — but the FUSE mount's
+read path splits a request into block-aligned `BlockId`s *before* it resolves
+placement, so pointing it at an async cluster unchanged would ask an async
+worker for block-shaped ranges and reintroduce the exact over-fetch this worker
+exists to remove. The Python bindings are the same Rust code. Nothing has
+decided *which* cluster a mount should use either: the CLI defers that to a
+human flag, and a filesystem has no human per read.
 
-For FUSE it is not only the lookup. The read path splits a request into
-block-aligned `BlockId`s *before* it resolves placement, so pointing it at the
-async ring unchanged would ask an async worker for block-shaped ranges and
-reintroduce the exact over-fetch this worker exists to remove. Nor has anything
-decided *which* ring a mount should use: the CLI defers that to a human flag,
-and a filesystem has no human per read.
+**Listing is not available.** An async cluster answers `ListObjects` with an
+error rather than an empty list. Directory listings — and therefore FUSE
+`readdir` — need a block cluster.
 
 **The NVMe tier has never written a byte outside tests.** Admissions are staged
 and flushed once `FLUSH_BYTES` (4 MiB) has accumulated. There is no timer and no

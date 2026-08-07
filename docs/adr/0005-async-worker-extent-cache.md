@@ -5,6 +5,8 @@
 - Relates to: #363 analytics over-fetch, `docs/use-cases/analytics.md` block granularity
 - Supersedes: the paged-block plan in `DESIGN.md` section 3, for the workloads
   this worker targets
+- Superseded in part: section 6 by ADR 0006, which moves the ring from the
+  request to the cluster
 
 ## Context
 
@@ -177,6 +179,16 @@ on first miss. Gating unconditionally would mean an L1-less deployment never
 writes to NVMe at all.
 
 ### 6. A separate rendezvous ring, keyed on the object
+
+> **Superseded by [ADR 0006](./0006-one-ring-per-cluster.md).** The ring below
+> is still the async worker's ring, and the reasoning for its hash key —
+> dropping the offset and the version — still holds unchanged. What 0006
+> reverses is everything about *where the ring lives*: it is now a property of
+> the cluster, chosen once at coordinator startup, not a field on a request.
+> `Ring` and `RingPlacementLookup` no longer exist and
+> `CONTROL_SCHEMA_VERSION` is back to 4, so the **Compatibility** and **Why the
+> client picks the ring** paragraphs below describe a wire that was never
+> shipped. They are left as the record of the decision 0006 overturns.
 
 Two disjoint rings run behind one coordinator, selected by node role. There is
 no placement-class enum: the ring *is* the distinction, and a second enum
@@ -358,6 +370,15 @@ The cost is that an async worker is not a drop-in replacement for a block
 worker, only for the read half. A deployment that writes through Talon needs
 both pools, and clients must route accordingly. Since section 6 already gives
 async workers their own cluster, that routing decision exists regardless.
+
+**Listing is out too, for the same reason.** The worker answers `StatObject` —
+FUSE `getattr` needs a size, and the worker already holds one — but not
+`ListObjects`. A listing is a metadata query against the origin's namespace with
+nothing an extent cache can contribute; it would be a straight proxy. Since
+[ADR 0006](./0006-one-ring-per-cluster.md) an async cluster has no block worker
+behind it to proxy to either, so its coordinator answers `ListObjects` with an
+explicit error naming the limitation. An empty listing would be worse than an
+error: a client caches it as an empty bucket.
 
 This also means invalidation has no *write*-path caller — and, since section 3
 removed the version refresh, no read-path caller either. `invalidate_object`

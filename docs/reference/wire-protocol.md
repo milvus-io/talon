@@ -107,11 +107,10 @@ Variant tags are the enum's declaration order. The read path needs these:
 | 11 | `ObjectStat` | coordinator → client | `size: u64`, `version: String` |
 | 12 | `ListObjects` | client → coordinator | `prefix: String` |
 | 13 | `ObjectList` | coordinator → client | `entries: Vec<ObjectEntry>` |
-| 17 | `RingPlacementLookup` | client → coordinator | `block: BlockId`, `ring: Ring`, `k: u8` |
 
-`RingPlacementLookup` requires schema 5 and is only needed to reach the async
-worker pool; see [Choosing a ring](#choosing-a-ring). A client that reads whole
-blocks needs `PlacementLookup` alone, exactly as before.
+There is one placement message. Which ring answers it is a property of the
+coordinator, not of the request; see
+[Which ring answers](#which-ring-answers).
 
 Supporting types:
 
@@ -122,7 +121,6 @@ struct NodeInfo  { id: NodeId, address: String, role: NodeRole }
 struct ObjectEntry { path: String, size: u64 }
 
 enum Backend  { S3 = 0, Gcs = 1, Azure = 2 }   // u32 tag
-enum Ring     { Block = 0, Async = 1 }         // u32 tag
 enum NodeRole { Coordinator = 0, Worker = 1, AsyncWorker = 2 }  // u32 tag
 
 // NodeId and Version are newtypes over String: encoded exactly as a String.
@@ -181,31 +179,33 @@ placement.
 owners were computed at. Clients still using this compatibility operation must
 invalidate a cached placement when they observe a different epoch.
 
-**Choosing a ring.** Two disjoint worker pools answer placement, and the client
-picks which one:
+**Which ring answers.** A coordinator runs exactly one placement ring, fixed at
+startup by its cluster type (ADR 0006). The request does not name it:
 
-| Ring | Message | Pool | Hashed on |
-|---|---|---|---|
-| block | `PlacementLookup`, or `RingPlacementLookup { ring: Block }` | `NodeRole::Worker` | the whole `BlockId` |
-| async | `RingPlacementLookup { ring: Async }` | `NodeRole::AsyncWorker` | the object identity alone |
+| Cluster type | Pool | Hashed on |
+|---|---|---|
+| `block` | `NodeRole::Worker` | the whole `BlockId` |
+| `async` | `NodeRole::AsyncWorker` | the object identity alone |
 
-The async pool caches the exact byte range asked for rather than a whole block,
-which is what a Parquet or Lance reader wants; the block pool is right for full
-scans. The coordinator sees only a byte range and cannot tell them apart, so it
-does not guess.
+An async cluster caches the exact byte range asked for rather than a whole
+block, which is what a Parquet or Lance reader wants; a block cluster is right
+for full scans. A deployment that needs both runs two clusters, each with its
+own coordinator address.
 
-A lookup never crosses pools. An async lookup against a cluster with no async
-workers answers with **no owners** — never a block worker, which holds no
-extents and would fail the read a round trip later.
+A lookup cannot cross pools, because a cluster refuses to register a worker of
+the other kind at all. A cluster with no workers answers with **no owners** —
+never a node borrowed from elsewhere, which would hold nothing and fail the
+read a round trip later.
 
-The two block-ring forms are defined to place identically, so a client may
-migrate to the ring-aware message without moving any data. Prefer
-`PlacementLookup` for the block ring anyway: it has meant the block ring since
-schema 1, and it works against coordinators older than schema 5.
+The data plane is identical either way: both worker types serve the same
+`GetRange`. A client that knows the address knows the answer shape;
+`--cluster-type` on the CLI exists only because a block cluster's ring can be
+recomputed client-side and the object ring cannot.
 
-Both forms answer with the same `PlacementResponse`, so a client decodes one
-reply shape either way. The data plane is identical: both worker types serve the
-same `GetRange`.
+**Not available in an async cluster.** `ListObjects` is answered with
+`Ack { ok: false }` and a reason: async workers serve reads and stats only, and
+there is no block worker behind them to proxy to. An empty `ObjectList` would
+be indistinguishable from an empty bucket.
 
 **Multi-block ranges.** A range spanning block boundaries splits into one fetch
 per block, each addressed by its own `BlockId`. Block size is a worker

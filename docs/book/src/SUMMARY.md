@@ -52,6 +52,7 @@
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)
 - [ADR 0004: Control-plane workload identity](./explanation/adr-0004-control-plane-workload-identity.md)
 - [ADR 0005: Async worker extent cache](./explanation/adr-0005-async-worker-extent-cache.md)
+- [ADR 0006: One ring per cluster](./explanation/adr-0006-one-ring-per-cluster.md)
 
 # Contributing
 
