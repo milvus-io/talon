@@ -7,13 +7,13 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use talon_coordinator::{
-    ClusterStateStore, CoordinatorConfig, CoordinatorConfigPatch, CoordinatorObservability,
-    Membership, MemoryStateStore, PlacementService, RendezvousPlacement, StateBackend,
+    ClusterPlacement, ClusterStateStore, CoordinatorConfig, CoordinatorConfigPatch,
+    CoordinatorObservability, Membership, MemoryStateStore, PlacementService, StateBackend,
     WriteDisposition,
 };
 use talon_core::{
-    NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace, WorkloadIdentity,
-    WorkloadRole,
+    ClusterType, NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace,
+    WorkloadIdentity, WorkloadRole,
 };
 use talon_metadata::{ClusterCapabilities, MappingRevision, MetadataStore, NamespaceId};
 use talon_transport::control_tls::ControlTlsChannel;
@@ -76,6 +76,13 @@ struct Args {
     /// Logical cluster identity.
     #[arg(long)]
     cluster_id: Option<String>,
+    /// Which cache this cluster is: `block` or `async`.
+    ///
+    /// Fixes the placement ring and the one worker role admitted. Parsed
+    /// through `ClusterType`'s `FromStr` rather than a mirrored `ValueEnum`,
+    /// so there is one list of valid values, not two.
+    #[arg(long)]
+    cluster_type: Option<ClusterType>,
     /// Stable coordinator node identity.
     #[arg(long)]
     node_id: Option<String>,
@@ -115,6 +122,7 @@ impl Args {
             admin_listen: self.admin_listen,
             admin_advertise: self.admin_advertise,
             cluster_id: self.cluster_id,
+            cluster_type: self.cluster_type,
             node_id: self.node_id,
             state_backend: self.state_backend,
             ha_enabled: self.ha_enabled,
@@ -222,7 +230,7 @@ async fn build_capabilities(
 }
 
 struct Coordinator {
-    service: PlacementService<RendezvousPlacement>,
+    service: PlacementService<ClusterPlacement>,
     observability: Arc<CoordinatorObservability>,
     lease_ttl: Duration,
 }
@@ -280,12 +288,27 @@ fn append_proxy_attempt_error(errors: &mut String, error: &str) {
 }
 
 impl Coordinator {
-    fn new(observability: Arc<CoordinatorObservability>, lease_ttl: Duration) -> Arc<Self> {
+    fn new(
+        observability: Arc<CoordinatorObservability>,
+        lease_ttl: Duration,
+        cluster_type: ClusterType,
+    ) -> Arc<Self> {
         Arc::new(Self {
-            service: PlacementService::new(Membership::new(), RendezvousPlacement),
+            // Membership and placement are built from the same cluster type,
+            // so the node set and the hash key can never disagree about which
+            // pool this coordinator serves.
+            service: PlacementService::new(
+                Membership::for_cluster(cluster_type),
+                ClusterPlacement::for_type(cluster_type),
+            ),
             observability,
             lease_ttl,
         })
+    }
+
+    /// The one worker role this cluster admits.
+    fn worker_role(&self) -> NodeRole {
+        self.service.membership().cluster_type().worker_role()
     }
 
     /// Forward a message to any healthy worker and return its reply (#318).
@@ -300,13 +323,22 @@ impl Coordinator {
     ///
     /// Workers are tried in membership order until one answers, so a single
     /// unreachable worker does not fail the request.
+    ///
+    /// In an async cluster the only workers are async workers, which implement
+    /// `StatObject` but not `ListObjects` (ADR 0005 §8). There is no block
+    /// worker to fall back to, so a listing is refused here rather than sent
+    /// to a node that cannot serve it — see [`Self::refuse_unsupported`].
     async fn proxy_to_worker(&self, message: ControlMessage) -> ControlMessage {
+        if let Some(refusal) = self.refuse_unsupported(&message) {
+            return refusal;
+        }
+        let role = self.worker_role();
         let workers: Vec<_> = self
             .service
             .membership()
             .snapshot()
             .into_iter()
-            .filter(|node| node.role == NodeRole::Worker)
+            .filter(|node| node.role == role)
             .collect();
         if workers.is_empty() {
             return ControlMessage::Ack {
@@ -316,6 +348,28 @@ impl Coordinator {
         }
 
         Self::proxy_to_workers(&workers, message).await
+    }
+
+    /// Refuse a proxied request no worker in this cluster can answer.
+    ///
+    /// Only `ListObjects` in an async cluster, today. Stated as an error
+    /// rather than answered with an empty list: an empty listing is
+    /// indistinguishable from an empty bucket, and a client would cache that
+    /// as fact. See ADR 0006.
+    fn refuse_unsupported(&self, message: &ControlMessage) -> Option<ControlMessage> {
+        let cluster_type = self.service.membership().cluster_type();
+        matches!(
+            (cluster_type, message),
+            (ClusterType::Async, ControlMessage::ListObjects { .. })
+        )
+        .then(|| ControlMessage::Ack {
+            ok: false,
+            detail: Some(
+                "listing is not available in an async cluster: async workers serve reads \
+                 and stats only (ADR 0005 §8). Route listings to a block cluster."
+                    .into(),
+            ),
+        })
     }
 
     /// Try workers in order, treating both transport errors and explicit worker
@@ -473,6 +527,26 @@ impl Coordinator {
                         detail: Some("node status belongs to another cluster".into()),
                     };
                 }
+                // A worker of the other kind is refused outright rather than
+                // stored and filtered out of placement. It holds none of the
+                // data this cluster serves, and a silent admission leaves it
+                // idle with no signal that it is in the wrong place.
+                let cluster_type = self.service.membership().cluster_type();
+                if !cluster_type.admits(status.node.role) {
+                    self.observability.metrics().record_heartbeat(true, false);
+                    return ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(format!(
+                            "a {} node does not belong to a {cluster_type} cluster; \
+                             point it at a {} cluster instead",
+                            status.node.role,
+                            match cluster_type {
+                                ClusterType::Block => "async",
+                                ClusterType::Async => "block",
+                            }
+                        )),
+                    };
+                }
                 let node = status.node.clone();
                 let healthy_ready =
                     status.health == talon_core::NodeHealth::Healthy && status.ready;
@@ -488,7 +562,7 @@ impl Coordinator {
                         // placement (issue #118); the store reconcile remains the
                         // authoritative source and will drop it otherwise.
                         if result.disposition == WriteDisposition::Applied
-                            && node.role == NodeRole::Worker
+                            && node.role.is_worker()
                             && healthy_ready
                         {
                             self.service.membership().register(node);
@@ -508,6 +582,8 @@ impl Coordinator {
                     }
                 }
             }
+            // The one lookup. Which ring it resolves against is this
+            // cluster's type, not anything on the request.
             lookup @ ControlMessage::PlacementLookup { .. } => {
                 // Fail closed: without a fresh authoritative snapshot we must not
                 // answer placement from possibly-stale local membership (#73).
@@ -577,6 +653,7 @@ async fn main() -> anyhow::Result<()> {
         admin_listen = %config.admin_listen,
         admin_advertise = %config.admin_advertise,
         cluster_id = %config.cluster_id,
+        cluster_type = %config.cluster_type,
         node_id = %config.node_id,
         state_backend = %config.state.backend,
         "starting talon-coordinator"
@@ -605,6 +682,7 @@ async fn main() -> anyhow::Result<()> {
     let state = Coordinator::new(
         Arc::clone(&observability),
         Duration::from_millis(config.state.lease_ttl_ms),
+        config.cluster_type,
     );
 
     // Management security (#85): auth mode from the environment. A bearer token
@@ -956,6 +1034,10 @@ fn revision_targets(
         .nodes
         .iter()
         .filter(|status| {
+            // `NodeRole::Worker` specifically, not the cluster's worker role:
+            // mapping-revision fencing (ADR 0003 §5) is a write-path concern
+            // and an async worker does not implement `MappingRevisionUpdate`.
+            // In an async cluster this correctly yields nothing.
             status.node.role == NodeRole::Worker
                 && status.health == NodeHealth::Healthy
                 && status.ready
@@ -1126,7 +1208,7 @@ fn validate_worker_node(
     role: NodeRole,
     message: &str,
 ) -> Result<(), String> {
-    if role != NodeRole::Worker {
+    if !role.is_worker() {
         return Err(format!(
             "{message} role does not match authenticated worker"
         ));
@@ -1518,7 +1600,11 @@ mod tests {
             "coordinator-1",
         );
         observability.check_ready().await.unwrap();
-        let coordinator = Coordinator::new(Arc::clone(&observability), Duration::from_secs(30));
+        let coordinator = Coordinator::new(
+            Arc::clone(&observability),
+            Duration::from_secs(30),
+            ClusterType::Block,
+        );
         let (mut client, server) = tokio::io::duplex(64 * 1024);
         let connection = tokio::spawn(handle_conn(
             server,
@@ -1583,7 +1669,11 @@ mod tests {
             .unwrap(),
         );
         observability.check_ready().await.unwrap();
-        let coordinator = Coordinator::new(Arc::clone(&observability), Duration::from_secs(30));
+        let coordinator = Coordinator::new(
+            Arc::clone(&observability),
+            Duration::from_secs(30),
+            ClusterType::Block,
+        );
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1979,8 +2069,16 @@ mod tests {
         let obs_b = observability_over(Arc::clone(&store), "coord-b");
         obs_a.check_ready().await.unwrap();
         obs_b.check_ready().await.unwrap();
-        let coord_a = Coordinator::new(Arc::clone(&obs_a), Duration::from_secs(30));
-        let coord_b = Coordinator::new(Arc::clone(&obs_b), Duration::from_secs(30));
+        let coord_a = Coordinator::new(
+            Arc::clone(&obs_a),
+            Duration::from_secs(30),
+            ClusterType::Block,
+        );
+        let coord_b = Coordinator::new(
+            Arc::clone(&obs_b),
+            Duration::from_secs(30),
+            ClusterType::Block,
+        );
 
         let reply = coord_a
             .dispatch(ControlMessage::NodeStatusHeartbeat {
@@ -2014,6 +2112,148 @@ mod tests {
         );
     }
 
+    /// A worker of the other kind is refused at the heartbeat, and never
+    /// becomes a placement candidate.
+    ///
+    /// The serve loop matches on the message before calling
+    /// `PlacementService::handle`, so this covers the binary's own arm too:
+    /// a rejection that only existed inside the service would leave the
+    /// enforcement dead in production while every unit test still passed.
+    #[tokio::test]
+    async fn a_worker_of_the_wrong_kind_is_refused_by_the_cluster() {
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store), "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(
+            Arc::clone(&obs),
+            Duration::from_secs(30),
+            ClusterType::Block,
+        );
+
+        let mut block = worker_status("cluster-a", "blk-1", "inc-1", "127.0.0.1:7001");
+        assert!(matches!(
+            coord
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(block.clone()),
+                })
+                .await,
+            ControlMessage::Ack { ok: true, .. }
+        ));
+
+        block.node = NodeInfo {
+            id: NodeId::new("ext-1"),
+            address: "127.0.0.1:7101".into(),
+            role: NodeRole::AsyncWorker,
+        };
+        block.incarnation_id = "inc-2".into();
+        match coord
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(block),
+            })
+            .await
+        {
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some(detail),
+            } => {
+                // The worker has to be able to act on this, so it must name
+                // both what it is and where it should go instead.
+                assert!(detail.contains("async_worker"), "{detail}");
+                assert!(detail.contains("block cluster"), "{detail}");
+            }
+            other => panic!("expected the async worker to be refused, got {other:?}"),
+        }
+
+        match coord
+            .dispatch(ControlMessage::PlacementLookup {
+                block: sample_block(),
+                k: 2,
+            })
+            .await
+        {
+            ControlMessage::PlacementResponse { owners, .. } => {
+                assert_eq!(
+                    owners,
+                    vec![NodeId::new("blk-1")],
+                    "the refused async worker must not be placeable"
+                );
+            }
+            other => panic!("expected PlacementResponse, got {other:?}"),
+        }
+    }
+
+    /// An async cluster refuses a listing rather than answering it empty.
+    ///
+    /// Async workers serve reads and stats only (ADR 0005 §8), and there is
+    /// no block worker in this cluster to fall back to. An empty list would
+    /// be indistinguishable from an empty bucket and a client would cache it
+    /// as fact.
+    #[tokio::test]
+    async fn an_async_cluster_refuses_a_listing_instead_of_answering_it_empty() {
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store), "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(
+            Arc::clone(&obs),
+            Duration::from_secs(30),
+            ClusterType::Async,
+        );
+
+        match coord
+            .dispatch(ControlMessage::ListObjects {
+                prefix: "s3/bucket/".into(),
+            })
+            .await
+        {
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some(detail),
+            } => {
+                assert!(detail.contains("listing"), "{detail}");
+                assert!(detail.contains("block cluster"), "{detail}");
+            }
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// An async cluster fails closed on the same condition as a block one.
+    ///
+    /// The readiness gate is shared, but the async cluster reaches it through
+    /// a different membership and placement pair, so a regression could land
+    /// on one and not the other. A cluster that kept answering from stale
+    /// local membership during a state-store outage would hand out owners it
+    /// no longer has (#73).
+    #[tokio::test]
+    async fn an_async_cluster_fails_closed_when_state_store_unavailable() {
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(Arc::clone(&store) as Arc<dyn ClusterStateStore>, "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(
+            Arc::clone(&obs),
+            Duration::from_secs(30),
+            ClusterType::Async,
+        );
+        let mut status = worker_status("cluster-a", "ext-1", "inc-1", "127.0.0.1:7101");
+        status.node.role = NodeRole::AsyncWorker;
+        coord
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(status),
+            })
+            .await;
+
+        store.set_available(false);
+        let _ = obs.reconcile_membership(coord.service.membership()).await;
+        assert!(!obs.is_ready());
+
+        let reply = coord
+            .dispatch(ControlMessage::PlacementLookup {
+                block: sample_block(),
+                k: 1,
+            })
+            .await;
+        assert!(matches!(reply, ControlMessage::Ack { ok: false, .. }));
+    }
+
     #[tokio::test]
     async fn reads_fail_closed_when_state_store_unavailable() {
         // With shared state unavailable the coordinator must not answer placement
@@ -2021,7 +2261,11 @@ mod tests {
         let store = Arc::new(MemoryStateStore::new());
         let obs = observability_over(Arc::clone(&store) as Arc<dyn ClusterStateStore>, "coord-a");
         obs.check_ready().await.unwrap();
-        let coord = Coordinator::new(Arc::clone(&obs), Duration::from_secs(30));
+        let coord = Coordinator::new(
+            Arc::clone(&obs),
+            Duration::from_secs(30),
+            ClusterType::Block,
+        );
         // Seed a worker so a "leaky" implementation would have something to serve.
         coord
             .dispatch(ControlMessage::NodeStatusHeartbeat {

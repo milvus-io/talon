@@ -108,6 +108,8 @@ pub fn plan_load<P: Placement>(
     split_into_blocks(object, offset, len, block_size, version)
         .into_iter()
         .map(|block| {
+            // Prewarm targets the block ring. An async worker cold-starts by
+            // design (ADR 0005 §7) and has nothing to prewarm into.
             let primary = placement.locate(&block, nodes);
             LoadAssignment {
                 block,

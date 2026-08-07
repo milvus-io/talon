@@ -10,6 +10,10 @@
 //! [`ControlMessage::PlacementLookup`] into a [`ControlMessage::PlacementResponse`],
 //! keeping the service usable directly (via [`lookup`](PlacementService::lookup))
 //! or over the wire.
+//!
+//! There is one ring, fixed by the cluster's [`ClusterType`] at startup. A
+//! client does not choose it — it is a property of which cluster it connected
+//! to. See ADR 0006.
 
 use talon_core::BlockId;
 use talon_transport::ControlMessage;
@@ -26,6 +30,11 @@ pub struct PlacementResult {
 }
 
 /// Answers placement lookups from the current membership + strategy.
+///
+/// Holds exactly one ring. Which one is decided once, from the cluster type,
+/// when the coordinator starts — see [`ClusterPlacement::for_type`].
+///
+/// [`ClusterPlacement::for_type`]: crate::ClusterPlacement::for_type
 pub struct PlacementService<P: Placement> {
     membership: Membership,
     placement: P,
@@ -33,6 +42,13 @@ pub struct PlacementService<P: Placement> {
 
 impl<P: Placement> PlacementService<P> {
     /// Create a service over the given membership registry and strategy.
+    ///
+    /// The two must agree about which pool this cluster serves: `membership`
+    /// admits one worker role and `placement` hashes for that role's ring.
+    /// Build both from the same [`ClusterType`] rather than pairing them by
+    /// hand.
+    ///
+    /// [`ClusterType`]: talon_core::ClusterType
     pub fn new(membership: Membership, placement: P) -> Self {
         Self {
             membership,
@@ -45,7 +61,7 @@ impl<P: Placement> PlacementService<P> {
         &self.membership
     }
 
-    /// Locate up to `k` ordered owners for `block` at the current epoch.
+    /// Locate up to `k` ordered owners for `block`, at the current epoch.
     ///
     /// The returned epoch is read together with the node snapshot so the
     /// answer is internally consistent for the client to cache.
@@ -54,7 +70,7 @@ impl<P: Placement> PlacementService<P> {
         // epoch, so a concurrent change can only make the epoch we return
         // conservatively old, prompting a harmless client refresh.
         let epoch = self.membership.epoch();
-        let nodes = self.membership.snapshot();
+        let nodes = self.membership.worker_snapshot();
         let owners = self
             .placement
             .locate_top_k(block, &nodes, k)
@@ -72,12 +88,7 @@ impl<P: Placement> PlacementService<P> {
     pub fn handle(&self, msg: ControlMessage) -> ControlMessage {
         match msg {
             ControlMessage::PlacementLookup { block, k } => {
-                let res = self.lookup(&block, k as usize);
-                let owners = res.owners.into_iter().map(talon_core::NodeId).collect();
-                ControlMessage::PlacementResponse {
-                    owners,
-                    epoch: res.epoch.0,
-                }
+                response(self.lookup(&block, k as usize))
             }
             other => ControlMessage::Ack {
                 ok: false,
@@ -87,11 +98,18 @@ impl<P: Placement> PlacementService<P> {
     }
 }
 
+fn response(res: PlacementResult) -> ControlMessage {
+    ControlMessage::PlacementResponse {
+        owners: res.owners.into_iter().map(talon_core::NodeId).collect(),
+        epoch: res.epoch.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::RendezvousPlacement;
-    use talon_core::{Backend, NodeId, NodeInfo, NodeRole, ObjectId, Version};
+    use crate::{ClusterPlacement, RendezvousPlacement};
+    use talon_core::{Backend, ClusterType, NodeId, NodeInfo, NodeRole, ObjectId, Version};
 
     fn block(n: u64) -> BlockId {
         BlockId::new(
@@ -102,16 +120,34 @@ mod tests {
         )
     }
 
-    fn svc(ids: &[&str]) -> PlacementService<RendezvousPlacement> {
-        let m = Membership::new();
-        for id in ids {
-            m.register(NodeInfo {
-                id: NodeId::new(*id),
-                address: format!("{id}:7001"),
-                role: NodeRole::Worker,
-            });
+    fn svc(ids: &[&str]) -> PlacementService<ClusterPlacement> {
+        cluster(ClusterType::Block, ids, &[])
+    }
+
+    /// A service for one cluster type, given block-worker and async-worker ids.
+    ///
+    /// Both lists are offered to every cluster on purpose: whichever role the
+    /// cluster does not admit must be refused, and passing only the "right"
+    /// ones would never exercise that.
+    fn cluster(
+        cluster_type: ClusterType,
+        block_ids: &[&str],
+        async_ids: &[&str],
+    ) -> PlacementService<ClusterPlacement> {
+        let m = Membership::for_cluster(cluster_type);
+        for (ids, role) in [
+            (block_ids, NodeRole::Worker),
+            (async_ids, NodeRole::AsyncWorker),
+        ] {
+            for id in ids {
+                m.register(NodeInfo {
+                    id: NodeId::new(*id),
+                    address: format!("{id}:7001"),
+                    role,
+                });
+            }
         }
-        PlacementService::new(m, RendezvousPlacement)
+        PlacementService::new(m, ClusterPlacement::for_type(cluster_type))
     }
 
     #[test]
@@ -160,6 +196,61 @@ mod tests {
             }
             other => panic!("expected PlacementResponse, got {other:?}"),
         }
+    }
+
+    /// A lookup can only ever name this cluster's own workers.
+    ///
+    /// It used to be possible to hold both pools in one registry and pick
+    /// between them per request. Now the other pool is not merely unselected —
+    /// it was refused at registration and is not present to select.
+    #[test]
+    fn a_lookup_only_ever_names_this_clusters_workers() {
+        let blocks = cluster(ClusterType::Block, &["blk-a", "blk-b"], &["ext-a", "ext-b"]);
+        let extents = cluster(ClusterType::Async, &["blk-a", "blk-b"], &["ext-a", "ext-b"]);
+
+        for i in 0..50 {
+            let owners = blocks.lookup(&block(i), 2).owners;
+            assert!(
+                !owners.is_empty() && owners.iter().all(|o| o.starts_with("blk-")),
+                "block cluster named an async worker: {owners:?}"
+            );
+            let owners = extents.lookup(&block(i), 2).owners;
+            assert!(
+                !owners.is_empty() && owners.iter().all(|o| o.starts_with("ext-")),
+                "async cluster named a block worker: {owners:?}"
+            );
+        }
+    }
+
+    /// The two cluster types must place differently, or one of the rings is
+    /// doing nothing.
+    #[test]
+    fn each_cluster_type_places_on_its_own_ring() {
+        let blocks = cluster(ClusterType::Block, &["a", "b", "c", "d", "e"], &[]);
+        let extents = cluster(ClusterType::Async, &[], &["a", "b", "c", "d", "e"]);
+
+        // Same node names in both, so any difference is the hash key, not the
+        // node set: the block ring includes the offset and the object ring
+        // does not.
+        let mut at_offset = block(1);
+        at_offset.offset = 256 << 20;
+        let differs = (0..200u64).any(|i| {
+            let mut b = block(i);
+            b.offset = 256 << 20;
+            blocks.lookup(&b, 1).owners != extents.lookup(&b, 1).owners
+        });
+        assert!(differs, "both cluster types placed identically everywhere");
+    }
+
+    /// An async cluster with no workers yet answers "nobody".
+    #[test]
+    fn a_cluster_with_no_workers_has_no_owners_but_a_real_epoch() {
+        let s = cluster(ClusterType::Async, &["blk-a"], &[]);
+        let res = s.lookup(&block(1), 2);
+        assert!(res.owners.is_empty());
+        // The refused block worker is not in the registry, so there is nothing
+        // for the epoch to cover either.
+        assert_eq!(res.epoch, Epoch::EMPTY);
     }
 
     #[test]

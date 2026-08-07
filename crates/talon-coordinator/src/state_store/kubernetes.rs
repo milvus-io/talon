@@ -183,11 +183,13 @@ impl KubernetesStateStore {
         lease_name(&self.cluster_id, role, node_id)
     }
 
+    /// The role label value, and the role component of the Lease name.
+    ///
+    /// `NodeRole::as_str` may contain an underscore, which is legal in a label
+    /// value and never reaches an object name directly — [`lease_name`] folds
+    /// the role into a hash and derives the readable prefix from the node id.
     fn role_str(status: &NodeStatus) -> &'static str {
-        match status.node.role {
-            talon_core::NodeRole::Coordinator => "coordinator",
-            talon_core::NodeRole::Worker => "worker",
-        }
+        status.node.role.as_str()
     }
 
     async fn with_timeout<T, F>(&self, future: F) -> StateStoreResult<T>

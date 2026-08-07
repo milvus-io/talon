@@ -1,0 +1,133 @@
+{{- if .Values.asyncWorker.enabled }}
+{{- include "talon.validateClusterType" . -}}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ .Release.Name }}-async-worker
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: async-worker
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-async-worker
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: async-worker
+spec:
+  replicas: {{ .Values.asyncWorker.replicas }}
+  revisionHistoryLimit: 5
+  selector:
+    matchLabels:
+      {{- include "talon.selectorLabels" (dict "component" "async-worker") | nindent 6 }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 1
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        {{- include "talon.labels" . | nindent 8 }}
+        app.kubernetes.io/component: async-worker
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8001"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: {{ .Release.Name }}-async-worker
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: {{ .Values.asyncWorker.topologySpreadWhenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "talon.selectorLabels" (dict "component" "async-worker") | nindent 14 }}
+      volumes:
+        - name: cache
+        {{- if .Values.asyncWorker.persistence.enabled }}
+          ephemeral:
+            volumeClaimTemplate:
+              spec:
+                accessModes: ["ReadWriteOnce"]
+                {{- with .Values.asyncWorker.persistence.storageClass }}
+                storageClassName: {{ . }}
+                {{- end }}
+                resources:
+                  requests:
+                    storage: {{ .Values.asyncWorker.persistence.size }}
+        {{- else }}
+          emptyDir: {}
+        {{- end }}
+      containers:
+        - name: async-worker
+          image: {{ include "talon.asyncWorkerImage" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args:
+            - "--coordinator"
+            - "{{ .Release.Name }}-coordinator:7000"
+            - "--listen"
+            - "0.0.0.0:7001"
+            - "--admin-listen"
+            - "0.0.0.0:8001"
+          ports:
+            - name: data
+              containerPort: 7001
+            - name: admin
+              containerPort: 8001
+          env:
+            - name: TALON_ASYNC_WORKER_CLUSTER_ID
+              value: {{ .Values.coordinator.clusterId | quote }}
+            - name: TALON_ASYNC_WORKER_NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: TALON_ASYNC_WORKER_ADVERTISE_ADDR
+              valueFrom:
+                fieldRef:
+                  fieldPath: status.podIP
+            - name: TALON_ASYNC_WORKER_CACHE_DIR
+              value: /var/cache/talon
+            - name: TALON_ASYNC_WORKER_CAPACITY_BYTES
+              value: {{ .Values.asyncWorker.capacityBytes | quote }}
+            - name: TALON_ASYNC_WORKER_L1_CAPACITY_BYTES
+              value: {{ .Values.asyncWorker.l1CapacityBytes | quote }}
+            - name: TALON_ASYNC_WORKER_CHECKPOINT_INTERVAL_BYTES
+              value: {{ .Values.asyncWorker.checkpointIntervalBytes | quote }}
+            - name: TALON_ASYNC_WORKER_AZURE_ACCOUNT
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.asyncWorker.backend.existingSecret }}
+                  key: {{ .Values.asyncWorker.backend.azureAccountKey }}
+            - name: TALON_ASYNC_WORKER_AZURE_SAS
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.asyncWorker.backend.existingSecret }}
+                  key: {{ .Values.asyncWorker.backend.azureSasKey }}
+          volumeMounts:
+            - name: cache
+              mountPath: /var/cache/talon
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            failureThreshold: 30
+            periodSeconds: 2
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+            failureThreshold: 3
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          resources:
+            {{- toYaml .Values.asyncWorker.resources | nindent 12 }}
+{{- end }}

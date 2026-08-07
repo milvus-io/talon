@@ -586,11 +586,13 @@ impl ClusterStateWatch for EtcdWatch {
     }
 }
 
+/// The key segment a role's node records live under.
+///
+/// Delegates to [`NodeRole::as_str`] so a new role cannot be added without
+/// getting a segment, and so the segment matches the label every other surface
+/// reports the role under.
 fn role_segment(role: NodeRole) -> &'static str {
-    match role {
-        NodeRole::Coordinator => "coordinator",
-        NodeRole::Worker => "worker",
-    }
+    role.as_str()
 }
 
 /// Reproduce the backend contract's incarnation/sequence ordering rule.

@@ -74,7 +74,7 @@ impl Coordinator {
         );
         Coordinator {
             obs,
-            service: PlacementService::new(Membership::new(), RendezvousPlacement),
+            service: PlacementService::new(Membership::default(), RendezvousPlacement),
         }
     }
 

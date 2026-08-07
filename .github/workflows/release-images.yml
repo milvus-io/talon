@@ -36,6 +36,8 @@ jobs:
             dockerfile: deploy/docker/coordinator.Dockerfile
           - image: worker
             dockerfile: deploy/docker/worker.Dockerfile
+          - image: async-worker
+            dockerfile: deploy/docker/async-worker.Dockerfile
           - image: fuse
             dockerfile: deploy/docker/fuse.Dockerfile
     steps:

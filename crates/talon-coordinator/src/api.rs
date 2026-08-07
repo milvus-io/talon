@@ -98,15 +98,24 @@ pub struct ClusterSummary {
     pub node_count: usize,
     /// Non-expired coordinators.
     pub coordinator_count: usize,
-    /// Non-expired workers.
+    /// Non-expired block workers.
     pub worker_count: usize,
-    /// Workers reporting healthy.
+    /// Block workers reporting healthy.
     pub healthy_worker_count: usize,
-    /// Sum of worker cache capacity, bytes.
+    /// Non-expired async (extent-cache) workers.
+    ///
+    /// Counted apart from `worker_count`, and deliberately excluded from the
+    /// byte and block totals below: an async worker's `block_count` is an
+    /// extent count, and summing the two pools into one series would blur the
+    /// distinction the second pool exists to make.
+    pub async_worker_count: usize,
+    /// Async workers reporting healthy.
+    pub healthy_async_worker_count: usize,
+    /// Sum of block-worker cache capacity, bytes.
     pub total_capacity_bytes: u64,
-    /// Sum of worker resident bytes.
+    /// Sum of block-worker resident bytes.
     pub total_resident_bytes: u64,
-    /// Sum of worker-held blocks.
+    /// Sum of blocks held by block workers.
     pub total_block_count: u64,
     /// Response metadata.
     pub meta: ResponseMeta,
@@ -235,10 +244,7 @@ pub struct NodeQuery {
 }
 
 fn role_str(role: NodeRole) -> &'static str {
-    match role {
-        NodeRole::Coordinator => "coordinator",
-        NodeRole::Worker => "worker",
-    }
+    role.as_str()
 }
 
 fn health_str(health: NodeHealth) -> &'static str {
@@ -344,6 +350,8 @@ async fn cluster_handler(State(state): State<Arc<CoordinatorObservability>>) -> 
         coordinator_count: 0,
         worker_count: 0,
         healthy_worker_count: 0,
+        async_worker_count: 0,
+        healthy_async_worker_count: 0,
         total_capacity_bytes: 0,
         total_resident_bytes: 0,
         total_block_count: 0,
@@ -366,6 +374,12 @@ async fn cluster_handler(State(state): State<Arc<CoordinatorObservability>>) -> 
                 summary.total_block_count = summary
                     .total_block_count
                     .saturating_add(status.metrics.block_count);
+            }
+            NodeRole::AsyncWorker => {
+                summary.async_worker_count += 1;
+                if status.health == NodeHealth::Healthy {
+                    summary.healthy_async_worker_count += 1;
+                }
             }
         }
     }

@@ -88,6 +88,13 @@ spec:
               value: "3"
             - name: TALON_COORDINATOR_CLUSTER_ID
               value: "talon"
+            # Which placement ring this cluster runs. `block` admits
+            # talon-worker (worker.yaml); `async` admits talon-async-worker
+            # (async-worker.yaml). A worker of the other kind is refused at
+            # registration (ADR 0006). Serving both means a second namespace
+            # with its own coordinator, not both workers here.
+            - name: TALON_COORDINATOR_CLUSTER_TYPE
+              value: "block"
             # Stable per-pod identity for the coordinator's own lease.
             - name: TALON_COORDINATOR_NODE_ID
               valueFrom:

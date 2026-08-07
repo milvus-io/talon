@@ -1,4 +1,5 @@
 {{- include "talon.validateBackend" . -}}
+{{- include "talon.validateClusterType" . -}}
 {{- $isEtcd := eq .Values.coordinator.backend "etcd" -}}
 {{- $isK8s := eq .Values.coordinator.backend "kubernetes" -}}
 {{- $ha := ne .Values.coordinator.backend "memory" -}}
@@ -130,6 +131,8 @@ spec:
             {{- end }}
             - name: TALON_COORDINATOR_CLUSTER_ID
               value: {{ .Values.coordinator.clusterId | quote }}
+            - name: TALON_COORDINATOR_CLUSTER_TYPE
+              value: {{ .Values.coordinator.clusterType | quote }}
             - name: TALON_COORDINATOR_NODE_ID
               valueFrom:
                 fieldRef:

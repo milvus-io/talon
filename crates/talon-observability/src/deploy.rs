@@ -19,6 +19,8 @@ pub const COORDINATOR_ETCD_YAML: &str =
     include_str!("../../../deploy/kubernetes/coordinator-etcd.yaml");
 /// Worker Deployment (cache nodes), shared by both coordinator backends.
 pub const WORKER_YAML: &str = include_str!("../../../deploy/kubernetes/worker.yaml");
+/// Async-worker Deployment (extent cache), for a `cluster_type=async` cluster.
+pub const ASYNC_WORKER_YAML: &str = include_str!("../../../deploy/kubernetes/async-worker.yaml");
 /// Example Secret template for the worker's object-store credentials.
 pub const WORKER_SECRET_EXAMPLE_YAML: &str =
     include_str!("../../../deploy/kubernetes/worker-secret.example.yaml");
@@ -57,6 +59,7 @@ mod tests {
             ("coordinator-kubernetes", COORDINATOR_KUBERNETES_YAML),
             ("coordinator-etcd", COORDINATOR_ETCD_YAML),
             ("worker", WORKER_YAML),
+            ("async-worker", ASYNC_WORKER_YAML),
             ("worker-secret.example", WORKER_SECRET_EXAMPLE_YAML),
             ("service", SERVICE_YAML),
             ("rbac", RBAC_YAML),
@@ -177,40 +180,92 @@ mod tests {
     }
 
     #[test]
-    fn worker_deployment_is_valid_and_uses_secret_credentials() {
-        let docs = parse_documents(WORKER_YAML);
-        let dep = docs
-            .iter()
-            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
-            .expect("a worker Deployment");
-        // Horizontally scalable.
-        assert!(dep["spec"]["replicas"].as_u64().unwrap() >= 1);
-        let spec = &dep["spec"]["template"]["spec"];
-        assert!(spec["terminationGracePeriodSeconds"].as_u64().unwrap() >= 20);
-        // Runs as the image's non-root user.
-        assert_eq!(
-            spec["securityContext"]["runAsNonRoot"].as_bool(),
-            Some(true)
-        );
-        let c = &spec["containers"][0];
-        for probe in ["startupProbe", "livenessProbe", "readinessProbe"] {
-            assert!(!c[probe].is_null(), "worker missing {probe}");
+    fn both_worker_deployments_are_valid_and_use_secret_credentials() {
+        // The two worker kinds ship separate manifests because they join
+        // different clusters, but every operational property below is the
+        // same for both — asserting them once per kind is what keeps the
+        // newer manifest from drifting away from the reviewed one.
+        for (name, yaml, prefix) in [
+            ("worker", WORKER_YAML, "TALON_WORKER"),
+            ("async-worker", ASYNC_WORKER_YAML, "TALON_ASYNC_WORKER"),
+        ] {
+            let docs = parse_documents(yaml);
+            let dep = docs
+                .iter()
+                .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
+                .unwrap_or_else(|| panic!("{name} needs a Deployment"));
+            // Horizontally scalable.
+            assert!(dep["spec"]["replicas"].as_u64().unwrap() >= 1);
+            let spec = &dep["spec"]["template"]["spec"];
+            assert!(spec["terminationGracePeriodSeconds"].as_u64().unwrap() >= 20);
+            // Runs as the image's non-root user.
+            assert_eq!(
+                spec["securityContext"]["runAsNonRoot"].as_bool(),
+                Some(true),
+                "{name}"
+            );
+            let c = &spec["containers"][0];
+            for probe in ["startupProbe", "livenessProbe", "readinessProbe"] {
+                assert!(!c[probe].is_null(), "{name} missing {probe}");
+            }
+            let envs = c["env"].as_sequence().unwrap();
+            // Object-store credentials must be secretKeyRefs, never inline.
+            for suffix in ["AZURE_ACCOUNT", "AZURE_SAS"] {
+                let key = format!("{prefix}_{suffix}");
+                let e = envs
+                    .iter()
+                    .find(|e| e["name"].as_str() == Some(key.as_str()))
+                    .unwrap_or_else(|| panic!("{name} env {key}"));
+                assert!(e.get("value").is_none(), "{key} must not be inline");
+                assert!(!e["valueFrom"]["secretKeyRef"].is_null());
+            }
+            // The worker must point at the coordinator Service.
+            let args = c["args"].as_sequence().unwrap();
+            assert!(
+                args.iter()
+                    .any(|a| a.as_str() == Some("talon-coordinator:7000")),
+                "{name} must dial the coordinator Service"
+            );
         }
-        let envs = c["env"].as_sequence().unwrap();
-        // Object-store credentials must be secretKeyRefs, never inline.
-        for key in ["TALON_WORKER_AZURE_ACCOUNT", "TALON_WORKER_AZURE_SAS"] {
+    }
+
+    #[test]
+    fn the_two_worker_kinds_are_never_the_same_deployment() {
+        // A cluster admits one worker role and refuses the other (ADR 0006).
+        // Applying both manifests into one namespace is the mistake this
+        // guards: distinct names and component labels mean the second apply
+        // adds a Deployment that will be refused at every heartbeat, rather
+        // than silently overwriting the first — which would look like a
+        // working upgrade.
+        let name_of = |yaml| {
+            parse_documents(yaml)
+                .into_iter()
+                .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
+                .map(|d| d["metadata"]["name"].as_str().unwrap().to_string())
+                .expect("a Deployment")
+        };
+        assert_ne!(name_of(WORKER_YAML), name_of(ASYNC_WORKER_YAML));
+    }
+
+    #[test]
+    fn each_coordinator_manifest_names_its_cluster_type() {
+        // Leaving it to the default makes an async deployment a silent
+        // one-line edit away from refusing every worker it schedules.
+        for yaml in [COORDINATOR_KUBERNETES_YAML, COORDINATOR_ETCD_YAML] {
+            let dep = parse_documents(yaml)
+                .into_iter()
+                .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
+                .expect("a Deployment");
+            let envs = dep["spec"]["template"]["spec"]["containers"][0]["env"]
+                .as_sequence()
+                .unwrap()
+                .clone();
             let e = envs
                 .iter()
-                .find(|e| e["name"].as_str() == Some(key))
-                .unwrap_or_else(|| panic!("worker env {key}"));
-            assert!(e.get("value").is_none(), "{key} must not be inline");
-            assert!(!e["valueFrom"]["secretKeyRef"].is_null());
+                .find(|e| e["name"].as_str() == Some("TALON_COORDINATOR_CLUSTER_TYPE"))
+                .expect("the cluster type must be explicit");
+            assert_eq!(e["value"].as_str(), Some("block"));
         }
-        // The worker must point at the coordinator Service.
-        let args = c["args"].as_sequence().unwrap();
-        assert!(args
-            .iter()
-            .any(|a| a.as_str() == Some("talon-coordinator:7000")));
     }
 
     #[test]

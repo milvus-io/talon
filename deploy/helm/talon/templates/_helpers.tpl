@@ -42,6 +42,31 @@ Resolve the image tag: explicit override or the chart appVersion.
 {{ .Values.image.registry }}/{{ .Values.image.worker }}:{{ include "talon.imageTag" . }}
 {{- end -}}
 
+{{- define "talon.asyncWorkerImage" -}}
+{{ .Values.image.registry }}/{{ .Values.image.asyncWorker }}:{{ include "talon.imageTag" . }}
+{{- end -}}
+
+{{/*
+Validate that the enabled worker matches the cluster type.
+
+A cluster runs one placement ring and refuses to register a worker of the
+other kind (ADR 0006). Catching that here makes it a failed `helm template`
+rather than a pool of pods that come up healthy, are turned away at every
+heartbeat, and show as a cache that never warms.
+*/}}
+{{- define "talon.validateClusterType" -}}
+{{- $t := .Values.coordinator.clusterType -}}
+{{- if not (has $t (list "block" "async")) -}}
+{{- fail (printf "coordinator.clusterType must be block or async, got %q" $t) -}}
+{{- end -}}
+{{- if and (eq $t "block") .Values.asyncWorker.enabled -}}
+{{- fail "asyncWorker.enabled requires coordinator.clusterType=async; a block cluster refuses async workers. Serving both means two releases, one per cluster type." -}}
+{{- end -}}
+{{- if and (eq $t "async") .Values.worker.enabled -}}
+{{- fail "worker.enabled requires coordinator.clusterType=block; an async cluster refuses block workers. Set worker.enabled=false and asyncWorker.enabled=true, or install a second release for the block cluster." -}}
+{{- end -}}
+{{- end -}}
+
 {{/*
 Validate the state backend and HA/replica invariants once, early.
 */}}

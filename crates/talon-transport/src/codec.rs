@@ -784,6 +784,40 @@ mod tests {
     }
 
     #[test]
+    fn the_block_lookup_still_encodes_at_schema_one() {
+        // The compatibility guarantee for every client that predates the
+        // async worker. `RingPlacementLookup` briefly rode alongside this at
+        // schema 5; removing it must not retag the lookup either.
+        let legacy = ControlMessage::PlacementLookup {
+            block: BlockId::new(
+                ObjectId::new(Backend::S3, "bkt", "obj.bin"),
+                0,
+                256 << 20,
+                Version::new("etag"),
+            ),
+            k: 1,
+        };
+        assert_eq!(legacy.minimum_schema(), MIN_CONTROL_SCHEMA_VERSION);
+        let encoded = encode(1, &legacy).expect("encode");
+        let body = &encoded[HEADER_LEN..];
+        assert_eq!(
+            u16::from_le_bytes([body[0], body[1]]),
+            MIN_CONTROL_SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn node_role_discriminants_are_append_only() {
+        // NodeRole rides the wire inside NodeInfo as a bincode u32 tag. The
+        // Java and Python clients decode it positionally, so Coordinator and
+        // Worker must stay 0 and 1 forever; AsyncWorker is appended at 2.
+        let tag = |role: NodeRole| bincode::serialize(&role).unwrap();
+        assert_eq!(tag(NodeRole::Coordinator), 0u32.to_le_bytes());
+        assert_eq!(tag(NodeRole::Worker), 1u32.to_le_bytes());
+        assert_eq!(tag(NodeRole::AsyncWorker), 2u32.to_le_bytes());
+    }
+
+    #[test]
     fn unknown_schema_rejected_not_panicked() {
         // Encode with a bumped schema and confirm decode reports it cleanly.
         let env = Envelope {

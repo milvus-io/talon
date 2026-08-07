@@ -4,16 +4,33 @@
 //! sandbox has no `/dev/fuse`):
 //!
 //! 1. Parse `/az/<container>/<blob>` into an [`ObjectId`].
-//! 2. Fetch worker membership and compute Maglev placement locally.
-//! 3. Send a data-plane [`RangeRequest`] to the selected worker.
+//! 2. Resolve the owning worker — locally in a block cluster, via the
+//!    coordinator in an async one (see *Naming the cluster type* below).
+//! 3. Send a data-plane [`RangeRequest`] to that worker and read the raw bytes.
 //!
 //! Prints byte count + elapsed time; writes the bytes to `--out` when given so
 //! the caller can `cmp` two reads for byte-exactness.
+//!
+//! # Naming the cluster type
+//!
+//! `--cluster-type` (or `TALON_CLUSTER_TYPE`) says which kind of cluster
+//! `--coordinator` points at: `block` (the default) is a `talon-worker`
+//! cluster, `async` is a `talon-async-worker` cluster caching exact ranges
+//! rather than 256MB blocks.
+//!
+//! This is not a choice of pool — a cluster runs one ring and would refuse a
+//! worker of the other kind (ADR 0006). It selects **how placement is
+//! resolved**, which genuinely differs: a block cluster's ring has a
+//! client-side Maglev equivalent and needs no round trip (#455), while the
+//! object ring has none and must be asked.
+//!
+//! The data plane is identical either way — both workers answer the same
+//! `RangeRequest` — so only step 2 changes.
 
 use std::time::Instant;
 
 use clap::Parser;
-use talon_core::{BlockId, CachePlacementTable, NodeRole, ObjectId, Version};
+use talon_core::{BlockId, CachePlacementTable, ClusterType, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -33,6 +50,13 @@ struct Args {
     /// Address of the coordinator to query for placement.
     #[arg(long, default_value = "127.0.0.1:7000")]
     coordinator: String,
+    /// Which kind of cluster `--coordinator` points at: `block` or `async`.
+    ///
+    /// Selects how placement resolves, not which pool answers — the cluster
+    /// has only one. Parsed through `ClusterType`'s `FromStr`, so the valid
+    /// values are listed in exactly one place.
+    #[arg(long, env = "TALON_CLUSTER_TYPE", default_value_t = ClusterType::Block)]
+    cluster_type: ClusterType,
     /// Connect directly to one worker, bypassing placement (diagnostics/tests).
     #[arg(long)]
     worker: Option<String>,
@@ -65,6 +89,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
+    let cluster_type = args.cluster_type;
     if args.membership_only {
         let mut nodes = membership_lookup(&args.coordinator).await?;
         nodes.sort_by(|left, right| {
@@ -72,8 +97,11 @@ async fn main() -> anyhow::Result<()> {
                 .cmp(&right.address)
                 .then_with(|| left.id.0.cmp(&right.id.0))
         });
+        // Only this cluster's workers. A node of the other kind cannot be
+        // registered here at all, so anything else in the snapshot is a
+        // coordinator.
         for node in nodes {
-            if node.role == NodeRole::Worker {
+            if node.role == cluster_type.worker_role() {
                 println!("member {} {}", node.id, node.address);
             }
         }
@@ -101,20 +129,45 @@ async fn main() -> anyhow::Result<()> {
             worker
         }
         None => {
-            let membership = membership_lookup(&args.coordinator).await?;
-            let placement = CachePlacementTable::new(&membership);
-            let owner = placement
-                .primary(&block)
-                .ok_or_else(|| anyhow::anyhow!("no worker owns this block (empty cluster?)"))?;
-            tracing::info!(owner = %owner.id, "resolved owner");
-            let worker_addr = owner.address.clone();
+            // The two rings resolve differently, and deliberately so.
+            let worker_addr = match cluster_type {
+                // Block cluster: the client rebuilds the coordinator's Maglev
+                // table from a membership snapshot and computes placement
+                // itself (#455), so there is no placement round trip.
+                ClusterType::Block => {
+                    let membership = membership_lookup(&args.coordinator).await?;
+                    let placement = CachePlacementTable::new(&membership);
+                    let owner = placement.primary(&block).ok_or_else(|| {
+                        anyhow::anyhow!("no worker owns this block (empty cluster?)")
+                    })?;
+                    tracing::info!(owner = %owner.id, "resolved owner");
+                    owner.address.clone()
+                }
+                // Async cluster: the object ring has no client-side
+                // equivalent yet, so this asks the coordinator and then
+                // resolves the id to an address.
+                ClusterType::Async => {
+                    let owners = placement_lookup(&args.coordinator, &block).await?;
+                    let owner = owners.first().ok_or_else(|| {
+                        // An empty answer means no async worker is registered.
+                        // It cannot mean "a block worker answered instead" —
+                        // this cluster would have refused one.
+                        anyhow::anyhow!(
+                            "no worker in this async cluster owns this read; \
+                             is one registered with the coordinator?"
+                        )
+                    })?;
+                    tracing::info!(owner = %owner, "resolved owner");
+                    resolve_address(&args.coordinator, owner).await?
+                }
+            };
             tracing::info!(%worker_addr, "resolved worker address");
             worker_addr
         }
     };
 
     if args.placement_only {
-        println!("placed {path} on {worker_addr}");
+        println!("placed {path} on {worker_addr} in this {cluster_type} cluster");
         return Ok(());
     }
 
@@ -149,6 +202,34 @@ async fn main() -> anyhow::Result<()> {
         println!("first {n} bytes (hex): {}", hex_prefix(&bytes[..n]));
     }
     Ok(())
+}
+
+/// Ask the coordinator who owns `block` and return the ordered owner ids.
+///
+/// There is one lookup message. Which ring answers it is a property of the
+/// coordinator, not of the request (ADR 0006), so the reply shape is the same
+/// whichever kind of cluster this reaches.
+async fn placement_lookup(coordinator: &str, block: &BlockId) -> anyhow::Result<Vec<String>> {
+    let msg = ControlMessage::PlacementLookup {
+        block: block.clone(),
+        k: 1,
+    };
+    match request_control(coordinator, &msg).await? {
+        ControlMessage::PlacementResponse { owners, .. } => {
+            Ok(owners.into_iter().map(|n| n.0).collect())
+        }
+        other => anyhow::bail!("unexpected placement reply: {other:?}"),
+    }
+}
+
+/// Send a `MembershipQuery` and resolve `owner_id` to its worker address.
+async fn resolve_address(coordinator: &str, owner_id: &str) -> anyhow::Result<String> {
+    membership_lookup(coordinator)
+        .await?
+        .into_iter()
+        .find(|n| n.id.0 == owner_id)
+        .map(|n| n.address)
+        .ok_or_else(|| anyhow::anyhow!("owner {owner_id} not in membership list"))
 }
 
 /// Return the coordinator's current membership snapshot.
@@ -220,8 +301,75 @@ fn hex_prefix(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use clap::Parser;
+    use talon_core::{ClusterType, NodeRole};
 
     use super::Args;
+
+    #[test]
+    fn a_block_cluster_is_assumed_unless_told_otherwise() {
+        // Every existing invocation must keep reaching a block worker; naming
+        // an async cluster is opt-in or this is a silent routing change.
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--path",
+            "/s3/bucket/object",
+            "--len",
+            "4096",
+        ])
+        .unwrap();
+        assert_eq!(args.cluster_type, ClusterType::Block);
+    }
+
+    #[test]
+    fn the_cluster_type_flag_names_an_async_cluster() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--cluster-type",
+            "async",
+            "--path",
+            "/s3/bucket/part-0.parquet",
+            "--len",
+            "4096",
+        ])
+        .unwrap();
+        assert_eq!(args.cluster_type, ClusterType::Async);
+        assert_eq!(args.cluster_type.worker_role(), NodeRole::AsyncWorker);
+    }
+
+    #[test]
+    fn an_unknown_cluster_type_is_rejected_rather_than_defaulted() {
+        // Silently falling back to `block` would send a selective read to a
+        // coordinator whose workers fetch 256MB for it.
+        assert!(Args::try_parse_from([
+            "talon-client",
+            "--cluster-type",
+            "extents",
+            "--path",
+            "/s3/bucket/object",
+            "--len",
+            "4096",
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn each_cluster_type_draws_only_from_its_own_role() {
+        assert_eq!(ClusterType::Block.worker_role(), NodeRole::Worker);
+        assert_eq!(ClusterType::Async.worker_role(), NodeRole::AsyncWorker);
+    }
+
+    #[test]
+    fn membership_only_accepts_a_cluster_type() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--membership-only",
+            "--cluster-type",
+            "async",
+        ])
+        .unwrap();
+        assert!(args.membership_only);
+        assert_eq!(args.cluster_type, ClusterType::Async);
+    }
 
     #[test]
     fn direct_worker_mode_is_parsed_without_changing_default_coordinator() {

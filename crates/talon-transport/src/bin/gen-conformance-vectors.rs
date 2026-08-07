@@ -77,6 +77,18 @@ fn vectors() -> Vec<Vector> {
             },
         ),
         control(
+            "control.membership_list.async_worker",
+            "NodeRole discriminant 2: appended after Coordinator (0) and Worker (1), which must keep their tags",
+            2,
+            &ControlMessage::MembershipList {
+                nodes: vec![NodeInfo {
+                    id: NodeId::new("async-worker-a"),
+                    address: "10.0.0.9:7001".into(),
+                    role: NodeRole::AsyncWorker,
+                }],
+            },
+        ),
+        control(
             "control.placement_response",
             "Coordinator reply: ordered owners plus the epoch they were computed at",
             1,

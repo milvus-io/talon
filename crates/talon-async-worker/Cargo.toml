@@ -1,0 +1,36 @@
+[package]
+name = "talon-async-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Async worker: an extent cache for selective reads over columnar data"
+
+[[bin]]
+name = "talon-async-worker"
+path = "src/main.rs"
+
+[dependencies]
+talon-core.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+bytes.workspace = true
+xxhash-rust.workspace = true
+talon-transport.workspace = true
+talon-backend = { path = "../talon-backend" }
+anyhow.workspace = true
+libc.workspace = true
+axum.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+tracing-subscriber.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+divan.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }
+
+[[bench]]
+name = "extent_cache_benches"
+harness = false

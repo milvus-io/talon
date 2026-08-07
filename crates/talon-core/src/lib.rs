@@ -20,9 +20,11 @@ pub mod trace;
 pub use backend::{BackendStore, ListPage, ListedObject, ObjectStat};
 pub use block::{page_len, BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{
-    azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
+    async_azure_sas_from_env, async_gcs_bearer_from_env, async_s3_secret_key_from_env,
+    async_s3_session_token_from_env, azure_sas_from_env, gcs_bearer_from_env,
+    s3_secret_key_from_env, s3_session_token_from_env, AsyncWorkerConfig, AsyncWorkerConfigPatch,
     ConfigVar, FuseConfig, FuseConfigPatch, Patch, WorkerConfig, WorkerConfigPatch,
-    FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA,
+    ASYNC_WORKER_ENV_SCHEMA, FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA,
 };
 pub use control_identity::{
     ControlTlsConfig, ControlTlsConfigPatch, WorkloadIdentity, WorkloadIdentityError, WorkloadRole,
@@ -31,7 +33,7 @@ pub use error::{Error, Result};
 pub use key::{Backend, BlockId, ObjectId, PageIndex, Version};
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use namespace_policy::{NamespacePolicy, ObjectNamespace};
-pub use node::{NodeId, NodeInfo, NodeRole};
+pub use node::{ClusterType, NodeId, NodeInfo, NodeRole};
 pub use placement::{cache_membership_epoch, rank_cache_workers, CachePlacementTable};
 pub use status::{
     NodeHealth, NodeMetricsSnapshot, NodeStatus, NodeStatusError, MAX_NODE_STATUS_BYTES,

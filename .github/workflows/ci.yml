@@ -269,6 +269,7 @@ jobs:
         run: |
           docker compose config --quiet
           docker compose --profile ha config --quiet
+          docker compose --profile extents config --quiet
           # The latency lab is a standalone stack; validate it parses too.
           docker compose -f deploy/testenv/docker-compose.yml config --quiet
           docker compose -f deploy/testenv/docker-compose.yml --profile tools config --quiet
@@ -288,6 +289,14 @@ jobs:
           push: false
           cache-from: type=gha,scope=worker
           cache-to: type=gha,scope=worker,mode=max
+      - name: Build async worker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/async-worker.Dockerfile
+          push: false
+          cache-from: type=gha,scope=async-worker
+          cache-to: type=gha,scope=async-worker,mode=max
       - name: Build fuse image
         uses: docker/build-push-action@v6
         with:
@@ -300,9 +309,10 @@ jobs:
   helm:
     name: helm chart
     runs-on: ubuntu-latest
-    # Lint and render the Talon chart across every state backend so a broken
-    # template or invalid values fails CI. No cluster is required — helm renders
-    # locally and we structurally validate the output.
+    # Lint and render the Talon chart across every state backend and both
+    # cluster types so a broken template or invalid values fails CI. No cluster
+    # is required — helm renders locally and we structurally validate the
+    # output.
     steps:
       - uses: actions/checkout@v4
       - name: Install Helm
@@ -328,6 +338,17 @@ jobs:
               | python3 -c "import sys,yaml; list(yaml.safe_load_all(sys.stdin))"
             echo "::endgroup::"
           done
+      - name: Render an async cluster
+        run: |
+          helm template t deploy/helm/talon \
+            --set coordinator.clusterType=async \
+            --set worker.enabled=false --set asyncWorker.enabled=true \
+            | tee /tmp/async.yaml \
+            | python3 -c "import sys,yaml; list(yaml.safe_load_all(sys.stdin))"
+          grep -q "talon-async-worker" /tmp/async.yaml \
+            || { echo "::error::async render has no async worker"; exit 1; }
+          grep -q "TALON_COORDINATOR_CLUSTER_TYPE" /tmp/async.yaml \
+            || { echo "::error::async render does not set the cluster type"; exit 1; }
       - name: Reject invalid configurations
         run: |
           if helm template t deploy/helm/talon --set coordinator.backend=redis >/dev/null 2>&1; then
@@ -336,6 +357,20 @@ jobs:
           if helm template t deploy/helm/talon \
               --set coordinator.backend=memory --set coordinator.replicas=3 >/dev/null 2>&1; then
             echo "::error::memory backend with HA should have failed"; exit 1
+          fi
+          # A cluster runs one ring and refuses the other kind's workers
+          # (ADR 0006); the chart must catch that before it reaches a cluster.
+          if helm template t deploy/helm/talon \
+              --set coordinator.clusterType=extents >/dev/null 2>&1; then
+            echo "::error::unknown cluster type should have failed"; exit 1
+          fi
+          if helm template t deploy/helm/talon \
+              --set asyncWorker.enabled=true >/dev/null 2>&1; then
+            echo "::error::async workers in a block cluster should have failed"; exit 1
+          fi
+          if helm template t deploy/helm/talon \
+              --set coordinator.clusterType=async >/dev/null 2>&1; then
+            echo "::error::block workers in an async cluster should have failed"; exit 1
           fi
 
   s3-e2e:

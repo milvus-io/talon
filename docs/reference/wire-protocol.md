@@ -108,6 +108,10 @@ Variant tags are the enum's declaration order. The read path needs these:
 | 12 | `ListObjects` | client → coordinator | `prefix: String` |
 | 13 | `ObjectList` | coordinator → client | `entries: Vec<ObjectEntry>` |
 
+There is one placement message. Which ring answers it is a property of the
+coordinator, not of the request; see
+[Which ring answers](#which-ring-answers).
+
 Supporting types:
 
 ```
@@ -117,7 +121,7 @@ struct NodeInfo  { id: NodeId, address: String, role: NodeRole }
 struct ObjectEntry { path: String, size: u64 }
 
 enum Backend  { S3 = 0, Gcs = 1, Azure = 2 }   // u32 tag
-enum NodeRole { Coordinator = 0, Worker = 1 }  // u32 tag
+enum NodeRole { Coordinator = 0, Worker = 1, AsyncWorker = 2 }  // u32 tag
 
 // NodeId and Version are newtypes over String: encoded exactly as a String.
 ```
@@ -174,6 +178,34 @@ placement.
 **Legacy epoch reconciliation.** `PlacementResponse` carries the epoch its
 owners were computed at. Clients still using this compatibility operation must
 invalidate a cached placement when they observe a different epoch.
+
+**Which ring answers.** A coordinator runs exactly one placement ring, fixed at
+startup by its cluster type (ADR 0006). The request does not name it:
+
+| Cluster type | Pool | Hashed on |
+|---|---|---|
+| `block` | `NodeRole::Worker` | the whole `BlockId` |
+| `async` | `NodeRole::AsyncWorker` | the object identity alone |
+
+An async cluster caches the exact byte range asked for rather than a whole
+block, which is what a Parquet or Lance reader wants; a block cluster is right
+for full scans. A deployment that needs both runs two clusters, each with its
+own coordinator address.
+
+A lookup cannot cross pools, because a cluster refuses to register a worker of
+the other kind at all. A cluster with no workers answers with **no owners** —
+never a node borrowed from elsewhere, which would hold nothing and fail the
+read a round trip later.
+
+The data plane is identical either way: both worker types serve the same
+`GetRange`. A client that knows the address knows the answer shape;
+`--cluster-type` on the CLI exists only because a block cluster's ring can be
+recomputed client-side and the object ring cannot.
+
+**Not available in an async cluster.** `ListObjects` is answered with
+`Ack { ok: false }` and a reason: async workers serve reads and stats only, and
+there is no block worker behind them to proxy to. An empty `ObjectList` would
+be indistinguishable from an empty bucket.
 
 **Multi-block ranges.** A range spanning block boundaries splits into one fetch
 per block, each addressed by its own `BlockId`. Block size is a worker

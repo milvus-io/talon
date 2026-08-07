@@ -4,6 +4,7 @@ members = [
     "crates/talon-core",
     "crates/talon-coordinator",
     "crates/talon-worker",
+    "crates/talon-async-worker",
     "crates/talon-fuse",
     "crates/talon-transport",
     "crates/talon-backend",
@@ -44,7 +45,7 @@ sha2 = "0.10"
 prost = "0.14"
 prost-build = "0.14"
 libc = "0.2"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 divan = "0.1"
 # Thread-per-core io_uring runtime for the data plane (#273, #285). The "sync"
 # feature provides spawn_blocking, which the zero-copy sendfile/splice path

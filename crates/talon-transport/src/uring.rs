@@ -115,7 +115,12 @@ where
     Ok(buf)
 }
 
-#[cfg(test)]
+// io_uring is Linux-only, so these tests are too. Without the gate the whole
+// crate's test target fails to *compile* on macOS — `monoio::IoUringDriver`
+// does not exist there — which takes every other test in this crate down with
+// it, including the codec ones that have nothing to do with io_uring. CI runs
+// on Linux and is unaffected.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use crate::frame::MsgType;

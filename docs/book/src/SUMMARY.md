@@ -26,6 +26,7 @@
 
 - [Operator runbook](./operations/runbook.md)
 - [Cloud backends (S3/GCS/Azure)](./operations/cloud-backends.md)
+- [The async worker](./operations/async-worker.md)
 - [Security hardening](./operations/security.md)
 - [Latency lab](./testing/latency-lab.md)
 
@@ -50,6 +51,8 @@
 - [ADR 0002: Write-cache durability](./explanation/adr-0002-write-cache-durability.md)
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)
 - [ADR 0004: Control-plane workload identity](./explanation/adr-0004-control-plane-workload-identity.md)
+- [ADR 0005: Async worker extent cache](./explanation/adr-0005-async-worker-extent-cache.md)
+- [ADR 0006: One ring per cluster](./explanation/adr-0006-one-ring-per-cluster.md)
 
 # Contributing
 

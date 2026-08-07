@@ -46,6 +46,14 @@ Logical cluster identity.
 - **Default:** `default`
 - **CLI flag:** `--cluster-id`
 
+### `cluster_type`
+
+Which cache this cluster is: block or async. Fixes the placement ring and the one worker role the cluster admits.
+
+- **Environment variable:** `TALON_COORDINATOR_CLUSTER_TYPE`
+- **Default:** `block`
+- **CLI flag:** `--cluster-type`
+
 ### `node_id`
 
 Stable coordinator node identity.
@@ -565,6 +573,301 @@ Azure SAS token; env-only, never from a config file or logged.
 - **Default:** none
 - **CLI flag:** not settable via CLI (config file or environment only)
 - **Secret:** read only from the environment; never written to a config file or logged
+
+## Async worker
+
+### `listen`
+
+Data-plane bind address.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_LISTEN`
+- **Default:** `127.0.0.1:7101`
+- **CLI flag:** `--listen`
+
+### `advertise_addr`
+
+Routable address advertised to the coordinator.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_ADVERTISE_ADDR`
+- **Default:** `<listen>`
+- **CLI flag:** `--advertise-addr`
+
+### `admin_listen`
+
+Admin HTTP bind address: metrics, health, ready.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_ADMIN_LISTEN`
+- **Default:** `127.0.0.1:8101`
+- **CLI flag:** `--admin-listen`
+
+### `coordinator`
+
+Coordinator control-plane address to register with.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_COORDINATOR`
+- **Default:** `127.0.0.1:7000`
+- **CLI flag:** `--coordinator`
+
+### `control_listen`
+
+Dedicated mTLS listener for privileged coordinator traffic.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CONTROL_LISTEN`
+- **Default:** none
+- **CLI flag:** `--control-listen`
+
+### `control_tls.ca_cert_path`
+
+PEM bundle of CAs trusted on the control listener.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CONTROL_TLS_CA_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.cert_path`
+
+PEM certificate chain presented on the control listener.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CONTROL_TLS_CERT_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `control_tls.key_path` 🔒
+
+PEM private key for the control listener certificate.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CONTROL_TLS_KEY_PATH`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `control_tls.trust_domain`
+
+SPIFFE trust domain required of the coordinator's identity.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CONTROL_TLS_TRUST_DOMAIN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `cluster_id`
+
+Logical cluster advertised in node status.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CLUSTER_ID`
+- **Default:** `default`
+- **CLI flag:** `--cluster-id`
+
+### `node_id`
+
+Stable node identity.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_NODE_ID`
+- **Default:** `<advertise_addr>`
+- **CLI flag:** `--node-id`
+
+### `heartbeat_interval_ms`
+
+Control-plane heartbeat interval (ms).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_HEARTBEAT_INTERVAL_MS`
+- **Default:** `5000`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `cache_dir`
+
+Directory for region-packed shard files. Wiped at startup.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CACHE_DIR`
+- **Default:** `/var/cache/talon-extents`
+- **CLI flag:** `--cache-dir`
+
+### `capacity_bytes`
+
+NVMe ceiling (bytes), rounded down to whole 64 MiB regions.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CAPACITY_BYTES`
+- **Default:** `68719476736`
+- **CLI flag:** `--capacity-bytes`
+
+### `disk_shards`
+
+Number of shard files. Must be a power of two.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_DISK_SHARDS`
+- **Default:** `8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `checksums_enabled`
+
+Verify a digest on every NVMe read through userspace.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CHECKSUMS_ENABLED`
+- **Default:** `true`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `l1_capacity_bytes`
+
+DRAM tier ceiling (bytes). Zero disables L1.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_L1_CAPACITY_BYTES`
+- **Default:** `0`
+- **CLI flag:** `--l1-capacity-bytes`
+
+### `l1_shards`
+
+DRAM tier shard count. Must be a power of two.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_L1_SHARDS`
+- **Default:** `16`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `checkpoint_interval_bytes`
+
+Bytes an NVMe shard writes between checkpoints. Zero disables warm restart and wipes the cache directory at every start.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_CHECKPOINT_INTERVAL_BYTES`
+- **Default:** `67108864`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend`
+
+Object-store backend: azure, s3, or gcs.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_BACKEND`
+- **Default:** none
+- **CLI flag:** `--backend`
+
+### `azure_account`
+
+Azure Blob storage account.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_AZURE_ACCOUNT`
+- **Default:** none
+- **CLI flag:** `--azure-account`
+
+### `azure_endpoint`
+
+Azure endpoint host override (Azurite/proxy).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_AZURE_ENDPOINT`
+- **Default:** none
+- **CLI flag:** `--azure-endpoint`
+
+### `azure_sas` 🔒
+
+Azure SAS token. Environment only; never logged.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_AZURE_SAS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `s3_region`
+
+S3 region. Required when backend = s3.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_S3_REGION`
+- **Default:** none
+- **CLI flag:** `--s3-region`
+
+### `s3_endpoint`
+
+S3 endpoint host override (MinIO/LocalStack).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_S3_ENDPOINT`
+- **Default:** none
+- **CLI flag:** `--s3-endpoint`
+
+### `s3_access_key_id`
+
+S3 access key id.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_S3_ACCESS_KEY_ID`
+- **Default:** none
+- **CLI flag:** `--s3-access-key-id`
+
+### `s3_secret_access_key` 🔒
+
+S3 secret access key. Environment only; never logged.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_S3_SECRET_ACCESS_KEY`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `s3_session_token` 🔒
+
+S3 session token for STS credentials. Environment only.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_S3_SESSION_TOKEN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `s3_path_style`
+
+Use S3 path-style addressing (endpoint/bucket/key).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_S3_PATH_STYLE`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `gcs_endpoint`
+
+GCS endpoint host override (fake-gcs-server).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_GCS_ENDPOINT`
+- **Default:** none
+- **CLI flag:** `--gcs-endpoint`
+
+### `gcs_bearer_token` 🔒
+
+GCS OAuth2 bearer token. Environment only; never logged.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_GCS_BEARER_TOKEN`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+- **Secret:** read only from the environment; never written to a config file or logged
+
+### `backend_max_retries`
+
+Retries after the initial attempt on a transient failure.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_BACKEND_MAX_RETRIES`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_retry_base_ms`
+
+Exponential backoff base between retries (ms).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_BACKEND_RETRY_BASE_MS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_retry_max_delay_ms`
+
+Ceiling on any single backoff wait (ms).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_BACKEND_RETRY_MAX_DELAY_MS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_timeout_floor_ms`
+
+Fixed part of the per-attempt deadline (ms).
+
+- **Environment variable:** `TALON_ASYNC_WORKER_BACKEND_TIMEOUT_FLOOR_MS`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `backend_min_throughput_bytes`
+
+Throughput floor extending the deadline by transfer size.
+
+- **Environment variable:** `TALON_ASYNC_WORKER_BACKEND_MIN_THROUGHPUT_BYTES`
+- **Default:** none
+- **CLI flag:** not settable via CLI (config file or environment only)
 
 ## FUSE client
 

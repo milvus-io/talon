@@ -63,6 +63,21 @@ those benches are added in a separate tier when the transport layer lands.
   bench is a **regression floor**, not the evidence for how the planes compare
   under load. That question is answered by the load test below.
 
+- `talon-async-worker` (`extent_cache_benches`): the extent cache's serve path —
+  cold miss, DRAM hit, `(ObjectId, Version)` interning — plus a Parquet-shaped
+  read trace run at two granularities.
+
+  **This one prints a number Divan does not record.** The async worker's claim
+  is about bandwidth, not latency, so `main` measures origin bytes at extent and
+  block granularity over the same trace and prints the comparison before the
+  timing table. The block side is the *definition* of block granularity — any
+  byte touched costs the whole aligned block — implemented over the identical
+  cache so the fetch unit is the only variable. It is not a model of
+  `talon-worker`: that worker's disk layout, index, and WAL are not reproduced,
+  and its latency is not what this measures. The block size used is 4 MiB rather
+  than 256 MiB so an iteration stays in the millisecond range, which makes the
+  printed ratio a lower bound.
+
 ## Concurrent load test
 
 `scripts/dataplane_loadtest.sh` drives a real worker with many connections in

@@ -366,7 +366,11 @@ impl CoordinatorMetrics {
             now.saturating_sub(snapshot.observed_at_unix_ms),
             Ordering::Relaxed,
         );
-        for role in [NodeRole::Coordinator, NodeRole::Worker] {
+        for role in [
+            NodeRole::Coordinator,
+            NodeRole::Worker,
+            NodeRole::AsyncWorker,
+        ] {
             for health in [
                 NodeHealth::Healthy,
                 NodeHealth::Degraded,
@@ -691,7 +695,11 @@ impl CoordinatorObservability {
                     .nodes
                     .iter()
                     .filter(|status| {
-                        status.node.role == NodeRole::Worker
+                        // Still the union of worker roles: `Membership` now
+                        // knows its cluster type and drops what it does not
+                        // admit, so narrowing here would only move the same
+                        // decision somewhere it cannot be logged.
+                        status.node.role.is_worker()
                             && status.health == NodeHealth::Healthy
                             && status.ready
                     })
@@ -912,10 +920,7 @@ fn state_error_kind(error: &StateStoreError) -> &'static str {
 }
 
 fn role_label(role: NodeRole) -> &'static str {
-    match role {
-        NodeRole::Coordinator => "coordinator",
-        NodeRole::Worker => "worker",
-    }
+    role.as_str()
 }
 
 fn health_label(health: NodeHealth) -> &'static str {
@@ -1207,7 +1212,7 @@ mod tests {
                 .unwrap();
         }
 
-        let membership = Membership::new();
+        let membership = Membership::default();
         observability
             .reconcile_membership(&membership)
             .await
