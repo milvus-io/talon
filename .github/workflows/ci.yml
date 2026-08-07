@@ -261,7 +261,10 @@ jobs:
     name: docker image build
     runs-on: ubuntu-latest
     # Smoke-build every container image on PRs (no push) so a broken Dockerfile
-    # fails CI. Publishing to GHCR happens separately on tags (release-images.yml).
+    # fails CI. A merge to main runs the real, publishing build in
+    # release-images.yml instead — running both would double the most expensive
+    # job in the repo for no extra signal, so this job is PR-only.
+    if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v4
       - uses: docker/setup-buildx-action@v3
@@ -272,6 +275,12 @@ jobs:
           # The latency lab is a standalone stack; validate it parses too.
           docker compose -f deploy/testenv/docker-compose.yml config --quiet
           docker compose -f deploy/testenv/docker-compose.yml --profile tools config --quiet
+      # The builds read the main-seeded layer cache (written by
+      # release-images.yml on every merge) but do not write. This sacrifices
+      # layer reuse between pushes of one PR (entries written from a PR are
+      # only readable within that PR) to keep mode=max exports from churning
+      # the repository's 10GB Actions cache quota, which is already saturated
+      # by the rust-cache entries every other job depends on.
       - name: Build coordinator image
         uses: docker/build-push-action@v6
         with:
@@ -279,7 +288,6 @@ jobs:
           file: deploy/docker/coordinator.Dockerfile
           push: false
           cache-from: type=gha,scope=coordinator
-          cache-to: type=gha,scope=coordinator,mode=max
       - name: Build worker image
         uses: docker/build-push-action@v6
         with:
@@ -287,7 +295,6 @@ jobs:
           file: deploy/docker/worker.Dockerfile
           push: false
           cache-from: type=gha,scope=worker
-          cache-to: type=gha,scope=worker,mode=max
       - name: Build fuse image
         uses: docker/build-push-action@v6
         with:
@@ -295,7 +302,6 @@ jobs:
           file: deploy/docker/fuse.Dockerfile
           push: false
           cache-from: type=gha,scope=fuse
-          cache-to: type=gha,scope=fuse,mode=max
 
   helm:
     name: helm chart
