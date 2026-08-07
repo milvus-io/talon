@@ -16,7 +16,7 @@
 //! ```
 
 use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
-use talon_transport::codec::{self, ControlMessage, ObjectEntry, Ring};
+use talon_transport::codec::{self, ControlMessage, ObjectEntry};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{FrameHeader, MsgType};
 
@@ -73,36 +73,6 @@ fn vectors() -> Vec<Vector> {
                     256 << 20,
                     Version::new("v1"),
                 ),
-                k: 1,
-            },
-        ),
-        control(
-            "control.ring_placement_lookup.async",
-            "Schema 5: ring-aware placement on the async ring. Only the object is hashed, so offset and version do not affect the answer",
-            1,
-            &ControlMessage::RingPlacementLookup {
-                block: BlockId::new(
-                    object("container", "path/to/object.parquet"),
-                    268_435_456,
-                    256 << 20,
-                    Version::new("v1"),
-                ),
-                ring: Ring::Async,
-                k: 1,
-            },
-        ),
-        control(
-            "control.ring_placement_lookup.block",
-            "Ring::Block is discriminant 0 and must stay there; note this is a different encoding from control.placement_lookup, which keeps its schema-1 bytes",
-            1,
-            &ControlMessage::RingPlacementLookup {
-                block: BlockId::new(
-                    object("container", "path/to/object"),
-                    268_435_456,
-                    256 << 20,
-                    Version::new("v1"),
-                ),
-                ring: Ring::Block,
                 k: 1,
             },
         ),

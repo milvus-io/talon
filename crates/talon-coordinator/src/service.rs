@@ -90,18 +90,6 @@ impl<P: Placement> PlacementService<P> {
             ControlMessage::PlacementLookup { block, k } => {
                 response(self.lookup(&block, k as usize))
             }
-            // The ring is no longer the client's to name. Reject rather than
-            // resolve: a client sending this believes it is choosing a pool,
-            // and answering anyway would confirm a belief that is now wrong.
-            // Removed from the wire entirely in the next change.
-            ControlMessage::RingPlacementLookup { ring, .. } => ControlMessage::Ack {
-                ok: false,
-                detail: Some(format!(
-                    "this cluster serves the {} ring only; a lookup cannot name a ring \
-                     (requested {ring})",
-                    self.membership.cluster_type()
-                )),
-            },
             other => ControlMessage::Ack {
                 ok: false,
                 detail: Some(format!("unexpected control message: {other:?}")),
@@ -122,7 +110,6 @@ mod tests {
     use super::*;
     use crate::{ClusterPlacement, RendezvousPlacement};
     use talon_core::{Backend, ClusterType, NodeId, NodeInfo, NodeRole, ObjectId, Version};
-    use talon_transport::Ring;
 
     fn block(n: u64) -> BlockId {
         BlockId::new(
@@ -264,29 +251,6 @@ mod tests {
         // The refused block worker is not in the registry, so there is nothing
         // for the epoch to cover either.
         assert_eq!(res.epoch, Epoch::EMPTY);
-    }
-
-    /// A client naming a ring is told it cannot, and which cluster it reached.
-    ///
-    /// Silently resolving would confirm a belief that is now wrong; answering
-    /// with an empty owner list would look like "no workers yet".
-    #[test]
-    fn a_lookup_that_names_a_ring_is_refused_with_the_clusters_type() {
-        let s = cluster(ClusterType::Async, &[], &["ext-a"]);
-        match s.handle(ControlMessage::RingPlacementLookup {
-            block: block(3),
-            ring: Ring::Block,
-            k: 2,
-        }) {
-            ControlMessage::Ack {
-                ok: false,
-                detail: Some(detail),
-            } => {
-                assert!(detail.contains("async"), "must name the cluster: {detail}");
-                assert!(detail.contains("block"), "must name the request: {detail}");
-            }
-            other => panic!("expected a refusal, got {other:?}"),
-        }
     }
 
     #[test]

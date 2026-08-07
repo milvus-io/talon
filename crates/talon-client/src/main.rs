@@ -4,34 +4,36 @@
 //! sandbox has no `/dev/fuse`):
 //!
 //! 1. Parse `/az/<container>/<blob>` into an [`ObjectId`].
-//! 2. Resolve the owning worker — locally on the block ring, via the
-//!    coordinator on the async ring (see *Choosing a ring* below).
+//! 2. Resolve the owning worker — locally in a block cluster, via the
+//!    coordinator in an async one (see *Naming the cluster type* below).
 //! 3. Send a data-plane [`RangeRequest`] to that worker and read the raw bytes.
 //!
 //! Prints byte count + elapsed time; writes the bytes to `--out` when given so
 //! the caller can `cmp` two reads for byte-exactness.
 //!
-//! # Choosing a ring
+//! # Naming the cluster type
 //!
-//! `--ring` selects which pool answers step 2. `block` (the default) reaches a
-//! `talon-worker`; `async` reaches a `talon-async-worker`, which caches the
-//! exact range rather than a 256MB block.
+//! `--cluster-type` (or `TALON_CLUSTER_TYPE`) says which kind of cluster
+//! `--coordinator` points at: `block` (the default) is a `talon-worker`
+//! cluster, `async` is a `talon-async-worker` cluster caching exact ranges
+//! rather than 256MB blocks.
 //!
-//! The caller picks, not the coordinator. The coordinator sees only a byte
-//! range and would have to guess from a file extension or a read size; the
-//! caller knows whether it is about to read a Parquet footer or stream a whole
-//! partition. See ADR 0005 section 6.
+//! This is not a choice of pool — a cluster runs one ring and would refuse a
+//! worker of the other kind (ADR 0006). It selects **how placement is
+//! resolved**, which genuinely differs: a block cluster's ring has a
+//! client-side Maglev equivalent and needs no round trip (#455), while the
+//! object ring has none and must be asked.
 //!
 //! The data plane is identical either way — both workers answer the same
 //! `RangeRequest` — so only step 2 changes.
 
 use std::time::Instant;
 
-use clap::{Parser, ValueEnum};
-use talon_core::{BlockId, CachePlacementTable, ObjectId, Version};
+use clap::Parser;
+use talon_core::{BlockId, CachePlacementTable, ClusterType, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
-use talon_transport::{codec, ControlMessage, FrameHeader, Ring};
+use talon_transport::{codec, ControlMessage, FrameHeader};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
@@ -41,48 +43,6 @@ const PLACEMENT_BLOCK_SIZE: u32 = 256 << 20;
 /// Placeholder version matching the worker's block identity.
 const PLACEHOLDER_VERSION: &str = "e2e-v1";
 
-/// The `--ring` flag.
-///
-/// A thin mirror of [`talon_transport::Ring`], which is where the ring actually
-/// lives: the role mapping and the wire encoding are shared with the
-/// coordinator and must not be restated here. This type exists only because
-/// `ValueEnum` cannot be derived for a type from another crate. Adding a ring
-/// means adding a variant in both places; `a_flag_exists_for_every_ring` fails
-/// if the two drift.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
-enum RingArg {
-    /// Block workers, hashed on the whole `BlockId`. The default, and the only
-    /// ring that existed before ADR 0005.
-    Block,
-    /// Async workers, hashed on the object identity alone, so every range of
-    /// one object resolves to the same worker.
-    Async,
-}
-
-impl From<RingArg> for Ring {
-    fn from(arg: RingArg) -> Self {
-        match arg {
-            RingArg::Block => Ring::Block,
-            RingArg::Async => Ring::Async,
-        }
-    }
-}
-
-/// The lookup message that resolves `block` on `ring`.
-///
-/// The block ring deliberately keeps sending the legacy `PlacementLookup`.
-/// That message has meant the block ring since schema 1 and every coordinator
-/// understands it; sending the ring-aware variant instead would demand a
-/// schema-5 peer for an identical answer. Only the async ring — which no
-/// pre-schema-5 coordinator can serve at all — pays that cost.
-fn lookup_for(ring: Ring, block: &BlockId) -> ControlMessage {
-    let block = block.clone();
-    match ring {
-        Ring::Block => ControlMessage::PlacementLookup { block, k: 1 },
-        ring => ControlMessage::RingPlacementLookup { block, ring, k: 1 },
-    }
-}
-
 /// Command-line arguments for the Talon client.
 #[derive(Debug, Parser)]
 #[command(name = "talon-client", version, about)]
@@ -90,9 +50,13 @@ struct Args {
     /// Address of the coordinator to query for placement.
     #[arg(long, default_value = "127.0.0.1:7000")]
     coordinator: String,
-    /// Which pool answers the lookup: `block` workers or `async` workers.
-    #[arg(long, value_enum, default_value_t = RingArg::Block)]
-    ring: RingArg,
+    /// Which kind of cluster `--coordinator` points at: `block` or `async`.
+    ///
+    /// Selects how placement resolves, not which pool answers — the cluster
+    /// has only one. Parsed through `ClusterType`'s `FromStr`, so the valid
+    /// values are listed in exactly one place.
+    #[arg(long, env = "TALON_CLUSTER_TYPE", default_value_t = ClusterType::Block)]
+    cluster_type: ClusterType,
     /// Connect directly to one worker, bypassing placement (diagnostics/tests).
     #[arg(long)]
     worker: Option<String>,
@@ -125,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let ring: Ring = args.ring.into();
+    let cluster_type = args.cluster_type;
     if args.membership_only {
         let mut nodes = membership_lookup(&args.coordinator).await?;
         nodes.sort_by(|left, right| {
@@ -133,11 +97,11 @@ async fn main() -> anyhow::Result<()> {
                 .cmp(&right.address)
                 .then_with(|| left.id.0.cmp(&right.id.0))
         });
-        // Show only the selected ring's pool: listing both would suggest a
-        // lookup could return either, which is exactly what the split
-        // prevents.
+        // Only this cluster's workers. A node of the other kind cannot be
+        // registered here at all, so anything else in the snapshot is a
+        // coordinator.
         for node in nodes {
-            if node.role == ring.role() {
+            if node.role == cluster_type.worker_role() {
                 println!("member {} {}", node.id, node.address);
             }
         }
@@ -166,11 +130,11 @@ async fn main() -> anyhow::Result<()> {
         }
         None => {
             // The two rings resolve differently, and deliberately so.
-            let worker_addr = match ring {
-                // Block ring: the client rebuilds the coordinator's Maglev
+            let worker_addr = match cluster_type {
+                // Block cluster: the client rebuilds the coordinator's Maglev
                 // table from a membership snapshot and computes placement
                 // itself (#455), so there is no placement round trip.
-                Ring::Block => {
+                ClusterType::Block => {
                     let membership = membership_lookup(&args.coordinator).await?;
                     let placement = CachePlacementTable::new(&membership);
                     let owner = placement.primary(&block).ok_or_else(|| {
@@ -179,18 +143,17 @@ async fn main() -> anyhow::Result<()> {
                     tracing::info!(owner = %owner.id, "resolved owner");
                     owner.address.clone()
                 }
-                // Async ring: no client-side equivalent of the object ring
-                // exists yet, so this still asks the coordinator and then
+                // Async cluster: the object ring has no client-side
+                // equivalent yet, so this asks the coordinator and then
                 // resolves the id to an address.
-                ring => {
-                    let owners = placement_lookup(&args.coordinator, &block, ring).await?;
+                ClusterType::Async => {
+                    let owners = placement_lookup(&args.coordinator, &block).await?;
                     let owner = owners.first().ok_or_else(|| {
-                        // An empty answer here almost always means no async
-                        // worker is registered, not an empty cluster — the two
-                        // pools are disjoint, so a block worker is never
-                        // substituted.
+                        // An empty answer means no async worker is registered.
+                        // It cannot mean "a block worker answered instead" —
+                        // this cluster would have refused one.
                         anyhow::anyhow!(
-                            "no worker on the {ring} ring owns this read; \
+                            "no worker in this async cluster owns this read; \
                              is one registered with the coordinator?"
                         )
                     })?;
@@ -204,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     if args.placement_only {
-        println!("placed {path} on {worker_addr} via the {ring} ring");
+        println!("placed {path} on {worker_addr} in this {cluster_type} cluster");
         return Ok(());
     }
 
@@ -241,16 +204,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Look up placement on `ring` and return the ordered owner ids.
+/// Ask the coordinator who owns `block` and return the ordered owner ids.
 ///
-/// Both rings answer with the same `PlacementResponse`, so the caller learns
-/// one reply shape regardless of which it asked.
-async fn placement_lookup(
-    coordinator: &str,
-    block: &BlockId,
-    ring: Ring,
-) -> anyhow::Result<Vec<String>> {
-    match request_control(coordinator, &lookup_for(ring, block)).await? {
+/// There is one lookup message. Which ring answers it is a property of the
+/// coordinator, not of the request (ADR 0006), so the reply shape is the same
+/// whichever kind of cluster this reaches.
+async fn placement_lookup(coordinator: &str, block: &BlockId) -> anyhow::Result<Vec<String>> {
+    let msg = ControlMessage::PlacementLookup {
+        block: block.clone(),
+        k: 1,
+    };
+    match request_control(coordinator, &msg).await? {
         ControlMessage::PlacementResponse { owners, .. } => {
             Ok(owners.into_iter().map(|n| n.0).collect())
         }
@@ -336,25 +300,15 @@ fn hex_prefix(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use clap::{Parser, ValueEnum};
-    use talon_core::{Backend, BlockId, NodeRole, ObjectId, Version};
-    use talon_transport::{ControlMessage, Ring};
+    use clap::Parser;
+    use talon_core::{ClusterType, NodeRole};
 
-    use super::{lookup_for, Args, RingArg};
-
-    fn block() -> BlockId {
-        BlockId::new(
-            ObjectId::new(Backend::S3, "bucket", "part-0.parquet"),
-            0,
-            256 << 20,
-            Version::new("v1"),
-        )
-    }
+    use super::Args;
 
     #[test]
-    fn the_block_ring_is_the_default() {
-        // Every existing invocation must keep reaching a block worker; the
-        // async ring is opt-in or this is a silent routing change.
+    fn a_block_cluster_is_assumed_unless_told_otherwise() {
+        // Every existing invocation must keep reaching a block worker; naming
+        // an async cluster is opt-in or this is a silent routing change.
         let args = Args::try_parse_from([
             "talon-client",
             "--path",
@@ -363,14 +317,14 @@ mod tests {
             "4096",
         ])
         .unwrap();
-        assert_eq!(args.ring, RingArg::Block);
+        assert_eq!(args.cluster_type, ClusterType::Block);
     }
 
     #[test]
-    fn the_ring_flag_selects_the_async_pool() {
+    fn the_cluster_type_flag_names_an_async_cluster() {
         let args = Args::try_parse_from([
             "talon-client",
-            "--ring",
+            "--cluster-type",
             "async",
             "--path",
             "/s3/bucket/part-0.parquet",
@@ -378,17 +332,17 @@ mod tests {
             "4096",
         ])
         .unwrap();
-        assert_eq!(args.ring, RingArg::Async);
-        assert_eq!(Ring::from(args.ring).role(), NodeRole::AsyncWorker);
+        assert_eq!(args.cluster_type, ClusterType::Async);
+        assert_eq!(args.cluster_type.worker_role(), NodeRole::AsyncWorker);
     }
 
     #[test]
-    fn an_unknown_ring_is_rejected_rather_than_defaulted() {
-        // Silently falling back to the block ring would send a selective read
-        // to a worker that fetches 256MB for it.
+    fn an_unknown_cluster_type_is_rejected_rather_than_defaulted() {
+        // Silently falling back to `block` would send a selective read to a
+        // coordinator whose workers fetch 256MB for it.
         assert!(Args::try_parse_from([
             "talon-client",
-            "--ring",
+            "--cluster-type",
             "extents",
             "--path",
             "/s3/bucket/object",
@@ -398,63 +352,23 @@ mod tests {
         .is_err());
     }
 
-    /// The block ring must keep sending the schema-1 message. Upgrading it to
-    /// the ring-aware variant would make the default invocation fail against
-    /// every coordinator older than schema 5, for an identical answer.
     #[test]
-    fn the_block_ring_still_sends_the_legacy_lookup() {
-        assert!(matches!(
-            lookup_for(Ring::Block, &block()),
-            ControlMessage::PlacementLookup { k: 1, .. }
-        ));
-    }
-
-    /// The async ring names itself explicitly, and a coordinator that cannot
-    /// read the message fails the lookup rather than answering from the block
-    /// pool.
-    #[test]
-    fn the_async_ring_names_itself_on_the_wire() {
-        let msg = lookup_for(Ring::Async, &block());
-        assert!(matches!(
-            msg,
-            ControlMessage::RingPlacementLookup {
-                ring: Ring::Async,
-                k: 1,
-                ..
-            }
-        ));
-        assert_eq!(msg.minimum_schema(), 5);
-    }
-
-    /// The flag and the wire enum must stay in step. A ring reachable on the
-    /// wire but unnameable from the CLI is invisible; the reverse would parse
-    /// and then route nowhere.
-    #[test]
-    fn a_flag_exists_for_every_ring() {
-        let rings: Vec<Ring> = RingArg::value_variants()
-            .iter()
-            .map(|arg| Ring::from(*arg))
-            .collect();
-        assert_eq!(rings, vec![Ring::Block, Ring::Async]);
-        // Distinct flags must not collapse onto one ring.
-        assert_eq!(
-            rings.iter().collect::<std::collections::HashSet<_>>().len(),
-            rings.len()
-        );
+    fn each_cluster_type_draws_only_from_its_own_role() {
+        assert_eq!(ClusterType::Block.worker_role(), NodeRole::Worker);
+        assert_eq!(ClusterType::Async.worker_role(), NodeRole::AsyncWorker);
     }
 
     #[test]
-    fn a_ring_draws_only_from_its_own_role() {
-        assert_eq!(Ring::from(RingArg::Block).role(), NodeRole::Worker);
-        assert_eq!(Ring::from(RingArg::Async).role(), NodeRole::AsyncWorker);
-    }
-
-    #[test]
-    fn membership_only_accepts_a_ring() {
-        let args =
-            Args::try_parse_from(["talon-client", "--membership-only", "--ring", "async"]).unwrap();
+    fn membership_only_accepts_a_cluster_type() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "--membership-only",
+            "--cluster-type",
+            "async",
+        ])
+        .unwrap();
         assert!(args.membership_only);
-        assert_eq!(args.ring, RingArg::Async);
+        assert_eq!(args.cluster_type, ClusterType::Async);
     }
 
     #[test]

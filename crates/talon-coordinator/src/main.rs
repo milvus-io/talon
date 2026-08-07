@@ -582,12 +582,9 @@ impl Coordinator {
                     }
                 }
             }
-            // Both rings arrive here. Which one is selected by the `ring`
-            // field on the ring-aware variant, or implicitly by the legacy
-            // variant; `PlacementService::handle` maps both. They share this
-            // arm because they share the readiness rule.
-            lookup @ (ControlMessage::PlacementLookup { .. }
-            | ControlMessage::RingPlacementLookup { .. }) => {
+            // The one lookup. Which ring it resolves against is this
+            // cluster's type, not anything on the request.
+            lookup @ ControlMessage::PlacementLookup { .. } => {
                 // Fail closed: without a fresh authoritative snapshot we must not
                 // answer placement from possibly-stale local membership (#73).
                 if !self.observability.is_ready() {
@@ -656,6 +653,7 @@ async fn main() -> anyhow::Result<()> {
         admin_listen = %config.admin_listen,
         admin_advertise = %config.admin_advertise,
         cluster_id = %config.cluster_id,
+        cluster_type = %config.cluster_type,
         node_id = %config.node_id,
         state_backend = %config.state.backend,
         "starting talon-coordinator"
@@ -1353,7 +1351,6 @@ mod tests {
     use talon_core::{
         NodeHealth, NodeId, NodeMetricsSnapshot, NodeStatus, NODE_STATUS_SCHEMA_VERSION,
     };
-    use talon_transport::Ring;
 
     use super::*;
 
@@ -2219,18 +2216,22 @@ mod tests {
         }
     }
 
-    /// Both rings fail closed on the same condition. A ring that kept answering
-    /// from stale local membership during a state-store outage would hand out
-    /// owners the cluster no longer has (#73).
+    /// An async cluster fails closed on the same condition as a block one.
+    ///
+    /// The readiness gate is shared, but the async cluster reaches it through
+    /// a different membership and placement pair, so a regression could land
+    /// on one and not the other. A cluster that kept answering from stale
+    /// local membership during a state-store outage would hand out owners it
+    /// no longer has (#73).
     #[tokio::test]
-    async fn the_async_ring_fails_closed_with_the_block_ring() {
+    async fn an_async_cluster_fails_closed_when_state_store_unavailable() {
         let store = Arc::new(MemoryStateStore::new());
         let obs = observability_over(Arc::clone(&store) as Arc<dyn ClusterStateStore>, "coord-a");
         obs.check_ready().await.unwrap();
         let coord = Coordinator::new(
             Arc::clone(&obs),
             Duration::from_secs(30),
-            ClusterType::Block,
+            ClusterType::Async,
         );
         let mut status = worker_status("cluster-a", "ext-1", "inc-1", "127.0.0.1:7101");
         status.node.role = NodeRole::AsyncWorker;
@@ -2245,9 +2246,8 @@ mod tests {
         assert!(!obs.is_ready());
 
         let reply = coord
-            .dispatch(ControlMessage::RingPlacementLookup {
+            .dispatch(ControlMessage::PlacementLookup {
                 block: sample_block(),
-                ring: Ring::Async,
                 k: 1,
             })
             .await;
