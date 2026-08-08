@@ -23,6 +23,7 @@
 //! Percentiles, not means: the difference between the runtimes lives in the
 //! tail, and a mean hides exactly the effect being measured.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -224,11 +225,12 @@ async fn drive_one(
 /// Drive one connection with `depth` requests in flight, returning post-warmup
 /// latencies in nanoseconds.
 ///
-/// The window is a FIFO of send timestamps and request ids. The worker serves a
-/// connection's requests one at a time, so the *n*th reply belongs to the *n*th
-/// request; the id is carried anyway and checked, so a server that ever starts
-/// reordering fails the run loudly instead of silently reporting another
-/// request's latency.
+/// Replies are matched by `request_id` through a pending map, not by position.
+/// A multiplexing worker answers a connection's requests concurrently and may
+/// complete a later request first, so a positional FIFO would charge a reply's
+/// latency to the wrong request. The map is also the correctness check: a reply
+/// carrying an id that was never sent, or one already completed, fails the run
+/// loudly instead of being silently counted.
 ///
 /// Reads and writes must overlap or the depth is a lie: writing `depth`
 /// requests up front and only then reading would still stall on a full socket
@@ -311,15 +313,30 @@ async fn drive_one_pipelined(
     let mut header_buf = [0u8; HEADER_LEN];
     let started = Instant::now();
     let mut recording = false;
+    // Sent-but-unanswered requests, keyed by the id echoed in the reply header.
+    let mut pending: HashMap<u32, Instant> = HashMap::with_capacity(depth * 2);
 
     while !stop.load(Ordering::Relaxed) {
         if !recording && started.elapsed() >= warmup {
             recording = true;
             latencies.clear();
         }
-        let Some((expect_id, t0)) = sent_rx.recv().await else {
-            break;
-        };
+        // Block for at least one outstanding request so the reader never waits
+        // on a socket that nobody has written to, then take whatever else the
+        // writer has already queued. The writer records a send *before* the
+        // bytes hit the wire, so every reply's id is queued by the time its
+        // frame can be read.
+        if pending.is_empty() {
+            match sent_rx.recv().await {
+                Some((id, t0)) => {
+                    pending.insert(id, t0);
+                }
+                None => break,
+            }
+        }
+        while let Ok((id, t0)) = sent_rx.try_recv() {
+            pending.insert(id, t0);
+        }
         if rd.read_exact(&mut header_buf).await.is_err() {
             errors.fetch_add(1, Ordering::Relaxed);
             break;
@@ -336,17 +353,41 @@ async fn drive_one_pipelined(
             errors.fetch_add(1, Ordering::Relaxed);
             break;
         }
-        // Replies are positional here. If one ever arrives out of order the
-        // latency below would be charged to the wrong request, so refuse to
-        // report a number rather than report a wrong one.
-        if header.request_id != expect_id {
+        // Out-of-order replies are expected from a multiplexing worker. The id
+        // may also not be in `pending` yet: the writer records a send before
+        // the bytes hit the wire, so a reply can be read before the writer task
+        // is polled again. Awaiting more records is safe and cannot deadlock —
+        // this frame was written, so its record was already queued and `recv`
+        // returns it; if the writer is gone `recv` returns `None`.
+        let t0 = loop {
+            if let Some(t0) = pending.remove(&header.request_id) {
+                break Some(t0);
+            }
+            match sent_rx.recv().await {
+                Some((id, t)) => {
+                    pending.insert(id, t);
+                }
+                None => break None,
+            }
+        };
+        let Some(t0) = t0 else {
             if errors.fetch_add(1, Ordering::Relaxed) == 0 {
                 eprintln!(
-                    "out-of-order reply: expected request_id {expect_id}, got {}",
+                    "reply for unknown request_id {}: never sent on this connection",
                     header.request_id
                 );
             }
             break;
+        };
+        if header.flags.contains(talon_transport::Flags::ERROR) {
+            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "first error response: {}",
+                    String::from_utf8_lossy(&body[..len])
+                );
+            }
+        } else if recording {
+            latencies.push(t0.elapsed().as_nanos() as u64);
         }
         if header.flags.contains(talon_transport::Flags::ERROR) {
             if errors.fetch_add(1, Ordering::Relaxed) == 0 {
