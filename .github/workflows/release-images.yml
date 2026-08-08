@@ -2,16 +2,24 @@ name: Release images
 
 # Build and publish the Talon container images to GHCR.
 #
-# On a version tag (vX.Y.Z) each image is pushed to
-# ghcr.io/<owner>/talon-<binary> with semver, major.minor, sha, and `latest`
-# tags. Pull requests do NOT run this workflow — the docker-build job in ci.yml
-# already smoke-builds every image (no push) on PRs.
+# Merges to main publish ghcr.io/<owner>/talon-<binary> with `latest` and
+# `sha-<short>` tags, so the images the compose files, Helm chart, and docs
+# reference always track the default branch. `latest` always converges on the
+# newest merged commit; rapid merges may coalesce queued runs (the per-ref
+# concurrency group keeps one pending slot), so an intermediate commit is not
+# guaranteed its own sha-* image. A version tag (vX.Y.Z) additionally
+# publishes semver and major.minor tags; `latest` tracks main only, so a tag
+# publish racing a main publish can never leave `latest` mixed across the
+# three images. Pull requests do NOT run this workflow — the docker-build job
+# in ci.yml already smoke-builds every image (no push).
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
-  # Allow a manual publish of `latest` from the default branch.
+  # Allow a manual publish from the default branch.
   workflow_dispatch:
 
 # Least-privilege: only the GHCR push needs package write; the built-in
@@ -55,12 +63,16 @@ jobs:
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository_owner }}/talon-${{ matrix.image }}
+          # latest=false disables the implicit `latest` that semver tags would
+          # otherwise add (it would also fire on prereleases like v1.2.3-rc.1);
+          # `latest` comes only from the default-branch line below.
+          flavor: |
+            latest=false
           tags: |
             type=semver,pattern={{version}}
             type=semver,pattern={{major}}.{{minor}}
             type=sha
             type=raw,value=latest,enable={{is_default_branch}}
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
 
       - name: Build and push
         uses: docker/build-push-action@v6
@@ -71,4 +83,7 @@ jobs:
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha,scope=${{ matrix.image }}
-          cache-to: type=gha,scope=${{ matrix.image }},mode=max
+          # Only main seeds the shared layer cache: entries written from tag
+          # refs are unreadable by other refs, so writing them would only churn
+          # the repository's 10GB Actions cache quota.
+          cache-to: ${{ github.ref == 'refs/heads/main' && format('type=gha,scope={0},mode=max', matrix.image) || '' }}
