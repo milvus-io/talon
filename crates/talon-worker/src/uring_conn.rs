@@ -60,7 +60,7 @@ use monoio::net::TcpStream;
 use talon_core::{BlockHandle, RequestId};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
-use talon_transport::uring::{read_frame, write_all};
+use talon_transport::uring::{write_all, BufferedFrameReader};
 
 use crate::observability::WorkerObservability;
 use crate::runtime::{ServeOutcome, WorkerRuntime};
@@ -73,23 +73,30 @@ pub async fn handle_conn(
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
     let _active_connection = observability.metrics().track_connection();
+    // One buffered reader per connection. A client that pipelines costs a single
+    // `recv` for the whole batch instead of two ring operations per request; a
+    // client that does not is unaffected beyond a copy.
+    let mut reader = BufferedFrameReader::new();
     loop {
         let request_started = Instant::now();
-        let (header, payload) =
-            match read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT).await {
-                Ok(frame) => frame,
-                Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
-                Err(talon_transport::ReadFrameError::Timeout) => {
-                    tracing::debug!("worker: connection read timed out");
-                    return Ok(());
-                }
-                Err(e) => return Err(anyhow::anyhow!(e)),
-            };
+        let (header, payload) = match reader
+            .next_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT)
+            .await
+        {
+            Ok(frame) => frame,
+            Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
+            Err(talon_transport::ReadFrameError::Timeout) => {
+                tracing::debug!("worker: connection read timed out");
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        };
 
         match header.msg_type {
             MsgType::Put => {
                 handle_put(
                     &mut stream,
+                    &mut reader,
                     &header,
                     &payload,
                     &worker,
@@ -364,6 +371,7 @@ async fn handle_control_frame(
 /// backend, cache it, and reply with the committed version.
 async fn handle_put(
     stream: &mut TcpStream,
+    reader: &mut BufferedFrameReader,
     header: &FrameHeader,
     payload: &[u8],
     worker: &Arc<WorkerRuntime>,
@@ -387,12 +395,16 @@ async fn handle_put(
         return Ok(());
     }
 
-    use monoio::io::AsyncReadRentExt;
+    // The body is unframed and follows the header directly, so it must be read
+    // through `reader`: while batching, the reader may already hold some or all
+    // of these bytes, and going to the socket would skip them and store a
+    // corrupt object.
     let write_result = if req.body_len <= worker.max_inline_write_bytes() {
         let body_len = usize::try_from(req.body_len)
             .map_err(|_| anyhow::anyhow!("PUT body length is not representable"))?;
-        let (res, body) = stream.read_exact(vec![0u8; body_len]).await;
-        res?;
+        let body = reader
+            .read_exact_bytes(stream, body_len, talon_transport::DEFAULT_READ_TIMEOUT)
+            .await?;
         worker
             .write_object(&req.object, bytes::Bytes::from(body))
             .await
@@ -402,8 +414,9 @@ async fn handle_put(
         let mut remaining = req.body_len;
         while remaining > 0 {
             let chunk_len = remaining.min(8 * 1024 * 1024) as usize;
-            let (res, chunk) = stream.read_exact(vec![0u8; chunk_len]).await;
-            res?;
+            let chunk = reader
+                .read_exact_bytes(stream, chunk_len, talon_transport::DEFAULT_READ_TIMEOUT)
+                .await?;
             if chunk.iter().all(|byte| *byte == 0) {
                 file.seek(std::io::SeekFrom::Current(chunk_len as i64))?;
             } else {
