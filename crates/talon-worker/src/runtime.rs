@@ -2307,7 +2307,8 @@ mod tests {
         use std::io::{Read, Seek, SeekFrom};
         match outcome {
             ServeOutcome::Sendfile(handle) => {
-                let mut f = std::fs::File::from(handle.fd);
+                // Dup: the descriptor is shared, so this reader must not close it.
+                let mut f = std::fs::File::from(handle.fd.try_clone().unwrap());
                 f.seek(SeekFrom::Start(handle.offset)).unwrap();
                 let mut buf = vec![0u8; handle.len as usize];
                 f.read_exact(&mut buf).unwrap();
@@ -3447,7 +3448,8 @@ mod tests {
         match runtime.serve(&request).await.unwrap() {
             ServeOutcome::Sendfile(handle) => {
                 let mut buf = vec![0u8; handle.len as usize];
-                let file = std::fs::File::from(handle.fd);
+                // Dup: the descriptor is shared, so this reader must not close it.
+                let file = std::fs::File::from(handle.fd.try_clone().unwrap());
                 file.read_exact_at(&mut buf, handle.offset).unwrap();
                 assert_eq!(Bytes::from(buf), expected(70, 10));
             }

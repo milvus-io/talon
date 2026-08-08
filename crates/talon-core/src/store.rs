@@ -9,16 +9,23 @@ use crate::{BlockId, PageIndex, Result};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::os::fd::OwnedFd;
+use std::sync::Arc;
 
 /// A zero-copy read source: a file descriptor plus the byte range to serve.
 ///
 /// The transport layer performs `sendfile(fd, socket, offset, len)`. Keeping
 /// this to `std` fd types means `talon-core` carries no transport or syscall
 /// dependency.
-#[derive(Debug)]
+///
+/// The fd is held behind an [`Arc`] so a store can keep a cached descriptor for
+/// an immutable, content-addressed block file and hand out shared handles,
+/// rather than paying `openat` + `statx` + `close` on every request. The
+/// underlying file is closed once the store's cached entry and all in-flight
+/// handles are dropped.
+#[derive(Debug, Clone)]
 pub struct BlockHandle {
     /// File descriptor backing the cached block or page.
-    pub fd: OwnedFd,
+    pub fd: Arc<OwnedFd>,
     /// Byte offset within the file at which the requested data starts.
     pub offset: u64,
     /// Number of bytes to serve from `offset`.
@@ -26,8 +33,20 @@ pub struct BlockHandle {
 }
 
 impl BlockHandle {
-    /// Create a new handle.
+    /// Create a new handle taking sole ownership of `fd`.
     pub fn new(fd: OwnedFd, offset: u64, len: u64) -> Self {
+        Self {
+            fd: Arc::new(fd),
+            offset,
+            len,
+        }
+    }
+
+    /// Create a handle over an already-shared descriptor.
+    ///
+    /// Used by stores that cache open fds for immutable block files: the same
+    /// descriptor backs many concurrent handles without a per-request `openat`.
+    pub fn from_shared(fd: Arc<OwnedFd>, offset: u64, len: u64) -> Self {
         Self { fd, offset, len }
     }
 }
