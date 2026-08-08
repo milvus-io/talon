@@ -73,6 +73,18 @@ struct Args {
     /// Emit JSON Lines instead of a table, for scripted comparison.
     #[arg(long)]
     json: bool,
+    /// Requests kept in flight per connection (pipeline depth).
+    ///
+    /// The default of 1 is closed-loop: send one request, wait for its reply.
+    /// That measures per-request latency but leaves nothing to amortise — the
+    /// server pays a full wakeup and two reads per request. A depth above 1
+    /// pipelines: `depth` requests are written before the first reply is read,
+    /// and each reply immediately refills the window. This is HTTP/1.1-style
+    /// pipelining, not multiplexing: the worker serves one connection's
+    /// requests sequentially, so replies come back in request order and the
+    /// pending window is a FIFO, not a map.
+    #[arg(long, default_value_t = 1)]
+    depth: usize,
 }
 
 /// One connection count's result.
@@ -114,6 +126,7 @@ fn proc_rss_kb(pid: u32) -> Option<u64> {
 
 /// Drive one connection closed-loop until `stop`, returning post-warmup
 /// latencies in nanoseconds.
+#[allow(clippy::too_many_arguments)]
 async fn drive_one(
     addr: String,
     object: ObjectId,
@@ -122,7 +135,21 @@ async fn drive_one(
     stop: Arc<AtomicBool>,
     errors: Arc<AtomicU64>,
     offset_seed: u64,
+    depth: usize,
 ) -> Vec<u64> {
+    if depth > 1 {
+        return drive_one_pipelined(
+            addr,
+            object,
+            range,
+            warmup,
+            stop,
+            errors,
+            offset_seed,
+            depth,
+        )
+        .await;
+    }
     let mut sock = match TcpStream::connect(&addr).await {
         Ok(s) => s,
         Err(_) => {
@@ -194,6 +221,157 @@ async fn drive_one(
     latencies
 }
 
+/// Drive one connection with `depth` requests in flight, returning post-warmup
+/// latencies in nanoseconds.
+///
+/// The window is a FIFO of send timestamps and request ids. The worker serves a
+/// connection's requests one at a time, so the *n*th reply belongs to the *n*th
+/// request; the id is carried anyway and checked, so a server that ever starts
+/// reordering fails the run loudly instead of silently reporting another
+/// request's latency.
+///
+/// Reads and writes must overlap or the depth is a lie: writing `depth`
+/// requests up front and only then reading would still stall on a full socket
+/// buffer. The socket is split so a writer task refills the window while this
+/// task drains replies.
+#[allow(clippy::too_many_arguments)]
+async fn drive_one_pipelined(
+    addr: String,
+    object: ObjectId,
+    range: u64,
+    warmup: Duration,
+    stop: Arc<AtomicBool>,
+    errors: Arc<AtomicU64>,
+    offset_seed: u64,
+    depth: usize,
+) -> Vec<u64> {
+    let sock = match TcpStream::connect(&addr).await {
+        Ok(s) => s,
+        Err(_) => {
+            errors.fetch_add(1, Ordering::Relaxed);
+            return Vec::new();
+        }
+    };
+    sock.set_nodelay(true).ok();
+    let (rd, mut wr) = sock.into_split();
+
+    // The writer task owns the write half exclusively, so a request frame is
+    // never interleaved with another's bytes. `credits` bounds the window: the
+    // reader returns one credit per reply, which is what keeps exactly `depth`
+    // requests outstanding rather than an unbounded flood.
+    let (credit_tx, mut credit_rx) = tokio::sync::mpsc::channel::<()>(depth);
+    let (sent_tx, mut sent_rx) = tokio::sync::mpsc::channel::<(u32, Instant)>(depth);
+    // Local to this connection: the reader ending must stop *this* writer, not
+    // the whole run. `stop` is shared by every connection and is the run clock.
+    let done = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let writer_done = Arc::clone(&done);
+    let writer_errors = Arc::clone(&errors);
+    let writer = tokio::spawn(async move {
+        let mut offset = (offset_seed * range) % (16 << 20);
+        let mut next_id: u32 = 1;
+        let mut window = 0usize;
+        while !writer_stop.load(Ordering::Relaxed) && !writer_done.load(Ordering::Relaxed) {
+            // Refill up to `depth`; past that, block until a reply frees a slot
+            // so a slow server backpressures the client instead of queueing.
+            if window == depth {
+                match credit_rx.recv().await {
+                    Some(()) => window -= 1,
+                    None => break,
+                }
+            }
+            let request = RangeRequest {
+                object: object.clone(),
+                offset,
+                len: range,
+            };
+            let id = next_id;
+            next_id = next_id.wrapping_add(1).max(1);
+            let Ok(encoded) = encode_request(id, &request) else {
+                break;
+            };
+            // Record the send before it hits the wire: a reply can be parsed by
+            // the reader before this task is polled again, and an id missing
+            // from the FIFO would be indistinguishable from a reordered reply.
+            if sent_tx.send((id, Instant::now())).await.is_err() {
+                break;
+            }
+            if wr.write_all(&encoded).await.is_err() {
+                writer_errors.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            window += 1;
+            offset = (offset + range) % (16 << 20);
+        }
+    });
+
+    let mut rd = rd;
+    let mut latencies: Vec<u64> = Vec::with_capacity(1 << 14);
+    let mut body = vec![0u8; range as usize];
+    let mut header_buf = [0u8; HEADER_LEN];
+    let started = Instant::now();
+    let mut recording = false;
+
+    while !stop.load(Ordering::Relaxed) {
+        if !recording && started.elapsed() >= warmup {
+            recording = true;
+            latencies.clear();
+        }
+        let Some((expect_id, t0)) = sent_rx.recv().await else {
+            break;
+        };
+        if rd.read_exact(&mut header_buf).await.is_err() {
+            errors.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        let Ok(header) = FrameHeader::decode(&header_buf) else {
+            errors.fetch_add(1, Ordering::Relaxed);
+            break;
+        };
+        let len = header.length as usize;
+        if len > body.len() {
+            body.resize(len, 0);
+        }
+        if len > 0 && rd.read_exact(&mut body[..len]).await.is_err() {
+            errors.fetch_add(1, Ordering::Relaxed);
+            break;
+        }
+        // Replies are positional here. If one ever arrives out of order the
+        // latency below would be charged to the wrong request, so refuse to
+        // report a number rather than report a wrong one.
+        if header.request_id != expect_id {
+            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "out-of-order reply: expected request_id {expect_id}, got {}",
+                    header.request_id
+                );
+            }
+            break;
+        }
+        if header.flags.contains(talon_transport::Flags::ERROR) {
+            if errors.fetch_add(1, Ordering::Relaxed) == 0 {
+                eprintln!(
+                    "first error response: {}",
+                    String::from_utf8_lossy(&body[..len])
+                );
+            }
+        } else if recording {
+            latencies.push(t0.elapsed().as_nanos() as u64);
+        }
+        // Returning the credit after recording keeps the window at `depth`.
+        // A closed channel means the writer is gone; the next recv ends the run.
+        if credit_tx.send(()).await.is_err() {
+            break;
+        }
+    }
+
+    done.store(true, Ordering::Relaxed);
+    drop(credit_tx);
+    drop(sent_rx);
+    let _ = writer.await;
+    latencies
+}
+
 async fn run_one(args: &Args, conns: usize) -> Run {
     let object = ObjectId::new(args.backend, &args.container, &args.object);
     let stop = Arc::new(AtomicBool::new(false));
@@ -210,6 +388,7 @@ async fn run_one(args: &Args, conns: usize) -> Run {
             Arc::clone(&stop),
             Arc::clone(&errors),
             i as u64,
+            args.depth.max(1),
         )));
     }
 
