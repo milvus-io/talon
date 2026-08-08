@@ -64,6 +64,69 @@ pub fn send_file_range(
     Ok(sent_total)
 }
 
+/// Send `header` and then `[offset, offset + len)` of `file` to `sock` in a
+/// single blocking step.
+///
+/// This is [`send_file_range`] with the response frame header prepended. Doing
+/// both here rather than writing the header from the ring saves a full
+/// ring-to-blocking-pool round-trip per request — measured as the dominant
+/// per-request cost on the serve path, since the payload copy itself is
+/// already zero-copy.
+///
+/// The header goes out with `MSG_MORE` so the kernel holds it back and
+/// coalesces it with the first `sendfile` chunk into one TCP segment instead
+/// of emitting a tiny header-only packet.
+///
+/// Returns the number of *payload* bytes sent (header bytes are not counted),
+/// so the caller can apply the same short-send check as [`send_file_range`].
+pub fn send_header_and_file_range(
+    sock: &impl AsRawFd,
+    header: &[u8],
+    file: &impl AsRawFd,
+    offset: u64,
+    len: u64,
+    chunk: usize,
+) -> io::Result<u64> {
+    let out_fd: RawFd = sock.as_raw_fd();
+
+    let mut written = 0usize;
+    while written < header.len() {
+        // SAFETY: valid fd; the pointer/length pair stays inside `header`.
+        let n = unsafe {
+            libc::send(
+                out_fd,
+                header[written..].as_ptr() as *const libc::c_void,
+                header.len() - written,
+                libc::MSG_MORE | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                _ => return Err(err),
+            }
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "socket accepted no header bytes",
+            ));
+        }
+        written += n as usize;
+    }
+
+    // `MSG_MORE` leaves the header corked; the sendfile below uncorks it by
+    // filling the segment. A zero-length payload would strand it, so flush.
+    if len == 0 {
+        // SAFETY: valid fd; a zero-length send with no MSG_MORE flushes.
+        unsafe { libc::send(out_fd, [].as_ptr(), 0, libc::MSG_NOSIGNAL) };
+        return Ok(0);
+    }
+
+    send_file_range(sock, file, offset, len, chunk)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -137,5 +200,63 @@ mod tests {
         // Ask for more than the file holds; sendfile stops at EOF.
         let got = roundtrip(data, 0, 1000, DEFAULT_CHUNK);
         assert_eq!(got, data);
+    }
+
+    /// Same as [`roundtrip`] but through the header-coalescing entry point.
+    fn roundtrip_with_header(
+        header: &[u8],
+        data: &[u8],
+        offset: u64,
+        len: u64,
+        chunk: usize,
+    ) -> Vec<u8> {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let file = temp_file_with(data);
+        let header = header.to_vec();
+
+        let server = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            let sent =
+                send_header_and_file_range(&conn, &header, &file, offset, len, chunk).unwrap();
+            conn.flush().unwrap();
+            sent
+        });
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        let mut got = Vec::new();
+        client.read_to_end(&mut got).unwrap();
+        let payload_sent = server.join().unwrap();
+        // The return value counts payload only, never the header.
+        assert_eq!(payload_sent as usize, got.len() - HDR.len());
+        got
+    }
+
+    const HDR: &[u8] = b"\x01\x02\x03\x04HEADERBYTES!";
+
+    #[test]
+    fn header_precedes_payload_byte_exactly() {
+        let data: Vec<u8> = (0..8192u32).map(|i| (i % 256) as u8).collect();
+        let got = roundtrip_with_header(HDR, &data, 0, data.len() as u64, DEFAULT_CHUNK);
+        assert_eq!(&got[..HDR.len()], HDR);
+        assert_eq!(&got[HDR.len()..], &data[..]);
+    }
+
+    #[test]
+    fn header_precedes_sub_range_and_survives_chunking() {
+        let data: Vec<u8> = (0..10_000u32).map(|i| (i * 13 % 251) as u8).collect();
+        let (off, len) = (777u64, 3333u64);
+        // A tiny chunk forces many sendfile calls after the corked header.
+        let got = roundtrip_with_header(HDR, &data, off, len, 64);
+        assert_eq!(&got[..HDR.len()], HDR);
+        assert_eq!(&got[HDR.len()..], &data[off as usize..(off + len) as usize]);
+    }
+
+    /// `MSG_MORE` corks the header; with no payload to uncork it the bytes
+    /// would sit in the kernel forever. The zero-length flush must release it.
+    #[test]
+    fn header_is_flushed_when_payload_is_empty() {
+        let got = roundtrip_with_header(HDR, b"anything", 0, 0, DEFAULT_CHUNK);
+        assert_eq!(got, HDR);
     }
 }

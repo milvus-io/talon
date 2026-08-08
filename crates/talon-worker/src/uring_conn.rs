@@ -64,7 +64,7 @@ use talon_transport::uring::{read_frame, write_all};
 
 use crate::observability::WorkerObservability;
 use crate::runtime::{ServeOutcome, WorkerRuntime};
-use crate::{send_file_range, DEFAULT_CHUNK};
+use crate::{send_header_and_file_range, DEFAULT_CHUNK};
 
 /// Serve one accepted data-plane connection until EOF or a fatal error.
 pub async fn handle_conn(
@@ -167,8 +167,7 @@ pub async fn handle_conn(
             Ok(ServeOutcome::Sendfile(handle)) => {
                 let len = handle.len;
                 let hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
-                write_all(&mut stream, hdr).await?;
-                match sendfile_payload(&stream, handle).await {
+                match sendfile_payload(&stream, hdr, handle).await {
                     Ok(()) => observability
                         .metrics()
                         .record_request_success(len, request_started.elapsed()),
@@ -220,21 +219,31 @@ fn rejoin(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
 }
 
 /// Stream a resident block to the client with `sendfile(2)` from the blocking
-/// pool.
+/// pool, writing the response frame header in the same blocking step.
 ///
 /// The ring keeps ownership of the socket throughout: only the raw fd crosses
 /// to the blocking thread, so there is no `into_std`/`from_std` round-trip and
 /// no non-blocking-mode toggling. `sendfile` must not run on the ring — it is
 /// blocking, and a slow client would stall every connection this ring owns.
-async fn sendfile_payload(stream: &TcpStream, handle: BlockHandle) -> anyhow::Result<()> {
+///
+/// The header travels with the payload rather than being written from the ring
+/// first: that removes one ring-to-pool hand-off (and its futex wake) per
+/// request, and `MSG_MORE` lets the kernel put the header and the first
+/// payload chunk in one segment.
+async fn sendfile_payload(
+    stream: &TcpStream,
+    header: Vec<u8>,
+    handle: BlockHandle,
+) -> anyhow::Result<()> {
     let sock_fd = stream.as_raw_fd();
     let len = handle.len;
     let sent = monoio::spawn_blocking(move || {
         // SAFETY-adjacent note: the fd outlives this call because `stream` is
         // borrowed for the duration of the await, and the connection task is the
         // only owner.
-        send_file_range(
+        send_header_and_file_range(
             &FdRef(sock_fd),
+            &header,
             &handle.fd,
             handle.offset,
             handle.len,
