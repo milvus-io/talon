@@ -73,32 +73,64 @@ fn principal_hash(principal: &AuthenticatedPrincipal) -> String {
 }
 
 fn resource_hash(access: &GatewayAccess) -> String {
-    match &access.target {
-        GatewayTarget::Object(object) => hash_parts(&[
-            access.provider_account.as_deref().unwrap_or(""),
-            object.backend.prefix(),
-            &object.bucket,
-            &object.object_path,
-        ]),
+    let mut hash = Sha256::new();
+    hash_requirement(
+        &mut hash,
+        access.operation,
+        access.provider_account.as_deref(),
+        &access.target,
+    );
+    for requirement in &access.additional {
+        hash_requirement(
+            &mut hash,
+            requirement.operation,
+            requirement.provider_account.as_deref(),
+            &requirement.target,
+        );
+    }
+    truncate_hash(hash)
+}
+
+fn hash_requirement(
+    hash: &mut Sha256,
+    operation: crate::GatewayOperation,
+    provider_account: Option<&str>,
+    target: &GatewayTarget,
+) {
+    update_hash(hash, operation.label());
+    update_hash(hash, provider_account.unwrap_or(""));
+    match target {
+        GatewayTarget::Object(object) => {
+            update_hash(hash, object.backend.prefix());
+            update_hash(hash, &object.bucket);
+            update_hash(hash, &object.object_path);
+        }
         GatewayTarget::Namespace {
             backend,
             namespace,
             prefix,
-        } => hash_parts(&[
-            access.provider_account.as_deref().unwrap_or(""),
-            backend.prefix(),
-            namespace,
-            prefix.as_deref().unwrap_or(""),
-        ]),
+        } => {
+            update_hash(hash, backend.prefix());
+            update_hash(hash, namespace);
+            update_hash(hash, prefix.as_deref().unwrap_or(""));
+        }
     }
 }
 
 fn hash_parts(parts: &[&str]) -> String {
     let mut hash = Sha256::new();
     for part in parts {
-        hash.update((part.len() as u64).to_be_bytes());
-        hash.update(part.as_bytes());
+        update_hash(&mut hash, part);
     }
+    truncate_hash(hash)
+}
+
+fn update_hash(hash: &mut Sha256, part: &str) {
+    hash.update((part.len() as u64).to_be_bytes());
+    hash.update(part.as_bytes());
+}
+
+fn truncate_hash(hash: Sha256) -> String {
     let digest = hash.finalize();
     let mut output = String::with_capacity(32);
     for byte in &digest[..16] {
@@ -126,6 +158,7 @@ mod tests {
                 "private-bucket",
                 "customer/path.txt",
             )),
+            additional: Vec::new(),
         };
         let event = SecurityAuditEvent::new(
             "request-id",
@@ -146,5 +179,26 @@ mod tests {
         ] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn copy_source_changes_resource_hash_without_being_exposed() {
+        let mut first = GatewayAccess {
+            operation: GatewayOperation::Write,
+            provider_account: Some("account-secret".into()),
+            target: GatewayTarget::Object(ObjectId::new(Backend::S3, "dst", "object")),
+            additional: vec![crate::GatewayAccessRequirement {
+                operation: GatewayOperation::Read,
+                provider_account: Some("account-secret".into()),
+                target: GatewayTarget::Object(ObjectId::new(Backend::S3, "src", "first")),
+            }],
+        };
+        let first_hash = resource_hash(&first);
+        first.additional[0].target =
+            GatewayTarget::Object(ObjectId::new(Backend::S3, "src", "second-secret"));
+        let second_hash = resource_hash(&first);
+        assert_ne!(first_hash, second_hash);
+        assert_eq!(first_hash.len(), 32);
+        assert_eq!(second_hash.len(), 32);
     }
 }

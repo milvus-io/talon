@@ -1427,6 +1427,7 @@ impl AzureBlobAdapter {
                     namespace: target.container,
                     prefix: query.prefix,
                 },
+                additional: Vec::new(),
             });
         }
         let blob = target.blob.ok_or_else(|| {
@@ -1443,6 +1444,7 @@ impl AzureBlobAdapter {
             operation,
             provider_account: Some(self.config.account.clone()),
             target: GatewayTarget::Object(ObjectId::new(Backend::Azure, target.container, blob)),
+            additional: Vec::new(),
         })
     }
 

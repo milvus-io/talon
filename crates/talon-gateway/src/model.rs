@@ -189,6 +189,19 @@ pub struct GatewayAccess {
     pub provider_account: Option<String>,
     /// Canonical namespace and optional object or listing prefix.
     pub target: GatewayTarget,
+    /// Additional resources that the same request must be authorized to access.
+    pub additional: Vec<GatewayAccessRequirement>,
+}
+
+/// One secondary authorization requirement for a multi-resource operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayAccessRequirement {
+    /// Required operation on the secondary target.
+    pub operation: GatewayOperation,
+    /// Provider tenant or storage account, when protocol parsing establishes it.
+    pub provider_account: Option<String>,
+    /// Canonical secondary target.
+    pub target: GatewayTarget,
 }
 
 /// Adapter response plus provider-neutral accounting metadata.

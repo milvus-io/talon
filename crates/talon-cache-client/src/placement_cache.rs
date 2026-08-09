@@ -17,7 +17,7 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 
 use crate::lock::RwLockExt;
-use talon_core::BlockId;
+use talon_core::{BlockId, ObjectId};
 
 /// Why a cached placement entry was (or should be) invalidated.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +113,14 @@ impl PlacementCache {
         self.entries.write_recover().remove(block).is_some()
     }
 
+    /// Invalidate every cached placement for an object after a committed mutation.
+    pub fn invalidate_object(&self, object: &ObjectId) -> usize {
+        let mut entries = self.entries.write_recover();
+        let before = entries.len();
+        entries.retain(|block, _| &block.object != object);
+        before - entries.len()
+    }
+
     /// Reconcile against an observed placement version: if the cached entry's
     /// version differs from `observed_epoch`, drop it so the next access
     /// re-ranks against membership.
@@ -199,6 +207,23 @@ mod tests {
             // Second invalidate is a no-op.
             assert!(!c.invalidate(&block(2), reason));
         }
+    }
+
+    #[test]
+    fn object_invalidation_removes_every_version_and_only_that_object() {
+        let c = PlacementCache::new(1000);
+        let first = block(1);
+        let mut second_version = first.clone();
+        second_version.version = Version::new("v2");
+        let other = block(2);
+        c.insert(first.clone(), cached(1, &["a"]), 0);
+        c.insert(second_version.clone(), cached(1, &["b"]), 0);
+        c.insert(other.clone(), cached(1, &["c"]), 0);
+
+        assert_eq!(c.invalidate_object(&first.object), 2);
+        assert!(c.get(&first, 0).is_none());
+        assert!(c.get(&second_version, 0).is_none());
+        assert!(c.get(&other, 0).is_some());
     }
 
     #[test]

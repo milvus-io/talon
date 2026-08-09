@@ -94,27 +94,48 @@ impl AuthorizationPolicy {
         protocol: ProviderProtocol,
         access: &GatewayAccess,
     ) -> bool {
-        if access
-            .provider_account
-            .as_deref()
-            .is_some_and(|account| account != principal.provider_account)
-        {
-            return false;
-        }
-        let (backend, namespace, requested_prefix) = target_parts(&access.target);
-        if backend != protocol_backend(protocol) {
-            return false;
-        }
         let current = self.current.read().unwrap().clone();
-        current.grants.iter().any(|grant| {
+        allows_requirement(
+            &current,
+            principal,
+            protocol,
+            access.operation,
+            access.provider_account.as_deref(),
+            &access.target,
+        ) && access.additional.iter().all(|requirement| {
+            allows_requirement(
+                &current,
+                principal,
+                protocol,
+                requirement.operation,
+                requirement.provider_account.as_deref(),
+                &requirement.target,
+            )
+        })
+    }
+}
+
+fn allows_requirement(
+    policy: &CompiledPolicy,
+    principal: &AuthenticatedPrincipal,
+    protocol: ProviderProtocol,
+    operation: GatewayOperation,
+    provider_account: Option<&str>,
+    target: &GatewayTarget,
+) -> bool {
+    if provider_account.is_some_and(|account| account != principal.provider_account) {
+        return false;
+    }
+    let (backend, namespace, requested_prefix) = target_parts(target);
+    backend == protocol_backend(protocol)
+        && policy.grants.iter().any(|grant| {
             grant.principal == principal.id
                 && grant.protocol == protocol
                 && grant.provider_account == principal.provider_account
                 && grant.namespace == namespace
-                && grant.operations.contains(&access.operation)
+                && grant.operations.contains(&operation)
                 && prefix_contains(grant.prefix.as_deref(), requested_prefix)
         })
-    }
 }
 
 fn target_parts(target: &GatewayTarget) -> (Backend, &str, Option<&str>) {
@@ -226,6 +247,7 @@ mod tests {
             operation,
             provider_account: None,
             target: GatewayTarget::Object(ObjectId::new(Backend::S3, namespace, key)),
+            additional: Vec::new(),
         }
     }
 
@@ -238,6 +260,7 @@ mod tests {
                 namespace: "bucket-a".into(),
                 prefix: prefix.map(str::to_string),
             },
+            additional: Vec::new(),
         }
     }
 
@@ -332,5 +355,38 @@ mod tests {
             AuthorizationPolicy::new(vec![first, duplicate_id]),
             Err(AuthorizationPolicyError::AmbiguousGrant(_))
         ));
+    }
+
+    #[test]
+    fn every_copy_resource_must_be_authorized() {
+        let mut destination = grant(None);
+        destination.operations = vec![GatewayOperation::Write];
+        let mut source = grant(None);
+        source.id = "source".into();
+        source.namespace = "bucket-b".into();
+        source.operations = vec![GatewayOperation::Read];
+        let principal = AuthenticatedPrincipal::new("principal-a", "account-a");
+        let mut copy = access("bucket-a", "copy", GatewayOperation::Write);
+        copy.additional.push(crate::GatewayAccessRequirement {
+            operation: GatewayOperation::Read,
+            provider_account: None,
+            target: GatewayTarget::Object(ObjectId::new(Backend::S3, "bucket-b", "source")),
+        });
+
+        assert!(!AuthorizationPolicy::new(vec![destination.clone()])
+            .unwrap()
+            .allows(&principal, ProviderProtocol::S3, &copy));
+        assert!(AuthorizationPolicy::new(vec![destination, source])
+            .unwrap()
+            .allows(&principal, ProviderProtocol::S3, &copy));
+
+        copy.additional[0].provider_account = Some("account-b".into());
+        assert!(
+            !AuthorizationPolicy::new(vec![grant(None)]).unwrap().allows(
+                &principal,
+                ProviderProtocol::S3,
+                &copy
+            )
+        );
     }
 }

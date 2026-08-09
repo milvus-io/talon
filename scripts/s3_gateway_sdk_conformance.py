@@ -1,5 +1,8 @@
 """Drive the Talon S3 gateway with boto3 and the MinIO Python SDK."""
 
+import base64
+import hashlib
+import io
 import os
 import urllib.request
 from urllib.parse import urlparse
@@ -8,6 +11,7 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 from minio import Minio
+from minio.commonconfig import CopySource
 
 
 def expected_object() -> bytes:
@@ -35,6 +39,7 @@ def main() -> None:
         signature_version="s3v4",
         retries={"max_attempts": 0},
         s3={"addressing_style": "path"},
+        request_checksum_calculation="when_required",
     )
 
     origin = boto3.client(
@@ -85,6 +90,57 @@ def main() -> None:
         s3.get_object(Bucket=bucket, Key="gateway/list/a space.txt")["Body"].read()
         == b"a"
     )
+    mutation_key = "gateway/mutations/object.bin"
+    copy_key = "gateway/mutations/copied.bin"
+    first_body = b"created-through-gateway"
+    second_body = b"overwritten-through-gateway"
+    checksum = base64.b64encode(hashlib.sha256(first_body).digest()).decode("ascii")
+    created = s3.put_object(
+        Bucket=bucket,
+        Key=mutation_key,
+        Body=first_body,
+        Metadata={"owner": "sdk-conformance"},
+        ChecksumSHA256=checksum,
+        IfNoneMatch="*",
+    )
+    assert created["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert s3.get_object(Bucket=bucket, Key=mutation_key)["Body"].read() == first_body
+    metadata = s3.head_object(Bucket=bucket, Key=mutation_key)
+    assert metadata["Metadata"]["owner"] == "sdk-conformance"
+
+    try:
+        s3.put_object(
+            Bucket=bucket,
+            Key=mutation_key,
+            Body=b"must-not-land",
+            IfNoneMatch="*",
+        )
+        raise AssertionError("conditional overwrite unexpectedly succeeded")
+    except ClientError as error:
+        assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 412
+
+    s3.put_object(Bucket=bucket, Key=mutation_key, Body=second_body)
+    assert s3.get_object(Bucket=bucket, Key=mutation_key)["Body"].read() == second_body
+    copied = s3.copy_object(
+        Bucket=bucket,
+        Key=copy_key,
+        CopySource={"Bucket": bucket, "Key": mutation_key},
+        Metadata={"copied": "true"},
+        MetadataDirective="REPLACE",
+    )
+    assert copied["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert s3.get_object(Bucket=bucket, Key=copy_key)["Body"].read() == second_body
+    assert s3.head_object(Bucket=bucket, Key=copy_key)["Metadata"]["copied"] == "true"
+
+    s3.delete_object(Bucket=bucket, Key=mutation_key)
+    s3.delete_object(Bucket=bucket, Key=mutation_key)
+    s3.delete_object(Bucket=bucket, Key=copy_key)
+    for deleted_key in (mutation_key, copy_key):
+        try:
+            s3.head_object(Bucket=bucket, Key=deleted_key)
+            raise AssertionError("deleted object unexpectedly exists")
+        except ClientError as error:
+            assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
     first = s3.list_objects_v2(Bucket=bucket, Prefix="gateway/list/", MaxKeys=1)
     assert first["IsTruncated"]
     second = s3.list_objects_v2(
@@ -126,6 +182,22 @@ def main() -> None:
     }
     assert "gateway/list/a space.txt" in minio_names
     assert "gateway/list/child/b.txt" in minio_names
+
+    minio_key = "gateway/mutations/minio.bin"
+    minio_copy_key = "gateway/mutations/minio-copy.bin"
+    minio_body = b"written-with-minio"
+    minio.put_object(
+        bucket,
+        minio_key,
+        io.BytesIO(minio_body),
+        len(minio_body),
+        metadata={"owner": "minio"},
+    )
+    assert read_minio(minio.get_object(bucket, minio_key)) == minio_body
+    minio.copy_object(bucket, minio_copy_key, CopySource(bucket, minio_key))
+    assert read_minio(minio.get_object(bucket, minio_copy_key)) == minio_body
+    minio.remove_object(bucket, minio_key)
+    minio.remove_object(bucket, minio_copy_key)
 
     print("S3 SDK gateway conformance passed")
 

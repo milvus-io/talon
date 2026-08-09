@@ -23,6 +23,7 @@ percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 rustls.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
@@ -36,4 +37,3 @@ x509-cert.workspace = true
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
-tempfile.workspace = true

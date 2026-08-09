@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::http::{HttpClient, HttpRequest, HttpRequestBody, HttpResponse};
 
 /// Tunable latency model applied by [`DelayingHttpClient`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +141,20 @@ impl HttpClient for DelayingHttpClient {
             tokio::time::sleep(delay).await;
         }
         Ok(resp)
+    }
+
+    async fn execute_body(
+        &self,
+        req: HttpRequest,
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        let response = self.inner.execute_body(req, body, len).await?;
+        let delay = self.delay_for(response.body.len());
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(response)
     }
 }
 

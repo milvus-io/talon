@@ -49,7 +49,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse};
+use crate::http::{HttpClient, HttpRequest, HttpRequestBody, HttpResponse};
 
 /// Statuses worth another attempt: request timeout, throttling, and the
 /// transient server-side 5xx set. Deliberately excludes `501 Not Implemented`
@@ -317,6 +317,24 @@ impl HttpClient for RetryingHttpClient {
             attempt += 1;
         }
     }
+
+    async fn execute_body(
+        &self,
+        req: HttpRequest,
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        let timeout = self.config.attempt_timeout(len);
+        match tokio::time::timeout(timeout, self.inner.execute_body(req, body, len)).await {
+            Ok(result) => result,
+            Err(_) => {
+                if let Some(observer) = &self.observer {
+                    observer.on_timeout();
+                }
+                Err(format!("request timed out after {timeout:?}"))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -379,6 +397,15 @@ mod tests {
                 Err(e) => Err(e.clone()),
             }
         }
+
+        async fn execute_body(
+            &self,
+            req: HttpRequest,
+            _body: HttpRequestBody,
+            _len: u64,
+        ) -> Result<HttpResponse, String> {
+            self.execute(req).await
+        }
     }
 
     /// A client that never responds, to exercise the deadline.
@@ -440,6 +467,22 @@ mod tests {
 
     fn client(inner: Arc<dyn HttpClient>) -> RetryingHttpClient {
         RetryingHttpClient::new(inner, RetryConfig::default(), 7)
+    }
+
+    #[tokio::test]
+    async fn single_use_stream_is_never_retried() {
+        let inner = ScriptedHttp::new(vec![Ok(503), Ok(200)]);
+        let body = futures::stream::once(async { Ok(bytes::Bytes::from_static(b"payload")) });
+        let response = client(Arc::clone(&inner) as Arc<dyn HttpClient>)
+            .execute_body(
+                HttpRequest::new(Method::Put, "https://origin/o".into(), Vec::new()),
+                Box::pin(body),
+                7,
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status, 503);
+        assert_eq!(inner.calls(), 1);
     }
 
     // ── classification ───────────────────────────────────────────────
