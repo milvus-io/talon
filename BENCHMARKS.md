@@ -110,6 +110,119 @@ Notes on running it:
   refuses to turn error frames into latency numbers and prints the first error
   verbatim.
 
+## Where the serve path actually saturates
+
+The sweep above compares data planes against each other. It does not answer a
+prior question: *what is the ceiling, and what is holding it?* These runs do.
+They matter because an optimization that helps on loopback can be worth nothing
+on a real cluster, where a different resource runs out first.
+
+All numbers below: `talon-srv8` on AKS (`Standard_E64ads_v5` class node, worker
+capped at 8 CPU by its cgroup), 64 KiB ranges, all cache hits, 32 connections,
+20 s measured after a 6 s warmup, `talon-loadgen --depth 16`.
+
+### Loopback: the kernel is the bottleneck, not Talon
+
+Client and worker on the same node, over `127.0.0.1`:
+
+| metric | value |
+|---|---|
+| throughput | 167,278 rps = **11.0 GB/s** (87.7 Gbps) |
+| worker CPU | 5.78 of 8 cores |
+| **kernel time** | **85% of worker CPU** (12,873 of 15,079 ticks) |
+| user time | 15% (2,206 ticks) |
+
+CPU was sampled from `utime`/`stime` in `/proc/<pid>/stat` across the measured
+window. The split is the finding: **six sevenths of the worker's CPU is spent
+inside the kernel** — `sendfile` copying bytes and the TCP stack — and only one
+seventh in Talon's own code (frame decode, cache lookup, response assembly).
+
+The practical consequence is that user-space optimizations on this path have a
+small denominator. Halving *all* of Talon's user-space work on the serve path
+would move total CPU by about 7%. Work that removes copies or syscalls
+(zero-copy send, batched submission) acts on the 85%.
+
+### Across the network: the NIC is the bottleneck, and it binds first
+
+Same worker, driven from `talon-cli7-0` on a **different node**, over the pod
+network:
+
+| path | rps | GB/s | Gbps | p50 | p99 |
+|---|---|---|---|---|---|
+| loopback | 167,278 | 11.0 | 87.7 | 4,617 µs | 35,244 µs |
+| **cross-node** | **44,662** | **2.93** | **23.4** | 20,269 µs | 49,905 µs |
+
+Cross-node throughput is **27% of loopback**, and 23.4 Gbps against a 25 GbE
+link is the wire, saturated. On this cluster the NIC runs out well before the
+worker does — the worker is not the constraint at all.
+
+**Read the loopback number as a component ceiling, not a capacity claim.** It
+measures how fast the serve path can go when the network is free. Any change
+that moves the loopback number but not the cross-node number has not made the
+deployed system faster.
+
+### Pipelining: the one change that moved the network number
+
+Depth is requests kept in flight per connection (`--depth`). Cross-node:
+
+| depth | rps | GB/s | p50 |
+|---|---|---|---|
+| 1 | 22,315 | 1.46 | 762 µs |
+| **16** | **44,592** | **2.92** | 20,250 µs |
+
+Pipelining **doubles cross-node throughput**, because at depth 1 each connection
+pays a full network round trip per request and the link sits idle waiting. It
+buys throughput with latency: p50 rises 27×, as depth-16 queueing means a
+request waits behind 15 others. That is the expected trade, not a defect —
+depth 1 is latency-optimal, depth 16 is bandwidth-optimal.
+
+### Multiplexing: measured, and not merged
+
+Serving a connection's requests concurrently with out-of-order replies
+(multiplexing, as opposed to in-order pipelining) was implemented and measured
+against the same baseline. It did not pay:
+
+| | baseline | multiplexed | Δ |
+|---|---|---|---|
+| loopback rps | 167,278 | 160,725 | **−3.9%** |
+| loopback user ticks | 2,206 | 2,484 | **+12.6%** |
+| loopback kernel ticks | 12,873 | 12,895 | +0.2% |
+| loopback max latency | 51.7 ms | **5,111 ms** | 99× worse |
+| cross-node rps | 44,662 | 44,612 | −0.1% |
+
+The kernel time is unchanged — multiplexing does not remove a single copy or
+syscall — while user time rises by an eighth for task spawning, semaphore
+admission, and write-lock acquisition. Multiplexing exists to remove head-of-line
+blocking, which requires *variance* in per-request service time; a uniform
+all-cache-hit workload has none to remove, so only the overhead lands.
+
+The max-latency blowup is structural and worth recording. Two responses' bytes
+must never interleave on the wire, and `sendfile` cannot be paused mid-transfer,
+so the write half must be held exclusively for the duration of each response.
+Multiplexing therefore reintroduces at the writer exactly the serialization it
+removes at the reader — and adds lock queueing on top.
+
+Cross-node the two are indistinguishable, because there the NIC decides.
+
+**Conclusion: not merged.** Multiplexing may still pay on a workload with genuine
+service-time variance (mixed cache hits and origin misses on one connection),
+which is the condition to test before revisiting it. It does not pay here.
+
+### Method notes
+
+- **Paired and order-swapped.** Baseline and candidate were run alternately, and
+  the order reversed between rounds, so drift in the shared cluster cannot
+  masquerade as an effect.
+- **Baselines built from the exact parent commit**, not from a nearby branch.
+  Comparing against a tree that already contains another change produces a
+  confident and wrong number; this was caught happening.
+- **The measurement client can be the bottleneck.** An earlier version of
+  `talon-loadgen` matched pipelined replies positionally, which serialized its
+  own reader and capped every depth-16 result near 85k rps — half the true
+  figure. Numbers recorded before that fix understate the worker and should not
+  be compared against numbers here. When a candidate and its baseline both sit
+  at a suspiciously equal ceiling, suspect the harness.
+
 ## For coding agents
 
 - One command surface: `just bench`, `just bench-save`, `just bench-check`.
