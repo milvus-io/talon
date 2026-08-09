@@ -19,6 +19,7 @@ use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutBody;
 
+use crate::authorization::{AuthenticatedPrincipal, AuthorizationPolicy};
 use crate::config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
 use crate::metrics::{GatewayMetrics, RequestObservation, ResponseObserver};
 use crate::model::{
@@ -59,8 +60,10 @@ impl GatewayReadiness {
     }
 
     /// Update installed production security components.
-    pub fn set_security(&self, security: GatewaySecurity) {
-        *self.security.write().unwrap() = security;
+    pub fn set_security(&self, mut security: GatewaySecurity) {
+        let mut current = self.security.write().unwrap();
+        security.authorization = current.authorization;
+        *current = security;
     }
 
     /// Update the TLS readiness bit from the installed listener state.
@@ -114,6 +117,7 @@ pub struct GatewayRuntime {
     adapter: Arc<dyn GatewayAdapter>,
     readiness: Arc<GatewayReadiness>,
     metrics: GatewayMetrics,
+    authorization: RwLock<Option<AuthorizationPolicy>>,
 }
 
 impl GatewayRuntime {
@@ -121,9 +125,10 @@ impl GatewayRuntime {
     pub fn new(
         config: GatewayConfig,
         adapter: Arc<dyn GatewayAdapter>,
-        security: GatewaySecurity,
+        mut security: GatewaySecurity,
     ) -> Result<Self, GatewayConfigError> {
         config.validate()?;
+        security.authorization = false;
         if config.mode == GatewayMode::Development {
             tracing::warn!(
                 bind = %config.bind,
@@ -135,6 +140,7 @@ impl GatewayRuntime {
             config,
             adapter,
             metrics: GatewayMetrics::new(),
+            authorization: RwLock::new(None),
         })
     }
 
@@ -146,6 +152,13 @@ impl GatewayRuntime {
     /// Shared metrics registry.
     pub fn metrics(&self) -> &GatewayMetrics {
         &self.metrics
+    }
+
+    /// Atomically install a compiled default-deny authorization policy.
+    pub fn install_authorization(&self, policy: AuthorizationPolicy) {
+        *self.authorization.write().unwrap() = Some(policy);
+        let mut security = self.readiness.security.write().unwrap();
+        security.authorization = true;
     }
 }
 
@@ -257,6 +270,46 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
     let elapsed = context.started.elapsed();
     let remaining = runtime.config.request_deadline.saturating_sub(elapsed);
     let protocol = runtime.adapter.protocol();
+    let policy = runtime.authorization.read().unwrap().clone();
+    if let Some(policy) = policy {
+        let access = match runtime.adapter.access(&request, &context) {
+            Ok(access) => access,
+            Err(result) => return record_adapter_result(&runtime, protocol, &context, *result),
+        };
+        let principal = request.extensions().get::<AuthenticatedPrincipal>();
+        if principal.map_or(true, |principal| {
+            !policy.allows(principal, protocol, &access)
+        }) {
+            runtime.metrics.record_authorization("deny");
+            tracing::warn!(
+                request_id = context.request_id,
+                protocol = protocol.label(),
+                operation = access.operation.label(),
+                decision = "deny",
+                "gateway authorization decision"
+            );
+            let result = GatewayResponse {
+                response: (StatusCode::FORBIDDEN, "request is not authorized").into_response(),
+                operation: access.operation,
+                target: Some(access.target),
+                route: GatewayRoute::None,
+                outcome: GatewayOutcome::Failed,
+                failure: Some(FailureReason::Authorization),
+                requested_bytes: 0,
+                cache_bytes: 0,
+                origin_bytes: 0,
+            };
+            return record_adapter_result(&runtime, protocol, &context, result);
+        }
+        runtime.metrics.record_authorization("allow");
+        tracing::info!(
+            request_id = context.request_id,
+            protocol = protocol.label(),
+            operation = access.operation.label(),
+            decision = "allow",
+            "gateway authorization decision"
+        );
+    }
     let result =
         match tokio::time::timeout(remaining, runtime.adapter.handle(request, context.clone()))
             .await
@@ -279,6 +332,15 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
             },
         };
 
+    record_adapter_result(&runtime, protocol, &context, result)
+}
+
+fn record_adapter_result(
+    runtime: &GatewayRuntime,
+    protocol: crate::ProviderProtocol,
+    context: &GatewayRequestContext,
+    result: GatewayResponse,
+) -> Response {
     let mut response = result.response;
     let status = response.status();
     runtime.metrics.record_headers(RequestObservation {
@@ -558,7 +620,10 @@ mod tests {
     use axum::body::to_bytes;
     use axum::http::Request as HttpRequest;
     use bytes::Bytes;
+    use talon_core::{Backend, ObjectId};
     use tower::ServiceExt;
+
+    use crate::{AuthorizationGrant, GatewayAccess, GatewayTarget};
 
     #[derive(Clone, Copy)]
     enum AdapterBehavior {
@@ -584,6 +649,22 @@ mod tests {
     impl GatewayAdapter for TestAdapter {
         fn protocol(&self) -> crate::ProviderProtocol {
             crate::ProviderProtocol::S3
+        }
+
+        fn access(
+            &self,
+            request: &Request,
+            _context: &GatewayRequestContext,
+        ) -> Result<GatewayAccess, Box<GatewayResponse>> {
+            Ok(GatewayAccess {
+                operation: GatewayOperation::Read,
+                provider_account: None,
+                target: GatewayTarget::Object(ObjectId::new(
+                    Backend::S3,
+                    "bucket-a",
+                    request.uri().path().trim_start_matches('/'),
+                )),
+            })
         }
 
         async fn handle(
@@ -641,18 +722,95 @@ mod tests {
             authentication: true,
             authorization: true,
         });
+        assert!(!runtime.readiness().is_ready());
+        runtime.install_authorization(
+            AuthorizationPolicy::new(vec![AuthorizationGrant {
+                id: "production-read".into(),
+                principal: "principal-a".into(),
+                protocol: crate::ProviderProtocol::S3,
+                provider_account: "account-a".into(),
+                namespace: "bucket-a".into(),
+                prefix: None,
+                operations: vec![GatewayOperation::Read],
+            }])
+            .unwrap(),
+        );
         let response = app
             .clone()
             .oneshot(HttpRequest::get("/readyz").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let response = app
-            .oneshot(HttpRequest::get("/object").body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        let mut request = HttpRequest::get("/object").body(Body::empty()).unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("principal-a", "account-a"));
+        let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn authorization_denies_before_dispatch_and_ignores_spoofed_headers() {
+        let adapter = TestAdapter::immediate();
+        let runtime = runtime_with(
+            GatewayConfig::default(),
+            adapter.clone(),
+            GatewaySecurity::default(),
+        );
+        runtime.install_authorization(
+            AuthorizationPolicy::new(vec![AuthorizationGrant {
+                id: "read-tenant".into(),
+                principal: "principal-a".into(),
+                protocol: crate::ProviderProtocol::S3,
+                provider_account: "account-a".into(),
+                namespace: "bucket-a".into(),
+                prefix: Some("tenant/".into()),
+                operations: vec![GatewayOperation::Read],
+            }])
+            .unwrap(),
+        );
+        let app = gateway_router(Arc::clone(&runtime));
+
+        let response = app
+            .clone()
+            .oneshot(
+                HttpRequest::get("/tenant/object-secret")
+                    .header("x-talon-principal", "principal-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+
+        let mut wrong_tenant = HttpRequest::get("/tenant/object-secret")
+            .body(Body::empty())
+            .unwrap();
+        wrong_tenant
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("principal-a", "account-b"));
+        let response = app.clone().oneshot(wrong_tenant).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+
+        let mut allowed = HttpRequest::get("/tenant/object-secret")
+            .body(Body::empty())
+            .unwrap();
+        allowed
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("principal-a", "account-a"));
+        let response = app.oneshot(allowed).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
+
+        let metrics = runtime.metrics().render();
+        assert!(metrics.contains("decision=\"deny\""));
+        assert!(metrics.contains("decision=\"allow\""));
+        assert!(!metrics.contains("object-secret"));
+        assert!(!metrics.contains("principal-a"));
+        assert!(!metrics.contains("account-a"));
     }
 
     #[tokio::test]

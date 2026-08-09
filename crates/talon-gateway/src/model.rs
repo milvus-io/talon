@@ -9,7 +9,7 @@ use axum::response::Response;
 use talon_core::{Backend, ObjectId};
 
 /// Object-store protocol served by one gateway process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ProviderProtocol {
     /// Amazon S3-compatible HTTP API.
     S3,
@@ -27,7 +27,7 @@ impl ProviderProtocol {
 }
 
 /// Provider-neutral operation used by policy and bounded-cardinality metrics.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GatewayOperation {
     /// Resolve object metadata.
     Stat,
@@ -180,6 +180,17 @@ pub struct GatewayRequestContext {
     pub started: Instant,
 }
 
+/// Provider-neutral resource and operation resolved without backend access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayAccess {
+    /// Operation requested by the client.
+    pub operation: GatewayOperation,
+    /// Provider account fixed by the listener, when the protocol exposes one.
+    pub provider_account: Option<String>,
+    /// Canonical namespace and optional object or listing prefix.
+    pub target: GatewayTarget,
+}
+
 /// Adapter response plus provider-neutral accounting metadata.
 pub struct GatewayResponse {
     /// Provider-correct status, headers, and streaming body.
@@ -225,6 +236,24 @@ pub trait GatewayAdapter: Send + Sync + 'static {
     /// Protocol label for metrics and logs.
     fn protocol(&self) -> ProviderProtocol;
 
-    /// Parse, authorize, execute, and translate one provider request.
+    /// Resolve an authorization target without cache or origin access.
+    fn access(
+        &self,
+        _request: &Request,
+        _context: &GatewayRequestContext,
+    ) -> Result<GatewayAccess, Box<GatewayResponse>> {
+        let mut response = GatewayResponse::new(
+            Response::builder()
+                .status(501)
+                .body(Body::empty())
+                .expect("static response is valid"),
+            GatewayOperation::Unsupported,
+        );
+        response.outcome = GatewayOutcome::Failed;
+        response.failure = Some(FailureReason::Unsupported);
+        Err(Box::new(response))
+    }
+
+    /// Execute and translate one request after shared authorization.
     async fn handle(&self, request: Request, context: GatewayRequestContext) -> GatewayResponse;
 }

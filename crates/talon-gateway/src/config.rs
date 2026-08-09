@@ -19,7 +19,7 @@ pub struct GatewaySecurity {
     pub tls: bool,
     /// Provider credentials are authenticated before dispatch.
     pub authentication: bool,
-    /// The authenticated principal is checked against a policy.
+    /// The authenticated principal is checked against a policy. Runtime installation manages this bit.
     pub authorization: bool,
 }
 

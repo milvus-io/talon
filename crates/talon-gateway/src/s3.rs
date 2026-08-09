@@ -15,8 +15,8 @@ use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER
 use talon_core::{Backend, ObjectId, Version};
 
 use crate::{
-    FailureReason, GatewayAdapter, GatewayOperation, GatewayOutcome, GatewayRequestContext,
-    GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
+    FailureReason, GatewayAccess, GatewayAdapter, GatewayOperation, GatewayOutcome,
+    GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -818,6 +818,15 @@ impl GatewayAdapter for S3Adapter {
         ProviderProtocol::S3
     }
 
+    fn access(
+        &self,
+        request: &Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayAccess, Box<GatewayResponse>> {
+        self.classify_access(request)
+            .map_err(|error| Box::new(error_response(error, &context.request_id)))
+    }
+
     async fn handle(&self, request: Request, context: GatewayRequestContext) -> GatewayResponse {
         match self.handle_request(request, &context).await {
             Ok(response) => response,
@@ -827,6 +836,38 @@ impl GatewayAdapter for S3Adapter {
 }
 
 impl S3Adapter {
+    fn classify_access(&self, request: &Request) -> Result<GatewayAccess, S3RequestError> {
+        let target = parse_target(request, &self.config)?;
+        let query = S3Query::parse(request.uri().query())?;
+        if request.method() == axum::http::Method::GET && target.key.is_none() && query.is_list_v2()
+        {
+            return Ok(GatewayAccess {
+                operation: GatewayOperation::List,
+                provider_account: None,
+                target: GatewayTarget::Namespace {
+                    backend: Backend::S3,
+                    namespace: target.bucket,
+                    prefix: query.prefix,
+                },
+            });
+        }
+        let key = target
+            .key
+            .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
+        let operation = match *request.method() {
+            axum::http::Method::HEAD => GatewayOperation::Stat,
+            axum::http::Method::GET => GatewayOperation::Read,
+            axum::http::Method::PUT | axum::http::Method::POST => GatewayOperation::Write,
+            axum::http::Method::DELETE => GatewayOperation::Delete,
+            _ => GatewayOperation::Unsupported,
+        };
+        Ok(GatewayAccess {
+            operation,
+            provider_account: None,
+            target: GatewayTarget::Object(ObjectId::new(Backend::S3, target.bucket, key)),
+        })
+    }
+
     async fn handle_request(
         &self,
         request: Request,
