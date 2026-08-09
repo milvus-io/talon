@@ -21,7 +21,8 @@ complete.
 | Copy Blob / Copy Blob From URL | Supported | Same-account concrete blob sources only. Source read and destination write grants are both required, and the origin source URL is rebuilt from trusted configuration. |
 | Set Blob Metadata / Properties | Supported | Bodyless `comp=metadata` and `comp=properties` requests preserve their operation-specific headers and origin conditions. |
 | Delete Blob | Supported | Passed through once; successful deletion and origin-confirmed absence invalidate local placement state. |
-| Put Block / Put Block List | Not yet supported | Rejected explicitly; staged block upload lifecycle support is tracked separately. |
+| Put Block / Put Block From URL | Supported | Fixed-length blocks stream once. Same-account URL sources require source read authorization and are rebuilt from trusted origin configuration. |
+| Get Block List / Put Block List | Supported | Uncommitted state is process-bound to principal and cache decision; only confirmed commit success invalidates cached placement. |
 
 Azure responses include UUID-shaped `x-ms-request-id` values, gateway request
 correlation, Azure XML errors, and origin metadata. Blob names and listing
@@ -46,7 +47,16 @@ The `azure backend and gateway e2e (azurite)` CI job runs both the backend
 contract and the gateway through the official Azure SDK against Azurite. It
 covers cold and warm reads, properties, full and ranged bytes, URL encoding,
 listing pagination and delimiter behavior, conditions, create and overwrite,
-metadata, content properties, same-account copy, deletion, and Azure errors.
+metadata, content properties, same-account copy, deletion, block staging,
+ordering, replacement, missing blocks, block lists, and Azure errors. Azurite
+returns its native `APINotImplemented` for Put Block From URL; focused backend
+tests cover trusted source reconstruction for that operation.
+
+Block blob staging supports Put Block, same-account Put Block From URL, Get
+Block List, and Put Block List. Uncommitted state is bound in memory to the
+authenticated principal and cache decision for 24 hours by default. A gateway
+restart intentionally loses that binding and fails closed rather than adopting
+orphaned blocks. Only a successful Put Block List invalidates cached data.
 
 Production exposure remains blocked until provider authentication and
 authorization are installed as tracked by issue #446. The protocol adapter is

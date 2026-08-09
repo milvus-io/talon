@@ -1,7 +1,9 @@
 //! Azure Blob Storage read adapter.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -15,8 +17,9 @@ use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER
 use talon_core::{Backend, ObjectId, Version};
 
 use crate::{
-    FailureReason, GatewayAccess, GatewayAdapter, GatewayOperation, GatewayOutcome,
-    GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
+    AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess, GatewayAdapter,
+    GatewayOperation, GatewayOutcome, GatewayRequestContext, GatewayResponse, GatewayRoute,
+    GatewayTarget, ProviderProtocol, AZURE_CACHE_MARK_HEADER,
 };
 
 const AZURE_API_VERSION: &str = "2021-12-02";
@@ -59,6 +62,10 @@ pub struct AzureAdapterConfig {
     pub transfer_chunk_bytes: u32,
     /// Route used until signed cache marks are implemented by #441.
     pub default_route: GatewayRoute,
+    /// Maximum active block-staging bindings tracked by one process.
+    pub max_block_bindings: usize,
+    /// Lifetime of an inactive block-staging binding.
+    pub block_binding_ttl: Duration,
 }
 
 impl AzureAdapterConfig {
@@ -71,6 +78,8 @@ impl AzureAdapterConfig {
             block_size: 256 * 1024 * 1024,
             transfer_chunk_bytes: DEFAULT_TRANSFER_CHUNK_BYTES,
             default_route: GatewayRoute::Cache,
+            max_block_bindings: 1024,
+            block_binding_ttl: Duration::from_secs(24 * 60 * 60),
         }
     }
 
@@ -83,7 +92,12 @@ impl AzureAdapterConfig {
     }
 
     fn validate(&self) -> Result<(), AzureRequestError> {
-        if self.account.is_empty() || self.block_size == 0 || self.transfer_chunk_bytes == 0 {
+        if self.account.is_empty()
+            || self.block_size == 0
+            || self.transfer_chunk_bytes == 0
+            || self.max_block_bindings == 0
+            || self.block_binding_ttl.is_zero()
+        {
             return Err(AzureRequestError::invalid(
                 "InvalidHeaderValue",
                 "Azure adapter account and cache sizes must be configured",
@@ -194,6 +208,39 @@ pub trait AzureOrigin: Send + Sync + 'static {
     ) -> Result<HttpResponse, String> {
         Err("Azure origin does not implement Delete Blob".into())
     }
+
+    /// Stream one Put Block or Put Block List request exactly once.
+    async fn put_block_body(
+        &self,
+        _object: &ObjectId,
+        _query: &str,
+        _headers: &[(String, String)],
+        _body: HttpRequestBody,
+        _len: u64,
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement block staging".into())
+    }
+
+    /// Stage one block from a same-account source URL.
+    async fn put_block_from_url(
+        &self,
+        _destination: &ObjectId,
+        _source: &ObjectId,
+        _query: &str,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement Put Block From URL".into())
+    }
+
+    /// Get one committed or uncommitted block list.
+    async fn get_block_list(
+        &self,
+        _object: &ObjectId,
+        _query: &str,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement Get Block List".into())
+    }
 }
 
 #[async_trait]
@@ -262,6 +309,38 @@ impl AzureOrigin for AzureBackend {
     ) -> Result<HttpResponse, String> {
         self.execute_delete_raw(object, headers).await
     }
+
+    async fn put_block_body(
+        &self,
+        object: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        self.execute_put_query_body_raw(object, query, headers, body, len)
+            .await
+    }
+
+    async fn put_block_from_url(
+        &self,
+        destination: &ObjectId,
+        source: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_copy_query_raw(destination, source, query, headers)
+            .await
+    }
+
+    async fn get_block_list(
+        &self,
+        object: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_get_query_raw(object, query, headers).await
+    }
 }
 
 /// Azure protocol adapter over a Talon cache and scoped origin identity.
@@ -269,6 +348,7 @@ pub struct AzureBlobAdapter {
     config: AzureAdapterConfig,
     cache: Arc<dyn AzureCache>,
     origin: Arc<dyn AzureOrigin>,
+    blocks: BlockRegistry,
 }
 
 impl AzureBlobAdapter {
@@ -280,10 +360,87 @@ impl AzureBlobAdapter {
     ) -> Result<Self, String> {
         config.validate().map_err(|error| error.message)?;
         Ok(Self {
+            blocks: BlockRegistry::new(config.max_block_bindings, config.block_binding_ttl),
             config,
             cache,
             origin,
         })
+    }
+}
+
+#[derive(Clone)]
+struct BlockBinding {
+    principal: AuthenticatedPrincipal,
+    decision: EffectiveDecision,
+    touched: Instant,
+}
+
+struct BlockRegistry {
+    bindings: Mutex<HashMap<ObjectId, BlockBinding>>,
+    max_bindings: usize,
+    ttl: Duration,
+}
+
+impl BlockRegistry {
+    fn new(max_bindings: usize, ttl: Duration) -> Self {
+        Self {
+            bindings: Mutex::new(HashMap::new()),
+            max_bindings,
+            ttl,
+        }
+    }
+
+    fn bind_or_authorize(
+        &self,
+        object: &ObjectId,
+        principal: &AuthenticatedPrincipal,
+        decision: EffectiveDecision,
+        now: Instant,
+    ) -> bool {
+        let mut bindings = self.bindings.lock().unwrap();
+        bindings.retain(|_, binding| now.saturating_duration_since(binding.touched) <= self.ttl);
+        if let Some(binding) = bindings.get_mut(object) {
+            if binding.principal != *principal || binding.decision != decision {
+                return false;
+            }
+            binding.touched = now;
+            return true;
+        }
+        if bindings.len() >= self.max_bindings {
+            return false;
+        }
+        bindings.insert(
+            object.clone(),
+            BlockBinding {
+                principal: principal.clone(),
+                decision,
+                touched: now,
+            },
+        );
+        true
+    }
+
+    fn authorize(
+        &self,
+        object: &ObjectId,
+        principal: &AuthenticatedPrincipal,
+        decision: EffectiveDecision,
+        now: Instant,
+    ) -> bool {
+        let mut bindings = self.bindings.lock().unwrap();
+        bindings.retain(|_, binding| now.saturating_duration_since(binding.touched) <= self.ttl);
+        let Some(binding) = bindings.get_mut(object) else {
+            return false;
+        };
+        if binding.principal != *principal || binding.decision != decision {
+            return false;
+        }
+        binding.touched = now;
+        true
+    }
+
+    fn remove(&self, object: &ObjectId) {
+        self.bindings.lock().unwrap().remove(object);
     }
 }
 
@@ -381,6 +538,8 @@ struct AzureQuery {
     delimiter: Option<String>,
     marker: Option<String>,
     maxresults: Option<String>,
+    blockid: Option<String>,
+    blocklisttype: Option<String>,
 }
 
 impl AzureQuery {
@@ -399,6 +558,12 @@ impl AzureQuery {
                 "maxresults" => {
                     set_query_value(&mut parsed.maxresults, value.into_owned(), "maxresults")?
                 }
+                "blockid" => set_query_value(&mut parsed.blockid, value.into_owned(), "blockid")?,
+                "blocklisttype" => set_query_value(
+                    &mut parsed.blocklisttype,
+                    value.into_owned(),
+                    "blocklisttype",
+                )?,
                 _ => {}
             }
         }
@@ -443,10 +608,62 @@ fn set_query_value(
 #[derive(Debug)]
 enum AzureMutation {
     PutBlob,
-    Copy { source: ObjectId },
+    Copy {
+        source: ObjectId,
+    },
     SetMetadata,
     SetProperties,
     Delete,
+    PutBlock {
+        block_id: String,
+        source: Option<ObjectId>,
+    },
+    PutBlockList,
+    GetBlockList {
+        kind: BlockListKind,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockListKind {
+    Committed,
+    Uncommitted,
+    All,
+}
+
+impl BlockListKind {
+    fn parse(value: Option<&str>) -> Result<Self, AzureRequestError> {
+        match value {
+            Some("committed") => Ok(Self::Committed),
+            Some("uncommitted") => Ok(Self::Uncommitted),
+            Some("all") => Ok(Self::All),
+            _ => Err(AzureRequestError::invalid(
+                "InvalidQueryParameterValue",
+                "blocklisttype must be committed, uncommitted, or all",
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::Uncommitted => "uncommitted",
+            Self::All => "all",
+        }
+    }
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn classify_mutation(
@@ -471,9 +688,27 @@ fn classify_mutation(
             Some("properties") if !request.headers().contains_key("x-ms-copy-source") => {
                 Ok(Some(AzureMutation::SetProperties))
             }
-            Some("block" | "blocklist") => Err(AzureRequestError::unsupported(
-                "block blob staging operations are not supported by this endpoint",
-            )),
+            Some("block") => {
+                let block_id = query
+                    .blockid
+                    .clone()
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| {
+                        AzureRequestError::invalid(
+                            "InvalidQueryParameterValue",
+                            "blockid is required",
+                        )
+                    })?;
+                let source = request
+                    .headers()
+                    .contains_key("x-ms-copy-source")
+                    .then(|| copy_source(request.headers(), config))
+                    .transpose()?;
+                Ok(Some(AzureMutation::PutBlock { block_id, source }))
+            }
+            Some("blocklist") if !request.headers().contains_key("x-ms-copy-source") => {
+                Ok(Some(AzureMutation::PutBlockList))
+            }
             _ => Err(AzureRequestError::unsupported(
                 "the requested blob PUT operation is not supported",
             )),
@@ -482,6 +717,11 @@ fn classify_mutation(
         axum::http::Method::DELETE => Err(AzureRequestError::unsupported(
             "the requested blob DELETE operation is not supported",
         )),
+        axum::http::Method::GET if query.comp.as_deref() == Some("blocklist") => {
+            Ok(Some(AzureMutation::GetBlockList {
+                kind: BlockListKind::parse(query.blocklisttype.as_deref())?,
+            }))
+        }
         _ => Ok(None),
     }
 }
@@ -688,6 +928,30 @@ fn mutation_headers(
                     CONTENT.contains(&name.as_str()) || name.starts_with("x-ms-blob-content-")
                 }
                 AzureMutation::Delete => name == "x-ms-delete-snapshots",
+                AzureMutation::PutBlock { source, .. } => {
+                    matches!(
+                        name.as_str(),
+                        "content-md5"
+                            | "x-ms-content-crc64"
+                            | "x-ms-encryption-scope"
+                            | "x-ms-encryption-key"
+                            | "x-ms-encryption-key-sha256"
+                    ) || (source.is_some()
+                        && (name.starts_with("x-ms-source-if-")
+                            || matches!(
+                                name.as_str(),
+                                "x-ms-source-range"
+                                    | "x-ms-source-content-md5"
+                                    | "x-ms-source-content-crc64"
+                            )))
+                }
+                AzureMutation::PutBlockList => {
+                    CONTENT.contains(&name.as_str())
+                        || name.starts_with("x-ms-blob-content-")
+                        || name.starts_with("x-ms-meta-")
+                        || matches!(name.as_str(), "x-ms-tags" | "x-ms-access-tier")
+                }
+                AzureMutation::GetBlockList { .. } => false,
             };
         if !allowed {
             continue;
@@ -707,6 +971,38 @@ fn mutation_headers(
         output.push((name, value.to_string()));
     }
     Ok(output)
+}
+
+fn block_principal(request: &Request) -> Result<AuthenticatedPrincipal, AzureRequestError> {
+    request
+        .extensions()
+        .get::<AuthenticatedPrincipal>()
+        .cloned()
+        .ok_or_else(|| AzureRequestError {
+            status: StatusCode::FORBIDDEN,
+            code: "AuthorizationFailure",
+            message: "the request is not authorized for this block operation".into(),
+            failure: FailureReason::Authorization,
+            content_range: None,
+            indeterminate_commit: false,
+        })
+}
+
+fn block_cache_decision(headers: &HeaderMap) -> Result<EffectiveDecision, AzureRequestError> {
+    let mut values = headers.get_all(AZURE_CACHE_MARK_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(EffectiveDecision::default());
+    };
+    if values.next().is_some() {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "cache decision must occur exactly once",
+        ));
+    }
+    EffectiveDecision::parse(value.to_str().map_err(|_| {
+        AzureRequestError::invalid("InvalidHeaderValue", "cache decision is invalid")
+    })?)
+    .map_err(|_| AzureRequestError::invalid("InvalidHeaderValue", "cache decision is invalid"))
 }
 
 fn conditional_headers(headers: &HeaderMap) -> Result<Vec<(String, String)>, AzureRequestError> {
@@ -1108,6 +1404,17 @@ impl AzureRequestError {
             code: "UnsupportedHttpVerb",
             message: message.into(),
             failure: FailureReason::Unsupported,
+            content_range: None,
+            indeterminate_commit: false,
+        }
+    }
+
+    fn block_binding() -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code: "BlockListUnavailable",
+            message: "the block staging context is unavailable".into(),
+            failure: FailureReason::Precondition,
             content_range: None,
             indeterminate_commit: false,
         }
@@ -1968,30 +2275,57 @@ mod tests {
     }
 
     #[test]
-    fn copy_access_requires_write_on_destination_and_read_on_source() {
+    fn copy_operations_require_write_on_destination_and_read_on_source() {
         let adapter = adapter(
             AzureAdapterConfig::public_cloud("acct"),
             Arc::new(TrackingCache::default()),
             MutationOrigin::new(),
         );
-        let mut request = request(axum::http::Method::PUT, "/dest/copied.bin");
-        request.headers_mut().insert(
+        let mut copy = request(axum::http::Method::PUT, "/dest/copied.bin");
+        copy.headers_mut().insert(
             "x-ms-copy-source",
             HeaderValue::from_static("https://acct.blob.core.windows.net/source/original.bin"),
         );
 
-        let access = adapter.classify_access(&request).unwrap();
-
-        assert_eq!(access.operation, GatewayOperation::Write);
-        assert_eq!(
-            access.target,
-            GatewayTarget::Object(ObjectId::new(Backend::Azure, "dest", "copied.bin"))
+        let mut block = request(
+            axum::http::Method::PUT,
+            "/dest/copied.bin?comp=block&blockid=YQ%3D%3D",
         );
-        assert_eq!(access.additional.len(), 1);
-        assert_eq!(access.additional[0].operation, GatewayOperation::Read);
-        assert_eq!(
-            access.additional[0].target,
-            GatewayTarget::Object(ObjectId::new(Backend::Azure, "source", "original.bin"))
+        block.headers_mut().insert(
+            "x-ms-copy-source",
+            HeaderValue::from_static("https://acct.blob.core.windows.net/source/original.bin"),
+        );
+
+        for request in [&copy, &block] {
+            let access = adapter.classify_access(request).unwrap();
+            assert_eq!(access.operation, GatewayOperation::Write);
+            assert_eq!(
+                access.target,
+                GatewayTarget::Object(ObjectId::new(Backend::Azure, "dest", "copied.bin"))
+            );
+            assert_eq!(access.additional.len(), 1);
+            assert_eq!(access.additional[0].operation, GatewayOperation::Read);
+            assert_eq!(
+                access.additional[0].target,
+                GatewayTarget::Object(ObjectId::new(Backend::Azure, "source", "original.bin"))
+            );
+        }
+    }
+
+    #[test]
+    fn block_queries_reject_duplicate_ids_and_preserve_decoded_bytes() {
+        assert!(AzureQuery::parse(Some("comp=block&blockid=YQ%3D%3D&blockid=Yg%3D%3D")).is_err());
+        let query = AzureQuery::parse(Some("comp=block&blockid=YStiLw%3D%3D")).unwrap();
+        let request = request(
+            axum::http::Method::PUT,
+            "/c/blob?comp=block&blockid=YStiLw%3D%3D",
+        );
+        let mutation =
+            classify_mutation(&request, &query, &AzureAdapterConfig::public_cloud("acct"))
+                .unwrap()
+                .unwrap();
+        assert!(
+            matches!(mutation, AzureMutation::PutBlock { block_id, source: None } if block_id == "YStiLw==")
         );
     }
 
@@ -2223,6 +2557,209 @@ mod tests {
         assert_eq!(response.response.status(), StatusCode::NOT_FOUND);
         assert_eq!(cache.invalidated.lock().unwrap().len(), 1);
     }
+
+    struct BlockOrigin {
+        calls: Mutex<Vec<(String, Vec<u8>)>>,
+        commit_status: Mutex<u16>,
+    }
+
+    impl BlockOrigin {
+        fn new(commit_status: u16) -> Arc<Self> {
+            Arc::new(Self {
+                calls: Mutex::new(Vec::new()),
+                commit_status: Mutex::new(commit_status),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl AzureOrigin for BlockOrigin {
+        async fn head(&self, _: &ObjectId, _: &[(String, String)]) -> Result<HttpResponse, String> {
+            unreachable!()
+        }
+        async fn get(
+            &self,
+            _: &ObjectId,
+            _: Option<(u64, u64)>,
+            _: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!()
+        }
+        async fn list(
+            &self,
+            _: &str,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: u32,
+        ) -> Result<HttpResponse, String> {
+            unreachable!()
+        }
+
+        async fn put_block_body(
+            &self,
+            _: &ObjectId,
+            query: &str,
+            _: &[(String, String)],
+            mut body: HttpRequestBody,
+            _: u64,
+        ) -> Result<HttpResponse, String> {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            self.calls.lock().unwrap().push((query.into(), bytes));
+            let status = if query == "comp=blocklist" {
+                *self.commit_status.lock().unwrap()
+            } else {
+                201
+            };
+            Ok(MutationOrigin::response(status))
+        }
+
+        async fn get_block_list(
+            &self,
+            _: &ObjectId,
+            query: &str,
+            _: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            self.calls.lock().unwrap().push((query.into(), Vec::new()));
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                body: Bytes::from_static(b"<BlockList/>"),
+            })
+        }
+    }
+
+    fn authenticated(mut request: Request, id: &str) -> Request {
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new(id, "acct"));
+        request
+    }
+
+    #[test]
+    fn block_registry_is_bounded_expires_and_matches_binding() {
+        let registry = BlockRegistry::new(1, Duration::from_secs(5));
+        let first = ObjectId::new(Backend::Azure, "c", "first");
+        let second = ObjectId::new(Backend::Azure, "c", "second");
+        let principal = AuthenticatedPrincipal::new("client", "acct");
+        let now = Instant::now();
+        assert!(registry.bind_or_authorize(&first, &principal, EffectiveDecision::default(), now));
+        assert!(!registry.bind_or_authorize(
+            &first,
+            &AuthenticatedPrincipal::new("other", "acct"),
+            EffectiveDecision::default(),
+            now
+        ));
+        assert!(!registry.authorize(&first, &principal, EffectiveDecision::ORIGIN_ONLY, now));
+        assert!(!registry.bind_or_authorize(
+            &second,
+            &principal,
+            EffectiveDecision::default(),
+            now
+        ));
+        assert!(registry.bind_or_authorize(
+            &second,
+            &principal,
+            EffectiveDecision::default(),
+            now + Duration::from_secs(6)
+        ));
+    }
+
+    #[tokio::test]
+    async fn block_commit_preserves_body_and_only_success_removes_binding() {
+        let cache = Arc::new(TrackingCache::default());
+        let origin = BlockOrigin::new(400);
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::clone(&cache) as Arc<dyn AzureCache>,
+            Arc::clone(&origin) as Arc<dyn AzureOrigin>,
+        );
+        let stage = authenticated(
+            body_request(
+                axum::http::Method::PUT,
+                "/c/blob?comp=block&blockid=YStiLw%3D%3D",
+                b"block",
+            ),
+            "client",
+        );
+        assert_eq!(
+            adapter.handle(stage, context()).await.response.status(),
+            StatusCode::CREATED
+        );
+
+        let xml = b"<?xml version=\"1.0\"?><BlockList><Latest>YStiLw==</Latest></BlockList>";
+        let failed = authenticated(
+            body_request(axum::http::Method::PUT, "/c/blob?comp=blocklist", xml),
+            "client",
+        );
+        assert_eq!(
+            adapter.handle(failed, context()).await.response.status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert!(cache.invalidated.lock().unwrap().is_empty());
+
+        *origin.commit_status.lock().unwrap() = 201;
+        let committed = authenticated(
+            body_request(axum::http::Method::PUT, "/c/blob?comp=blocklist", xml),
+            "client",
+        );
+        assert_eq!(
+            adapter.handle(committed, context()).await.response.status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(cache.invalidated.lock().unwrap().len(), 1);
+        {
+            let calls = origin.calls.lock().unwrap();
+            assert_eq!(calls[0].0, "comp=block&blockid=YStiLw%3D%3D");
+            assert_eq!(calls[1].1, xml);
+            assert_eq!(calls[2].1, xml);
+        }
+
+        let repeated = authenticated(
+            body_request(axum::http::Method::PUT, "/c/blob?comp=blocklist", xml),
+            "client",
+        );
+        assert_eq!(
+            adapter.handle(repeated, context()).await.response.status(),
+            StatusCode::CONFLICT
+        );
+    }
+
+    #[tokio::test]
+    async fn uncommitted_list_requires_binding_but_committed_list_does_not() {
+        let origin = BlockOrigin::new(201);
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::new(TrackingCache::default()),
+            origin,
+        );
+        let committed = request(
+            axum::http::Method::GET,
+            "/c/blob?comp=blocklist&blocklisttype=committed",
+        );
+        assert_eq!(
+            adapter.handle(committed, context()).await.response.status(),
+            StatusCode::OK
+        );
+        let uncommitted = authenticated(
+            request(
+                axum::http::Method::GET,
+                "/c/blob?comp=blocklist&blocklisttype=uncommitted",
+            ),
+            "client",
+        );
+        assert_eq!(
+            adapter
+                .handle(uncommitted, context())
+                .await
+                .response
+                .status(),
+            StatusCode::CONFLICT
+        );
+    }
 }
 
 #[async_trait]
@@ -2270,6 +2807,7 @@ impl AzureBlobAdapter {
         let mutation = classify_mutation(request, &query, &self.config)?;
         let operation = match mutation.as_ref() {
             Some(AzureMutation::Delete) => GatewayOperation::Delete,
+            Some(AzureMutation::GetBlockList { .. }) => GatewayOperation::Read,
             Some(_) => GatewayOperation::Write,
             None => match *request.method() {
                 axum::http::Method::HEAD => GatewayOperation::Stat,
@@ -2283,7 +2821,12 @@ impl AzureBlobAdapter {
             target: GatewayTarget::Object(ObjectId::new(Backend::Azure, target.container, blob)),
             additional: Vec::new(),
         };
-        if let Some(AzureMutation::Copy { source }) = mutation {
+        let source = match mutation {
+            Some(AzureMutation::Copy { source }) => Some(source),
+            Some(AzureMutation::PutBlock { source, .. }) => source,
+            _ => None,
+        };
+        if let Some(source) = source {
             access.additional.push(crate::GatewayAccessRequirement {
                 operation: GatewayOperation::Read,
                 provider_account: Some(self.config.account.clone()),
@@ -2322,6 +2865,14 @@ impl AzureBlobAdapter {
                         .await
                 }
                 AzureMutation::Delete => self.delete(object, request.headers(), context).await,
+                AzureMutation::PutBlock { block_id, source } => {
+                    self.put_block(object, block_id, source, request, context)
+                        .await
+                }
+                AzureMutation::PutBlockList => self.put_block_list(object, request, context).await,
+                AzureMutation::GetBlockList { kind } => {
+                    self.get_block_list(object, kind, request, context).await
+                }
             };
         }
         match *request.method() {
@@ -2331,6 +2882,131 @@ impl AzureBlobAdapter {
                 "the requested HTTP method is not supported",
             )),
         }
+    }
+
+    async fn put_block(
+        &self,
+        object: ObjectId,
+        block_id: String,
+        source: Option<ObjectId>,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        let principal = block_principal(&request)?;
+        let decision = block_cache_decision(request.headers())?;
+        let mutation = AzureMutation::PutBlock {
+            block_id: block_id.clone(),
+            source: source.clone(),
+        };
+        let headers = mutation_headers(request.headers(), &mutation)?;
+        let len = if source.is_some() {
+            require_empty_body(request.headers())?;
+            None
+        } else {
+            Some(single_content_length(request.headers())?)
+        };
+        if !self
+            .blocks
+            .bind_or_authorize(&object, &principal, decision, Instant::now())
+        {
+            return Err(AzureRequestError::block_binding());
+        }
+        let query = format!("comp=block&blockid={}", encode_query_value(&block_id));
+        let response = if let Some(source) = source {
+            self.origin
+                .put_block_from_url(&object, &source, &query, &headers)
+                .await
+        } else {
+            let len = len.expect("Put Block body length was validated");
+            let body = request
+                .into_body()
+                .into_data_stream()
+                .map(|chunk| chunk.map_err(|error| error.to_string()));
+            self.origin
+                .put_block_body(&object, &query, &headers, Box::pin(body), len)
+                .await
+        }
+        .map_err(|_| AzureRequestError::indeterminate_commit())?;
+        Ok(raw_buffered_response(
+            response,
+            GatewayOperation::Write,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
+    }
+
+    async fn put_block_list(
+        &self,
+        object: ObjectId,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        let principal = block_principal(&request)?;
+        let decision = block_cache_decision(request.headers())?;
+        if !self
+            .blocks
+            .authorize(&object, &principal, decision, Instant::now())
+        {
+            return Err(AzureRequestError::block_binding());
+        }
+        let len = single_content_length(request.headers())?;
+        let headers = mutation_headers(request.headers(), &AzureMutation::PutBlockList)?;
+        let body = request
+            .into_body()
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(|error| error.to_string()));
+        let response = self
+            .origin
+            .put_block_body(&object, "comp=blocklist", &headers, Box::pin(body), len)
+            .await
+            .map_err(|_| AzureRequestError::indeterminate_commit())?;
+        if response.is_success() {
+            self.blocks.remove(&object);
+            let _ = self.cache.invalidate_object(&object);
+        }
+        Ok(raw_buffered_response(
+            response,
+            GatewayOperation::Write,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
+    }
+
+    async fn get_block_list(
+        &self,
+        object: ObjectId,
+        kind: BlockListKind,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        if kind != BlockListKind::Committed {
+            let principal = block_principal(&request)?;
+            let decision = block_cache_decision(request.headers())?;
+            if !self
+                .blocks
+                .authorize(&object, &principal, decision, Instant::now())
+            {
+                return Err(AzureRequestError::block_binding());
+            }
+        }
+        require_empty_body(request.headers())?;
+        let mutation = AzureMutation::GetBlockList { kind };
+        let headers = mutation_headers(request.headers(), &mutation)?;
+        let query = format!("comp=blocklist&blocklisttype={}", kind.as_str());
+        let response = self
+            .origin
+            .get_block_list(&object, &query, &headers)
+            .await
+            .map_err(AzureRequestError::origin_unavailable)?;
+        Ok(raw_buffered_response(
+            response,
+            GatewayOperation::Read,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
     }
 
     async fn put(

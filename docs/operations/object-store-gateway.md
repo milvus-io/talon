@@ -183,6 +183,8 @@ Azure variables:
 | `TALON_GATEWAY_AZURE_SHARED_KEY` | unset | Base64 account key. Mutually exclusive with SAS. |
 | `TALON_GATEWAY_AZURE_SAS` | unset | Origin SAS without logging or serialization. |
 | `TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH` | unset | JSON incoming account-key identity file. Required for Azure production readiness. |
+| `TALON_GATEWAY_AZURE_MAX_BLOCK_BINDINGS` | `1024` | Maximum active block-staging bindings held by one gateway process. |
+| `TALON_GATEWAY_AZURE_BLOCK_BINDING_TTL_MS` | `86400000` | Inactivity lifetime for one process-local block-staging binding. |
 | `TALON_GATEWAY_AZURE_MAX_CLOCK_SKEW_MS` | `900000` | Maximum Shared Key clock skew and SAS start/expiry grace. |
 
 Azure client keys are also separate from the origin credential. Each key maps
@@ -211,12 +213,15 @@ carrying a cache mark are rejected because SAS cannot bind custom headers.
 Azure `Put Blob` accepts only fixed-length `BlockBlob` uploads. Copy is limited
 to a concrete source blob in the configured account and requires both source
 read and destination write authorization. Set Blob Metadata, Set Blob
-Properties, and Delete Blob are also passed through; Put Block and Put Block
-List remain unsupported. The gateway never retries a consumed upload stream.
+Properties, Delete Blob, Put Block, Put Block From URL, Get Block List, and Put
+Block List are also passed through. Active block sets are held in a bounded,
+expiring process-local registry and cannot be adopted after a restart. The
+gateway never retries a consumed upload stream.
 Confirmed mutation success, plus `404` from Delete Blob, invalidates local
-placement state. A failed HTTP response does not invalidate it, while transport
-loss after dispatch returns `x-talon-commit-state: indeterminate` and requires
-an authoritative blob check before retrying.
+placement state; staged blocks do not. A failed HTTP response does not
+invalidate it, while transport loss after dispatch returns
+`x-talon-commit-state: indeterminate` and requires an authoritative blob check
+before retrying.
 
 ## Docker
 

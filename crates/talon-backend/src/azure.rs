@@ -407,6 +407,66 @@ impl AzureBackend {
             .await
     }
 
+    /// Stream one fixed-length queried PUT without replaying its body.
+    pub async fn execute_put_query_body_raw(
+        &self,
+        obj: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = HttpRequest::new(
+            Method::Put,
+            self.blob_url_with_query(obj, query),
+            self.common_headers(),
+        );
+        request
+            .headers
+            .push(("content-length".into(), len.to_string()));
+        Self::extend_mutation_headers(&mut request, headers);
+        self.http
+            .execute_body(self.authorized(request), body, len)
+            .await
+    }
+
+    /// Execute a bodyless queried PUT with a trusted same-account source URL.
+    pub async fn execute_copy_query_raw(
+        &self,
+        destination: &ObjectId,
+        source: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = HttpRequest::new(
+            Method::Put,
+            self.blob_url_with_query(destination, query),
+            self.common_headers(),
+        );
+        request.headers.push(("content-length".into(), "0".into()));
+        request
+            .headers
+            .push(("x-ms-copy-source".into(), self.blob_url(source)));
+        Self::extend_mutation_headers(&mut request, headers);
+        self.http.execute(self.authorized(request)).await
+    }
+
+    /// Execute a queried buffered GET such as Get Block List.
+    pub async fn execute_get_query_raw(
+        &self,
+        obj: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = HttpRequest::new(
+            Method::Get,
+            self.blob_url_with_query(obj, query),
+            self.common_headers(),
+        );
+        Self::extend_mutation_headers(&mut request, headers);
+        self.http.execute(self.authorized(request)).await
+    }
+
     /// Execute one bodyless Azure Blob PUT subresource operation.
     pub async fn execute_put_raw(
         &self,
@@ -1282,5 +1342,71 @@ mod tests {
             .header("authorization")
             .unwrap()
             .starts_with("SharedKey acct:"));
+    }
+
+    #[tokio::test]
+    async fn block_put_merges_sas_query_and_streams_declared_length() {
+        let http = MockHttp::new(HttpResponse {
+            status: 201,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::new(
+            AzureConfig::new("acct"),
+            Some("sv=2021&sig=abc".into()),
+            http.clone(),
+        );
+        let body: HttpRequestBody = Box::pin(futures::stream::once(async {
+            Ok(bytes::Bytes::from_static(b"block-data"))
+        }));
+
+        backend
+            .execute_put_query_body_raw(&obj(), "comp=block&blockid=YQ%3D%3D", &[], body, 10)
+            .await
+            .unwrap();
+
+        let (request, bytes, len) = http.last_body.lock().unwrap().clone().unwrap();
+        assert_eq!(request.url.matches('?').count(), 1);
+        assert!(request
+            .url
+            .contains("sv=2021&sig=abc&comp=block&blockid=YQ%3D%3D"));
+        assert_eq!(request.header("content-length"), Some("10"));
+        assert_eq!(bytes, b"block-data");
+        assert_eq!(len, 10);
+    }
+
+    #[tokio::test]
+    async fn block_from_url_rebuilds_source_and_preserves_destination_query() {
+        let http = MockHttp::new(HttpResponse {
+            status: 201,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::new(
+            AzureConfig::emulator("acct", "azurite.internal:10000", false),
+            None,
+            http.clone(),
+        );
+        let source = ObjectId::new(Backend::Azure, "source", "original.bin");
+
+        backend
+            .execute_copy_query_raw(
+                &obj(),
+                &source,
+                "comp=block&blockid=YQ%3D%3D",
+                &[(
+                    "x-ms-copy-source".into(),
+                    "https://attacker.invalid/secret".into(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert!(request.url.ends_with("?comp=block&blockid=YQ%3D%3D"));
+        assert_eq!(
+            request.header("x-ms-copy-source"),
+            Some("http://azurite.internal:10000/acct/source/original.bin")
+        );
     }
 }
