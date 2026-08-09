@@ -17,12 +17,24 @@ complete.
 | Conditional reads | Supported | ETag and date conditions remain origin-authoritative; `If-Range` controls range use. |
 | Virtual-host addressing | Supported | One configured public-cloud account per process. |
 | Azurite path addressing | Supported | `/account/container/blob` endpoint-override clients are accepted. |
-| Put, delete, copy, and block APIs | Not yet supported | Rejected explicitly until a write-through milestone preserves Azure commit semantics. |
+| Put Blob (`BlockBlob`) | Supported | One fixed-length body streams to the origin once; conditions, content properties, metadata, tags, tier, and encryption headers use an explicit allowlist. |
+| Copy Blob / Copy Blob From URL | Supported | Same-account concrete blob sources only. Source read and destination write grants are both required, and the origin source URL is rebuilt from trusted configuration. |
+| Set Blob Metadata / Properties | Supported | Bodyless `comp=metadata` and `comp=properties` requests preserve their operation-specific headers and origin conditions. |
+| Delete Blob | Supported | Passed through once; successful deletion and origin-confirmed absence invalidate local placement state. |
+| Put Block / Put Block List | Not yet supported | Rejected explicitly; staged block upload lifecycle support is tracked separately. |
 
 Azure responses include UUID-shaped `x-ms-request-id` values, gateway request
 correlation, Azure XML errors, and origin metadata. Blob names and listing
 parameters use strict percent decoding. Unsupported or malformed requests fail
 closed instead of being silently reinterpreted.
+
+Incoming client authorization, dates, version headers, and copy-source URLs are
+not forwarded to rewritten origin requests. The gateway signs the validated
+operation with its scoped origin identity. Mutation responses remain
+origin-authoritative: confirmed success invalidates cached placement, failed
+HTTP responses retain it, and a lost response after dispatch returns
+`x-talon-commit-state: indeterminate`. Clients must inspect the blob before
+retrying an indeterminate mutation.
 
 Cache infrastructure unavailability and timeout may fall back to a conditional
 origin stream. Not-found, invalid range, version mismatch, authentication,
@@ -33,7 +45,8 @@ disconnecting drops the upstream stream.
 The `azure backend and gateway e2e (azurite)` CI job runs both the backend
 contract and the gateway through the official Azure SDK against Azurite. It
 covers cold and warm reads, properties, full and ranged bytes, URL encoding,
-listing pagination and delimiter behavior, conditions, and Azure errors.
+listing pagination and delimiter behavior, conditions, create and overwrite,
+metadata, content properties, same-account copy, deletion, and Azure errors.
 
 Production exposure remains blocked until provider authentication and
 authorization are installed as tracked by issue #446. The protocol adapter is

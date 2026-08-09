@@ -10,7 +10,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use talon_backend::{AzureBackend, HttpResponse, HttpStreamResponse};
+use talon_backend::{AzureBackend, HttpRequestBody, HttpResponse, HttpStreamResponse};
 use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER_CHUNK_BYTES};
 use talon_core::{Backend, ObjectId, Version};
 
@@ -97,6 +97,11 @@ impl AzureAdapterConfig {
 pub trait AzureCache: Send + Sync + 'static {
     /// Stream one exact object range from Talon.
     fn stream(&self, request: AzureCacheRequest<'_>) -> Result<CacheStream, CacheReadError>;
+
+    /// Invalidate every cached placement for one blob after a confirmed mutation.
+    fn invalidate_object(&self, _object: &ObjectId) -> usize {
+        0
+    }
 }
 
 impl AzureCache for BlockReader {
@@ -115,6 +120,10 @@ impl AzureCache for BlockReader {
             request.now_ms,
         )
         .map(|stream| Box::pin(stream) as CacheStream)
+    }
+
+    fn invalidate_object(&self, object: &ObjectId) -> usize {
+        BlockReader::invalidate_object(self, object)
     }
 }
 
@@ -145,6 +154,46 @@ pub trait AzureOrigin: Send + Sync + 'static {
         marker: Option<&str>,
         max_results: u32,
     ) -> Result<HttpResponse, String>;
+
+    /// Stream one ordinary Put Blob body exactly once.
+    async fn put_body(
+        &self,
+        _object: &ObjectId,
+        _headers: &[(String, String)],
+        _body: HttpRequestBody,
+        _len: u64,
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement Put Blob".into())
+    }
+
+    /// Copy one same-account source blob to a destination.
+    async fn copy(
+        &self,
+        _destination: &ObjectId,
+        _source: &ObjectId,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement Copy Blob".into())
+    }
+
+    /// Execute one bodyless PUT subresource operation.
+    async fn put_subresource(
+        &self,
+        _object: &ObjectId,
+        _query: &str,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement blob property mutations".into())
+    }
+
+    /// Execute one conditional Delete Blob request.
+    async fn delete(
+        &self,
+        _object: &ObjectId,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement Delete Blob".into())
+    }
 }
 
 #[async_trait]
@@ -176,6 +225,42 @@ impl AzureOrigin for AzureBackend {
     ) -> Result<HttpResponse, String> {
         self.execute_list_raw(container, prefix, delimiter, marker, max_results, &[])
             .await
+    }
+
+    async fn put_body(
+        &self,
+        object: &ObjectId,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        self.execute_put_body_raw(object, headers, body, len).await
+    }
+
+    async fn copy(
+        &self,
+        destination: &ObjectId,
+        source: &ObjectId,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_copy_raw(destination, source, headers).await
+    }
+
+    async fn put_subresource(
+        &self,
+        object: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_put_raw(object, query, headers).await
+    }
+
+    async fn delete(
+        &self,
+        object: &ObjectId,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_delete_raw(object, headers).await
     }
 }
 
@@ -304,12 +389,16 @@ impl AzureQuery {
         let mut parsed = Self::default();
         for (key, value) in url::form_urlencoded::parse(query.unwrap_or_default().as_bytes()) {
             match key.as_ref() {
-                "restype" => parsed.restype = Some(value.into_owned()),
-                "comp" => parsed.comp = Some(value.into_owned()),
-                "prefix" => parsed.prefix = Some(value.into_owned()),
-                "delimiter" => parsed.delimiter = Some(value.into_owned()),
-                "marker" => parsed.marker = Some(value.into_owned()),
-                "maxresults" => parsed.maxresults = Some(value.into_owned()),
+                "restype" => set_query_value(&mut parsed.restype, value.into_owned(), "restype")?,
+                "comp" => set_query_value(&mut parsed.comp, value.into_owned(), "comp")?,
+                "prefix" => set_query_value(&mut parsed.prefix, value.into_owned(), "prefix")?,
+                "delimiter" => {
+                    set_query_value(&mut parsed.delimiter, value.into_owned(), "delimiter")?
+                }
+                "marker" => set_query_value(&mut parsed.marker, value.into_owned(), "marker")?,
+                "maxresults" => {
+                    set_query_value(&mut parsed.maxresults, value.into_owned(), "maxresults")?
+                }
                 _ => {}
             }
         }
@@ -335,6 +424,289 @@ impl AzureQuery {
                 }),
         }
     }
+}
+
+fn set_query_value(
+    slot: &mut Option<String>,
+    value: String,
+    name: &str,
+) -> Result<(), AzureRequestError> {
+    if slot.replace(value).is_some() {
+        return Err(AzureRequestError::invalid(
+            "InvalidQueryParameterValue",
+            format!("{name} must occur exactly once"),
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug)]
+enum AzureMutation {
+    PutBlob,
+    Copy { source: ObjectId },
+    SetMetadata,
+    SetProperties,
+    Delete,
+}
+
+fn classify_mutation(
+    request: &Request,
+    query: &AzureQuery,
+    config: &AzureAdapterConfig,
+) -> Result<Option<AzureMutation>, AzureRequestError> {
+    match *request.method() {
+        axum::http::Method::PUT => match query.comp.as_deref() {
+            None if request.headers().contains_key("x-ms-copy-source") => {
+                Ok(Some(AzureMutation::Copy {
+                    source: copy_source(request.headers(), config)?,
+                }))
+            }
+            None => {
+                require_block_blob(request.headers())?;
+                Ok(Some(AzureMutation::PutBlob))
+            }
+            Some("metadata") if !request.headers().contains_key("x-ms-copy-source") => {
+                Ok(Some(AzureMutation::SetMetadata))
+            }
+            Some("properties") if !request.headers().contains_key("x-ms-copy-source") => {
+                Ok(Some(AzureMutation::SetProperties))
+            }
+            Some("block" | "blocklist") => Err(AzureRequestError::unsupported(
+                "block blob staging operations are not supported by this endpoint",
+            )),
+            _ => Err(AzureRequestError::unsupported(
+                "the requested blob PUT operation is not supported",
+            )),
+        },
+        axum::http::Method::DELETE if query.comp.is_none() => Ok(Some(AzureMutation::Delete)),
+        axum::http::Method::DELETE => Err(AzureRequestError::unsupported(
+            "the requested blob DELETE operation is not supported",
+        )),
+        _ => Ok(None),
+    }
+}
+
+fn require_block_blob(headers: &HeaderMap) -> Result<(), AzureRequestError> {
+    let mut values = headers.get_all("x-ms-blob-type").iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| *value == "BlockBlob")
+        .ok_or_else(|| {
+            AzureRequestError::invalid("InvalidHeaderValue", "x-ms-blob-type must be BlockBlob")
+        })?;
+    let _ = value;
+    if values.next().is_some() {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "x-ms-blob-type must occur exactly once",
+        ));
+    }
+    Ok(())
+}
+
+fn copy_source(
+    headers: &HeaderMap,
+    config: &AzureAdapterConfig,
+) -> Result<ObjectId, AzureRequestError> {
+    let mut values = headers.get_all("x-ms-copy-source").iter();
+    let value = values
+        .next()
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| {
+            AzureRequestError::invalid("InvalidHeaderValue", "copy source is invalid")
+        })?;
+    if values.next().is_some() {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "x-ms-copy-source must occur exactly once",
+        ));
+    }
+    let source = url::Url::parse(value)
+        .map_err(|_| AzureRequestError::invalid("InvalidHeaderValue", "copy source is invalid"))?;
+    if !matches!(source.scheme(), "http" | "https")
+        || !source.username().is_empty()
+        || source.password().is_some()
+        || source.query().is_some()
+        || source.fragment().is_some()
+    {
+        return Err(AzureRequestError::invalid(
+            "CopySourceNotSupported",
+            "copy source credentials, versions, and fragments are not supported",
+        ));
+    }
+    let segments = source
+        .path()
+        .trim_start_matches('/')
+        .split('/')
+        .collect::<Vec<_>>();
+    let public_account = source.host_str().and_then(|host| {
+        host.strip_suffix(&format!(".{}", config.endpoint_suffix))
+            .map(str::to_string)
+    });
+    let (account, container_index) = if let Some(account) = public_account {
+        (Some(account), 0)
+    } else if config.path_style {
+        (
+            segments
+                .first()
+                .map(|segment| decode_path(segment))
+                .transpose()?,
+            1,
+        )
+    } else {
+        return Err(AzureRequestError::invalid(
+            "CopySourceNotSupported",
+            "copy source must use the configured storage endpoint",
+        ));
+    };
+    if account.as_deref() != Some(config.account.as_str()) {
+        return Err(AzureRequestError::invalid(
+            "CopySourceNotSupported",
+            "copy source must belong to the configured storage account",
+        ));
+    }
+    let container = segments
+        .get(container_index)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AzureRequestError::invalid("InvalidHeaderValue", "copy source is invalid")
+        })?;
+    let blob = segments
+        .get(container_index + 1..)
+        .unwrap_or_default()
+        .join("/");
+    if blob.is_empty() {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "copy source must identify a blob",
+        ));
+    }
+    Ok(ObjectId::new(
+        Backend::Azure,
+        decode_path(container)?,
+        decode_path(&blob)?,
+    ))
+}
+
+fn single_content_length(headers: &HeaderMap) -> Result<u64, AzureRequestError> {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "Transfer-Encoding is not supported for Azure mutations",
+        ));
+    }
+    let mut values = headers.get_all(header::CONTENT_LENGTH).iter();
+    let value = values.next().ok_or_else(|| {
+        AzureRequestError::invalid("MissingRequiredHeader", "Content-Length is required")
+    })?;
+    if values.next().is_some() {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "Content-Length must occur exactly once",
+        ));
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            AzureRequestError::invalid("InvalidHeaderValue", "Content-Length is invalid")
+        })
+}
+
+fn require_empty_body(headers: &HeaderMap) -> Result<(), AzureRequestError> {
+    if headers.contains_key(header::TRANSFER_ENCODING) {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "this operation requires an empty body",
+        ));
+    }
+    if headers.contains_key(header::CONTENT_LENGTH) && single_content_length(headers)? != 0 {
+        return Err(AzureRequestError::invalid(
+            "InvalidHeaderValue",
+            "this operation requires an empty body",
+        ));
+    }
+    Ok(())
+}
+
+fn mutation_headers(
+    headers: &HeaderMap,
+    mutation: &AzureMutation,
+) -> Result<Vec<(String, String)>, AzureRequestError> {
+    const CONDITIONS: [&str; 6] = [
+        "if-match",
+        "if-none-match",
+        "if-modified-since",
+        "if-unmodified-since",
+        "x-ms-if-tags",
+        "x-ms-lease-id",
+    ];
+    const CONTENT: [&str; 8] = [
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-md5",
+        "content-type",
+        "expires",
+        "x-ms-content-crc64",
+    ];
+    let mut output = Vec::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        let allowed = CONDITIONS.contains(&name.as_str())
+            || match mutation {
+                AzureMutation::PutBlob => {
+                    CONTENT.contains(&name.as_str())
+                        || name.starts_with("x-ms-meta-")
+                        || matches!(
+                            name.as_str(),
+                            "x-ms-tags"
+                                | "x-ms-access-tier"
+                                | "x-ms-encryption-scope"
+                                | "x-ms-encryption-key"
+                                | "x-ms-encryption-key-sha256"
+                        )
+                }
+                AzureMutation::Copy { .. } => {
+                    name.starts_with("x-ms-meta-")
+                        || name.starts_with("x-ms-source-if-")
+                        || matches!(
+                            name.as_str(),
+                            "x-ms-requires-sync"
+                                | "x-ms-source-lease-id"
+                                | "x-ms-source-content-md5"
+                                | "x-ms-metadata-directive"
+                                | "x-ms-tags"
+                                | "x-ms-access-tier"
+                        )
+                }
+                AzureMutation::SetMetadata => name.starts_with("x-ms-meta-"),
+                AzureMutation::SetProperties => {
+                    CONTENT.contains(&name.as_str()) || name.starts_with("x-ms-blob-content-")
+                }
+                AzureMutation::Delete => name == "x-ms-delete-snapshots",
+            };
+        if !allowed {
+            continue;
+        }
+        if output
+            .iter()
+            .any(|(existing, _): &(String, String)| existing == &name)
+        {
+            return Err(AzureRequestError::invalid(
+                "InvalidHeaderValue",
+                format!("{name} must occur exactly once"),
+            ));
+        }
+        let value = value.to_str().map_err(|_| {
+            AzureRequestError::invalid("InvalidHeaderValue", format!("{name} is invalid"))
+        })?;
+        output.push((name, value.to_string()));
+    }
+    Ok(output)
 }
 
 fn conditional_headers(headers: &HeaderMap) -> Result<Vec<(String, String)>, AzureRequestError> {
@@ -680,6 +1052,7 @@ struct AzureRequestError {
     message: String,
     failure: FailureReason,
     content_range: Option<String>,
+    indeterminate_commit: bool,
 }
 
 impl AzureRequestError {
@@ -690,6 +1063,7 @@ impl AzureRequestError {
             message: message.into(),
             failure: FailureReason::InvalidRequest,
             content_range: None,
+            indeterminate_commit: false,
         }
     }
 
@@ -700,6 +1074,7 @@ impl AzureRequestError {
             message: "the requested range is not satisfiable".into(),
             failure: FailureReason::InvalidRequest,
             content_range: Some(format!("bytes */{size}")),
+            indeterminate_commit: false,
         }
     }
 
@@ -711,6 +1086,30 @@ impl AzureRequestError {
             message: "the storage service is temporarily unavailable".into(),
             failure: FailureReason::Origin,
             content_range: None,
+            indeterminate_commit: false,
+        }
+    }
+
+    fn indeterminate_commit() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "InternalError",
+            message: "the mutation result is indeterminate; inspect the blob before retrying"
+                .into(),
+            failure: FailureReason::Origin,
+            content_range: None,
+            indeterminate_commit: true,
+        }
+    }
+
+    fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_IMPLEMENTED,
+            code: "UnsupportedHttpVerb",
+            message: message.into(),
+            failure: FailureReason::Unsupported,
+            content_range: None,
+            indeterminate_commit: false,
         }
     }
 
@@ -721,6 +1120,7 @@ impl AzureRequestError {
             message: message.into(),
             failure: FailureReason::Internal,
             content_range: None,
+            indeterminate_commit: false,
         }
     }
 }
@@ -736,6 +1136,7 @@ fn cache_error(error: CacheReadError) -> AzureRequestError {
             message,
             failure: FailureReason::NotFound,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::VersionMismatch(message) => AzureRequestError {
             status: StatusCode::PRECONDITION_FAILED,
@@ -743,6 +1144,7 @@ fn cache_error(error: CacheReadError) -> AzureRequestError {
             message,
             failure: FailureReason::Precondition,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::CacheMiss(message) => AzureRequestError {
             status: StatusCode::NOT_FOUND,
@@ -750,6 +1152,7 @@ fn cache_error(error: CacheReadError) -> AzureRequestError {
             message,
             failure: FailureReason::CacheUnavailable,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::Timeout(message) => AzureRequestError {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -757,6 +1160,7 @@ fn cache_error(error: CacheReadError) -> AzureRequestError {
             message,
             failure: FailureReason::Timeout,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::Unavailable(message) => AzureRequestError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -764,6 +1168,7 @@ fn cache_error(error: CacheReadError) -> AzureRequestError {
             message,
             failure: FailureReason::CacheUnavailable,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::Origin(message) => AzureRequestError::origin_unavailable(message),
         CacheReadError::Protocol(message)
@@ -791,6 +1196,12 @@ fn error_response(error: AzureRequestError, request_id: &str) -> GatewayResponse
         if let Ok(value) = HeaderValue::from_str(&content_range) {
             response.headers_mut().insert(header::CONTENT_RANGE, value);
         }
+    }
+    if error.indeterminate_commit {
+        response.headers_mut().insert(
+            "x-talon-commit-state",
+            HeaderValue::from_static("indeterminate"),
+        );
     }
     stamp_gateway_headers(response.headers_mut(), request_id);
     GatewayResponse {
@@ -1069,6 +1480,162 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TrackingCache {
+        invalidated: Mutex<Vec<ObjectId>>,
+    }
+
+    impl AzureCache for TrackingCache {
+        fn stream(&self, _request: AzureCacheRequest<'_>) -> Result<CacheStream, CacheReadError> {
+            unreachable!("mutation tests do not read from cache")
+        }
+
+        fn invalidate_object(&self, object: &ObjectId) -> usize {
+            self.invalidated.lock().unwrap().push(object.clone());
+            1
+        }
+    }
+
+    type MutationRecord = (ObjectId, Vec<(String, String)>);
+    type CopyRecord = (ObjectId, ObjectId, Vec<(String, String)>);
+    type SubresourceRecord = (ObjectId, String, Vec<(String, String)>);
+
+    struct MutationOrigin {
+        put_status: u16,
+        copy_status: u16,
+        subresource_status: u16,
+        delete_status: u16,
+        put_transport_error: bool,
+        put: Mutex<Option<MutationRecord>>,
+        put_body: Mutex<Vec<u8>>,
+        copy: Mutex<Option<CopyRecord>>,
+        subresources: Mutex<Vec<SubresourceRecord>>,
+        delete: Mutex<Option<MutationRecord>>,
+    }
+
+    impl MutationOrigin {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                put_status: 201,
+                copy_status: 202,
+                subresource_status: 200,
+                delete_status: 202,
+                put_transport_error: false,
+                put: Mutex::new(None),
+                put_body: Mutex::new(Vec::new()),
+                copy: Mutex::new(None),
+                subresources: Mutex::new(Vec::new()),
+                delete: Mutex::new(None),
+            })
+        }
+
+        fn response(status: u16) -> HttpResponse {
+            HttpResponse {
+                status,
+                headers: Vec::new(),
+                body: Bytes::new(),
+            }
+        }
+
+        fn with_put_result(status: u16, transport_error: bool) -> Arc<Self> {
+            let mut origin = Self::new();
+            let inner = Arc::get_mut(&mut origin).unwrap();
+            inner.put_status = status;
+            inner.put_transport_error = transport_error;
+            origin
+        }
+
+        fn with_delete_status(status: u16) -> Arc<Self> {
+            let mut origin = Self::new();
+            Arc::get_mut(&mut origin).unwrap().delete_status = status;
+            origin
+        }
+    }
+
+    #[async_trait]
+    impl AzureOrigin for MutationOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            unreachable!("mutation tests do not issue HEAD")
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("mutation tests do not issue GET")
+        }
+
+        async fn list(
+            &self,
+            _container: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _marker: Option<&str>,
+            _max_results: u32,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("mutation tests do not issue LIST")
+        }
+
+        async fn put_body(
+            &self,
+            object: &ObjectId,
+            headers: &[(String, String)],
+            mut body: HttpRequestBody,
+            _len: u64,
+        ) -> Result<HttpResponse, String> {
+            *self.put.lock().unwrap() = Some((object.clone(), headers.to_vec()));
+            if self.put_transport_error {
+                return Err("connection lost after dispatch".into());
+            }
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            *self.put_body.lock().unwrap() = bytes;
+            Ok(Self::response(self.put_status))
+        }
+
+        async fn copy(
+            &self,
+            destination: &ObjectId,
+            source: &ObjectId,
+            headers: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            *self.copy.lock().unwrap() =
+                Some((destination.clone(), source.clone(), headers.to_vec()));
+            Ok(Self::response(self.copy_status))
+        }
+
+        async fn put_subresource(
+            &self,
+            object: &ObjectId,
+            query: &str,
+            headers: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            self.subresources.lock().unwrap().push((
+                object.clone(),
+                query.to_string(),
+                headers.to_vec(),
+            ));
+            Ok(Self::response(self.subresource_status))
+        }
+
+        async fn delete(
+            &self,
+            object: &ObjectId,
+            headers: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            *self.delete.lock().unwrap() = Some((object.clone(), headers.to_vec()));
+            Ok(Self::response(self.delete_status))
+        }
+    }
+
     fn context() -> GatewayRequestContext {
         GatewayRequestContext {
             request_id: "00112233-4455-4677-8899-aabbccddeeff".into(),
@@ -1082,6 +1649,16 @@ mod tests {
             .uri(uri)
             .header(header::HOST, "acct.blob.core.windows.net")
             .body(Body::empty())
+            .unwrap()
+    }
+
+    fn body_request(method: axum::http::Method, uri: &str, body: &'static [u8]) -> Request {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "acct.blob.core.windows.net")
+            .header(header::CONTENT_LENGTH, body.len())
+            .body(Body::from(body))
             .unwrap()
     }
 
@@ -1389,6 +1966,263 @@ mod tests {
         );
         assert_eq!(response.outcome, GatewayOutcome::Failed);
     }
+
+    #[test]
+    fn copy_access_requires_write_on_destination_and_read_on_source() {
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::new(TrackingCache::default()),
+            MutationOrigin::new(),
+        );
+        let mut request = request(axum::http::Method::PUT, "/dest/copied.bin");
+        request.headers_mut().insert(
+            "x-ms-copy-source",
+            HeaderValue::from_static("https://acct.blob.core.windows.net/source/original.bin"),
+        );
+
+        let access = adapter.classify_access(&request).unwrap();
+
+        assert_eq!(access.operation, GatewayOperation::Write);
+        assert_eq!(
+            access.target,
+            GatewayTarget::Object(ObjectId::new(Backend::Azure, "dest", "copied.bin"))
+        );
+        assert_eq!(access.additional.len(), 1);
+        assert_eq!(access.additional[0].operation, GatewayOperation::Read);
+        assert_eq!(
+            access.additional[0].target,
+            GatewayTarget::Object(ObjectId::new(Backend::Azure, "source", "original.bin"))
+        );
+    }
+
+    #[test]
+    fn copy_rejects_credentials_and_cross_account_sources_before_dispatch() {
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::new(TrackingCache::default()),
+            MutationOrigin::new(),
+        );
+        for source in [
+            "https://acct.blob.core.windows.net/source/blob?sig=secret",
+            "https://other.blob.core.windows.net/source/blob",
+            "https://attacker.invalid/acct/source/blob",
+        ] {
+            let mut request = request(axum::http::Method::PUT, "/dest/blob");
+            request
+                .headers_mut()
+                .insert("x-ms-copy-source", HeaderValue::from_str(source).unwrap());
+            let error = adapter.classify_access(&request).unwrap_err();
+            assert_eq!(error.code, "CopySourceNotSupported");
+        }
+    }
+
+    #[tokio::test]
+    async fn mutations_reject_transfer_encoded_bodies_before_origin_dispatch() {
+        let origin = MutationOrigin::new();
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::new(TrackingCache::default()),
+            Arc::clone(&origin) as Arc<dyn AzureOrigin>,
+        );
+        let mut put = request(axum::http::Method::PUT, "/container/blob");
+        put.headers_mut()
+            .insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
+        put.headers_mut().insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+
+        let response = adapter.handle(put, context()).await;
+
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert!(origin.put.lock().unwrap().is_none());
+
+        let mut delete = request(axum::http::Method::DELETE, "/container/blob");
+        delete.headers_mut().insert(
+            header::TRANSFER_ENCODING,
+            HeaderValue::from_static("chunked"),
+        );
+        let response = adapter.handle(delete, context()).await;
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert!(origin.delete.lock().unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn put_streams_once_forwards_only_allowed_headers_and_invalidates_on_success() {
+        let cache = Arc::new(TrackingCache::default());
+        let origin = MutationOrigin::new();
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::clone(&cache) as Arc<dyn AzureCache>,
+            Arc::clone(&origin) as Arc<dyn AzureOrigin>,
+        );
+        let mut request =
+            body_request(axum::http::Method::PUT, "/container/blob", b"streamed-body");
+        for (name, value) in [
+            ("x-ms-blob-type", "BlockBlob"),
+            ("content-type", "application/custom"),
+            ("x-ms-meta-owner", "talon"),
+            ("if-none-match", "*"),
+            ("authorization", "SharedKey attacker:secret"),
+            ("x-ms-date", "Sun, 06 Nov 1994 08:49:37 GMT"),
+            ("x-ms-version", "2099-01-01"),
+        ] {
+            request.headers_mut().insert(
+                HeaderName::from_static(name),
+                HeaderValue::from_static(value),
+            );
+        }
+
+        let response = adapter.handle(request, context()).await;
+
+        assert_eq!(response.response.status(), StatusCode::CREATED);
+        assert_eq!(*origin.put_body.lock().unwrap(), b"streamed-body");
+        let put = origin.put.lock().unwrap();
+        let headers = &put.as_ref().unwrap().1;
+        assert!(headers
+            .iter()
+            .any(|item| item == &("content-type".into(), "application/custom".into())));
+        assert!(headers
+            .iter()
+            .any(|item| item == &("x-ms-meta-owner".into(), "talon".into())));
+        assert!(headers
+            .iter()
+            .any(|item| item == &("if-none-match".into(), "*".into())));
+        assert!(!headers.iter().any(|(name, _)| matches!(
+            name.as_str(),
+            "authorization" | "x-ms-date" | "x-ms-version" | "x-ms-blob-type"
+        )));
+        assert_eq!(cache.invalidated.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_and_indeterminate_puts_do_not_invalidate_cache() {
+        for (status, transport_error, expected_status, indeterminate) in [
+            (412, false, StatusCode::PRECONDITION_FAILED, false),
+            (201, true, StatusCode::INTERNAL_SERVER_ERROR, true),
+        ] {
+            let cache = Arc::new(TrackingCache::default());
+            let origin = MutationOrigin::with_put_result(status, transport_error);
+            let adapter = adapter(
+                AzureAdapterConfig::public_cloud("acct"),
+                Arc::clone(&cache) as Arc<dyn AzureCache>,
+                origin,
+            );
+            let mut request = body_request(axum::http::Method::PUT, "/container/blob", b"data");
+            request
+                .headers_mut()
+                .insert("x-ms-blob-type", HeaderValue::from_static("BlockBlob"));
+
+            let response = adapter.handle(request, context()).await;
+
+            assert_eq!(response.response.status(), expected_status);
+            assert_eq!(
+                response
+                    .response
+                    .headers()
+                    .get("x-talon-commit-state")
+                    .is_some(),
+                indeterminate
+            );
+            assert!(cache.invalidated.lock().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn copy_metadata_properties_and_delete_dispatch_canonical_operations() {
+        let cache = Arc::new(TrackingCache::default());
+        let origin = MutationOrigin::new();
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::clone(&cache) as Arc<dyn AzureCache>,
+            Arc::clone(&origin) as Arc<dyn AzureOrigin>,
+        );
+
+        let mut copy = request(axum::http::Method::PUT, "/dest/copied.bin");
+        copy.headers_mut().insert(
+            "x-ms-copy-source",
+            HeaderValue::from_static("https://acct.blob.core.windows.net/source/original.bin"),
+        );
+        copy.headers_mut().insert(
+            header::AUTHORIZATION,
+            HeaderValue::from_static("SharedKey attacker:secret"),
+        );
+        assert_eq!(
+            adapter.handle(copy, context()).await.response.status(),
+            StatusCode::ACCEPTED
+        );
+        {
+            let copy = origin.copy.lock().unwrap();
+            let (_, source, headers) = copy.as_ref().unwrap();
+            assert_eq!(
+                source,
+                &ObjectId::new(Backend::Azure, "source", "original.bin")
+            );
+            assert!(!headers
+                .iter()
+                .any(|(name, _)| name == "authorization" || name == "x-ms-copy-source"));
+        }
+
+        let mut metadata = request(axum::http::Method::PUT, "/dest/copied.bin?comp=metadata");
+        metadata
+            .headers_mut()
+            .insert("x-ms-meta-owner", HeaderValue::from_static("talon"));
+        assert_eq!(
+            adapter.handle(metadata, context()).await.response.status(),
+            StatusCode::OK
+        );
+        let mut properties = request(axum::http::Method::PUT, "/dest/copied.bin?comp=properties");
+        properties.headers_mut().insert(
+            "x-ms-blob-content-type",
+            HeaderValue::from_static("application/octet-stream"),
+        );
+        assert_eq!(
+            adapter
+                .handle(properties, context())
+                .await
+                .response
+                .status(),
+            StatusCode::OK
+        );
+        {
+            let subresources = origin.subresources.lock().unwrap();
+            assert_eq!(subresources[0].1, "comp=metadata");
+            assert_eq!(subresources[1].1, "comp=properties");
+        }
+
+        assert_eq!(
+            adapter
+                .handle(
+                    request(axum::http::Method::DELETE, "/dest/copied.bin"),
+                    context()
+                )
+                .await
+                .response
+                .status(),
+            StatusCode::ACCEPTED
+        );
+        assert_eq!(cache.invalidated.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn delete_not_found_confirms_absence_and_invalidates_cache() {
+        let cache = Arc::new(TrackingCache::default());
+        let adapter = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::clone(&cache) as Arc<dyn AzureCache>,
+            MutationOrigin::with_delete_status(404),
+        );
+
+        let response = adapter
+            .handle(
+                request(axum::http::Method::DELETE, "/container/missing"),
+                context(),
+            )
+            .await;
+
+        assert_eq!(response.response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(cache.invalidated.lock().unwrap().len(), 1);
+    }
 }
 
 #[async_trait]
@@ -1433,19 +2267,30 @@ impl AzureBlobAdapter {
         let blob = target.blob.ok_or_else(|| {
             AzureRequestError::invalid("InvalidUri", "request does not identify a blob")
         })?;
-        let operation = match *request.method() {
-            axum::http::Method::HEAD => GatewayOperation::Stat,
-            axum::http::Method::GET => GatewayOperation::Read,
-            axum::http::Method::PUT => GatewayOperation::Write,
-            axum::http::Method::DELETE => GatewayOperation::Delete,
-            _ => GatewayOperation::Unsupported,
+        let mutation = classify_mutation(request, &query, &self.config)?;
+        let operation = match mutation.as_ref() {
+            Some(AzureMutation::Delete) => GatewayOperation::Delete,
+            Some(_) => GatewayOperation::Write,
+            None => match *request.method() {
+                axum::http::Method::HEAD => GatewayOperation::Stat,
+                axum::http::Method::GET => GatewayOperation::Read,
+                _ => GatewayOperation::Unsupported,
+            },
         };
-        Ok(GatewayAccess {
+        let mut access = GatewayAccess {
             operation,
             provider_account: Some(self.config.account.clone()),
             target: GatewayTarget::Object(ObjectId::new(Backend::Azure, target.container, blob)),
             additional: Vec::new(),
-        })
+        };
+        if let Some(AzureMutation::Copy { source }) = mutation {
+            access.additional.push(crate::GatewayAccessRequirement {
+                operation: GatewayOperation::Read,
+                provider_account: Some(self.config.account.clone()),
+                target: GatewayTarget::Object(source),
+            });
+        }
+        Ok(access)
     }
 
     async fn handle_request(
@@ -1462,17 +2307,148 @@ impl AzureBlobAdapter {
             AzureRequestError::invalid("InvalidUri", "request does not identify a blob")
         })?;
         let object = ObjectId::new(Backend::Azure, target.container, blob);
+        if let Some(mutation) = classify_mutation(&request, &query, &self.config)? {
+            return match mutation {
+                AzureMutation::PutBlob => self.put(object, request, context).await,
+                AzureMutation::Copy { source } => {
+                    self.copy(object, source, request.headers(), context).await
+                }
+                AzureMutation::SetMetadata => {
+                    self.put_subresource(object, "comp=metadata", request.headers(), context)
+                        .await
+                }
+                AzureMutation::SetProperties => {
+                    self.put_subresource(object, "comp=properties", request.headers(), context)
+                        .await
+                }
+                AzureMutation::Delete => self.delete(object, request.headers(), context).await,
+            };
+        }
         match *request.method() {
             axum::http::Method::HEAD => self.head(object, request.headers(), context).await,
             axum::http::Method::GET => self.get(object, request.headers(), context).await,
-            _ => Err(AzureRequestError {
-                status: StatusCode::METHOD_NOT_ALLOWED,
-                code: "UnsupportedHttpVerb",
-                message: "the requested HTTP method is not supported".into(),
-                failure: FailureReason::Unsupported,
-                content_range: None,
-            }),
+            _ => Err(AzureRequestError::unsupported(
+                "the requested HTTP method is not supported",
+            )),
         }
+    }
+
+    async fn put(
+        &self,
+        object: ObjectId,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        let len = single_content_length(request.headers())?;
+        let headers = mutation_headers(request.headers(), &AzureMutation::PutBlob)?;
+        let body = request
+            .into_body()
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(|error| error.to_string()));
+        let response = self
+            .origin
+            .put_body(&object, &headers, Box::pin(body), len)
+            .await
+            .map_err(|_| AzureRequestError::indeterminate_commit())?;
+        if response.is_success() {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        let mut response = raw_buffered_response(
+            response,
+            GatewayOperation::Write,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(object)),
+            context,
+        );
+        response.requested_bytes = len;
+        Ok(response)
+    }
+
+    async fn copy(
+        &self,
+        destination: ObjectId,
+        source: ObjectId,
+        headers: &HeaderMap,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        require_empty_body(headers)?;
+        let headers = mutation_headers(
+            headers,
+            &AzureMutation::Copy {
+                source: source.clone(),
+            },
+        )?;
+        let response = self
+            .origin
+            .copy(&destination, &source, &headers)
+            .await
+            .map_err(|_| AzureRequestError::indeterminate_commit())?;
+        if response.is_success() {
+            let _ = self.cache.invalidate_object(&destination);
+        }
+        Ok(raw_buffered_response(
+            response,
+            GatewayOperation::Write,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(destination)),
+            context,
+        ))
+    }
+
+    async fn put_subresource(
+        &self,
+        object: ObjectId,
+        query: &str,
+        headers: &HeaderMap,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        require_empty_body(headers)?;
+        let mutation = if query == "comp=metadata" {
+            AzureMutation::SetMetadata
+        } else {
+            AzureMutation::SetProperties
+        };
+        let headers = mutation_headers(headers, &mutation)?;
+        let response = self
+            .origin
+            .put_subresource(&object, query, &headers)
+            .await
+            .map_err(|_| AzureRequestError::indeterminate_commit())?;
+        if response.is_success() {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        Ok(raw_buffered_response(
+            response,
+            GatewayOperation::Write,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
+    }
+
+    async fn delete(
+        &self,
+        object: ObjectId,
+        headers: &HeaderMap,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, AzureRequestError> {
+        require_empty_body(headers)?;
+        let headers = mutation_headers(headers, &AzureMutation::Delete)?;
+        let response = self
+            .origin
+            .delete(&object, &headers)
+            .await
+            .map_err(|_| AzureRequestError::indeterminate_commit())?;
+        if response.is_success() || response.status == 404 {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        Ok(raw_buffered_response(
+            response,
+            GatewayOperation::Delete,
+            GatewayRoute::Origin,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
     }
 
     async fn head(

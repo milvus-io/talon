@@ -201,12 +201,22 @@ to the one account served by the process and to one policy principal:
 ```
 
 The verifier accepts full Shared Key plus service/account SAS for Blob service
-reads and listings. It enforces signature scope, permissions, resource type,
-protocol, start, expiry, and bounded skew. Stored access policies, signed IP
+reads, listings, writes, and deletes. It enforces signature scope, permissions,
+resource type, protocol, start, expiry, and bounded skew. Stored access policies, signed IP
 ranges, encryption scopes, and user-delegation SAS fail closed because this
 gateway cannot independently enforce those external constraints. Shared Key
 signs `x-ms-talon-cache-mark` through Azure canonicalized headers; SAS requests
 carrying a cache mark are rejected because SAS cannot bind custom headers.
+
+Azure `Put Blob` accepts only fixed-length `BlockBlob` uploads. Copy is limited
+to a concrete source blob in the configured account and requires both source
+read and destination write authorization. Set Blob Metadata, Set Blob
+Properties, and Delete Blob are also passed through; Put Block and Put Block
+List remain unsupported. The gateway never retries a consumed upload stream.
+Confirmed mutation success, plus `404` from Delete Blob, invalidates local
+placement state. A failed HTTP response does not invalidate it, while transport
+loss after dispatch returns `x-talon-commit-state: indeterminate` and requires
+an authoritative blob check before retrying.
 
 ## Docker
 

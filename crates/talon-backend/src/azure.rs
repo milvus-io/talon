@@ -20,7 +20,9 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Method};
+use crate::http::{
+    HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
+};
 
 /// Percent-encode a query value. `/` is escaped: a listing prefix contains
 /// slashes and an unescaped one would change the request path.
@@ -149,6 +151,32 @@ impl AzureBackend {
             Some(sas) => format!("{base}?{sas}"),
             None => base,
         }
+    }
+
+    fn blob_url_with_query(&self, obj: &ObjectId, query: &str) -> String {
+        let url = self.blob_url(obj);
+        let separator = if url.contains('?') { '&' } else { '?' };
+        format!("{url}{separator}{query}")
+    }
+
+    fn extend_mutation_headers(request: &mut HttpRequest, headers: &[(String, String)]) {
+        request.headers.extend(
+            headers
+                .iter()
+                .filter(|(name, _)| {
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "authorization"
+                            | "host"
+                            | "content-length"
+                            | "transfer-encoding"
+                            | "x-ms-copy-source"
+                            | "x-ms-date"
+                            | "x-ms-version"
+                    )
+                })
+                .cloned(),
+        );
     }
 
     /// Build the container listing URL.
@@ -361,6 +389,69 @@ impl AzureBackend {
         let mut headers = self.common_headers();
         headers.extend_from_slice(conditions);
         let request = HttpRequest::new(Method::Get, url, headers);
+        self.http.execute(self.authorized(request)).await
+    }
+
+    /// Stream one fixed-length Put Blob request without replaying its body.
+    pub async fn execute_put_body_raw(
+        &self,
+        obj: &ObjectId,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_streamed_put(obj, len);
+        Self::extend_mutation_headers(&mut request, headers);
+        self.http
+            .execute_body(self.authorized(request), body, len)
+            .await
+    }
+
+    /// Execute one bodyless Azure Blob PUT subresource operation.
+    pub async fn execute_put_raw(
+        &self,
+        obj: &ObjectId,
+        query: &str,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = HttpRequest::new(
+            Method::Put,
+            self.blob_url_with_query(obj, query),
+            self.common_headers(),
+        );
+        request.headers.push(("content-length".into(), "0".into()));
+        Self::extend_mutation_headers(&mut request, headers);
+        self.http.execute(self.authorized(request)).await
+    }
+
+    /// Execute same-account Copy Blob with a source URL built from origin configuration.
+    pub async fn execute_copy_raw(
+        &self,
+        destination: &ObjectId,
+        source: &ObjectId,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = HttpRequest::new(
+            Method::Put,
+            self.blob_url(destination),
+            self.common_headers(),
+        );
+        request.headers.push(("content-length".into(), "0".into()));
+        request
+            .headers
+            .push(("x-ms-copy-source".into(), self.blob_url(source)));
+        Self::extend_mutation_headers(&mut request, headers);
+        self.http.execute(self.authorized(request)).await
+    }
+
+    /// Execute a conditional raw Delete Blob request.
+    pub async fn execute_delete_raw(
+        &self,
+        obj: &ObjectId,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_delete(obj);
+        Self::extend_mutation_headers(&mut request, headers);
         self.http.execute(self.authorized(request)).await
     }
 
@@ -618,6 +709,7 @@ mod tests {
     struct MockHttp {
         last: Mutex<Option<HttpRequest>>,
         last_file: Mutex<Option<(HttpRequest, std::path::PathBuf, u64)>>,
+        last_body: Mutex<Option<(HttpRequest, Vec<u8>, u64)>>,
         response: HttpResponse,
     }
 
@@ -626,6 +718,7 @@ mod tests {
             Arc::new(Self {
                 last: Mutex::new(None),
                 last_file: Mutex::new(None),
+                last_body: Mutex::new(None),
                 response,
             })
         }
@@ -645,6 +738,21 @@ mod tests {
             len: u64,
         ) -> std::result::Result<HttpResponse, String> {
             *self.last_file.lock().unwrap() = Some((req, path.to_path_buf(), len));
+            Ok(self.response.clone())
+        }
+
+        async fn execute_body(
+            &self,
+            req: HttpRequest,
+            mut body: HttpRequestBody,
+            len: u64,
+        ) -> std::result::Result<HttpResponse, String> {
+            use futures::StreamExt as _;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            *self.last_body.lock().unwrap() = Some((req, bytes, len));
             Ok(self.response.clone())
         }
     }
@@ -1031,5 +1139,148 @@ mod tests {
             url.contains("marker=2%21m"),
             "marker must be encoded: {url}"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_put_streams_body_and_replaces_incoming_auth_material() {
+        let http = MockHttp::new(HttpResponse {
+            status: 201,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let backend = AzureBackend::with_shared_key(AzureConfig::new("acct"), key, http.clone());
+        let body = Box::pin(futures::stream::iter([
+            Ok(bytes::Bytes::from_static(b"streamed-")),
+            Ok(bytes::Bytes::from_static(b"body")),
+        ]));
+
+        backend
+            .execute_put_body_raw(
+                &obj(),
+                &[
+                    ("content-type".into(), "application/custom".into()),
+                    ("authorization".into(), "SharedKey attacker:secret".into()),
+                    ("x-ms-date".into(), "stale".into()),
+                ],
+                body,
+                13,
+            )
+            .await
+            .unwrap();
+
+        let recorded = http.last_body.lock().unwrap();
+        let (request, body, len) = recorded.as_ref().unwrap();
+        assert_eq!(body, b"streamed-body");
+        assert_eq!(*len, 13);
+        assert_eq!(request.header("content-length"), Some("13"));
+        assert_eq!(request.header("x-ms-blob-type"), Some("BlockBlob"));
+        assert_eq!(request.header("content-type"), Some("application/custom"));
+        assert_eq!(
+            request
+                .headers
+                .iter()
+                .filter(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+                .count(),
+            1
+        );
+        assert!(request
+            .header("authorization")
+            .unwrap()
+            .starts_with("SharedKey acct:"));
+        assert_ne!(request.header("x-ms-date"), Some("stale"));
+    }
+
+    #[tokio::test]
+    async fn raw_copy_rebuilds_source_url_from_backend_configuration() {
+        let http = MockHttp::new(HttpResponse {
+            status: 202,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::new(
+            AzureConfig::emulator("acct", "azurite.internal:10000", false),
+            Some("sv=2021&sig=origin-secret".into()),
+            http.clone(),
+        );
+        let source = ObjectId::new(Backend::Azure, "source", "dir/original.bin");
+
+        backend
+            .execute_copy_raw(
+                &obj(),
+                &source,
+                &[(
+                    "x-ms-copy-source".into(),
+                    "https://attacker.invalid/blob?sig=bad".into(),
+                )],
+            )
+            .await
+            .unwrap();
+
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(
+            request.header("x-ms-copy-source"),
+            Some(
+                "http://azurite.internal:10000/acct/source/dir/original.bin?sv=2021&sig=origin-secret"
+            )
+        );
+        assert_eq!(request.url.matches('?').count(), 1);
+        assert!(request.url.contains("sv=2021&sig=origin-secret"));
+    }
+
+    #[tokio::test]
+    async fn raw_subresource_merges_query_with_sas_and_preserves_conditions() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::new(
+            AzureConfig::new("acct"),
+            Some("sv=2021&sig=abc".into()),
+            http.clone(),
+        );
+
+        backend
+            .execute_put_raw(
+                &obj(),
+                "comp=metadata",
+                &[
+                    ("if-match".into(), "\"etag\"".into()),
+                    ("x-ms-meta-owner".into(), "talon".into()),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(request.url.matches('?').count(), 1);
+        assert!(request.url.contains("sv=2021&sig=abc&comp=metadata"));
+        assert_eq!(request.header("if-match"), Some("\"etag\""));
+        assert_eq!(request.header("x-ms-meta-owner"), Some("talon"));
+    }
+
+    #[tokio::test]
+    async fn raw_delete_signs_forwarded_preconditions() {
+        let http = MockHttp::new(HttpResponse {
+            status: 202,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let key = "MDEyMzQ1Njc4OWFiY2RlZjAxMjM0NTY3ODlhYmNkZWY=";
+        let backend = AzureBackend::with_shared_key(AzureConfig::new("acct"), key, http.clone());
+
+        backend
+            .execute_delete_raw(&obj(), &[("if-match".into(), "\"etag\"".into())])
+            .await
+            .unwrap();
+
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(request.method, Method::Delete);
+        assert_eq!(request.header("if-match"), Some("\"etag\""));
+        assert!(request
+            .header("authorization")
+            .unwrap()
+            .starts_with("SharedKey acct:"));
     }
 }
