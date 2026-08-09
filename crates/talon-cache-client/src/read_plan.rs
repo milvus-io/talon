@@ -9,12 +9,10 @@
 //!
 //! The plan is clamped to the file's `size`: a read starting at or past EOF
 //! yields an empty plan, and a read overrunning EOF is truncated at the last
-//! valid byte (mirroring POSIX short reads). This is pure arithmetic over
-//! [`mapping::resolve_read`](crate::mapping::resolve_read); no I/O happens here.
+//! valid byte (mirroring POSIX short reads). This is pure block-offset
+//! arithmetic; no I/O happens here.
 
 use talon_core::{BlockId, ObjectId, Version};
-
-use crate::mapping::resolve_read;
 
 /// One block-local slice of a larger read.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,19 +51,15 @@ pub fn plan_read(
     let mut segments = Vec::new();
     let mut pos = offset;
     while pos < end {
-        // The block covering `pos`, plus the offset of `pos` within it.
-        let target = match resolve_read(obj, pos, block_size, version) {
-            Ok(t) => t,
-            Err(_) => break, // block_size==0 guarded above; defensive.
-        };
-        let block_start = target.block.offset;
+        let block_start = (pos / bs) * bs;
+        let offset_in_block = (pos - block_start) as u32;
         let block_end = block_start + bs;
         // Take up to the block boundary or the clamped read end, whichever first.
         let seg_end = block_end.min(end);
         let seg_len = (seg_end - pos) as u32;
         segments.push(BlockSegment {
-            block: target.block,
-            offset_in_block: target.offset_in_block,
+            block: BlockId::new(obj.clone(), block_start, block_size, version.clone()),
+            offset_in_block,
             len: seg_len,
         });
         pos = seg_end;

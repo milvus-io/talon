@@ -1,11 +1,10 @@
 //! Poison-tolerant lock accessors.
 //!
-//! Every piece of shared state in this crate is a plain data structure behind a
-//! `Mutex` or `RwLock` — a namespace map, an idle-connection bucket, a placement
-//! cache. None of them has a multi-step invariant that a panic could leave
-//! half-applied, so Rust's default poisoning behaviour buys nothing here and
-//! costs a great deal: `lock().unwrap()` turns *one* panic anywhere under the
-//! lock into a permanent, unrecoverable failure of every later access.
+//! FUSE namespace state is a plain data structure behind a `Mutex`. It has no
+//! multi-step invariant that a panic could leave half-applied, so Rust's default
+//! poisoning behaviour buys nothing here and costs a great deal:
+//! `lock().unwrap()` turns *one* panic anywhere under the lock into a permanent,
+//! unrecoverable failure of every later access.
 //!
 //! On a FUSE mount that failure mode is severe. The namespace lives behind a
 //! single `Mutex`, so a poisoned lock means every subsequent `lookup`,
@@ -18,7 +17,7 @@
 //! one entry" rather than "the mount is dead". Prefer them over
 //! `lock().unwrap()` throughout the crate.
 
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard};
 
 /// Poison-tolerant access to a [`Mutex`].
 pub(crate) trait MutexExt<T> {
@@ -29,25 +28,6 @@ pub(crate) trait MutexExt<T> {
 impl<T> MutexExt<T> for Mutex<T> {
     fn lock_recover(&self) -> MutexGuard<'_, T> {
         self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-}
-
-/// Poison-tolerant access to an [`RwLock`].
-pub(crate) trait RwLockExt<T> {
-    /// Read-lock, recovering the guard if the lock was poisoned by a panic.
-    fn read_recover(&self) -> RwLockReadGuard<'_, T>;
-    /// Write-lock, recovering the guard if the lock was poisoned by a panic.
-    fn write_recover(&self) -> RwLockWriteGuard<'_, T>;
-}
-
-impl<T> RwLockExt<T> for RwLock<T> {
-    fn read_recover(&self) -> RwLockReadGuard<'_, T> {
-        self.read().unwrap_or_else(|poisoned| poisoned.into_inner())
-    }
-
-    fn write_recover(&self) -> RwLockWriteGuard<'_, T> {
-        self.write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -76,23 +56,5 @@ mod tests {
         assert_eq!(*g, vec![1, 2, 3, 4]);
         g.push(5);
         assert_eq!(g.len(), 5);
-    }
-
-    #[test]
-    fn rwlock_survives_a_panic_under_the_write_lock() {
-        let l = Arc::new(RwLock::new(String::from("a")));
-        let l2 = Arc::clone(&l);
-        let panicked = std::thread::spawn(move || {
-            let mut g = l2.write_recover();
-            g.push('b');
-            panic!("boom");
-        })
-        .join();
-        assert!(panicked.is_err());
-        assert!(l.is_poisoned());
-
-        assert_eq!(&*l.read_recover(), "ab");
-        l.write_recover().push('c');
-        assert_eq!(&*l.read_recover(), "abc");
     }
 }

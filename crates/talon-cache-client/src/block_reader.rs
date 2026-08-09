@@ -19,7 +19,7 @@
 //! before giving up. A failed refresh keeps using the last-good snapshot.
 //! [`BlockReader::observe_epoch`] reconciles the cache when a different
 //! membership token is seen. Multi-block splitting is handled by
-//! [`crate::read_plan`] and readahead by [`crate::prefetch`].
+//! [`crate::read_plan`]; protocol frontends own their prefetch policy.
 
 use std::sync::Arc;
 

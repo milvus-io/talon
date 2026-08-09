@@ -2560,6 +2560,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-cache-client"
+version = "0.1.0"
+dependencies = [
+ "talon-core",
+ "talon-transport",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "talon-client"
 version = "0.1.0"
 dependencies = [
@@ -2628,6 +2640,7 @@ dependencies = [
  "divan",
  "fuser",
  "libc",
+ "talon-cache-client",
  "talon-core",
  "talon-metadata",
  "talon-transport",
