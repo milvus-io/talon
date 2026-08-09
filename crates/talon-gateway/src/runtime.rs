@@ -319,7 +319,10 @@ pub enum GatewayTlsServeError {
     Io(#[from] std::io::Error),
 }
 
-async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Request) -> Response {
+async fn adapter_handler(
+    State(runtime): State<Arc<GatewayRuntime>>,
+    mut request: Request,
+) -> Response {
     let context = request
         .extensions()
         .get::<GatewayRequestContext>()
@@ -434,6 +437,9 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
             "allow",
             "policy_allowed",
         ));
+    }
+    if let Some(principal) = authenticated {
+        request.extensions_mut().insert(principal);
     }
     let result =
         match tokio::time::timeout(remaining, runtime.adapter.handle(request, context.clone()))

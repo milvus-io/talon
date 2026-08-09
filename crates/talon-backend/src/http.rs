@@ -22,6 +22,8 @@ pub enum Method {
     Head,
     /// PUT, used to upload a whole object (write-through, #226).
     Put,
+    /// POST, used for multipart create and completion requests.
+    Post,
     /// DELETE, used to remove an object.
     Delete,
 }

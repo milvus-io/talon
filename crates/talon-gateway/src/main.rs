@@ -49,6 +49,8 @@ struct Settings {
     s3_session_token: Option<String>,
     s3_client_identities_path: Option<PathBuf>,
     s3_max_clock_skew_ms: u64,
+    s3_max_multipart_uploads: usize,
+    s3_multipart_ttl_ms: u64,
     authorization_path: Option<PathBuf>,
     tls: Option<GatewayTlsConfig>,
 }
@@ -226,6 +228,16 @@ impl Settings {
                 "900000",
                 "TALON_GATEWAY_S3_MAX_CLOCK_SKEW_MS",
             )?,
+            s3_max_multipart_uploads: parse_or(
+                value(&mut get, "TALON_GATEWAY_S3_MAX_MULTIPART_UPLOADS"),
+                "1024",
+                "TALON_GATEWAY_S3_MAX_MULTIPART_UPLOADS",
+            )?,
+            s3_multipart_ttl_ms: parse_or(
+                value(&mut get, "TALON_GATEWAY_S3_MULTIPART_TTL_MS"),
+                "86400000",
+                "TALON_GATEWAY_S3_MULTIPART_TTL_MS",
+            )?,
             authorization_path: value(&mut get, "TALON_GATEWAY_AUTHORIZATION_PATH")
                 .map(PathBuf::from),
             tls,
@@ -392,6 +404,8 @@ fn s3_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
     config.block_size = settings.block_size;
     config.transfer_chunk_bytes = settings.transfer_chunk_bytes;
     config.default_route = settings.route;
+    config.max_multipart_uploads = settings.s3_max_multipart_uploads;
+    config.multipart_state_ttl = std::time::Duration::from_millis(settings.s3_multipart_ttl_ms);
     let cache = cache_reader(settings);
     Ok(Arc::new(S3Adapter::new(
         config,
@@ -680,6 +694,8 @@ mod tests {
         assert!(settings.tls.is_none());
         assert!(settings.s3_client_identities_path.is_none());
         assert_eq!(settings.s3_max_clock_skew_ms, 900_000);
+        assert_eq!(settings.s3_max_multipart_uploads, 1024);
+        assert_eq!(settings.s3_multipart_ttl_ms, 86_400_000);
         assert!(settings.authorization_path.is_none());
         assert!(settings.azure_client_identities_path.is_none());
         assert_eq!(settings.azure_max_clock_skew_ms, 900_000);
