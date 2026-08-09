@@ -33,6 +33,23 @@ use crate::pool::ConnectionPool;
 use crate::read_plan::plan_read;
 use crate::worker_client::{WorkerClient, WorkerError};
 
+pub(crate) enum DetailedBlockReadError {
+    Block(BlockReadError),
+    Worker(WorkerError),
+}
+
+impl From<BlockReadError> for DetailedBlockReadError {
+    fn from(error: BlockReadError) -> Self {
+        Self::Block(error)
+    }
+}
+
+struct ReplicaFailure {
+    reason: RefreshReason,
+    error: WorkerError,
+    retryable: bool,
+}
+
 /// Errors from a block read.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockReadError {
@@ -154,6 +171,28 @@ impl BlockReader {
         len: u32,
         now_ms: u64,
     ) -> Result<Vec<u8>, BlockReadError> {
+        match self
+            .read_block_detailed(block, offset_in_block, len, now_ms)
+            .await
+        {
+            Ok(bytes) => Ok(bytes),
+            Err(DetailedBlockReadError::Block(error)) => Err(error),
+            Err(DetailedBlockReadError::Worker(_)) => Err(BlockReadError::AllReplicasFailed),
+        }
+    }
+
+    /// Read one block slice while preserving the last worker failure.
+    ///
+    /// The public FUSE-compatible API intentionally retains its historical
+    /// `AllReplicasFailed` result. Streaming protocol frontends need the typed
+    /// final failure to make a deterministic fallback decision.
+    pub(crate) async fn read_block_detailed(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        len: u32,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, DetailedBlockReadError> {
         let cached = match self.cache.get(block, now_ms) {
             Some(c) => {
                 self.stats.record_cache_hit();
@@ -175,11 +214,14 @@ impl BlockReader {
                 self.stats.add_bytes_served(bytes.len() as u64);
                 return Ok(bytes);
             }
-            Err(reason) => {
+            Err(failure) => {
+                if !failure.retryable {
+                    return Err(DetailedBlockReadError::Worker(failure.error));
+                }
                 // Every cached replica failed; drop the stale placement and do a
                 // single membership refresh before giving up.
-                tracing::debug!(%block, ?reason, "all cached replicas failed; refreshing placement");
-                self.cache.invalidate(block, reason);
+                tracing::debug!(%block, reason = ?failure.reason, "all cached replicas failed; refreshing placement");
+                self.cache.invalidate(block, failure.reason);
                 self.stats.record_coordinator_refresh();
             }
         }
@@ -188,7 +230,7 @@ impl BlockReader {
         let bytes = self
             .try_replicas(block, &fresh.replicas, abs_offset, len)
             .await
-            .map_err(|_| BlockReadError::AllReplicasFailed)?;
+            .map_err(|failure| DetailedBlockReadError::Worker(failure.error))?;
         self.stats.add_bytes_served(bytes.len() as u64);
         Ok(bytes)
     }
@@ -205,11 +247,18 @@ impl BlockReader {
         replicas: &[String],
         abs_offset: u64,
         len: u32,
-    ) -> Result<Vec<u8>, RefreshReason> {
+    ) -> Result<Vec<u8>, ReplicaFailure> {
         if replicas.is_empty() {
-            return Err(RefreshReason::WrongOwner);
+            return Err(ReplicaFailure {
+                reason: RefreshReason::WrongOwner,
+                error: WorkerError::Remote(talon_transport::DataPlaneError {
+                    code: talon_transport::DataErrorCode::Internal,
+                    message: "placement contained no worker addresses".into(),
+                }),
+                retryable: true,
+            });
         }
-        let mut last = RefreshReason::WrongOwner;
+        let mut last = None;
         for addr in replicas {
             let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
             self.stats.record_worker_fetch();
@@ -218,22 +267,39 @@ impl BlockReader {
                 .await
             {
                 Ok(bytes) if bytes.len() as u64 == u64::from(len) => return Ok(bytes),
-                Ok(_) => {
+                Ok(bytes) => {
                     self.stats.record_worker_failure();
-                    last = RefreshReason::WrongOwner;
+                    last = Some(ReplicaFailure {
+                        reason: RefreshReason::WrongOwner,
+                        error: WorkerError::RangeLengthMismatch {
+                            expected: u64::from(len),
+                            actual: bytes.len() as u64,
+                        },
+                        retryable: true,
+                    });
                 }
                 Err(e) => {
                     self.stats.record_worker_failure();
-                    last = match e {
+                    let reason = match &e {
                         WorkerError::Io(_) => RefreshReason::ConnectFailure,
                         // A framing/encode error is not a placement problem, but
                         // treat it as a wrong-owner refresh so we still recover.
                         _ => RefreshReason::WrongOwner,
                     };
+                    let retryable = replica_retryable(&e);
+                    let failure = ReplicaFailure {
+                        reason,
+                        error: e,
+                        retryable,
+                    };
+                    if !retryable {
+                        return Err(failure);
+                    }
+                    last = Some(failure);
                 }
             }
         }
-        Err(last)
+        Err(last.expect("non-empty replica list records a failure"))
     }
 
     /// Reconcile the cache against an observed placement version.
@@ -400,6 +466,19 @@ impl BlockReader {
                 }
             }
         }
+    }
+}
+
+fn replica_retryable(error: &WorkerError) -> bool {
+    match error {
+        WorkerError::Remote(error) => !matches!(
+            error.code,
+            talon_transport::DataErrorCode::InvalidRequest
+                | talon_transport::DataErrorCode::NotFound
+                | talon_transport::DataErrorCode::VersionMismatch
+                | talon_transport::DataErrorCode::Origin
+        ),
+        _ => true,
     }
 }
 

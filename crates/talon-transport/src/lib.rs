@@ -23,9 +23,9 @@ pub use codec::{
     CONTROL_SCHEMA_VERSION, MIN_CONTROL_SCHEMA_VERSION,
 };
 pub use data::{
-    decode_delete, decode_put_header, decode_request, encode_delete, encode_error,
-    encode_put_header, encode_request, response_header_ok, DataError, DeleteRequest, PutRequest,
-    RangeRequest,
+    decode_delete, decode_error_payload, decode_put_header, decode_request, encode_delete,
+    encode_error, encode_put_header, encode_request, encode_typed_error, response_header_ok,
+    DataError, DataErrorCode, DataPlaneError, DeleteRequest, PutRequest, RangeRequest,
 };
 pub use frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
 pub use limits::{

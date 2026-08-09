@@ -16,6 +16,54 @@ use talon_core::ObjectId;
 
 use crate::frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN};
 
+const ERROR_ENVELOPE_MAGIC: &[u8; 4] = b"TLE1";
+
+/// Stable machine-readable classification for a data-plane failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DataErrorCode {
+    /// A legacy or otherwise unclassified failure.
+    Unknown,
+    /// The request could not be parsed or names an invalid range.
+    InvalidRequest,
+    /// The requested object does not exist at the origin.
+    NotFound,
+    /// The requested block is absent and origin fetch was disabled.
+    CacheMiss,
+    /// The worker or one of its required services is unavailable.
+    Unavailable,
+    /// The operation exceeded its deadline.
+    Timeout,
+    /// The source object changed relative to the requested version.
+    VersionMismatch,
+    /// The authoritative origin returned an operation failure.
+    Origin,
+    /// The worker encountered an internal or protocol failure.
+    Internal,
+}
+
+/// A decoded data-plane error, including legacy string-only replies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DataPlaneError {
+    /// Stable error class. Legacy replies use [`DataErrorCode::Unknown`].
+    pub code: DataErrorCode,
+    /// Human-readable diagnostic text; never use it for control flow.
+    pub message: String,
+}
+
+impl std::fmt::Display for DataPlaneError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}: {}", self.code, self.message)
+    }
+}
+
+impl std::error::Error for DataPlaneError {}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ErrorEnvelope {
+    code: DataErrorCode,
+    message: String,
+}
+
 /// A client→worker request to read `[offset, offset+len)` of an object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RangeRequest {
@@ -188,6 +236,55 @@ pub fn encode_error(request_id: u32, message: &str) -> Vec<u8> {
     buf
 }
 
+/// Build a typed error response understood by new clients.
+///
+/// The `ERROR` frame shape is unchanged. A short magic prefix distinguishes
+/// the bincode envelope from legacy UTF-8 error payloads, so rolling upgrades
+/// remain fail-closed in both directions.
+pub fn encode_typed_error(
+    request_id: u32,
+    code: DataErrorCode,
+    message: impl Into<String>,
+) -> Vec<u8> {
+    let envelope = ErrorEnvelope {
+        code,
+        message: message.into(),
+    };
+    let encoded = bincode::serialize(&envelope).expect("error envelope is serializable");
+    let mut body = Vec::with_capacity(ERROR_ENVELOPE_MAGIC.len() + encoded.len());
+    body.extend_from_slice(ERROR_ENVELOPE_MAGIC);
+    body.extend_from_slice(&encoded);
+    let mut header = FrameHeader::new(MsgType::GetRange, request_id, body.len() as u32);
+    header.flags = Flags(Flags::ERROR);
+    let mut out = Vec::with_capacity(HEADER_LEN + body.len());
+    out.extend_from_slice(&header.encode());
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Decode a typed or legacy error-frame payload.
+///
+/// A malformed typed envelope is classified as [`DataErrorCode::Internal`]
+/// rather than falling back to lossy string matching.
+pub fn decode_error_payload(body: &[u8]) -> DataPlaneError {
+    let Some(encoded) = body.strip_prefix(ERROR_ENVELOPE_MAGIC) else {
+        return DataPlaneError {
+            code: DataErrorCode::Unknown,
+            message: String::from_utf8_lossy(body).into_owned(),
+        };
+    };
+    match bincode::deserialize::<ErrorEnvelope>(encoded) {
+        Ok(envelope) => DataPlaneError {
+            code: envelope.code,
+            message: envelope.message,
+        },
+        Err(error) => DataPlaneError {
+            code: DataErrorCode::Internal,
+            message: format!("malformed typed worker error: {error}"),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -237,6 +334,40 @@ mod tests {
         assert!(header.flags.contains(Flags::ERROR));
         assert_eq!(header.request_id, 7);
         assert_eq!(&buf[HEADER_LEN..], b"boom");
+    }
+
+    #[test]
+    fn typed_error_round_trips_with_a_stable_code() {
+        let buf = encode_typed_error(9, DataErrorCode::VersionMismatch, "object changed");
+        let header = FrameHeader::decode(&buf).unwrap();
+        assert!(header.flags.contains(Flags::ERROR));
+        assert_eq!(header.request_id, 9);
+        assert_eq!(
+            decode_error_payload(&buf[HEADER_LEN..]),
+            DataPlaneError {
+                code: DataErrorCode::VersionMismatch,
+                message: "object changed".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_error_is_unknown_without_string_classification() {
+        let buf = encode_error(4, "object not found: bucket/key");
+        assert_eq!(
+            decode_error_payload(&buf[HEADER_LEN..]),
+            DataPlaneError {
+                code: DataErrorCode::Unknown,
+                message: "object not found: bucket/key".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn malformed_typed_error_fails_closed_as_internal() {
+        let error = decode_error_payload(b"TLE1not-bincode");
+        assert_eq!(error.code, DataErrorCode::Internal);
+        assert!(error.message.contains("malformed typed worker error"));
     }
 
     #[test]

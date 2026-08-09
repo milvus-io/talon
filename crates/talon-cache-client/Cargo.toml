@@ -10,6 +10,8 @@ description = "Reusable coordinator and worker data-plane client for Talon"
 [dependencies]
 talon-core.workspace = true
 talon-transport.workspace = true
+bytes.workspace = true
+futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

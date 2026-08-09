@@ -26,10 +26,11 @@ use std::time::Instant;
 use talon_core::RequestId;
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
-use talon_transport::{codec, ControlMessage, FrameHeader};
+use talon_transport::{codec, ControlMessage, DataErrorCode, FrameHeader};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
+use crate::data_error::encode_runtime_error;
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
 
 /// Serve data-plane range requests on one connection until EOF.
@@ -105,8 +106,9 @@ pub async fn handle_conn(
         // GetRange (plus the Put/Delete/Control handled above); other frames are
         // capped tightly by read_frame.
         if header.msg_type != MsgType::GetRange {
-            let err = data::encode_error(
+            let err = data::encode_typed_error(
                 header.request_id,
+                DataErrorCode::InvalidRequest,
                 "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
             );
             stream.write_all(&err).await?;
@@ -123,7 +125,11 @@ pub async fn handle_conn(
         let (h, req) = match data::decode_request(&full) {
             Ok(v) => v,
             Err(e) => {
-                let err = data::encode_error(header.request_id, &format!("bad request: {e}"));
+                let err = data::encode_typed_error(
+                    header.request_id,
+                    DataErrorCode::InvalidRequest,
+                    format!("bad request: {e}"),
+                );
                 stream.write_all(&err).await?;
                 stream.flush().await?;
                 observability
@@ -134,7 +140,25 @@ pub async fn handle_conn(
         };
 
         if !observability.is_ready() {
-            let err = data::encode_error(h.request_id, "worker is not ready");
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::Unavailable,
+                "worker is not ready",
+            );
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
+
+        if req.offset.checked_add(req.len).is_none() {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::InvalidRequest,
+                "range offset+len overflows u64",
+            );
             stream.write_all(&err).await?;
             stream.flush().await?;
             observability
@@ -188,7 +212,7 @@ pub async fn handle_conn(
                     error = %e,
                     "serving range failed"
                 );
-                let err = data::encode_error(h.request_id, &e.to_string());
+                let err = encode_runtime_error(h.request_id, &e);
                 stream.write_all(&err).await?;
                 stream.flush().await?;
                 observability
