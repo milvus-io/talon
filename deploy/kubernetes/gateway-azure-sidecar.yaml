@@ -1,0 +1,71 @@
+# Loopback-only Azure Blob gateway sidecar template. The application container
+# uses http://127.0.0.1:8080/<account>. Do not add a Service before #446.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: talon-gateway-azure
+type: Opaque
+stringData:
+  account-key: replace-me
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: application-with-talon-azure
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: application-with-talon-azure
+  template:
+    metadata:
+      labels:
+        app: application-with-talon-azure
+    spec:
+      containers:
+        - name: application
+          image: replace-with-your-application
+          env:
+            - name: AZURE_STORAGE_BLOB_ENDPOINT
+              value: http://127.0.0.1:8080/replace-account
+        - name: talon-gateway
+          image: ghcr.io/milvus-io/talon-gateway:latest
+          env:
+            - name: TALON_GATEWAY_PROTOCOL
+              value: azure
+            - name: TALON_GATEWAY_BIND
+              value: 127.0.0.1:8080
+            - name: TALON_GATEWAY_MODE
+              value: development
+            - name: TALON_GATEWAY_PATH_STYLE
+              value: "true"
+            - name: TALON_COORDINATOR_ADDR
+              value: talon-coordinator:7411
+            - name: TALON_GATEWAY_AZURE_ACCOUNT
+              value: replace-account
+            - name: TALON_GATEWAY_AZURE_SHARED_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: talon-gateway-azure
+                  key: account-key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+            periodSeconds: 10

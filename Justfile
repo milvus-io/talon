@@ -85,6 +85,10 @@ bench-save NAME="main":
 bench-check *ARGS:
     python3 scripts/bench.py check {{ARGS}}
 
+# Measure bounded HTTP gateway overhead and slow-consumer memory behavior.
+gateway-bench:
+    cargo run --release -p talon-gateway --example gateway_benchmark
+
 # Print the current committed baseline.
 bench-baseline NAME="main":
     @cat bench/baselines/{{NAME}}.json
