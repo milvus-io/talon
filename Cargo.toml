@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/talon-core",
     "crates/talon-cache-client",
+    "crates/talon-gateway",
     "crates/talon-coordinator",
     "crates/talon-worker",
     "crates/talon-fuse",
@@ -53,6 +54,9 @@ divan = "0.1"
 # needs to stay off the ring; it requires an explicitly attached thread pool.
 monoio = { version = "0.2.4", features = ["sync"] }
 axum = "0.8"
+tower = { version = "0.5", features = ["limit", "util"] }
+tower-http = { version = "0.6", features = ["timeout"] }
+http-body-util = "0.1"
 serde_yaml = "0.9"
 # Kubernetes client for the Lease-based ClusterStateStore backend (feature
 # "kubernetes"). rustls avoids a system OpenSSL build dependency. k8s-openapi is
