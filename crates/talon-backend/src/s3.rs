@@ -22,7 +22,7 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
-use crate::http::{HttpClient, HttpRequest, Method};
+use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Method};
 
 /// Percent-encode a query value.
 ///
@@ -278,6 +278,77 @@ impl S3Backend {
             payload_hash,
         );
         req
+    }
+
+    fn session_headers(&self) -> Vec<(String, String)> {
+        self.creds
+            .session_token
+            .as_ref()
+            .map(|token| vec![("x-amz-security-token".to_string(), token.clone())])
+            .unwrap_or_default()
+    }
+
+    /// Execute a raw metadata request while forwarding only validated
+    /// conditional headers supplied by a protocol adapter.
+    pub async fn execute_head_raw(
+        &self,
+        obj: &ObjectId,
+        conditions: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_head(obj);
+        request.headers.extend_from_slice(conditions);
+        self.http.execute(self.signed(request)).await
+    }
+
+    /// Execute a whole or ranged GET without buffering its response body.
+    pub async fn execute_get_stream_raw(
+        &self,
+        obj: &ObjectId,
+        range: Option<(u64, u64)>,
+        conditions: &[(String, String)],
+    ) -> std::result::Result<HttpStreamResponse, String> {
+        let mut headers = self.session_headers();
+        if let Some((start, end)) = range {
+            headers.push(("range".into(), format!("bytes={start}-{end}")));
+        }
+        headers.extend_from_slice(conditions);
+        let request = HttpRequest::new(Method::Get, self.object_url(obj), headers);
+        self.http.execute_stream(self.signed(request)).await
+    }
+
+    /// Execute one raw ListObjectsV2 page.
+    pub async fn execute_list_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        continuation_token: Option<&str>,
+        max_keys: u32,
+        encoding_type: Option<&str>,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut query = format!("list-type=2&max-keys={}", max_keys.min(1000));
+        if !prefix.is_empty() {
+            query.push_str("&prefix=");
+            query.push_str(&encode_query_value(prefix));
+        }
+        if let Some(delimiter) = delimiter {
+            query.push_str("&delimiter=");
+            query.push_str(&encode_query_value(delimiter));
+        }
+        if let Some(token) = continuation_token {
+            query.push_str("&continuation-token=");
+            query.push_str(&encode_query_value(token));
+        }
+        if let Some(encoding_type) = encoding_type {
+            query.push_str("&encoding-type=");
+            query.push_str(&encode_query_value(encoding_type));
+        }
+        let request = HttpRequest::new(
+            Method::Get,
+            format!("{}?{query}", self.bucket_url(bucket)),
+            self.session_headers(),
+        );
+        self.http.execute(self.signed(request)).await
     }
 
     fn build_streamed_put(
@@ -634,6 +705,39 @@ mod tests {
             path.object_url(&obj()),
             "http://minio:9000/my-bucket/data/checkpoint.bin"
         );
+    }
+
+    #[tokio::test]
+    async fn raw_list_v2_encodes_and_signs_gateway_parameters() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let mut config = S3Config::aws("us-east-1");
+        config.path_style = true;
+        config.tls = false;
+        config.endpoint = "localhost:4566".into();
+        let s3 = S3Backend::new(config, creds(), http.clone());
+
+        s3.execute_list_raw(
+            "my-bucket",
+            "a/b",
+            Some("/"),
+            Some("next token"),
+            7,
+            Some("url"),
+        )
+        .await
+        .unwrap();
+
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(request.method, Method::Get);
+        assert_eq!(
+            request.url,
+            "http://localhost:4566/my-bucket?list-type=2&max-keys=7&prefix=a%2Fb&delimiter=%2F&continuation-token=next%20token&encoding-type=url"
+        );
+        assert!(request.header("authorization").is_some());
     }
 
     #[tokio::test]

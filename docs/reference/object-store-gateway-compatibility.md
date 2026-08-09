@@ -42,6 +42,25 @@ and deployment are tracked separately.
 
 ## S3
 
-The S3 compatibility matrix will be added with the S3 adapter and conformance
-tasks. Existing `talon-backend` S3 support is an origin client, not an
-S3-compatible gateway endpoint.
+| Surface | Status | Authority and behavior |
+|---|---|---|
+| HeadObject | Supported | Metadata and conditions are resolved by the configured origin identity. |
+| GetObject | Supported | Bytes stream from Talon or the origin without whole-object buffering. |
+| One `Range` | Supported | Closed, open-ended, suffix, aligned, unaligned, and EOF-clamped ranges are supported. |
+| Multiple ranges | Rejected | Returns the S3 `InvalidRange` error; multipart responses are not approximated. |
+| ListObjectsV2 | Supported | `prefix`, `delimiter`, `continuation-token`, `max-keys`, and URL encoding are forwarded to one bounded origin page. |
+| Conditional reads | Supported | ETag and date conditions remain origin-authoritative; `If-Range` controls range use. |
+| Virtual-host addressing | Supported | The bucket is parsed from the configured endpoint suffix. |
+| Path addressing | Supported | `/bucket/key` endpoint-override clients are accepted. |
+| Put, delete, copy, and multipart APIs | Not yet supported | Rejected explicitly until a write-through milestone preserves S3 commit semantics. |
+
+Incoming client authorization material is never forwarded to a rewritten
+origin request. The gateway uses its scoped origin identity and signs the
+validated method, target, conditions, range, and listing parameters again.
+Full incoming SigV4 authentication and bucket authorization remain blocked on
+issue #446, so production exposure stays fail-closed.
+
+The S3 adapter emits S3 XML errors and gateway request IDs. Cache fallback and
+streaming behavior match the Azure adapter rules above. Official SDK and
+S3-compatible service conformance is tracked separately from the protocol
+adapter implementation.
