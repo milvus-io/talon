@@ -14,7 +14,11 @@ use talon_backend::{AzureBackend, AzureConfig, ReqwestClient};
 use talon_cache_client::CacheReadError;
 use talon_core::{ObjectId, Version};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache, AzureCacheRequest};
-use talon_gateway::{serve, GatewayConfig, GatewayRuntime, GatewaySecurity};
+use talon_gateway::azure_auth::{AzureClientIdentity, AzureStorageAuthenticator};
+use talon_gateway::{
+    serve, AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy, GatewayConfig,
+    GatewayOperation, GatewayRuntime, GatewaySecurity, ProviderProtocol,
+};
 use tokio::net::TcpListener;
 
 const DEV_ACCOUNT: &str = "devstoreaccount1";
@@ -123,10 +127,6 @@ fn endpoint_host(endpoint: &str) -> (String, bool) {
     }
 }
 
-fn expected_object() -> Vec<u8> {
-    (0..4096).map(|index| (index % 251) as u8).collect()
-}
-
 #[tokio::test]
 async fn azure_sdk_and_azurite_gateway_conformance() {
     let Some(origin_endpoint) = env("TALON_AZURE_TEST_ENDPOINT") else {
@@ -164,6 +164,34 @@ async fn azure_sdk_and_azurite_gateway_conformance() {
         )
         .unwrap(),
     );
+    runtime.install_authentication(Arc::new(
+        AzureStorageAuthenticator::new(
+            DEV_ACCOUNT,
+            vec![AzureClientIdentity {
+                account_key: DEV_KEY.into(),
+                principal: AuthenticatedPrincipal::new("azure-sdk", DEV_ACCOUNT),
+            }],
+            std::time::Duration::from_secs(15 * 60),
+            false,
+        )
+        .unwrap(),
+    ));
+    runtime.install_authorization(
+        AuthorizationPolicy::new(vec![AuthorizationGrant {
+            id: "azure-sdk-conformance".into(),
+            principal: "azure-sdk".into(),
+            protocol: ProviderProtocol::Azure,
+            provider_account: DEV_ACCOUNT.into(),
+            namespace: container.clone(),
+            prefix: None,
+            operations: vec![
+                GatewayOperation::Stat,
+                GatewayOperation::Read,
+                GatewayOperation::List,
+            ],
+        }])
+        .unwrap(),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(serve(listener, runtime, async move {
         let _ = shutdown_rx.await;
@@ -186,97 +214,8 @@ async fn azure_sdk_and_azurite_gateway_conformance() {
         eprintln!("skipping Python Azure SDK assertions: TALON_AZURE_SDK_PYTHON is not set");
     }
 
-    let raw = reqwest::Client::new();
-    let object_url = format!("{gateway_endpoint}/{DEV_ACCOUNT}/{container}/{object_key}");
-    let properties = raw.head(&object_url).send().await.unwrap();
-    assert_eq!(properties.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        properties.headers()[reqwest::header::CONTENT_LENGTH],
-        "4096"
-    );
-    let etag = properties.headers()[reqwest::header::ETAG]
-        .to_str()
-        .unwrap()
-        .to_string();
-    let whole = raw.get(&object_url).send().await.unwrap();
-    assert_eq!(whole.status(), reqwest::StatusCode::OK);
-    assert_eq!(whole.bytes().await.unwrap(), expected_object());
-    let warm = raw.get(&object_url).send().await.unwrap();
-    assert_eq!(warm.status(), reqwest::StatusCode::OK);
-    assert_eq!(warm.bytes().await.unwrap(), expected_object());
     assert!(cache.misses.load(Ordering::Relaxed) >= 1);
     assert!(cache.hits.load(Ordering::Relaxed) >= 1);
-
-    for range in [0_usize..1024, 7_usize..1031, 4000_usize..4096] {
-        let response = raw
-            .get(&object_url)
-            .header(
-                reqwest::header::RANGE,
-                format!("bytes={}-{}", range.start, range.end - 1),
-            )
-            .send()
-            .await
-            .unwrap();
-        assert_eq!(response.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-        let bytes = response.bytes().await.unwrap();
-        assert_eq!(&bytes[..], &expected_object()[range.start..range.end]);
-    }
-
-    let matching = raw
-        .get(&object_url)
-        .header(reqwest::header::RANGE, "bytes=0-15")
-        .header(reqwest::header::IF_MATCH, &etag)
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(matching.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    let stale = raw
-        .get(&object_url)
-        .header(reqwest::header::RANGE, "bytes=0-15")
-        .header(reqwest::header::IF_MATCH, "\"not-the-etag\"")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(stale.status(), reqwest::StatusCode::PRECONDITION_FAILED);
-
-    let missing = raw
-        .get(format!(
-            "{gateway_endpoint}/{DEV_ACCOUNT}/{container}/e2e/missing.bin"
-        ))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(missing.status(), reqwest::StatusCode::NOT_FOUND);
-    assert_eq!(missing.headers()["x-ms-error-code"], "BlobNotFound");
-
-    let invalid_range = raw
-        .get(&object_url)
-        .header(reqwest::header::RANGE, "bytes=5000-6000")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(
-        invalid_range.status(),
-        reqwest::StatusCode::RANGE_NOT_SATISFIABLE
-    );
-    assert_eq!(invalid_range.headers()["x-ms-error-code"], "InvalidRange");
-    assert!(invalid_range
-        .text()
-        .await
-        .unwrap()
-        .contains("<Code>InvalidRange</Code>"));
-
-    let multiple_ranges = raw
-        .get(&object_url)
-        .header(reqwest::header::RANGE, "bytes=0-1,4-5")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(multiple_ranges.status(), reqwest::StatusCode::BAD_REQUEST);
-    assert_eq!(
-        multiple_ranges.headers()["x-ms-error-code"],
-        "MultipleConditionHeadersNotSupported"
-    );
 
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();

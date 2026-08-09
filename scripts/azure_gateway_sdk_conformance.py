@@ -1,11 +1,20 @@
 """Drive the Talon Azure gateway with Microsoft's Azure Storage SDK."""
 
 import os
+from datetime import datetime, timedelta, timezone
 
 from azure.core import MatchConditions
 from azure.core.credentials import AzureNamedKeyCredential
 from azure.core.exceptions import HttpResponseError, ResourceNotFoundError
-from azure.storage.blob import BlobPrefix, BlobServiceClient
+from azure.storage.blob import (
+    AccountSasPermissions,
+    BlobPrefix,
+    BlobSasPermissions,
+    BlobServiceClient,
+    ResourceTypes,
+    generate_account_sas,
+    generate_blob_sas,
+)
 
 
 ACCOUNT = "devstoreaccount1"
@@ -90,6 +99,45 @@ def main() -> None:
     assert any(
         isinstance(item, BlobPrefix) and item.name == "gateway/list/child/"
         for item in walked
+    )
+
+    expiry = datetime.now(timezone.utc) + timedelta(minutes=5)
+    blob_sas = generate_blob_sas(
+        account_name=ACCOUNT,
+        container_name=container_name,
+        blob_name=object_name,
+        account_key=ACCOUNT_KEY,
+        permission=BlobSasPermissions(read=True),
+        expiry=expiry,
+        protocol="https,http",
+    )
+    sas_blob = BlobServiceClient(
+        account_url=f"{gateway_endpoint}/{ACCOUNT}", credential=blob_sas
+    ).get_blob_client(container_name, object_name)
+    assert sas_blob.download_blob().readall() == expected_object()
+
+    account_sas = generate_account_sas(
+        account_name=ACCOUNT,
+        account_key=ACCOUNT_KEY,
+        resource_types=ResourceTypes(service=True, container=True, object=True),
+        permission=AccountSasPermissions(read=True, list=True),
+        expiry=expiry,
+        protocol="https,http",
+    )
+    sas_service = BlobServiceClient(
+        account_url=f"{gateway_endpoint}/{ACCOUNT}", credential=account_sas
+    )
+    assert (
+        sas_service.get_blob_client(container_name, object_name)
+        .download_blob()
+        .readall()
+        == expected_object()
+    )
+    assert any(
+        item.name == "gateway/list/a space.txt"
+        for item in sas_service.get_container_client(container_name).list_blobs(
+            name_starts_with="gateway/list/"
+        )
     )
 
     print("Azure SDK gateway conformance passed")

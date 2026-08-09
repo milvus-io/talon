@@ -13,6 +13,7 @@ talon-backend = { path = "../talon-backend" }
 talon-cache-client.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64 = "0.22"
 bytes.workspace = true
 futures.workspace = true
 http-body-util.workspace = true
@@ -33,6 +34,5 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tempfile.workspace = true
