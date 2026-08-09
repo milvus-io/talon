@@ -345,7 +345,7 @@ jobs:
           fi
 
   s3-e2e:
-    name: s3 backend e2e (localstack)
+    name: s3 backend and gateway e2e (localstack)
     runs-on: ubuntu-latest
     # Exercises the real S3Backend (SigV4 signing + path-style endpoint) against
     # LocalStack, reading bytes an object actually contains. The test skips when
@@ -368,10 +368,16 @@ jobs:
       TALON_S3_TEST_BUCKET: talon-e2e
       TALON_S3_TEST_KEY: e2e/object.bin
       TALON_S3_TEST_REGION: us-east-1
+      TALON_S3_SDK_PYTHON: python
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install S3 client libraries
+        run: python -m pip install boto3==1.40.0 minio==7.2.16
       - name: Seed the bucket with a deterministic object
         run: |
           # 4096 bytes where byte i == i % 251 (matches the test's expectation).
@@ -382,8 +388,10 @@ jobs:
           aws --endpoint-url http://127.0.0.1:4566 s3 mb s3://talon-e2e
           aws --endpoint-url http://127.0.0.1:4566 s3 cp /tmp/object.bin s3://talon-e2e/e2e/object.bin
       - uses: Swatinem/rust-cache@v2
-      - name: Run the S3 e2e test
+      - name: Run the S3 backend e2e test
         run: cargo test -p talon-backend --test s3_e2e --locked -- --nocapture
+      - name: Run the S3 SDK gateway conformance test
+        run: cargo test -p talon-gateway --test s3_sdk_e2e --locked -- --nocapture
 
   gcs-e2e:
     name: gcs backend e2e (fake-gcs)

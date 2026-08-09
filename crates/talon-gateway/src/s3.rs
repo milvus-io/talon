@@ -682,6 +682,26 @@ impl S3RequestError {
         }
     }
 
+    fn not_found() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "NoSuchKey",
+            message: "The specified key does not exist".into(),
+            failure: FailureReason::NotFound,
+            content_range: None,
+        }
+    }
+
+    fn precondition_failed() -> Self {
+        Self {
+            status: StatusCode::PRECONDITION_FAILED,
+            code: "PreconditionFailed",
+            message: "At least one precondition failed".into(),
+            failure: FailureReason::Precondition,
+            content_range: None,
+        }
+    }
+
     fn origin_unavailable(message: impl Into<String>) -> Self {
         let _ = message.into();
         Self {
@@ -898,6 +918,12 @@ impl S3Adapter {
             .head(&object, &conditions)
             .await
             .map_err(S3RequestError::origin_unavailable)?;
+        if metadata.status == 404 {
+            return Err(S3RequestError::not_found());
+        }
+        if metadata.status == 412 {
+            return Err(S3RequestError::precondition_failed());
+        }
         if !(200..300).contains(&metadata.status) {
             return Ok(raw_response(
                 metadata,
@@ -1071,6 +1097,8 @@ impl S3Adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
 
     use axum::body::to_bytes;
@@ -1090,8 +1118,54 @@ mod tests {
                 Err(CacheReadError::Unavailable(message)) => {
                     Err(CacheReadError::Unavailable(message.clone()))
                 }
+                Err(CacheReadError::Timeout(message)) => {
+                    Err(CacheReadError::Timeout(message.clone()))
+                }
+                Err(CacheReadError::Protocol(message)) => {
+                    Err(CacheReadError::Protocol(message.clone()))
+                }
                 _ => unreachable!("test cache response"),
             }
+        }
+    }
+
+    struct DropSignal(Arc<AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct DemandCache {
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl DemandCache {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                polls: Arc::new(AtomicUsize::new(0)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            })
+        }
+    }
+
+    impl S3Cache for DemandCache {
+        fn stream(&self, _request: S3CacheRequest<'_>) -> Result<CacheStream, CacheReadError> {
+            let chunks = VecDeque::from([Bytes::from_static(b"abc"), Bytes::from_static(b"def")]);
+            let polls = Arc::clone(&self.polls);
+            let guard = DropSignal(Arc::clone(&self.dropped));
+            Ok(Box::pin(futures::stream::unfold(
+                (chunks, guard),
+                move |(mut chunks, guard)| {
+                    let polls = Arc::clone(&polls);
+                    async move {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        chunks.pop_front().map(|chunk| (Ok(chunk), (chunks, guard)))
+                    }
+                },
+            )))
         }
     }
 
@@ -1168,6 +1242,40 @@ mod tests {
                 headers: vec![("content-type".into(), "application/xml".into())],
                 body: Bytes::from_static(b"<ListBucketResult/>"),
             })
+        }
+    }
+
+    struct UnavailableOrigin;
+
+    #[async_trait]
+    impl S3Origin for UnavailableOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            Err("connect failed at https://s3.example/?secret=credential".into())
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("HEAD failure must stop GET dispatch")
+        }
+
+        async fn list(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _continuation_token: Option<&str>,
+            _max_keys: u32,
+            _encoding_type: Option<&str>,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("test only dispatches object reads")
         }
     }
 
@@ -1276,6 +1384,78 @@ mod tests {
             to_bytes(response.response.into_body(), 16).await.unwrap(),
             "abcdef"
         );
+    }
+
+    #[tokio::test]
+    async fn timeout_falls_back_but_protocol_failure_is_terminal() {
+        let timeout = adapter(
+            MockCache {
+                response: Err(CacheReadError::Timeout("slow worker".into())),
+            },
+            MockOrigin::new(),
+        )
+        .handle(request(axum::http::Method::GET, "/bucket/key"), context())
+        .await;
+        assert_eq!(timeout.response.status(), StatusCode::OK);
+        assert_eq!(timeout.outcome, GatewayOutcome::Fallback);
+
+        let protocol = adapter(
+            MockCache {
+                response: Err(CacheReadError::Protocol("bad frame".into())),
+            },
+            MockOrigin::new(),
+        )
+        .handle(request(axum::http::Method::GET, "/bucket/key"), context())
+        .await;
+        assert_eq!(
+            protocol.response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(protocol.outcome, GatewayOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn cache_stream_respects_backpressure_and_cancellation() {
+        let cache = DemandCache::new();
+        let response = S3Adapter::new(
+            S3AdapterConfig::path_style("localhost"),
+            Arc::clone(&cache) as Arc<dyn S3Cache>,
+            MockOrigin::new(),
+        )
+        .unwrap()
+        .handle(request(axum::http::Method::GET, "/bucket/key"), context())
+        .await;
+
+        assert_eq!(cache.polls.load(Ordering::SeqCst), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(cache.polls.load(Ordering::SeqCst), 1);
+        let mut body = response.response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(cache.polls.load(Ordering::SeqCst), 1);
+        drop(body);
+        assert!(cache.dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn origin_outage_returns_a_sanitized_s3_error() {
+        let response = S3Adapter::new(
+            S3AdapterConfig::path_style("localhost"),
+            Arc::new(MockCache {
+                response: Ok(Vec::new()),
+            }),
+            Arc::new(UnavailableOrigin),
+        )
+        .unwrap()
+        .handle(request(axum::http::Method::GET, "/bucket/key"), context())
+        .await;
+
+        assert_eq!(response.response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = to_bytes(response.response.into_body(), 4096).await.unwrap();
+        assert!(!body.windows(6).any(|window| window == b"secret"));
+        assert!(!body.windows(10).any(|window| window == b"credential"));
     }
 
     #[tokio::test]
