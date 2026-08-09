@@ -35,6 +35,22 @@ to 16 rings, so 8 cores serve **108K rps** and adding cores adds throughput
 with nothing to tune
 ([measurements](docs/explanation/data-plane-runtime.md)).
 
+**Fast enough that the network gives out first.** With requests pipelined on
+each connection, 8 cores serve **11.0 GB/s** of 64 KiB reads over loopback (the
+108K rps above is the same host without pipelining), and **85% of that CPU is
+kernel time** — `sendfile` and the TCP stack — with only 15% left in Talon's own
+code. Point a client on another node at the same worker and it delivers
+**2.93 GB/s: 23.4 Gbps against a 25 GbE link**, which is the wire, saturated.
+The cache is not the bottleneck on a real cluster; the NIC is.
+
+We publish that ratio because it is the honest way to read a cache benchmark:
+loopback measures a component ceiling with the network taken out of the way, and
+**a change that moves the loopback number but not the cross-node number has not
+made the deployed system faster.** The same page records what that discipline
+rejected — response multiplexing was built, measured at −3.9% with unchanged
+kernel time, and dropped
+([full tables and method](BENCHMARKS.md)).
+
 Read it through a FUSE mount, or use the [Python](docs/clients/python.md) /
 [Java](docs/clients/java.md) SDKs when a mount isn't the right fit.
 
