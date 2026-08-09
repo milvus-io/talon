@@ -7,9 +7,8 @@
 //! `Authorization: SharedKey <account>:<signature>` header value.
 //!
 //! Only what the blob backend needs is implemented: the full `SharedKey` scheme
-//! (not `SharedKeyLite`), header-based signing, and requests that carry no query
-//! string (so the canonicalized resource is just `/account/path`). Signing is a
-//! pure function of the request + account + key, unit-testable offline.
+//! (not `SharedKeyLite`) and header-based signing. Signing is a pure function of
+//! the request + account + key, unit-testable offline.
 //!
 //! Reference: <https://learn.microsoft.com/rest/api/storageservices/authorize-with-shared-key>
 
@@ -66,15 +65,24 @@ fn method_str(m: Method) -> &'static str {
     }
 }
 
-/// Extract host + path from a URL (path keeps its leading `/`, query dropped).
-fn host_and_path(url: &str) -> (String, String) {
-    let after_scheme = url.split_once("://").map(|(_, r)| r).unwrap_or(url);
-    let (host, rest) = match after_scheme.split_once('/') {
-        Some((h, r)) => (h.to_string(), format!("/{r}")),
-        None => (after_scheme.to_string(), "/".to_string()),
-    };
-    let path = rest.split_once('?').map(|(p, _)| p).unwrap_or(&rest);
-    (host, path.to_string())
+fn canonicalized_resource(url: &str, account: &str) -> Result<String, String> {
+    let url = url::Url::parse(url).map_err(|error| format!("invalid Azure URL: {error}"))?;
+    let mut resource = format!("/{account}{}", url.path());
+    let mut query = std::collections::BTreeMap::<String, Vec<String>>::new();
+    for (name, value) in url.query_pairs() {
+        query
+            .entry(name.to_ascii_lowercase())
+            .or_default()
+            .push(value.into_owned());
+    }
+    for (name, mut values) in query {
+        values.sort();
+        resource.push('\n');
+        resource.push_str(&name);
+        resource.push(':');
+        resource.push_str(&values.join(","));
+    }
+    Ok(resource)
 }
 
 /// Compute the `Authorization: SharedKey ...` header value for `req`.
@@ -127,8 +135,7 @@ pub fn authorization_header(
     // result deliberately repeats the account (/devstoreaccount1/devstoreaccount1
     // /...) — that is exactly what Azurite signs against, so it must NOT be
     // stripped.
-    let (_host, path) = host_and_path(&req.url);
-    let canonical_resource = format!("/{account}{path}");
+    let canonical_resource = canonicalized_resource(&req.url, account)?;
 
     // The 20-line StringToSign (verb + standard headers + canonical headers +
     // canonical resource). Empty standard headers are blank lines.
@@ -260,10 +267,25 @@ mod tests {
 
     #[test]
     fn canonical_resource_uses_account_and_path() {
-        // Path-style emulator URL: host has a port, path is /account/container/blob.
-        let (host, path) = host_and_path("http://127.0.0.1:10000/devstoreaccount1/c/b");
-        assert_eq!(host, "127.0.0.1:10000");
-        assert_eq!(path, "/devstoreaccount1/c/b");
+        let resource = canonicalized_resource(
+            "http://127.0.0.1:10000/devstoreaccount1/c/b",
+            "devstoreaccount1",
+        )
+        .unwrap();
+        assert_eq!(resource, "/devstoreaccount1/devstoreaccount1/c/b");
+    }
+
+    #[test]
+    fn canonical_resource_sorts_and_decodes_query_parameters() {
+        let resource = canonicalized_resource(
+            "http://127.0.0.1:10000/devstoreaccount1/c?prefix=a%2Fb&comp=list&X=2&x=1",
+            "devstoreaccount1",
+        )
+        .unwrap();
+        assert_eq!(
+            resource,
+            "/devstoreaccount1/devstoreaccount1/c\ncomp:list\nprefix:a/b\nx:1,2"
+        );
     }
 
     #[test]

@@ -2558,6 +2558,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
@@ -2665,6 +2666,7 @@ dependencies = [
  "http-body-util",
  "httpdate",
  "percent-encoding",
+ "reqwest",
  "serde",
  "serde_json",
  "talon-backend",

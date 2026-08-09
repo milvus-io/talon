@@ -418,7 +418,8 @@ async fn request_lifecycle(
     next: Next,
 ) -> Response {
     let started = std::time::Instant::now();
-    let request_id = format!("{:016x}", NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed));
+    let sequence = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed) & 0x0000_ffff_ffff_ffff;
+    let request_id = format!("00000000-0000-4000-8000-{sequence:012x}");
     let method = request.method().clone();
     let operational = matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics");
     let context = GatewayRequestContext {
@@ -895,7 +896,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(response.headers()[REQUEST_ID_HEADER].as_bytes().len(), 16);
+        assert_eq!(response.headers()[REQUEST_ID_HEADER].as_bytes().len(), 36);
         let _ = to_bytes(response.into_body(), 4096).await.unwrap();
         let metrics = runtime.metrics().render();
         assert!(metrics.contains("protocol=\"s3\""));
