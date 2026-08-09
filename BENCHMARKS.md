@@ -168,9 +168,10 @@ network:
 | loopback | 167,278 | 11.0 | 87.7 | 4,617 µs | 35,244 µs |
 | **cross-node** | **44,662** | **2.93** | **23.4** | 20,269 µs | 49,905 µs |
 
-Cross-node throughput is **27% of loopback**, and 23.4 Gbps against a 25 GbE
-link is the wire, saturated. On this cluster the NIC runs out well before the
-worker does — the worker is not the constraint at all.
+Cross-node throughput is **27% of the loopback rate at the same 32 connections**
+(24% of the 189,379 rps peak reached at 64 connections), and 23.4 Gbps against a
+25 GbE link is the wire, saturated. On this cluster the NIC runs out well before
+the worker does — the worker is not the constraint at all.
 
 **Read the loopback number as a component ceiling, not a capacity claim.** It
 measures how fast the serve path can go when the network is free. Any change
