@@ -1,5 +1,6 @@
 """Drive the Talon Azure gateway with Microsoft's Azure Storage SDK."""
 
+import base64
 import os
 from datetime import datetime, timedelta, timezone
 
@@ -12,6 +13,7 @@ from azure.storage.blob import (
     BlobSasPermissions,
     BlobServiceClient,
     ContentSettings,
+    BlobBlock,
     ResourceTypes,
     generate_account_sas,
     generate_blob_sas,
@@ -89,6 +91,49 @@ def main() -> None:
         raise AssertionError("deleted copy unexpectedly remained visible")
     except ResourceNotFoundError:
         pass
+
+    block_blob = container.get_blob_client("gateway/blocks/ordered.bin")
+    first_id = base64.b64encode(b"000001").decode("ascii")
+    second_id = base64.b64encode(b"000002").decode("ascii")
+    block_blob.stage_block(first_id, b"first-")
+    block_blob.stage_block(second_id, b"second")
+    committed, uncommitted = block_blob.get_block_list(block_list_type="all")
+    assert not committed
+    assert [block.id for block in uncommitted] == [first_id, second_id]
+    block_blob.commit_block_list(
+        [BlobBlock(block_id=second_id), BlobBlock(block_id=first_id)]
+    )
+    assert block_blob.download_blob().readall() == b"secondfirst-"
+
+    replacement_id = base64.b64encode(b"replace").decode("ascii")
+    block_blob.stage_block(replacement_id, b"old")
+    block_blob.stage_block(replacement_id, b"new")
+    block_blob.commit_block_list([BlobBlock(block_id=replacement_id)])
+    assert block_blob.download_blob().readall() == b"new"
+
+    source_blob = container.get_blob_client("gateway/blocks/source.bin")
+    source_blob.upload_blob(b"copied-block", overwrite=True)
+    from_url_blob = container.get_blob_client("gateway/blocks/from-url.bin")
+    copied_id = base64.b64encode(b"copied").decode("ascii")
+    try:
+        from_url_blob.stage_block_from_url(copied_id, source_blob.url, retry_total=0)
+    except HttpResponseError as error:
+        # Azurite 3.33 does not implement this Azure API. The origin error must
+        # pass through unchanged; supported services exercise the success path.
+        assert error.error_code == "APINotImplemented"
+    else:
+        from_url_blob.commit_block_list([BlobBlock(block_id=copied_id)])
+        assert from_url_blob.download_blob().readall() == b"copied-block"
+
+    missing_blob = container.get_blob_client("gateway/blocks/missing.bin")
+    present_id = base64.b64encode(b"present").decode("ascii")
+    missing_id = base64.b64encode(b"missing").decode("ascii")
+    missing_blob.stage_block(present_id, b"present")
+    try:
+        missing_blob.commit_block_list([BlobBlock(block_id=missing_id)])
+        raise AssertionError("missing block commit unexpectedly succeeded")
+    except HttpResponseError as error:
+        assert error.status_code in (400, 409)
 
     mutation_blob.delete_blob()
     try:

@@ -42,6 +42,8 @@ struct Settings {
     azure_sas: Option<String>,
     azure_client_identities_path: Option<PathBuf>,
     azure_max_clock_skew_ms: u64,
+    azure_max_block_bindings: usize,
+    azure_block_binding_ttl_ms: u64,
     s3_region: Option<String>,
     s3_endpoint: Option<String>,
     s3_access_key: Option<String>,
@@ -216,6 +218,16 @@ impl Settings {
                 "900000",
                 "TALON_GATEWAY_AZURE_MAX_CLOCK_SKEW_MS",
             )?,
+            azure_max_block_bindings: parse_or(
+                value(&mut get, "TALON_GATEWAY_AZURE_MAX_BLOCK_BINDINGS"),
+                "1024",
+                "TALON_GATEWAY_AZURE_MAX_BLOCK_BINDINGS",
+            )?,
+            azure_block_binding_ttl_ms: parse_or(
+                value(&mut get, "TALON_GATEWAY_AZURE_BLOCK_BINDING_TTL_MS"),
+                "86400000",
+                "TALON_GATEWAY_AZURE_BLOCK_BINDING_TTL_MS",
+            )?,
             s3_region: value(&mut get, "TALON_GATEWAY_S3_REGION"),
             s3_endpoint: value(&mut get, "TALON_GATEWAY_S3_ENDPOINT"),
             s3_access_key: value(&mut get, "AWS_ACCESS_KEY_ID"),
@@ -346,6 +358,9 @@ fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
     config.block_size = settings.block_size;
     config.transfer_chunk_bytes = settings.transfer_chunk_bytes;
     config.default_route = settings.route;
+    config.max_block_bindings = settings.azure_max_block_bindings;
+    config.block_binding_ttl =
+        std::time::Duration::from_millis(settings.azure_block_binding_ttl_ms);
     let cache = cache_reader(settings);
     Ok(Arc::new(AzureBlobAdapter::new(
         config,
@@ -699,6 +714,8 @@ mod tests {
         assert!(settings.authorization_path.is_none());
         assert!(settings.azure_client_identities_path.is_none());
         assert_eq!(settings.azure_max_clock_skew_ms, 900_000);
+        assert_eq!(settings.azure_max_block_bindings, 1024);
+        assert_eq!(settings.azure_block_binding_ttl_ms, 86_400_000);
     }
 
     #[test]
