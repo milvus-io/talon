@@ -26,6 +26,19 @@ use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
 
+/// Validated S3 multipart request metadata supplied by a protocol adapter.
+#[derive(Clone, Copy)]
+pub struct S3MultipartRequest<'a> {
+    /// Origin method for the multipart operation.
+    pub method: Method,
+    /// Canonical destination object.
+    pub object: &'a ObjectId,
+    /// Percent-encoded multipart query without the leading question mark.
+    pub query: &'a str,
+    /// Sanitized provider headers to sign and forward.
+    pub headers: &'a [(String, String)],
+}
+
 /// Percent-encode a query value.
 ///
 /// The URL is signed after this, and SigV4 canonicalizes the query itself, so
@@ -405,6 +418,62 @@ impl S3Backend {
         let mut request = self.build_delete(obj);
         request.headers.extend_from_slice(conditions);
         self.http.execute(self.signed(request)).await
+    }
+
+    /// Execute a bodyless multipart request with an adapter-validated query.
+    pub async fn execute_multipart_raw(
+        &self,
+        request: S3MultipartRequest<'_>,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut outgoing = HttpRequest::new(
+            request.method,
+            format!("{}?{}", self.object_url(request.object), request.query),
+            self.session_headers(),
+        );
+        outgoing.headers.extend_from_slice(request.headers);
+        self.http.execute(self.signed(outgoing)).await
+    }
+
+    /// Execute a single-use multipart request body without implicit replay.
+    pub async fn execute_multipart_body_raw(
+        &self,
+        request: S3MultipartRequest<'_>,
+        body: HttpRequestBody,
+        len: u64,
+        payload_hash: &str,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut outgoing = HttpRequest::new(
+            request.method,
+            format!("{}?{}", self.object_url(request.object), request.query),
+            self.session_headers(),
+        );
+        outgoing
+            .headers
+            .push(("content-length".into(), len.to_string()));
+        outgoing.headers.extend_from_slice(request.headers);
+        let outgoing = self.signed_with_payload_hash(outgoing, payload_hash);
+        self.http.execute_body(outgoing, body, len).await
+    }
+
+    /// Execute a multipart request from a verified spool file.
+    pub async fn execute_multipart_file_raw(
+        &self,
+        request: S3MultipartRequest<'_>,
+        path: &Path,
+        len: u64,
+        payload_hash: &str,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut outgoing = HttpRequest::new(
+            request.method,
+            format!("{}?{}", self.object_url(request.object), request.query),
+            self.session_headers(),
+        );
+        outgoing
+            .headers
+            .push(("content-length".into(), len.to_string()));
+        outgoing.headers.extend_from_slice(request.headers);
+        let outgoing = self.signed_with_payload_hash(outgoing, payload_hash);
+        self.http.execute_file(outgoing, path, len).await
     }
 
     fn build_streamed_put(
@@ -1253,5 +1322,44 @@ mod tests {
             .header("authorization")
             .unwrap()
             .contains("x-amz-copy-source"));
+    }
+
+    #[tokio::test]
+    async fn multipart_post_query_and_body_are_resigned() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        let body = futures::stream::iter([Ok(bytes::Bytes::from_static(b"<Complete/>"))]);
+        backend
+            .execute_multipart_body_raw(
+                S3MultipartRequest {
+                    method: Method::Post,
+                    object: &obj(),
+                    query: "uploadId=opaque%2Fid",
+                    headers: &[("x-amz-meta-operation".into(), "complete".into())],
+                },
+                Box::pin(body),
+                11,
+                "UNSIGNED-PAYLOAD",
+            )
+            .await
+            .unwrap();
+
+        let (request, body, len) = http.last_body.lock().unwrap().clone().unwrap();
+        assert_eq!(request.method, Method::Post);
+        assert!(request.url.ends_with("?uploadId=opaque%2Fid"));
+        assert_eq!(body, b"<Complete/>");
+        assert_eq!(len, 11);
+        assert_eq!(
+            request.header("x-amz-content-sha256"),
+            Some("UNSIGNED-PAYLOAD")
+        );
+        assert!(request
+            .header("authorization")
+            .unwrap()
+            .contains("x-amz-meta-operation"));
     }
 }

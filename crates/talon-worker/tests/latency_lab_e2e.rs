@@ -90,7 +90,7 @@ impl HttpClient for CountingHttpClient {
                 })
             }
             // The read path only issues HEAD + ranged GET.
-            Method::Put | Method::Delete => {
+            Method::Put | Method::Post | Method::Delete => {
                 Err(format!("unexpected {:?} in the read-path test", req.method))
             }
         }

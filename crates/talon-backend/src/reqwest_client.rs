@@ -79,6 +79,7 @@ impl HttpClient for ReqwestClient {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
             Method::Put => reqwest::Method::PUT,
+            Method::Post => reqwest::Method::POST,
             Method::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self.inner.request(method, &req.url);
@@ -109,6 +110,7 @@ impl HttpClient for ReqwestClient {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
             Method::Put => reqwest::Method::PUT,
+            Method::Post => reqwest::Method::POST,
             Method::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self.inner.request(method, &req.url);
@@ -150,6 +152,7 @@ impl HttpClient for ReqwestClient {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
             Method::Put => reqwest::Method::PUT,
+            Method::Post => reqwest::Method::POST,
             Method::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self.inner.request(method, &req.url);
@@ -196,6 +199,7 @@ impl HttpClient for ReqwestClient {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
             Method::Put => reqwest::Method::PUT,
+            Method::Post => reqwest::Method::POST,
             Method::Delete => reqwest::Method::DELETE,
         };
         let mut builder = self.inner.request(method, &req.url);

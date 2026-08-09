@@ -141,6 +141,88 @@ def main() -> None:
             raise AssertionError("deleted object unexpectedly exists")
         except ClientError as error:
             assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    multipart_key = "gateway/multipart/boto3.bin"
+    multipart = s3.create_multipart_upload(
+        Bucket=bucket, Key=multipart_key, Metadata={"owner": "boto3-multipart"}
+    )
+    upload_id = multipart["UploadId"]
+    part_one = b"a" * (5 * 1024 * 1024)
+    part_two = b"tail"
+    uploaded_one = s3.upload_part(
+        Bucket=bucket, Key=multipart_key, UploadId=upload_id,
+        PartNumber=1, Body=part_one,
+    )
+    uploaded_two = s3.upload_part(
+        Bucket=bucket, Key=multipart_key, UploadId=upload_id,
+        PartNumber=2, Body=part_two,
+    )
+    listed_parts = s3.list_parts(Bucket=bucket, Key=multipart_key, UploadId=upload_id)
+    assert [part["PartNumber"] for part in listed_parts["Parts"]] == [1, 2]
+    completed = s3.complete_multipart_upload(
+        Bucket=bucket, Key=multipart_key, UploadId=upload_id,
+        MultipartUpload={"Parts": [
+            {"PartNumber": 1, "ETag": uploaded_one["ETag"]},
+            {"PartNumber": 2, "ETag": uploaded_two["ETag"]},
+        ]},
+    )
+    assert completed["ResponseMetadata"]["HTTPStatusCode"] == 200
+    assert s3.get_object(Bucket=bucket, Key=multipart_key)["Body"].read() == part_one + part_two
+
+    invalid_key = "gateway/multipart/invalid-order.bin"
+    invalid = s3.create_multipart_upload(Bucket=bucket, Key=invalid_key)
+    invalid_id = invalid["UploadId"]
+    invalid_one = s3.upload_part(
+        Bucket=bucket, Key=invalid_key, UploadId=invalid_id,
+        PartNumber=1, Body=part_one,
+    )
+    invalid_two = s3.upload_part(
+        Bucket=bucket, Key=invalid_key, UploadId=invalid_id,
+        PartNumber=2, Body=part_two,
+    )
+    try:
+        s3.complete_multipart_upload(
+            Bucket=bucket, Key=invalid_key, UploadId=invalid_id,
+            MultipartUpload={"Parts": [
+                {"PartNumber": 2, "ETag": invalid_two["ETag"]},
+                {"PartNumber": 1, "ETag": invalid_one["ETag"]},
+            ]},
+        )
+        raise AssertionError("out-of-order multipart completion unexpectedly succeeded")
+    except ClientError as error:
+        assert error.response["ResponseMetadata"]["HTTPStatusCode"] >= 400
+    s3.abort_multipart_upload(Bucket=bucket, Key=invalid_key, UploadId=invalid_id)
+
+    copy_multipart_key = "gateway/multipart/copied.bin"
+    copy_upload = s3.create_multipart_upload(Bucket=bucket, Key=copy_multipart_key)
+    copy_upload_id = copy_upload["UploadId"]
+    copied_part = s3.upload_part_copy(
+        Bucket=bucket, Key=copy_multipart_key, UploadId=copy_upload_id,
+        PartNumber=1, CopySource={"Bucket": bucket, "Key": multipart_key},
+        CopySourceRange=f"bytes=0-{len(part_one) - 1}",
+    )
+    s3.complete_multipart_upload(
+        Bucket=bucket, Key=copy_multipart_key, UploadId=copy_upload_id,
+        MultipartUpload={"Parts": [{
+            "PartNumber": 1,
+            "ETag": copied_part["CopyPartResult"]["ETag"],
+        }]},
+    )
+    assert s3.get_object(Bucket=bucket, Key=copy_multipart_key)["Body"].read() == part_one
+
+    aborted_key = "gateway/multipart/aborted.bin"
+    aborted = s3.create_multipart_upload(Bucket=bucket, Key=aborted_key)
+    aborted_id = aborted["UploadId"]
+    s3.upload_part(
+        Bucket=bucket, Key=aborted_key, UploadId=aborted_id,
+        PartNumber=1, Body=part_two,
+    )
+    s3.abort_multipart_upload(Bucket=bucket, Key=aborted_key, UploadId=aborted_id)
+    try:
+        s3.list_parts(Bucket=bucket, Key=aborted_key, UploadId=aborted_id)
+        raise AssertionError("aborted multipart upload unexpectedly remained visible")
+    except ClientError as error:
+        assert error.response["Error"]["Code"] == "NoSuchUpload"
     first = s3.list_objects_v2(Bucket=bucket, Prefix="gateway/list/", MaxKeys=1)
     assert first["IsTruncated"]
     second = s3.list_objects_v2(
@@ -198,6 +280,17 @@ def main() -> None:
     assert read_minio(minio.get_object(bucket, minio_copy_key)) == minio_body
     minio.remove_object(bucket, minio_key)
     minio.remove_object(bucket, minio_copy_key)
+
+    minio_multipart_key = "gateway/multipart/minio.bin"
+    minio_multipart_body = b"m" * (6 * 1024 * 1024)
+    minio.put_object(
+        bucket, minio_multipart_key, io.BytesIO(minio_multipart_body),
+        len(minio_multipart_body), part_size=5 * 1024 * 1024,
+    )
+    assert read_minio(minio.get_object(bucket, minio_multipart_key)) == minio_multipart_body
+    minio.remove_object(bucket, minio_multipart_key)
+    for key in (multipart_key, copy_multipart_key):
+        s3.delete_object(Bucket=bucket, Key=key)
 
     print("S3 SDK gateway conformance passed")
 

@@ -114,6 +114,8 @@ S3 variables:
 | `AWS_SESSION_TOKEN` | unset | Optional STS token. |
 | `TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH` | unset | JSON incoming identity file. Required for S3 production readiness. |
 | `TALON_GATEWAY_S3_MAX_CLOCK_SKEW_MS` | `900000` | Maximum header-signature clock skew and presigned grace. |
+| `TALON_GATEWAY_S3_MAX_MULTIPART_UPLOADS` | `1024` | Maximum active multipart bindings held by one gateway process. |
+| `TALON_GATEWAY_S3_MULTIPART_TTL_MS` | `86400000` | Inactivity lifetime for one process-local multipart binding. |
 
 The identity file is separate from the origin environment variables. Do not use
 the gateway's origin access key as a client identity in production:
@@ -162,9 +164,15 @@ the origin exactly once. `PutObject` requires one valid `Content-Length` and is
 limited by the gateway's 16 MiB default body limit and 30 second default total
 deadline. `UNSIGNED-PAYLOAD` streams directly; a lowercase SHA-256 declaration
 is verified in a secure temporary file before the origin is mutated. AWS
-streaming chunk-signature modes and multipart uploads are not yet supported.
-Increase deployment limits only with corresponding disk, concurrency, and
-deadline capacity.
+streaming chunk-signature modes are not supported. S3 multipart create,
+upload-part, upload-part-copy, list-parts, complete, and abort are supported.
+Active uploads are process-local, bounded to 1024 entries, and expire after 24
+hours by default. A gateway restart or a binding mismatch fails closed with
+`NoSuchUpload`; operators must abort the orphan directly at the origin before
+starting a replacement upload. Completion alone invalidates local object
+placement, and HTTP 200 completion responses carrying `<Error>` do not commit
+gateway state. Increase deployment limits only with corresponding disk,
+concurrency, and deadline capacity.
 
 Azure variables:
 

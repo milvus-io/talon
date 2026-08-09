@@ -1,7 +1,9 @@
 //! Amazon S3-compatible read adapter.
 
+use std::collections::HashMap;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::body::Body;
@@ -11,15 +13,18 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
-use talon_backend::{HttpRequestBody, HttpResponse, HttpStreamResponse, S3Backend};
+use talon_backend::{
+    HttpRequestBody, HttpResponse, HttpStreamResponse, Method, S3Backend, S3MultipartRequest,
+};
 use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER_CHUNK_BYTES};
 use talon_core::{Backend, ObjectId, Version};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    FailureReason, GatewayAccess, GatewayAccessRequirement, GatewayAdapter, GatewayOperation,
-    GatewayOutcome, GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget,
-    ProviderProtocol,
+    AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess,
+    GatewayAccessRequirement, GatewayAdapter, GatewayOperation, GatewayOutcome,
+    GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
+    S3_CACHE_MARK_HEADER,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -58,6 +63,10 @@ pub struct S3AdapterConfig {
     pub transfer_chunk_bytes: u32,
     /// Route used until signed cache marks are implemented by #441.
     pub default_route: GatewayRoute,
+    /// Maximum active multipart uploads tracked by one gateway process.
+    pub max_multipart_uploads: usize,
+    /// Lifetime of an inactive multipart binding.
+    pub multipart_state_ttl: Duration,
 }
 
 impl S3AdapterConfig {
@@ -69,6 +78,8 @@ impl S3AdapterConfig {
             block_size: 256 * 1024 * 1024,
             transfer_chunk_bytes: DEFAULT_TRANSFER_CHUNK_BYTES,
             default_route: GatewayRoute::Cache,
+            max_multipart_uploads: 1024,
+            multipart_state_ttl: Duration::from_secs(24 * 60 * 60),
         }
     }
 
@@ -82,7 +93,11 @@ impl S3AdapterConfig {
     }
 
     fn validate(&self) -> Result<(), S3RequestError> {
-        if self.endpoint_suffix.is_empty() || self.block_size == 0 || self.transfer_chunk_bytes == 0
+        if self.endpoint_suffix.is_empty()
+            || self.block_size == 0
+            || self.transfer_chunk_bytes == 0
+            || self.max_multipart_uploads == 0
+            || self.multipart_state_ttl.is_zero()
         {
             return Err(S3RequestError::invalid(
                 "InvalidArgument",
@@ -190,6 +205,30 @@ pub trait S3Origin: Send + Sync + 'static {
     ) -> Result<HttpResponse, String> {
         Err("S3 origin does not implement DELETE".into())
     }
+
+    async fn multipart(&self, _request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement multipart requests".into())
+    }
+
+    async fn multipart_body(
+        &self,
+        _request: S3MultipartRequest<'_>,
+        _body: HttpRequestBody,
+        _len: u64,
+        _payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement multipart request bodies".into())
+    }
+
+    async fn multipart_file(
+        &self,
+        _request: S3MultipartRequest<'_>,
+        _path: &std::path::Path,
+        _len: u64,
+        _payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement multipart file bodies".into())
+    }
 }
 
 #[async_trait]
@@ -270,6 +309,32 @@ impl S3Origin for S3Backend {
     ) -> Result<HttpResponse, String> {
         self.execute_delete_raw(object, conditions).await
     }
+
+    async fn multipart(&self, request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
+        self.execute_multipart_raw(request).await
+    }
+
+    async fn multipart_body(
+        &self,
+        request: S3MultipartRequest<'_>,
+        body: HttpRequestBody,
+        len: u64,
+        payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        self.execute_multipart_body_raw(request, body, len, payload_hash)
+            .await
+    }
+
+    async fn multipart_file(
+        &self,
+        request: S3MultipartRequest<'_>,
+        path: &std::path::Path,
+        len: u64,
+        payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        self.execute_multipart_file_raw(request, path, len, payload_hash)
+            .await
+    }
 }
 
 /// S3 protocol adapter over Talon and a scoped origin identity.
@@ -277,6 +342,7 @@ pub struct S3Adapter {
     config: S3AdapterConfig,
     cache: Arc<dyn S3Cache>,
     origin: Arc<dyn S3Origin>,
+    uploads: MultipartRegistry,
 }
 
 impl S3Adapter {
@@ -288,10 +354,102 @@ impl S3Adapter {
     ) -> Result<Self, String> {
         config.validate().map_err(|error| error.message)?;
         Ok(Self {
+            uploads: MultipartRegistry::new(
+                config.max_multipart_uploads,
+                config.multipart_state_ttl,
+            ),
             config,
             cache,
             origin,
         })
+    }
+}
+
+#[derive(Clone)]
+struct MultipartBinding {
+    object: ObjectId,
+    principal: AuthenticatedPrincipal,
+    decision: EffectiveDecision,
+    touched: Instant,
+}
+
+#[derive(Default)]
+struct MultipartRegistryState {
+    uploads: HashMap<String, MultipartBinding>,
+    reservations: usize,
+}
+
+struct MultipartRegistry {
+    state: Mutex<MultipartRegistryState>,
+    max_uploads: usize,
+    ttl: Duration,
+}
+
+impl MultipartRegistry {
+    fn new(max_uploads: usize, ttl: Duration) -> Self {
+        Self {
+            state: Mutex::new(MultipartRegistryState::default()),
+            max_uploads,
+            ttl,
+        }
+    }
+
+    fn reserve(&self, now: Instant) -> bool {
+        let mut state = self.state.lock().unwrap();
+        self.prune_locked(&mut state, now);
+        if state.uploads.len().saturating_add(state.reservations) >= self.max_uploads {
+            return false;
+        }
+        state.reservations += 1;
+        true
+    }
+
+    fn cancel_reservation(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.reservations = state.reservations.saturating_sub(1);
+    }
+
+    fn publish(&self, upload_id: String, binding: MultipartBinding) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.reservations = state.reservations.saturating_sub(1);
+        if state.uploads.contains_key(&upload_id) {
+            return false;
+        }
+        state.uploads.insert(upload_id, binding);
+        true
+    }
+
+    fn authorize(
+        &self,
+        upload_id: &str,
+        object: &ObjectId,
+        principal: &AuthenticatedPrincipal,
+        decision: EffectiveDecision,
+        now: Instant,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        self.prune_locked(&mut state, now);
+        let Some(binding) = state.uploads.get_mut(upload_id) else {
+            return false;
+        };
+        if binding.object != *object
+            || binding.principal != *principal
+            || binding.decision != decision
+        {
+            return false;
+        }
+        binding.touched = now;
+        true
+    }
+
+    fn remove(&self, upload_id: &str) {
+        self.state.lock().unwrap().uploads.remove(upload_id);
+    }
+
+    fn prune_locked(&self, state: &mut MultipartRegistryState, now: Instant) {
+        state
+            .uploads
+            .retain(|_, binding| now.saturating_duration_since(binding.touched) <= self.ttl);
     }
 }
 
@@ -377,7 +535,11 @@ struct S3Query {
     continuation_token: Option<String>,
     max_keys: Option<String>,
     encoding_type: Option<String>,
-    multipart: bool,
+    uploads: Option<String>,
+    upload_id: Option<String>,
+    part_number: Option<String>,
+    part_number_marker: Option<String>,
+    max_parts: Option<String>,
 }
 
 impl S3Query {
@@ -392,7 +554,21 @@ impl S3Query {
                 "continuation-token" => parsed.continuation_token = Some(value.into_owned()),
                 "max-keys" => parsed.max_keys = Some(value.into_owned()),
                 "encoding-type" => parsed.encoding_type = Some(value.into_owned()),
-                "uploads" | "uploadId" | "partNumber" => parsed.multipart = true,
+                "uploads" => set_query_value(&mut parsed.uploads, value.into_owned(), "uploads")?,
+                "uploadId" => {
+                    set_query_value(&mut parsed.upload_id, value.into_owned(), "uploadId")?
+                }
+                "partNumber" => {
+                    set_query_value(&mut parsed.part_number, value.into_owned(), "partNumber")?
+                }
+                "part-number-marker" => set_query_value(
+                    &mut parsed.part_number_marker,
+                    value.into_owned(),
+                    "part-number-marker",
+                )?,
+                "max-parts" => {
+                    set_query_value(&mut parsed.max_parts, value.into_owned(), "max-parts")?
+                }
                 _ => {}
             }
         }
@@ -405,6 +581,94 @@ impl S3Query {
             }
         }
         Ok(parsed)
+    }
+
+    fn multipart_operation(
+        &self,
+        method: &axum::http::Method,
+        copy: bool,
+    ) -> Result<Option<MultipartOperation>, S3RequestError> {
+        let multipart = self.uploads.is_some()
+            || self.upload_id.is_some()
+            || self.part_number.is_some()
+            || self.part_number_marker.is_some()
+            || self.max_parts.is_some();
+        if !multipart {
+            return Ok(None);
+        }
+        if let Some(value) = self.uploads.as_deref() {
+            if method == axum::http::Method::POST
+                && value.is_empty()
+                && self.upload_id.is_none()
+                && self.part_number.is_none()
+                && self.part_number_marker.is_none()
+                && self.max_parts.is_none()
+            {
+                return Ok(Some(MultipartOperation::Create));
+            }
+            return Err(S3RequestError::invalid(
+                "InvalidRequest",
+                "invalid CreateMultipartUpload request",
+            ));
+        }
+        let upload_id = self
+            .upload_id
+            .as_deref()
+            .filter(|value| !value.is_empty() && value.len() <= 2048)
+            .ok_or_else(|| S3RequestError::invalid("InvalidArgument", "uploadId is invalid"))?
+            .to_string();
+        match *method {
+            axum::http::Method::PUT => {
+                if self.part_number_marker.is_some() || self.max_parts.is_some() {
+                    return Err(S3RequestError::invalid(
+                        "InvalidArgument",
+                        "invalid UploadPart request",
+                    ));
+                }
+                let part_number = parse_part_number(self.part_number.as_deref())?;
+                Ok(Some(MultipartOperation::UploadPart {
+                    upload_id,
+                    part_number,
+                    copy,
+                }))
+            }
+            axum::http::Method::GET if self.part_number.is_none() => {
+                let part_number_marker = self
+                    .part_number_marker
+                    .as_deref()
+                    .map(parse_part_marker)
+                    .transpose()?;
+                let max_parts = self
+                    .max_parts
+                    .as_deref()
+                    .map(parse_max_parts)
+                    .transpose()?
+                    .unwrap_or(1000);
+                Ok(Some(MultipartOperation::ListParts {
+                    upload_id,
+                    part_number_marker,
+                    max_parts,
+                }))
+            }
+            axum::http::Method::POST
+                if self.part_number.is_none()
+                    && self.part_number_marker.is_none()
+                    && self.max_parts.is_none() =>
+            {
+                Ok(Some(MultipartOperation::Complete { upload_id }))
+            }
+            axum::http::Method::DELETE
+                if self.part_number.is_none()
+                    && self.part_number_marker.is_none()
+                    && self.max_parts.is_none() =>
+            {
+                Ok(Some(MultipartOperation::Abort { upload_id }))
+            }
+            _ => Err(S3RequestError::invalid(
+                "InvalidRequest",
+                "unsupported multipart request shape",
+            )),
+        }
     }
 
     fn is_list_v2(&self) -> bool {
@@ -426,6 +690,147 @@ impl S3Query {
                 }),
         }
     }
+}
+
+fn set_query_value(
+    slot: &mut Option<String>,
+    value: String,
+    name: &str,
+) -> Result<(), S3RequestError> {
+    if slot.replace(value).is_some() {
+        return Err(S3RequestError::invalid(
+            "InvalidArgument",
+            format!("{name} must occur exactly once"),
+        ));
+    }
+    Ok(())
+}
+
+fn parse_part_number(value: Option<&str>) -> Result<u16, S3RequestError> {
+    value
+        .and_then(|value| value.parse::<u16>().ok())
+        .filter(|value| (1..=10_000).contains(value))
+        .ok_or_else(|| {
+            S3RequestError::invalid("InvalidArgument", "partNumber must be between 1 and 10000")
+        })
+}
+
+fn parse_part_marker(value: &str) -> Result<u16, S3RequestError> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value <= 10_000)
+        .ok_or_else(|| S3RequestError::invalid("InvalidArgument", "part-number-marker is invalid"))
+}
+
+fn parse_max_parts(value: &str) -> Result<u16, S3RequestError> {
+    value
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value <= 1000)
+        .ok_or_else(|| S3RequestError::invalid("InvalidArgument", "max-parts is invalid"))
+}
+
+#[derive(Debug)]
+enum MultipartOperation {
+    Create,
+    UploadPart {
+        upload_id: String,
+        part_number: u16,
+        copy: bool,
+    },
+    ListParts {
+        upload_id: String,
+        part_number_marker: Option<u16>,
+        max_parts: u16,
+    },
+    Complete {
+        upload_id: String,
+    },
+    Abort {
+        upload_id: String,
+    },
+}
+
+impl MultipartOperation {
+    fn upload_id(&self) -> Option<&str> {
+        match self {
+            Self::Create => None,
+            Self::UploadPart { upload_id, .. }
+            | Self::ListParts { upload_id, .. }
+            | Self::Complete { upload_id }
+            | Self::Abort { upload_id } => Some(upload_id),
+        }
+    }
+
+    fn query(&self) -> String {
+        match self {
+            Self::Create => "uploads=".into(),
+            Self::UploadPart {
+                upload_id,
+                part_number,
+                ..
+            } => format!(
+                "partNumber={part_number}&uploadId={}",
+                encode_query_value(upload_id)
+            ),
+            Self::ListParts {
+                upload_id,
+                part_number_marker,
+                max_parts,
+            } => {
+                let mut query = format!("uploadId={}", encode_query_value(upload_id));
+                if let Some(marker) = part_number_marker {
+                    query.push_str(&format!("&part-number-marker={marker}"));
+                }
+                query.push_str(&format!("&max-parts={max_parts}"));
+                query
+            }
+            Self::Complete { upload_id } | Self::Abort { upload_id } => {
+                format!("uploadId={}", encode_query_value(upload_id))
+            }
+        }
+    }
+}
+
+fn encode_query_value(value: &str) -> String {
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn multipart_principal(request: &Request) -> Result<AuthenticatedPrincipal, S3RequestError> {
+    request
+        .extensions()
+        .get::<AuthenticatedPrincipal>()
+        .cloned()
+        .ok_or_else(S3RequestError::access_denied)
+}
+
+fn cache_decision(headers: &HeaderMap) -> Result<EffectiveDecision, S3RequestError> {
+    let mut values = headers.get_all(S3_CACHE_MARK_HEADER).iter();
+    let Some(value) = values.next() else {
+        return Ok(EffectiveDecision::default());
+    };
+    if values.next().is_some() {
+        return Err(S3RequestError::invalid(
+            "InvalidRequest",
+            "cache decision must occur exactly once",
+        ));
+    }
+    EffectiveDecision::parse(
+        value
+            .to_str()
+            .map_err(|_| S3RequestError::invalid("InvalidRequest", "cache decision is invalid"))?,
+    )
+    .map_err(|_| S3RequestError::invalid("InvalidRequest", "cache decision is invalid"))
 }
 
 fn single_content_length(headers: &HeaderMap) -> Result<u64, S3RequestError> {
@@ -468,7 +873,7 @@ fn mutation_headers(
     headers: &HeaderMap,
     copy: bool,
 ) -> Result<Vec<(String, String)>, S3RequestError> {
-    const EXACT: [&str; 18] = [
+    const EXACT: [&str; 19] = [
         "cache-control",
         "content-disposition",
         "content-encoding",
@@ -481,6 +886,7 @@ fn mutation_headers(
         "x-amz-acl",
         "x-amz-checksum-algorithm",
         "x-amz-copy-source",
+        "x-amz-copy-source-range",
         "x-amz-metadata-directive",
         "x-amz-storage-class",
         "x-amz-tagging",
@@ -906,6 +1312,39 @@ impl S3RequestError {
         }
     }
 
+    fn no_such_upload() -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "NoSuchUpload",
+            message: "The specified multipart upload does not exist".into(),
+            failure: FailureReason::NotFound,
+            content_range: None,
+            indeterminate_commit: false,
+        }
+    }
+
+    fn access_denied() -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code: "AccessDenied",
+            message: "Access Denied".into(),
+            failure: FailureReason::Authorization,
+            content_range: None,
+            indeterminate_commit: false,
+        }
+    }
+
+    fn multipart_capacity() -> Self {
+        Self {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "ServiceUnavailable",
+            message: "Multipart upload capacity is temporarily exhausted".into(),
+            failure: FailureReason::Internal,
+            content_range: None,
+            indeterminate_commit: false,
+        }
+    }
+
     fn precondition_failed() -> Self {
         Self {
             status: StatusCode::PRECONDITION_FAILED,
@@ -1139,12 +1578,21 @@ impl S3Adapter {
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
-        let operation = match *request.method() {
-            axum::http::Method::HEAD => GatewayOperation::Stat,
-            axum::http::Method::GET => GatewayOperation::Read,
-            axum::http::Method::PUT | axum::http::Method::POST => GatewayOperation::Write,
-            axum::http::Method::DELETE => GatewayOperation::Delete,
-            _ => GatewayOperation::Unsupported,
+        let multipart = query.multipart_operation(
+            request.method(),
+            request.headers().contains_key("x-amz-copy-source"),
+        )?;
+        let operation = match multipart.as_ref() {
+            Some(MultipartOperation::ListParts { .. }) => GatewayOperation::List,
+            Some(MultipartOperation::Abort { .. }) => GatewayOperation::Delete,
+            Some(_) => GatewayOperation::Write,
+            None => match *request.method() {
+                axum::http::Method::HEAD => GatewayOperation::Stat,
+                axum::http::Method::GET => GatewayOperation::Read,
+                axum::http::Method::PUT | axum::http::Method::POST => GatewayOperation::Write,
+                axum::http::Method::DELETE => GatewayOperation::Delete,
+                _ => GatewayOperation::Unsupported,
+            },
         };
         let mut access = GatewayAccess {
             operation,
@@ -1179,15 +1627,11 @@ impl S3Adapter {
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
         let object = ObjectId::new(Backend::S3, target.bucket, key);
-        if query.multipart {
-            return Err(S3RequestError {
-                status: StatusCode::NOT_IMPLEMENTED,
-                code: "NotImplemented",
-                message: "Multipart upload operations are not supported by this endpoint".into(),
-                failure: FailureReason::Unsupported,
-                content_range: None,
-                indeterminate_commit: false,
-            });
+        if let Some(operation) = query.multipart_operation(
+            request.method(),
+            request.headers().contains_key("x-amz-copy-source"),
+        )? {
+            return self.multipart(object, operation, request, context).await;
         }
         match *request.method() {
             axum::http::Method::HEAD => self.head(object, request.headers(), context).await,
@@ -1203,6 +1647,358 @@ impl S3Adapter {
                 indeterminate_commit: false,
             }),
         }
+    }
+
+    async fn multipart(
+        &self,
+        object: ObjectId,
+        operation: MultipartOperation,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let principal = multipart_principal(&request)?;
+        let decision = cache_decision(request.headers())?;
+        if matches!(operation, MultipartOperation::Create) {
+            return self
+                .create_multipart(object, request.headers(), principal, decision, context)
+                .await;
+        }
+        let upload_id = operation
+            .upload_id()
+            .expect("non-create multipart operation has an upload ID");
+        if !self
+            .uploads
+            .authorize(upload_id, &object, &principal, decision, Instant::now())
+        {
+            return Err(S3RequestError::no_such_upload());
+        }
+        match operation {
+            MultipartOperation::Create => unreachable!(),
+            MultipartOperation::UploadPart {
+                part_number,
+                copy,
+                upload_id,
+            } => {
+                self.upload_part(object, upload_id, part_number, copy, request, context)
+                    .await
+            }
+            MultipartOperation::ListParts {
+                upload_id,
+                part_number_marker,
+                max_parts,
+            } => {
+                self.list_parts(object, upload_id, part_number_marker, max_parts, context)
+                    .await
+            }
+            MultipartOperation::Complete { upload_id } => {
+                self.complete_multipart(object, upload_id, request, context)
+                    .await
+            }
+            MultipartOperation::Abort { upload_id } => {
+                self.abort_multipart(object, upload_id, context).await
+            }
+        }
+    }
+
+    async fn create_multipart(
+        &self,
+        object: ObjectId,
+        headers: &HeaderMap,
+        principal: AuthenticatedPrincipal,
+        decision: EffectiveDecision,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        if !self.uploads.reserve(Instant::now()) {
+            return Err(S3RequestError::multipart_capacity());
+        }
+        let headers = match mutation_headers(headers, false) {
+            Ok(headers) => headers,
+            Err(error) => {
+                self.uploads.cancel_reservation();
+                return Err(error);
+            }
+        };
+        let response = match self
+            .origin
+            .multipart(S3MultipartRequest {
+                method: Method::Post,
+                object: &object,
+                query: "uploads=",
+                headers: &headers,
+            })
+            .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                self.uploads.cancel_reservation();
+                return Err(S3RequestError::indeterminate_commit());
+            }
+        };
+        if !response.is_success() {
+            self.uploads.cancel_reservation();
+            return Ok(raw_response(
+                response,
+                GatewayOperation::Write,
+                Some(GatewayTarget::Object(object)),
+                context,
+            ));
+        }
+        let upload_id = std::str::from_utf8(&response.body)
+            .ok()
+            .and_then(|xml| talon_backend::xml::element(xml, "UploadId"))
+            .map(talon_backend::xml::unescape)
+            .filter(|upload_id| !upload_id.is_empty() && upload_id.len() <= 2048);
+        let Some(upload_id) = upload_id else {
+            self.uploads.cancel_reservation();
+            return Err(S3RequestError::indeterminate_commit());
+        };
+        let published = self.uploads.publish(
+            upload_id,
+            MultipartBinding {
+                object: object.clone(),
+                principal,
+                decision,
+                touched: Instant::now(),
+            },
+        );
+        if !published {
+            return Err(S3RequestError::indeterminate_commit());
+        }
+        Ok(raw_response(
+            response,
+            GatewayOperation::Write,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
+    }
+
+    async fn upload_part(
+        &self,
+        object: ObjectId,
+        upload_id: String,
+        part_number: u16,
+        copy: bool,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let query = MultipartOperation::UploadPart {
+            upload_id,
+            part_number,
+            copy,
+        }
+        .query();
+        if copy {
+            let headers = mutation_headers(request.headers(), true)?;
+            let response = self
+                .origin
+                .multipart(S3MultipartRequest {
+                    method: Method::Put,
+                    object: &object,
+                    query: &query,
+                    headers: &headers,
+                })
+                .await
+                .map_err(|_| S3RequestError::indeterminate_commit())?;
+            let failed = copy_response_failed(&response);
+            let mut response = raw_response(
+                response,
+                GatewayOperation::Write,
+                Some(GatewayTarget::Object(object)),
+                context,
+            );
+            if failed && response.response.status().is_success() {
+                response.outcome = GatewayOutcome::Failed;
+                response.failure = Some(FailureReason::Origin);
+            }
+            return Ok(response);
+        }
+        let len = single_content_length(request.headers())?;
+        let payload_hash = payload_declaration(&request)?;
+        let headers = mutation_headers(request.headers(), false)?;
+        let body = request.into_body().into_data_stream();
+        let response = if payload_hash == "UNSIGNED-PAYLOAD" {
+            let body = body.map(|chunk| chunk.map_err(|error| error.to_string()));
+            self.origin
+                .multipart_body(
+                    S3MultipartRequest {
+                        method: Method::Put,
+                        object: &object,
+                        query: &query,
+                        headers: &headers,
+                    },
+                    Box::pin(body),
+                    len,
+                    &payload_hash,
+                )
+                .await
+        } else {
+            let (spool, actual_hash) = spool_and_hash(body, len).await?;
+            if actual_hash != payload_hash {
+                return Err(S3RequestError::invalid(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided payload hash does not match the request body",
+                ));
+            }
+            self.origin
+                .multipart_file(
+                    S3MultipartRequest {
+                        method: Method::Put,
+                        object: &object,
+                        query: &query,
+                        headers: &headers,
+                    },
+                    spool.path(),
+                    len,
+                    &actual_hash,
+                )
+                .await
+        }
+        .map_err(|_| S3RequestError::indeterminate_commit())?;
+        let mut response = raw_response(
+            response,
+            GatewayOperation::Write,
+            Some(GatewayTarget::Object(object)),
+            context,
+        );
+        response.requested_bytes = len;
+        Ok(response)
+    }
+
+    async fn list_parts(
+        &self,
+        object: ObjectId,
+        upload_id: String,
+        part_number_marker: Option<u16>,
+        max_parts: u16,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let query = MultipartOperation::ListParts {
+            upload_id,
+            part_number_marker,
+            max_parts,
+        }
+        .query();
+        let response = self
+            .origin
+            .multipart(S3MultipartRequest {
+                method: Method::Get,
+                object: &object,
+                query: &query,
+                headers: &[],
+            })
+            .await
+            .map_err(S3RequestError::origin_unavailable)?;
+        Ok(raw_response(
+            response,
+            GatewayOperation::List,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
+    }
+
+    async fn complete_multipart(
+        &self,
+        object: ObjectId,
+        upload_id: String,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let query = MultipartOperation::Complete {
+            upload_id: upload_id.clone(),
+        }
+        .query();
+        let len = single_content_length(request.headers())?;
+        let payload_hash = payload_declaration(&request)?;
+        let headers = mutation_headers(request.headers(), false)?;
+        let body = request.into_body().into_data_stream();
+        let response = if payload_hash == "UNSIGNED-PAYLOAD" {
+            let body = body.map(|chunk| chunk.map_err(|error| error.to_string()));
+            self.origin
+                .multipart_body(
+                    S3MultipartRequest {
+                        method: Method::Post,
+                        object: &object,
+                        query: &query,
+                        headers: &headers,
+                    },
+                    Box::pin(body),
+                    len,
+                    &payload_hash,
+                )
+                .await
+        } else {
+            let (spool, actual_hash) = spool_and_hash(body, len).await?;
+            if actual_hash != payload_hash {
+                return Err(S3RequestError::invalid(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided payload hash does not match the request body",
+                ));
+            }
+            self.origin
+                .multipart_file(
+                    S3MultipartRequest {
+                        method: Method::Post,
+                        object: &object,
+                        query: &query,
+                        headers: &headers,
+                    },
+                    spool.path(),
+                    len,
+                    &actual_hash,
+                )
+                .await
+        }
+        .map_err(|_| S3RequestError::indeterminate_commit())?;
+        let embedded_error = copy_response_failed(&response);
+        if (response.is_success() && !embedded_error) || response.status == 404 {
+            self.uploads.remove(&upload_id);
+        }
+        if response.is_success() && !embedded_error {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        let mut response = raw_response(
+            response,
+            GatewayOperation::Write,
+            Some(GatewayTarget::Object(object)),
+            context,
+        );
+        response.requested_bytes = len;
+        if embedded_error && response.response.status().is_success() {
+            response.outcome = GatewayOutcome::Failed;
+            response.failure = Some(FailureReason::Origin);
+        }
+        Ok(response)
+    }
+
+    async fn abort_multipart(
+        &self,
+        object: ObjectId,
+        upload_id: String,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let query = MultipartOperation::Abort {
+            upload_id: upload_id.clone(),
+        }
+        .query();
+        let response = self
+            .origin
+            .multipart(S3MultipartRequest {
+                method: Method::Delete,
+                object: &object,
+                query: &query,
+                headers: &[],
+            })
+            .await
+            .map_err(|_| S3RequestError::indeterminate_commit())?;
+        if response.is_success() || response.status == 404 {
+            self.uploads.remove(&upload_id);
+        }
+        Ok(raw_response(
+            response,
+            GatewayOperation::Delete,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
     }
 
     async fn put(
@@ -1641,6 +2437,30 @@ mod tests {
         headers: Mutex<Vec<(String, String)>>,
     }
 
+    type MultipartCall = (Method, String, Vec<(String, String)>, Vec<u8>);
+
+    struct MultipartOrigin {
+        responses: Mutex<VecDeque<Result<HttpResponse, String>>>,
+        calls: Mutex<Vec<MultipartCall>>,
+    }
+
+    impl MultipartOrigin {
+        fn new(responses: impl IntoIterator<Item = Result<HttpResponse, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                calls: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn response(&self) -> Result<HttpResponse, String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("multipart test provided one response per origin call")
+        }
+    }
+
     struct StallingMutationOrigin;
 
     #[async_trait]
@@ -1784,6 +2604,87 @@ mod tests {
         }
     }
 
+    #[async_trait]
+    impl S3Origin for MultipartOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            unreachable!("multipart tests do not stat")
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("multipart tests do not read objects")
+        }
+
+        async fn list(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _continuation_token: Option<&str>,
+            _max_keys: u32,
+            _encoding_type: Option<&str>,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("multipart tests do not list objects")
+        }
+
+        async fn multipart(&self, request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
+            self.calls.lock().unwrap().push((
+                request.method,
+                request.query.into(),
+                request.headers.to_vec(),
+                Vec::new(),
+            ));
+            self.response()
+        }
+
+        async fn multipart_body(
+            &self,
+            request: S3MultipartRequest<'_>,
+            mut body: HttpRequestBody,
+            _len: u64,
+            _payload_hash: &str,
+        ) -> Result<HttpResponse, String> {
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            self.calls.lock().unwrap().push((
+                request.method,
+                request.query.into(),
+                request.headers.to_vec(),
+                bytes,
+            ));
+            self.response()
+        }
+
+        async fn multipart_file(
+            &self,
+            request: S3MultipartRequest<'_>,
+            path: &std::path::Path,
+            _len: u64,
+            _payload_hash: &str,
+        ) -> Result<HttpResponse, String> {
+            let bytes = tokio::fs::read(path)
+                .await
+                .map_err(|error| error.to_string())?;
+            self.calls.lock().unwrap().push((
+                request.method,
+                request.query.into(),
+                request.headers.to_vec(),
+                bytes,
+            ));
+            self.response()
+        }
+    }
+
     fn mutation_adapter(cache: Arc<MutationCache>, origin: Arc<MutationOrigin>) -> S3Adapter {
         S3Adapter::new(S3AdapterConfig::path_style("localhost"), cache, origin).unwrap()
     }
@@ -1912,6 +2813,19 @@ mod tests {
             .unwrap()
     }
 
+    fn authenticated_request(method: &str, uri: &str, body: Body) -> Request {
+        let mut request = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .body(body)
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("multipart-user", "account-a"));
+        request
+    }
+
     fn context() -> GatewayRequestContext {
         GatewayRequestContext {
             request_id: "00000000-0000-4000-8000-000000000001".into(),
@@ -1941,6 +2855,77 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    #[test]
+    fn parses_only_supported_multipart_shapes() {
+        let upload = S3Query::parse(Some("partNumber=7&uploadId=id%2Ftoken"))
+            .unwrap()
+            .multipart_operation(&axum::http::Method::PUT, false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            upload.query(),
+            "partNumber=7&uploadId=id%2Ftoken",
+            "opaque upload IDs are decoded once and safely re-encoded"
+        );
+        assert!(S3Query::parse(Some("uploadId=a&uploadId=b")).is_err());
+        assert!(S3Query::parse(Some("partNumber=0&uploadId=id"))
+            .unwrap()
+            .multipart_operation(&axum::http::Method::PUT, false)
+            .is_err());
+        assert!(S3Query::parse(Some("uploads=&uploadId=id"))
+            .unwrap()
+            .multipart_operation(&axum::http::Method::POST, false)
+            .is_err());
+    }
+
+    #[test]
+    fn multipart_registry_is_bounded_expires_and_fails_closed() {
+        let registry = MultipartRegistry::new(1, Duration::from_secs(5));
+        let now = Instant::now();
+        let object = ObjectId::new(Backend::S3, "bucket", "key");
+        let principal = AuthenticatedPrincipal::new("user", "account");
+        assert!(registry.reserve(now));
+        assert!(!registry.reserve(now));
+        assert!(registry.publish(
+            "upload".into(),
+            MultipartBinding {
+                object: object.clone(),
+                principal: principal.clone(),
+                decision: EffectiveDecision::DEFAULT,
+                touched: now,
+            }
+        ));
+        assert!(!registry.authorize(
+            "upload",
+            &ObjectId::new(Backend::S3, "bucket", "other"),
+            &principal,
+            EffectiveDecision::DEFAULT,
+            now,
+        ));
+        assert!(!registry.authorize(
+            "upload",
+            &object,
+            &AuthenticatedPrincipal::new("other", "account"),
+            EffectiveDecision::DEFAULT,
+            now,
+        ));
+        assert!(!registry.authorize(
+            "upload",
+            &object,
+            &principal,
+            EffectiveDecision::ORIGIN_ONLY,
+            now,
+        ));
+        assert!(!registry.authorize(
+            "upload",
+            &object,
+            &principal,
+            EffectiveDecision::DEFAULT,
+            now + Duration::from_secs(6),
+        ));
+        assert!(registry.reserve(now + Duration::from_secs(6)));
     }
 
     #[tokio::test]
@@ -2149,6 +3134,26 @@ mod tests {
             access.additional[0].target,
             GatewayTarget::Object(ObjectId::new(Backend::S3, "source", "original"))
         );
+
+        let mut part_copy = request(
+            axum::http::Method::PUT,
+            "/destination/copied?partNumber=1&uploadId=opaque",
+        );
+        part_copy.headers_mut().insert(
+            "x-amz-copy-source",
+            HeaderValue::from_static("/source/original"),
+        );
+        let access = adapter(
+            MockCache {
+                response: Ok(Vec::new()),
+            },
+            MockOrigin::new(),
+        )
+        .classify_access(&part_copy)
+        .unwrap();
+        assert_eq!(access.operation, GatewayOperation::Write);
+        assert_eq!(access.additional.len(), 1);
+        assert_eq!(access.additional[0].operation, GatewayOperation::Read);
     }
 
     #[tokio::test]
@@ -2281,6 +3286,96 @@ mod tests {
         assert_eq!(response.outcome, GatewayOutcome::Failed);
         assert_eq!(response.failure, Some(FailureReason::Origin));
         assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn multipart_binding_and_completion_are_fail_closed() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MultipartOrigin::new([
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                body: Bytes::from_static(
+                    b"<InitiateMultipartUploadResult><UploadId>opaque/id</UploadId></InitiateMultipartUploadResult>",
+                ),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                body: Bytes::from_static(
+                    b"<Error><Code>InternalError</Code><Message>complete failed</Message></Error>",
+                ),
+            }),
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("content-type".into(), "application/xml".into())],
+                body: Bytes::from_static(b"<CompleteMultipartUploadResult/>")
+            }),
+        ]);
+        let adapter = S3Adapter::new(
+            S3AdapterConfig::path_style("localhost"),
+            Arc::clone(&cache) as Arc<dyn S3Cache>,
+            Arc::clone(&origin) as Arc<dyn S3Origin>,
+        )
+        .unwrap();
+
+        let create = adapter
+            .handle(
+                authenticated_request("POST", "/bucket/key?uploads", Body::empty()),
+                context(),
+            )
+            .await;
+        assert_eq!(create.response.status(), StatusCode::OK);
+        assert_eq!(origin.calls.lock().unwrap()[0].1, "uploads=");
+
+        let mut wrong_principal =
+            authenticated_request("GET", "/bucket/key?uploadId=opaque%2Fid", Body::empty());
+        wrong_principal
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("different-user", "account-a"));
+        let rejected = adapter.handle(wrong_principal, context()).await;
+        assert_eq!(rejected.response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(origin.calls.lock().unwrap().len(), 1);
+
+        let complete_body = "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>etag</ETag></Part></CompleteMultipartUpload>";
+        let complete = || {
+            let mut request = authenticated_request(
+                "POST",
+                "/bucket/key?uploadId=opaque%2Fid",
+                Body::from(complete_body),
+            );
+            request.headers_mut().insert(
+                header::CONTENT_LENGTH,
+                HeaderValue::from_str(&complete_body.len().to_string()).unwrap(),
+            );
+            request.headers_mut().insert(
+                "x-amz-content-sha256",
+                HeaderValue::from_static("UNSIGNED-PAYLOAD"),
+            );
+            request
+        };
+        let embedded_error = adapter.handle(complete(), context()).await;
+        assert_eq!(embedded_error.response.status(), StatusCode::OK);
+        assert_eq!(embedded_error.outcome, GatewayOutcome::Failed);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+
+        let success = adapter.handle(complete(), context()).await;
+        assert_eq!(success.response.status(), StatusCode::OK);
+        assert_eq!(success.outcome, GatewayOutcome::Complete);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+        assert_eq!(origin.calls.lock().unwrap()[2].0, Method::Post);
+        assert_eq!(origin.calls.lock().unwrap()[2].3, complete_body.as_bytes());
+
+        let removed = adapter
+            .handle(
+                authenticated_request("GET", "/bucket/key?uploadId=opaque%2Fid", Body::empty()),
+                context(),
+            )
+            .await;
+        assert_eq!(removed.response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(origin.calls.lock().unwrap().len(), 3);
     }
 
     #[tokio::test]

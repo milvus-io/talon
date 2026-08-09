@@ -25,5 +25,5 @@ pub use http::{
 };
 pub use reqwest_client::ReqwestClient;
 pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
-pub use s3::{S3Backend, S3Config, S3Credentials};
+pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest};
 pub use sigv4::{sign_request, AmzDate};

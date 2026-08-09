@@ -55,7 +55,7 @@ and deployment are tracked separately.
 | PutObject | Supported | Fixed-length bodies are passed through once. `UNSIGNED-PAYLOAD` streams with backpressure; a declared SHA-256 is verified in a bounded-memory spool before origin dispatch. |
 | CopyObject | Supported | Source read and destination write grants are both required. Copy conditions and metadata remain origin-authoritative. |
 | DeleteObject | Supported | Passed through once; the origin status remains authoritative and confirmed absence invalidates local placement state. |
-| Multipart upload | Not yet supported | Multipart query shapes return `NotImplemented`; tracked by issue #497. |
+| Multipart upload | Supported | Create, upload-part, upload-part-copy, list-parts, complete, and abort are passed through. Upload IDs remain origin-issued; source and destination authorization is enforced for part copy. |
 
 Incoming client authorization material is never forwarded to a rewritten
 origin request. The gateway uses its scoped origin identity and signs the
@@ -69,16 +69,25 @@ all local placement entries for the object; a failed origin response does not.
 If transport fails after dispatch, the gateway returns
 `x-talon-commit-state: indeterminate`; clients must inspect object state before
 retrying. Request bodies are bounded by the configured gateway body and request
-deadlines (16 MiB and 30 seconds by default). Multipart upload is the path for
-objects that exceed the configured ordinary-request bound.
+deadlines (16 MiB and 30 seconds by default). Each multipart part and completion
+document must fit that bound, while the completed object may be larger.
+
+Active multipart uploads are held in a bounded, 24-hour in-memory registry by
+default. The binding includes the destination object, authenticated principal,
+provider account, and immutable cache decision. A missing, expired, mismatched,
+or restart-lost binding returns `NoSuchUpload` before origin dispatch. Complete
+invalidates local placement only after a confirmed success; an HTTP 200 body
+containing `<Error>` remains a failure. Abort removes the binding after origin
+success or confirmed absence.
 
 The S3 adapter emits S3 XML errors and gateway request IDs. Cache fallback and
 streaming behavior match the Azure adapter rules above. The `s3 backend and
 gateway e2e (localstack)` CI job runs the backend plus the gateway through
 boto3 and the MinIO SDK. It covers cold and warm reads, exact ranges, URL
-encoding, conditions, presigned URLs, listing pagination and delimiters, and
-standard errors. Arrow-compatible signed HEAD and ranged GET fixtures run in
-the same test.
+encoding, conditions, presigned URLs, listing pagination and delimiters,
+ordinary mutations, boto3 and MinIO multipart operations, part copy, abort,
+ordering failures, and standard errors. Arrow-compatible signed HEAD and ranged
+GET fixtures run in the same test.
 
 ## Cache routing mark
 
