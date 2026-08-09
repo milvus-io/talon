@@ -57,6 +57,7 @@ axum = "0.8"
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["timeout"] }
 http-body-util = "0.1"
+httpdate = "1"
 serde_yaml = "0.9"
 # Kubernetes client for the Lease-based ClusterStateStore backend (feature
 # "kubernetes"). rustls avoids a system OpenSSL build dependency. k8s-openapi is

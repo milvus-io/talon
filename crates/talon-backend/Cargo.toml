@@ -13,6 +13,7 @@ talon-core.workspace = true
 serde_json.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
+futures.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tokio = { workspace = true, features = ["time"] }
 tokio-util.workspace = true

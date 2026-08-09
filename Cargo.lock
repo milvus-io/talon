@@ -2549,6 +2549,7 @@ dependencies = [
  "async-trait",
  "base64",
  "bytes",
+ "futures",
  "hmac",
  "reqwest",
  "serde_json",
@@ -2662,14 +2663,19 @@ dependencies = [
  "bytes",
  "futures",
  "http-body-util",
+ "httpdate",
+ "percent-encoding",
  "serde",
  "serde_json",
+ "talon-backend",
+ "talon-cache-client",
  "talon-core",
  "thiserror 2.0.19",
  "tokio",
  "tower",
  "tower-http",
  "tracing",
+ "url",
 ]
 
 [[package]]

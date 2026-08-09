@@ -20,7 +20,7 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
-use crate::http::{HttpClient, HttpRequest, Method};
+use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Method};
 
 /// Percent-encode a query value. `/` is escaped: a listing prefix contains
 /// slashes and an unescaped one would change the request path.
@@ -164,6 +164,18 @@ impl AzureBackend {
         cursor: Option<&str>,
         max: u32,
     ) -> String {
+        self.list_url_with_delimiter(container, prefix, None, cursor, max)
+    }
+
+    /// Build a container listing URL with the full gateway read surface.
+    pub fn list_url_with_delimiter(
+        &self,
+        container: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        cursor: Option<&str>,
+        max: u32,
+    ) -> String {
         let scheme = if self.config.tls { "https" } else { "http" };
         let host =
             self.config.endpoint_host.clone().unwrap_or_else(|| {
@@ -177,6 +189,9 @@ impl AzureBackend {
         let mut query = format!("restype=container&comp=list&maxresults={max}");
         if !prefix.is_empty() {
             query.push_str(&format!("&prefix={}", encode_query_value(prefix)));
+        }
+        if let Some(delimiter) = delimiter.filter(|value| !value.is_empty()) {
+            query.push_str(&format!("&delimiter={}", encode_query_value(delimiter)));
         }
         if let Some(marker) = cursor {
             query.push_str(&format!("&marker={}", encode_query_value(marker)));
@@ -298,6 +313,57 @@ impl AzureBackend {
         }
     }
 
+    /// Execute a raw metadata request while forwarding only validated
+    /// conditional headers supplied by a protocol adapter.
+    pub async fn execute_head_raw(
+        &self,
+        obj: &ObjectId,
+        conditions: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_head(obj);
+        request.headers.extend_from_slice(conditions);
+        self.http.execute(self.authorized(request)).await
+    }
+
+    /// Execute a whole or ranged GET without buffering its response body.
+    pub async fn execute_get_stream_raw(
+        &self,
+        obj: &ObjectId,
+        range: Option<(u64, u64)>,
+        conditions: &[(String, String)],
+    ) -> std::result::Result<HttpStreamResponse, String> {
+        let mut headers = self.common_headers();
+        if let Some((start, end)) = range {
+            headers.push(("x-ms-range".into(), format!("bytes={start}-{end}")));
+        }
+        headers.extend_from_slice(conditions);
+        let request = HttpRequest::new(Method::Get, self.blob_url(obj), headers);
+        self.http.execute_stream(self.authorized(request)).await
+    }
+
+    /// Execute one raw Azure List Blobs page.
+    pub async fn execute_list_raw(
+        &self,
+        container: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        marker: Option<&str>,
+        max_results: u32,
+        conditions: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let url = self.list_url_with_delimiter(
+            container,
+            prefix,
+            delimiter,
+            marker,
+            max_results.clamp(1, 5000),
+        );
+        let mut headers = self.common_headers();
+        headers.extend_from_slice(conditions);
+        let request = HttpRequest::new(Method::Get, url, headers);
+        self.http.execute(self.authorized(request)).await
+    }
+
     /// Build the whole-blob PUT request (exposed for testing).
     ///
     /// Azure block-blob upload requires `x-ms-blob-type: BlockBlob`. When
@@ -407,7 +473,11 @@ impl BackendStore for AzureBackend {
         let max_keys = max_keys.clamp(1, 5000);
         let url = self.list_url(bucket, prefix, cursor, max_keys);
         let req = HttpRequest::new(Method::Get, url, self.common_headers());
-        let resp = self.http.execute(req).await.map_err(Error::Backend)?;
+        let resp = self
+            .http
+            .execute(self.authorized(req))
+            .await
+            .map_err(Error::Backend)?;
         if resp.status == 404 {
             return Err(Error::NotFound(bucket.to_string()));
         }
