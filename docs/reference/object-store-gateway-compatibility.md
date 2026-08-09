@@ -61,6 +61,9 @@ Full incoming SigV4 authentication and bucket authorization remain blocked on
 issue #446, so production exposure stays fail-closed.
 
 The S3 adapter emits S3 XML errors and gateway request IDs. Cache fallback and
-streaming behavior match the Azure adapter rules above. Official SDK and
-S3-compatible service conformance is tracked separately from the protocol
-adapter implementation.
+streaming behavior match the Azure adapter rules above. The `s3 backend and
+gateway e2e (localstack)` CI job runs the backend plus the gateway through
+boto3 and the MinIO SDK. It covers cold and warm reads, exact ranges, URL
+encoding, conditions, presigned URLs, listing pagination and delimiters, and
+standard errors. Arrow-compatible signed HEAD and ranged GET fixtures run in
+the same test.
