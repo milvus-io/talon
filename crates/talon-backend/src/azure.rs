@@ -194,6 +194,16 @@ impl AzureBackend {
     /// name cannot be paired with a neighbour's size. The continuation cursor
     /// is `<NextMarker>`, which Azure emits **empty** rather than omitting when
     /// the listing is complete.
+    ///
+    /// A storage account with the hierarchical namespace enabled (ADLS Gen2)
+    /// lists directories as zero-byte blobs carrying
+    /// `<ResourceType>directory</ResourceType>`, and — unlike the flat-namespace
+    /// convention — their `<Name>` has **no** trailing slash. Left alone, such a
+    /// record claims the same key as the directory's own children, and every
+    /// consumer that maps keys onto a POSIX tree has to reject the listing
+    /// because `a/b` cannot be both a file and the parent of `a/b/c`. Normalizing
+    /// them to the trailing-slash form turns them into ordinary directory
+    /// markers, which the rest of Talon already understands.
     pub fn parse_list_response(body: &str) -> Result<ListPage> {
         let objects = crate::xml::blocks(body, "Blob")
             .into_iter()
@@ -208,6 +218,24 @@ impl AzureBackend {
                             "Azure listing entry {key} has no usable <Content-Length>"
                         ))
                     })?;
+                let is_directory = crate::xml::element(record, "ResourceType")
+                    .is_some_and(|v| v.trim().eq_ignore_ascii_case("directory"));
+                if is_directory {
+                    // Only a zero-byte record is safe to represent as a marker.
+                    // A directory that reports content would mean the listing
+                    // disagrees with itself; surface that instead of hiding it.
+                    if size != 0 {
+                        return Err(Error::Backend(format!(
+                            "Azure listing entry {key} is a directory with {size} bytes of content"
+                        )));
+                    }
+                    if !key.ends_with('/') {
+                        return Ok(ListedObject {
+                            key: format!("{key}/"),
+                            size,
+                        });
+                    }
+                }
                 Ok(ListedObject { key, size })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -921,6 +949,66 @@ mod tests {
         let page = AzureBackend::parse_list_response(body).unwrap();
         assert!(page.objects.is_empty());
         assert_eq!(page.next, None);
+    }
+
+    /// An account with the hierarchical namespace enabled (ADLS Gen2) lists a
+    /// directory as a zero-byte blob whose `<Name>` carries no trailing slash.
+    /// Without normalization `data` collides with its own child `data/a.lance`,
+    /// and a POSIX consumer must reject the whole listing.
+    #[test]
+    fn list_normalizes_adls_directory_records_to_markers() {
+        let body = r#"<EnumerationResults><Blobs>
+          <Blob><Name>data</Name><Properties>
+            <Content-Length>0</Content-Length>
+            <ResourceType>directory</ResourceType></Properties></Blob>
+          <Blob><Name>data/a.lance</Name><Properties>
+            <Content-Length>9</Content-Length>
+            <ResourceType>file</ResourceType></Properties></Blob>
+          </Blobs><NextMarker /></EnumerationResults>"#;
+        let page = AzureBackend::parse_list_response(body).unwrap();
+        assert_eq!(page.objects[0].key, "data/");
+        assert_eq!(page.objects[0].size, 0);
+        assert_eq!(page.objects[1].key, "data/a.lance");
+        assert_eq!(page.objects[1].size, 9);
+    }
+
+    /// A directory record that already ends in `/` must not grow a second one.
+    #[test]
+    fn list_leaves_an_already_slashed_directory_marker_alone() {
+        let body = r#"<EnumerationResults><Blobs>
+          <Blob><Name>data/</Name><Properties>
+            <Content-Length>0</Content-Length>
+            <ResourceType>directory</ResourceType></Properties></Blob>
+          </Blobs><NextMarker /></EnumerationResults>"#;
+        let page = AzureBackend::parse_list_response(body).unwrap();
+        assert_eq!(page.objects[0].key, "data/");
+    }
+
+    /// A flat-namespace account reports no `<ResourceType>`. A zero-byte blob
+    /// there is a real object, not a directory, and must keep its exact key.
+    #[test]
+    fn list_does_not_invent_markers_without_a_resource_type() {
+        let body = r#"<EnumerationResults><Blobs>
+          <Blob><Name>data</Name><Properties>
+            <Content-Length>0</Content-Length></Properties></Blob>
+          </Blobs><NextMarker /></EnumerationResults>"#;
+        let page = AzureBackend::parse_list_response(body).unwrap();
+        assert_eq!(page.objects[0].key, "data");
+    }
+
+    /// A directory that claims to hold bytes means the listing contradicts
+    /// itself; silently dropping the length would hide real data.
+    #[test]
+    fn list_rejects_a_directory_record_with_content() {
+        let body = r#"<EnumerationResults><Blobs>
+          <Blob><Name>data</Name><Properties>
+            <Content-Length>5</Content-Length>
+            <ResourceType>directory</ResourceType></Properties></Blob>
+          </Blobs><NextMarker /></EnumerationResults>"#;
+        let err = AzureBackend::parse_list_response(body)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("directory with 5 bytes"), "{err}");
     }
 
     /// A SAS token is itself a query string. Appending listing params with `?`
