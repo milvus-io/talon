@@ -25,6 +25,7 @@ use crate::model::{
     FailureReason, GatewayAdapter, GatewayOperation, GatewayOutcome, GatewayRequestContext,
     GatewayResponse, GatewayRoute,
 };
+use crate::tls::{GatewayTlsConfig, GatewayTlsError, GatewayTlsListener};
 
 /// Opaque request ID emitted by the shared core and translated by adapters.
 pub const REQUEST_ID_HEADER: &str = "x-talon-request-id";
@@ -60,6 +61,11 @@ impl GatewayReadiness {
     /// Update installed production security components.
     pub fn set_security(&self, security: GatewaySecurity) {
         *self.security.write().unwrap() = security;
+    }
+
+    /// Update the TLS readiness bit from the installed listener state.
+    pub fn set_tls_ready(&self, ready: bool) {
+        self.security.write().unwrap().tls = ready;
     }
 
     /// Whether the process should receive provider traffic.
@@ -171,6 +177,30 @@ pub async fn serve(
     runtime: Arc<GatewayRuntime>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
+    serve_listener(listener, runtime, shutdown).await
+}
+
+/// Serve HTTPS with reloadable TLS 1.3 material.
+pub async fn serve_tls(
+    listener: TcpListener,
+    runtime: Arc<GatewayRuntime>,
+    tls: GatewayTlsConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), GatewayTlsServeError> {
+    let listener = GatewayTlsListener::load(listener, tls, runtime.metrics().clone())?;
+    runtime.readiness.set_tls_ready(true);
+    serve_listener(listener, runtime, shutdown).await?;
+    Ok(())
+}
+
+async fn serve_listener<L>(
+    listener: L,
+    runtime: Arc<GatewayRuntime>,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> std::io::Result<()>
+where
+    L: axum::serve::Listener<Addr = SocketAddr>,
+{
     let local = listener.local_addr()?;
     if runtime.config.mode == GatewayMode::Development && !local.ip().is_loopback() {
         return Err(std::io::Error::new(
@@ -182,7 +212,7 @@ pub async fn serve(
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
         listener,
-        gateway_router(Arc::clone(&runtime)).into_make_service_with_connect_info::<SocketAddr>(),
+        gateway_router(Arc::clone(&runtime)).into_make_service(),
     )
     .with_graceful_shutdown(async move {
         let _ = shutdown_rx.await;
@@ -205,6 +235,17 @@ pub async fn serve(
             }
         }
     }
+}
+
+/// HTTPS startup or serving failure.
+#[derive(Debug, thiserror::Error)]
+pub enum GatewayTlsServeError {
+    /// Initial TLS material or bounds were invalid.
+    #[error(transparent)]
+    Tls(#[from] GatewayTlsError),
+    /// The listener failed while serving.
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
 }
 
 async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Request) -> Response {

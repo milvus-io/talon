@@ -7,6 +7,7 @@ mod metrics;
 mod model;
 mod runtime;
 pub mod s3;
+mod tls;
 
 pub use cache_mark::{
     CacheFallback, CacheLookup, CacheMarkError, CachePopulation, EffectiveDecision,
@@ -18,4 +19,8 @@ pub use model::{
     FailureReason, GatewayAdapter, GatewayOperation, GatewayOutcome, GatewayRequestContext,
     GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
 };
-pub use runtime::{gateway_router, serve, GatewayReadiness, GatewayRuntime, REQUEST_ID_HEADER};
+pub use runtime::{
+    gateway_router, serve, serve_tls, GatewayReadiness, GatewayRuntime, GatewayTlsServeError,
+    REQUEST_ID_HEADER,
+};
+pub use tls::{GatewayTlsConfig, GatewayTlsError, GatewayTlsListener};

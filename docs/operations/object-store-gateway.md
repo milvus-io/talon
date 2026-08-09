@@ -15,7 +15,9 @@ and are not implemented. This has two enforced consequences:
   sidecar in the same network namespace.
 - `production` mode can bind a routable address, but `/readyz` remains failing
   and provider requests return `503` until TLS, authentication, and
-  authorization are installed.
+  authorization are installed. Configuring the TLS certificate and key enables
+  a TLS 1.3-only listener, but authentication and authorization remain blocked
+  by #446.
 
 Do not add a Kubernetes Service, ingress, host port, or public load balancer to
 the current gateway. A client signature or SAS token is parsed only as protocol
@@ -55,6 +57,16 @@ Common variables:
 | `TALON_GATEWAY_TRANSFER_CHUNK_BYTES` | `1048576` | Maximum cache body frame. |
 | `TALON_GATEWAY_PLACEMENT_TTL_MS` | `5000` | Client-side placement freshness. |
 | `TALON_GATEWAY_REPLICAS` | `1` | Ordered worker replicas attempted by the cache client. |
+| `TALON_GATEWAY_TLS_CERT_PATH` | unset | PEM server certificate chain; must be paired with the key. |
+| `TALON_GATEWAY_TLS_KEY_PATH` | unset | PEM private key; its path and contents are redacted. |
+| `TALON_GATEWAY_TLS_RELOAD_MS` | `5000` | Last-good certificate/key reload interval. |
+| `TALON_GATEWAY_TLS_HANDSHAKE_TIMEOUT_MS` | `10000` | Maximum TLS handshake time per connection. |
+| `TALON_GATEWAY_TLS_MAX_HANDSHAKES` | `256` | Maximum concurrent pre-HTTP TLS handshakes. |
+
+The listener permits TLS 1.3 only and advertises HTTP/2 and HTTP/1.1. A bad
+rotation increments `talon_gateway_tls_events_total{event="reload_failure"}`
+and retains the previous valid material. Plaintext and stalled handshakes are
+discarded before HTTP dispatch and counted with bounded event labels.
 
 S3 variables:
 

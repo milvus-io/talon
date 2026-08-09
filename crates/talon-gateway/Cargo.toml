@@ -20,8 +20,10 @@ httpdate.workspace = true
 percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+rustls.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tokio-rustls.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
@@ -29,4 +31,6 @@ tracing-subscriber.workspace = true
 url.workspace = true
 
 [dev-dependencies]
+base64 = "0.22"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+tempfile.workspace = true
