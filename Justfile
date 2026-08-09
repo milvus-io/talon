@@ -89,6 +89,11 @@ bench-check *ARGS:
 bench-baseline NAME="main":
     @cat bench/baselines/{{NAME}}.json
 
+# Render the data-plane charts used in the README and docs from
+# bench/data/dataplane.json. Needs `uv` (deps are declared inline, PEP 723).
+bench-charts *ARGS:
+    uv run scripts/bench_charts.py {{ARGS}}
+
 # --- supply chain / coverage ---
 
 # Check the dependency tree for RUSTSEC advisories, banned crates, and unknown

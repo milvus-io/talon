@@ -1,0 +1,85 @@
+{
+  "_comment": [
+    "Measured data-plane results, the source of truth for the charts rendered by",
+    "scripts/bench_charts.py and for the tables in BENCHMARKS.md.",
+    "",
+    "Host: managed Kubernetes, Standard_E64ads_v5 class node, worker capped at",
+    "8 CPU by its cgroup. 64 KiB ranges, all cache hits. Warmup excluded.",
+    "Regenerate the charts after editing: just bench-charts"
+  ],
+  "host": "Standard_E64ads_v5 class node, worker capped at 8 CPU (cgroup)",
+  "range_bytes": 65536,
+  "ring_scaling_depth16": {
+    "_comment": "8 rings, 64 connections, depth 16, 15 s after 5 s warmup. Peak reproduced within 1% (187,553 on a repeat run).",
+    "connections": 64,
+    "depth": 16,
+    "rows": [
+      {
+        "rings": 1,
+        "rps": 51718,
+        "cpu_cores": 1.0,
+        "kernel_share": 0.88
+      },
+      {
+        "rings": 2,
+        "rps": 71907,
+        "cpu_cores": 1.99,
+        "kernel_share": 0.88
+      },
+      {
+        "rings": 4,
+        "rps": 138144,
+        "cpu_cores": 3.98,
+        "kernel_share": 0.88
+      },
+      {
+        "rings": 8,
+        "rps": 189379,
+        "cpu_cores": 5.71,
+        "kernel_share": 0.89
+      }
+    ]
+  },
+  "loopback_vs_network": {
+    "_comment": "Same worker, 32 connections, depth 16, 20 s after 6 s warmup. Directly comparable to each other.",
+    "connections": 32,
+    "depth": 16,
+    "rows": [
+      {
+        "path": "loopback",
+        "rps": 167278,
+        "gbps": 87.7,
+        "p50_us": 4617.0,
+        "p99_us": 35244.2
+      },
+      {
+        "path": "cross-node",
+        "rps": 44662,
+        "gbps": 23.4,
+        "p50_us": 20269.2,
+        "p99_us": 49904.7
+      }
+    ],
+    "nic_line_rate_gbps": 25.0
+  },
+  "cpu_split_loopback": {
+    "_comment": "Sampled from utime/stime in /proc/<pid>/stat across the measured window, 32 connections.",
+    "kernel_ticks": 12873,
+    "user_ticks": 2206
+  },
+  "pipelining_cross_node": {
+    "_comment": "Cross-node, 32 connections. Depth is requests in flight per connection.",
+    "rows": [
+      {
+        "depth": 1,
+        "rps": 22315,
+        "p50_us": 762.1
+      },
+      {
+        "depth": 16,
+        "rps": 44592,
+        "p50_us": 20249.5
+      }
+    ]
+  }
+}

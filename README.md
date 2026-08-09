@@ -39,6 +39,8 @@ before the cache does. Both numbers are published together, because a change
 that moves the loopback figure and not the cross-node one has not made anything
 faster ([how this is measured](BENCHMARKS.md)).
 
+![Loopback vs cross-node throughput against the 25 GbE line rate](docs/assets/bench/throughput-ceilings.svg)
+
 Read it through a FUSE mount:
 
 ```sh
