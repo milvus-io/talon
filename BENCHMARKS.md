@@ -148,10 +148,14 @@ Tuning the ring count and connection count raises the peak further, on the same
 out of cores, because a single pipelined ring already spends 88% of its time in
 the kernel and additional rings contend for one shared network stack.
 
+![Throughput and CPU used across 1, 2, 4 and 8 io_uring rings](docs/assets/bench/ring-scaling.svg)
+
 CPU was sampled from `utime`/`stime` in `/proc/<pid>/stat` across the measured
 window. The split is the finding: **six sevenths of the worker's CPU is spent
 inside the kernel** — `sendfile` copying bytes and the TCP stack — and only one
 seventh in Talon's own code (frame decode, cache lookup, response assembly).
+
+![Worker CPU split: 85% kernel time, 15% Talon's own code](docs/assets/bench/cpu-split.svg)
 
 The practical consequence is that user-space optimizations on this path have a
 small denominator. Halving *all* of Talon's user-space work on the serve path
@@ -172,6 +176,8 @@ Cross-node throughput is **27% of the loopback rate at the same 32 connections**
 (24% of the 189,379 rps peak reached at 64 connections), and 23.4 Gbps against a
 25 GbE link is the wire, saturated. On this cluster the NIC runs out well before
 the worker does — the worker is not the constraint at all.
+
+![Loopback vs cross-node throughput against the 25 GbE line rate](docs/assets/bench/throughput-ceilings.svg)
 
 **Read the loopback number as a component ceiling, not a capacity claim.** It
 measures how fast the serve path can go when the network is free. Any change
@@ -240,13 +246,38 @@ which is the condition to test before revisiting it. It does not pay here.
   be compared against numbers here. When a candidate and its baseline both sit
   at a suspiciously equal ceiling, suspect the harness.
 
+## Charts
+
+The figures above are generated, not hand-drawn. `bench/data/dataplane.json`
+holds the measurements and is the single source of truth for both the charts and
+the tables on this page; `scripts/bench_charts.py` renders it to SVG:
+
+```sh
+just bench-charts           # re-render docs/assets/bench/*.svg
+just bench-charts --check   # non-zero exit if a chart is stale
+```
+
+Dependencies are declared inline (PEP 723), so `uv` builds a throwaway
+environment on demand — there is nothing to install and matplotlib is not a
+project dependency.
+
+**To record a new measurement, edit the JSON and re-run — never edit an SVG.**
+Keeping one source means a re-measurement cannot leave the charts saying one
+thing and the prose another. Output is byte-reproducible (fixed `svg.hashsalt`,
+no render timestamp), so an unchanged run produces no diff and `--check` is
+meaningful. `--check` renders to a scratch directory rather than the committed
+paths, so it reports drift instead of silently repairing it.
+
 ## For coding agents
 
-- One command surface: `just bench`, `just bench-save`, `just bench-check`.
+- One command surface: `just bench`, `just bench-save`, `just bench-check`,
+  `just bench-charts`.
 - `bench-check` output is a markdown table and its exit code is the verdict
   (0 = within threshold, 1 = regression). Parse either.
 - `bench/results/latest.json` and `bench/baselines/<name>.json` are stable
   `{ "binary::name[/arg]": median_ns }` maps for programmatic diffing.
+- `bench/data/dataplane.json` is the structured record of the data-plane
+  measurements — read numbers from there rather than parsing prose or SVGs.
 - Prefer scoping with `-p <crate>` while iterating; run the full suite before
   saving a baseline.
 
