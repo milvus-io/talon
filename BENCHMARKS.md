@@ -133,6 +133,21 @@ Client and worker on the same node, over `127.0.0.1`:
 | **kernel time** | **85% of worker CPU** (12,873 of 15,079 ticks) |
 | user time | 15% (2,206 ticks) |
 
+Tuning the ring count and connection count raises the peak further, on the same
+8-core host, at depth 16 with 64 connections:
+
+| rings | throughput | GB/s | worker CPU | kernel share |
+|---|---|---|---|---|
+| 1 | 51,718 rps | 3.39 | 1.00 | 88% |
+| 2 | 71,907 rps | 4.71 | 1.99 | 88% |
+| 4 | 138,144 rps | 9.05 | 3.98 | 88% |
+| **8** | **189,379 rps** | **12.41** | 5.71 | 89% |
+
+189,379 rps reproduced within 1% across runs (187,553 on a repeat). Note that the
+8-ring peak uses 5.71 of 8 cores: the system stops being CPU-bound before it runs
+out of cores, because a single pipelined ring already spends 88% of its time in
+the kernel and additional rings contend for one shared network stack.
+
 CPU was sampled from `utime`/`stime` in `/proc/<pid>/stat` across the measured
 window. The split is the finding: **six sevenths of the worker's CPU is spent
 inside the kernel** — `sendfile` copying bytes and the TCP stack — and only one

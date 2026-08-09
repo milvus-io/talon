@@ -30,26 +30,27 @@ than by how much data you keep.
 Reads never copy: `sendfile` from NVMe to socket, `splice` from socket to NVMe
 on fill, driven by io_uring. At 1024 concurrent connections that measures **26%
 more throughput and 17× lower p50 latency — on comparable CPU and 19% less
-memory** — than the same server on Tokio. Per-core throughput stays flat from 1
-to 16 rings, so 8 cores serve **108K rps** and adding cores adds throughput
-with nothing to tune
+memory** — than the same server on Tokio
 ([measurements](docs/explanation/data-plane-runtime.md)).
 
-**Fast enough that the network gives out first.** With requests pipelined on
-each connection, 8 cores serve **11.0 GB/s** of 64 KiB reads over loopback (the
-108K rps above is the same host without pipelining), and **85% of that CPU is
-kernel time** — `sendfile` and the TCP stack — with only 15% left in Talon's own
-code. Point a client on another node at the same worker and it delivers
-**2.93 GB/s: 23.4 Gbps against a 25 GbE link**, which is the wire, saturated.
-The cache is not the bottleneck on a real cluster; the NIC is.
+**8 cores serve 189K rps — 12.4 GB/s of 64 KiB reads.** With requests pipelined
+per connection, one io_uring ring already does 51.7K rps on a single core, and
+eight rings reach **189,379 rps** while still leaving 2 of 8 cores idle. At that
+point **89% of the worker's CPU is kernel time** — `sendfile` and the TCP stack —
+and only 11% is Talon's own code, which is about the most a userspace cache can
+get out of the way.
 
-We publish that ratio because it is the honest way to read a cache benchmark:
-loopback measures a component ceiling with the network taken out of the way, and
-**a change that moves the loopback number but not the cross-node number has not
-made the deployed system faster.** The same page records what that discipline
-rejected — response multiplexing was built, measured at −3.9% with unchanged
-kernel time, and dropped
-([full tables and method](BENCHMARKS.md)).
+**And that is fast enough that the network gives out first.** Point a client on
+another node at the same worker and it delivers **2.93 GB/s: 23.4 Gbps against a
+25 GbE link**, which is the wire, saturated — 24% of what the worker can do
+locally. On a real cluster the cache is not the bottleneck; the NIC is.
+
+We publish both numbers because the pair is what a cache benchmark actually
+means: loopback measures a component ceiling with the network taken out of the
+way, and **a change that moves the loopback number but not the cross-node number
+has not made the deployed system faster.** Held to that standard, response
+multiplexing was built, measured at −3.9% with unchanged kernel time, and
+dropped ([full tables and method](BENCHMARKS.md)).
 
 Read it through a FUSE mount, or use the [Python](docs/clients/python.md) /
 [Java](docs/clients/java.md) SDKs when a mount isn't the right fit.
