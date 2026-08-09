@@ -129,7 +129,8 @@ Start with the section that matches what you're doing:
 - **Understanding Talon** — [DESIGN.md](DESIGN.md) (v1 architecture and the
   decisions behind it) and the [architecture decision records](docs/adr/).
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md) (build, test, submit
-  changes) and [BENCHMARKS.md](BENCHMARKS.md) (the microbenchmark harness).
+  changes) and [BENCHMARKS.md](BENCHMARKS.md) (the benchmark harness, plus the
+  measured throughput ceilings on loopback and across the network).
 
 ## Contributing
 

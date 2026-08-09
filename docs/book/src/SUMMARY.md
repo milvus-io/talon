@@ -54,4 +54,4 @@
 # Contributing
 
 - [Contributing guide](./contributing/contributing.md)
-- [Benchmarks](./contributing/benchmarks.md)
+- [Benchmarks and measured ceilings](./contributing/benchmarks.md)
