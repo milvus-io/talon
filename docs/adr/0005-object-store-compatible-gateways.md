@@ -62,16 +62,21 @@ Every request passes through these stages:
 1. parse the protocol request without normalizing away signed path/query bytes;
 2. authenticate the client and authorize the operation and namespace;
 3. map the protocol target to a canonical `ObjectId`;
-4. validate the signed `x-talon-cache-mark` and derive an internal route;
+4. validate the provider-specific signed cache mark and derive an internal
+   route;
 5. resolve origin metadata when the route requires a version or exact length;
 6. stream from Talon workers or the origin according to that route;
 7. translate the result into protocol-specific headers/errors and record
    bounded-cardinality metrics.
 
-The raw cache-mark header is never forwarded to workers or the origin. The
-default in its absence follows #441: lookup on, population on, and bounded
-origin fallback. Production mode rejects a cache mark that is not covered by
-the client signature.
+The raw cache-mark header is never forwarded to workers or the origin. S3 uses
+`x-talon-cache-mark`, which must appear in SigV4 `SignedHeaders`. Azure uses
+`x-ms-talon-cache-mark`, because Azure Shared Key canonicalizes `x-ms-*`
+headers but cannot cover an arbitrary extension header. SAS-authenticated
+requests fail closed when they carry a mark because Azure SAS does not bind
+custom headers. The default in a mark's absence follows #441: lookup on,
+population on, and bounded origin fallback. Production mode rejects a cache
+mark that is not covered by the client signature.
 
 ### 3. Keep protocol compatibility in adapters
 
