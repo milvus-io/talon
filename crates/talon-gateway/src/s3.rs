@@ -10,13 +10,16 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use talon_backend::{HttpResponse, HttpStreamResponse, S3Backend};
+use sha2::{Digest, Sha256};
+use talon_backend::{HttpRequestBody, HttpResponse, HttpStreamResponse, S3Backend};
 use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER_CHUNK_BYTES};
 use talon_core::{Backend, ObjectId, Version};
+use tokio::io::AsyncWriteExt;
 
 use crate::{
-    FailureReason, GatewayAccess, GatewayAdapter, GatewayOperation, GatewayOutcome,
-    GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
+    FailureReason, GatewayAccess, GatewayAccessRequirement, GatewayAdapter, GatewayOperation,
+    GatewayOutcome, GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget,
+    ProviderProtocol,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
@@ -94,6 +97,11 @@ impl S3AdapterConfig {
 pub trait S3Cache: Send + Sync + 'static {
     /// Stream one exact object range from Talon.
     fn stream(&self, request: S3CacheRequest<'_>) -> Result<CacheStream, CacheReadError>;
+
+    /// Drop local placement knowledge after an origin mutation commits.
+    fn invalidate_object(&self, _object: &ObjectId) -> usize {
+        0
+    }
 }
 
 impl S3Cache for BlockReader {
@@ -112,6 +120,10 @@ impl S3Cache for BlockReader {
             request.now_ms,
         )
         .map(|stream| Box::pin(stream) as CacheStream)
+    }
+
+    fn invalidate_object(&self, object: &ObjectId) -> usize {
+        BlockReader::invalidate_object(self, object)
     }
 }
 
@@ -140,6 +152,44 @@ pub trait S3Origin: Send + Sync + 'static {
         max_keys: u32,
         encoding_type: Option<&str>,
     ) -> Result<HttpResponse, String>;
+
+    async fn put_body(
+        &self,
+        _object: &ObjectId,
+        _headers: &[(String, String)],
+        _body: HttpRequestBody,
+        _len: u64,
+        _payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement PUT".into())
+    }
+
+    async fn put_file(
+        &self,
+        _object: &ObjectId,
+        _headers: &[(String, String)],
+        _path: &std::path::Path,
+        _len: u64,
+        _payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement file PUT".into())
+    }
+
+    async fn copy(
+        &self,
+        _object: &ObjectId,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement CopyObject".into())
+    }
+
+    async fn delete(
+        &self,
+        _object: &ObjectId,
+        _conditions: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement DELETE".into())
+    }
 }
 
 #[async_trait]
@@ -179,6 +229,46 @@ impl S3Origin for S3Backend {
             encoding_type,
         )
         .await
+    }
+
+    async fn put_body(
+        &self,
+        object: &ObjectId,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+        payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        self.execute_put_body_raw(object, headers, body, len, payload_hash)
+            .await
+    }
+
+    async fn put_file(
+        &self,
+        object: &ObjectId,
+        headers: &[(String, String)],
+        path: &std::path::Path,
+        len: u64,
+        payload_hash: &str,
+    ) -> Result<HttpResponse, String> {
+        self.execute_put_file_raw(object, headers, path, len, payload_hash)
+            .await
+    }
+
+    async fn copy(
+        &self,
+        object: &ObjectId,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_copy_raw(object, headers).await
+    }
+
+    async fn delete(
+        &self,
+        object: &ObjectId,
+        conditions: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_delete_raw(object, conditions).await
     }
 }
 
@@ -287,6 +377,7 @@ struct S3Query {
     continuation_token: Option<String>,
     max_keys: Option<String>,
     encoding_type: Option<String>,
+    multipart: bool,
 }
 
 impl S3Query {
@@ -301,6 +392,7 @@ impl S3Query {
                 "continuation-token" => parsed.continuation_token = Some(value.into_owned()),
                 "max-keys" => parsed.max_keys = Some(value.into_owned()),
                 "encoding-type" => parsed.encoding_type = Some(value.into_owned()),
+                "uploads" | "uploadId" | "partNumber" => parsed.multipart = true,
                 _ => {}
             }
         }
@@ -334,6 +426,114 @@ impl S3Query {
                 }),
         }
     }
+}
+
+fn single_content_length(headers: &HeaderMap) -> Result<u64, S3RequestError> {
+    let values = headers.get_all(header::CONTENT_LENGTH);
+    let mut values = values.iter();
+    let value = values.next().ok_or_else(|| {
+        S3RequestError::invalid("MissingContentLength", "Content-Length is required")
+    })?;
+    if values.next().is_some() {
+        return Err(S3RequestError::invalid(
+            "InvalidArgument",
+            "Content-Length must occur exactly once",
+        ));
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| S3RequestError::invalid("InvalidArgument", "Content-Length is invalid"))
+}
+
+fn payload_declaration(request: &Request) -> Result<String, S3RequestError> {
+    if let Some(value) = request.headers().get("x-amz-content-sha256") {
+        return value
+            .to_str()
+            .map(str::to_string)
+            .map_err(|_| S3RequestError::invalid("InvalidArgument", "payload hash is invalid"));
+    }
+    for (name, value) in
+        url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+    {
+        if name.eq_ignore_ascii_case("X-Amz-Content-Sha256") {
+            return Ok(value.into_owned());
+        }
+    }
+    Ok("UNSIGNED-PAYLOAD".into())
+}
+
+fn mutation_headers(
+    headers: &HeaderMap,
+    copy: bool,
+) -> Result<Vec<(String, String)>, S3RequestError> {
+    const EXACT: [&str; 18] = [
+        "cache-control",
+        "content-disposition",
+        "content-encoding",
+        "content-language",
+        "content-md5",
+        "content-type",
+        "expires",
+        "if-match",
+        "if-none-match",
+        "x-amz-acl",
+        "x-amz-checksum-algorithm",
+        "x-amz-copy-source",
+        "x-amz-metadata-directive",
+        "x-amz-storage-class",
+        "x-amz-tagging",
+        "x-amz-tagging-directive",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-aws-kms-key-id",
+    ];
+    let mut output = Vec::new();
+    for (name, value) in headers {
+        let name = name.as_str().to_ascii_lowercase();
+        let allowed = EXACT.contains(&name.as_str())
+            || name.starts_with("x-amz-meta-")
+            || name.starts_with("x-amz-checksum-")
+            || (copy && name.starts_with("x-amz-copy-source-if-"));
+        if !allowed || (!copy && name.starts_with("x-amz-copy-")) {
+            continue;
+        }
+        if output
+            .iter()
+            .any(|(existing, _): &(String, String)| existing == &name)
+        {
+            return Err(S3RequestError::invalid(
+                "InvalidArgument",
+                format!("{name} must occur exactly once"),
+            ));
+        }
+        let value = value.to_str().map_err(|_| {
+            S3RequestError::invalid("InvalidArgument", format!("{name} is invalid"))
+        })?;
+        output.push((name, value.to_string()));
+    }
+    Ok(output)
+}
+
+fn copy_source(headers: &HeaderMap) -> Result<Option<ObjectId>, S3RequestError> {
+    let Some(value) = headers.get("x-amz-copy-source") else {
+        return Ok(None);
+    };
+    let value = value
+        .to_str()
+        .map_err(|_| S3RequestError::invalid("InvalidArgument", "copy source is invalid"))?;
+    if value.contains('?') {
+        return Err(S3RequestError::invalid(
+            "NotImplemented",
+            "versioned CopyObject is not supported",
+        ));
+    }
+    let decoded = decode_path(value.trim_start_matches('/'))?;
+    let (bucket, key) = decoded
+        .split_once('/')
+        .filter(|(bucket, key)| !bucket.is_empty() && !key.is_empty())
+        .ok_or_else(|| S3RequestError::invalid("InvalidArgument", "copy source is invalid"))?;
+    Ok(Some(ObjectId::new(Backend::S3, bucket, key)))
 }
 
 fn conditional_headers(headers: &HeaderMap) -> Result<Vec<(String, String)>, S3RequestError> {
@@ -539,6 +739,16 @@ fn raw_response(
     }
 }
 
+fn copy_response_failed(response: &HttpResponse) -> bool {
+    if !response.is_success() {
+        return true;
+    }
+    std::str::from_utf8(&response.body)
+        .ok()
+        .and_then(|xml| talon_backend::xml::element(xml, "Error"))
+        .is_some()
+}
+
 async fn raw_streaming_response(
     mut origin: HttpStreamResponse,
     operation: GatewayOperation,
@@ -659,6 +869,7 @@ struct S3RequestError {
     message: String,
     failure: FailureReason,
     content_range: Option<String>,
+    indeterminate_commit: bool,
 }
 
 impl S3RequestError {
@@ -669,6 +880,7 @@ impl S3RequestError {
             message: message.into(),
             failure: FailureReason::InvalidRequest,
             content_range: None,
+            indeterminate_commit: false,
         }
     }
 
@@ -679,6 +891,7 @@ impl S3RequestError {
             message: "The requested range is not satisfiable".into(),
             failure: FailureReason::InvalidRequest,
             content_range: Some(format!("bytes */{size}")),
+            indeterminate_commit: false,
         }
     }
 
@@ -689,6 +902,7 @@ impl S3RequestError {
             message: "The specified key does not exist".into(),
             failure: FailureReason::NotFound,
             content_range: None,
+            indeterminate_commit: false,
         }
     }
 
@@ -699,6 +913,7 @@ impl S3RequestError {
             message: "At least one precondition failed".into(),
             failure: FailureReason::Precondition,
             content_range: None,
+            indeterminate_commit: false,
         }
     }
 
@@ -710,6 +925,19 @@ impl S3RequestError {
             message: "Please reduce your request rate".into(),
             failure: FailureReason::Origin,
             content_range: None,
+            indeterminate_commit: false,
+        }
+    }
+
+    fn indeterminate_commit() -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "InternalError",
+            message: "The mutation result is indeterminate; inspect the object before retrying"
+                .into(),
+            failure: FailureReason::Origin,
+            content_range: None,
+            indeterminate_commit: true,
         }
     }
 
@@ -720,6 +948,7 @@ impl S3RequestError {
             message: message.into(),
             failure: FailureReason::Internal,
             content_range: None,
+            indeterminate_commit: false,
         }
     }
 }
@@ -733,6 +962,7 @@ fn cache_error(error: CacheReadError) -> S3RequestError {
             message,
             failure: FailureReason::NotFound,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::VersionMismatch(message) => S3RequestError {
             status: StatusCode::PRECONDITION_FAILED,
@@ -740,6 +970,7 @@ fn cache_error(error: CacheReadError) -> S3RequestError {
             message,
             failure: FailureReason::Precondition,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::Timeout(message) => S3RequestError {
             status: StatusCode::GATEWAY_TIMEOUT,
@@ -747,6 +978,7 @@ fn cache_error(error: CacheReadError) -> S3RequestError {
             message,
             failure: FailureReason::Timeout,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::Unavailable(message) => S3RequestError {
             status: StatusCode::SERVICE_UNAVAILABLE,
@@ -754,6 +986,7 @@ fn cache_error(error: CacheReadError) -> S3RequestError {
             message,
             failure: FailureReason::CacheUnavailable,
             content_range: None,
+            indeterminate_commit: false,
         },
         CacheReadError::Origin(message) => S3RequestError::origin_unavailable(message),
         CacheReadError::Protocol(message)
@@ -779,6 +1012,12 @@ fn error_response(error: S3RequestError, request_id: &str) -> GatewayResponse {
         if let Ok(value) = HeaderValue::from_str(&content_range) {
             response.headers_mut().insert(header::CONTENT_RANGE, value);
         }
+    }
+    if error.indeterminate_commit {
+        response.headers_mut().insert(
+            "x-talon-commit-state",
+            HeaderValue::from_static("indeterminate"),
+        );
     }
     stamp_gateway_headers(response.headers_mut(), request_id);
     GatewayResponse {
@@ -810,6 +1049,51 @@ fn unix_millis() -> u64 {
         .as_millis()
         .try_into()
         .unwrap_or(u64::MAX)
+}
+
+async fn spool_and_hash<S>(
+    mut body: S,
+    expected_len: u64,
+) -> Result<(tempfile::NamedTempFile, String), S3RequestError>
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
+    let spool = tempfile::NamedTempFile::new()
+        .map_err(|_| S3RequestError::internal("could not create upload spool"))?;
+    let file = spool
+        .reopen()
+        .map_err(|_| S3RequestError::internal("could not open upload spool"))?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut hasher = Sha256::new();
+    let mut received = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| {
+            S3RequestError::invalid("IncompleteBody", "The request body could not be read")
+        })?;
+        received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+            S3RequestError::invalid("InvalidArgument", "request body is too large")
+        })?;
+        if received > expected_len {
+            return Err(S3RequestError::invalid(
+                "InvalidArgument",
+                "request body exceeds Content-Length",
+            ));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| S3RequestError::internal("could not spool upload body"))?;
+    }
+    if received != expected_len {
+        return Err(S3RequestError::invalid(
+            "IncompleteBody",
+            "request body is shorter than Content-Length",
+        ));
+    }
+    file.flush()
+        .await
+        .map_err(|_| S3RequestError::internal("could not flush upload spool"))?;
+    Ok((spool, format!("{:x}", hasher.finalize())))
 }
 
 #[async_trait]
@@ -849,6 +1133,7 @@ impl S3Adapter {
                     namespace: target.bucket,
                     prefix: query.prefix,
                 },
+                additional: Vec::new(),
             });
         }
         let key = target
@@ -861,11 +1146,22 @@ impl S3Adapter {
             axum::http::Method::DELETE => GatewayOperation::Delete,
             _ => GatewayOperation::Unsupported,
         };
-        Ok(GatewayAccess {
+        let mut access = GatewayAccess {
             operation,
             provider_account: None,
             target: GatewayTarget::Object(ObjectId::new(Backend::S3, target.bucket, key)),
-        })
+            additional: Vec::new(),
+        };
+        if request.method() == axum::http::Method::PUT {
+            if let Some(source) = copy_source(request.headers())? {
+                access.additional.push(GatewayAccessRequirement {
+                    operation: GatewayOperation::Read,
+                    provider_account: None,
+                    target: GatewayTarget::Object(source),
+                });
+            }
+        }
+        Ok(access)
     }
 
     async fn handle_request(
@@ -883,17 +1179,126 @@ impl S3Adapter {
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
         let object = ObjectId::new(Backend::S3, target.bucket, key);
+        if query.multipart {
+            return Err(S3RequestError {
+                status: StatusCode::NOT_IMPLEMENTED,
+                code: "NotImplemented",
+                message: "Multipart upload operations are not supported by this endpoint".into(),
+                failure: FailureReason::Unsupported,
+                content_range: None,
+                indeterminate_commit: false,
+            });
+        }
         match *request.method() {
             axum::http::Method::HEAD => self.head(object, request.headers(), context).await,
             axum::http::Method::GET => self.get(object, request.headers(), context).await,
+            axum::http::Method::PUT => self.put(object, request, context).await,
+            axum::http::Method::DELETE => self.delete(object, request.headers(), context).await,
             _ => Err(S3RequestError {
                 status: StatusCode::METHOD_NOT_ALLOWED,
                 code: "MethodNotAllowed",
                 message: "The specified method is not allowed".into(),
                 failure: FailureReason::Unsupported,
                 content_range: None,
+                indeterminate_commit: false,
             }),
         }
+    }
+
+    async fn put(
+        &self,
+        object: ObjectId,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        if copy_source(request.headers())?.is_some() {
+            return self.copy(object, request.headers(), context).await;
+        }
+        let len = single_content_length(request.headers())?;
+        let payload_hash = payload_declaration(&request)?;
+        let headers = mutation_headers(request.headers(), false)?;
+        let body = request.into_body().into_data_stream();
+        let response = if payload_hash == "UNSIGNED-PAYLOAD" {
+            let body = body.map(|chunk| chunk.map_err(|error| error.to_string()));
+            self.origin
+                .put_body(&object, &headers, Box::pin(body), len, &payload_hash)
+                .await
+        } else {
+            let (spool, actual_hash) = spool_and_hash(body, len).await?;
+            if actual_hash != payload_hash {
+                return Err(S3RequestError::invalid(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided payload hash does not match the request body",
+                ));
+            }
+            self.origin
+                .put_file(&object, &headers, spool.path(), len, &actual_hash)
+                .await
+        }
+        .map_err(|_| S3RequestError::indeterminate_commit())?;
+        if response.is_success() {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        let mut response = raw_response(
+            response,
+            GatewayOperation::Write,
+            Some(GatewayTarget::Object(object)),
+            context,
+        );
+        response.requested_bytes = len;
+        Ok(response)
+    }
+
+    async fn copy(
+        &self,
+        object: ObjectId,
+        headers: &HeaderMap,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let headers = mutation_headers(headers, true)?;
+        let response = self
+            .origin
+            .copy(&object, &headers)
+            .await
+            .map_err(|_| S3RequestError::indeterminate_commit())?;
+        let failed = copy_response_failed(&response);
+        if !failed {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        let mut response = raw_response(
+            response,
+            GatewayOperation::Write,
+            Some(GatewayTarget::Object(object)),
+            context,
+        );
+        if failed && response.response.status().is_success() {
+            response.outcome = GatewayOutcome::Failed;
+            response.failure = Some(FailureReason::Origin);
+        }
+        Ok(response)
+    }
+
+    async fn delete(
+        &self,
+        object: ObjectId,
+        headers: &HeaderMap,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let conditions = conditional_headers(headers)?;
+        let response = self
+            .origin
+            .delete(&object, &conditions)
+            .await
+            .map_err(|_| S3RequestError::indeterminate_commit())?;
+        if response.is_success() || response.status == 404 {
+            let _ = self.cache.invalidate_object(&object);
+        }
+        Ok(raw_response(
+            response,
+            GatewayOperation::Delete,
+            Some(GatewayTarget::Object(object)),
+            context,
+        ))
     }
 
     async fn head(
@@ -1212,6 +1617,175 @@ mod tests {
 
     struct MockOrigin {
         lists: Mutex<Vec<ListRequest>>,
+    }
+
+    struct MutationCache {
+        invalidations: AtomicUsize,
+    }
+
+    impl S3Cache for MutationCache {
+        fn stream(&self, _request: S3CacheRequest<'_>) -> Result<CacheStream, CacheReadError> {
+            unreachable!("mutation tests do not read")
+        }
+
+        fn invalidate_object(&self, _object: &ObjectId) -> usize {
+            self.invalidations.fetch_add(1, Ordering::SeqCst);
+            1
+        }
+    }
+
+    struct MutationOrigin {
+        response: Mutex<Result<HttpResponse, String>>,
+        calls: AtomicUsize,
+        body: Mutex<Vec<u8>>,
+        headers: Mutex<Vec<(String, String)>>,
+    }
+
+    struct StallingMutationOrigin;
+
+    #[async_trait]
+    impl S3Origin for StallingMutationOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            unreachable!("mutation test does not stat")
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("mutation test does not read")
+        }
+
+        async fn list(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _continuation_token: Option<&str>,
+            _max_keys: u32,
+            _encoding_type: Option<&str>,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("mutation test does not list")
+        }
+
+        async fn put_body(
+            &self,
+            _object: &ObjectId,
+            _headers: &[(String, String)],
+            mut body: HttpRequestBody,
+            _len: u64,
+            _payload_hash: &str,
+        ) -> Result<HttpResponse, String> {
+            let _ = body.next().await;
+            futures::future::pending().await
+        }
+    }
+
+    impl MutationOrigin {
+        fn new(response: Result<HttpResponse, String>) -> Arc<Self> {
+            Arc::new(Self {
+                response: Mutex::new(response),
+                calls: AtomicUsize::new(0),
+                body: Mutex::new(Vec::new()),
+                headers: Mutex::new(Vec::new()),
+            })
+        }
+
+        fn response(&self) -> Result<HttpResponse, String> {
+            self.response.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl S3Origin for MutationOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            unreachable!("mutation tests do not stat")
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("mutation tests do not read")
+        }
+
+        async fn list(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _continuation_token: Option<&str>,
+            _max_keys: u32,
+            _encoding_type: Option<&str>,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("mutation tests do not list")
+        }
+
+        async fn put_body(
+            &self,
+            _object: &ObjectId,
+            headers: &[(String, String)],
+            mut body: HttpRequestBody,
+            _len: u64,
+            _payload_hash: &str,
+        ) -> Result<HttpResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.headers.lock().unwrap() = headers.to_vec();
+            while let Some(chunk) = body.next().await {
+                self.body.lock().unwrap().extend_from_slice(&chunk?);
+            }
+            self.response()
+        }
+
+        async fn put_file(
+            &self,
+            _object: &ObjectId,
+            headers: &[(String, String)],
+            path: &std::path::Path,
+            _len: u64,
+            _payload_hash: &str,
+        ) -> Result<HttpResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.headers.lock().unwrap() = headers.to_vec();
+            *self.body.lock().unwrap() = tokio::fs::read(path).await.map_err(|e| e.to_string())?;
+            self.response()
+        }
+
+        async fn copy(
+            &self,
+            _object: &ObjectId,
+            headers: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.headers.lock().unwrap() = headers.to_vec();
+            self.response()
+        }
+
+        async fn delete(
+            &self,
+            _object: &ObjectId,
+            conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.headers.lock().unwrap() = conditions.to_vec();
+            self.response()
+        }
+    }
+
+    fn mutation_adapter(cache: Arc<MutationCache>, origin: Arc<MutationOrigin>) -> S3Adapter {
+        S3Adapter::new(S3AdapterConfig::path_style("localhost"), cache, origin).unwrap()
     }
 
     impl MockOrigin {
@@ -1551,5 +2125,206 @@ mod tests {
         assert!(body
             .windows(b"<Code>InvalidRange</Code>".len())
             .any(|window| window == b"<Code>InvalidRange</Code>"));
+    }
+
+    #[test]
+    fn copy_access_requires_source_read_and_destination_write() {
+        let mut copy = request(axum::http::Method::PUT, "/destination/copied");
+        copy.headers_mut().insert(
+            "x-amz-copy-source",
+            HeaderValue::from_static("/source/original"),
+        );
+        let access = adapter(
+            MockCache {
+                response: Ok(Vec::new()),
+            },
+            MockOrigin::new(),
+        )
+        .classify_access(&copy)
+        .unwrap();
+        assert_eq!(access.operation, GatewayOperation::Write);
+        assert_eq!(access.additional.len(), 1);
+        assert_eq!(access.additional[0].operation, GatewayOperation::Read);
+        assert_eq!(
+            access.additional[0].target,
+            GatewayTarget::Object(ObjectId::new(Backend::S3, "source", "original"))
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_put_rejects_tampering_before_origin_dispatch() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, "3")
+            .header(
+                "x-amz-content-sha256",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )
+            .body(Body::from("abc"))
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin))
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unsigned_put_streams_sanitized_headers_and_invalidates_after_commit() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: vec![("etag".into(), "\"v2\"".into())],
+            body: Bytes::new(),
+        }));
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, "3")
+            .header("authorization", "incoming-secret")
+            .header("x-amz-date", "incoming-date")
+            .header("x-amz-security-token", "incoming-token")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-meta-owner", "team-a")
+            .body(Body::from("abc"))
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin))
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(origin.body.lock().unwrap().as_slice(), b"abc");
+        assert_eq!(
+            origin.headers.lock().unwrap().as_slice(),
+            &[("x-amz-meta-owner".into(), "team-a".into())]
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_or_indeterminate_put_never_invalidates_cache() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let rejected = MutationOrigin::new(Ok(HttpResponse {
+            status: 412,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let put = || {
+            Request::builder()
+                .method("PUT")
+                .uri("/bucket/key")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_LENGTH, "3")
+                .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+                .body(Body::from("abc"))
+                .unwrap()
+        };
+        let response = mutation_adapter(Arc::clone(&cache), rejected)
+            .handle(put(), context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::PRECONDITION_FAILED);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+
+        let unavailable = MutationOrigin::new(Err("response lost".into()));
+        let response = mutation_adapter(Arc::clone(&cache), unavailable)
+            .handle(put(), context())
+            .await;
+        assert_eq!(
+            response.response.status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            response.response.headers()["x-talon-commit-state"],
+            "indeterminate"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn embedded_copy_error_does_not_invalidate_destination() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/xml".into())],
+            body: Bytes::from_static(
+                b"<Error><Code>InternalError</Code><Message>copy failed</Message></Error>",
+            ),
+        }));
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/destination/copied")
+            .header(header::HOST, "localhost")
+            .header("x-amz-copy-source", "/source/original")
+            .body(Body::empty())
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), origin)
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(response.outcome, GatewayOutcome::Failed);
+        assert_eq!(response.failure, Some(FailureReason::Origin));
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_put_is_demand_driven_and_cancellation_drops_the_body() {
+        let polls = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let chunks = VecDeque::from([Bytes::from_static(b"abc"), Bytes::from_static(b"def")]);
+        let stream_polls = Arc::clone(&polls);
+        let guard = DropSignal(Arc::clone(&dropped));
+        let stream = futures::stream::unfold((chunks, guard), move |(mut chunks, guard)| {
+            let polls = Arc::clone(&stream_polls);
+            async move {
+                polls.fetch_add(1, Ordering::SeqCst);
+                chunks
+                    .pop_front()
+                    .map(|chunk| (Ok::<_, std::io::Error>(chunk), (chunks, guard)))
+            }
+        });
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, "6")
+            .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let adapter = S3Adapter::new(
+            S3AdapterConfig::path_style("localhost"),
+            Arc::new(MutationCache {
+                invalidations: AtomicUsize::new(0),
+            }),
+            Arc::new(StallingMutationOrigin),
+        )
+        .unwrap();
+        let task = tokio::spawn(async move { adapter.handle(request, context()).await });
+        for _ in 0..20 {
+            if polls.load(Ordering::SeqCst) > 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 1);
+        task.abort();
+        let _ = task.await;
+        assert!(dropped.load(Ordering::SeqCst));
     }
 }

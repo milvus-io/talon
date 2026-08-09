@@ -47,6 +47,10 @@ fn to_hex(bytes: &[u8]) -> String {
     s
 }
 
+fn normalize_header_value(value: &str) -> String {
+    value.split_ascii_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// RFC 3986 encode a path, preserving `/`. Unreserved chars pass through; all
 /// others are percent-encoded. S3 canonical URIs are single-encoded.
 fn uri_encode_path(path: &str) -> String {
@@ -243,11 +247,23 @@ pub fn sign_request_with_payload_hash(
     }
 
     // Canonical headers: the signed set, lowercased, sorted, trimmed values.
-    let mut signed: Vec<(String, String)> = vec![
+    let mut signed: Vec<(String, String)> = req
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            name.to_ascii_lowercase().starts_with("x-amz-")
+                && !matches!(
+                    name.to_ascii_lowercase().as_str(),
+                    "x-amz-date" | "x-amz-content-sha256" | "x-amz-security-token"
+                )
+        })
+        .map(|(name, value)| (name.to_ascii_lowercase(), normalize_header_value(value)))
+        .collect();
+    signed.extend([
         ("host".into(), host),
         ("x-amz-content-sha256".into(), payload_hash.to_string()),
         ("x-amz-date".into(), date.datetime.clone()),
-    ];
+    ]);
     if let Some(tok) = &creds.session_token {
         signed.push(("x-amz-security-token".into(), tok.clone()));
     }
@@ -259,7 +275,7 @@ pub fn sign_request_with_payload_hash(
         .join(";");
     let canonical_headers = signed
         .iter()
-        .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+        .map(|(k, v)| format!("{k}:{}\n", normalize_header_value(v)))
         .collect::<String>();
 
     let canonical_request = format!(

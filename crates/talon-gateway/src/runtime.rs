@@ -880,6 +880,7 @@ mod tests {
                     "bucket-a",
                     request.uri().path().trim_start_matches('/'),
                 )),
+                additional: Vec::new(),
             })
         }
 

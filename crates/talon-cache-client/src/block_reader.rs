@@ -142,6 +142,11 @@ impl BlockReader {
         self.coordinator.addr()
     }
 
+    /// Drop all local placement entries for an object after an origin mutation.
+    pub fn invalidate_object(&self, object: &ObjectId) -> usize {
+        self.cache.invalidate_object(object)
+    }
+
     /// The read-path counters this reader updates.
     pub fn stats(&self) -> &ReadStats {
         &self.stats

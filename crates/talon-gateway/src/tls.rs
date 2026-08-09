@@ -597,6 +597,7 @@ mod tests {
                     "bucket-a",
                     "tenant/object",
                 )),
+                additional: Vec::new(),
             })
         }
 

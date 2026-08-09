@@ -1,10 +1,10 @@
 # Object-store gateway deployment
 
-`talon-gateway` exposes the read-only compatibility surface documented in the
+`talon-gateway` exposes the compatibility surface documented in the
 [compatibility matrix](../reference/object-store-gateway-compatibility.md). One
 process serves either S3 or Azure Blob, connects to a Talon coordinator and
 worker fleet for cached bytes, and uses a separately scoped origin identity for
-metadata and fallback reads.
+metadata, fallback reads, and origin-authoritative mutations.
 
 ## Security state
 
@@ -37,9 +37,9 @@ with the process's origin identity.
 | Gateway to Azure | Exactly one of `TALON_GATEWAY_AZURE_SHARED_KEY` or `TALON_GATEWAY_AZURE_SAS` | Environment/secret injection only. |
 | Gateway to Talon | Coordinator and worker data-plane connection | Existing Talon cache-client boundary; mTLS integration is part of #446. |
 
-Use an origin identity limited to read metadata, object ranges, and bounded
-listing on the namespaces assigned to that gateway. Do not grant write or
-account administration permissions.
+Use an origin identity limited to the advertised read and mutation operations
+on namespaces assigned to that gateway. Do not grant bucket or account
+administration permissions.
 
 ## Configuration
 
@@ -146,7 +146,7 @@ intended:
       "provider_account": "tenant-a",
       "namespace": "datasets",
       "prefix": "published/",
-      "operations": ["stat", "read", "list"]
+      "operations": ["stat", "read", "list", "write", "delete"]
     }
   ]
 }
@@ -156,6 +156,15 @@ SigV4 verification enforces the configured region, `s3` service, host,
 canonical URI/query/headers, timestamp or presigned expiry, payload declaration,
 and STS token. A present `x-talon-cache-mark` must be signed and syntactically
 valid. Invalid requests fail before cache or origin dispatch.
+
+Ordinary S3 `PutObject`, `CopyObject`, and `DeleteObject` requests are sent to
+the origin exactly once. `PutObject` requires one valid `Content-Length` and is
+limited by the gateway's 16 MiB default body limit and 30 second default total
+deadline. `UNSIGNED-PAYLOAD` streams directly; a lowercase SHA-256 declaration
+is verified in a secure temporary file before the origin is mutated. AWS
+streaming chunk-signature modes and multipart uploads are not yet supported.
+Increase deployment limits only with corresponding disk, concurrency, and
+deadline capacity.
 
 Azure variables:
 
@@ -234,6 +243,7 @@ probe loopback with `exec` because kubelet HTTP probes target the Pod IP.
 | `503` with `ServerBusy` or `ServiceUnavailable` | Origin unavailable, or cache fallback also unavailable. | Check origin reachability and scoped credentials; correlate `x-talon-request-id`. |
 | `504` / timeout error | Worker or request deadline elapsed. | Check worker saturation, placement freshness, and network latency. |
 | `412` | Origin ETag changed or a client condition failed. | Re-resolve metadata; do not retry stale cached bytes. |
+| `500` with `x-talon-commit-state: indeterminate` | Mutation dispatch began but the origin response was lost. | Inspect the authoritative object before deciding whether to retry. |
 | `404` | Origin-authoritative object absence. | Verify namespace and key; cache does not override this result. |
 | `416` | Unsatisfiable or multi-range request. | Send one valid byte range. |
 | Cache errors increase while reads succeed | Infrastructure fallback is active. | Repair coordinator/workers before origin load becomes sustained. |

@@ -95,6 +95,9 @@ pub struct HttpStreamResponse {
     pub body: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>,
 }
 
+/// Single-use, demand-driven outgoing request body.
+pub type HttpRequestBody = Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>;
+
 impl HttpStreamResponse {
     /// Look up the first response header value (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&str> {
@@ -273,6 +276,20 @@ pub trait HttpClient: Send + Sync {
     ) -> Result<HttpResponse, String> {
         let _ = (req, path, len);
         Err("HTTP client does not support streamed file bodies".to_string())
+    }
+
+    /// Execute a request with a single-use streaming body.
+    ///
+    /// Implementations must not retry or eagerly collect `body`. Exactly `len`
+    /// bytes must be forwarded before the origin response is accepted.
+    async fn execute_body(
+        &self,
+        req: HttpRequest,
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        let _ = (req, body, len);
+        Err("HTTP client does not support streamed request bodies".to_string())
     }
 }
 

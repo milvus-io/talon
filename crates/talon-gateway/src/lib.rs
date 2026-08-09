@@ -25,8 +25,9 @@ pub use cache_mark::{
 pub use config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
 pub use metrics::GatewayMetrics;
 pub use model::{
-    FailureReason, GatewayAccess, GatewayAdapter, GatewayOperation, GatewayOutcome,
-    GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
+    FailureReason, GatewayAccess, GatewayAccessRequirement, GatewayAdapter, GatewayOperation,
+    GatewayOutcome, GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget,
+    ProviderProtocol,
 };
 pub use runtime::{
     gateway_router, serve, serve_tls, GatewayReadiness, GatewayRuntime, GatewayTlsServeError,

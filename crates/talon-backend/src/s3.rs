@@ -22,7 +22,9 @@ use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
 };
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Method};
+use crate::http::{
+    HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
+};
 
 /// Percent-encode a query value.
 ///
@@ -351,6 +353,60 @@ impl S3Backend {
         self.http.execute(self.signed(request)).await
     }
 
+    /// Execute a single-use streaming PUT. The payload declaration is signed
+    /// by the scoped origin credential and the body is never retried here.
+    pub async fn execute_put_body_raw(
+        &self,
+        obj: &ObjectId,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+        payload_hash: &str,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_streamed_put(obj, len, None);
+        request.headers.extend_from_slice(headers);
+        let request = self.signed_with_payload_hash(request, payload_hash);
+        self.http.execute_body(request, body, len).await
+    }
+
+    /// Execute a PUT from a verified spool file without buffering it in memory.
+    pub async fn execute_put_file_raw(
+        &self,
+        obj: &ObjectId,
+        headers: &[(String, String)],
+        path: &Path,
+        len: u64,
+        payload_hash: &str,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_streamed_put(obj, len, None);
+        request.headers.extend_from_slice(headers);
+        let request = self.signed_with_payload_hash(request, payload_hash);
+        self.http.execute_file(request, path, len).await
+    }
+
+    /// Execute CopyObject. `headers` contains only adapter-validated copy and
+    /// metadata headers; incoming client credentials are never accepted here.
+    pub async fn execute_copy_raw(
+        &self,
+        obj: &ObjectId,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_streamed_put(obj, 0, None);
+        request.headers.extend_from_slice(headers);
+        self.http.execute(self.signed(request)).await
+    }
+
+    /// Execute an idempotent raw object DELETE with validated conditions.
+    pub async fn execute_delete_raw(
+        &self,
+        obj: &ObjectId,
+        conditions: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = self.build_delete(obj);
+        request.headers.extend_from_slice(conditions);
+        self.http.execute(self.signed(request)).await
+    }
+
     fn build_streamed_put(
         &self,
         obj: &ObjectId,
@@ -622,6 +678,7 @@ mod tests {
     struct MockHttp {
         last: Mutex<Option<HttpRequest>>,
         last_file: Mutex<Option<(HttpRequest, PathBuf, u64)>>,
+        last_body: Mutex<Option<(HttpRequest, Vec<u8>, u64)>>,
         response: HttpResponse,
     }
 
@@ -630,6 +687,7 @@ mod tests {
             Arc::new(Self {
                 last: Mutex::new(None),
                 last_file: Mutex::new(None),
+                last_body: Mutex::new(None),
                 response,
             })
         }
@@ -649,6 +707,21 @@ mod tests {
             len: u64,
         ) -> std::result::Result<HttpResponse, String> {
             *self.last_file.lock().unwrap() = Some((req, path.to_path_buf(), len));
+            Ok(self.response.clone())
+        }
+
+        async fn execute_body(
+            &self,
+            req: HttpRequest,
+            mut body: HttpRequestBody,
+            len: u64,
+        ) -> std::result::Result<HttpResponse, String> {
+            use futures::StreamExt as _;
+            let mut bytes = Vec::new();
+            while let Some(chunk) = body.next().await {
+                bytes.extend_from_slice(&chunk?);
+            }
+            *self.last_body.lock().unwrap() = Some((req, bytes, len));
             Ok(self.response.clone())
         }
     }
@@ -1125,5 +1198,60 @@ mod tests {
             .unwrap();
         let req = http.last.lock().unwrap().clone().unwrap();
         assert!(req.url.contains("max-keys=1000"), "url: {}", req.url);
+    }
+
+    #[tokio::test]
+    async fn raw_streamed_put_is_resigned_and_preserves_metadata() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![("etag".into(), "\"v2\"".into())],
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        let body = futures::stream::iter([Ok(bytes::Bytes::from_static(b"abc"))]);
+        backend
+            .execute_put_body_raw(
+                &obj(),
+                &[("x-amz-meta-owner".into(), "team-a".into())],
+                Box::pin(body),
+                3,
+                "UNSIGNED-PAYLOAD",
+            )
+            .await
+            .unwrap();
+
+        let (request, body, len) = http.last_body.lock().unwrap().clone().unwrap();
+        assert_eq!(body, b"abc");
+        assert_eq!(len, 3);
+        assert_eq!(
+            request.header("x-amz-content-sha256"),
+            Some("UNSIGNED-PAYLOAD")
+        );
+        assert_eq!(request.header("x-amz-meta-owner"), Some("team-a"));
+        let authorization = request.header("authorization").unwrap();
+        assert!(authorization.contains("x-amz-meta-owner"));
+    }
+
+    #[tokio::test]
+    async fn copy_source_is_signed_with_origin_credentials() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(S3Config::aws("us-east-1"), creds(), http.clone());
+        backend
+            .execute_copy_raw(
+                &obj(),
+                &[("x-amz-copy-source".into(), "/source/key".into())],
+            )
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(request.header("x-amz-copy-source"), Some("/source/key"));
+        assert!(request
+            .header("authorization")
+            .unwrap()
+            .contains("x-amz-copy-source"));
     }
 }

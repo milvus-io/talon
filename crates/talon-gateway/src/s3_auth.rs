@@ -341,9 +341,15 @@ fn validate_payload_hash(request: &Request, signed: &SignedRequest) -> Result<()
         if !accepted {
             return Err(AuthFailure);
         }
-    } else {
-        // Write support must install a streaming body verifier before payloads
-        // can be authenticated without buffering the whole object.
+    } else if signed.payload_hash != "UNSIGNED-PAYLOAD"
+        && (signed.payload_hash.len() != 64
+            || !signed
+                .payload_hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    {
+        // Streaming SigV4 chunk modes need per-chunk verification and are not
+        // accepted as ordinary object PUTs.
         return Err(AuthFailure);
     }
     Ok(())
@@ -723,6 +729,34 @@ mod tests {
         builder.body(Body::empty()).unwrap()
     }
 
+    fn signed_put(payload_hash: &str) -> Request {
+        let mut outgoing = HttpRequest::new(
+            Method::Put,
+            "https://example.com/bucket/object".into(),
+            vec![("content-length".into(), "3".into())],
+        );
+        sign_request_with_payload_hash(
+            &mut outgoing,
+            &S3Credentials {
+                access_key_id: ACCESS_KEY.into(),
+                secret_access_key: SECRET_KEY.into(),
+                session_token: None,
+            },
+            "us-east-1",
+            "s3",
+            &AmzDate {
+                datetime: DATETIME.into(),
+                date: "20130524".into(),
+            },
+            payload_hash,
+        );
+        let mut builder = Request::builder().method("PUT").uri("/bucket/object");
+        for (name, value) in outgoing.headers {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::from("abc")).unwrap()
+    }
+
     fn presigned_request(expires: u64, session_token: Option<&str>) -> Request {
         let credential = uri_encode(
             format!("{ACCESS_KEY}/20130524/us-east-1/s3/aws4_request").as_bytes(),
@@ -827,6 +861,24 @@ mod tests {
     }
 
     #[test]
+    fn accepts_supported_put_payload_declarations_only() {
+        let verifier = authenticator(None);
+        let digest = sha256_hex(b"abc");
+        assert!(verifier
+            .authenticate_at(&signed_put(&digest), now())
+            .is_ok());
+        assert!(verifier
+            .authenticate_at(&signed_put("UNSIGNED-PAYLOAD"), now())
+            .is_ok());
+        assert!(verifier
+            .authenticate_at(&signed_put("STREAMING-AWS4-HMAC-SHA256-PAYLOAD"), now())
+            .is_err());
+        assert!(verifier
+            .authenticate_at(&signed_put(&digest.to_ascii_uppercase()), now())
+            .is_err());
+    }
+
+    #[test]
     fn rejects_tampering_scope_replay_and_payload_hash() {
         let verifier = authenticator(None);
         let mut tampered = signed_header_request("/bucket/object", "s3", None);
@@ -896,7 +948,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_invalid_identity_sets_and_unsigned_payloads() {
+    fn rejects_invalid_identity_sets_and_streaming_payload_modes() {
         assert!(parse_datetime("0000000\u{e9}000000Z").is_err());
         assert!(matches!(
             S3SigV4Authenticator::new("us-east-1", Vec::new(), Duration::from_secs(1)),
@@ -921,7 +973,7 @@ mod tests {
                 datetime: DATETIME.into(),
                 date: "20130524".into(),
             },
-            "UNSIGNED-PAYLOAD",
+            "STREAMING-AWS4-HMAC-SHA256-PAYLOAD",
         );
         let mut builder = Request::builder().method("PUT").uri("/bucket/object");
         for (name, value) in outgoing.headers {

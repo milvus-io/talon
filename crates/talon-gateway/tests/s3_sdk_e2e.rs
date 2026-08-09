@@ -103,6 +103,13 @@ impl S3Cache for ReadThroughCache {
             Ok(body)
         })))
     }
+
+    fn invalidate_object(&self, object: &ObjectId) -> usize {
+        let mut entries = self.entries.lock().unwrap();
+        let before = entries.len();
+        entries.retain(|(cached, _, _, _), _| cached != object);
+        before - entries.len()
+    }
 }
 
 fn env(name: &str) -> Option<String> {
@@ -196,6 +203,8 @@ async fn s3_sdks_and_localstack_gateway_conformance() {
                 GatewayOperation::Stat,
                 GatewayOperation::Read,
                 GatewayOperation::List,
+                GatewayOperation::Write,
+                GatewayOperation::Delete,
             ],
         }])
         .unwrap(),

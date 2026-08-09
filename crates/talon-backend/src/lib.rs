@@ -20,7 +20,9 @@ pub mod xml;
 pub use azure::{AzureBackend, AzureConfig};
 pub use delay::{DelayConfig, DelayingHttpClient};
 pub use gcs::{GcsBackend, GcsConfig};
-pub use http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Method};
+pub use http::{
+    HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
+};
 pub use reqwest_client::ReqwestClient;
 pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
 pub use s3::{S3Backend, S3Config, S3Credentials};
