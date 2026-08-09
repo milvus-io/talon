@@ -2563,6 +2563,8 @@ dependencies = [
 name = "talon-cache-client"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures",
  "talon-core",
  "talon-transport",
  "tempfile",

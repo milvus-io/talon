@@ -61,7 +61,9 @@ use talon_core::{BlockHandle, RequestId};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::uring::{write_all, BufferedFrameReader};
+use talon_transport::DataErrorCode;
 
+use crate::data_error::encode_runtime_error;
 use crate::observability::WorkerObservability;
 use crate::runtime::{ServeOutcome, WorkerRuntime};
 use crate::{send_header_and_file_range, DEFAULT_CHUNK};
@@ -137,8 +139,9 @@ pub async fn handle_conn(
             // A data listener serves only GetRange/Put/Delete; anything else is
             // rejected before any per-request work.
             _ => {
-                let err = data::encode_error(
+                let err = data::encode_typed_error(
                     header.request_id,
+                    DataErrorCode::InvalidRequest,
                     "worker only serves GetRange/Put/Delete/StatObject/ListObjects",
                 );
                 write_all(&mut stream, err).await?;
@@ -152,7 +155,11 @@ pub async fn handle_conn(
         let (h, req) = match data::decode_request(&rejoin(&header, &payload)) {
             Ok(v) => v,
             Err(e) => {
-                let err = data::encode_error(header.request_id, &format!("bad request: {e}"));
+                let err = data::encode_typed_error(
+                    header.request_id,
+                    DataErrorCode::InvalidRequest,
+                    format!("bad request: {e}"),
+                );
                 write_all(&mut stream, err).await?;
                 observability
                     .metrics()
@@ -162,7 +169,24 @@ pub async fn handle_conn(
         };
 
         if !observability.is_ready() {
-            let err = data::encode_error(h.request_id, "worker is not ready");
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::Unavailable,
+                "worker is not ready",
+            );
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
+
+        if req.offset.checked_add(req.len).is_none() {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::InvalidRequest,
+                "range offset+len overflows u64",
+            );
             write_all(&mut stream, err).await?;
             observability
                 .metrics()
@@ -207,7 +231,7 @@ pub async fn handle_conn(
                     error = %e,
                     "serving range failed"
                 );
-                let err = data::encode_error(h.request_id, &e.to_string());
+                let err = encode_runtime_error(h.request_id, &e);
                 write_all(&mut stream, err).await?;
                 observability
                     .metrics()

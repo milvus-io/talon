@@ -5,7 +5,7 @@
 //! single [`MsgType::GetRange`] frame whose body is a bincode
 //! [`RangeRequest`] (object + `[offset, len)`), and a reply that is a
 //! `GetRange` frame carrying the **raw range bytes** — or, if the
-//! [`Flags::ERROR`] bit is set, a UTF-8 error string.
+//! [`Flags::ERROR`] bit is set, a typed error envelope (or a legacy string).
 //!
 //! The response body is raw (no bincode envelope) precisely so a production
 //! worker can `sendfile` the range straight from a file into the socket; this
@@ -20,8 +20,8 @@ use std::time::Duration;
 use talon_core::{ObjectId, RequestId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    encode_delete, encode_put_header, encode_request, DeleteRequest, Flags, PutRequest,
-    RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_delete, encode_put_header, encode_request, DataPlaneError,
+    DeleteRequest, Flags, PutRequest, RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -59,9 +59,9 @@ pub enum WorkerError {
         /// Maximum accepted payload size for this reply.
         cap: u32,
     },
-    /// The worker set the ERROR flag and returned this message.
+    /// The worker set the ERROR flag and returned this typed or legacy error.
     #[error("worker error: {0}")]
-    Remote(String),
+    Remote(DataPlaneError),
 }
 
 /// A thin data-plane client bound to one worker address.
@@ -101,8 +101,9 @@ impl WorkerClient {
     ///
     /// Returns the raw range bytes on success. A worker-side error (block not
     /// present, backend failure, etc.) surfaces as [`WorkerError::Remote`] with
-    /// the worker's message, which the caller can use to trigger a placement
-    /// refresh or replica fallback.
+    /// a stable code when the worker supports typed errors. Legacy string-only
+    /// replies remain [`talon_transport::DataErrorCode::Unknown`] and must not
+    /// be classified by matching their text.
     ///
     /// Uses a pooled connection when one is warm; the connection is returned to
     /// the pool only after a fully successful exchange, so a broken socket is
@@ -487,9 +488,7 @@ async fn read_version_reply(stream: &mut TcpStream) -> Result<Version, WorkerErr
     let mut body = vec![0u8; header.length as usize];
     stream.read_exact(&mut body).await?;
     if header.flags.contains(Flags::ERROR) {
-        return Err(WorkerError::Remote(
-            String::from_utf8_lossy(&body).into_owned(),
-        ));
+        return Err(WorkerError::Remote(decode_error_payload(&body)));
     }
     Ok(Version::new(String::from_utf8_lossy(&body).into_owned()))
 }
@@ -498,7 +497,7 @@ async fn read_version_reply(stream: &mut TcpStream) -> Result<Version, WorkerErr
 ///
 /// A successful reply must advertise exactly `expected_len` before its buffer is
 /// allocated. If the header carries [`Flags::ERROR`], the body is instead a
-/// UTF-8 message capped at [`MAX_CONTROL_PAYLOAD_LEN`] and returned as
+/// typed or legacy message capped at [`MAX_CONTROL_PAYLOAD_LEN`] and returned as
 /// [`WorkerError::Remote`].
 async fn read_range_reply(
     stream: &mut TcpStream,
@@ -526,8 +525,7 @@ async fn read_range_reply(
     let mut body = vec![0u8; header.length as usize];
     stream.read_exact(&mut body).await?;
     if header.flags.contains(Flags::ERROR) {
-        let msg = String::from_utf8_lossy(&body).into_owned();
-        return Err(WorkerError::Remote(msg));
+        return Err(WorkerError::Remote(decode_error_payload(&body)));
     }
     Ok(body)
 }
@@ -661,7 +659,10 @@ mod tests {
         let client = WorkerClient::new(addr);
         let err = client.fetch_range(&object(), 0, 16).await.unwrap_err();
         match err {
-            WorkerError::Remote(m) => assert_eq!(m, "block not present"),
+            WorkerError::Remote(error) => {
+                assert_eq!(error.code, talon_transport::DataErrorCode::Unknown);
+                assert_eq!(error.message, "block not present");
+            }
             other => panic!("expected Remote, got {other:?}"),
         }
     }
@@ -964,7 +965,10 @@ mod tests {
         let client = WriteClient::new(addr);
         let err = client.put_object(&object(), b"x").await.unwrap_err();
         match err {
-            WorkerError::Remote(m) => assert_eq!(m, "backend PUT failed"),
+            WorkerError::Remote(error) => {
+                assert_eq!(error.code, talon_transport::DataErrorCode::Unknown);
+                assert_eq!(error.message, "backend PUT failed");
+            }
             other => panic!("expected Remote, got {other:?}"),
         }
     }

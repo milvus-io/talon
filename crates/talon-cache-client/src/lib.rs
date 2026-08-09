@@ -11,6 +11,7 @@ pub mod membership_cache;
 pub mod metrics;
 pub mod placement_cache;
 pub mod pool;
+pub mod range_stream;
 pub mod read_plan;
 pub mod worker_client;
 
@@ -21,5 +22,6 @@ pub use coordinator_client::{
 pub use metrics::{ReadStats, ReadStatsSnapshot};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use pool::{ConnectionPool, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
+pub use range_stream::{CacheReadError, RangeChunkStream, DEFAULT_TRANSFER_CHUNK_BYTES};
 pub use read_plan::{plan_read, BlockSegment};
 pub use worker_client::{WorkerClient, WorkerError, WriteClient};

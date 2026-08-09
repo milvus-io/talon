@@ -6,6 +6,7 @@
 
 pub mod block_store;
 pub mod capacity;
+mod data_error;
 pub mod eviction;
 pub mod flusher;
 pub mod index;
