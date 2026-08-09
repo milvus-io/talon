@@ -4,22 +4,46 @@
 //! mountable POSIX filesystem. Reads and writes to the mount are translated
 //! into object store operations against the cluster.
 
-pub mod block_reader;
+/// Compatibility exports for the shared cache client read path.
+pub mod block_reader {
+    pub use talon_cache_client::block_reader::*;
+}
 pub mod capability;
-pub mod coordinator_client;
+/// Compatibility exports for the shared coordinator client.
+pub mod coordinator_client {
+    pub use talon_cache_client::coordinator_client::*;
+}
 pub(crate) mod lock;
 pub mod mapping;
-pub mod membership_cache;
-pub mod metrics;
+/// Compatibility exports for the shared membership cache.
+pub mod membership_cache {
+    pub use talon_cache_client::membership_cache::*;
+}
+/// Compatibility exports for shared cache-client metrics.
+pub mod metrics {
+    pub use talon_cache_client::metrics::*;
+}
 #[cfg(feature = "mount")]
 pub mod mount;
 pub mod ops;
-pub mod placement_cache;
-pub mod pool;
+/// Compatibility exports for the shared placement cache.
+pub mod placement_cache {
+    pub use talon_cache_client::placement_cache::*;
+}
+/// Compatibility exports for the shared connection pool.
+pub mod pool {
+    pub use talon_cache_client::pool::*;
+}
 pub mod prefetch;
-pub mod read_plan;
+/// Compatibility exports for shared range planning.
+pub mod read_plan {
+    pub use talon_cache_client::read_plan::*;
+}
 pub mod readahead;
-pub mod worker_client;
+/// Compatibility exports for shared worker clients.
+pub mod worker_client {
+    pub use talon_cache_client::worker_client::*;
+}
 
 pub use block_reader::{BlockReadError, BlockReader, FileView};
 pub use coordinator_client::{

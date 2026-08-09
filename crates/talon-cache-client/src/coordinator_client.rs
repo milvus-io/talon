@@ -160,8 +160,8 @@ impl CoordinatorClient {
 
     /// List objects under `prefix` (mount-relative) for `readdir`.
     ///
-    /// Returns `(path, size)` entries the caller can feed into a
-    /// [`ReadOnlyFs`](crate::ops::ReadOnlyFs) to synthesize the namespace tree.
+    /// Returns `(path, size)` entries from which a protocol frontend can
+    /// synthesize its namespace view.
     pub async fn list_objects(
         &self,
         prefix: &str,

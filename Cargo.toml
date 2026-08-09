@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/talon-core",
+    "crates/talon-cache-client",
     "crates/talon-coordinator",
     "crates/talon-worker",
     "crates/talon-fuse",
@@ -22,6 +23,7 @@ rust-version = "1.80"
 
 [workspace.dependencies]
 talon-core = { path = "crates/talon-core" }
+talon-cache-client = { path = "crates/talon-cache-client" }
 talon-transport = { path = "crates/talon-transport" }
 talon-metadata = { path = "crates/talon-metadata" }
 

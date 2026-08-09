@@ -1,0 +1,18 @@
+[package]
+name = "talon-cache-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "Reusable coordinator and worker data-plane client for Talon"
+
+[dependencies]
+talon-core.workspace = true
+talon-transport.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

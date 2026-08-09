@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 talon-core.workspace = true
+talon-cache-client.workspace = true
 talon-metadata.workspace = true
 talon-transport.workspace = true
 anyhow.workspace = true
