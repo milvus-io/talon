@@ -15,8 +15,8 @@ use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER
 use talon_core::{Backend, ObjectId, Version};
 
 use crate::{
-    FailureReason, GatewayAdapter, GatewayOperation, GatewayOutcome, GatewayRequestContext,
-    GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
+    FailureReason, GatewayAccess, GatewayAdapter, GatewayOperation, GatewayOutcome,
+    GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
 };
 
 const AZURE_API_VERSION: &str = "2021-12-02";
@@ -1397,6 +1397,15 @@ impl GatewayAdapter for AzureBlobAdapter {
         ProviderProtocol::Azure
     }
 
+    fn access(
+        &self,
+        request: &Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayAccess, Box<GatewayResponse>> {
+        self.classify_access(request)
+            .map_err(|error| Box::new(error_response(error, &context.request_id)))
+    }
+
     async fn handle(&self, request: Request, context: GatewayRequestContext) -> GatewayResponse {
         match self.handle_request(request, &context).await {
             Ok(response) => response,
@@ -1406,6 +1415,37 @@ impl GatewayAdapter for AzureBlobAdapter {
 }
 
 impl AzureBlobAdapter {
+    fn classify_access(&self, request: &Request) -> Result<GatewayAccess, AzureRequestError> {
+        let target = parse_target(request, &self.config)?;
+        let query = AzureQuery::parse(request.uri().query())?;
+        if request.method() == axum::http::Method::GET && target.blob.is_none() && query.is_list() {
+            return Ok(GatewayAccess {
+                operation: GatewayOperation::List,
+                provider_account: Some(self.config.account.clone()),
+                target: GatewayTarget::Namespace {
+                    backend: Backend::Azure,
+                    namespace: target.container,
+                    prefix: query.prefix,
+                },
+            });
+        }
+        let blob = target.blob.ok_or_else(|| {
+            AzureRequestError::invalid("InvalidUri", "request does not identify a blob")
+        })?;
+        let operation = match *request.method() {
+            axum::http::Method::HEAD => GatewayOperation::Stat,
+            axum::http::Method::GET => GatewayOperation::Read,
+            axum::http::Method::PUT => GatewayOperation::Write,
+            axum::http::Method::DELETE => GatewayOperation::Delete,
+            _ => GatewayOperation::Unsupported,
+        };
+        Ok(GatewayAccess {
+            operation,
+            provider_account: Some(self.config.account.clone()),
+            target: GatewayTarget::Object(ObjectId::new(Backend::Azure, target.container, blob)),
+        })
+    }
+
     async fn handle_request(
         &self,
         request: Request,

@@ -43,6 +43,16 @@ impl GatewayMetrics {
             .inc();
     }
 
+    pub(crate) fn record_authorization(&self, decision: &'static str) {
+        self.registry
+            .counter(
+                "talon_gateway_authorization_total",
+                "Gateway authorization decisions.",
+                labels(&[("decision", decision)]),
+            )
+            .inc();
+    }
+
     pub(crate) fn record_headers(&self, observation: RequestObservation) {
         let failure = observation.failure.map_or("none", FailureReason::label);
         let response_class = match observation.status / 100 {

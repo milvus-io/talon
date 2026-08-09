@@ -240,8 +240,9 @@ mod tests {
 
     use super::*;
     use crate::{
-        serve_tls, GatewayAdapter, GatewayConfig, GatewayMode, GatewayOperation,
-        GatewayRequestContext, GatewayResponse, GatewayRuntime, GatewaySecurity, ProviderProtocol,
+        serve_tls, AuthorizationPolicy, GatewayAdapter, GatewayConfig, GatewayMode,
+        GatewayOperation, GatewayRequestContext, GatewayResponse, GatewayRuntime, GatewaySecurity,
+        ProviderProtocol,
     };
 
     const CERT_DER: &[u8] =
@@ -313,6 +314,7 @@ mod tests {
             )
             .unwrap(),
         );
+        runtime.install_authorization(AuthorizationPolicy::new(Vec::new()).unwrap());
         assert!(!runtime.readiness().is_ready());
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
         let server_runtime = Arc::clone(&runtime);
