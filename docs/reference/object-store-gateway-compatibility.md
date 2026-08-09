@@ -68,6 +68,15 @@ encoding, conditions, presigned URLs, listing pagination and delimiters, and
 standard errors. Arrow-compatible signed HEAD and ranged GET fixtures run in
 the same test.
 
+## Cache routing mark
+
+The version 1 cache-routing contract is defined but is not accepted by the
+read-only gateway until incoming authentication is implemented. S3 uses the
+SigV4-signed `x-talon-cache-mark` header. Azure Shared Key uses the canonical
+`x-ms-talon-cache-mark` header; Azure SAS requests cannot carry a non-default
+mark because SAS does not sign custom headers. An absent mark means lookup on,
+population on, and bounded origin fallback.
+
 See the [deployment and failure runbook](../operations/object-store-gateway.md)
 and [gateway benchmark results](object-store-gateway-benchmarks.md) for the
 operational boundary around this matrix.
