@@ -50,6 +50,7 @@
 - [ADR 0002: Write-cache durability](./explanation/adr-0002-write-cache-durability.md)
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)
 - [ADR 0004: Control-plane workload identity](./explanation/adr-0004-control-plane-workload-identity.md)
+- [ADR 0005: Object-store-compatible gateways](./explanation/adr-0005-object-store-compatible-gateways.md)
 
 # Contributing
 
