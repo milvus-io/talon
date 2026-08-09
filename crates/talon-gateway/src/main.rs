@@ -14,8 +14,9 @@ use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache};
 use talon_gateway::s3_auth::{S3ClientIdentity, S3SigV4Authenticator};
 use talon_gateway::{
     serve, serve_tls, AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy,
-    GatewayAdapter, GatewayConfig, GatewayMode, GatewayOperation, GatewayRoute, GatewayRuntime,
-    GatewaySecurity, GatewayTlsConfig, ProviderProtocol,
+    GatewayAdapter, GatewayClientAuthConfig, GatewayClientAuthMode, GatewayConfig, GatewayMode,
+    GatewayMtlsIdentity, GatewayOperation, GatewayRoute, GatewayRuntime, GatewaySecurity,
+    GatewayTlsConfig, ProviderProtocol,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -119,8 +120,49 @@ impl Settings {
         )?;
         let tls_certificate = value(&mut get, "TALON_GATEWAY_TLS_CERT_PATH");
         let tls_private_key = value(&mut get, "TALON_GATEWAY_TLS_KEY_PATH");
+        let client_auth_mode =
+            value(&mut get, "TALON_GATEWAY_TLS_CLIENT_AUTH").unwrap_or_else(|| "off".into());
+        let client_ca = value(&mut get, "TALON_GATEWAY_TLS_CLIENT_CA_PATH");
+        let trust_domain = value(&mut get, "TALON_GATEWAY_TLS_TRUST_DOMAIN");
+        let mtls_identities = value(&mut get, "TALON_GATEWAY_MTLS_IDENTITIES_PATH");
+        let client_auth = match client_auth_mode.as_str() {
+            "off" if client_ca.is_none() && trust_domain.is_none() && mtls_identities.is_none() => {
+                None
+            }
+            "off" => return Err(invalid(
+                "mTLS client settings require TALON_GATEWAY_TLS_CLIENT_AUTH=optional or required",
+            )),
+            "optional" | "required" => {
+                let mode = if client_auth_mode == "optional" {
+                    GatewayClientAuthMode::Optional
+                } else {
+                    GatewayClientAuthMode::Required
+                };
+                let ca = client_ca.ok_or_else(|| {
+                    invalid("TALON_GATEWAY_TLS_CLIENT_CA_PATH is required for mTLS")
+                })?;
+                let trust_domain = trust_domain.ok_or_else(|| {
+                    invalid("TALON_GATEWAY_TLS_TRUST_DOMAIN is required for mTLS")
+                })?;
+                let identities = mtls_identities.ok_or_else(|| {
+                    invalid("TALON_GATEWAY_MTLS_IDENTITIES_PATH is required for mTLS")
+                })?;
+                Some(load_mtls_identities(
+                    Path::new(&identities),
+                    PathBuf::from(ca),
+                    mode,
+                    trust_domain,
+                )?)
+            }
+            _ => {
+                return Err(invalid(
+                    "TALON_GATEWAY_TLS_CLIENT_AUTH must be off, optional, or required",
+                ))
+            }
+        };
         let tls = match (tls_certificate, tls_private_key) {
-            (None, None) => None,
+            (None, None) if client_auth.is_none() => None,
+            (None, None) => return Err(invalid("mTLS requires gateway TLS certificate and key")),
             (Some(certificate_path), Some(private_key_path)) => Some(GatewayTlsConfig {
                 certificate_path: certificate_path.into(),
                 private_key_path: private_key_path.into(),
@@ -139,6 +181,7 @@ impl Settings {
                     "256",
                     "TALON_GATEWAY_TLS_MAX_HANDSHAKES",
                 )?,
+                client_auth,
             }),
             _ => return Err(invalid(
                 "TALON_GATEWAY_TLS_CERT_PATH and TALON_GATEWAY_TLS_KEY_PATH must be set together",
@@ -389,6 +432,20 @@ struct AzureIdentityConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct MtlsIdentityFile {
+    identities: Vec<MtlsIdentityConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MtlsIdentityConfig {
+    uri_san: String,
+    principal: String,
+    provider_account: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuthorizationFile {
     grants: Vec<AuthorizationGrantConfig>,
 }
@@ -486,6 +543,31 @@ fn load_authorization(path: &Path) -> MainResult<AuthorizationPolicy> {
         })
         .collect::<MainResult<Vec<_>>>()?;
     Ok(AuthorizationPolicy::new(grants)?)
+}
+
+fn load_mtls_identities(
+    path: &Path,
+    ca_certificate_path: PathBuf,
+    mode: GatewayClientAuthMode,
+    trust_domain: String,
+) -> MainResult<GatewayClientAuthConfig> {
+    let configured: MtlsIdentityFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    Ok(GatewayClientAuthConfig {
+        ca_certificate_path,
+        mode,
+        trust_domain,
+        identities: configured
+            .identities
+            .into_iter()
+            .map(|identity| GatewayMtlsIdentity {
+                uri_san: identity.uri_san,
+                principal: AuthenticatedPrincipal::new(
+                    identity.principal,
+                    identity.provider_account,
+                ),
+            })
+            .collect(),
+    })
 }
 
 async fn shutdown_signal() {
@@ -681,7 +763,53 @@ mod tests {
         assert_eq!(tls.reload_interval, std::time::Duration::from_millis(250));
         assert_eq!(tls.handshake_timeout, std::time::Duration::from_millis(900));
         assert_eq!(tls.max_concurrent_handshakes, 32);
+        assert!(tls.client_auth.is_none());
         assert!(!format!("{tls:?}").contains("/tls/key.pem"));
+    }
+
+    #[test]
+    fn mtls_settings_are_grouped_and_load_explicit_identity_mappings() {
+        let temp = TempDir::new().unwrap();
+        let identities = temp.path().join("mtls-identities.json");
+        std::fs::write(
+            &identities,
+            r#"{
+                "identities": [{
+                    "uri_san": "spiffe://cluster.example/talon/cluster-a/worker/worker-1",
+                    "principal": "worker-reader",
+                    "provider_account": "account-a"
+                }]
+            }"#,
+        )
+        .unwrap();
+        let identity_path = identities.to_str().unwrap();
+        let configured = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_TLS_CERT_PATH", "/tls/cert.pem"),
+            ("TALON_GATEWAY_TLS_KEY_PATH", "/tls/key.pem"),
+            ("TALON_GATEWAY_TLS_CLIENT_AUTH", "required"),
+            ("TALON_GATEWAY_TLS_CLIENT_CA_PATH", "/tls/client-ca.pem"),
+            ("TALON_GATEWAY_TLS_TRUST_DOMAIN", "cluster.example"),
+            ("TALON_GATEWAY_MTLS_IDENTITIES_PATH", identity_path),
+        ])
+        .unwrap();
+        let client_auth = configured.tls.unwrap().client_auth.unwrap();
+        assert_eq!(client_auth.mode, GatewayClientAuthMode::Required);
+        assert_eq!(client_auth.trust_domain, "cluster.example");
+        assert_eq!(client_auth.identities.len(), 1);
+        assert_eq!(client_auth.identities[0].principal.id, "worker-reader");
+
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_TLS_CLIENT_AUTH", "optional"),
+            ("TALON_GATEWAY_TLS_CLIENT_CA_PATH", "/tls/client-ca.pem"),
+        ])
+        .is_err());
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_TLS_CLIENT_CA_PATH", "/tls/client-ca.pem"),
+        ])
+        .is_err());
     }
 
     #[test]

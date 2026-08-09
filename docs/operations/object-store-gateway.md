@@ -8,8 +8,9 @@ metadata and fallback reads.
 
 ## Security state
 
-S3 SigV4 and Azure Shared Key/SAS authentication plus namespace authorization
-are available. This has the following enforced consequences:
+S3 SigV4, Azure Shared Key/SAS, and URI-SAN client-certificate authentication
+plus namespace authorization are available. This has the following enforced
+consequences:
 
 - `development` mode only binds loopback. It is suitable for an application
   sidecar in the same network namespace.
@@ -18,8 +19,9 @@ are available. This has the following enforced consequences:
   authorization are installed. S3 requires both configuration files documented
   below.
 
-Only a validated provider identity that maps to an explicit allow grant can
-pass the production data plane.
+Only a validated provider or mTLS identity that maps to an explicit allow grant
+can pass the production data plane. When both identity forms are present, both
+must map to exactly the same principal and provider account.
 
 ## Credential boundary
 
@@ -61,12 +63,45 @@ Common variables:
 | `TALON_GATEWAY_TLS_RELOAD_MS` | `5000` | Last-good certificate/key reload interval. |
 | `TALON_GATEWAY_TLS_HANDSHAKE_TIMEOUT_MS` | `10000` | Maximum TLS handshake time per connection. |
 | `TALON_GATEWAY_TLS_MAX_HANDSHAKES` | `256` | Maximum concurrent pre-HTTP TLS handshakes. |
+| `TALON_GATEWAY_TLS_CLIENT_AUTH` | `off` | `off`, `optional`, or `required` client-certificate mode. |
+| `TALON_GATEWAY_TLS_CLIENT_CA_PATH` | unset | PEM client trust-anchor bundle; required when client auth is enabled. |
+| `TALON_GATEWAY_TLS_TRUST_DOMAIN` | unset | Exact SPIFFE URI SAN trust domain. |
+| `TALON_GATEWAY_MTLS_IDENTITIES_PATH` | unset | JSON URI SAN to principal mapping file. |
 | `TALON_GATEWAY_AUTHORIZATION_PATH` | unset | JSON allow-grant file. Required for production readiness. |
 
 The listener permits TLS 1.3 only and advertises HTTP/2 and HTTP/1.1. A bad
 rotation increments `talon_gateway_tls_events_total{event="reload_failure"}`
 and retains the previous valid material. Plaintext and stalled handshakes are
 discarded before HTTP dispatch and counted with bounded event labels.
+
+Client authentication validates the certificate chain, validity period, and
+client-authentication usage. The leaf must contain exactly one URI SAN, use the
+configured `spiffe://` trust domain, and match an explicit mapping:
+
+```json
+{
+  "identities": [
+    {
+      "uri_san": "spiffe://cluster.example/talon/cluster-a/worker/worker-1",
+      "principal": "analytics-reader",
+      "provider_account": "tenant-a"
+    }
+  ]
+}
+```
+
+`required` mTLS can satisfy production authentication readiness without a
+provider identity file. `optional` only controls the TLS handshake and still
+requires a provider authenticator for readiness. A request with both a provider
+credential and client certificate is denied unless their mappings agree. CA
+bundles may contain old and new trust anchors during rotation; invalid reloads
+retain the complete last-good server and client-auth configuration.
+
+Authentication and authorization decisions emit `gateway security audit`
+events with request ID, protocol, operation, decision, and bounded reason.
+Principal and resource identifiers are truncated SHA-256 values; credentials,
+certificate contents, account names, buckets, containers, and object paths are
+not emitted.
 
 S3 variables:
 

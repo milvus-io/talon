@@ -1,5 +1,6 @@
 //! Provider-neutral, bounded HTTP runtime shared by Talon's object-store gateways.
 
+mod audit;
 mod authorization;
 pub mod azure;
 pub mod azure_auth;
@@ -12,6 +13,7 @@ pub mod s3;
 pub mod s3_auth;
 mod tls;
 
+pub use audit::{GatewayAuditSink, SecurityAuditEvent};
 pub use authorization::{
     AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy, AuthorizationPolicyError,
     GatewayAuthenticationError, GatewayAuthenticator,
@@ -30,4 +32,7 @@ pub use runtime::{
     gateway_router, serve, serve_tls, GatewayReadiness, GatewayRuntime, GatewayTlsServeError,
     REQUEST_ID_HEADER,
 };
-pub use tls::{GatewayTlsConfig, GatewayTlsError, GatewayTlsListener};
+pub use tls::{
+    GatewayClientAuthConfig, GatewayClientAuthMode, GatewayConnectionInfo, GatewayMtlsIdentity,
+    GatewayTlsConfig, GatewayTlsError, GatewayTlsListener,
+};
