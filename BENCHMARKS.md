@@ -117,9 +117,10 @@ prior question: *what is the ceiling, and what is holding it?* These runs do.
 They matter because an optimization that helps on loopback can be worth nothing
 on a real cluster, where a different resource runs out first.
 
-All numbers below: `talon-srv8` on AKS (`Standard_E64ads_v5` class node, worker
-capped at 8 CPU by its cgroup), 64 KiB ranges, all cache hits, 32 connections,
-20 s measured after a 6 s warmup, `talon-loadgen --depth 16`.
+All numbers below: `talon-srv8` on a managed Kubernetes cluster
+(`Standard_E64ads_v5` class node, worker capped at 8 CPU by its cgroup),
+64 KiB ranges, all cache hits, 32 connections, 20 s measured after a 6 s
+warmup, `talon-loadgen --depth 16`.
 
 ### Loopback: the kernel is the bottleneck, not Talon
 
