@@ -2654,6 +2654,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-gateway"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "futures",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "talon-core",
+ "thiserror 2.0.19",
+ "tokio",
+ "tower",
+ "tower-http",
+ "tracing",
+]
+
+[[package]]
 name = "talon-metadata"
 version = "0.1.0"
 dependencies = [
@@ -3076,6 +3095,7 @@ dependencies = [
  "http-body",
  "mime",
  "pin-project-lite",
+ "tokio",
  "tower",
  "tower-layer",
  "tower-service",
