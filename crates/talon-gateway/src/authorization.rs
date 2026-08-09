@@ -3,6 +3,7 @@
 use std::collections::HashSet;
 use std::sync::{Arc, RwLock};
 
+use axum::extract::Request;
 use talon_core::Backend;
 
 use crate::{GatewayAccess, GatewayOperation, GatewayTarget, ProviderProtocol};
@@ -25,6 +26,21 @@ impl AuthenticatedPrincipal {
         }
     }
 }
+
+/// Trusted provider credential verifier installed before authorization.
+pub trait GatewayAuthenticator: Send + Sync + 'static {
+    /// Validate one request and return its policy identity.
+    fn authenticate(
+        &self,
+        request: &Request,
+        protocol: ProviderProtocol,
+    ) -> Result<AuthenticatedPrincipal, GatewayAuthenticationError>;
+}
+
+/// Stable authentication failure that never contains credential material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("request authentication failed")]
+pub struct GatewayAuthenticationError;
 
 /// One allow-only policy grant.
 #[derive(Debug, Clone, PartialEq, Eq)]

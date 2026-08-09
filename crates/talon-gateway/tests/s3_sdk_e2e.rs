@@ -14,7 +14,11 @@ use talon_backend::{ReqwestClient, S3Backend, S3Config, S3Credentials};
 use talon_cache_client::CacheReadError;
 use talon_core::{ObjectId, Version};
 use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache, S3CacheRequest};
-use talon_gateway::{serve, GatewayConfig, GatewayRuntime, GatewaySecurity};
+use talon_gateway::s3_auth::{S3ClientIdentity, S3SigV4Authenticator};
+use talon_gateway::{
+    serve, AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy, GatewayConfig,
+    GatewayOperation, GatewayRuntime, GatewaySecurity, ProviderProtocol,
+};
 use tokio::net::TcpListener;
 
 type CacheKey = (ObjectId, Version, u64, u64);
@@ -119,10 +123,6 @@ fn endpoint_host(endpoint: &str) -> (String, bool) {
     }
 }
 
-fn expected_object() -> Vec<u8> {
-    (0..4096).map(|index| (index % 251) as u8).collect()
-}
-
 #[tokio::test]
 async fn s3_sdks_and_localstack_gateway_conformance() {
     let Some(origin_endpoint) = env("TALON_S3_TEST_ENDPOINT") else {
@@ -143,8 +143,8 @@ async fn s3_sdks_and_localstack_gateway_conformance() {
             tls,
         },
         S3Credentials {
-            access_key_id: access_key,
-            secret_access_key: secret_key,
+            access_key_id: access_key.clone(),
+            secret_access_key: secret_key.clone(),
             session_token: None,
         },
         Arc::new(ReqwestClient::new()),
@@ -171,6 +171,35 @@ async fn s3_sdks_and_localstack_gateway_conformance() {
         )
         .unwrap(),
     );
+    runtime.install_authentication(Arc::new(
+        S3SigV4Authenticator::new(
+            &region,
+            vec![S3ClientIdentity {
+                access_key_id: access_key,
+                secret_access_key: secret_key,
+                session_token: None,
+                principal: AuthenticatedPrincipal::new("sdk-client", "test-account"),
+            }],
+            std::time::Duration::from_secs(15 * 60),
+        )
+        .unwrap(),
+    ));
+    runtime.install_authorization(
+        AuthorizationPolicy::new(vec![AuthorizationGrant {
+            id: "sdk-conformance".into(),
+            principal: "sdk-client".into(),
+            protocol: ProviderProtocol::S3,
+            provider_account: "test-account".into(),
+            namespace: bucket.clone(),
+            prefix: None,
+            operations: vec![
+                GatewayOperation::Stat,
+                GatewayOperation::Read,
+                GatewayOperation::List,
+            ],
+        }])
+        .unwrap(),
+    );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
     let server = tokio::spawn(serve(listener, runtime, async move {
         let _ = shutdown_rx.await;
@@ -194,37 +223,6 @@ async fn s3_sdks_and_localstack_gateway_conformance() {
         eprintln!("skipping Python S3 SDK assertions: TALON_S3_SDK_PYTHON is not set");
     }
 
-    // Arrow's S3 filesystem uses signed HEAD and exact ranged GET requests.
-    // Authentication is intentionally deferred to #446, but these fixtures
-    // prove that its headers do not alter parsing or leak to the origin signer.
-    let raw = reqwest::Client::new();
-    let object_url = format!("{gateway_endpoint}/{bucket}/{object_key}");
-    let properties = raw
-        .head(&object_url)
-        .header("x-amz-date", "20260809T000000Z")
-        .header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
-        .header(
-            reqwest::header::AUTHORIZATION,
-            "AWS4-HMAC-SHA256 Credential=arrow/20260809/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=fixture",
-        )
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(properties.status(), reqwest::StatusCode::OK);
-    assert_eq!(
-        properties.headers()[reqwest::header::CONTENT_LENGTH],
-        "4096"
-    );
-
-    let range = raw
-        .get(&object_url)
-        .header(reqwest::header::RANGE, "bytes=7-1030")
-        .header("x-amz-checksum-mode", "ENABLED")
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(range.status(), reqwest::StatusCode::PARTIAL_CONTENT);
-    assert_eq!(range.bytes().await.unwrap(), &expected_object()[7..1031]);
     assert!(cache.misses.load(Ordering::Relaxed) >= 1);
     assert!(cache.hits.load(Ordering::Relaxed) >= 1);
 

@@ -19,7 +19,7 @@ use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutBody;
 
-use crate::authorization::{AuthenticatedPrincipal, AuthorizationPolicy};
+use crate::authorization::{AuthenticatedPrincipal, AuthorizationPolicy, GatewayAuthenticator};
 use crate::config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
 use crate::metrics::{GatewayMetrics, RequestObservation, ResponseObserver};
 use crate::model::{
@@ -62,6 +62,7 @@ impl GatewayReadiness {
     /// Update installed production security components.
     pub fn set_security(&self, mut security: GatewaySecurity) {
         let mut current = self.security.write().unwrap();
+        security.authentication = current.authentication;
         security.authorization = current.authorization;
         *current = security;
     }
@@ -118,6 +119,7 @@ pub struct GatewayRuntime {
     readiness: Arc<GatewayReadiness>,
     metrics: GatewayMetrics,
     authorization: RwLock<Option<AuthorizationPolicy>>,
+    authentication: RwLock<Option<Arc<dyn GatewayAuthenticator>>>,
 }
 
 impl GatewayRuntime {
@@ -128,6 +130,7 @@ impl GatewayRuntime {
         mut security: GatewaySecurity,
     ) -> Result<Self, GatewayConfigError> {
         config.validate()?;
+        security.authentication = false;
         security.authorization = false;
         if config.mode == GatewayMode::Development {
             tracing::warn!(
@@ -141,6 +144,7 @@ impl GatewayRuntime {
             adapter,
             metrics: GatewayMetrics::new(),
             authorization: RwLock::new(None),
+            authentication: RwLock::new(None),
         })
     }
 
@@ -159,6 +163,13 @@ impl GatewayRuntime {
         *self.authorization.write().unwrap() = Some(policy);
         let mut security = self.readiness.security.write().unwrap();
         security.authorization = true;
+    }
+
+    /// Install a credential verifier and mark authentication ready.
+    pub fn install_authentication(&self, authenticator: Arc<dyn GatewayAuthenticator>) {
+        *self.authentication.write().unwrap() = Some(authenticator);
+        let mut security = self.readiness.security.write().unwrap();
+        security.authentication = true;
     }
 }
 
@@ -270,14 +281,42 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
     let elapsed = context.started.elapsed();
     let remaining = runtime.config.request_deadline.saturating_sub(elapsed);
     let protocol = runtime.adapter.protocol();
+    let authenticator = runtime.authentication.read().unwrap().clone();
+    let authenticated = match authenticator {
+        Some(authenticator) => match authenticator.authenticate(&request, protocol) {
+            Ok(principal) => {
+                runtime.metrics.record_authentication("success");
+                Some(principal)
+            }
+            Err(_) => {
+                runtime.metrics.record_authentication("failure");
+                let result = GatewayResponse {
+                    response: (StatusCode::FORBIDDEN, "request authentication failed")
+                        .into_response(),
+                    operation: GatewayOperation::Unsupported,
+                    target: None,
+                    route: GatewayRoute::None,
+                    outcome: GatewayOutcome::Failed,
+                    failure: Some(FailureReason::Authentication),
+                    requested_bytes: 0,
+                    cache_bytes: 0,
+                    origin_bytes: 0,
+                };
+                return record_adapter_result(&runtime, protocol, &context, result);
+            }
+        },
+        None => request
+            .extensions()
+            .get::<AuthenticatedPrincipal>()
+            .cloned(),
+    };
     let policy = runtime.authorization.read().unwrap().clone();
     if let Some(policy) = policy {
         let access = match runtime.adapter.access(&request, &context) {
             Ok(access) => access,
             Err(result) => return record_adapter_result(&runtime, protocol, &context, *result),
         };
-        let principal = request.extensions().get::<AuthenticatedPrincipal>();
-        if principal.map_or(true, |principal| {
+        if authenticated.as_ref().map_or(true, |principal| {
             !policy.allows(principal, protocol, &access)
         }) {
             runtime.metrics.record_authorization("deny");
@@ -623,7 +662,38 @@ mod tests {
     use talon_core::{Backend, ObjectId};
     use tower::ServiceExt;
 
-    use crate::{AuthorizationGrant, GatewayAccess, GatewayTarget};
+    use crate::{
+        AuthorizationGrant, GatewayAccess, GatewayAuthenticationError, GatewayAuthenticator,
+        GatewayTarget,
+    };
+
+    struct StaticAuthenticator;
+
+    struct RejectingAuthenticator;
+
+    impl GatewayAuthenticator for StaticAuthenticator {
+        fn authenticate(
+            &self,
+            request: &Request,
+            _protocol: crate::ProviderProtocol,
+        ) -> Result<AuthenticatedPrincipal, GatewayAuthenticationError> {
+            request
+                .extensions()
+                .get::<AuthenticatedPrincipal>()
+                .cloned()
+                .ok_or(GatewayAuthenticationError)
+        }
+    }
+
+    impl GatewayAuthenticator for RejectingAuthenticator {
+        fn authenticate(
+            &self,
+            _request: &Request,
+            _protocol: crate::ProviderProtocol,
+        ) -> Result<AuthenticatedPrincipal, GatewayAuthenticationError> {
+            Err(GatewayAuthenticationError)
+        }
+    }
 
     #[derive(Clone, Copy)]
     enum AdapterBehavior {
@@ -723,6 +793,7 @@ mod tests {
             authorization: true,
         });
         assert!(!runtime.readiness().is_ready());
+        runtime.install_authentication(Arc::new(StaticAuthenticator));
         runtime.install_authorization(
             AuthorizationPolicy::new(vec![AuthorizationGrant {
                 id: "production-read".into(),
@@ -811,6 +882,34 @@ mod tests {
         assert!(!metrics.contains("object-secret"));
         assert!(!metrics.contains("principal-a"));
         assert!(!metrics.contains("account-a"));
+    }
+
+    #[tokio::test]
+    async fn installed_authenticator_cannot_be_bypassed_by_request_extensions() {
+        let adapter = TestAdapter::immediate();
+        let runtime = runtime_with(
+            GatewayConfig::default(),
+            adapter.clone(),
+            GatewaySecurity::default(),
+        );
+        runtime.install_authentication(Arc::new(RejectingAuthenticator));
+        let app = gateway_router(Arc::clone(&runtime));
+        let mut request = HttpRequest::get("/secret-object")
+            .header("x-talon-principal", "spoofed")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("spoofed", "account-a"));
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+        let metrics = runtime.metrics().render();
+        assert!(metrics.contains("result=\"failure\""));
+        assert!(!metrics.contains("secret-object"));
+        assert!(!metrics.contains("spoofed"));
     }
 
     #[tokio::test]

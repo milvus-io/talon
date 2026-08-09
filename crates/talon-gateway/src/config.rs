@@ -17,7 +17,7 @@ pub enum GatewayMode {
 pub struct GatewaySecurity {
     /// Client connections are protected by TLS.
     pub tls: bool,
-    /// Provider credentials are authenticated before dispatch.
+    /// Provider credentials are authenticated before dispatch. Runtime installation manages this bit.
     pub authentication: bool,
     /// The authenticated principal is checked against a policy. Runtime installation manages this bit.
     pub authorization: bool,

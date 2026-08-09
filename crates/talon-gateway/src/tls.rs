@@ -240,7 +240,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        serve_tls, AuthorizationPolicy, GatewayAdapter, GatewayConfig, GatewayMode,
+        serve_tls, AuthenticatedPrincipal, AuthorizationPolicy, GatewayAdapter,
+        GatewayAuthenticationError, GatewayAuthenticator, GatewayConfig, GatewayMode,
         GatewayOperation, GatewayRequestContext, GatewayResponse, GatewayRuntime, GatewaySecurity,
         ProviderProtocol,
     };
@@ -251,6 +252,18 @@ mod tests {
         include_bytes!("../../talon-transport/tests/fixtures/control_tls/coordinator-key.der");
 
     struct Adapter;
+
+    struct Authenticator;
+
+    impl GatewayAuthenticator for Authenticator {
+        fn authenticate(
+            &self,
+            _request: &Request,
+            _protocol: ProviderProtocol,
+        ) -> Result<AuthenticatedPrincipal, GatewayAuthenticationError> {
+            Ok(AuthenticatedPrincipal::new("test", "test"))
+        }
+    }
 
     #[async_trait]
     impl GatewayAdapter for Adapter {
@@ -314,6 +327,7 @@ mod tests {
             )
             .unwrap(),
         );
+        runtime.install_authentication(Arc::new(Authenticator));
         runtime.install_authorization(AuthorizationPolicy::new(Vec::new()).unwrap());
         assert!(!runtime.readiness().is_ready());
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();

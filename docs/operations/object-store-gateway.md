@@ -8,20 +8,20 @@ metadata and fallback reads.
 
 ## Security state
 
-Incoming provider authentication and authorization are tracked by issue #446
-and are not implemented. This has two enforced consequences:
+S3 SigV4 header and presigned authentication plus namespace authorization are
+available. Azure client authentication remains tracked by issue #494. This has
+the following enforced consequences:
 
 - `development` mode only binds loopback. It is suitable for an application
   sidecar in the same network namespace.
 - `production` mode can bind a routable address, but `/readyz` remains failing
   and provider requests return `503` until TLS, authentication, and
-  authorization are installed. Configuring the TLS certificate and key enables
-  a TLS 1.3-only listener, but authentication and authorization remain blocked
-  by #446.
+  authorization are installed. S3 requires both configuration files documented
+  below. Azure remains unready until #494 installs its authenticator.
 
-Do not add a Kubernetes Service, ingress, host port, or public load balancer to
-the current gateway. A client signature or SAS token is parsed only as protocol
-input; it is not yet proof of identity.
+Do not expose an Azure gateway through a Kubernetes Service, ingress, host port,
+or public load balancer. Only an S3 SigV4 identity that maps to an explicit
+allow grant can pass the production data plane.
 
 ## Credential boundary
 
@@ -31,7 +31,8 @@ with the process's origin identity.
 
 | Direction | Credential | Storage |
 |---|---|---|
-| Client to gateway | Not yet validated | Never logged or forwarded; #446 owns validation. |
+| Client to S3 gateway | SigV4 access key, optional STS token, or presigned query | Identity file mounted read-only; never logged or forwarded. |
+| Client to Azure gateway | Not yet validated | Never logged or forwarded; #494 owns validation. |
 | Gateway to S3 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` | Environment/secret injection only. |
 | Gateway to Azure | Exactly one of `TALON_GATEWAY_AZURE_SHARED_KEY` or `TALON_GATEWAY_AZURE_SAS` | Environment/secret injection only. |
 | Gateway to Talon | Coordinator and worker data-plane connection | Existing Talon cache-client boundary; mTLS integration is part of #446. |
@@ -62,6 +63,7 @@ Common variables:
 | `TALON_GATEWAY_TLS_RELOAD_MS` | `5000` | Last-good certificate/key reload interval. |
 | `TALON_GATEWAY_TLS_HANDSHAKE_TIMEOUT_MS` | `10000` | Maximum TLS handshake time per connection. |
 | `TALON_GATEWAY_TLS_MAX_HANDSHAKES` | `256` | Maximum concurrent pre-HTTP TLS handshakes. |
+| `TALON_GATEWAY_AUTHORIZATION_PATH` | unset | JSON allow-grant file. Required for production readiness. |
 
 The listener permits TLS 1.3 only and advertises HTTP/2 and HTTP/1.1. A bad
 rotation increments `talon_gateway_tls_events_total{event="reload_failure"}`
@@ -77,6 +79,50 @@ S3 variables:
 | `AWS_ACCESS_KEY_ID` | required | Scoped origin access key. |
 | `AWS_SECRET_ACCESS_KEY` | required | Scoped origin secret. |
 | `AWS_SESSION_TOKEN` | unset | Optional STS token. |
+| `TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH` | unset | JSON incoming identity file. Required for S3 production readiness. |
+| `TALON_GATEWAY_S3_MAX_CLOCK_SKEW_MS` | `900000` | Maximum header-signature clock skew and presigned grace. |
+
+The identity file is separate from the origin environment variables. Do not use
+the gateway's origin access key as a client identity in production:
+
+```json
+{
+  "identities": [
+    {
+      "access_key_id": "client-access-key",
+      "secret_access_key": "client-secret",
+      "session_token": "optional-sts-token",
+      "principal": "analytics-reader",
+      "provider_account": "tenant-a"
+    }
+  ]
+}
+```
+
+The authorization file is allow-only and defaults to deny. Prefixes are literal
+object-store prefixes; use a trailing slash when a path-like boundary is
+intended:
+
+```json
+{
+  "grants": [
+    {
+      "id": "tenant-a-datasets",
+      "principal": "analytics-reader",
+      "protocol": "s3",
+      "provider_account": "tenant-a",
+      "namespace": "datasets",
+      "prefix": "published/",
+      "operations": ["stat", "read", "list"]
+    }
+  ]
+}
+```
+
+SigV4 verification enforces the configured region, `s3` service, host,
+canonical URI/query/headers, timestamp or presigned expiry, payload declaration,
+and STS token. A present `x-talon-cache-mark` must be signed and syntactically
+valid. Invalid requests fail before cache or origin dispatch.
 
 Azure variables:
 
@@ -125,7 +171,8 @@ probe loopback with `exec` because kubelet HTTP probes target the Pod IP.
 | Symptom | Meaning | Action |
 |---|---|---|
 | `/healthz` fails | Process/runtime failure. | Restart and inspect bounded gateway logs. |
-| `/readyz` reports security reasons | Production security is incomplete. | Do not route traffic; complete #446. |
+| `/readyz` reports security reasons | Production security is incomplete. | Do not route traffic; install TLS, incoming identities, and authorization grants. |
+| S3 request returns `403` | Signature, expiry, identity, account, namespace, prefix, or operation was denied. | Check client time and non-secret policy identifiers; never log signatures or keys. |
 | `503` with `ServerBusy` or `ServiceUnavailable` | Origin unavailable, or cache fallback also unavailable. | Check origin reachability and scoped credentials; correlate `x-talon-request-id`. |
 | `504` / timeout error | Worker or request deadline elapsed. | Check worker saturation, placement freshness, and network latency. |
 | `412` | Origin ETag changed or a client condition failed. | Re-resolve metadata; do not retry stale cached bytes. |
