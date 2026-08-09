@@ -1,5 +1,8 @@
 # Talon
 
+[![CI](https://github.com/milvus-io/talon/actions/workflows/ci.yml/badge.svg)](https://github.com/milvus-io/talon/actions/workflows/ci.yml)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+
 **An object-store cache whose metadata does not grow with your data — so there
 is no scaling ceiling and no single point of failure.**
 
@@ -28,15 +31,35 @@ records, so the store stays bounded by the features you actually use rather
 than by how much data you keep.
 
 Reads never copy: `sendfile` from NVMe to socket, `splice` from socket to NVMe
-on fill, driven by io_uring. At 1024 concurrent connections that measures **26%
-more throughput and 17× lower p50 latency — on comparable CPU and 19% less
-memory** — than the same server on Tokio. Per-core throughput stays flat from 1
-to 16 rings, so 8 cores serve **108K rps** and adding cores adds throughput
-with nothing to tune
-([measurements](docs/explanation/data-plane-runtime.md)).
+on fill, driven by io_uring. On an 8-core worker that serves **189K reads/s —
+12.4 GB/s** of 64 KiB ranges, at which point **89% of the CPU is kernel time**
+and only 11% is Talon's own code. Across a real network the same worker
+saturates a **25 GbE link at 23.4 Gbps**, so on a cluster the NIC gives out
+before the cache does. Both numbers are published together, because a change
+that moves the loopback figure and not the cross-node one has not made anything
+faster ([how this is measured](BENCHMARKS.md)).
 
-Read it through a FUSE mount, or use the [Python](docs/clients/python.md) /
-[Java](docs/clients/java.md) SDKs when a mount isn't the right fit.
+Read it through a FUSE mount:
+
+```sh
+talon-fuse --mountpoint /mnt/talon \
+  --coordinator 127.0.0.1:7000 \
+  --namespace-prefix s3/training-data
+
+ls /mnt/talon                 # your bucket, as a directory tree
+```
+
+or skip the mount and use the [Python](docs/clients/python.md) /
+[Java](docs/clients/java.md) SDKs:
+
+```python
+import talon
+
+# block_size must match the workers' configured block size
+with talon.Client("coordinator-host:7000", block_size=8 << 20) as client:
+    chunk = client.read("s3://training-data/shard-0.parquet",
+                        offset=0, length=1 << 20)
+```
 
 **POSIX behaviour is measured, not asserted.** Against a real kernel mount,
 Talon passes **99.2% of pjdfstest** (8,731 of 8,798 assertions across 238 test
@@ -57,8 +80,9 @@ those 67 failures are that refusal and its cascade. **POSIX locking is likewise
 refused rather than faked** — `getlk`/`setlk` return `EOPNOTSUPP` instead of
 falling back to kernel-local locks that would look cluster-wide and not be.
 
-[![CI](https://github.com/milvus-io/talon/actions/workflows/ci.yml/badge.svg)](https://github.com/milvus-io/talon/actions/workflows/ci.yml)
-[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+**Status: v0.1, pre-1.0.** The APIs and on-disk layout may still change between
+releases. What is claimed above is measured and reproducible; what is not
+claimed yet is a stability guarantee.
 
 ## Quick start
 
@@ -122,15 +146,16 @@ Start with the section that matches what you're doing:
   builds the workspace, runs a cluster, and opens the management console;
   [DESIGN.md](DESIGN.md) explains what each component does, and
   [Data-plane runtime](docs/explanation/data-plane-runtime.md) covers the
-  zero-copy path and the io_uring measurements.
+  zero-copy path, the ring scaling tables, and why io_uring beats Tokio at high
+  connection counts (26% more throughput, 17× lower p50 at 1024 connections).
 - **Operating Talon** — [Operator runbook](docs/operations/runbook.md) (HA,
   etcd/Kubernetes backends, configuration, upgrades, alerts) and
   [security hardening](docs/operations/security.md).
 - **Understanding Talon** — [DESIGN.md](DESIGN.md) (v1 architecture and the
   decisions behind it) and the [architecture decision records](docs/adr/).
 - **Contributing** — [CONTRIBUTING.md](CONTRIBUTING.md) (build, test, submit
-  changes) and [BENCHMARKS.md](BENCHMARKS.md) (the benchmark harness, plus the
-  measured throughput ceilings on loopback and across the network).
+  changes) and [BENCHMARKS.md](BENCHMARKS.md) (the benchmark harness, the
+  measured throughput ceilings, and what was measured and rejected).
 
 ## Contributing
 

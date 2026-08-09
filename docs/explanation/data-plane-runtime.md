@@ -80,7 +80,7 @@ by hashing the TCP 4-tuple. There is no shared accept queue, no lock, and no
 thundering herd — a connection is assigned to a ring at accept time and stays
 there for its lifetime.
 
-Measured scaling on an 8-core host:
+Measured scaling on an 8-core host, one request in flight per connection:
 
 | rings | throughput | scaling | per-core |
 |---|---|---|---|
@@ -94,6 +94,33 @@ Per-core throughput is flat from 1 to 16 rings, which is the number that matters
 it means there is **no cross-ring contention** to amortise. The fall-off at 16 is
 SMT — this host has 8 physical cores, so the extra rings land on hyperthread
 siblings. The useful setting is one ring per *physical* core.
+
+**With requests pipelined per connection the picture changes**, and it is worth
+seeing both. Re-measured at depth 16, 64 connections, 64 KiB ranges:
+
+| rings | throughput | GB/s | scaling | per-core | worker CPU | kernel share |
+|---|---|---|---|---|---|---|
+| 1 | 51,718 rps | 3.39 | 1.00× | 51,718 | 1.00 | 88% |
+| 2 | 71,907 rps | 4.71 | 1.39× | 35,953 | 1.99 | 88% |
+| 4 | 138,144 rps | 9.05 | 2.67× | 34,536 | 3.98 | 88% |
+| **8** | **189,379 rps** | **12.41** | **3.66×** | 23,672 | 5.71 | 89% |
+
+Two things are different, and neither is a defect.
+
+**Absolute throughput is much higher** — 189K rps against 108K — because at depth
+1 each connection pays a round trip per request and the link idles between them.
+
+**Per-core throughput is no longer flat**, and the 8-ring point uses only 5.71 of
+8 cores rather than saturating them. That is not cross-ring contention appearing;
+it is the ceiling moving from *Talon* to the *kernel*. A single pipelined ring
+already spends 88% of its CPU in `sendfile` and the TCP stack, so adding rings
+adds contention for one shared network stack rather than for anything Talon owns.
+The system stops being CPU-bound before it runs out of cores.
+
+Read the first table for **scheduling efficiency** — it isolates Talon's own
+per-core cost — and the second for **achievable throughput**. And note that both
+are loopback; [what binds the serve path](#what-binds-the-serve-path-once-a-plane-is-chosen)
+below records what survives a real network, which is considerably less.
 
 ## What was measured and rejected
 
@@ -239,6 +266,11 @@ pipeline depth 16:
 | loopback | 167,278 | 11.0 | 87.7 |
 | **cross-node** | **44,662** | **2.93** | **23.4** |
 
+Both rows are 32 connections, so they are directly comparable to each other. The
+loopback peak is higher still — 189,379 rps at 64 connections across 8 rings, per
+the table above — which makes the cross-node share **24% of what the worker can
+do locally**.
+
 Two findings, and they point the same way.
 
 **On loopback, 85% of the worker's CPU is kernel time** — `sendfile` copying
@@ -248,8 +280,7 @@ of Talon's user-space work on the serve path would move total CPU by about 7%.
 Only changes that remove copies or syscalls act on the large share.
 
 **Across the network, the NIC binds first.** 23.4 Gbps against a 25 GbE link is
-the wire, saturated, at 27% of the loopback rate. On that cluster the worker is
-not the constraint at all.
+the wire, saturated. On that cluster the worker is not the constraint at all.
 
 The consequence for anyone optimising here: **a change that moves the loopback
 number but not the cross-node number has not made the deployed system faster.**
