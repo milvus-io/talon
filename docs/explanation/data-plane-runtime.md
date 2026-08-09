@@ -224,6 +224,51 @@ cargo bench -p talon-worker --bench dataplane_benches   # latency floor
 scripts/dataplane_loadtest.sh                           # concurrent sweep
 ```
 
+## What binds the serve path, once a plane is chosen
+
+The tables above compare the two planes against each other. They do not say what
+the ceiling is, or which resource reaches it first — and that turns out to
+decide which optimisations are worth attempting at all.
+
+Measured on a managed Kubernetes cluster (`Standard_E64ads_v5` class node, worker
+capped at 8 CPU by its cgroup), 64 KiB ranges, all cache hits, 32 connections at
+pipeline depth 16:
+
+| path | rps | GB/s | Gbps |
+|---|---|---|---|
+| loopback | 167,278 | 11.0 | 87.7 |
+| **cross-node** | **44,662** | **2.93** | **23.4** |
+
+Two findings, and they point the same way.
+
+**On loopback, 85% of the worker's CPU is kernel time** — `sendfile` copying
+bytes and the TCP stack — against 15% in Talon's own code, sampled from
+`utime`/`stime` in `/proc/<pid>/stat` across the measured window. Halving *all*
+of Talon's user-space work on the serve path would move total CPU by about 7%.
+Only changes that remove copies or syscalls act on the large share.
+
+**Across the network, the NIC binds first.** 23.4 Gbps against a 25 GbE link is
+the wire, saturated, at 27% of the loopback rate. On that cluster the worker is
+not the constraint at all.
+
+The consequence for anyone optimising here: **a change that moves the loopback
+number but not the cross-node number has not made the deployed system faster.**
+Loopback measures a component ceiling with the network taken out of the way; it
+is a useful instrument, not a capacity claim.
+
+Two results already follow from this. Pipelining — keeping requests in flight
+per connection rather than paying a round trip each — doubles cross-node
+throughput (22,315 → 44,592 rps), because it fills a link that was idling.
+Multiplexing, serving one connection's requests concurrently with out-of-order
+replies, was implemented and measured and **did not pay**: kernel time unchanged,
+user time up 12.6% for scheduling overhead, and max latency 99× worse, because
+two responses' bytes must never interleave and `sendfile` cannot be paused, so
+the write half must be held exclusively — reintroducing at the writer the
+serialisation it removes at the reader. It was not merged.
+
+[BENCHMARKS.md](../../BENCHMARKS.md) records the full tables, the method, and the
+conditions under which multiplexing could still be worth revisiting.
+
 ## Coexistence with Tokio
 
 Even on a ring, the worker is not Tokio-free, and the reason is worth stating.
