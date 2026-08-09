@@ -2,15 +2,19 @@
 
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use serde::Deserialize;
 use talon_backend::{AzureBackend, AzureConfig, ReqwestClient, S3Backend, S3Config, S3Credentials};
 use talon_cache_client::{BlockReader, CoordinatorClient, PlacementCache};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache};
 use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache};
+use talon_gateway::s3_auth::{S3ClientIdentity, S3SigV4Authenticator};
 use talon_gateway::{
-    serve, serve_tls, GatewayAdapter, GatewayConfig, GatewayMode, GatewayRoute, GatewayRuntime,
-    GatewaySecurity, GatewayTlsConfig,
+    serve, serve_tls, AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy,
+    GatewayAdapter, GatewayConfig, GatewayMode, GatewayOperation, GatewayRoute, GatewayRuntime,
+    GatewaySecurity, GatewayTlsConfig, ProviderProtocol,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -39,6 +43,9 @@ struct Settings {
     s3_access_key: Option<String>,
     s3_secret_key: Option<String>,
     s3_session_token: Option<String>,
+    s3_client_identities_path: Option<PathBuf>,
+    s3_max_clock_skew_ms: u64,
+    authorization_path: Option<PathBuf>,
     tls: Option<GatewayTlsConfig>,
 }
 
@@ -156,6 +163,15 @@ impl Settings {
             s3_access_key: value(&mut get, "AWS_ACCESS_KEY_ID"),
             s3_secret_key: value(&mut get, "AWS_SECRET_ACCESS_KEY"),
             s3_session_token: value(&mut get, "AWS_SESSION_TOKEN"),
+            s3_client_identities_path: value(&mut get, "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH")
+                .map(PathBuf::from),
+            s3_max_clock_skew_ms: parse_or(
+                value(&mut get, "TALON_GATEWAY_S3_MAX_CLOCK_SKEW_MS"),
+                "900000",
+                "TALON_GATEWAY_S3_MAX_CLOCK_SKEW_MS",
+            )?,
+            authorization_path: value(&mut get, "TALON_GATEWAY_AUTHORIZATION_PATH")
+                .map(PathBuf::from),
             tls,
         })
     }
@@ -328,6 +344,100 @@ fn s3_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
     )?))
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct S3IdentityFile {
+    identities: Vec<S3IdentityConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct S3IdentityConfig {
+    access_key_id: String,
+    secret_access_key: String,
+    session_token: Option<String>,
+    principal: String,
+    provider_account: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationFile {
+    grants: Vec<AuthorizationGrantConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuthorizationGrantConfig {
+    id: String,
+    principal: String,
+    protocol: String,
+    provider_account: String,
+    namespace: String,
+    prefix: Option<String>,
+    operations: Vec<String>,
+}
+
+fn load_s3_authenticator(
+    path: &Path,
+    region: &str,
+    max_clock_skew_ms: u64,
+) -> MainResult<S3SigV4Authenticator> {
+    let configured: S3IdentityFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let identities = configured
+        .identities
+        .into_iter()
+        .map(|identity| S3ClientIdentity {
+            access_key_id: identity.access_key_id,
+            secret_access_key: identity.secret_access_key,
+            session_token: identity.session_token,
+            principal: AuthenticatedPrincipal::new(identity.principal, identity.provider_account),
+        })
+        .collect();
+    Ok(S3SigV4Authenticator::new(
+        region,
+        identities,
+        std::time::Duration::from_millis(max_clock_skew_ms),
+    )?)
+}
+
+fn load_authorization(path: &Path) -> MainResult<AuthorizationPolicy> {
+    let configured: AuthorizationFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let grants = configured
+        .grants
+        .into_iter()
+        .map(|grant| {
+            let protocol = match grant.protocol.as_str() {
+                "s3" => ProviderProtocol::S3,
+                "azure" => ProviderProtocol::Azure,
+                _ => return Err(invalid("authorization grant protocol must be s3 or azure")),
+            };
+            let operations = grant
+                .operations
+                .into_iter()
+                .map(|operation| match operation.as_str() {
+                    "stat" => Ok(GatewayOperation::Stat),
+                    "read" => Ok(GatewayOperation::Read),
+                    "list" => Ok(GatewayOperation::List),
+                    "write" => Ok(GatewayOperation::Write),
+                    "delete" => Ok(GatewayOperation::Delete),
+                    _ => Err(invalid("authorization grant operation is invalid")),
+                })
+                .collect::<MainResult<Vec<_>>>()?;
+            Ok(AuthorizationGrant {
+                id: grant.id,
+                principal: grant.principal,
+                protocol,
+                provider_account: grant.provider_account,
+                namespace: grant.namespace,
+                prefix: grant.prefix,
+                operations,
+            })
+        })
+        .collect::<MainResult<Vec<_>>>()?;
+    Ok(AuthorizationPolicy::new(grants)?)
+}
+
 async fn shutdown_signal() {
     #[cfg(unix)]
     {
@@ -365,6 +475,22 @@ async fn main() -> MainResult<()> {
         adapter,
         GatewaySecurity::default(),
     )?);
+    if let Some(path) = &settings.s3_client_identities_path {
+        if settings.protocol != "s3" {
+            return Err(invalid(
+                "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH requires the s3 protocol",
+            ));
+        }
+        let region = settings.s3_region.as_deref().unwrap_or("us-east-1");
+        runtime.install_authentication(Arc::new(load_s3_authenticator(
+            path,
+            region,
+            settings.s3_max_clock_skew_ms,
+        )?));
+    }
+    if let Some(path) = &settings.authorization_path {
+        runtime.install_authorization(load_authorization(path)?);
+    }
     let listener = TcpListener::bind(settings.bind).await?;
     info!(
         bind = %settings.bind,
@@ -384,6 +510,7 @@ async fn main() -> MainResult<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tempfile::TempDir;
 
     fn settings(values: &[(&str, &str)]) -> MainResult<Settings> {
         let values = values
@@ -402,6 +529,9 @@ mod tests {
         assert_eq!(settings.route, GatewayRoute::Cache);
         assert!(!settings.incoming_path_style);
         assert!(settings.tls.is_none());
+        assert!(settings.s3_client_identities_path.is_none());
+        assert_eq!(settings.s3_max_clock_skew_ms, 900_000);
+        assert!(settings.authorization_path.is_none());
     }
 
     #[test]
@@ -483,5 +613,42 @@ mod tests {
         assert_eq!(tls.handshake_timeout, std::time::Duration::from_millis(900));
         assert_eq!(tls.max_concurrent_handshakes, 32);
         assert!(!format!("{tls:?}").contains("/tls/key.pem"));
+    }
+
+    #[test]
+    fn loads_separate_client_identity_and_authorization_files() {
+        let temp = TempDir::new().unwrap();
+        let identities = temp.path().join("identities.json");
+        let authorization = temp.path().join("authorization.json");
+        std::fs::write(
+            &identities,
+            r#"{
+                "identities": [{
+                    "access_key_id": "client-key",
+                    "secret_access_key": "client-secret",
+                    "principal": "reader",
+                    "provider_account": "tenant-a"
+                }]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &authorization,
+            r#"{
+                "grants": [{
+                    "id": "tenant-read",
+                    "principal": "reader",
+                    "protocol": "s3",
+                    "provider_account": "tenant-a",
+                    "namespace": "bucket-a",
+                    "prefix": "datasets/",
+                    "operations": ["stat", "read", "list"]
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        assert!(load_s3_authenticator(&identities, "us-east-1", 900_000).is_ok());
+        assert!(load_authorization(&authorization).is_ok());
     }
 }

@@ -8,10 +8,12 @@ mod metrics;
 mod model;
 mod runtime;
 pub mod s3;
+pub mod s3_auth;
 mod tls;
 
 pub use authorization::{
     AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy, AuthorizationPolicyError,
+    GatewayAuthenticationError, GatewayAuthenticator,
 };
 pub use cache_mark::{
     CacheFallback, CacheLookup, CacheMarkError, CachePopulation, EffectiveDecision,
