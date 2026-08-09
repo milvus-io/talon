@@ -110,6 +110,15 @@ Notes on running it:
   refuses to turn error frames into latency numbers and prints the first error
   verbatim.
 
+## Object-store gateway
+
+`just gateway-bench` measures the bounded HTTP runtime around controlled
+cache-client, worker, and origin delays, then streams a large object to a slow
+consumer while sampling RSS. Results and interpretation are in the
+[gateway benchmark reference](docs/reference/object-store-gateway-benchmarks.md).
+The harness emits JSON Lines and is a regression floor, not a cloud capacity
+claim.
+
 ## Where the serve path actually saturates
 
 The sweep above compares data planes against each other. It does not answer a

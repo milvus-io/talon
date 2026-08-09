@@ -302,6 +302,13 @@ jobs:
           file: deploy/docker/fuse.Dockerfile
           push: false
           cache-from: type=gha,scope=fuse
+      - name: Build gateway image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: deploy/docker/gateway.Dockerfile
+          push: false
+          cache-from: type=gha,scope=gateway
 
   helm:
     name: helm chart

@@ -1,0 +1,78 @@
+# Loopback-only S3 gateway sidecar template. The application container shares
+# the Pod network namespace and uses http://127.0.0.1:8080. Do not add a Service
+# before #446 installs incoming SigV4 authentication and bucket authorization.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: talon-gateway-s3
+type: Opaque
+stringData:
+  access-key-id: replace-me
+  secret-access-key: replace-me
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: application-with-talon-s3
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: application-with-talon-s3
+  template:
+    metadata:
+      labels:
+        app: application-with-talon-s3
+    spec:
+      containers:
+        - name: application
+          image: replace-with-your-application
+          env:
+            - name: AWS_ENDPOINT_URL_S3
+              value: http://127.0.0.1:8080
+        - name: talon-gateway
+          image: ghcr.io/milvus-io/talon-gateway:latest
+          env:
+            - name: TALON_GATEWAY_PROTOCOL
+              value: s3
+            - name: TALON_GATEWAY_BIND
+              value: 127.0.0.1:8080
+            - name: TALON_GATEWAY_MODE
+              value: development
+            - name: TALON_GATEWAY_PATH_STYLE
+              value: "true"
+            - name: TALON_COORDINATOR_ADDR
+              value: talon-coordinator:7411
+            - name: TALON_GATEWAY_S3_REGION
+              value: us-east-1
+            - name: AWS_ACCESS_KEY_ID
+              valueFrom:
+                secretKeyRef:
+                  name: talon-gateway-s3
+                  key: access-key-id
+            - name: AWS_SECRET_ACCESS_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: talon-gateway-s3
+                  key: secret-access-key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 10001
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          readinessProbe:
+            exec:
+              command: ["curl", "-fsS", "http://127.0.0.1:8080/readyz"]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+            periodSeconds: 10

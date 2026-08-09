@@ -10,7 +10,7 @@ name: Release images
 # guaranteed its own sha-* image. A version tag (vX.Y.Z) additionally
 # publishes semver and major.minor tags; `latest` tracks main only, so a tag
 # publish racing a main publish can never leave `latest` mixed across the
-# three images. Pull requests do NOT run this workflow — the docker-build job
+# images. Pull requests do NOT run this workflow — the docker-build job
 # in ci.yml already smoke-builds every image (no push).
 
 on:
@@ -46,6 +46,8 @@ jobs:
             dockerfile: deploy/docker/worker.Dockerfile
           - image: fuse
             dockerfile: deploy/docker/fuse.Dockerfile
+          - image: gateway
+            dockerfile: deploy/docker/gateway.Dockerfile
     steps:
       - uses: actions/checkout@v4
 

@@ -67,3 +67,7 @@ boto3 and the MinIO SDK. It covers cold and warm reads, exact ranges, URL
 encoding, conditions, presigned URLs, listing pagination and delimiters, and
 standard errors. Arrow-compatible signed HEAD and ranged GET fixtures run in
 the same test.
+
+See the [deployment and failure runbook](../operations/object-store-gateway.md)
+and [gateway benchmark results](object-store-gateway-benchmarks.md) for the
+operational boundary around this matrix.

@@ -5,6 +5,11 @@ stateless replicas behind one Service, with a user-selected shared-state
 backend. Pick **exactly one** coordinator Deployment (Kubernetes Lease *or*
 external etcd); deploying both is a misconfiguration.
 
+The object-store gateway has loopback-only sidecar templates for
+[S3](gateway-s3-sidecar.yaml) and [Azure Blob](gateway-azure-sidecar.yaml).
+They intentionally have no Service until incoming provider authentication and
+authorization are implemented in issue #446.
+
 ## Files
 
 | File | Purpose |
@@ -17,6 +22,8 @@ external etcd); deploying both is a misconfiguration.
 | `rbac.yaml` | Least-privilege namespaced Lease RBAC. **Kubernetes backend only.** |
 | `etcd-secret.example.yaml` | Template Secret for etcd endpoints/credentials/TLS and the optional management token. **etcd backend only.** |
 | `servicemonitor.yaml` | Prometheus Operator ServiceMonitor (or use the pod scrape annotations). |
+| `gateway-s3-sidecar.yaml` | Loopback-only S3 gateway sidecar template. |
+| `gateway-azure-sidecar.yaml` | Loopback-only Azure Blob gateway sidecar template. |
 
 ## Quick start — Kubernetes Lease backend
 

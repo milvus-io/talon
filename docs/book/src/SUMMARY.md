@@ -28,6 +28,7 @@
 - [Cloud backends (S3/GCS/Azure)](./operations/cloud-backends.md)
 - [Security hardening](./operations/security.md)
 - [Latency lab](./testing/latency-lab.md)
+- [Object-store gateway deployment](./operations/object-store-gateway.md)
 
 # Client SDKs
 
@@ -42,6 +43,7 @@
 - [REST API reference](./reference/rest-api.md)
 - [Wire protocol reference](./reference/wire-protocol.md)
 - [Object-store gateway compatibility](./reference/object-store-gateway-compatibility.md)
+- [Object-store gateway benchmarks](./reference/object-store-gateway-benchmarks.md)
 
 # Explanation
 
