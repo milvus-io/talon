@@ -2,6 +2,7 @@
 
 mod authorization;
 pub mod azure;
+pub mod azure_auth;
 mod cache_mark;
 mod config;
 mod metrics;

@@ -8,20 +8,18 @@ metadata and fallback reads.
 
 ## Security state
 
-S3 SigV4 header and presigned authentication plus namespace authorization are
-available. Azure client authentication remains tracked by issue #494. This has
-the following enforced consequences:
+S3 SigV4 and Azure Shared Key/SAS authentication plus namespace authorization
+are available. This has the following enforced consequences:
 
 - `development` mode only binds loopback. It is suitable for an application
   sidecar in the same network namespace.
 - `production` mode can bind a routable address, but `/readyz` remains failing
   and provider requests return `503` until TLS, authentication, and
   authorization are installed. S3 requires both configuration files documented
-  below. Azure remains unready until #494 installs its authenticator.
+  below.
 
-Do not expose an Azure gateway through a Kubernetes Service, ingress, host port,
-or public load balancer. Only an S3 SigV4 identity that maps to an explicit
-allow grant can pass the production data plane.
+Only a validated provider identity that maps to an explicit allow grant can
+pass the production data plane.
 
 ## Credential boundary
 
@@ -32,7 +30,7 @@ with the process's origin identity.
 | Direction | Credential | Storage |
 |---|---|---|
 | Client to S3 gateway | SigV4 access key, optional STS token, or presigned query | Identity file mounted read-only; never logged or forwarded. |
-| Client to Azure gateway | Not yet validated | Never logged or forwarded; #494 owns validation. |
+| Client to Azure gateway | Shared Key, service SAS, or account SAS | Identity file mounted read-only; never logged or forwarded. |
 | Gateway to S3 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` | Environment/secret injection only. |
 | Gateway to Azure | Exactly one of `TALON_GATEWAY_AZURE_SHARED_KEY` or `TALON_GATEWAY_AZURE_SAS` | Environment/secret injection only. |
 | Gateway to Talon | Coordinator and worker data-plane connection | Existing Talon cache-client boundary; mTLS integration is part of #446. |
@@ -132,6 +130,31 @@ Azure variables:
 | `TALON_GATEWAY_AZURE_ENDPOINT` | public Azure | Optional `http[s]://host[:port]`; custom endpoints use path addressing. |
 | `TALON_GATEWAY_AZURE_SHARED_KEY` | unset | Base64 account key. Mutually exclusive with SAS. |
 | `TALON_GATEWAY_AZURE_SAS` | unset | Origin SAS without logging or serialization. |
+| `TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH` | unset | JSON incoming account-key identity file. Required for Azure production readiness. |
+| `TALON_GATEWAY_AZURE_MAX_CLOCK_SKEW_MS` | `900000` | Maximum Shared Key clock skew and SAS start/expiry grace. |
+
+Azure client keys are also separate from the origin credential. Each key maps
+to the one account served by the process and to one policy principal:
+
+```json
+{
+  "identities": [
+    {
+      "account_key": "base64-client-account-key",
+      "principal": "analytics-reader",
+      "provider_account": "storage-account-a"
+    }
+  ]
+}
+```
+
+The verifier accepts full Shared Key plus service/account SAS for Blob service
+reads and listings. It enforces signature scope, permissions, resource type,
+protocol, start, expiry, and bounded skew. Stored access policies, signed IP
+ranges, encryption scopes, and user-delegation SAS fail closed because this
+gateway cannot independently enforce those external constraints. Shared Key
+signs `x-ms-talon-cache-mark` through Azure canonicalized headers; SAS requests
+carrying a cache mark are rejected because SAS cannot bind custom headers.
 
 ## Docker
 

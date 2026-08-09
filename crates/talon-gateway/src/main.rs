@@ -9,6 +9,7 @@ use serde::Deserialize;
 use talon_backend::{AzureBackend, AzureConfig, ReqwestClient, S3Backend, S3Config, S3Credentials};
 use talon_cache_client::{BlockReader, CoordinatorClient, PlacementCache};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache};
+use talon_gateway::azure_auth::{AzureClientIdentity, AzureStorageAuthenticator};
 use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache};
 use talon_gateway::s3_auth::{S3ClientIdentity, S3SigV4Authenticator};
 use talon_gateway::{
@@ -38,6 +39,8 @@ struct Settings {
     azure_endpoint: Option<String>,
     azure_shared_key: Option<String>,
     azure_sas: Option<String>,
+    azure_client_identities_path: Option<PathBuf>,
+    azure_max_clock_skew_ms: u64,
     s3_region: Option<String>,
     s3_endpoint: Option<String>,
     s3_access_key: Option<String>,
@@ -158,6 +161,16 @@ impl Settings {
             azure_endpoint: value(&mut get, "TALON_GATEWAY_AZURE_ENDPOINT"),
             azure_shared_key: value(&mut get, "TALON_GATEWAY_AZURE_SHARED_KEY"),
             azure_sas: value(&mut get, "TALON_GATEWAY_AZURE_SAS"),
+            azure_client_identities_path: value(
+                &mut get,
+                "TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH",
+            )
+            .map(PathBuf::from),
+            azure_max_clock_skew_ms: parse_or(
+                value(&mut get, "TALON_GATEWAY_AZURE_MAX_CLOCK_SKEW_MS"),
+                "900000",
+                "TALON_GATEWAY_AZURE_MAX_CLOCK_SKEW_MS",
+            )?,
             s3_region: value(&mut get, "TALON_GATEWAY_S3_REGION"),
             s3_endpoint: value(&mut get, "TALON_GATEWAY_S3_ENDPOINT"),
             s3_access_key: value(&mut get, "AWS_ACCESS_KEY_ID"),
@@ -362,6 +375,20 @@ struct S3IdentityConfig {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+struct AzureIdentityFile {
+    identities: Vec<AzureIdentityConfig>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AzureIdentityConfig {
+    account_key: String,
+    principal: String,
+    provider_account: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 struct AuthorizationFile {
     grants: Vec<AuthorizationGrantConfig>,
 }
@@ -398,6 +425,29 @@ fn load_s3_authenticator(
         region,
         identities,
         std::time::Duration::from_millis(max_clock_skew_ms),
+    )?)
+}
+
+fn load_azure_authenticator(
+    path: &Path,
+    account: &str,
+    max_clock_skew_ms: u64,
+    transport_https: bool,
+) -> MainResult<AzureStorageAuthenticator> {
+    let configured: AzureIdentityFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let identities = configured
+        .identities
+        .into_iter()
+        .map(|identity| AzureClientIdentity {
+            account_key: identity.account_key,
+            principal: AuthenticatedPrincipal::new(identity.principal, identity.provider_account),
+        })
+        .collect();
+    Ok(AzureStorageAuthenticator::new(
+        account,
+        identities,
+        std::time::Duration::from_millis(max_clock_skew_ms),
+        transport_https,
     )?)
 }
 
@@ -488,6 +538,23 @@ async fn main() -> MainResult<()> {
             settings.s3_max_clock_skew_ms,
         )?));
     }
+    if let Some(path) = &settings.azure_client_identities_path {
+        if settings.protocol != "azure" {
+            return Err(invalid(
+                "TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH requires the azure protocol",
+            ));
+        }
+        let account = settings
+            .azure_account
+            .as_deref()
+            .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
+        runtime.install_authentication(Arc::new(load_azure_authenticator(
+            path,
+            account,
+            settings.azure_max_clock_skew_ms,
+            settings.tls.is_some(),
+        )?));
+    }
     if let Some(path) = &settings.authorization_path {
         runtime.install_authorization(load_authorization(path)?);
     }
@@ -532,6 +599,8 @@ mod tests {
         assert!(settings.s3_client_identities_path.is_none());
         assert_eq!(settings.s3_max_clock_skew_ms, 900_000);
         assert!(settings.authorization_path.is_none());
+        assert!(settings.azure_client_identities_path.is_none());
+        assert_eq!(settings.azure_max_clock_skew_ms, 900_000);
     }
 
     #[test]
@@ -619,6 +688,7 @@ mod tests {
     fn loads_separate_client_identity_and_authorization_files() {
         let temp = TempDir::new().unwrap();
         let identities = temp.path().join("identities.json");
+        let azure_identities = temp.path().join("azure-identities.json");
         let authorization = temp.path().join("authorization.json");
         std::fs::write(
             &identities,
@@ -628,6 +698,17 @@ mod tests {
                     "secret_access_key": "client-secret",
                     "principal": "reader",
                     "provider_account": "tenant-a"
+                }]
+            }"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &azure_identities,
+            r#"{
+                "identities": [{
+                    "account_key": "MDEyMzQ1Njc4OWFiY2RlZg==",
+                    "principal": "azure-reader",
+                    "provider_account": "account-a"
                 }]
             }"#,
         )
@@ -649,6 +730,7 @@ mod tests {
         .unwrap();
 
         assert!(load_s3_authenticator(&identities, "us-east-1", 900_000).is_ok());
+        assert!(load_azure_authenticator(&azure_identities, "account-a", 900_000, true).is_ok());
         assert!(load_authorization(&authorization).is_ok());
     }
 }
