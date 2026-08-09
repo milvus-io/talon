@@ -1,12 +1,11 @@
 //! Axum server, lifecycle middleware, operational endpoints, and limits.
 
 use std::future::{Future, IntoFuture};
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
 use axum::body::Body;
-use axum::extract::{Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -19,6 +18,7 @@ use tokio::net::TcpListener;
 use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutBody;
 
+use crate::audit::{GatewayAuditSink, SecurityAuditEvent, TracingAuditSink};
 use crate::authorization::{AuthenticatedPrincipal, AuthorizationPolicy, GatewayAuthenticator};
 use crate::config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
 use crate::metrics::{GatewayMetrics, RequestObservation, ResponseObserver};
@@ -26,7 +26,7 @@ use crate::model::{
     FailureReason, GatewayAdapter, GatewayOperation, GatewayOutcome, GatewayRequestContext,
     GatewayResponse, GatewayRoute,
 };
-use crate::tls::{GatewayTlsConfig, GatewayTlsError, GatewayTlsListener};
+use crate::tls::{GatewayConnectionInfo, GatewayTlsConfig, GatewayTlsError, GatewayTlsListener};
 
 /// Opaque request ID emitted by the shared core and translated by adapters.
 pub const REQUEST_ID_HEADER: &str = "x-talon-request-id";
@@ -120,6 +120,7 @@ pub struct GatewayRuntime {
     metrics: GatewayMetrics,
     authorization: RwLock<Option<AuthorizationPolicy>>,
     authentication: RwLock<Option<Arc<dyn GatewayAuthenticator>>>,
+    audit: RwLock<Arc<dyn GatewayAuditSink>>,
 }
 
 impl GatewayRuntime {
@@ -145,6 +146,7 @@ impl GatewayRuntime {
             metrics: GatewayMetrics::new(),
             authorization: RwLock::new(None),
             authentication: RwLock::new(None),
+            audit: RwLock::new(Arc::new(TracingAuditSink)),
         })
     }
 
@@ -170,6 +172,20 @@ impl GatewayRuntime {
         *self.authentication.write().unwrap() = Some(authenticator);
         let mut security = self.readiness.security.write().unwrap();
         security.authentication = true;
+    }
+
+    /// Install a security audit destination.
+    pub fn install_audit_sink(&self, sink: Arc<dyn GatewayAuditSink>) {
+        *self.audit.write().unwrap() = sink;
+    }
+
+    fn enable_mtls_authentication(&self) {
+        self.readiness.security.write().unwrap().authentication = true;
+    }
+
+    fn audit(&self, event: SecurityAuditEvent) {
+        let sink = self.audit.read().unwrap().clone();
+        sink.record(event);
     }
 }
 
@@ -201,42 +217,12 @@ pub async fn serve(
     runtime: Arc<GatewayRuntime>,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> std::io::Result<()> {
-    serve_listener(listener, runtime, shutdown).await
-}
-
-/// Serve HTTPS with reloadable TLS 1.3 material.
-pub async fn serve_tls(
-    listener: TcpListener,
-    runtime: Arc<GatewayRuntime>,
-    tls: GatewayTlsConfig,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> Result<(), GatewayTlsServeError> {
-    let listener = GatewayTlsListener::load(listener, tls, runtime.metrics().clone())?;
-    runtime.readiness.set_tls_ready(true);
-    serve_listener(listener, runtime, shutdown).await?;
-    Ok(())
-}
-
-async fn serve_listener<L>(
-    listener: L,
-    runtime: Arc<GatewayRuntime>,
-    shutdown: impl Future<Output = ()> + Send + 'static,
-) -> std::io::Result<()>
-where
-    L: axum::serve::Listener<Addr = SocketAddr>,
-{
-    let local = listener.local_addr()?;
-    if runtime.config.mode == GatewayMode::Development && !local.ip().is_loopback() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "development gateway listener is not loopback",
-        ));
-    }
-
+    ensure_listener_allowed(&listener, &runtime)?;
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let server = axum::serve(
         listener,
-        gateway_router(Arc::clone(&runtime)).into_make_service(),
+        gateway_router(Arc::clone(&runtime))
+            .into_make_service_with_connect_info::<GatewayConnectionInfo>(),
     )
     .with_graceful_shutdown(async move {
         let _ = shutdown_rx.await;
@@ -261,6 +247,67 @@ where
     }
 }
 
+/// Serve HTTPS with reloadable TLS 1.3 material.
+pub async fn serve_tls(
+    listener: TcpListener,
+    runtime: Arc<GatewayRuntime>,
+    tls: GatewayTlsConfig,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), GatewayTlsServeError> {
+    ensure_listener_allowed(&listener, &runtime)?;
+    let mtls_required = tls
+        .client_auth
+        .as_ref()
+        .is_some_and(|config| config.mode == crate::GatewayClientAuthMode::Required);
+    let listener = GatewayTlsListener::load(listener, tls, runtime.metrics().clone())?;
+    runtime.readiness.set_tls_ready(true);
+    if mtls_required {
+        runtime.enable_mtls_authentication();
+    }
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+    let server = axum::serve(
+        listener,
+        gateway_router(Arc::clone(&runtime))
+            .into_make_service_with_connect_info::<GatewayConnectionInfo>(),
+    )
+    .with_graceful_shutdown(async move {
+        let _ = shutdown_rx.await;
+    })
+    .into_future();
+    tokio::pin!(server);
+    tokio::pin!(shutdown);
+
+    let result = tokio::select! {
+        result = &mut server => result,
+        () = &mut shutdown => {
+            runtime.readiness.begin_shutdown();
+            let _ = shutdown_tx.send(());
+            match tokio::time::timeout(runtime.config.graceful_shutdown_timeout, &mut server).await {
+                Ok(result) => result,
+                Err(_) => Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "gateway graceful shutdown timed out",
+                )),
+            }
+        }
+    };
+    result.map_err(GatewayTlsServeError::Io)
+}
+
+fn ensure_listener_allowed(
+    listener: &TcpListener,
+    runtime: &GatewayRuntime,
+) -> std::io::Result<()> {
+    let local = listener.local_addr()?;
+    if runtime.config.mode == GatewayMode::Development && !local.ip().is_loopback() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "development gateway listener is not loopback",
+        ));
+    }
+    Ok(())
+}
+
 /// HTTPS startup or serving failure.
 #[derive(Debug, thiserror::Error)]
 pub enum GatewayTlsServeError {
@@ -282,34 +329,67 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
     let remaining = runtime.config.request_deadline.saturating_sub(elapsed);
     let protocol = runtime.adapter.protocol();
     let authenticator = runtime.authentication.read().unwrap().clone();
-    let authenticated = match authenticator {
-        Some(authenticator) => match authenticator.authenticate(&request, protocol) {
-            Ok(principal) => {
-                runtime.metrics.record_authentication("success");
-                Some(principal)
-            }
-            Err(_) => {
-                runtime.metrics.record_authentication("failure");
-                let result = GatewayResponse {
-                    response: (StatusCode::FORBIDDEN, "request authentication failed")
-                        .into_response(),
-                    operation: GatewayOperation::Unsupported,
-                    target: None,
-                    route: GatewayRoute::None,
-                    outcome: GatewayOutcome::Failed,
-                    failure: Some(FailureReason::Authentication),
-                    requested_bytes: 0,
-                    cache_bytes: 0,
-                    origin_bytes: 0,
-                };
-                return record_adapter_result(&runtime, protocol, &context, result);
-            }
-        },
-        None => request
-            .extensions()
-            .get::<AuthenticatedPrincipal>()
-            .cloned(),
+    let mtls_principal = request
+        .extensions()
+        .get::<ConnectInfo<GatewayConnectionInfo>>()
+        .and_then(|info| info.0.principal().cloned());
+    let direct_principal = request
+        .extensions()
+        .get::<AuthenticatedPrincipal>()
+        .cloned();
+    let credential_present = provider_credential_present(&request, protocol);
+    if credential_present && authenticator.is_none() && mtls_principal.is_some() {
+        return authentication_failure(
+            &runtime,
+            protocol,
+            &context,
+            &request,
+            mtls_principal.as_ref(),
+            "provider_authenticator_missing",
+        );
+    }
+    let credential_principal = authenticator.as_ref().and_then(|authenticator| {
+        credential_present.then(|| authenticator.authenticate(&request, protocol))
+    });
+    let authenticated = match (credential_principal, mtls_principal.clone()) {
+        (Some(Ok(credential)), Some(mtls)) if credential == mtls => Some(credential),
+        (Some(Ok(credential)), None) => Some(credential),
+        (None, Some(mtls)) => Some(mtls),
+        (None, None) if authenticator.is_none() => direct_principal,
+        (None, None) => {
+            return authentication_failure(
+                &runtime,
+                protocol,
+                &context,
+                &request,
+                None,
+                "missing_credentials",
+            );
+        }
+        (Some(Err(_)), _) => {
+            return authentication_failure(
+                &runtime,
+                protocol,
+                &context,
+                &request,
+                mtls_principal.as_ref(),
+                "provider_credential_rejected",
+            );
+        }
+        (Some(Ok(_)), Some(_)) => {
+            return authentication_failure(
+                &runtime,
+                protocol,
+                &context,
+                &request,
+                mtls_principal.as_ref(),
+                "identity_mismatch",
+            );
+        }
     };
+    if credential_present || mtls_principal.is_some() {
+        runtime.metrics.record_authentication("success");
+    }
     let policy = runtime.authorization.read().unwrap().clone();
     if let Some(policy) = policy {
         let access = match runtime.adapter.access(&request, &context) {
@@ -320,13 +400,18 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
             !policy.allows(principal, protocol, &access)
         }) {
             runtime.metrics.record_authorization("deny");
-            tracing::warn!(
-                request_id = context.request_id,
-                protocol = protocol.label(),
-                operation = access.operation.label(),
-                decision = "deny",
-                "gateway authorization decision"
-            );
+            runtime.audit(SecurityAuditEvent::new(
+                &context.request_id,
+                protocol,
+                authenticated.as_ref(),
+                Some(&access),
+                "deny",
+                if authenticated.is_some() {
+                    "policy_denied"
+                } else {
+                    "missing_identity"
+                },
+            ));
             let result = GatewayResponse {
                 response: (StatusCode::FORBIDDEN, "request is not authorized").into_response(),
                 operation: access.operation,
@@ -341,13 +426,14 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
             return record_adapter_result(&runtime, protocol, &context, result);
         }
         runtime.metrics.record_authorization("allow");
-        tracing::info!(
-            request_id = context.request_id,
-            protocol = protocol.label(),
-            operation = access.operation.label(),
-            decision = "allow",
-            "gateway authorization decision"
-        );
+        runtime.audit(SecurityAuditEvent::new(
+            &context.request_id,
+            protocol,
+            authenticated.as_ref(),
+            Some(&access),
+            "allow",
+            "policy_allowed",
+        ));
     }
     let result =
         match tokio::time::timeout(remaining, runtime.adapter.handle(request, context.clone()))
@@ -372,6 +458,56 @@ async fn adapter_handler(State(runtime): State<Arc<GatewayRuntime>>, request: Re
         };
 
     record_adapter_result(&runtime, protocol, &context, result)
+}
+
+fn provider_credential_present(request: &Request, protocol: crate::ProviderProtocol) -> bool {
+    if request.headers().contains_key(header::AUTHORIZATION) {
+        return true;
+    }
+    request.uri().query().is_some_and(|query| {
+        url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| match protocol {
+            crate::ProviderProtocol::S3 => {
+                key.eq_ignore_ascii_case("x-amz-algorithm")
+                    || key.eq_ignore_ascii_case("x-amz-signature")
+                    || key.eq_ignore_ascii_case("x-amz-credential")
+            }
+            crate::ProviderProtocol::Azure => key.eq_ignore_ascii_case("sig"),
+        })
+    })
+}
+
+fn authentication_failure(
+    runtime: &GatewayRuntime,
+    protocol: crate::ProviderProtocol,
+    context: &GatewayRequestContext,
+    request: &Request,
+    principal: Option<&AuthenticatedPrincipal>,
+    reason: &'static str,
+) -> Response {
+    runtime.metrics.record_authentication("failure");
+    let access = runtime.adapter.access(request, context).ok();
+    runtime.audit(SecurityAuditEvent::new(
+        &context.request_id,
+        protocol,
+        principal,
+        access.as_ref(),
+        "deny",
+        reason,
+    ));
+    let result = GatewayResponse {
+        response: (StatusCode::FORBIDDEN, "request authentication failed").into_response(),
+        operation: access
+            .as_ref()
+            .map_or(GatewayOperation::Unsupported, |access| access.operation),
+        target: access.map(|access| access.target),
+        route: GatewayRoute::None,
+        outcome: GatewayOutcome::Failed,
+        failure: Some(FailureReason::Authentication),
+        requested_bytes: 0,
+        cache_bytes: 0,
+        origin_bytes: 0,
+    };
+    record_adapter_result(runtime, protocol, context, result)
 }
 
 fn record_adapter_result(
@@ -654,6 +790,7 @@ async fn metrics_handler(State(runtime): State<Arc<GatewayRuntime>>) -> Response
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use async_trait::async_trait;
     use axum::body::to_bytes;
@@ -663,13 +800,22 @@ mod tests {
     use tower::ServiceExt;
 
     use crate::{
-        AuthorizationGrant, GatewayAccess, GatewayAuthenticationError, GatewayAuthenticator,
-        GatewayTarget,
+        AuthorizationGrant, GatewayAccess, GatewayAuditSink, GatewayAuthenticationError,
+        GatewayAuthenticator, GatewayTarget, SecurityAuditEvent,
     };
 
     struct StaticAuthenticator;
 
     struct RejectingAuthenticator;
+
+    #[derive(Default)]
+    struct CapturingAuditSink(Mutex<Vec<SecurityAuditEvent>>);
+
+    impl GatewayAuditSink for CapturingAuditSink {
+        fn record(&self, event: SecurityAuditEvent) {
+            self.0.lock().unwrap().push(event);
+        }
+    }
 
     impl GatewayAuthenticator for StaticAuthenticator {
         fn authenticate(
@@ -812,7 +958,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        let mut request = HttpRequest::get("/object").body(Body::empty()).unwrap();
+        let mut request = HttpRequest::get("/object")
+            .header(header::AUTHORIZATION, "test")
+            .body(Body::empty())
+            .unwrap();
         request
             .extensions_mut()
             .insert(AuthenticatedPrincipal::new("principal-a", "account-a"));
@@ -841,6 +990,8 @@ mod tests {
             }])
             .unwrap(),
         );
+        let audit = Arc::new(CapturingAuditSink::default());
+        runtime.install_audit_sink(audit.clone());
         let app = gateway_router(Arc::clone(&runtime));
 
         let response = app
@@ -882,6 +1033,17 @@ mod tests {
         assert!(!metrics.contains("object-secret"));
         assert!(!metrics.contains("principal-a"));
         assert!(!metrics.contains("account-a"));
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].decision, "deny");
+        assert_eq!(events[1].decision, "deny");
+        assert_eq!(events[2].decision, "allow");
+        for event in events.iter() {
+            let rendered = format!("{event:?}");
+            assert!(!rendered.contains("object-secret"));
+            assert!(!rendered.contains("principal-a"));
+            assert!(!rendered.contains("account-a"));
+        }
     }
 
     #[tokio::test]
@@ -910,6 +1072,45 @@ mod tests {
         assert!(metrics.contains("result=\"failure\""));
         assert!(!metrics.contains("secret-object"));
         assert!(!metrics.contains("spoofed"));
+    }
+
+    #[tokio::test]
+    async fn provider_and_mtls_identity_mismatch_fails_before_dispatch() {
+        let adapter = TestAdapter::immediate();
+        let runtime = runtime_with(
+            GatewayConfig::default(),
+            adapter.clone(),
+            GatewaySecurity::default(),
+        );
+        runtime.install_authentication(Arc::new(StaticAuthenticator));
+        let audit = Arc::new(CapturingAuditSink::default());
+        runtime.install_audit_sink(audit.clone());
+        let app = gateway_router(runtime);
+        let mut request = HttpRequest::get("/secret-object")
+            .header(header::AUTHORIZATION, "test")
+            .body(Body::empty())
+            .unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("provider-reader", "account-a"));
+        request
+            .extensions_mut()
+            .insert(ConnectInfo(GatewayConnectionInfo::authenticated(
+                "127.0.0.1:12345".parse().unwrap(),
+                AuthenticatedPrincipal::new("mtls-reader", "account-a"),
+            )));
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(adapter.calls.load(Ordering::SeqCst), 0);
+        let events = audit.0.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].reason, "identity_mismatch");
+        let rendered = format!("{:?}", events[0]);
+        assert!(!rendered.contains("provider-reader"));
+        assert!(!rendered.contains("mtls-reader"));
+        assert!(!rendered.contains("secret-object"));
     }
 
     #[tokio::test]
