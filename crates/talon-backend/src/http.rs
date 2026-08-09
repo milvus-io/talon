@@ -8,7 +8,10 @@
 //! asserts on the constructed [`HttpRequest`].
 
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures::Stream;
 use std::path::Path;
+use std::pin::Pin;
 
 /// An HTTP method (only the verbs the backends need).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,31 @@ pub struct HttpResponse {
     pub headers: Vec<(String, String)>,
     /// Response body (empty for HEAD).
     pub body: bytes::Bytes,
+}
+
+/// Streaming HTTP response used when buffering an object body is not allowed.
+pub struct HttpStreamResponse {
+    /// HTTP status code.
+    pub status: u16,
+    /// Response headers.
+    pub headers: Vec<(String, String)>,
+    /// Demand-driven response body chunks.
+    pub body: Pin<Box<dyn Stream<Item = Result<Bytes, String>> + Send>>,
+}
+
+impl HttpStreamResponse {
+    /// Look up the first response header value (case-insensitive).
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value.as_str())
+    }
+
+    /// Whether the status is in the 2xx range.
+    pub fn is_success(&self) -> bool {
+        (200..300).contains(&self.status)
+    }
 }
 
 impl HttpResponse {
@@ -219,6 +247,19 @@ pub trait HttpClient: Send + Sync {
     /// Execute `req` and return the response, or an error string on transport
     /// failure (DNS/connect/timeout).
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, String>;
+
+    /// Execute without buffering the response body.
+    ///
+    /// The compatibility default converts an existing buffered implementation
+    /// into one chunk. Network clients must override this for object gateways.
+    async fn execute_stream(&self, req: HttpRequest) -> Result<HttpStreamResponse, String> {
+        let response = self.execute(req).await?;
+        Ok(HttpStreamResponse {
+            status: response.status,
+            headers: response.headers,
+            body: Box::pin(futures::stream::once(async move { Ok(response.body) })),
+        })
+    }
 
     /// Execute a request whose body is streamed from `path`.
     ///

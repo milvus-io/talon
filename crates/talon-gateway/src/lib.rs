@@ -1,5 +1,6 @@
 //! Provider-neutral, bounded HTTP runtime shared by Talon's object-store gateways.
 
+pub mod azure;
 mod config;
 mod metrics;
 mod model;

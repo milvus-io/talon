@@ -9,10 +9,15 @@ description = "Shared bounded HTTP runtime for Talon object-store gateways"
 
 [dependencies]
 talon-core.workspace = true
+talon-backend = { path = "../talon-backend" }
+talon-cache-client.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+bytes.workspace = true
 futures.workspace = true
 http-body-util.workspace = true
+httpdate.workspace = true
+percent-encoding.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -20,6 +25,4 @@ tokio.workspace = true
 tower.workspace = true
 tower-http.workspace = true
 tracing.workspace = true
-
-[dev-dependencies]
-bytes.workspace = true
+url.workspace = true

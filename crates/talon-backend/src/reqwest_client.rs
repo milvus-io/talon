@@ -12,11 +12,12 @@
 //! client does no signing of its own.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use std::path::Path;
 use tokio::io::AsyncReadExt;
 use tokio_util::io::ReaderStream;
 
-use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
+use crate::http::{HttpClient, HttpRequest, HttpResponse, HttpStreamResponse, Method};
 
 /// Cap on establishing a TCP+TLS connection. Independent of transfer size, so a
 /// slow connect always indicates a fault rather than a large object.
@@ -98,6 +99,42 @@ impl HttpClient for ReqwestClient {
             status,
             headers,
             body,
+        })
+    }
+
+    async fn execute_stream(&self, req: HttpRequest) -> Result<HttpStreamResponse, String> {
+        let method = match req.method {
+            Method::Get => reqwest::Method::GET,
+            Method::Head => reqwest::Method::HEAD,
+            Method::Put => reqwest::Method::PUT,
+            Method::Delete => reqwest::Method::DELETE,
+        };
+        let mut builder = self.inner.request(method, &req.url);
+        for (key, value) in &req.headers {
+            builder = builder.header(key.as_str(), value.as_str());
+        }
+        if !req.body.is_empty() {
+            builder = builder.body(req.body.clone());
+        }
+        let response = builder.send().await.map_err(sanitize_error)?;
+        let status = response.status().as_u16();
+        let headers = response
+            .headers()
+            .iter()
+            .map(|(key, value)| {
+                (
+                    key.as_str().to_string(),
+                    value.to_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect();
+        let body = response
+            .bytes_stream()
+            .map(|chunk| chunk.map_err(sanitize_error));
+        Ok(HttpStreamResponse {
+            status,
+            headers,
+            body: Box::pin(body),
         })
     }
 
