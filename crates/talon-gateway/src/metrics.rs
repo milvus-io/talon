@@ -33,6 +33,16 @@ impl GatewayMetrics {
         self.registry.render()
     }
 
+    pub(crate) fn record_tls_event(&self, event: &'static str) {
+        self.registry
+            .counter(
+                "talon_gateway_tls_events_total",
+                "Gateway TLS handshake and reload outcomes.",
+                labels(&[("event", event)]),
+            )
+            .inc();
+    }
+
     pub(crate) fn record_headers(&self, observation: RequestObservation) {
         let failure = observation.failure.map_or("none", FailureReason::label);
         let response_class = match observation.status / 100 {

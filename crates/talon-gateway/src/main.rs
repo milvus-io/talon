@@ -9,8 +9,8 @@ use talon_cache_client::{BlockReader, CoordinatorClient, PlacementCache};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache};
 use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache};
 use talon_gateway::{
-    serve, GatewayAdapter, GatewayConfig, GatewayMode, GatewayRoute, GatewayRuntime,
-    GatewaySecurity,
+    serve, serve_tls, GatewayAdapter, GatewayConfig, GatewayMode, GatewayRoute, GatewayRuntime,
+    GatewaySecurity, GatewayTlsConfig,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -39,6 +39,7 @@ struct Settings {
     s3_access_key: Option<String>,
     s3_secret_key: Option<String>,
     s3_session_token: Option<String>,
+    tls: Option<GatewayTlsConfig>,
 }
 
 impl Settings {
@@ -106,6 +107,33 @@ impl Settings {
             false,
             "TALON_GATEWAY_PATH_STYLE",
         )?;
+        let tls_certificate = value(&mut get, "TALON_GATEWAY_TLS_CERT_PATH");
+        let tls_private_key = value(&mut get, "TALON_GATEWAY_TLS_KEY_PATH");
+        let tls = match (tls_certificate, tls_private_key) {
+            (None, None) => None,
+            (Some(certificate_path), Some(private_key_path)) => Some(GatewayTlsConfig {
+                certificate_path: certificate_path.into(),
+                private_key_path: private_key_path.into(),
+                reload_interval: std::time::Duration::from_millis(parse_or(
+                    value(&mut get, "TALON_GATEWAY_TLS_RELOAD_MS"),
+                    "5000",
+                    "TALON_GATEWAY_TLS_RELOAD_MS",
+                )?),
+                handshake_timeout: std::time::Duration::from_millis(parse_or(
+                    value(&mut get, "TALON_GATEWAY_TLS_HANDSHAKE_TIMEOUT_MS"),
+                    "10000",
+                    "TALON_GATEWAY_TLS_HANDSHAKE_TIMEOUT_MS",
+                )?),
+                max_concurrent_handshakes: parse_or(
+                    value(&mut get, "TALON_GATEWAY_TLS_MAX_HANDSHAKES"),
+                    "256",
+                    "TALON_GATEWAY_TLS_MAX_HANDSHAKES",
+                )?,
+            }),
+            _ => return Err(invalid(
+                "TALON_GATEWAY_TLS_CERT_PATH and TALON_GATEWAY_TLS_KEY_PATH must be set together",
+            )),
+        };
 
         Ok(Self {
             protocol,
@@ -128,6 +156,7 @@ impl Settings {
             s3_access_key: value(&mut get, "AWS_ACCESS_KEY_ID"),
             s3_secret_key: value(&mut get, "AWS_SECRET_ACCESS_KEY"),
             s3_session_token: value(&mut get, "AWS_SESSION_TOKEN"),
+            tls,
         })
     }
 }
@@ -344,7 +373,10 @@ async fn main() -> MainResult<()> {
         route = ?settings.route,
         "starting object-store gateway"
     );
-    serve(listener, runtime, shutdown_signal()).await?;
+    match settings.tls {
+        Some(tls) => serve_tls(listener, runtime, tls, shutdown_signal()).await?,
+        None => serve(listener, runtime, shutdown_signal()).await?,
+    }
     Ok(())
 }
 
@@ -369,6 +401,7 @@ mod tests {
         assert_eq!(settings.mode, GatewayMode::Development);
         assert_eq!(settings.route, GatewayRoute::Cache);
         assert!(!settings.incoming_path_style);
+        assert!(settings.tls.is_none());
     }
 
     #[test]
@@ -425,5 +458,30 @@ mod tests {
         ])
         .unwrap();
         assert!(azure_adapter(&both).is_err());
+    }
+
+    #[test]
+    fn tls_paths_are_all_or_none_and_bounds_are_parsed() {
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_TLS_CERT_PATH", "/tls/cert.pem"),
+        ])
+        .is_err());
+
+        let settings = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_TLS_CERT_PATH", "/tls/cert.pem"),
+            ("TALON_GATEWAY_TLS_KEY_PATH", "/tls/key.pem"),
+            ("TALON_GATEWAY_TLS_RELOAD_MS", "250"),
+            ("TALON_GATEWAY_TLS_HANDSHAKE_TIMEOUT_MS", "900"),
+            ("TALON_GATEWAY_TLS_MAX_HANDSHAKES", "32"),
+        ])
+        .unwrap();
+        let tls = settings.tls.unwrap();
+        assert_eq!(tls.certificate_path, std::path::Path::new("/tls/cert.pem"));
+        assert_eq!(tls.reload_interval, std::time::Duration::from_millis(250));
+        assert_eq!(tls.handshake_timeout, std::time::Duration::from_millis(900));
+        assert_eq!(tls.max_concurrent_handshakes, 32);
+        assert!(!format!("{tls:?}").contains("/tls/key.pem"));
     }
 }
