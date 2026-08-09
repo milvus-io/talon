@@ -204,6 +204,9 @@ impl HttpClient for ReqwestClient {
         };
         let mut builder = self.inner.request(method, &req.url);
         for (key, value) in &req.headers {
+            if key.eq_ignore_ascii_case(reqwest::header::CONTENT_LENGTH.as_str()) {
+                continue;
+            }
             builder = builder.header(key.as_str(), value.as_str());
         }
         let forwarded = body.map(|chunk| chunk.map_err(std::io::Error::other));
@@ -246,6 +249,7 @@ fn sanitize_error(error: reqwest::Error) -> String {
 mod tests {
     use super::*;
     use crate::http::HttpRequest;
+    use tokio::io::AsyncWriteExt as _;
 
     #[tokio::test]
     async fn transport_error_does_not_leak_sas_url() {
@@ -271,5 +275,52 @@ mod tests {
             !err.contains("nonexistent-host.invalid.example"),
             "error leaked the URL: {err}"
         );
+    }
+
+    #[tokio::test]
+    async fn streamed_body_sends_exactly_one_trusted_content_length() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert!(read > 0);
+                request.extend_from_slice(&buffer[..read]);
+            }
+            stream
+                .write_all(b"HTTP/1.1 201 Created\r\nContent-Length: 0\r\n\r\n")
+                .await
+                .unwrap();
+            request
+        });
+        let client = ReqwestClient::new();
+        let body = Box::pin(futures::stream::once(async {
+            Ok(bytes::Bytes::from_static(b"body"))
+        }));
+
+        let response = client
+            .execute_body(
+                HttpRequest {
+                    method: Method::Put,
+                    url: format!("http://{address}/object"),
+                    headers: vec![("Content-Length".into(), "999".into())],
+                    body: bytes::Bytes::new(),
+                },
+                body,
+                4,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status, 201);
+        let request = String::from_utf8(server.await.unwrap()).unwrap();
+        let content_lengths = request
+            .lines()
+            .filter(|line| line.to_ascii_lowercase().starts_with("content-length:"))
+            .collect::<Vec<_>>();
+        assert_eq!(content_lengths, ["content-length: 4"]);
     }
 }

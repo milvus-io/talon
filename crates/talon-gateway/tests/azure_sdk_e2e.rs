@@ -33,6 +33,7 @@ struct ReadThroughCache {
     entries: Arc<Mutex<HashMap<CacheKey, Bytes>>>,
     hits: Arc<AtomicUsize>,
     misses: Arc<AtomicUsize>,
+    invalidations: Arc<AtomicUsize>,
 }
 
 impl ReadThroughCache {
@@ -42,6 +43,7 @@ impl ReadThroughCache {
             entries: Arc::new(Mutex::new(HashMap::new())),
             hits: Arc::new(AtomicUsize::new(0)),
             misses: Arc::new(AtomicUsize::new(0)),
+            invalidations: Arc::new(AtomicUsize::new(0)),
         })
     }
 }
@@ -106,6 +108,15 @@ impl AzureCache for ReadThroughCache {
             entries.lock().unwrap().insert(key, body.clone());
             Ok(body)
         })))
+    }
+
+    fn invalidate_object(&self, object: &ObjectId) -> usize {
+        let mut entries = self.entries.lock().unwrap();
+        let before = entries.len();
+        entries.retain(|(cached, _, _, _), _| cached != object);
+        let removed = before - entries.len();
+        self.invalidations.fetch_add(1, Ordering::Relaxed);
+        removed
     }
 }
 
@@ -188,6 +199,8 @@ async fn azure_sdk_and_azurite_gateway_conformance() {
                 GatewayOperation::Stat,
                 GatewayOperation::Read,
                 GatewayOperation::List,
+                GatewayOperation::Write,
+                GatewayOperation::Delete,
             ],
         }])
         .unwrap(),
@@ -216,6 +229,7 @@ async fn azure_sdk_and_azurite_gateway_conformance() {
 
     assert!(cache.misses.load(Ordering::Relaxed) >= 1);
     assert!(cache.hits.load(Ordering::Relaxed) >= 1);
+    assert!(cache.invalidations.load(Ordering::Relaxed) >= 6);
 
     shutdown_tx.send(()).unwrap();
     server.await.unwrap().unwrap();
