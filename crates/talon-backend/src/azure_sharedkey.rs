@@ -109,10 +109,12 @@ pub fn authorization_header(
             .unwrap_or_default()
     };
 
-    // Content-Length is signed as empty when 0 (per the 2015+ signing rules).
-    let content_length = match req.body.len() {
-        0 => String::new(),
-        n => n.to_string(),
+    // Streamed requests keep their body outside `HttpRequest`, so the signed
+    // length must come from the canonical request header. Azure signs zero as
+    // empty under the 2015+ rules.
+    let content_length = match header("content-length").as_str() {
+        "" | "0" => String::new(),
+        value => value.to_string(),
     };
 
     // Canonicalized headers: all x-ms-* headers, lowercased, sorted, "k:v" joined
@@ -263,6 +265,32 @@ mod tests {
         assert_ne!(
             authorization_header(&base, "acct", KEY).unwrap(),
             authorization_header(&with_range, "acct", KEY).unwrap()
+        );
+    }
+
+    #[test]
+    fn streamed_content_length_participates_in_the_signature() {
+        let without_length = req(
+            Method::Put,
+            "https://acct.blob.core.windows.net/c/b",
+            vec![
+                ("x-ms-date", "Fri, 26 Jun 2015 23:39:12 GMT"),
+                ("x-ms-version", "2021-12-02"),
+            ],
+        );
+        let with_length = req(
+            Method::Put,
+            "https://acct.blob.core.windows.net/c/b",
+            vec![
+                ("content-length", "23"),
+                ("x-ms-date", "Fri, 26 Jun 2015 23:39:12 GMT"),
+                ("x-ms-version", "2021-12-02"),
+            ],
+        );
+
+        assert_ne!(
+            authorization_header(&without_length, "acct", KEY).unwrap(),
+            authorization_header(&with_length, "acct", KEY).unwrap()
         );
     }
 
