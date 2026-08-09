@@ -841,6 +841,7 @@ mod tests {
     enum CacheBehavior {
         Data(Vec<Bytes>),
         Unavailable,
+        Timeout,
     }
 
     struct MockCache {
@@ -867,6 +868,13 @@ mod tests {
                 request: Mutex::new(None),
             })
         }
+
+        fn timeout() -> Arc<Self> {
+            Arc::new(Self {
+                behavior: CacheBehavior::Timeout,
+                request: Mutex::new(None),
+            })
+        }
     }
 
     impl AzureCache for MockCache {
@@ -882,6 +890,7 @@ mod tests {
                     chunks.clone().into_iter().map(Ok),
                 ))),
                 CacheBehavior::Unavailable => Err(CacheReadError::Unavailable("down".into())),
+                CacheBehavior::Timeout => Err(CacheReadError::Timeout("slow worker".into())),
             }
         }
     }
@@ -941,6 +950,38 @@ mod tests {
         }
     }
 
+    struct DemandCache {
+        polls: Arc<AtomicUsize>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    impl DemandCache {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                polls: Arc::new(AtomicUsize::new(0)),
+                dropped: Arc::new(AtomicBool::new(false)),
+            })
+        }
+    }
+
+    impl AzureCache for DemandCache {
+        fn stream(&self, _request: AzureCacheRequest<'_>) -> Result<CacheStream, CacheReadError> {
+            let chunks = VecDeque::from([Bytes::from_static(b"abc"), Bytes::from_static(b"def")]);
+            let polls = Arc::clone(&self.polls);
+            let guard = DropSignal(Arc::clone(&self.dropped));
+            Ok(Box::pin(futures::stream::unfold(
+                (chunks, guard),
+                move |(mut chunks, guard)| {
+                    let polls = Arc::clone(&polls);
+                    async move {
+                        polls.fetch_add(1, Ordering::SeqCst);
+                        chunks.pop_front().map(|chunk| (Ok(chunk), (chunks, guard)))
+                    }
+                },
+            )))
+        }
+    }
+
     #[async_trait]
     impl AzureOrigin for MockOrigin {
         async fn head(
@@ -995,9 +1036,42 @@ mod tests {
         }
     }
 
+    struct UnavailableOrigin;
+
+    #[async_trait]
+    impl AzureOrigin for UnavailableOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            Err("connect failed at https://account.example/?sig=secret".into())
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("HEAD failure must stop GET dispatch")
+        }
+
+        async fn list(
+            &self,
+            _container: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _marker: Option<&str>,
+            _max_results: u32,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("test only dispatches object reads")
+        }
+    }
+
     fn context() -> GatewayRequestContext {
         GatewayRequestContext {
-            request_id: "0011223344556677".into(),
+            request_id: "00112233-4455-4677-8899-aabbccddeeff".into(),
             started: std::time::Instant::now(),
         }
     }
@@ -1157,6 +1231,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cache_timeout_is_eligible_for_origin_fallback() {
+        let origin = MockOrigin::object(&[b"abc", b"def"]);
+        let response = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            MockCache::timeout(),
+            origin,
+        )
+        .handle(
+            request(axum::http::Method::GET, "/container/blob"),
+            context(),
+        )
+        .await;
+
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(response.outcome, GatewayOutcome::Fallback);
+    }
+
+    #[tokio::test]
+    async fn cache_stream_respects_backpressure_and_cancellation() {
+        let cache = DemandCache::new();
+        let response = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            Arc::clone(&cache) as Arc<dyn AzureCache>,
+            MockOrigin::object(&[]),
+        )
+        .handle(
+            request(axum::http::Method::GET, "/container/blob"),
+            context(),
+        )
+        .await;
+
+        assert_eq!(cache.polls.load(Ordering::SeqCst), 1);
+        tokio::task::yield_now().await;
+        assert_eq!(cache.polls.load(Ordering::SeqCst), 1);
+        let mut body = response.response.into_body().into_data_stream();
+        assert_eq!(
+            body.next().await.unwrap().unwrap(),
+            Bytes::from_static(b"abc")
+        );
+        assert_eq!(cache.polls.load(Ordering::SeqCst), 1);
+        drop(body);
+        assert!(cache.dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn origin_outage_returns_a_sanitized_azure_error() {
+        let response = adapter(
+            AzureAdapterConfig::public_cloud("acct"),
+            MockCache::data(&[]),
+            Arc::new(UnavailableOrigin),
+        )
+        .handle(
+            request(axum::http::Method::GET, "/container/blob"),
+            context(),
+        )
+        .await;
+
+        assert_eq!(response.response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(response.response.headers()["x-ms-error-code"], "ServerBusy");
+        let body = to_bytes(response.response.into_body(), 4096).await.unwrap();
+        assert!(!body.windows(6).any(|window| window == b"secret"));
+        assert!(!body.windows(4).any(|window| window == b"sig="));
+    }
+
+    #[tokio::test]
     async fn head_preserves_content_length_and_list_forwards_pagination() {
         let cache = MockCache::data(&[]);
         let origin = MockOrigin::object(&[]);
@@ -1174,7 +1313,7 @@ mod tests {
         assert_eq!(head.response.headers()[header::CONTENT_LENGTH], "6");
         assert_eq!(
             head.response.headers()["x-ms-request-id"],
-            "0011223344556677"
+            "00112233-4455-4677-8899-aabbccddeeff"
         );
 
         let list = adapter

@@ -424,7 +424,7 @@ jobs:
         run: cargo test -p talon-backend --test gcs_e2e --locked -- --nocapture
 
   azure-e2e:
-    name: azure backend e2e (azurite)
+    name: azure backend and gateway e2e (azurite)
     runs-on: ubuntu-latest
     # Exercises the real AzureBackend (Shared Key signing + path-style endpoint)
     # against Azurite, reading bytes an object actually contains. The test skips
@@ -436,12 +436,18 @@ jobs:
       TALON_AZURE_TEST_ENDPOINT: http://127.0.0.1:10000
       TALON_AZURE_TEST_CONTAINER: talon-e2e
       TALON_AZURE_TEST_KEY: e2e/object.bin
+      TALON_AZURE_SDK_PYTHON: python
       # Azurite's well-known dev connection string (public emulator values).
       AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+      - name: Install the official Azure Storage SDK
+        run: python -m pip install azure-storage-blob==12.26.0
       - name: Start Azurite and seed a deterministic object
         run: |
           docker run -d --name azurite -p 10000:10000 \
@@ -458,8 +464,10 @@ jobs:
           az storage blob upload --container-name talon-e2e \
             --name e2e/object.bin --file /tmp/object.bin --overwrite
       - uses: Swatinem/rust-cache@v2
-      - name: Run the Azure e2e test
+      - name: Run the Azure backend e2e test
         run: cargo test -p talon-backend --test azure_e2e --locked -- --nocapture
+      - name: Run the Azure SDK gateway conformance test
+        run: cargo test -p talon-gateway --test azure_sdk_e2e --locked -- --nocapture
 
   python-client:
     name: python client

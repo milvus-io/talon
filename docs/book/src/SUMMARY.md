@@ -41,6 +41,7 @@
 - [Namespace authorization policy](./reference/namespace-policy.md)
 - [REST API reference](./reference/rest-api.md)
 - [Wire protocol reference](./reference/wire-protocol.md)
+- [Object-store gateway compatibility](./reference/object-store-gateway-compatibility.md)
 
 # Explanation
 
