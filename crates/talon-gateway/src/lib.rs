@@ -5,6 +5,7 @@ mod config;
 mod metrics;
 mod model;
 mod runtime;
+pub mod s3;
 
 pub use config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
 pub use metrics::GatewayMetrics;

@@ -77,9 +77,9 @@ fn canonical_query(query: &str) -> String {
         .split('&')
         .filter(|p| !p.is_empty())
         .map(|pair| match pair.split_once('=') {
-            Some((k, v)) => (uri_encode_component(k), uri_encode_component(v)),
+            Some((k, v)) => (uri_encode_query_component(k), uri_encode_query_component(v)),
             // A bare key still needs a trailing `=` in the canonical form.
-            None => (uri_encode_component(pair), String::new()),
+            None => (uri_encode_query_component(pair), String::new()),
         })
         .collect();
     pairs.sort();
@@ -90,14 +90,42 @@ fn canonical_query(query: &str) -> String {
         .join("&")
 }
 
+/// Normalize a URL query component to exactly one layer of AWS encoding.
+///
+/// Request builders must percent-encode values to form a valid URL. SigV4
+/// canonicalization operates on their decoded bytes, so existing escapes are
+/// decoded before applying AWS's RFC 3986 encoding. A literal `+` remains a
+/// plus byte rather than form-urlencoded whitespace.
+fn uri_encode_query_component(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%'
+            && index + 2 < bytes.len()
+            && bytes[index + 1].is_ascii_hexdigit()
+            && bytes[index + 2].is_ascii_hexdigit()
+        {
+            let high = (bytes[index + 1] as char).to_digit(16).unwrap() as u8;
+            let low = (bytes[index + 2] as char).to_digit(16).unwrap() as u8;
+            decoded.push((high << 4) | low);
+            index += 3;
+        } else {
+            decoded.push(bytes[index]);
+            index += 1;
+        }
+    }
+    uri_encode_bytes(&decoded)
+}
+
 /// URI-encode a query key or value.
 ///
 /// Unlike [`uri_encode_path`], `/` is **not** left literal: in a query
 /// component it is a reserved character and must be escaped, which matters for
 /// a listing prefix like `dir/sub`.
-fn uri_encode_component(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for &b in s.as_bytes() {
+fn uri_encode_bytes(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len());
+    for &b in bytes {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
                 out.push(b as char)
@@ -288,6 +316,10 @@ mod tests {
     #[test]
     fn canonical_query_escapes_slashes_in_values() {
         assert_eq!(canonical_query("prefix=dir/sub/"), "prefix=dir%2Fsub%2F");
+        assert_eq!(
+            canonical_query("prefix=dir%2Fsub%2F"),
+            "prefix=dir%2Fsub%2F"
+        );
     }
 
     #[test]
@@ -306,8 +338,8 @@ mod tests {
     }
 
     #[test]
-    fn uri_encode_component_leaves_unreserved_characters_alone() {
-        assert_eq!(uri_encode_component("aZ0-_.~"), "aZ0-_.~");
+    fn uri_encode_query_component_leaves_unreserved_characters_alone() {
+        assert_eq!(uri_encode_query_component("aZ0-_.~"), "aZ0-_.~");
     }
 
     use super::*;
