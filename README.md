@@ -51,8 +51,8 @@ talon-fuse --mountpoint /mnt/talon \
 ls /mnt/talon                 # your bucket, as a directory tree
 ```
 
-or skip the mount and use the [Python](docs/clients/python.md) /
-[Java](docs/clients/java.md) SDKs:
+or skip the mount and use the [Python](docs/clients/python.md),
+[Java](docs/clients/java.md), or [C](docs/clients/c.md) SDKs:
 
 ```python
 import talon
@@ -142,8 +142,9 @@ Start with the section that matches what you're doing:
   training, checkpointing, notebooks and data sharing, cross-cloud reads, and
   analytics — including where it does *not* help.
 - **Reading from Talon in code** — [Client SDKs](docs/clients/overview.md):
-  a [Python](docs/clients/python.md) wheel and a native-free
-  [Java](docs/clients/java.md) jar, for when a FUSE mount is not the right fit.
+  a [Python](docs/clients/python.md) wheel, a native-free
+  [Java](docs/clients/java.md) jar, and async [C](docs/clients/c.md) bindings
+  for when a FUSE mount is not the right fit.
 - **Using Talon** — the [Getting started tutorial](docs/tutorials/getting-started.md)
   builds the workspace, runs a cluster, and opens the management console;
   [DESIGN.md](DESIGN.md) explains what each component does, and

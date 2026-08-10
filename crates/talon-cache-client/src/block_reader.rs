@@ -260,6 +260,57 @@ impl BlockReader {
         }
     }
 
+    /// Read `dst.len()` bytes at `offset_in_block` within `block` into `dst`.
+    ///
+    /// This follows the same placement-cache, replica fallback, and refresh
+    /// behavior as [`read_block`](Self::read_block), without allocating an
+    /// intermediate result buffer.
+    pub async fn read_block_into(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize, BlockReadError> {
+        let cached = match self.cache.get(block, now_ms) {
+            Some(cached) => {
+                self.stats.record_cache_hit();
+                cached
+            }
+            None => {
+                self.stats.record_cache_miss();
+                self.resolve_and_cache(block, now_ms).await?
+            }
+        };
+        let abs_offset = block.offset + u64::from(offset_in_block);
+
+        match self
+            .try_replicas_into(block, &cached.replicas, abs_offset, dst)
+            .await
+        {
+            Ok(n) => {
+                self.stats.add_bytes_served(n as u64);
+                return Ok(n);
+            }
+            Err(failure) => {
+                if !failure.retryable {
+                    return Err(BlockReadError::AllReplicasFailed);
+                }
+                tracing::debug!(%block, reason = ?failure.reason, "all cached replicas failed; refreshing placement");
+                self.cache.invalidate(block, failure.reason);
+                self.stats.record_coordinator_refresh();
+            }
+        }
+
+        let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
+        let n = self
+            .try_replicas_into(block, &fresh.replicas, abs_offset, dst)
+            .await
+            .map_err(|_| BlockReadError::AllReplicasFailed)?;
+        self.stats.add_bytes_served(n as u64);
+        Ok(n)
+    }
+
     /// Read one block slice while preserving the last worker failure.
     ///
     /// The public FUSE-compatible API intentionally retains its historical
@@ -381,6 +432,66 @@ impl BlockReader {
         Err(last.expect("non-empty replica list records a failure"))
     }
 
+    /// Buffer-oriented variant of [`try_replicas`](Self::try_replicas).
+    async fn try_replicas_into(
+        &self,
+        block: &BlockId,
+        replicas: &[String],
+        abs_offset: u64,
+        dst: &mut [u8],
+    ) -> Result<usize, ReplicaFailure> {
+        if replicas.is_empty() {
+            return Err(ReplicaFailure {
+                reason: RefreshReason::WrongOwner,
+                error: WorkerError::Remote(talon_transport::DataPlaneError {
+                    code: talon_transport::DataErrorCode::Internal,
+                    message: "placement contained no worker addresses".into(),
+                }),
+                retryable: true,
+            });
+        }
+        let mut last = None;
+        for addr in replicas {
+            let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
+            self.stats.record_worker_fetch();
+            match worker
+                .fetch_range_into(&block.object, abs_offset, dst)
+                .await
+            {
+                Ok(n) if n == dst.len() => return Ok(n),
+                Ok(n) => {
+                    self.stats.record_worker_failure();
+                    last = Some(ReplicaFailure {
+                        reason: RefreshReason::WrongOwner,
+                        error: WorkerError::RangeLengthMismatch {
+                            expected: dst.len() as u64,
+                            actual: n as u64,
+                        },
+                        retryable: true,
+                    });
+                }
+                Err(error) => {
+                    self.stats.record_worker_failure();
+                    let reason = match &error {
+                        WorkerError::Io(_) => RefreshReason::ConnectFailure,
+                        _ => RefreshReason::WrongOwner,
+                    };
+                    let retryable = replica_retryable(&error);
+                    let failure = ReplicaFailure {
+                        reason,
+                        error,
+                        retryable,
+                    };
+                    if !retryable {
+                        return Err(failure);
+                    }
+                    last = Some(failure);
+                }
+            }
+        }
+        Err(last.expect("non-empty replica list records a failure"))
+    }
+
     /// Reconcile the cache against an observed placement version.
     ///
     /// When a response (placement or otherwise) carries a version token that
@@ -433,6 +544,50 @@ impl BlockReader {
             out.extend_from_slice(&bytes);
         }
         Ok(out)
+    }
+
+    /// Read from `file` at `offset` into `dst`, spanning block boundaries.
+    ///
+    /// The returned value is the number of bytes written. Reads at or past EOF
+    /// return `0`, and reads overlapping EOF return a short count, matching
+    /// [`read`](Self::read).
+    pub async fn read_into(
+        &self,
+        file: &FileView<'_>,
+        offset: u64,
+        dst: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize, BlockReadError> {
+        let plan = plan_read(
+            file.object,
+            offset,
+            dst.len() as u64,
+            file.block_size,
+            file.version,
+            file.size,
+        );
+        let mut written = 0usize;
+        for seg in plan {
+            let len = seg.len as usize;
+            let end = written + len;
+            let n = self
+                .read_block_into(
+                    &seg.block,
+                    seg.offset_in_block,
+                    &mut dst[written..end],
+                    now_ms,
+                )
+                .await?;
+            if n != len {
+                return Err(WorkerError::RangeLengthMismatch {
+                    expected: len as u64,
+                    actual: n as u64,
+                }
+                .into());
+            }
+            written = end;
+        }
+        Ok(written)
     }
 
     /// Resolve the worker address that owns `object` (for a write/delete).
@@ -1053,6 +1208,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn multi_block_read_into_stitches_in_caller_buffer() {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_addr = mock_worker(Arc::clone(&hits)).await;
+        let coord_addr = mock_coordinator(worker_addr).await;
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
+
+        let object = ObjectId::new(Backend::S3, "b", "o/1");
+        let version = Version::new("v1");
+        let offset = 900u64;
+        let mut dst = vec![0u8; 2300];
+        let file = FileView {
+            object: &object,
+            block_size: 1024,
+            version: &version,
+            size: 100_000,
+        };
+
+        let n = reader.read_into(&file, offset, &mut dst, 0).await.unwrap();
+        assert_eq!(n, dst.len());
+        for (index, byte) in dst.iter().enumerate() {
+            assert_eq!(*byte, ((offset + index as u64) % 256) as u8);
+        }
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 4);
+        assert_eq!(cache.len(), 4);
+    }
+
+    #[tokio::test]
     async fn read_past_eof_is_empty_without_fetch() {
         let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
@@ -1070,6 +1253,29 @@ mod tests {
         };
         let bytes = reader.read(&file, 5000, 10, 0).await.unwrap();
         assert!(bytes.is_empty());
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn read_into_past_eof_is_empty_without_fetch() {
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_addr = mock_worker(Arc::clone(&hits)).await;
+        let coord_addr = mock_coordinator(worker_addr).await;
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
+        let object = ObjectId::new(Backend::S3, "b", "o/1");
+        let version = Version::new("v1");
+        let file = FileView {
+            object: &object,
+            block_size: 1024,
+            version: &version,
+            size: 1500,
+        };
+        let mut dst = vec![7u8; 10];
+
+        let n = reader.read_into(&file, 5000, &mut dst, 0).await.unwrap();
+        assert_eq!(n, 0);
+        assert_eq!(dst, vec![7u8; 10]);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 

@@ -1,6 +1,6 @@
 # Client SDKs
 
-Talon can be reached three ways, and which one fits depends less on language
+Talon can be reached four ways, and which one fits depends less on language
 than on how much control the workload needs.
 
 | | best for | needs |
@@ -8,6 +8,7 @@ than on how much control the workload needs.
 | **FUSE mount** | unmodified applications, POSIX tooling | a privileged mount and `/dev/fuse` |
 | **Python client** | training loaders, notebooks, data pipelines | a wheel |
 | **Java client** | JVM query engines and data tooling | a jar |
+| **C client** | C/C++ engines that need async ranged reads | a header and shared/static library |
 
 ## Why a native client rather than the mount
 
@@ -25,7 +26,7 @@ keeps working. It also carries constraints a native client avoids:
 If the application already speaks in terms of objects and byte ranges, a client
 is a closer fit.
 
-## Two different architectures, deliberately
+## Different architectures, deliberately
 
 **Python binds the Rust core.** Block splitting, placement caching, replica
 fallback, and connection pooling already exist and are exercised by the FUSE
@@ -36,6 +37,11 @@ ecosystem already expects.
 **Java is a pure jar.** No JNI, no FFM, no native artifact — it drops into any
 JVM build with no per-platform matrix, no `System.loadLibrary` failure mode, and
 no JNI crash surface. The cost is that the wire protocol is implemented twice.
+
+**C binds the Rust read path behind a C ABI.** It exposes async `read` and
+`stat` with callback dispatch, while the Rust side keeps ownership of placement
+caching, replica fallback, and connection pooling. Callers own read buffers so
+the binding does not allocate an intermediate result buffer for range bytes.
 
 That duplication is why the [wire protocol reference](../reference/wire-protocol.md)
 exists as a specification with **conformance vectors** rather than as prose. The
@@ -51,7 +57,7 @@ have served, invisibly from both ends.
 
 ## Current scope
 
-Both clients are **read-only**: `read` and `stat`.
+All native clients are **read-only** in this release.
 
 `list` is implemented in both but not yet usable, because listing needs a
 capability the storage backends do not have yet
@@ -61,3 +67,4 @@ deserve a design pass rather than being rushed into a first release.
 
 - [Python client](./python.md)
 - [Java client](./java.md)
+- [C client](./c.md)

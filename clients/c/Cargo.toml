@@ -1,0 +1,22 @@
+[package]
+name = "talon-c"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+description = "C bindings for the Talon distributed object-store cache client"
+publish = false
+
+[lib]
+name = "talon_c"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+talon-core.workspace = true
+talon-cache-client.workspace = true
+talon-transport.workspace = true
+tokio.workspace = true
+
+[build-dependencies]
+cc = "1"

@@ -28,6 +28,11 @@ ci: fmt-check clippy test
 
 # --- documentation ---
 
+# Build the C client and stage its header and libraries in target/talon-c-sdk.
+# Pass a destination with: just package-c path/to/output
+package-c OUTPUT="target/talon-c-sdk":
+    ./clients/c/package.sh "{{OUTPUT}}"
+
 # Regenerate the configuration reference from the ConfigVar schemas.
 gen-config-docs:
     cargo run -q -p talon-coordinator --features etcd,kubernetes \

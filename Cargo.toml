@@ -10,6 +10,7 @@ members = [
     "crates/talon-transport",
     "crates/talon-backend",
     "crates/talon-client",
+    "clients/c",
     "clients/python",
     "crates/talon-observability",
     "crates/talon-metadata",
