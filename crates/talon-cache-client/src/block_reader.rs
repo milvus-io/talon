@@ -30,6 +30,7 @@ use crate::membership_cache::{MembershipCache, MembershipSnapshot};
 use crate::metrics::ReadStats;
 use crate::placement_cache::{Cached, PlacementCache, RefreshReason};
 use crate::pool::ConnectionPool;
+use crate::range_stream::CacheReadError;
 use crate::read_plan::plan_read;
 use crate::worker_client::{WorkerClient, WorkerError};
 
@@ -150,6 +151,79 @@ impl BlockReader {
     /// The read-path counters this reader updates.
     pub fn stats(&self) -> &ReadStats {
         &self.stats
+    }
+
+    /// Read a versioned block slice only when it is already resident in Talon.
+    ///
+    /// Unlike [`read_block`](Self::read_block), this operation cannot invoke a
+    /// worker backend. It is therefore suitable for a gateway that must use a
+    /// request-scoped client capability for every origin miss.
+    pub async fn read_cached_block(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        len: u32,
+        now_ms: u64,
+    ) -> Result<Vec<u8>, CacheReadError> {
+        let placement = match self.cache.get(block, now_ms) {
+            Some(cached) => cached,
+            None => self
+                .resolve_and_cache(block, now_ms)
+                .await
+                .map_err(cache_block_error)?,
+        };
+        let offset = block.offset + u64::from(offset_in_block);
+        let mut last_error = None;
+        for address in &placement.replicas {
+            let worker = WorkerClient::with_pool(address.clone(), Arc::clone(&self.worker_pool));
+            match worker
+                .fetch_cached_range(&block.object, &block.version, offset, u64::from(len))
+                .await
+            {
+                Ok(bytes) if bytes.len() == len as usize => return Ok(bytes),
+                Ok(bytes) => {
+                    last_error = Some(CacheReadError::Protocol(
+                        WorkerError::RangeLengthMismatch {
+                            expected: u64::from(len),
+                            actual: bytes.len() as u64,
+                        }
+                        .to_string(),
+                    ));
+                }
+                Err(error) => last_error = Some(error.into()),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| {
+            CacheReadError::Unavailable("placement contained no worker addresses".into())
+        }))
+    }
+
+    /// Admit one complete versioned block to its current primary owner.
+    ///
+    /// The worker validates alignment, object length, and exact body length and
+    /// commits atomically without invoking its configured backend.
+    pub async fn admit_block(
+        &self,
+        block: &BlockId,
+        object_len: u64,
+        body: &[u8],
+        now_ms: u64,
+    ) -> Result<(), CacheReadError> {
+        let placement = match self.cache.get(block, now_ms) {
+            Some(cached) => cached,
+            None => self
+                .resolve_and_cache(block, now_ms)
+                .await
+                .map_err(cache_block_error)?,
+        };
+        let address = placement
+            .replicas
+            .first()
+            .ok_or_else(|| CacheReadError::Unavailable("block has no primary owner".into()))?;
+        WorkerClient::with_pool(address.clone(), Arc::clone(&self.worker_pool))
+            .admit_cached_block(block, object_len, body)
+            .await
+            .map_err(Into::into)
     }
 
     /// Read `len` bytes at `offset_in_block` within `block`.
@@ -474,6 +548,14 @@ impl BlockReader {
     }
 }
 
+fn cache_block_error(error: BlockReadError) -> CacheReadError {
+    match error {
+        BlockReadError::Coordinator(error) => error.into(),
+        BlockReadError::Worker(error) => error.into(),
+        other => CacheReadError::Unavailable(other.to_string()),
+    }
+}
+
 fn replica_retryable(error: &WorkerError) -> bool {
     match error {
         WorkerError::Remote(error) => !matches!(
@@ -493,7 +575,9 @@ mod tests {
     use talon_core::{Backend, NodeId, NodeInfo, NodeRole, ObjectId, Version};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
     use talon_transport::{
-        decode_request, encode_error, response_header_ok, ControlMessage, RangeRequest,
+        decode_cached_block_put_header, decode_cached_request, decode_request, encode_error,
+        encode_typed_error, response_header_ok, ControlMessage, DataErrorCode, MsgType,
+        RangeRequest,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -987,5 +1071,85 @@ mod tests {
         let bytes = reader.read(&file, 5000, 10, 0).await.unwrap();
         assert!(bytes.is_empty());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_block_read_uses_fail_closed_wire_operation_and_typed_miss() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let frame = FrameHeader::decode(&header).unwrap();
+            assert_eq!(frame.msg_type, MsgType::GetCachedRange);
+            let mut body = vec![0_u8; frame.length as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            let mut encoded = header.to_vec();
+            encoded.extend_from_slice(&body);
+            let (_, request) = decode_cached_request(&encoded).unwrap();
+            assert_eq!(request.version, Version::new("v1"));
+            assert_eq!((request.offset, request.len), (block().offset + 7, 11));
+            socket
+                .write_all(&encode_typed_error(
+                    frame.request_id,
+                    DataErrorCode::CacheMiss,
+                    "block is not resident",
+                ))
+                .await
+                .unwrap();
+        });
+        let coordinator = mock_coordinator(worker).await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(10_000)),
+            1,
+        );
+
+        let error = reader
+            .read_cached_block(&block(), 7, 11, 0)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, CacheReadError::CacheMiss(_)));
+    }
+
+    #[tokio::test]
+    async fn block_admission_resolves_primary_and_sends_exact_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = listener.local_addr().unwrap().to_string();
+        let expected = block();
+        let expected_on_worker = expected.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let frame = FrameHeader::decode(&header).unwrap();
+            assert_eq!(frame.msg_type, MsgType::AdmitCachedBlock);
+            let mut payload = vec![0_u8; frame.length as usize];
+            socket.read_exact(&mut payload).await.unwrap();
+            let mut encoded = header.to_vec();
+            encoded.extend_from_slice(&payload);
+            let (_, request) = decode_cached_block_put_header(&encoded).unwrap();
+            assert_eq!(request.block, expected_on_worker);
+            assert_eq!(request.object_len, expected_on_worker.offset + 5);
+            let mut body = vec![0_u8; request.body_len as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, b"tail!");
+            socket
+                .write_all(&response_header_ok(frame.request_id, 0))
+                .await
+                .unwrap();
+        });
+        let coordinator = mock_coordinator(worker).await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(10_000)),
+            1,
+        );
+
+        reader
+            .admit_block(&expected, expected.offset + 5, b"tail!", 0)
+            .await
+            .unwrap();
     }
 }
