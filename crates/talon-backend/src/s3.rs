@@ -7,10 +7,10 @@
 //! response parsing are all unit-testable without network access; a real client
 //! is injected in production.
 //!
-//! Authentication is AWS Signature v4 (see [`crate::sigv4`]): every request is
-//! signed just before execution with the configured [`S3Credentials`], region,
-//! and the `s3` service. Endpoints are configurable so MinIO/Ceph and other
-//! S3-compatible stores work.
+//! Service-authenticated requests use AWS Signature v4 (see [`crate::sigv4`]).
+//! Explicit request-scoped entry points instead preserve an origin-issued
+//! presigned query and never consult [`S3Credentials`]. Endpoints are
+//! configurable so MinIO/Ceph and other S3-compatible stores work.
 
 use std::io::{Read, Take};
 use std::path::{Path, PathBuf};
@@ -25,6 +25,7 @@ use talon_core::{
 use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
+use crate::S3PresignedQuery;
 
 /// Validated S3 multipart request metadata supplied by a protocol adapter.
 #[derive(Clone, Copy)]
@@ -329,6 +330,105 @@ impl S3Backend {
         headers.extend_from_slice(conditions);
         let request = HttpRequest::new(Method::Get, self.object_url(obj), headers);
         self.http.execute_stream(self.signed(request)).await
+    }
+
+    fn presigned_object_request(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> HttpRequest {
+        HttpRequest::new(
+            method,
+            format!("{}?{}", self.object_url(obj), credential.expose_secret()),
+            headers.to_vec(),
+        )
+    }
+
+    /// Execute a bodyless object request using only the supplied presigned
+    /// query. Configured service credentials are not added or used.
+    pub async fn execute_presigned_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        self.http
+            .execute(self.presigned_object_request(method, obj, credential, headers))
+            .await
+    }
+
+    /// Execute a streaming object request using only the supplied presigned
+    /// query.
+    pub async fn execute_presigned_stream_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpStreamResponse, String> {
+        self.http
+            .execute_stream(self.presigned_object_request(method, obj, credential, headers))
+            .await
+    }
+
+    /// Execute a single-use request body using only the supplied presigned
+    /// query.
+    pub async fn execute_presigned_body_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> std::result::Result<HttpResponse, String> {
+        self.http
+            .execute_body(
+                self.presigned_object_request(method, obj, credential, headers),
+                body,
+                len,
+            )
+            .await
+    }
+
+    /// Execute a staged request body using only the supplied presigned query.
+    pub async fn execute_presigned_file_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+        path: &Path,
+        len: u64,
+    ) -> std::result::Result<HttpResponse, String> {
+        self.http
+            .execute_file(
+                self.presigned_object_request(method, obj, credential, headers),
+                path,
+                len,
+            )
+            .await
+    }
+
+    /// Execute a bucket-scoped request, such as ListObjectsV2, preserving the
+    /// client's complete presigned query byte-for-byte.
+    pub async fn execute_presigned_bucket_raw(
+        &self,
+        method: Method,
+        bucket: &str,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        self.http
+            .execute(HttpRequest::new(
+                method,
+                format!("{}?{}", self.bucket_url(bucket), credential.expose_secret()),
+                headers.to_vec(),
+            ))
+            .await
     }
 
     /// Execute one raw ListObjectsV2 page.
@@ -805,6 +905,74 @@ mod tests {
 
     fn obj() -> ObjectId {
         ObjectId::new(Backend::S3, "my-bucket", "data/checkpoint.bin")
+    }
+
+    fn presigned() -> S3PresignedQuery {
+        S3PresignedQuery::new(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=client%2Fscope&X-Amz-Date=20260810T000000Z&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=CLIENTSECRET",
+        )
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn presigned_execution_preserves_query_and_never_uses_service_credentials() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(
+            S3Config {
+                region: "us-east-1".into(),
+                endpoint: "localhost:9000".into(),
+                path_style: true,
+                tls: false,
+            },
+            S3Credentials {
+                access_key_id: "SERVICE".into(),
+                secret_access_key: "SERVICESECRET".into(),
+                session_token: Some("SERVICETOKEN".into()),
+            },
+            http.clone(),
+        );
+        let credential = presigned();
+        backend
+            .execute_presigned_raw(
+                Method::Head,
+                &obj(),
+                &credential,
+                &[("if-match".into(), "\"etag\"".into())],
+            )
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            format!(
+                "http://localhost:9000/my-bucket/data/checkpoint.bin?{}",
+                credential.expose_secret()
+            )
+        );
+        assert_eq!(request.header("if-match"), Some("\"etag\""));
+        assert!(request.header("authorization").is_none());
+        assert!(request.header("x-amz-security-token").is_none());
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("SERVICESECRET"));
+        assert!(!debug.contains("CLIENTSECRET"));
+        assert!(!debug.contains("etag"));
+
+        backend
+            .execute_presigned_bucket_raw(Method::Get, "my-bucket", &credential, &[])
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            format!(
+                "http://localhost:9000/my-bucket?{}",
+                credential.expose_secret()
+            )
+        );
     }
 
     #[test]

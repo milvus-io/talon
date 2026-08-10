@@ -8,9 +8,10 @@
 //!
 //! The `ObjectId::bucket` field carries the **container** name for Azure (the
 //! account is part of the endpoint host). Like the other backends this is
-//! generic over an [`HttpClient`] and unit-testable offline. Authentication is
-//! either a SAS token (in the URL query) or Shared Key (see
-//! [`crate::azure_sharedkey`]), signed just before each request executes.
+//! generic over an [`HttpClient`] and unit-testable offline. Service
+//! authentication is either a static SAS token or Shared Key (see
+//! [`crate::azure_sharedkey`]); explicit request-scoped entry points use an
+//! origin-issued client SAS without consulting either service credential.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -23,6 +24,7 @@ use talon_core::{
 use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
+use crate::AzureSas;
 
 /// Percent-encode a query value. `/` is escaped: a listing prefix contains
 /// slashes and an unescaped one would change the request path.
@@ -395,6 +397,102 @@ impl AzureBackend {
         headers.extend_from_slice(conditions);
         let request = HttpRequest::new(Method::Get, self.blob_url(obj), headers);
         self.http.execute_stream(self.authorized(request)).await
+    }
+
+    fn sas_object_request(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> HttpRequest {
+        let mut url = self.blob_url(obj);
+        if let Some(query) = url.find('?') {
+            url.truncate(query);
+        }
+        url.push('?');
+        url.push_str(credential.expose_secret());
+        let mut outgoing = self.common_headers();
+        outgoing.extend_from_slice(headers);
+        HttpRequest::new(method, url, outgoing)
+    }
+
+    /// Execute a bodyless object request using only the supplied SAS. The
+    /// backend's configured Shared Key or static SAS is not used.
+    pub async fn execute_sas_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        self.http
+            .execute(self.sas_object_request(method, obj, credential, headers))
+            .await
+    }
+
+    /// Execute a streaming object request using only the supplied SAS.
+    pub async fn execute_sas_stream_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpStreamResponse, String> {
+        self.http
+            .execute_stream(self.sas_object_request(method, obj, credential, headers))
+            .await
+    }
+
+    /// Execute a single-use request body using only the supplied SAS.
+    pub async fn execute_sas_body_raw(
+        &self,
+        method: Method,
+        obj: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> std::result::Result<HttpResponse, String> {
+        self.http
+            .execute_body(
+                self.sas_object_request(method, obj, credential, headers),
+                body,
+                len,
+            )
+            .await
+    }
+
+    /// Execute a container-scoped request, such as List Blobs, preserving the
+    /// client's complete SAS-bearing query byte-for-byte.
+    pub async fn execute_sas_container_raw(
+        &self,
+        method: Method,
+        container: &str,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> std::result::Result<HttpResponse, String> {
+        let scheme = if self.config.tls { "https" } else { "http" };
+        let host =
+            self.config.endpoint_host.clone().unwrap_or_else(|| {
+                format!("{}.{}", self.config.account, self.config.endpoint_suffix)
+            });
+        let base = if self.config.path_style {
+            format!("{scheme}://{host}/{}/{container}", self.config.account)
+        } else {
+            format!("{scheme}://{host}/{container}")
+        };
+        self.http
+            .execute(HttpRequest::new(
+                method,
+                format!("{base}?{}", credential.expose_secret()),
+                {
+                    let mut outgoing = self.common_headers();
+                    outgoing.extend_from_slice(headers);
+                    outgoing
+                },
+            ))
+            .await
     }
 
     /// Execute one raw Azure List Blobs page.
@@ -848,6 +946,60 @@ mod tests {
     fn obj() -> ObjectId {
         // bucket == Azure container.
         ObjectId::new(Backend::Azure, "my-container", "data/checkpoint.bin")
+    }
+
+    #[tokio::test]
+    async fn request_sas_replaces_service_auth_and_preserves_the_client_query() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend =
+            AzureBackend::with_shared_key(AzureConfig::new("myacct"), "SERVICEKEY", http.clone());
+        let credential = AzureSas::new(
+            "sv=2024-11-04&sp=r&sig=CLIENTSECRET&comp=metadata&snapshot=opaque%2Bvalue",
+        )
+        .unwrap();
+        backend
+            .execute_sas_raw(
+                Method::Head,
+                &obj(),
+                &credential,
+                &[("if-match".into(), "\"etag\"".into())],
+            )
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            format!(
+                "https://myacct.blob.core.windows.net/my-container/data/checkpoint.bin?{}",
+                credential.expose_secret()
+            )
+        );
+        assert_eq!(
+            request.header("x-ms-version"),
+            Some(AzureBackend::API_VERSION)
+        );
+        assert_eq!(request.header("if-match"), Some("\"etag\""));
+        assert!(request.header("authorization").is_none());
+        assert!(request.header("x-ms-date").is_none());
+        assert!(!format!("{request:?}").contains("CLIENTSECRET"));
+
+        backend
+            .execute_sas_container_raw(Method::Get, "my-container", &credential, &[])
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            format!(
+                "https://myacct.blob.core.windows.net/my-container?{}",
+                credential.expose_secret()
+            )
+        );
+        assert!(request.header("authorization").is_none());
     }
 
     #[test]
