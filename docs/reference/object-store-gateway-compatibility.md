@@ -58,6 +58,12 @@ authenticated principal and cache decision for 24 hours by default. A gateway
 restart intentionally loses that binding and fails closed rather than adopting
 orphaned blocks. Only a successful Put Block List invalidates cached data.
 
+Azure SAS passthrough for a trusted loopback sidecar is designed but not yet
+implemented (#510). The target behavior preserves all SAS query fields on an
+origin access and shares cache entries across capabilities. A resident hit is
+not re-authorized; a miss, listing, or mutation remains origin-authoritative.
+Shared Key passthrough is not part of the first milestone.
+
 Production exposure remains blocked until provider authentication and
 authorization are installed as tracked by issue #446. The protocol adapter is
 currently intended for conformance and integration work; executable packaging
@@ -111,6 +117,13 @@ encoding, conditions, presigned URLs, listing pagination and delimiters,
 ordinary mutations, boto3 and MinIO multipart operations, part copy, abort,
 ordering failures, and standard errors. Arrow-compatible signed HEAD and ranged
 GET fixtures run in the same test.
+
+S3 presigned-query passthrough for a trusted loopback sidecar is designed but
+not yet implemented (#510). The capability must have been signed for the
+configured origin method, authority, canonical path, query, headers, and body;
+the gateway restores that origin request after a cache miss. A resident hit is
+not re-authorized. Header SigV4 and a standalone STS session token are not part
+of the first milestone.
 
 ## Cache routing mark
 
