@@ -89,6 +89,16 @@ bench-check *ARGS:
 gateway-bench:
     cargo run --release -p talon-gateway --example gateway_benchmark
 
+# Benchmark the gateway's real S3 and Azure adapters against a live stack.
+# Requires the four gateways, two workers, two coordinators and the origin stub
+# from scripts/gateway_bench_stack.sh to be running.
+gateway-proxy-bench *ARGS:
+    python3 scripts/gateway_proxy_bench.py {{ARGS}}
+
+# Bring up (or tear down) the local stack the proxy benchmark drives.
+gateway-bench-stack ACTION="up":
+    scripts/gateway_bench_stack.sh {{ACTION}}
+
 # Print the current committed baseline.
 bench-baseline NAME="main":
     @cat bench/baselines/{{NAME}}.json

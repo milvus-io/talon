@@ -1,0 +1,80 @@
+{
+  "description": "Gateway S3 vs Azure proxy paths, cache route vs origin passthrough. Loopback, one host, synthetic dual-protocol origin stub. Paired order-swapped rounds; every response verified against origin by SHA-256.",
+  "host": {
+    "cores": 16,
+    "loopback": true
+  },
+  "config": {
+    "requests": 2000,
+    "range_bytes": 1048576,
+    "concurrency": 8,
+    "rounds": 4,
+    "object_bytes": 67108864,
+    "out": "/tmp/gwbench/results.json"
+  },
+  "origin_stub_ceiling": {
+    "rps": 4014.4,
+    "throughput_MiBps": 4014.4,
+    "p50_ms": 1.809,
+    "p99_ms": 4.28,
+    "note": "Client straight to the origin stub, gateway removed. The origin arms land at ~40% of this, so they are not stub-bound."
+  },
+  "arms": [
+    {
+      "arm": "s3-cache",
+      "protocol": "s3",
+      "route": "cache",
+      "rounds": 4,
+      "rps_median": 3080.0,
+      "rps_min": 3035.1,
+      "rps_max": 3094.9,
+      "throughput_MiBps_median": 3080.0,
+      "p50_ms_median": 1.642,
+      "p99_ms_median": 3.644,
+      "cpu_per_request_us": 840.0,
+      "cpu_cores_busy": 2.98
+    },
+    {
+      "arm": "azure-cache",
+      "protocol": "azure",
+      "route": "cache",
+      "rounds": 4,
+      "rps_median": 3165.2,
+      "rps_min": 3078.1,
+      "rps_max": 3204.8,
+      "throughput_MiBps_median": 3165.2,
+      "p50_ms_median": 1.633,
+      "p99_ms_median": 3.218,
+      "cpu_per_request_us": 840.0,
+      "cpu_cores_busy": 2.97
+    },
+    {
+      "arm": "s3-origin",
+      "protocol": "s3",
+      "route": "origin",
+      "rounds": 4,
+      "rps_median": 1579.2,
+      "rps_min": 1430.2,
+      "rps_max": 1725.0,
+      "throughput_MiBps_median": 1579.2,
+      "p50_ms_median": 2.011,
+      "p99_ms_median": 44.642,
+      "cpu_per_request_us": 990.0,
+      "cpu_cores_busy": 1.47
+    },
+    {
+      "arm": "azure-origin",
+      "protocol": "azure",
+      "route": "origin",
+      "rounds": 4,
+      "rps_median": 1638.2,
+      "rps_min": 1424.3,
+      "rps_max": 2038.4,
+      "throughput_MiBps_median": 1638.2,
+      "p50_ms_median": 1.946,
+      "p99_ms_median": 44.967,
+      "cpu_per_request_us": 975.0,
+      "cpu_cores_busy": 1.72
+    }
+  ]
+}
