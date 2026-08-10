@@ -119,6 +119,52 @@ consumer while sampling RSS. Results and interpretation are in the
 The harness emits JSON Lines and is a regression floor, not a cloud capacity
 claim.
 
+### S3 and Azure proxy paths, end to end
+
+`just gateway-proxy-bench` drives the gateway's **real** adapters — a live
+coordinator, worker, cache and origin — rather than the fixed sleeps above.
+It exists to answer two questions the synthetic harness cannot: does either
+client protocol cost more than the other, and what does the cache route buy
+over passing through to origin?
+
+Four deployments run concurrently on one 16-core host (S3 and Azure × `cache`
+and `origin`), against one dual-protocol origin stub so both adapters face an
+identical backend. Rounds are paired and **order-swapped**, so machine drift
+lands on both arms instead of on whichever ran first. Every response is
+verified against the origin by SHA-256; a wrong status, length, or checksum
+fails the run rather than being counted as throughput.
+
+| Arm | rps (median of 4) | MiB/s | p50 | p99 | CPU/req | cores busy |
+| --- | --- | --- | --- | --- | --- | --- |
+| S3, `cache` | 3,080 | 3,080 | 1.64 ms | 3.64 ms | 840 µs | 2.98 |
+| Azure, `cache` | 3,165 | 3,165 | 1.63 ms | 3.22 ms | 840 µs | 2.97 |
+| S3, `origin` | 1,579 | 1,579 | 2.01 ms | 44.6 ms | 990 µs | 1.47 |
+| Azure, `origin` | 1,638 | 1,638 | 1.95 ms | 45.0 ms | 975 µs | 1.72 |
+
+1 MiB ranges, concurrency 8, 2,000 measured requests per arm per round, 64 MiB
+object.
+
+**The two protocols cost the same.** Azure leads S3 by 2.8% on the cache route,
+but the run-to-run spread within a single arm is up to 4.0%, so that gap is
+smaller than the noise it sits in. Per-request CPU is identical to three
+significant figures (840 µs both). Treat S3 and Azure as equal-cost front
+ends; there is no protocol-level reason to prefer one.
+
+**The cache route is ~1.95× the origin route** and, more importantly, changes
+the shape of the tail: p99 falls from ~45 ms to ~3.4 ms, a 13× improvement,
+because a cache hit never inherits the origin's variance.
+
+**Control, so the origin arms are not misread.** The same client straight to
+the origin stub with the gateway removed reaches 4,014 rps. The origin arms
+land near 40% of that, so they are measuring gateway passthrough cost, not the
+stub's ceiling. They still hold the origin's latency distribution, which is why
+their p99 is the stub's and not the gateway's.
+
+**What this is not.** Loopback, one host, a synthetic origin: these are
+*relative* numbers for comparing adapters and routes, not a cloud capacity
+claim. Cross-node, the NIC binds long before any of these figures
+([see below](#where-the-serve-path-actually-saturates)).
+
 ## Where the serve path actually saturates
 
 The sweep above compares data planes against each other. It does not answer a
