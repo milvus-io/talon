@@ -72,6 +72,21 @@ pub async fn handle_conn(
             .await?;
             continue;
         }
+        if header.msg_type == MsgType::AdmitCachedBlock {
+            if !handle_cached_block_admission(
+                &mut stream,
+                &header,
+                &payload,
+                &worker,
+                &observability,
+                request_started,
+            )
+            .await?
+            {
+                return Ok(());
+            }
+            continue;
+        }
         if header.msg_type == MsgType::Delete {
             handle_delete(
                 &mut stream,
@@ -233,6 +248,87 @@ pub async fn handle_conn(
             }
         }
     }
+}
+
+async fn handle_cached_block_admission(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<bool> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+    let (h, req) = match data::decode_cached_block_put_header(&full) {
+        Ok(value) => value,
+        Err(error) => {
+            let reply = data::encode_typed_error(
+                header.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("bad cache admission: {error}"),
+            );
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(false);
+        }
+    };
+    if !observability.is_ready() {
+        let reply = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::Unavailable,
+            "worker is not ready",
+        );
+        stream.write_all(&reply).await?;
+        stream.flush().await?;
+        return Ok(false);
+    }
+    if let Err(error) = worker.validate_cached_block_admission(&req) {
+        let reply = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::InvalidRequest,
+            error.to_string(),
+        );
+        stream.write_all(&reply).await?;
+        stream.flush().await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(false);
+    }
+
+    let body_len = usize::try_from(req.body_len)
+        .map_err(|_| anyhow::anyhow!("cache admission body length is not representable"))?;
+    let mut body = vec![0_u8; body_len];
+    stream.read_exact(&mut body).await?;
+    match worker
+        .admit_cached_block(&req, bytes::Bytes::from(body))
+        .await
+    {
+        Ok(()) => {
+            stream
+                .write_all(&data::response_header_ok(h.request_id, 0))
+                .await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_success(req.body_len, request_started.elapsed());
+        }
+        Err(error) => {
+            stream
+                .write_all(&encode_runtime_error(h.request_id, &error))
+                .await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(true)
 }
 
 async fn handle_cached_range(

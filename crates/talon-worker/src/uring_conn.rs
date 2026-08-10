@@ -20,8 +20,8 @@
 //!
 //! - per-message-type payload caps enforced *before* allocation, and read
 //!   timeouts (#111) — via [`talon_transport::uring::read_frame`];
-//! - `GetRange`/`GetCachedRange`/`Put`/`Delete` dispatch, with any other type rejected before
-//!   per-request work is done;
+//! - `GetRange`/`GetCachedRange`/`AdmitCachedBlock`/`Put`/`Delete` dispatch,
+//!   with any other type rejected before per-request work is done;
 //! - readiness gating, so an unready worker returns an error frame rather than
 //!   serving;
 //! - the desync rule: once a response header promising `len` bytes is on the
@@ -106,6 +106,22 @@ pub async fn handle_conn(
                     request_started,
                 )
                 .await?;
+                continue;
+            }
+            MsgType::AdmitCachedBlock => {
+                if !handle_cached_block_admission(
+                    &mut stream,
+                    &mut reader,
+                    &header,
+                    &payload,
+                    &worker,
+                    &observability,
+                    request_started,
+                )
+                .await?
+                {
+                    return Ok(());
+                }
                 continue;
             }
             MsgType::Delete => {
@@ -251,6 +267,77 @@ pub async fn handle_conn(
             }
         }
     }
+}
+
+async fn handle_cached_block_admission(
+    stream: &mut TcpStream,
+    reader: &mut BufferedFrameReader,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &Arc<WorkerRuntime>,
+    observability: &Arc<WorkerObservability>,
+    request_started: Instant,
+) -> anyhow::Result<bool> {
+    let (h, req) = match data::decode_cached_block_put_header(&rejoin(header, payload)) {
+        Ok(value) => value,
+        Err(error) => {
+            let reply = data::encode_typed_error(
+                header.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("bad cache admission: {error}"),
+            );
+            write_all(stream, reply).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(false);
+        }
+    };
+    if !observability.is_ready() {
+        let reply = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::Unavailable,
+            "worker is not ready",
+        );
+        write_all(stream, reply).await?;
+        return Ok(false);
+    }
+    if let Err(error) = worker.validate_cached_block_admission(&req) {
+        let reply = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::InvalidRequest,
+            error.to_string(),
+        );
+        write_all(stream, reply).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(false);
+    }
+
+    let body_len = usize::try_from(req.body_len)
+        .map_err(|_| anyhow::anyhow!("cache admission body length is not representable"))?;
+    let body = reader
+        .read_exact_bytes(stream, body_len, talon_transport::DEFAULT_READ_TIMEOUT)
+        .await?;
+    match worker
+        .admit_cached_block(&req, bytes::Bytes::from(body))
+        .await
+    {
+        Ok(()) => {
+            write_all(stream, data::response_header_ok(h.request_id, 0).to_vec()).await?;
+            observability
+                .metrics()
+                .record_request_success(req.body_len, request_started.elapsed());
+        }
+        Err(error) => {
+            write_all(stream, encode_runtime_error(h.request_id, &error)).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(true)
 }
 
 async fn handle_cached_range(
@@ -662,10 +749,11 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
     use talon_core::{
-        BackendStore, NodeId, NodeInfo, NodeRole, ObjectId, ObjectStat, Result, Version,
+        BackendStore, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, ObjectStat, Result, Version,
     };
     use talon_transport::data::{
-        encode_delete, encode_put_header, encode_request, DeleteRequest, PutRequest, RangeRequest,
+        encode_cached_block_put_header, encode_delete, encode_put_header, encode_request,
+        CachedBlockPutRequest, CachedRangeRequest, DeleteRequest, PutRequest, RangeRequest,
     };
     use talon_transport::Flags;
 
@@ -847,6 +935,48 @@ mod tests {
                 );
                 assert_eq!(body, expected, "pass {pass}: range bytes must match");
             }
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn admits_a_complete_block_through_the_ring_handler() {
+        let root = tmp_root("admit");
+        run(async {
+            let (worker, obs) = build(&root, Arc::new(RampBackend), 8);
+            let retained = Arc::clone(&worker);
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let address = listener.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let _ = handle_conn(stream, worker, obs).await;
+            });
+            let object = ObjectId::new(talon_core::Backend::Azure, "c", "admitted");
+            let request = CachedBlockPutRequest {
+                block: BlockId::new(object.clone(), 0, 8, Version::new("origin-v2")),
+                object_len: 8,
+                body_len: 8,
+            };
+            let mut client = TcpStream::connect(address).await.unwrap();
+            let mut wire = encode_cached_block_put_header(7, &request).unwrap();
+            wire.extend_from_slice(b"gateway!");
+            let (result, _) = client.write_all(wire).await;
+            result.unwrap();
+            let (reply, body) = read_response(&mut client).await;
+            assert!(!reply.flags.contains(Flags::ERROR));
+            assert!(body.is_empty());
+            assert_eq!(
+                retained
+                    .serve_cached(&CachedRangeRequest {
+                        object,
+                        version: Version::new("origin-v2"),
+                        offset: 0,
+                        len: 8,
+                    })
+                    .await
+                    .unwrap(),
+                Bytes::from_static(b"gateway!")
+            );
         });
         std::fs::remove_dir_all(root).ok();
     }
