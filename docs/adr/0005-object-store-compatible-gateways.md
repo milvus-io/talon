@@ -191,6 +191,46 @@ binding to a loopback address. It is not a production configuration and must
 emit a startup warning. Production readiness fails closed without TLS,
 authentication, and an authorization policy.
 
+### 6a. Allow capability passthrough only for a trusted local sidecar
+
+Issue #510 adds a separate, opt-in origin-authentication mode for colocated
+jobs that already hold an origin-issued capability. This mode is not an
+exception to the production security model above: it is accepted only in
+`development` mode on a loopback listener and must fail configuration
+validation in `production` mode or on a routable listener.
+
+The first capability forms are S3 presigned-query credentials and Azure Blob
+service or account SAS. On an origin access, the gateway restores the
+configured origin authority and preserves the signed method, canonical path,
+query, headers, and body needed by the provider. It does not replace the
+capability with gateway credentials. Header-signed requests are outside the
+first milestone unless interception preserves their signed authority and
+target exactly; an STS session token by itself is not S3 authorization.
+
+The security boundary is deliberately narrower: possession of the loopback
+listener grants access to resident cache bytes. A cache hit is not
+re-authorized, tokens are excluded from cache keys, and a revoked capability
+does not revoke bytes already available to that local process. Mutations,
+listings, metadata misses, and data misses still require an origin request and
+therefore provider authorization. Raw capabilities must remain request-scoped
+and must never enter logs, metrics, cache metadata, worker storage, or control
+messages.
+
+This behavior cannot be implemented by forwarding one header through the
+existing read path. Workers currently read through with their process origin
+identity. The trusted passthrough path instead requires a cache-only worker
+probe, a gateway origin fetch, and bounded admission of the validated response
+into the cache. A probe miss must never invoke a worker `BackendStore`.
+
+Version metadata is held in a bounded, process-local gateway index populated
+from successful origin responses. An S3 GET presigned URL cannot authorize a
+separate HEAD, so a cold or restart-lost metadata entry goes directly to the
+origin GET before it can address versioned cache blocks. Consequently the
+first request after gateway restart may access the origin even when matching
+bytes remain on workers. Metadata expiry and mutable-object freshness are
+deployment policy; this mode targets immutable training inputs and must not
+claim the production close-to-open contract.
+
 ### 7. Use the provider's HTTP stack, not a hand-written parser
 
 The gateway uses the repository's Tokio runtime and a maintained HTTP server
@@ -239,6 +279,8 @@ one begins.
    conformance before claiming transparent write support.
 10. Publish deployment configuration, compatibility matrices, and gateway
     overhead benchmarks (#478).
+11. Add the trusted local capability-passthrough path as cache probe, bounded
+    admission, provider forwarding, and conformance PRs (#510).
 
 ## Consequences
 
@@ -278,9 +320,12 @@ payloads through it adds a throughput bottleneck and violates #440.
 
 ### Forward client authorization directly to the origin
 
-Rejected. S3 signatures include the authority and signed headers, and endpoint
-override commonly changes both. Re-signing after explicit authorization gives
-the gateway a coherent trust boundary.
+Rejected for production and shared gateways. S3 signatures include the
+authority and signed headers, and endpoint override commonly changes both.
+Re-signing after explicit authorization gives the gateway a coherent trust
+boundary. The loopback-only capability mode in section 6a is a deliberately
+weaker, opt-in boundary for a colocated process and preserves the signed
+request when it accesses the origin.
 
 ### Build two independent proxies
 

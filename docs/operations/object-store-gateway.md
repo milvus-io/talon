@@ -41,6 +41,36 @@ Use an origin identity limited to the advertised read and mutation operations
 on namespaces assigned to that gateway. Do not grant bucket or account
 administration permissions.
 
+### Planned trusted passthrough mode
+
+Issue #510 tracks `TALON_GATEWAY_ORIGIN_AUTH=trusted-passthrough`. It is a
+planned sidecar mode, not a currently accepted configuration value. It will be
+restricted to a loopback `development` listener and initially accept S3
+presigned-query credentials and Azure service/account SAS.
+
+In that mode a resident cache read is intentionally not authorized again. Any
+process that can reach the listener can read matching resident data, so the
+listener must share the training job's network namespace and must not be
+published by a container port, Service, ingress, or host-network wildcard.
+Cache keys exclude credentials. Listings, mutations, cold metadata, and data
+misses go to the provider with the request-scoped capability; Talon service
+credentials are not substituted.
+
+The mode requires a cache-only worker probe and gateway-driven cache fill.
+Until those protocol changes land, setting no origin credentials does not
+produce passthrough: workers still read through using their configured backend
+identity. For S3, a cold GET uses the original GET at the origin because its
+presigned query cannot authorize a synthetic HEAD. Successful origin responses
+seed a bounded in-memory metadata index; restart loses that index and forces a
+new origin request. Capability revocation and mutable-object freshness are not
+enforced for already resident bytes.
+
+Clients must create the capability for the configured origin authority and
+canonical target. Replacing the network destination is valid only when the
+gateway can restore that authority without changing the signed method, path,
+query, signed headers, or body. `x-amz-security-token` without a matching
+SigV4 signature is not a bearer credential.
+
 ## Configuration
 
 Common variables:
@@ -50,6 +80,7 @@ Common variables:
 | `TALON_GATEWAY_PROTOCOL` | `s3` | `s3` or `azure`. |
 | `TALON_GATEWAY_BIND` | `127.0.0.1:8080` | Listener; development mode rejects non-loopback addresses. |
 | `TALON_GATEWAY_MODE` | `development` | `development` or fail-closed `production`. |
+| `TALON_GATEWAY_ORIGIN_AUTH` | `service` | Planned: `service` or loopback-only `trusted-passthrough` (#510). |
 | `TALON_COORDINATOR_ADDR` | required | Talon coordinator control address. |
 | `TALON_GATEWAY_ROUTE` | `cache` | `cache`, `cache-only`, or direct `origin`. |
 | `TALON_GATEWAY_PATH_STYLE` | `false` | Accept `/bucket/key` or `/account/container/blob`. |
