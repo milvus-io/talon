@@ -2562,6 +2562,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-c"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "talon-cache-client",
+ "talon-core",
+ "talon-transport",
+ "tokio",
+]
+
+[[package]]
 name = "talon-cache-client"
 version = "0.1.0"
 dependencies = [

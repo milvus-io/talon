@@ -35,6 +35,7 @@
 - [Overview](./clients/overview.md)
 - [Python client](./clients/python.md)
 - [Java client](./clients/java.md)
+- [C client](./clients/c.md)
 
 # Reference
 

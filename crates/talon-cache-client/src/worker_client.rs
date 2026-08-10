@@ -159,6 +159,53 @@ impl WorkerClient {
         }
     }
 
+    /// Fetch `[offset, offset + dst.len())` of `object` into `dst`.
+    ///
+    /// This avoids allocating an intermediate range buffer for callers that
+    /// retain ownership of their destination storage, such as C bindings.
+    pub async fn fetch_range_into(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<usize, WorkerError> {
+        let request = RangeRequest {
+            object: object.clone(),
+            offset,
+            len: dst.len() as u64,
+        };
+        let request_id = RequestId::next();
+        let output = encode_request(request_id.0, &request)?;
+        match self.exchange_into(&output, dst).await {
+            Ok(n) => Ok(n),
+            Err((true, _)) => {
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                let n = self
+                    .pool
+                    .with_request_deadline("worker fetch_range retry", async {
+                        stream.write_all(&output).await?;
+                        stream.flush().await?;
+                        read_range_reply_into(&mut stream, dst).await
+                    })
+                    .await?;
+                self.pool.release(&self.addr, stream);
+                Ok(n)
+            }
+            Err((false, error)) => {
+                tracing::error!(
+                    req = %request_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    offset,
+                    len = dst.len(),
+                    error = %error,
+                    "worker range fetch failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Fetch a versioned range only if it is already resident on the worker.
     ///
     /// The distinct wire operation is fail-closed during rolling upgrades: an
@@ -296,6 +343,34 @@ impl WorkerClient {
                 Ok(bytes)
             }
             Err(err) => Err((reused, err)),
+        }
+    }
+
+    /// One request/response into a caller-owned buffer.
+    async fn exchange_into(
+        &self,
+        output: &[u8],
+        dst: &mut [u8],
+    ) -> Result<usize, (bool, WorkerError)> {
+        let (mut stream, reused) = self
+            .pool
+            .checkout(&self.addr)
+            .await
+            .map_err(|error| (false, WorkerError::from(error)))?;
+        let result: Result<usize, WorkerError> = self
+            .pool
+            .with_request_deadline("worker fetch_range", async {
+                stream.write_all(output).await?;
+                stream.flush().await?;
+                read_range_reply_into(&mut stream, dst).await
+            })
+            .await;
+        match result {
+            Ok(n) => {
+                self.pool.release(&self.addr, stream);
+                Ok(n)
+            }
+            Err(error) => Err((reused, error)),
         }
     }
 }
@@ -637,6 +712,39 @@ async fn read_range_reply(
     Ok(body)
 }
 
+/// Read a successful range reply directly into `dst`.
+async fn read_range_reply_into(
+    stream: &mut TcpStream,
+    dst: &mut [u8],
+) -> Result<usize, WorkerError> {
+    let mut header_buf = [0u8; HEADER_LEN];
+    stream.read_exact(&mut header_buf).await?;
+    let header = FrameHeader::decode(&header_buf)?;
+    if header.msg_type != MsgType::GetRange {
+        return Err(WorkerError::NotGetRange(header.msg_type));
+    }
+    if header.flags.contains(Flags::ERROR) {
+        if header.length > MAX_CONTROL_PAYLOAD_LEN {
+            return Err(WorkerError::PayloadTooLarge {
+                length: header.length,
+                cap: MAX_CONTROL_PAYLOAD_LEN,
+            });
+        }
+        let mut body = vec![0u8; header.length as usize];
+        stream.read_exact(&mut body).await?;
+        return Err(WorkerError::Remote(decode_error_payload(&body)));
+    }
+    let expected_len = dst.len() as u64;
+    if u64::from(header.length) != expected_len {
+        return Err(WorkerError::RangeLengthMismatch {
+            expected: expected_len,
+            actual: u64::from(header.length),
+        });
+    }
+    stream.read_exact(dst).await?;
+    Ok(dst.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -796,6 +904,27 @@ mod tests {
         assert_eq!(bytes[0], 0);
         assert_eq!(bytes[250], 250);
         assert_eq!(bytes[251], 0);
+    }
+
+    #[tokio::test]
+    async fn fetch_range_into_fills_caller_buffer() {
+        let addr = mock_worker(|req| {
+            let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
+            let mut out = response_header_ok(0, payload.len() as u32).to_vec();
+            out.extend_from_slice(&payload);
+            out
+        })
+        .await;
+        let client = WorkerClient::new(addr);
+        let mut dst = vec![0u8; 4096];
+        let n = client
+            .fetch_range_into(&object(), 0, &mut dst)
+            .await
+            .unwrap();
+        assert_eq!(n, dst.len());
+        assert_eq!(dst[0], 0);
+        assert_eq!(dst[250], 250);
+        assert_eq!(dst[251], 0);
     }
 
     #[tokio::test]
