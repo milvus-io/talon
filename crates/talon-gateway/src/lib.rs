@@ -22,7 +22,7 @@ pub use cache_mark::{
     CacheFallback, CacheLookup, CacheMarkError, CachePopulation, EffectiveDecision,
     AZURE_CACHE_MARK_HEADER, S3_CACHE_MARK_HEADER,
 };
-pub use config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
+pub use config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity, OriginAuthMode};
 pub use metrics::GatewayMetrics;
 pub use model::{
     FailureReason, GatewayAccess, GatewayAccessRequirement, GatewayAdapter, GatewayOperation,

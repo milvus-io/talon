@@ -16,7 +16,7 @@ use talon_gateway::{
     serve, serve_tls, AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy,
     GatewayAdapter, GatewayClientAuthConfig, GatewayClientAuthMode, GatewayConfig, GatewayMode,
     GatewayMtlsIdentity, GatewayOperation, GatewayRoute, GatewayRuntime, GatewaySecurity,
-    GatewayTlsConfig, ProviderProtocol,
+    GatewayTlsConfig, OriginAuthMode, ProviderProtocol,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -28,6 +28,7 @@ struct Settings {
     protocol: String,
     bind: SocketAddr,
     mode: GatewayMode,
+    origin_auth: OriginAuthMode,
     coordinator: String,
     block_size: u32,
     transfer_chunk_bytes: u32,
@@ -72,7 +73,7 @@ impl Settings {
         if !matches!(protocol.as_str(), "s3" | "azure") {
             return Err(invalid("TALON_GATEWAY_PROTOCOL must be s3 or azure"));
         }
-        let bind = parse_or(
+        let bind: SocketAddr = parse_or(
             value(&mut get, "TALON_GATEWAY_BIND"),
             "127.0.0.1:8080",
             "TALON_GATEWAY_BIND",
@@ -86,6 +87,27 @@ impl Settings {
                 ))
             }
         };
+        let origin_auth = match value(&mut get, "TALON_GATEWAY_ORIGIN_AUTH").as_deref() {
+            None | Some("service") => OriginAuthMode::Service,
+            Some("trusted-passthrough") => OriginAuthMode::TrustedPassthrough,
+            Some(_) => {
+                return Err(invalid(
+                    "TALON_GATEWAY_ORIGIN_AUTH must be service or trusted-passthrough",
+                ))
+            }
+        };
+        if origin_auth == OriginAuthMode::TrustedPassthrough {
+            if mode != GatewayMode::Development {
+                return Err(invalid(
+                    "trusted-passthrough origin auth requires TALON_GATEWAY_MODE=development",
+                ));
+            }
+            if !bind.ip().is_loopback() {
+                return Err(invalid(
+                    "trusted-passthrough origin auth requires a loopback bind address",
+                ));
+            }
+        }
         let coordinator = required(&mut get, "TALON_COORDINATOR_ADDR")?;
         let block_size = parse_or(
             value(&mut get, "TALON_GATEWAY_BLOCK_SIZE"),
@@ -192,10 +214,11 @@ impl Settings {
             )),
         };
 
-        Ok(Self {
+        let settings = Self {
             protocol,
             bind,
             mode,
+            origin_auth,
             coordinator,
             block_size,
             transfer_chunk_bytes,
@@ -253,7 +276,24 @@ impl Settings {
             authorization_path: value(&mut get, "TALON_GATEWAY_AUTHORIZATION_PATH")
                 .map(PathBuf::from),
             tls,
-        })
+        };
+        settings.validate_origin_auth()?;
+        Ok(settings)
+    }
+
+    fn validate_origin_auth(&self) -> MainResult<()> {
+        if self.origin_auth != OriginAuthMode::TrustedPassthrough {
+            return Ok(());
+        }
+        if self.s3_client_identities_path.is_some()
+            || self.azure_client_identities_path.is_some()
+            || self.authorization_path.is_some()
+        {
+            return Err(invalid(
+                "trusted-passthrough origin auth cannot be combined with gateway client identity or authorization policy configuration",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -311,6 +351,11 @@ fn cache_reader(settings: &Settings) -> Arc<BlockReader> {
 }
 
 fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
+    if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
+        return Err(invalid(
+            "trusted-passthrough Azure routing is not available in this build",
+        ));
+    }
     let account = settings
         .azure_account
         .clone()
@@ -370,6 +415,11 @@ fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
 }
 
 fn s3_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
+    if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
+        return Err(invalid(
+            "trusted-passthrough S3 routing is not available in this build",
+        ));
+    }
     let region = settings
         .s3_region
         .clone()
@@ -631,6 +681,7 @@ async fn main() -> MainResult<()> {
         GatewayConfig {
             bind: settings.bind,
             mode: settings.mode,
+            origin_auth: settings.origin_auth,
             ..GatewayConfig::default()
         },
         adapter,
@@ -704,6 +755,7 @@ mod tests {
         assert_eq!(settings.protocol, "s3");
         assert!(settings.bind.ip().is_loopback());
         assert_eq!(settings.mode, GatewayMode::Development);
+        assert_eq!(settings.origin_auth, OriginAuthMode::Service);
         assert_eq!(settings.route, GatewayRoute::Cache);
         assert!(!settings.incoming_path_style);
         assert!(settings.tls.is_none());
@@ -727,12 +779,47 @@ mod tests {
         .is_err());
         assert!(settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_ORIGIN_AUTH", "forward"),
+        ])
+        .is_err());
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
             ("TALON_GATEWAY_MODE", "unsafe"),
         ])
         .is_err());
         assert!(settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
             ("TALON_GATEWAY_PATH_STYLE", "maybe"),
+        ])
+        .is_err());
+    }
+
+    #[test]
+    fn trusted_passthrough_configuration_is_bounded_and_fail_closed() {
+        let trusted = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_ORIGIN_AUTH", "trusted-passthrough"),
+        ])
+        .unwrap();
+        assert_eq!(trusted.origin_auth, OriginAuthMode::TrustedPassthrough);
+        assert!(s3_adapter(&trusted).is_err());
+
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_ORIGIN_AUTH", "trusted-passthrough"),
+            ("TALON_GATEWAY_MODE", "production"),
+        ])
+        .is_err());
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_ORIGIN_AUTH", "trusted-passthrough"),
+            ("TALON_GATEWAY_BIND", "0.0.0.0:8080"),
+        ])
+        .is_err());
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_ORIGIN_AUTH", "trusted-passthrough"),
+            ("TALON_GATEWAY_AUTHORIZATION_PATH", "/policy.json"),
         ])
         .is_err());
     }
