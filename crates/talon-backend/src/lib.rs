@@ -11,6 +11,7 @@ pub mod azure_sharedkey;
 pub mod delay;
 pub mod gcs;
 pub mod http;
+mod query_auth;
 pub mod reqwest_client;
 pub mod retry;
 pub mod s3;
@@ -23,6 +24,7 @@ pub use gcs::{GcsBackend, GcsConfig};
 pub use http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
+pub use query_auth::{AzureSas, S3PresignedQuery};
 pub use reqwest_client::ReqwestClient;
 pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
 pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest};

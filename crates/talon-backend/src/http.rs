@@ -29,7 +29,7 @@ pub enum Method {
 }
 
 /// An outgoing HTTP request built by a backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct HttpRequest {
     /// Request method.
     pub method: Method,
@@ -39,6 +39,27 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     /// Request body. Empty for GET/HEAD/DELETE; carries the object bytes for PUT.
     pub body: bytes::Bytes,
+}
+
+impl std::fmt::Debug for HttpRequest {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let url = self.url.split_once('?').map_or_else(
+            || self.url.clone(),
+            |(base, _)| format!("{base}?[REDACTED]"),
+        );
+        let header_names = self
+            .headers
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>();
+        formatter
+            .debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("url", &url)
+            .field("header_names", &header_names)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 impl HttpRequest {

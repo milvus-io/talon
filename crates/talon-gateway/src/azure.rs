@@ -12,7 +12,9 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use talon_backend::{AzureBackend, HttpRequestBody, HttpResponse, HttpStreamResponse};
+use talon_backend::{
+    AzureBackend, AzureSas, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
+};
 use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER_CHUNK_BYTES};
 use talon_core::{Backend, ObjectId, Version};
 
@@ -141,7 +143,8 @@ impl AzureCache for BlockReader {
     }
 }
 
-/// Origin seam. The production implementation keeps GET bodies streaming.
+/// Origin seam. Service-auth methods and explicit request-scoped SAS methods
+/// are separate; the production implementation keeps GET bodies streaming.
 #[async_trait]
 pub trait AzureOrigin: Send + Sync + 'static {
     /// Execute a conditional blob metadata request.
@@ -240,6 +243,48 @@ pub trait AzureOrigin: Send + Sync + 'static {
         _headers: &[(String, String)],
     ) -> Result<HttpResponse, String> {
         Err("Azure origin does not implement Get Block List".into())
+    }
+
+    async fn sas_object(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &AzureSas,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement SAS requests".into())
+    }
+
+    async fn sas_object_stream(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &AzureSas,
+        _headers: &[(String, String)],
+    ) -> Result<HttpStreamResponse, String> {
+        Err("Azure origin does not implement streaming SAS requests".into())
+    }
+
+    async fn sas_object_body(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &AzureSas,
+        _headers: &[(String, String)],
+        _body: HttpRequestBody,
+        _len: u64,
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement SAS request bodies".into())
+    }
+
+    async fn sas_container(
+        &self,
+        _method: Method,
+        _container: &str,
+        _credential: &AzureSas,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("Azure origin does not implement container SAS requests".into())
     }
 }
 
@@ -340,6 +385,52 @@ impl AzureOrigin for AzureBackend {
         headers: &[(String, String)],
     ) -> Result<HttpResponse, String> {
         self.execute_get_query_raw(object, query, headers).await
+    }
+
+    async fn sas_object(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_sas_raw(method, object, credential, headers)
+            .await
+    }
+
+    async fn sas_object_stream(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> Result<HttpStreamResponse, String> {
+        self.execute_sas_stream_raw(method, object, credential, headers)
+            .await
+    }
+
+    async fn sas_object_body(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        self.execute_sas_body_raw(method, object, credential, headers, body, len)
+            .await
+    }
+
+    async fn sas_container(
+        &self,
+        method: Method,
+        container: &str,
+        credential: &AzureSas,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_sas_container_raw(method, container, credential, headers)
+            .await
     }
 }
 

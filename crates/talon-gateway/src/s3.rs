@@ -15,6 +15,7 @@ use futures::{Stream, StreamExt};
 use sha2::{Digest, Sha256};
 use talon_backend::{
     HttpRequestBody, HttpResponse, HttpStreamResponse, Method, S3Backend, S3MultipartRequest,
+    S3PresignedQuery,
 };
 use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER_CHUNK_BYTES};
 use talon_core::{Backend, ObjectId, Version};
@@ -142,7 +143,9 @@ impl S3Cache for BlockReader {
     }
 }
 
-/// Scoped origin identity. Incoming client signatures are never forwarded.
+/// Origin execution seam. Service-auth methods and explicit request-scoped
+/// presigned methods are separate so one can never silently substitute for the
+/// other.
 #[async_trait]
 pub trait S3Origin: Send + Sync + 'static {
     async fn head(
@@ -228,6 +231,60 @@ pub trait S3Origin: Send + Sync + 'static {
         _payload_hash: &str,
     ) -> Result<HttpResponse, String> {
         Err("S3 origin does not implement multipart file bodies".into())
+    }
+
+    async fn presigned_object(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &S3PresignedQuery,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement presigned requests".into())
+    }
+
+    async fn presigned_object_stream(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &S3PresignedQuery,
+        _headers: &[(String, String)],
+    ) -> Result<HttpStreamResponse, String> {
+        Err("S3 origin does not implement streaming presigned requests".into())
+    }
+
+    async fn presigned_object_body(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &S3PresignedQuery,
+        _headers: &[(String, String)],
+        _body: HttpRequestBody,
+        _len: u64,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement presigned request bodies".into())
+    }
+
+    async fn presigned_object_file(
+        &self,
+        _method: Method,
+        _object: &ObjectId,
+        _credential: &S3PresignedQuery,
+        _headers: &[(String, String)],
+        _path: &std::path::Path,
+        _len: u64,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement presigned request files".into())
+    }
+
+    async fn presigned_bucket(
+        &self,
+        _method: Method,
+        _bucket: &str,
+        _credential: &S3PresignedQuery,
+        _headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement bucket presigned requests".into())
     }
 }
 
@@ -333,6 +390,65 @@ impl S3Origin for S3Backend {
         payload_hash: &str,
     ) -> Result<HttpResponse, String> {
         self.execute_multipart_file_raw(request, path, len, payload_hash)
+            .await
+    }
+
+    async fn presigned_object(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_presigned_raw(method, object, credential, headers)
+            .await
+    }
+
+    async fn presigned_object_stream(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> Result<HttpStreamResponse, String> {
+        self.execute_presigned_stream_raw(method, object, credential, headers)
+            .await
+    }
+
+    async fn presigned_object_body(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+        body: HttpRequestBody,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        self.execute_presigned_body_raw(method, object, credential, headers, body, len)
+            .await
+    }
+
+    async fn presigned_object_file(
+        &self,
+        method: Method,
+        object: &ObjectId,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+        path: &std::path::Path,
+        len: u64,
+    ) -> Result<HttpResponse, String> {
+        self.execute_presigned_file_raw(method, object, credential, headers, path, len)
+            .await
+    }
+
+    async fn presigned_bucket(
+        &self,
+        method: Method,
+        bucket: &str,
+        credential: &S3PresignedQuery,
+        headers: &[(String, String)],
+    ) -> Result<HttpResponse, String> {
+        self.execute_presigned_bucket_raw(method, bucket, credential, headers)
             .await
     }
 }
