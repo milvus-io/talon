@@ -8,6 +8,7 @@ mod cache_mark;
 mod config;
 mod metrics;
 mod model;
+mod origin_metadata;
 mod runtime;
 pub mod s3;
 pub mod s3_auth;
@@ -29,6 +30,7 @@ pub use model::{
     GatewayOutcome, GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget,
     ProviderProtocol,
 };
+pub use origin_metadata::{OriginMetadataIndex, OriginObjectMetadata};
 pub use runtime::{
     gateway_router, serve, serve_tls, GatewayReadiness, GatewayRuntime, GatewayTlsServeError,
     REQUEST_ID_HEADER,
