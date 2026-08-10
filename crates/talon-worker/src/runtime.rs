@@ -9,10 +9,11 @@ use talon_core::{
     Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId,
     ObjectStore, PageIndex, Version,
 };
-use talon_transport::data::RangeRequest;
-use talon_transport::frame::HEADER_LEN;
+use talon_transport::data::{CachedRangeRequest, RangeRequest};
+use talon_transport::frame::{HEADER_LEN, MAX_PAYLOAD_LEN};
 use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LEN};
 
+use crate::data_error::CacheMiss;
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
     MemoryStore, PagedBlockStore, Presence, WholeBlockStore, WorkerMetrics,
@@ -255,7 +256,6 @@ impl WorkerRuntime {
         if request.len == 0 {
             return Ok(bytes::Bytes::new());
         }
-
         // Resolve using the cache first; on a precondition failure (the object
         // was overwritten within the version-cache window) drop the stale entry
         // and retry once against a force-resolved version.
@@ -299,6 +299,73 @@ impl WorkerRuntime {
             }
             Err(error) => Err(error),
         }
+    }
+
+    /// Serve a versioned range only from resident cache state.
+    ///
+    /// Unlike [`serve`](Self::serve), this path neither resolves metadata nor
+    /// invokes `BackendStore`. A partially resident multi-block/page request is
+    /// a complete miss; no prefix is returned.
+    pub async fn serve_cached(&self, request: &CachedRangeRequest) -> anyhow::Result<bytes::Bytes> {
+        self.ensure_configured_backend(request.object.backend)?;
+        if request.len == 0 {
+            return Ok(bytes::Bytes::new());
+        }
+        if request.len > u64::from(MAX_PAYLOAD_LEN) {
+            anyhow::bail!(
+                "cache-only range length {} exceeds response frame limit {}",
+                request.len,
+                MAX_PAYLOAD_LEN
+            );
+        }
+        let end = request
+            .offset
+            .checked_add(request.len)
+            .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
+        let block_size = u64::from(self.block_size);
+        let mut output = bytes::BytesMut::with_capacity(request.len as usize);
+        let mut cursor = request.offset;
+        while cursor < end {
+            let block = self.block_for(&request.object, cursor, &request.version);
+            let offset = cursor - block.offset;
+            let take = (block.offset + block_size).min(end) - cursor;
+            let Some(meta) = self.index.get(&block) else {
+                return Err(CacheMiss.into());
+            };
+            let piece = match meta.form {
+                BlockForm::Whole => self
+                    .cached_block_range(&block, offset, take)
+                    .await?
+                    .ok_or(CacheMiss)?,
+                BlockForm::Paged { page_size, .. } => {
+                    let available = available_range_len(meta.len, offset, take)?;
+                    if available != take {
+                        return Err(CacheMiss.into());
+                    }
+                    let mut piece = bytes::BytesMut::with_capacity(take as usize);
+                    for page in touched_pages(offset, take, page_size) {
+                        let page_start = u64::from(page.0) * u64::from(page_size);
+                        let page_len = talon_core::page_len(meta.len, page_size, page);
+                        let from = offset.max(page_start);
+                        let to = (offset + take).min(page_start + page_len);
+                        if to <= from {
+                            continue;
+                        }
+                        let bytes = self.cached_page(&block, page).await?.ok_or(CacheMiss)?;
+                        piece.extend_from_slice(&slice(&bytes, from - page_start, to - from)?);
+                    }
+                    self.metrics.record_cache_hit();
+                    piece.freeze()
+                }
+            };
+            if piece.len() != take as usize {
+                return Err(CacheMiss.into());
+            }
+            output.extend_from_slice(&piece);
+            cursor += take;
+        }
+        debug_assert_eq!(request.len as usize, output.len());
+        Ok(output.freeze())
     }
 
     /// The single-resolved-version body of [`serve`](Self::serve).
@@ -2339,6 +2406,45 @@ mod tests {
         let outcome = runtime.serve(&request("ok")).await.unwrap();
         assert_eq!(read_handle(outcome), b"abcd");
         // No second backend fetch.
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cache_only_probe_never_fetches_the_backend() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime(Arc::clone(&backend), WorkerMetrics::new(1024), &root);
+        let probe = CachedRangeRequest {
+            object: request("ok").object,
+            version: Version::new("v1"),
+            offset: 0,
+            len: 4,
+        };
+
+        let miss = runtime.serve_cached(&probe).await.unwrap_err();
+        assert!(miss.downcast_ref::<CacheMiss>().is_some());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+
+        assert_eq!(
+            runtime.serve_range(&request("ok")).await.unwrap(),
+            Bytes::from_static(b"abcd")
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            runtime.serve_cached(&probe).await.unwrap(),
+            Bytes::from_static(b"abcd")
+        );
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+
+        let wrong_version = CachedRangeRequest {
+            version: Version::new("different"),
+            ..probe
+        };
+        let miss = runtime.serve_cached(&wrong_version).await.unwrap_err();
+        assert!(miss.downcast_ref::<CacheMiss>().is_some());
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(root).ok();
     }

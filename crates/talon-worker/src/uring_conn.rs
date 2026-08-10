@@ -20,7 +20,7 @@
 //!
 //! - per-message-type payload caps enforced *before* allocation, and read
 //!   timeouts (#111) — via [`talon_transport::uring::read_frame`];
-//! - `GetRange`/`Put`/`Delete` dispatch, with any other type rejected before
+//! - `GetRange`/`GetCachedRange`/`Put`/`Delete` dispatch, with any other type rejected before
 //!   per-request work is done;
 //! - readiness gating, so an unready worker returns an error frame rather than
 //!   serving;
@@ -135,6 +135,18 @@ pub async fn handle_conn(
                 .await?;
                 continue;
             }
+            MsgType::GetCachedRange => {
+                handle_cached_range(
+                    &mut stream,
+                    &header,
+                    &payload,
+                    &worker,
+                    &observability,
+                    request_started,
+                )
+                .await?;
+                continue;
+            }
             MsgType::GetRange => {}
             // A data listener serves only GetRange/Put/Delete; anything else is
             // rejected before any per-request work.
@@ -239,6 +251,73 @@ pub async fn handle_conn(
             }
         }
     }
+}
+
+async fn handle_cached_range(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &WorkerRuntime,
+    observability: &WorkerObservability,
+    request_started: Instant,
+) -> std::io::Result<()> {
+    let (decoded, request) = match data::decode_cached_request(&rejoin(header, payload)) {
+        Ok(value) => value,
+        Err(error) => {
+            let reply = data::encode_typed_error(
+                header.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("bad cache-only request: {error}"),
+            );
+            write_all(stream, reply).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+    if !observability.is_ready() {
+        let reply = data::encode_typed_error(
+            decoded.request_id,
+            DataErrorCode::Unavailable,
+            "worker is not ready",
+        );
+        write_all(stream, reply).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(());
+    }
+    if request.offset.checked_add(request.len).is_none() {
+        let reply = data::encode_typed_error(
+            decoded.request_id,
+            DataErrorCode::InvalidRequest,
+            "range offset+len overflows u64",
+        );
+        write_all(stream, reply).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(());
+    }
+    match worker.serve_cached(&request).await {
+        Ok(bytes) => {
+            let header = data::response_header_ok(decoded.request_id, bytes.len() as u32);
+            write_all(stream, header.to_vec()).await?;
+            let len = bytes.len() as u64;
+            write_all(stream, bytes.to_vec()).await?;
+            observability
+                .metrics()
+                .record_request_success(len, request_started.elapsed());
+        }
+        Err(error) => {
+            write_all(stream, encode_runtime_error(decoded.request_id, &error)).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(())
 }
 
 /// Rebuild the contiguous `header || payload` buffer the `data` decoders expect.
