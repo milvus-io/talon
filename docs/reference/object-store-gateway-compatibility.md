@@ -73,6 +73,9 @@ and deployment are tracked separately.
 
 | Surface | Status | Authority and behavior |
 |---|---|---|
+| HeadBucket | Supported | Passed through once with the configured origin identity; the origin's 200/404/403 status stays authoritative so SDK existence probes work. `x-amz-bucket-region` is rewritten to the gateway region so the origin's real region never leaks into client signing. Requires a prefixless `probe` grant on the bucket, which authorizes nothing object-level. |
+| GetBucketLocation | Supported | Answered locally with the gateway's configured signing region, because clients use the response to pick their SigV4 credential scope for this gateway, not for the origin. Bucket existence is not checked. Accepted with a `us-east-1` credential scope as the one bootstrap exception, matching the region-cache probe minio-family SDKs sign before they know the region. Requires a prefixless `probe` grant on the bucket, which authorizes nothing object-level. |
+| CreateBucket, DeleteBucket, ListBuckets | Rejected | Buckets are provisioned at the origin out of band; the gateway's origin identity holds no bucket administration permissions. |
 | HeadObject | Supported | Metadata and conditions are resolved by the configured origin identity. |
 | GetObject | Supported | Bytes stream from Talon or the origin without whole-object buffering. |
 | One `Range` | Supported | Closed, open-ended, suffix, aligned, unaligned, and EOF-clamped ranges are supported. |
@@ -114,7 +117,8 @@ streaming behavior match the Azure adapter rules above. The `s3 backend and
 gateway e2e (localstack)` CI job runs the backend plus the gateway through
 boto3 and the MinIO SDK. It covers cold and warm reads, exact ranges, URL
 encoding, conditions, presigned URLs, listing pagination and delimiters,
-ordinary mutations, boto3 and MinIO multipart operations, part copy, abort,
+bucket existence probes and the locally answered location query, ordinary
+mutations, boto3 and MinIO multipart operations, part copy, abort,
 ordering failures, and standard errors. Arrow-compatible signed HEAD and ranged
 GET fixtures run in the same test.
 

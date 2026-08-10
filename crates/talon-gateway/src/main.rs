@@ -466,6 +466,7 @@ fn s3_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
     if let Some(suffix) = &settings.endpoint_suffix {
         config.endpoint_suffix.clone_from(suffix);
     }
+    config.region.clone_from(&region);
     config.block_size = settings.block_size;
     config.transfer_chunk_bytes = settings.transfer_chunk_bytes;
     config.default_route = settings.route;
@@ -603,6 +604,7 @@ fn load_authorization(path: &Path) -> MainResult<AuthorizationPolicy> {
                 .into_iter()
                 .map(|operation| match operation.as_str() {
                     "stat" => Ok(GatewayOperation::Stat),
+                    "probe" => Ok(GatewayOperation::Probe),
                     "read" => Ok(GatewayOperation::Read),
                     "list" => Ok(GatewayOperation::List),
                     "write" => Ok(GatewayOperation::Write),

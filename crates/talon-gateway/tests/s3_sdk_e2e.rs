@@ -159,7 +159,11 @@ async fn s3_sdks_and_localstack_gateway_conformance() {
     let cache = ReadThroughCache::new(Arc::clone(&origin));
     let adapter = Arc::new(
         S3Adapter::new(
-            S3AdapterConfig::path_style("localhost"),
+            {
+                let mut config = S3AdapterConfig::path_style("localhost");
+                config.region.clone_from(&region);
+                config
+            },
             Arc::clone(&cache) as Arc<dyn S3Cache>,
             origin,
         )
@@ -192,21 +196,35 @@ async fn s3_sdks_and_localstack_gateway_conformance() {
         .unwrap(),
     ));
     runtime.install_authorization(
-        AuthorizationPolicy::new(vec![AuthorizationGrant {
-            id: "sdk-conformance".into(),
-            principal: "sdk-client".into(),
-            protocol: ProviderProtocol::S3,
-            provider_account: "test-account".into(),
-            namespace: bucket.clone(),
-            prefix: None,
-            operations: vec![
-                GatewayOperation::Stat,
-                GatewayOperation::Read,
-                GatewayOperation::List,
-                GatewayOperation::Write,
-                GatewayOperation::Delete,
-            ],
-        }])
+        AuthorizationPolicy::new(vec![
+            AuthorizationGrant {
+                id: "sdk-conformance".into(),
+                principal: "sdk-client".into(),
+                protocol: ProviderProtocol::S3,
+                provider_account: "test-account".into(),
+                namespace: bucket.clone(),
+                prefix: None,
+                operations: vec![
+                    GatewayOperation::Stat,
+                    GatewayOperation::Probe,
+                    GatewayOperation::Read,
+                    GatewayOperation::List,
+                    GatewayOperation::Write,
+                    GatewayOperation::Delete,
+                ],
+            },
+            // Lets the missing-bucket probe reach the origin so the SDK
+            // assertions observe a pass-through 404 instead of a policy 403.
+            AuthorizationGrant {
+                id: "sdk-conformance-missing-bucket".into(),
+                principal: "sdk-client".into(),
+                protocol: ProviderProtocol::S3,
+                provider_account: "test-account".into(),
+                namespace: format!("{bucket}-missing"),
+                prefix: None,
+                operations: vec![GatewayOperation::Probe],
+            },
+        ])
         .unwrap(),
     );
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
