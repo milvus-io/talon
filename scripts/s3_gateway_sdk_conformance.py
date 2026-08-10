@@ -59,6 +59,31 @@ def main() -> None:
         aws_secret_access_key=secret_key,
         config=config,
     )
+    v1_names = [
+        item["Key"]
+        for item in s3.list_objects(Bucket=bucket, Prefix="gateway/list/").get(
+            "Contents", []
+        )
+    ]
+    assert "gateway/list/a space.txt" in v1_names, v1_names
+    assert "gateway/list/child/b.txt" in v1_names, v1_names
+    first_page = s3.list_objects(Bucket=bucket, Prefix="gateway/list/", MaxKeys=1)
+    assert first_page["IsTruncated"] is True
+    # The marker deliberately needs no URL encoding: LocalStack compares raw
+    # markers against URL-encoded keys under the encoding-type=url parameter
+    # boto3 injects, so a marker containing a space never matches there. Real
+    # S3 applies encoding-type to the response only. The space-keyed object is
+    # still covered by the full-listing assertion above.
+    second_page = s3.list_objects(
+        Bucket=bucket,
+        Prefix="gateway/list/",
+        Marker="gateway/list/b",
+    )
+    second_names = [item["Key"] for item in second_page.get("Contents", [])]
+    assert second_names == ["gateway/list/child/b.txt"], (
+        f"V1 Marker pagination must resume after the marker key: {second_names}"
+    )
+
     s3.head_bucket(Bucket=bucket)
     location = s3.get_bucket_location(Bucket=bucket)
     expected_location = None if region == "us-east-1" else region

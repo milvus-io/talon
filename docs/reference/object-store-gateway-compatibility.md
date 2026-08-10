@@ -81,6 +81,7 @@ and deployment are tracked separately.
 | One `Range` | Supported | Closed, open-ended, suffix, aligned, unaligned, and EOF-clamped ranges are supported. |
 | Multiple ranges | Rejected | Returns the S3 `InvalidRange` error; multipart responses are not approximated. |
 | ListObjectsV2 | Supported | `prefix`, `delimiter`, `continuation-token`, `max-keys`, and URL encoding are forwarded to one bounded origin page. |
+| ListObjects (V1) | Supported | A bucket-level `GET` whose query carries only listing parameters forwards `prefix`, `delimiter`, `marker`, `max-keys`, and URL encoding to one bounded origin page; the V1 response body passes back unchanged. Bucket sub-resource queries (`uploads`, `versions`, `acl`, and any unrecognized key) and `list-type` values other than `2` are rejected rather than approximated by a listing. |
 | Conditional reads | Supported | ETag and date conditions remain origin-authoritative; `If-Range` controls range use. |
 | Virtual-host addressing | Supported | The bucket is parsed from the configured endpoint suffix. |
 | Path addressing | Supported | `/bucket/key` endpoint-override clients are accepted. |

@@ -190,9 +190,12 @@ canonical URI/query/headers, timestamp or presigned expiry, payload declaration,
 and STS token. A present `x-talon-cache-mark` must be signed and syntactically
 valid. Invalid requests fail before cache or origin dispatch.
 
-`HeadBucket` existence probes pass through to the origin once and keep its
-status authoritative, so SDK startup checks (for example minio-go
-`BucketExists`) distinguish a missing bucket (404) from a denied one (403).
+Both listing dialects pass through: ListObjectsV2 and ListObjects V1, the
+latter being what the AWS C++ SDK's `ListObjectsRequest` and its startup
+connectivity checks emit. `HeadBucket` existence probes pass through to the
+origin once and keep its status authoritative, so SDK startup checks (for
+example minio-go `BucketExists`) distinguish a missing bucket (404) from a
+denied one (403).
 The response's `x-amz-bucket-region` is rewritten to the gateway region so
 clients never re-sign for the origin's real region. `GetBucketLocation` is
 answered locally with `TALON_GATEWAY_S3_REGION` because clients use it to pick

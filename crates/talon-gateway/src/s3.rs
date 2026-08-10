@@ -181,6 +181,18 @@ pub trait S3Origin: Send + Sync + 'static {
         Err("S3 origin does not implement HeadBucket".into())
     }
 
+    async fn list_v1(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _delimiter: Option<&str>,
+        _marker: Option<&str>,
+        _max_keys: u32,
+        _encoding_type: Option<&str>,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement ListObjects V1".into())
+    }
+
     async fn put_body(
         &self,
         _object: &ObjectId,
@@ -339,6 +351,19 @@ impl S3Origin for S3Backend {
 
     async fn head_bucket(&self, bucket: &str) -> Result<HttpResponse, String> {
         self.execute_head_bucket_raw(bucket).await
+    }
+
+    async fn list_v1(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        marker: Option<&str>,
+        max_keys: u32,
+        encoding_type: Option<&str>,
+    ) -> Result<HttpResponse, String> {
+        self.execute_list_v1_raw(bucket, prefix, delimiter, marker, max_keys, encoding_type)
+            .await
     }
 
     async fn put_body(
@@ -598,6 +623,33 @@ enum BucketProbe {
     Location,
 }
 
+/// A bucket-level `GET` is a V1 listing only when its query carries nothing
+/// but listing parameters. Known sub-resources (`uploads`), multipart
+/// parameters, unrecognized query keys (`versions`, `acl`, ...), and
+/// unsupported `list-type` values name different S3 operations, so they are
+/// rejected rather than approximated by a listing.
+fn require_v1_list_shape(query: &S3Query) -> Result<(), S3RequestError> {
+    if query.list_type.is_some() {
+        return Err(S3RequestError::invalid(
+            "InvalidArgument",
+            "list-type must be 2",
+        ));
+    }
+    if query.uploads.is_some()
+        || query.upload_id.is_some()
+        || query.part_number.is_some()
+        || query.part_number_marker.is_some()
+        || query.max_parts.is_some()
+        || query.unknown.is_some()
+    {
+        return Err(S3RequestError::invalid(
+            "NotImplemented",
+            "bucket sub-resource requests are not supported",
+        ));
+    }
+    Ok(())
+}
+
 fn bucket_probe(
     method: &axum::http::Method,
     target: &ParsedTarget,
@@ -695,6 +747,11 @@ struct S3Query {
     part_number_marker: Option<String>,
     max_parts: Option<String>,
     location: Option<String>,
+    marker: Option<String>,
+    /// First query key outside the recognized set, kept so bucket-level
+    /// requests can reject unknown sub-resources instead of approximating
+    /// them with a listing.
+    unknown: Option<String>,
 }
 
 impl S3Query {
@@ -727,7 +784,12 @@ impl S3Query {
                 "location" => {
                     set_query_value(&mut parsed.location, value.into_owned(), "location")?
                 }
-                _ => {}
+                "marker" => set_query_value(&mut parsed.marker, value.into_owned(), "marker")?,
+                other => {
+                    if parsed.unknown.is_none() {
+                        parsed.unknown = Some(other.to_string());
+                    }
+                }
             }
         }
         if let Some(value) = parsed.encoding_type.as_deref() {
@@ -1745,6 +1807,19 @@ impl S3Adapter {
                 additional: Vec::new(),
             });
         }
+        if request.method() == axum::http::Method::GET && target.key.is_none() {
+            require_v1_list_shape(&query)?;
+            return Ok(GatewayAccess {
+                operation: GatewayOperation::List,
+                provider_account: None,
+                target: GatewayTarget::Namespace {
+                    backend: Backend::S3,
+                    namespace: target.bucket,
+                    prefix: query.prefix,
+                },
+                additional: Vec::new(),
+            });
+        }
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
@@ -1797,6 +1872,10 @@ impl S3Adapter {
             Some(BucketProbe::Head) => return self.head_bucket(target.bucket, context).await,
             Some(BucketProbe::Location) => return Ok(self.bucket_location(target.bucket, context)),
             None => {}
+        }
+        if request.method() == axum::http::Method::GET && target.key.is_none() {
+            require_v1_list_shape(&query)?;
+            return self.list_v1(target.bucket, query, context).await;
         }
         let key = target
             .key
@@ -2374,6 +2453,40 @@ impl S3Adapter {
                 query.prefix.as_deref().unwrap_or(""),
                 query.delimiter.as_deref(),
                 query.continuation_token.as_deref(),
+                max_keys,
+                query.encoding_type.as_deref(),
+            )
+            .await
+            .map_err(S3RequestError::origin_unavailable)?;
+        Ok(raw_response(
+            response,
+            GatewayOperation::List,
+            Some(GatewayTarget::Namespace {
+                backend: Backend::S3,
+                namespace: bucket,
+                prefix: query.prefix,
+            }),
+            context,
+        ))
+    }
+
+    /// ListObjects (V1): the listing dialect of the AWS C++ SDK's
+    /// `ListObjectsRequest`. The origin's V1 response body passes back
+    /// unchanged, including `Marker`/`NextMarker` pagination.
+    async fn list_v1(
+        &self,
+        bucket: String,
+        query: S3Query,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let max_keys = query.max_keys()?;
+        let response = self
+            .origin
+            .list_v1(
+                &bucket,
+                query.prefix.as_deref().unwrap_or(""),
+                query.delimiter.as_deref(),
+                query.marker.as_deref(),
                 max_keys,
                 query.encoding_type.as_deref(),
             )
@@ -3123,9 +3236,12 @@ mod tests {
             .is_err());
     }
 
+    type V1ListRequest = (String, String, Option<String>, Option<String>, u32);
+
     struct BucketOrigin {
         responses: Mutex<VecDeque<Result<HttpResponse, String>>>,
         buckets: Mutex<Vec<String>>,
+        v1_lists: Mutex<Vec<V1ListRequest>>,
     }
 
     impl BucketOrigin {
@@ -3133,7 +3249,16 @@ mod tests {
             Arc::new(Self {
                 responses: Mutex::new(responses.into_iter().collect()),
                 buckets: Mutex::new(Vec::new()),
+                v1_lists: Mutex::new(Vec::new()),
             })
+        }
+
+        fn next_response(&self) -> Result<HttpResponse, String> {
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("bucket probe test provided one response per call")
         }
     }
 
@@ -3170,11 +3295,26 @@ mod tests {
 
         async fn head_bucket(&self, bucket: &str) -> Result<HttpResponse, String> {
             self.buckets.lock().unwrap().push(bucket.to_string());
-            self.responses
-                .lock()
-                .unwrap()
-                .pop_front()
-                .expect("bucket probe test provided one response per call")
+            self.next_response()
+        }
+
+        async fn list_v1(
+            &self,
+            bucket: &str,
+            prefix: &str,
+            delimiter: Option<&str>,
+            marker: Option<&str>,
+            max_keys: u32,
+            _encoding_type: Option<&str>,
+        ) -> Result<HttpResponse, String> {
+            self.v1_lists.lock().unwrap().push((
+                bucket.to_string(),
+                prefix.to_string(),
+                delimiter.map(str::to_string),
+                marker.map(str::to_string),
+                max_keys,
+            ));
+            self.next_response()
         }
     }
 
@@ -3213,10 +3353,96 @@ mod tests {
             .classify_access(&request(axum::http::Method::GET, "/bucket?list-type=2"))
             .unwrap();
         assert_eq!(list.operation, GatewayOperation::List);
-        assert!(adapter
+        let v1 = adapter
+            .classify_access(&request(axum::http::Method::GET, "/bucket?prefix=a/"))
+            .unwrap();
+        assert_eq!(v1.operation, GatewayOperation::List);
+        assert_eq!(
+            v1.target,
+            GatewayTarget::Namespace {
+                backend: Backend::S3,
+                namespace: "bucket".into(),
+                prefix: Some("a/".into()),
+            }
+        );
+        let bare = adapter
             .classify_access(&request(axum::http::Method::GET, "/bucket"))
-            .is_err());
+            .unwrap();
+        assert_eq!(bare.operation, GatewayOperation::List);
+        assert_eq!(
+            bare.target,
+            GatewayTarget::Namespace {
+                backend: Backend::S3,
+                namespace: "bucket".into(),
+                prefix: None,
+            },
+            "a bare bucket GET is a whole-bucket V1 listing"
+        );
+        assert!(
+            adapter
+                .classify_access(&request(axum::http::Method::PUT, "/bucket"))
+                .is_err(),
+            "bucket-level mutations stay rejected"
+        );
         assert!(S3Query::parse(Some("location=&location=")).is_err());
+    }
+
+    #[test]
+    fn bucket_sub_resources_are_rejected_not_approximated() {
+        let adapter = bucket_probe_adapter(BucketOrigin::new([]), "us-east-1");
+        for (uri, code) in [
+            ("/bucket?uploads=", "NotImplemented"),
+            ("/bucket?versions", "NotImplemented"),
+            ("/bucket?acl", "NotImplemented"),
+            ("/bucket?list-type=3", "InvalidArgument"),
+        ] {
+            let error = adapter
+                .classify_access(&request(axum::http::Method::GET, uri))
+                .unwrap_err();
+            assert_eq!(error.code, code, "{uri} must not become a V1 listing");
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_listing_forwards_validated_parameters() {
+        let origin = BucketOrigin::new([Ok(HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/xml".into())],
+            body: Bytes::from_static(
+                b"<?xml version=\"1.0\"?><ListBucketResult><IsTruncated>true</IsTruncated>\
+                  <NextMarker>b.txt</NextMarker><Contents><Key>a.txt</Key></Contents>\
+                  </ListBucketResult>",
+            ),
+        })]);
+        let adapter = bucket_probe_adapter(Arc::clone(&origin), "us-east-1");
+        let response = adapter
+            .handle(
+                request(
+                    axum::http::Method::GET,
+                    "/bucket?prefix=gateway%2F&marker=start%2Fkey&max-keys=7",
+                ),
+                context(),
+            )
+            .await;
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(response.operation, GatewayOperation::List);
+        assert_eq!(response.outcome, GatewayOutcome::Complete);
+        let body = to_bytes(response.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(std::str::from_utf8(&body)
+            .unwrap()
+            .contains("<NextMarker>b.txt</NextMarker>"));
+        assert_eq!(
+            *origin.v1_lists.lock().unwrap(),
+            vec![(
+                "bucket".to_string(),
+                "gateway/".to_string(),
+                None,
+                Some("start/key".to_string()),
+                7,
+            )]
+        );
     }
 
     #[tokio::test]

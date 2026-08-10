@@ -483,6 +483,43 @@ impl S3Backend {
         self.http.execute(self.signed(request)).await
     }
 
+    /// Execute one raw ListObjects (V1) page. The V1 response body
+    /// (`ListBucketResult` with `Marker`/`NextMarker` pagination) passes back
+    /// unchanged; the origin already speaks V1 so nothing is translated.
+    pub async fn execute_list_v1_raw(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        marker: Option<&str>,
+        max_keys: u32,
+        encoding_type: Option<&str>,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut query = format!("max-keys={}", max_keys.min(1000));
+        if !prefix.is_empty() {
+            query.push_str("&prefix=");
+            query.push_str(&encode_query_value(prefix));
+        }
+        if let Some(delimiter) = delimiter {
+            query.push_str("&delimiter=");
+            query.push_str(&encode_query_value(delimiter));
+        }
+        if let Some(marker) = marker {
+            query.push_str("&marker=");
+            query.push_str(&encode_query_value(marker));
+        }
+        if let Some(encoding_type) = encoding_type {
+            query.push_str("&encoding-type=");
+            query.push_str(&encode_query_value(encoding_type));
+        }
+        let request = HttpRequest::new(
+            Method::Get,
+            format!("{}?{query}", self.bucket_url(bucket)),
+            self.session_headers(),
+        );
+        self.http.execute(self.signed(request)).await
+    }
+
     /// Execute a single-use streaming PUT. The payload declaration is signed
     /// by the scoped origin credential and the body is never retried here.
     pub async fn execute_put_body_raw(
@@ -1022,6 +1059,46 @@ mod tests {
             .header("authorization")
             .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256")));
         assert_eq!(request.header("x-amz-security-token"), Some("SERVICETOKEN"));
+    }
+
+    #[tokio::test]
+    async fn list_v1_targets_the_bucket_url_without_a_list_type() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(
+            S3Config {
+                region: "us-east-1".into(),
+                endpoint: "minio:9000".into(),
+                path_style: true,
+                tls: false,
+            },
+            creds(),
+            http.clone(),
+        );
+        backend
+            .execute_list_v1_raw(
+                "my-bucket",
+                "gateway/a b",
+                None,
+                Some("start/key"),
+                2000,
+                None,
+            )
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(request.method, Method::Get);
+        assert_eq!(
+            request.url,
+            "http://minio:9000/my-bucket?max-keys=1000&prefix=gateway%2Fa%20b&marker=start%2Fkey",
+            "V1 pages carry no list-type and clamp max-keys"
+        );
+        assert!(request
+            .header("authorization")
+            .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256")));
     }
 
     #[test]
