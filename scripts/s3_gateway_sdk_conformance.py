@@ -59,6 +59,16 @@ def main() -> None:
         aws_secret_access_key=secret_key,
         config=config,
     )
+    s3.head_bucket(Bucket=bucket)
+    location = s3.get_bucket_location(Bucket=bucket)
+    expected_location = None if region == "us-east-1" else region
+    assert location.get("LocationConstraint") == expected_location, location
+    try:
+        s3.head_bucket(Bucket=f"{bucket}-missing")
+        raise AssertionError("missing bucket unexpectedly exists")
+    except ClientError as error:
+        assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
     properties = s3.head_object(Bucket=bucket, Key=object_name)
     etag = properties["ETag"]
     assert properties["ContentLength"] == 4096
@@ -254,6 +264,18 @@ def main() -> None:
         secret_key=secret_key,
         secure=parsed.scheme == "https",
         region=region,
+    )
+    assert minio.bucket_exists(bucket)
+    assert not minio.bucket_exists(f"{bucket}-missing")
+    minio_bootstrap = Minio(
+        parsed.netloc,
+        access_key=access_key,
+        secret_key=secret_key,
+        secure=parsed.scheme == "https",
+    )
+    assert minio_bootstrap.bucket_exists(bucket), (
+        "a client without a configured region must resolve it through the "
+        "gateway's location probe"
     )
     assert minio.stat_object(bucket, object_name).size == 4096
     assert read_minio(minio.get_object(bucket, object_name)) == expected_object()

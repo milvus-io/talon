@@ -56,6 +56,10 @@ pub struct S3CacheRequest<'a> {
 pub struct S3AdapterConfig {
     /// Host suffix after the bucket in virtual-host-style requests.
     pub endpoint_suffix: String,
+    /// Region clients must use in their SigV4 credential scope. Returned by
+    /// `GetBucketLocation` so SDKs resolve the gateway's signing region, which
+    /// can differ from the origin bucket's real region.
+    pub region: String,
     /// Whether incoming requests use `/bucket/key` paths.
     pub path_style: bool,
     /// Talon cache block size.
@@ -75,6 +79,7 @@ impl S3AdapterConfig {
     pub fn aws(region: impl AsRef<str>) -> Self {
         Self {
             endpoint_suffix: format!("s3.{}.amazonaws.com", region.as_ref()),
+            region: region.as_ref().to_string(),
             path_style: false,
             block_size: 256 * 1024 * 1024,
             transfer_chunk_bytes: DEFAULT_TRANSFER_CHUNK_BYTES,
@@ -95,6 +100,7 @@ impl S3AdapterConfig {
 
     fn validate(&self) -> Result<(), S3RequestError> {
         if self.endpoint_suffix.is_empty()
+            || self.region.is_empty()
             || self.block_size == 0
             || self.transfer_chunk_bytes == 0
             || self.max_multipart_uploads == 0
@@ -170,6 +176,10 @@ pub trait S3Origin: Send + Sync + 'static {
         max_keys: u32,
         encoding_type: Option<&str>,
     ) -> Result<HttpResponse, String>;
+
+    async fn head_bucket(&self, _bucket: &str) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement HeadBucket".into())
+    }
 
     async fn put_body(
         &self,
@@ -325,6 +335,10 @@ impl S3Origin for S3Backend {
             encoding_type,
         )
         .await
+    }
+
+    async fn head_bucket(&self, bucket: &str) -> Result<HttpResponse, String> {
+        self.execute_head_bucket_raw(bucket).await
     }
 
     async fn put_body(
@@ -575,6 +589,30 @@ struct ParsedTarget {
     key: Option<String>,
 }
 
+/// Bucket-level probes that carry no object key.
+#[derive(Debug, PartialEq, Eq)]
+enum BucketProbe {
+    /// `HEAD /<bucket>` existence check, passed through to the origin.
+    Head,
+    /// `GET /<bucket>?location` signing-region query, answered locally.
+    Location,
+}
+
+fn bucket_probe(
+    method: &axum::http::Method,
+    target: &ParsedTarget,
+    query: &S3Query,
+) -> Option<BucketProbe> {
+    if target.key.is_some() {
+        return None;
+    }
+    match *method {
+        axum::http::Method::HEAD => Some(BucketProbe::Head),
+        axum::http::Method::GET if query.location.is_some() => Some(BucketProbe::Location),
+        _ => None,
+    }
+}
+
 fn parse_target(
     request: &Request,
     config: &S3AdapterConfig,
@@ -656,6 +694,7 @@ struct S3Query {
     part_number: Option<String>,
     part_number_marker: Option<String>,
     max_parts: Option<String>,
+    location: Option<String>,
 }
 
 impl S3Query {
@@ -684,6 +723,9 @@ impl S3Query {
                 )?,
                 "max-parts" => {
                     set_query_value(&mut parsed.max_parts, value.into_owned(), "max-parts")?
+                }
+                "location" => {
+                    set_query_value(&mut parsed.location, value.into_owned(), "location")?
                 }
                 _ => {}
             }
@@ -1691,6 +1733,18 @@ impl S3Adapter {
                 additional: Vec::new(),
             });
         }
+        if bucket_probe(request.method(), &target, &query).is_some() {
+            return Ok(GatewayAccess {
+                operation: GatewayOperation::Probe,
+                provider_account: None,
+                target: GatewayTarget::Namespace {
+                    backend: Backend::S3,
+                    namespace: target.bucket,
+                    prefix: None,
+                },
+                additional: Vec::new(),
+            });
+        }
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
@@ -1738,6 +1792,11 @@ impl S3Adapter {
         if request.method() == axum::http::Method::GET && target.key.is_none() && query.is_list_v2()
         {
             return self.list(target.bucket, query, context).await;
+        }
+        match bucket_probe(request.method(), &target, &query) {
+            Some(BucketProbe::Head) => return self.head_bucket(target.bucket, context).await,
+            Some(BucketProbe::Location) => return Ok(self.bucket_location(target.bucket, context)),
+            None => {}
         }
         let key = target
             .key
@@ -2231,6 +2290,74 @@ impl S3Adapter {
             Some(GatewayTarget::Object(object)),
             context,
         ))
+    }
+
+    async fn head_bucket(
+        &self,
+        bucket: String,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let mut response = self
+            .origin
+            .head_bucket(&bucket)
+            .await
+            .map_err(S3RequestError::origin_unavailable)?;
+        // The origin's real bucket region must not leak: SDKs that resolve a
+        // signing region from this header would re-sign for the origin's
+        // region and then fail this gateway's SigV4 scope check.
+        response
+            .headers
+            .retain(|(name, _)| !name.eq_ignore_ascii_case("x-amz-bucket-region"));
+        response
+            .headers
+            .push(("x-amz-bucket-region".into(), self.config.region.clone()));
+        Ok(raw_response(
+            response,
+            GatewayOperation::Probe,
+            Some(GatewayTarget::Namespace {
+                backend: Backend::S3,
+                namespace: bucket,
+                prefix: None,
+            }),
+            context,
+        ))
+    }
+
+    /// Answer `GetBucketLocation` locally. Clients ask this to learn the
+    /// region for their SigV4 credential scope, and requests to this gateway
+    /// must be signed with the gateway's configured region, which can differ
+    /// from the origin bucket's real region.
+    fn bucket_location(&self, bucket: String, context: &GatewayRequestContext) -> GatewayResponse {
+        let constraint = if self.config.region == "us-east-1" {
+            ""
+        } else {
+            self.config.region.as_str()
+        };
+        let body = format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LocationConstraint xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">{}</LocationConstraint>",
+            xml_escape(constraint),
+        );
+        let mut response = (StatusCode::OK, Body::from(body)).into_response();
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/xml"),
+        );
+        stamp_gateway_headers(response.headers_mut(), &context.request_id);
+        GatewayResponse {
+            response,
+            operation: GatewayOperation::Probe,
+            target: Some(GatewayTarget::Namespace {
+                backend: Backend::S3,
+                namespace: bucket,
+                prefix: None,
+            }),
+            route: GatewayRoute::None,
+            outcome: GatewayOutcome::Complete,
+            failure: None,
+            requested_bytes: 0,
+            cache_bytes: 0,
+            origin_bytes: 0,
+        }
     }
 
     async fn list(
@@ -2994,6 +3121,230 @@ mod tests {
             .unwrap()
             .multipart_operation(&axum::http::Method::POST, false)
             .is_err());
+    }
+
+    struct BucketOrigin {
+        responses: Mutex<VecDeque<Result<HttpResponse, String>>>,
+        buckets: Mutex<Vec<String>>,
+    }
+
+    impl BucketOrigin {
+        fn new(responses: impl IntoIterator<Item = Result<HttpResponse, String>>) -> Arc<Self> {
+            Arc::new(Self {
+                responses: Mutex::new(responses.into_iter().collect()),
+                buckets: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl S3Origin for BucketOrigin {
+        async fn head(
+            &self,
+            _object: &ObjectId,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpResponse, String> {
+            unreachable!("bucket probe tests do not stat objects")
+        }
+
+        async fn get(
+            &self,
+            _object: &ObjectId,
+            _range: Option<(u64, u64)>,
+            _conditions: &[(String, String)],
+        ) -> Result<HttpStreamResponse, String> {
+            unreachable!("bucket probe tests do not read objects")
+        }
+
+        async fn list(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _delimiter: Option<&str>,
+            _continuation_token: Option<&str>,
+            _max_keys: u32,
+            _encoding_type: Option<&str>,
+        ) -> Result<HttpResponse, String> {
+            unreachable!("bucket probe tests do not list")
+        }
+
+        async fn head_bucket(&self, bucket: &str) -> Result<HttpResponse, String> {
+            self.buckets.lock().unwrap().push(bucket.to_string());
+            self.responses
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("bucket probe test provided one response per call")
+        }
+    }
+
+    fn bucket_probe_adapter(origin: Arc<BucketOrigin>, region: &str) -> S3Adapter {
+        let mut config = S3AdapterConfig::path_style("localhost");
+        config.region = region.into();
+        S3Adapter::new(
+            config,
+            Arc::new(MockCache {
+                response: Ok(vec![]),
+            }),
+            origin,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn bucket_probes_classify_as_namespace_probe() {
+        let adapter = bucket_probe_adapter(BucketOrigin::new([]), "us-east-1");
+        for probe in [
+            request(axum::http::Method::HEAD, "/bucket"),
+            request(axum::http::Method::GET, "/bucket?location="),
+        ] {
+            let access = adapter.classify_access(&probe).unwrap();
+            assert_eq!(access.operation, GatewayOperation::Probe);
+            assert_eq!(
+                access.target,
+                GatewayTarget::Namespace {
+                    backend: Backend::S3,
+                    namespace: "bucket".into(),
+                    prefix: None,
+                }
+            );
+        }
+        let list = adapter
+            .classify_access(&request(axum::http::Method::GET, "/bucket?list-type=2"))
+            .unwrap();
+        assert_eq!(list.operation, GatewayOperation::List);
+        assert!(adapter
+            .classify_access(&request(axum::http::Method::GET, "/bucket"))
+            .is_err());
+        assert!(S3Query::parse(Some("location=&location=")).is_err());
+    }
+
+    #[tokio::test]
+    async fn head_bucket_passes_the_origin_status_through() {
+        let origin = BucketOrigin::new([
+            Ok(HttpResponse {
+                status: 200,
+                headers: vec![("x-amz-bucket-region".into(), "eu-central-1".into())],
+                body: Bytes::new(),
+            }),
+            Ok(HttpResponse {
+                status: 404,
+                headers: Vec::new(),
+                body: Bytes::new(),
+            }),
+            Ok(HttpResponse {
+                status: 403,
+                headers: Vec::new(),
+                body: Bytes::new(),
+            }),
+        ]);
+        let adapter = bucket_probe_adapter(Arc::clone(&origin), "us-west-2");
+
+        let found = adapter
+            .handle(request(axum::http::Method::HEAD, "/bucket"), context())
+            .await;
+        assert_eq!(found.response.status(), StatusCode::OK);
+        assert_eq!(found.operation, GatewayOperation::Probe);
+        assert_eq!(found.outcome, GatewayOutcome::Complete);
+        assert_eq!(
+            found.response.headers().get("x-amz-bucket-region").unwrap(),
+            "us-west-2",
+            "the origin's real region must not leak past the gateway"
+        );
+
+        let missing = adapter
+            .handle(request(axum::http::Method::HEAD, "/bucket"), context())
+            .await;
+        assert_eq!(missing.response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(missing.outcome, GatewayOutcome::Failed);
+        assert_eq!(missing.failure, Some(FailureReason::NotFound));
+
+        let denied = adapter
+            .handle(request(axum::http::Method::HEAD, "/bucket"), context())
+            .await;
+        assert_eq!(denied.response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(denied.outcome, GatewayOutcome::Failed);
+        assert_eq!(denied.failure, Some(FailureReason::Authorization));
+
+        assert_eq!(
+            *origin.buckets.lock().unwrap(),
+            vec!["bucket", "bucket", "bucket"]
+        );
+    }
+
+    #[tokio::test]
+    async fn head_bucket_without_origin_support_fails_closed() {
+        let adapter = S3Adapter::new(
+            S3AdapterConfig::path_style("localhost"),
+            Arc::new(MockCache {
+                response: Ok(vec![]),
+            }),
+            Arc::new(StallingMutationOrigin),
+        )
+        .unwrap();
+        let response = adapter
+            .handle(request(axum::http::Method::HEAD, "/bucket"), context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn bucket_location_is_answered_locally_from_the_gateway_region() {
+        let adapter = S3Adapter::new(
+            {
+                let mut config = S3AdapterConfig::path_style("localhost");
+                config.region = "us-west-2".into();
+                config
+            },
+            Arc::new(MockCache {
+                response: Ok(vec![]),
+            }),
+            Arc::new(StallingMutationOrigin),
+        )
+        .unwrap();
+        let response = adapter
+            .handle(
+                request(axum::http::Method::GET, "/bucket?location="),
+                context(),
+            )
+            .await;
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(response.operation, GatewayOperation::Probe);
+        assert_eq!(response.route, GatewayRoute::None);
+        assert_eq!(response.outcome, GatewayOutcome::Complete);
+        assert!(response.response.headers().contains_key("x-amz-request-id"));
+        let body = to_bytes(response.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(body.contains(">us-west-2</LocationConstraint>"), "{body}");
+    }
+
+    #[tokio::test]
+    async fn bucket_location_for_us_east_1_is_the_empty_constraint() {
+        let adapter = S3Adapter::new(
+            S3AdapterConfig::path_style("localhost"),
+            Arc::new(MockCache {
+                response: Ok(vec![]),
+            }),
+            Arc::new(StallingMutationOrigin),
+        )
+        .unwrap();
+        let response = adapter
+            .handle(
+                request(axum::http::Method::GET, "/bucket?location="),
+                context(),
+            )
+            .await;
+        assert_eq!(response.response.status(), StatusCode::OK);
+        let body = to_bytes(response.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert!(
+            body.contains("doc/2006-03-01/\"></LocationConstraint>"),
+            "us-east-1 must serialize as the empty constraint: {body}"
+        );
     }
 
     #[test]

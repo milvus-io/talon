@@ -265,6 +265,51 @@ mod tests {
     }
 
     #[test]
+    fn probe_grants_never_disclose_object_metadata() {
+        let probe_grant = AuthorizationGrant {
+            id: "prober".into(),
+            principal: "principal-a".into(),
+            protocol: ProviderProtocol::S3,
+            provider_account: "account-a".into(),
+            namespace: "bucket-a".into(),
+            prefix: None,
+            operations: vec![GatewayOperation::Probe],
+        };
+        let policy = AuthorizationPolicy::new(vec![probe_grant]).unwrap();
+        let principal = AuthenticatedPrincipal::new("principal-a", "account-a");
+        let probe = GatewayAccess {
+            operation: GatewayOperation::Probe,
+            provider_account: None,
+            target: GatewayTarget::Namespace {
+                backend: Backend::S3,
+                namespace: "bucket-a".into(),
+                prefix: None,
+            },
+            additional: Vec::new(),
+        };
+        assert!(policy.allows(&principal, ProviderProtocol::S3, &probe));
+        assert!(
+            !policy.allows(
+                &principal,
+                ProviderProtocol::S3,
+                &access("bucket-a", "any/object", GatewayOperation::Stat)
+            ),
+            "a prefixless probe grant must not leak object HeadObject"
+        );
+
+        let stat_policy = AuthorizationPolicy::new(vec![AuthorizationGrant {
+            operations: vec![GatewayOperation::Stat],
+            id: "stat-only".into(),
+            ..grant(None)
+        }])
+        .unwrap();
+        assert!(
+            !stat_policy.allows(&principal, ProviderProtocol::S3, &probe),
+            "object metadata grants must not unlock namespace probes"
+        );
+    }
+
+    #[test]
     fn policy_is_default_deny_and_tenant_scoped() {
         let policy = AuthorizationPolicy::new(vec![grant(Some("tenant/"))]).unwrap();
         let principal = AuthenticatedPrincipal::new("principal-a", "account-a");

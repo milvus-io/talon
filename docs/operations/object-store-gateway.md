@@ -138,7 +138,7 @@ S3 variables:
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `TALON_GATEWAY_S3_REGION` | `us-east-1` | Origin signing region. |
+| `TALON_GATEWAY_S3_REGION` | `us-east-1` | Origin signing region, required incoming SigV4 scope region, `GetBucketLocation` answer, and the `x-amz-bucket-region` value stamped on `HeadBucket` responses. |
 | `TALON_GATEWAY_S3_ENDPOINT` | AWS regional endpoint | Optional `http[s]://host[:port]`; custom endpoints use path addressing. |
 | `AWS_ACCESS_KEY_ID` | required | Scoped origin access key. |
 | `AWS_SECRET_ACCESS_KEY` | required | Scoped origin secret. |
@@ -189,6 +189,23 @@ SigV4 verification enforces the configured region, `s3` service, host,
 canonical URI/query/headers, timestamp or presigned expiry, payload declaration,
 and STS token. A present `x-talon-cache-mark` must be signed and syntactically
 valid. Invalid requests fail before cache or origin dispatch.
+
+`HeadBucket` existence probes pass through to the origin once and keep its
+status authoritative, so SDK startup checks (for example minio-go
+`BucketExists`) distinguish a missing bucket (404) from a denied one (403).
+The response's `x-amz-bucket-region` is rewritten to the gateway region so
+clients never re-sign for the origin's real region. `GetBucketLocation` is
+answered locally with `TALON_GATEWAY_S3_REGION` because clients use it to pick
+the SigV4 signing region for requests to this gateway; the probe is also the
+one request accepted with a `us-east-1` credential scope, matching the
+region-cache bootstrap that minio-family SDKs send before they know the real
+region. Both probes authorize as the dedicated `probe` operation: grant SDK
+clients one prefixless `probe` entry on the bucket they probe. A `probe` grant
+discloses only bucket existence and the gateway region — it never authorizes
+`HeadObject` or any other object access, so prefix isolation between tenants
+is preserved. Buckets must be provisioned
+at the origin out of band: `CreateBucket` remains rejected, and the origin
+identity still must not hold bucket administration permissions.
 
 Ordinary S3 `PutObject`, `CopyObject`, and `DeleteObject` requests are sent to
 the origin exactly once. `PutObject` requires one valid `Content-Length` and is

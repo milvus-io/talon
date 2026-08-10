@@ -316,6 +316,23 @@ impl S3Backend {
         self.http.execute(self.signed(request)).await
     }
 
+    /// Execute a raw bucket existence probe (`HEAD /<bucket>`).
+    ///
+    /// The origin stays authoritative: its 200/404/403 status passes back
+    /// unchanged so a client can distinguish a missing bucket from a denied
+    /// one.
+    pub async fn execute_head_bucket_raw(
+        &self,
+        bucket: &str,
+    ) -> std::result::Result<HttpResponse, String> {
+        let request = HttpRequest::new(
+            Method::Head,
+            self.bucket_url(bucket),
+            self.session_headers(),
+        );
+        self.http.execute(self.signed(request)).await
+    }
+
     /// Execute a whole or ranged GET without buffering its response body.
     pub async fn execute_get_stream_raw(
         &self,
@@ -973,6 +990,38 @@ mod tests {
                 credential.expose_secret()
             )
         );
+    }
+
+    #[tokio::test]
+    async fn head_bucket_probe_targets_the_bucket_url_and_signs_with_service_credentials() {
+        let http = MockHttp::new(HttpResponse {
+            status: 404,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(
+            S3Config {
+                region: "us-east-1".into(),
+                endpoint: "minio:9000".into(),
+                path_style: true,
+                tls: false,
+            },
+            S3Credentials {
+                access_key_id: "SERVICE".into(),
+                secret_access_key: "SERVICESECRET".into(),
+                session_token: Some("SERVICETOKEN".into()),
+            },
+            http.clone(),
+        );
+        let response = backend.execute_head_bucket_raw("my-bucket").await.unwrap();
+        assert_eq!(response.status, 404, "the origin status passes through");
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(request.method, Method::Head);
+        assert_eq!(request.url, "http://minio:9000/my-bucket");
+        assert!(request
+            .header("authorization")
+            .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256")));
+        assert_eq!(request.header("x-amz-security-token"), Some("SERVICETOKEN"));
     }
 
     #[test]

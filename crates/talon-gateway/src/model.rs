@@ -31,6 +31,10 @@ impl ProviderProtocol {
 pub enum GatewayOperation {
     /// Resolve object metadata.
     Stat,
+    /// A namespace-level existence or signing-region probe. Deliberately
+    /// separate from [`Self::Stat`]: a probe grant discloses only that the
+    /// namespace exists and which region to sign for, never object metadata.
+    Probe,
     /// Read a full object or one byte range.
     Read,
     /// List a namespace or prefix.
@@ -47,6 +51,7 @@ impl GatewayOperation {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Stat => "stat",
+            Self::Probe => "probe",
             Self::Read => "read",
             Self::List => "list",
             Self::Write => "write",

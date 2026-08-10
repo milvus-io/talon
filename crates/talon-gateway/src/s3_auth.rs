@@ -91,7 +91,21 @@ impl S3SigV4Authenticator {
         } else {
             parse_header_signed(request, now, self.max_clock_skew)?
         };
-        if signed.scope.region != self.region || signed.scope.service != "s3" {
+        if signed.scope.service != "s3" {
+            return Err(AuthFailure);
+        }
+        // minio-go and the MinIO Python SDK bootstrap their region cache with
+        // a `GET /<bucket>?location` probe signed for us-east-1 before they
+        // know the real region, matching how S3 resolves that probe globally.
+        // Accept the default-region scope for exactly that read-only probe so
+        // those SDKs can discover this gateway's region; every other request
+        // must be signed for the configured region. The signature itself is
+        // still fully verified against the declared scope below.
+        let bootstrap_probe = request.method() == axum::http::Method::GET
+            && query_value(&query, "location")?.is_some();
+        if signed.scope.region != self.region
+            && !(bootstrap_probe && signed.scope.region == "us-east-1")
+        {
             return Err(AuthFailure);
         }
         let identity = self
@@ -755,6 +769,73 @@ mod tests {
             builder = builder.header(name, value);
         }
         builder.body(Body::from("abc")).unwrap()
+    }
+
+    fn signed_header_request_for_region(path_and_query: &str, region: &str) -> Request {
+        let mut outgoing = HttpRequest::new(
+            Method::Get,
+            format!("https://example.com{path_and_query}"),
+            Vec::new(),
+        );
+        sign_request(
+            &mut outgoing,
+            &S3Credentials {
+                access_key_id: ACCESS_KEY.into(),
+                secret_access_key: SECRET_KEY.into(),
+                session_token: None,
+            },
+            region,
+            "s3",
+            &AmzDate {
+                datetime: DATETIME.into(),
+                date: "20130524".into(),
+            },
+        );
+        let mut builder = Request::builder().method("GET").uri(path_and_query);
+        for (name, value) in outgoing.headers {
+            builder = builder.header(name, value);
+        }
+        builder.body(Body::empty()).unwrap()
+    }
+
+    #[test]
+    fn location_probe_accepts_the_default_region_bootstrap_scope() {
+        let authenticator = S3SigV4Authenticator::new(
+            "us-west-2",
+            vec![S3ClientIdentity {
+                access_key_id: ACCESS_KEY.into(),
+                secret_access_key: SECRET_KEY.into(),
+                session_token: None,
+                principal: AuthenticatedPrincipal::new("reader", "account-a"),
+            }],
+            Duration::from_secs(15 * 60),
+        )
+        .unwrap();
+        let probe = |region| signed_header_request_for_region("/bucket?location=", region);
+        assert!(
+            authenticator
+                .authenticate_at(&probe("us-east-1"), now())
+                .is_ok(),
+            "the SDK region-cache bootstrap probe signs with us-east-1"
+        );
+        assert!(authenticator
+            .authenticate_at(&probe("us-west-2"), now())
+            .is_ok());
+        assert!(
+            authenticator
+                .authenticate_at(&probe("eu-west-1"), now())
+                .is_err(),
+            "only the default-region bootstrap scope is exempt"
+        );
+        assert!(
+            authenticator
+                .authenticate_at(
+                    &signed_header_request_for_region("/bucket/key", "us-east-1"),
+                    now()
+                )
+                .is_err(),
+            "non-probe requests must be signed for the configured region"
+        );
     }
 
     fn presigned_request(expires: u64, session_token: Option<&str>) -> Request {
