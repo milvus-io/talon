@@ -12,7 +12,7 @@
 //! module only handles the request encode/decode and the response header shape.
 
 use serde::{Deserialize, Serialize};
-use talon_core::ObjectId;
+use talon_core::{ObjectId, Version};
 
 use crate::frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN};
 
@@ -69,6 +69,19 @@ struct ErrorEnvelope {
 pub struct RangeRequest {
     /// The source object whose bytes are requested.
     pub object: ObjectId,
+    /// Byte offset within the object to start reading at.
+    pub offset: u64,
+    /// Number of bytes to read.
+    pub len: u64,
+}
+
+/// A cache-only range probe carrying the exact versioned cache identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedRangeRequest {
+    /// The source object whose resident bytes are requested.
+    pub object: ObjectId,
+    /// Exact origin version used in the cache block key.
+    pub version: Version,
     /// Byte offset within the object to start reading at.
     pub offset: u64,
     /// Number of bytes to read.
@@ -149,6 +162,38 @@ pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, RangeRequest), DataErr
         });
     }
     let req: RangeRequest = bincode::deserialize(body)?;
+    Ok((header, req))
+}
+
+/// Encode a cache-only range probe. Older workers reject its distinct message
+/// type instead of accidentally treating it as an origin-backed read.
+pub fn encode_cached_request(
+    request_id: u32,
+    req: &CachedRangeRequest,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(req)?;
+    let header = FrameHeader::new(MsgType::GetCachedRange, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a framed cache-only range probe.
+pub fn decode_cached_request(buf: &[u8]) -> Result<(FrameHeader, CachedRangeRequest), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetCachedRange {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let req = bincode::deserialize(body)?;
     Ok((header, req))
 }
 
@@ -305,6 +350,21 @@ mod tests {
         assert_eq!(header.msg_type, MsgType::GetRange);
         assert_eq!(header.request_id, 11);
         assert_eq!(back, req());
+    }
+
+    #[test]
+    fn cached_request_round_trips_with_version() {
+        let request = CachedRangeRequest {
+            object: req().object,
+            version: Version::new("etag-v2"),
+            offset: 17,
+            len: 23,
+        };
+        let encoded = encode_cached_request(12, &request).unwrap();
+        let (header, decoded) = decode_cached_request(&encoded).unwrap();
+        assert_eq!(header.msg_type, MsgType::GetCachedRange);
+        assert_eq!(header.request_id, 12);
+        assert_eq!(decoded, request);
     }
 
     #[test]

@@ -33,7 +33,7 @@ use tokio::net::TcpStream;
 use crate::data_error::encode_runtime_error;
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
 
-/// Serve data-plane range requests on one connection until EOF.
+/// Serve data-plane range and cache-only probe requests until EOF.
 pub async fn handle_conn(
     mut stream: TcpStream,
     worker: Arc<WorkerRuntime>,
@@ -91,6 +91,18 @@ pub async fn handle_conn(
         // giving the coordinator backend access.
         if header.msg_type == MsgType::Control {
             handle_control_frame(
+                &mut stream,
+                &header,
+                &payload,
+                &worker,
+                &observability,
+                request_started,
+            )
+            .await?;
+            continue;
+        }
+        if header.msg_type == MsgType::GetCachedRange {
+            handle_cached_range(
                 &mut stream,
                 &header,
                 &payload,
@@ -221,6 +233,81 @@ pub async fn handle_conn(
             }
         }
     }
+}
+
+async fn handle_cached_range(
+    stream: &mut TcpStream,
+    header: &FrameHeader,
+    payload: &[u8],
+    worker: &WorkerRuntime,
+    observability: &WorkerObservability,
+    request_started: Instant,
+) -> std::io::Result<()> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+    let (decoded, request) = match data::decode_cached_request(&full) {
+        Ok(value) => value,
+        Err(error) => {
+            let reply = data::encode_typed_error(
+                header.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("bad cache-only request: {error}"),
+            );
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            return Ok(());
+        }
+    };
+    if !observability.is_ready() {
+        let reply = data::encode_typed_error(
+            decoded.request_id,
+            DataErrorCode::Unavailable,
+            "worker is not ready",
+        );
+        stream.write_all(&reply).await?;
+        stream.flush().await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(());
+    }
+    if request.offset.checked_add(request.len).is_none() {
+        let reply = data::encode_typed_error(
+            decoded.request_id,
+            DataErrorCode::InvalidRequest,
+            "range offset+len overflows u64",
+        );
+        stream.write_all(&reply).await?;
+        stream.flush().await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(());
+    }
+    match worker.serve_cached(&request).await {
+        Ok(bytes) => {
+            let reply = data::response_header_ok(decoded.request_id, bytes.len() as u32);
+            stream.write_all(&reply).await?;
+            stream.write_all(&bytes).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_success(bytes.len() as u64, request_started.elapsed());
+        }
+        Err(error) => {
+            let reply = encode_runtime_error(decoded.request_id, &error);
+            stream.write_all(&reply).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+        }
+    }
+    Ok(())
 }
 
 /// Handle a `Control` frame on the data plane.

@@ -48,7 +48,7 @@ pub fn max_payload_for(msg_type: MsgType) -> u32 {
     match msg_type {
         MsgType::Control => MAX_CONTROL_PAYLOAD_LEN,
         MsgType::Ping => MAX_PING_PAYLOAD_LEN,
-        MsgType::Put | MsgType::Delete => MAX_CONTROL_PAYLOAD_LEN,
+        MsgType::Put | MsgType::Delete | MsgType::GetCachedRange => MAX_CONTROL_PAYLOAD_LEN,
         MsgType::Get | MsgType::GetRange => MAX_PAYLOAD_LEN,
     }
 }

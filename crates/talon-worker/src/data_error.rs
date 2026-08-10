@@ -3,12 +3,27 @@
 use talon_core::Error;
 use talon_transport::{encode_typed_error, DataErrorCode};
 
+/// Marker returned when a cache-only request is not fully resident.
+#[derive(Debug)]
+pub(crate) struct CacheMiss;
+
+impl std::fmt::Display for CacheMiss {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("requested range is not fully resident")
+    }
+}
+
+impl std::error::Error for CacheMiss {}
+
 /// Encode an error returned by [`crate::WorkerRuntime`] for a range request.
 pub(crate) fn encode_runtime_error(request_id: u32, error: &anyhow::Error) -> Vec<u8> {
     encode_typed_error(request_id, classify(error), error.to_string())
 }
 
 fn classify(error: &anyhow::Error) -> DataErrorCode {
+    if error.downcast_ref::<CacheMiss>().is_some() {
+        return DataErrorCode::CacheMiss;
+    }
     if let Some(error) = error.downcast_ref::<Error>() {
         return match error {
             Error::NotFound(_) => DataErrorCode::NotFound,
@@ -47,6 +62,7 @@ mod tests {
 
     #[test]
     fn core_failures_have_stable_codes() {
+        assert_eq!(encoded_code(CacheMiss.into()), DataErrorCode::CacheMiss);
         assert_eq!(
             encoded_code(Error::NotFound("x".into()).into()),
             DataErrorCode::NotFound

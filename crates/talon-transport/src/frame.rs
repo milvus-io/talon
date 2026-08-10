@@ -58,6 +58,9 @@ pub enum MsgType {
     /// Data-plane delete (#226): a bincode
     /// [`DeleteRequest`](crate::data::DeleteRequest) header, no body.
     Delete = 5,
+    /// Read a versioned range only when every requested byte is resident.
+    /// This operation must never access the worker backend.
+    GetCachedRange = 6,
 }
 
 impl MsgType {
@@ -70,6 +73,7 @@ impl MsgType {
             3 => MsgType::Put,
             4 => MsgType::Ping,
             5 => MsgType::Delete,
+            6 => MsgType::GetCachedRange,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -209,6 +213,8 @@ mod tests {
             MsgType::GetRange,
             MsgType::Put,
             MsgType::Ping,
+            MsgType::Delete,
+            MsgType::GetCachedRange,
         ]
         .into_iter()
         .enumerate()

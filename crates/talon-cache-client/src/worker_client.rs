@@ -20,8 +20,9 @@ use std::time::Duration;
 use talon_core::{ObjectId, RequestId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_delete, encode_put_header, encode_request, DataPlaneError,
-    DeleteRequest, Flags, PutRequest, RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_cached_request, encode_delete, encode_put_header, encode_request,
+    CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest, RangeRequest,
+    MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -155,6 +156,44 @@ impl WorkerClient {
                 );
                 Err(err)
             }
+        }
+    }
+
+    /// Fetch a versioned range only if it is already resident on the worker.
+    ///
+    /// The distinct wire operation is fail-closed during rolling upgrades: an
+    /// older worker rejects it instead of performing an origin-backed read.
+    pub async fn fetch_cached_range(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let request = CachedRangeRequest {
+            object: object.clone(),
+            version: version.clone(),
+            offset,
+            len,
+        };
+        let request_id = RequestId::next();
+        let output = encode_cached_request(request_id.0, &request)?;
+        match self.exchange(&output, len).await {
+            Ok(bytes) => Ok(bytes),
+            Err((true, _)) => {
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                let bytes = self
+                    .pool
+                    .with_request_deadline("worker fetch_cached_range retry", async {
+                        stream.write_all(&output).await?;
+                        stream.flush().await?;
+                        read_range_reply(&mut stream, len).await
+                    })
+                    .await?;
+                self.pool.release(&self.addr, stream);
+                Ok(bytes)
+            }
+            Err((false, error)) => Err(error),
         }
     }
 
@@ -535,7 +574,9 @@ mod tests {
     use super::*;
     use std::time::Duration;
     use talon_core::Backend;
-    use talon_transport::{decode_request, encode_error, response_header_ok};
+    use talon_transport::{
+        decode_cached_request, decode_request, encode_error, response_header_ok,
+    };
     use tokio::net::TcpListener;
 
     fn object() -> ObjectId {
@@ -651,6 +692,37 @@ mod tests {
         assert_eq!(bytes[0], 0);
         assert_eq!(bytes[250], 250);
         assert_eq!(bytes[251], 0);
+    }
+
+    #[tokio::test]
+    async fn cached_fetch_sends_the_versioned_fail_closed_operation() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0_u8; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let frame = FrameHeader::decode(&header).unwrap();
+            assert_eq!(frame.msg_type, MsgType::GetCachedRange);
+            let mut body = vec![0_u8; frame.length as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            let mut request = header.to_vec();
+            request.extend_from_slice(&body);
+            let (_, request) = decode_cached_request(&request).unwrap();
+            assert_eq!(request.version, Version::new("etag-v2"));
+            assert_eq!((request.offset, request.len), (3, 4));
+            socket
+                .write_all(&response_header_ok(frame.request_id, 4))
+                .await
+                .unwrap();
+            socket.write_all(b"data").await.unwrap();
+        });
+
+        let bytes = WorkerClient::new(address)
+            .fetch_cached_range(&object(), &Version::new("etag-v2"), 3, 4)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"data");
     }
 
     #[tokio::test]
