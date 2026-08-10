@@ -17,12 +17,12 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use talon_core::{ObjectId, RequestId, Version};
+use talon_core::{BlockId, ObjectId, RequestId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_cached_request, encode_delete, encode_put_header, encode_request,
-    CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest, RangeRequest,
-    MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_cached_block_put_header, encode_cached_request, encode_delete,
+    encode_put_header, encode_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError,
+    DeleteRequest, Flags, PutRequest, RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -194,6 +194,74 @@ impl WorkerClient {
                 Ok(bytes)
             }
             Err((false, error)) => Err(error),
+        }
+    }
+
+    /// Admit one complete, versioned block without asking the worker to access
+    /// its configured backend.
+    pub async fn admit_cached_block(
+        &self,
+        block: &BlockId,
+        object_len: u64,
+        body: &[u8],
+    ) -> Result<(), WorkerError> {
+        let request_id = RequestId::next();
+        let header = encode_cached_block_put_header(
+            request_id.0,
+            &CachedBlockPutRequest {
+                block: block.clone(),
+                object_len,
+                body_len: body.len() as u64,
+            },
+        )?;
+        match self.admit_exchange(&header, body).await {
+            Ok(()) => Ok(()),
+            Err((true, _)) => {
+                let mut stream = self.pool.fresh(&self.addr).await?;
+                self.pool
+                    .with_deadline(
+                        "worker admit_cached_block retry",
+                        streamed_put_timeout(body.len() as u64),
+                        async {
+                            stream.write_all(&header).await?;
+                            stream.write_all(body).await?;
+                            stream.flush().await?;
+                            read_range_reply(&mut stream, 0).await.map(|_| ())
+                        },
+                    )
+                    .await?;
+                self.pool.release(&self.addr, stream);
+                Ok(())
+            }
+            Err((false, error)) => Err(error),
+        }
+    }
+
+    async fn admit_exchange(&self, header: &[u8], body: &[u8]) -> Result<(), (bool, WorkerError)> {
+        let (mut stream, reused) = self
+            .pool
+            .checkout(&self.addr)
+            .await
+            .map_err(|error| (false, WorkerError::from(error)))?;
+        let result = self
+            .pool
+            .with_deadline(
+                "worker admit_cached_block",
+                streamed_put_timeout(body.len() as u64),
+                async {
+                    stream.write_all(header).await?;
+                    stream.write_all(body).await?;
+                    stream.flush().await?;
+                    read_range_reply(&mut stream, 0).await.map(|_| ())
+                },
+            )
+            .await;
+        match result {
+            Ok(()) => {
+                self.pool.release(&self.addr, stream);
+                Ok(())
+            }
+            Err(error) => Err((reused, error)),
         }
     }
 
@@ -575,12 +643,48 @@ mod tests {
     use std::time::Duration;
     use talon_core::Backend;
     use talon_transport::{
-        decode_cached_request, decode_request, encode_error, response_header_ok,
+        decode_cached_block_put_header, decode_cached_request, decode_request, encode_error,
+        response_header_ok,
     };
     use tokio::net::TcpListener;
 
     fn object() -> ObjectId {
         ObjectId::new(Backend::Azure, "container", "path/to/blob.bin")
+    }
+
+    #[tokio::test]
+    async fn cache_admission_sends_exact_versioned_block_and_body() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let block = BlockId::new(object(), 8, 8, Version::new("etag-v2"));
+        let expected = block.clone();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header_bytes = [0_u8; HEADER_LEN];
+            socket.read_exact(&mut header_bytes).await.unwrap();
+            let header = FrameHeader::decode(&header_bytes).unwrap();
+            assert_eq!(header.msg_type, MsgType::AdmitCachedBlock);
+            let mut payload = vec![0_u8; header.length as usize];
+            socket.read_exact(&mut payload).await.unwrap();
+            let mut frame = header_bytes.to_vec();
+            frame.extend_from_slice(&payload);
+            let (_, request) = decode_cached_block_put_header(&frame).unwrap();
+            assert_eq!(request.block, expected);
+            assert_eq!(request.object_len, 13);
+            assert_eq!(request.body_len, 5);
+            let mut body = vec![0_u8; 5];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, b"tail!");
+            socket
+                .write_all(&response_header_ok(header.request_id, 0))
+                .await
+                .unwrap();
+        });
+
+        WorkerClient::new(addr)
+            .admit_cached_block(&block, 13, b"tail!")
+            .await
+            .unwrap();
     }
 
     /// What a mock write-worker records: the object and body it received.

@@ -9,7 +9,7 @@ use talon_core::{
     Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId,
     ObjectStore, PageIndex, Version,
 };
-use talon_transport::data::{CachedRangeRequest, RangeRequest};
+use talon_transport::data::{CachedBlockPutRequest, CachedRangeRequest, RangeRequest};
 use talon_transport::frame::{HEADER_LEN, MAX_PAYLOAD_LEN};
 use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LEN};
 
@@ -1225,9 +1225,18 @@ impl WorkerRuntime {
             }
         };
 
+        self.commit_cached_block(block, bytes.clone()).await?;
+        Ok(bytes)
+    }
+
+    async fn commit_cached_block(
+        &self,
+        block: &BlockId,
+        bytes: bytes::Bytes,
+    ) -> anyhow::Result<()> {
         let len = bytes.len() as u64;
         self.store
-            .put(block, bytes.clone())
+            .put(block, bytes)
             .await
             .map_err(|error| anyhow::anyhow!("commit block failed: {error}"))?;
         self.index.commit(BlockMeta {
@@ -1251,7 +1260,62 @@ impl WorkerRuntime {
             self.refresh_l1_metrics();
         }
         tracing::info!(block = %block, bytes = len, "committed block");
-        Ok(bytes)
+        Ok(())
+    }
+
+    /// Validate a gateway cache admission before its raw body is read.
+    pub fn validate_cached_block_admission(
+        &self,
+        request: &CachedBlockPutRequest,
+    ) -> anyhow::Result<()> {
+        self.ensure_configured_backend(request.block.object.backend)?;
+        let block_size = u64::from(self.block_size);
+        if request.block.block_size != self.block_size {
+            anyhow::bail!(
+                "admission block size {} does not match worker block size {}",
+                request.block.block_size,
+                self.block_size
+            );
+        }
+        if request.block.offset % block_size != 0 {
+            anyhow::bail!(
+                "admission block offset {} is not aligned",
+                request.block.offset
+            );
+        }
+        if request.block.offset >= request.object_len {
+            anyhow::bail!(
+                "admission block offset {} is outside object length {}",
+                request.block.offset,
+                request.object_len
+            );
+        }
+        let expected = block_size.min(request.object_len - request.block.offset);
+        if request.body_len != expected {
+            anyhow::bail!(
+                "admission body length {} does not match complete block length {}",
+                request.body_len,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    /// Admit one complete versioned block without consulting the backend.
+    pub async fn admit_cached_block(
+        &self,
+        request: &CachedBlockPutRequest,
+        body: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        self.validate_cached_block_admission(request)?;
+        if body.len() as u64 != request.body_len {
+            anyhow::bail!(
+                "admission body length changed: expected {}, received {}",
+                request.body_len,
+                body.len()
+            );
+        }
+        self.commit_cached_block(&request.block, body).await
     }
 
     /// Write a whole object through to the backend, then cache it (#226/#229).
@@ -2446,6 +2510,109 @@ mod tests {
         let miss = runtime.serve_cached(&wrong_version).await.unwrap_err();
         assert!(miss.downcast_ref::<CacheMiss>().is_some());
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn cache_admission_is_versioned_local_only_and_rejects_partial_blocks() {
+        let root = tmp_root();
+        let backend = Arc::new(MockBackend {
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime(Arc::clone(&backend), WorkerMetrics::new(1024), &root);
+        let object = request("admitted").object;
+        let block = BlockId::new(object.clone(), 0, 8, Version::new("origin-v2"));
+        let admission = CachedBlockPutRequest {
+            block: block.clone(),
+            object_len: 8,
+            body_len: 8,
+        };
+
+        runtime
+            .admit_cached_block(&admission, Bytes::from_static(b"gateway!"))
+            .await
+            .unwrap();
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            runtime
+                .serve_cached(&CachedRangeRequest {
+                    object: object.clone(),
+                    version: Version::new("origin-v2"),
+                    offset: 1,
+                    len: 4,
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"atew")
+        );
+        let wrong_version = runtime
+            .serve_cached(&CachedRangeRequest {
+                object: object.clone(),
+                version: Version::new("other"),
+                offset: 0,
+                len: 1,
+            })
+            .await
+            .unwrap_err();
+        assert!(wrong_version.downcast_ref::<CacheMiss>().is_some());
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+
+        let tail = CachedBlockPutRequest {
+            block: BlockId::new(object.clone(), 8, 8, Version::new("origin-v2")),
+            object_len: 11,
+            body_len: 3,
+        };
+        runtime
+            .admit_cached_block(&tail, Bytes::from_static(b"end"))
+            .await
+            .unwrap();
+        assert_eq!(
+            runtime
+                .serve_cached(&CachedRangeRequest {
+                    object: object.clone(),
+                    version: Version::new("origin-v2"),
+                    offset: 8,
+                    len: 3,
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"end")
+        );
+
+        let invalid = [
+            CachedBlockPutRequest {
+                block: BlockId::new(object.clone(), 1, 8, Version::new("misaligned")),
+                object_len: 9,
+                body_len: 8,
+            },
+            CachedBlockPutRequest {
+                block: BlockId::new(object.clone(), 8, 8, Version::new("partial")),
+                object_len: 16,
+                body_len: 7,
+            },
+            CachedBlockPutRequest {
+                block: BlockId::new(object.clone(), 0, 4, Version::new("wrong-size")),
+                object_len: 4,
+                body_len: 4,
+            },
+        ];
+        for request in invalid {
+            assert!(runtime
+                .admit_cached_block(&request, Bytes::from(vec![0; request.body_len as usize]))
+                .await
+                .is_err());
+            assert!(runtime
+                .serve_cached(&CachedRangeRequest {
+                    object: object.clone(),
+                    version: request.block.version,
+                    offset: request.block.offset,
+                    len: 1,
+                })
+                .await
+                .is_err());
+        }
+        assert_eq!(runtime.block_count(), 2);
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
         std::fs::remove_dir_all(root).ok();
     }
 

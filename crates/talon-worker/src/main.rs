@@ -1367,6 +1367,97 @@ mod tests {
 
         drop(client);
         server.await.unwrap();
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn tokio_conn_admits_a_complete_block_without_origin_access() {
+        use talon_core::BlockId;
+        use talon_transport::data::{
+            encode_cached_block_put_header, CachedBlockPutRequest, CachedRangeRequest,
+        };
+
+        let (worker, observability, _, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        observability.readiness().set_control_registered(true);
+        let object = ObjectId::new(talon_core::Backend::Azure, "c", "admitted");
+        let block = BlockId::new(object.clone(), 0, 8, Version::new("origin-v2"));
+        let request = CachedBlockPutRequest {
+            block,
+            object_len: 8,
+            body_len: 8,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_worker = Arc::clone(&worker);
+        let server_observability = Arc::clone(&observability);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_conn(stream, server_worker, server_observability)
+                .await
+                .unwrap();
+        });
+
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(&encode_cached_block_put_header(7, &request).unwrap())
+            .await
+            .unwrap();
+        client.write_all(b"gateway!").await.unwrap();
+        let mut reply = [0_u8; HEADER_LEN];
+        client.read_exact(&mut reply).await.unwrap();
+        let reply = FrameHeader::decode(&reply).unwrap();
+        assert_eq!(reply.length, 0);
+        assert!(!reply.flags.contains(talon_transport::Flags::ERROR));
+        assert_eq!(
+            worker
+                .serve_cached(&CachedRangeRequest {
+                    object: object.clone(),
+                    version: Version::new("origin-v2"),
+                    offset: 0,
+                    len: 8,
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"gateway!")
+        );
+        drop(client);
+        server.await.unwrap();
+
+        let truncated = CachedBlockPutRequest {
+            block: BlockId::new(object.clone(), 0, 8, Version::new("truncated")),
+            object_len: 8,
+            body_len: 8,
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_worker = Arc::clone(&worker);
+        let server_observability = Arc::clone(&observability);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            handle_conn(stream, server_worker, server_observability)
+                .await
+                .is_err()
+        });
+        let mut client = TcpStream::connect(address).await.unwrap();
+        client
+            .write_all(&encode_cached_block_put_header(8, &truncated).unwrap())
+            .await
+            .unwrap();
+        client.write_all(b"short").await.unwrap();
+        client.shutdown().await.unwrap();
+        assert!(server.await.unwrap());
+        assert!(worker
+            .serve_cached(&CachedRangeRequest {
+                object,
+                version: Version::new("truncated"),
+                offset: 0,
+                len: 1,
+            })
+            .await
+            .is_err());
         std::fs::remove_dir_all(root).ok();
     }
 

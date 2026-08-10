@@ -61,6 +61,9 @@ pub enum MsgType {
     /// Read a versioned range only when every requested byte is resident.
     /// This operation must never access the worker backend.
     GetCachedRange = 6,
+    /// Admit one complete, versioned block into the worker cache without
+    /// accessing the configured backend.
+    AdmitCachedBlock = 7,
 }
 
 impl MsgType {
@@ -74,6 +77,7 @@ impl MsgType {
             4 => MsgType::Ping,
             5 => MsgType::Delete,
             6 => MsgType::GetCachedRange,
+            7 => MsgType::AdmitCachedBlock,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -215,6 +219,7 @@ mod tests {
             MsgType::Ping,
             MsgType::Delete,
             MsgType::GetCachedRange,
+            MsgType::AdmitCachedBlock,
         ]
         .into_iter()
         .enumerate()

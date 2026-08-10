@@ -12,7 +12,7 @@
 //! module only handles the request encode/decode and the response header shape.
 
 use serde::{Deserialize, Serialize};
-use talon_core::{ObjectId, Version};
+use talon_core::{BlockId, ObjectId, Version};
 
 use crate::frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN};
 
@@ -102,6 +102,21 @@ pub struct PutRequest {
     pub body_len: u64,
 }
 
+/// A request to admit one complete origin-fetched block into the local cache.
+///
+/// The raw block bytes (`body_len` of them) follow this framed header. The
+/// worker validates the block geometry against `object_len` and never accesses
+/// its backend while handling this operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CachedBlockPutRequest {
+    /// Exact versioned cache identity of the block.
+    pub block: BlockId,
+    /// Authoritative total object length observed by the gateway.
+    pub object_len: u64,
+    /// Number of raw block bytes following this header.
+    pub body_len: u64,
+}
+
 /// A client→worker request to delete an object (#226). No body follows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DeleteRequest {
@@ -121,6 +136,9 @@ pub enum DataError {
     /// A non-`Put` frame was handed to the put codec.
     #[error("expected a Put frame, got {0:?}")]
     NotPut(MsgType),
+    /// A non-`AdmitCachedBlock` frame was handed to the admission codec.
+    #[error("expected an AdmitCachedBlock frame, got {0:?}")]
+    NotCachedBlockPut(MsgType),
     /// A non-`Delete` frame was handed to the delete codec.
     #[error("expected a Delete frame, got {0:?}")]
     NotDelete(MsgType),
@@ -232,6 +250,39 @@ pub fn decode_put_header(buf: &[u8]) -> Result<(FrameHeader, PutRequest), DataEr
     }
     let req: PutRequest = bincode::deserialize(body)?;
     Ok((header, req))
+}
+
+/// Encode a cache-admission header. The caller writes exactly `body_len` raw
+/// bytes after the returned frame.
+pub fn encode_cached_block_put_header(
+    request_id: u32,
+    req: &CachedBlockPutRequest,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(req)?;
+    let header = FrameHeader::new(MsgType::AdmitCachedBlock, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a cache-admission header (without its trailing raw body).
+pub fn decode_cached_block_put_header(
+    buf: &[u8],
+) -> Result<(FrameHeader, CachedBlockPutRequest), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::AdmitCachedBlock {
+        return Err(DataError::NotCachedBlockPut(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    Ok((header, bincode::deserialize(body)?))
 }
 
 /// Encode a [`DeleteRequest`] into `header || bincode(req)` (no body follows).
@@ -454,6 +505,21 @@ mod tests {
         assert_eq!(header.request_id, 42);
         assert_eq!(back, req);
         // The frame length covers only the small header, NOT the body.
+        assert!((header.length as usize) < 1024);
+    }
+
+    #[test]
+    fn cached_block_put_header_round_trips() {
+        let request = CachedBlockPutRequest {
+            block: BlockId::new(obj(), 8, 8, Version::new("etag-v3")),
+            object_len: 13,
+            body_len: 5,
+        };
+        let encoded = encode_cached_block_put_header(43, &request).unwrap();
+        let (header, decoded) = decode_cached_block_put_header(&encoded).unwrap();
+        assert_eq!(header.msg_type, MsgType::AdmitCachedBlock);
+        assert_eq!(header.request_id, 43);
+        assert_eq!(decoded, request);
         assert!((header.length as usize) < 1024);
     }
 
