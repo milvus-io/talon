@@ -236,6 +236,18 @@ is preserved. Buckets must be provisioned
 at the origin out of band: `CreateBucket` remains rejected, and the origin
 identity still must not hold bucket administration permissions.
 
+A query parameter in S3 selects an operation rather than modifying the one the
+path names: `DELETE /bucket/key` removes the object, while
+`DELETE /bucket/key?tagging` removes only its tags. Sub-resources the gateway
+does not implement are therefore refused with `NotImplemented` for every method
+and target rather than ignored, since ignoring one would run a different
+request than the client sent — and for `?tagging` or `?versionId` on a delete,
+destructively, while answering success. Reserved `x-amz-*` parameters are not
+sub-resources: presigned requests keep carrying their SigV4 credential there.
+This also refuses `response-content-type` and its siblings, which the gateway
+never applied, and the `x-id` parameter the JavaScript AWS SDK appends; no
+Talon-supported client sends either.
+
 Ordinary S3 `PutObject`, `CopyObject`, and `DeleteObject` requests are sent to
 the origin exactly once. `PutObject` requires one valid `Content-Length` and is
 limited by the gateway's 16 MiB default body limit and 30 second default total
