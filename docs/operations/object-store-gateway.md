@@ -101,6 +101,7 @@ Common variables:
 | `TALON_GATEWAY_TLS_TRUST_DOMAIN` | unset | Exact SPIFFE URI SAN trust domain. |
 | `TALON_GATEWAY_MTLS_IDENTITIES_PATH` | unset | JSON URI SAN to principal mapping file. |
 | `TALON_GATEWAY_AUTHORIZATION_PATH` | unset | JSON allow-grant file. Required for production readiness. |
+| `TALON_GATEWAY_AUTH_RELOAD_MS` | `5000` | Client identity and authorization file poll interval. |
 
 The listener permits TLS 1.3 only and advertises HTTP/2 and HTTP/1.1. A bad
 rotation increments `talon_gateway_tls_events_total{event="reload_failure"}`
@@ -135,6 +136,25 @@ events with request ID, protocol, operation, decision, and bounded reason.
 Principal and resource identifiers are truncated SHA-256 values; credentials,
 certificate contents, account names, buckets, containers, and object paths are
 not emitted.
+
+The client identity and authorization files are polled every
+`TALON_GATEWAY_AUTH_RELOAD_MS` and re-applied atomically when their bytes
+change, so credentials can be issued or revoked without a restart. Each file
+loads independently, and every poll increments
+`talon_gateway_auth_reload_polls_total{file,result}`: `success` when a change was
+applied, `failure` when an unreadable or invalid file was rejected, and
+`unchanged` otherwise, so a stalled reload loop is visible as the counter rate
+dropping to zero. A failed load retains the complete last-good configuration
+for that file, logs a warning without file contents, and keeps counting
+failures until the file is corrected. An identity file with an empty list is
+invalid and never replaces the running authenticator; an authorization file
+with an empty grant list is valid and denies every request. In-flight requests
+finish with the configuration they started with; a revoked credential fails on
+its next request, including later parts of an active multipart upload. Because
+the files apply independently, order coordinated rotations so the narrowing
+side lands first: tighten grants before adding the identity they cover, and
+remove an identity before removing its grants. The mTLS URI SAN mapping file
+is read once at startup and is not polled.
 
 S3 variables:
 
@@ -317,6 +337,13 @@ Replace placeholder images and Secrets before applying. The templates run as a
 fixed non-root UID, drop all capabilities, use a read-only root filesystem, and
 probe loopback with `exec` because kubelet HTTP probes target the Pod IP.
 
+Mount Secret-backed identity and authorization files as a whole volume
+directory: a `subPath` mount pins the initial file version forever and never
+receives Secret updates. With whole-volume mounts the kubelet swaps the
+directory atomically, and a credential change becomes effective after the
+kubelet sync period (about one minute by default) plus
+`TALON_GATEWAY_AUTH_RELOAD_MS`.
+
 ## Failure runbook
 
 | Symptom | Meaning | Action |
@@ -331,6 +358,7 @@ probe loopback with `exec` because kubelet HTTP probes target the Pod IP.
 | `404` | Origin-authoritative object absence. | Verify namespace and key; cache does not override this result. |
 | `416` | Unsatisfiable or multi-range request. | Send one valid byte range. |
 | Cache errors increase while reads succeed | Infrastructure fallback is active. | Repair coordinator/workers before origin load becomes sustained. |
+| New or rotated client credential is not accepted | The reload has not fired yet, or the updated file keeps failing to load. | Check `talon_gateway_auth_reload_polls_total` for `failure` growth and a nonzero overall rate; expect kubelet sync plus one reload interval of latency. |
 
 Metrics use bounded labels only. Use request IDs for individual incidents;
 object names, credentials, and origin URLs are deliberately absent from labels

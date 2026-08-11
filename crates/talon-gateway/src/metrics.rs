@@ -43,6 +43,21 @@ impl GatewayMetrics {
             .inc();
     }
 
+    /// Count one identity or authorization file reload poll outcome.
+    ///
+    /// Public because the reload loop lives in the gateway binary; both label
+    /// values must stay bounded (`file` names a configured input, `result` is
+    /// `success`, `failure`, or `unchanged`).
+    pub fn record_auth_reload(&self, file: &'static str, result: &'static str) {
+        self.registry
+            .counter(
+                "talon_gateway_auth_reload_polls_total",
+                "Gateway identity and authorization file reload poll outcomes.",
+                labels(&[("file", file), ("result", result)]),
+            )
+            .inc();
+    }
+
     pub(crate) fn record_authorization(&self, decision: &'static str) {
         self.registry
             .counter(
@@ -189,9 +204,13 @@ mod tests {
         metrics
             .response_observer(ProviderProtocol::Azure, GatewayOperation::Read)
             .complete(10, Duration::from_millis(3));
+        metrics.record_auth_reload("s3_identities", "failure");
         let rendered = metrics.render();
         assert!(rendered.contains("protocol=\"azure\""));
         assert!(rendered.contains("source=\"response\""));
+        assert!(rendered.contains(
+            "talon_gateway_auth_reload_polls_total{file=\"s3_identities\",result=\"failure\"}"
+        ));
         assert!(!rendered.contains("object"));
         assert!(!rendered.contains("credential"));
     }
