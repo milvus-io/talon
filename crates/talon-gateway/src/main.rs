@@ -34,6 +34,8 @@ struct Settings {
     transfer_chunk_bytes: u32,
     placement_ttl_ms: u64,
     replicas: u8,
+    max_body_bytes: usize,
+    request_deadline_ms: u64,
     route: GatewayRoute,
     incoming_path_style: bool,
     endpoint_suffix: Option<String>,
@@ -128,6 +130,16 @@ impl Settings {
             value(&mut get, "TALON_GATEWAY_REPLICAS"),
             "1",
             "TALON_GATEWAY_REPLICAS",
+        )?;
+        let max_body_bytes = parse_or(
+            value(&mut get, "TALON_GATEWAY_MAX_BODY_BYTES"),
+            "16777216",
+            "TALON_GATEWAY_MAX_BODY_BYTES",
+        )?;
+        let request_deadline_ms = parse_or(
+            value(&mut get, "TALON_GATEWAY_REQUEST_DEADLINE_MS"),
+            "30000",
+            "TALON_GATEWAY_REQUEST_DEADLINE_MS",
         )?;
         let route = match value(&mut get, "TALON_GATEWAY_ROUTE").as_deref() {
             None | Some("cache") => GatewayRoute::Cache,
@@ -224,6 +236,8 @@ impl Settings {
             transfer_chunk_bytes,
             placement_ttl_ms,
             replicas,
+            max_body_bytes,
+            request_deadline_ms,
             route,
             incoming_path_style,
             endpoint_suffix: value(&mut get, "TALON_GATEWAY_ENDPOINT_SUFFIX"),
@@ -684,6 +698,8 @@ async fn main() -> MainResult<()> {
             bind: settings.bind,
             mode: settings.mode,
             origin_auth: settings.origin_auth,
+            max_body_bytes: settings.max_body_bytes,
+            request_deadline: std::time::Duration::from_millis(settings.request_deadline_ms),
             ..GatewayConfig::default()
         },
         adapter,
@@ -770,6 +786,25 @@ mod tests {
         assert_eq!(settings.azure_max_clock_skew_ms, 900_000);
         assert_eq!(settings.azure_max_block_bindings, 1024);
         assert_eq!(settings.azure_block_binding_ttl_ms, 86_400_000);
+        assert_eq!(settings.max_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(settings.request_deadline_ms, 30_000);
+    }
+
+    #[test]
+    fn body_and_deadline_limits_are_configurable() {
+        let configured = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_MAX_BODY_BYTES", "536870912"),
+            ("TALON_GATEWAY_REQUEST_DEADLINE_MS", "300000"),
+        ])
+        .unwrap();
+        assert_eq!(configured.max_body_bytes, 512 * 1024 * 1024);
+        assert_eq!(configured.request_deadline_ms, 300_000);
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_MAX_BODY_BYTES", "not-a-number"),
+        ])
+        .is_err());
     }
 
     #[test]
