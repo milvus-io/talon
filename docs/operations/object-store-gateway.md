@@ -86,6 +86,8 @@ Common variables:
 | `TALON_GATEWAY_PATH_STYLE` | `false` | Accept `/bucket/key` or `/account/container/blob`. |
 | `TALON_GATEWAY_ENDPOINT_SUFFIX` | provider default | Virtual-host suffix accepted from clients. |
 | `TALON_GATEWAY_BLOCK_SIZE` | `268435456` | Must match worker cache granularity. |
+| `TALON_GATEWAY_MAX_BODY_BYTES` | `16777216` | Request body limit, enforced before spooling. Raise only with matching disk and concurrency capacity. |
+| `TALON_GATEWAY_REQUEST_DEADLINE_MS` | `30000` | Total request deadline, covering the streamed response body. Raise for large objects on slow links. |
 | `TALON_GATEWAY_TRANSFER_CHUNK_BYTES` | `1048576` | Maximum cache body frame. |
 | `TALON_GATEWAY_PLACEMENT_TTL_MS` | `5000` | Client-side placement freshness. |
 | `TALON_GATEWAY_REPLICAS` | `1` | Ordered worker replicas attempted by the cache client. |
