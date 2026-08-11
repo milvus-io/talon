@@ -43,6 +43,32 @@ impl GatewayMetrics {
             .inc();
     }
 
+    /// Count one origin credential refresh outcome (workload identity).
+    ///
+    /// Public because credentials are resolved in the gateway binary before
+    /// the runtime exists; `result` is `refresh_success` or `refresh_failure`.
+    pub fn record_origin_credentials(&self, result: &'static str) {
+        self.registry
+            .counter(
+                "talon_gateway_origin_credentials_total",
+                "Origin credential refresh outcomes.",
+                labels(&[("result", result)]),
+            )
+            .inc();
+    }
+
+    /// Publish when the current origin credentials expire (unix seconds,
+    /// `0` when the mechanism reports no expiry or credentials are static).
+    pub fn set_origin_credentials_expiry(&self, unix_seconds: f64) {
+        self.registry
+            .gauge(
+                "talon_gateway_origin_credentials_expiry_seconds",
+                "Unix time when the current origin credentials expire.",
+                labels(&[]),
+            )
+            .set(unix_seconds);
+    }
+
     /// Count one identity or authorization file reload poll outcome.
     ///
     /// Public because the reload loop lives in the gateway binary; both label
@@ -213,5 +239,16 @@ mod tests {
         ));
         assert!(!rendered.contains("object"));
         assert!(!rendered.contains("credential"));
+    }
+
+    #[test]
+    fn origin_credential_metrics_render_bounded_labels() {
+        let metrics = GatewayMetrics::new();
+        metrics.record_origin_credentials("refresh_failure");
+        metrics.set_origin_credentials_expiry(1_754_000_000.0);
+        let rendered = metrics.render();
+        assert!(rendered
+            .contains("talon_gateway_origin_credentials_total{result=\"refresh_failure\"} 1"));
+        assert!(rendered.contains("talon_gateway_origin_credentials_expiry_seconds"));
     }
 }

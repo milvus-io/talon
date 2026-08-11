@@ -100,16 +100,30 @@ pub struct S3Credentials {
 /// An S3 `BackendStore` over a pluggable HTTP client.
 pub struct S3Backend {
     config: S3Config,
-    creds: S3Credentials,
+    credentials: Arc<dyn crate::credentials::ProvideS3Credentials>,
     http: Arc<dyn HttpClient>,
 }
 
 impl S3Backend {
-    /// Construct a backend from config, credentials, and an HTTP client.
+    /// Construct a backend from config, fixed credentials, and an HTTP client.
     pub fn new(config: S3Config, creds: S3Credentials, http: Arc<dyn HttpClient>) -> Self {
+        Self::with_credentials_provider(
+            config,
+            Arc::new(crate::credentials::StaticS3Credentials::new(creds)),
+            http,
+        )
+    }
+
+    /// Construct a backend whose credentials come from a snapshot provider
+    /// (static or background-refreshed workload identity).
+    pub fn with_credentials_provider(
+        config: S3Config,
+        credentials: Arc<dyn crate::credentials::ProvideS3Credentials>,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
         Self {
             config,
-            creds,
+            credentials,
             http,
         }
     }
@@ -207,7 +221,7 @@ impl S3Backend {
         if_match: Option<&Version>,
     ) -> HttpRequest {
         let mut headers = vec![("Range".to_string(), Self::range_header(offset, len))];
-        if let Some(tok) = &self.creds.session_token {
+        if let Some(tok) = &self.credentials.current().session_token {
             headers.push(("x-amz-security-token".to_string(), tok.clone()));
         }
         if let Some(version) = if_match {
@@ -225,7 +239,7 @@ impl S3Backend {
     /// Build the HEAD request for a stat (exposed for testing).
     pub fn build_head(&self, obj: &ObjectId) -> HttpRequest {
         let mut headers = Vec::new();
-        if let Some(tok) = &self.creds.session_token {
+        if let Some(tok) = &self.credentials.current().session_token {
             headers.push(("x-amz-security-token".to_string(), tok.clone()));
         }
         HttpRequest {
@@ -247,7 +261,7 @@ impl S3Backend {
         if_match: Option<&Version>,
     ) -> HttpRequest {
         let mut headers = vec![("Content-Length".to_string(), body.len().to_string())];
-        if let Some(tok) = &self.creds.session_token {
+        if let Some(tok) = &self.credentials.current().session_token {
             headers.push(("x-amz-security-token".to_string(), tok.clone()));
         }
         if let Some(version) = if_match {
@@ -264,7 +278,7 @@ impl S3Backend {
     /// Build the DELETE request (exposed for testing).
     pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
         let mut headers = Vec::new();
-        if let Some(tok) = &self.creds.session_token {
+        if let Some(tok) = &self.credentials.current().session_token {
             headers.push(("x-amz-security-token".to_string(), tok.clone()));
         }
         HttpRequest {
@@ -277,17 +291,24 @@ impl S3Backend {
 
     /// Sign `req` with AWS SigV4 for this backend's region, stamping the current
     /// wall-clock time. Called on every request just before it is executed.
+    ///
+    /// The credential snapshot is taken here, and `sign_request` re-stamps the
+    /// session-token header from the same snapshot it signs with, so a
+    /// concurrent refresh can never pair one snapshot's token with another's
+    /// signature.
     fn signed(&self, mut req: HttpRequest) -> HttpRequest {
         let date = crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now());
-        crate::sigv4::sign_request(&mut req, &self.creds, &self.config.region, "s3", &date);
+        let creds = self.credentials.current();
+        crate::sigv4::sign_request(&mut req, &creds, &self.config.region, "s3", &date);
         req
     }
 
     fn signed_with_payload_hash(&self, mut req: HttpRequest, payload_hash: &str) -> HttpRequest {
         let date = crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now());
+        let creds = self.credentials.current();
         crate::sigv4::sign_request_with_payload_hash(
             &mut req,
-            &self.creds,
+            &creds,
             &self.config.region,
             "s3",
             &date,
@@ -297,7 +318,8 @@ impl S3Backend {
     }
 
     fn session_headers(&self) -> Vec<(String, String)> {
-        self.creds
+        self.credentials
+            .current()
             .session_token
             .as_ref()
             .map(|token| vec![("x-amz-security-token".to_string(), token.clone())])

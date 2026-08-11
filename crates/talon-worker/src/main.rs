@@ -70,6 +70,31 @@ struct MetricsRetryObserver {
     observability: Arc<WorkerObservability>,
 }
 
+/// Bridges origin credential refresh outcomes to the worker's registry.
+struct CredentialsMetricsObserver {
+    observability: Arc<WorkerObservability>,
+}
+
+impl talon_backend::CredentialsObserver for CredentialsMetricsObserver {
+    fn refresh_succeeded(&self, expires_at: Option<std::time::SystemTime>) {
+        self.observability
+            .metrics()
+            .record_origin_credentials("refresh_success");
+        let unix_seconds = expires_at
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |since_epoch| since_epoch.as_secs_f64());
+        self.observability
+            .metrics()
+            .set_origin_credentials_expiry(unix_seconds);
+    }
+
+    fn refresh_failed(&self) {
+        self.observability
+            .metrics()
+            .record_origin_credentials("refresh_failure");
+    }
+}
+
 impl talon_backend::RetryObserver for MetricsRetryObserver {
     fn on_retry(&self, _attempt: u32, _status: Option<u16>) {
         self.observability.metrics().record_backend_retry();
@@ -186,17 +211,27 @@ fn split_scheme(endpoint: &str) -> (String, bool) {
     }
 }
 
-/// Build the Azure backend from account (config/env) + SAS (env only), honoring
-/// an optional endpoint override (Azurite/proxy).
-fn build_azure_backend(
+/// Explicit origin credential mechanism (`static`, `aws-web-identity`,
+/// `aliyun-oidc`, `tencent-oidc`, `huawei-agency`, `gcp-metadata`); unset
+/// means static material first, then auto-detected workload identity. Read
+/// from the environment like the secrets themselves.
+fn origin_credentials_source() -> Option<String> {
+    std::env::var("TALON_ORIGIN_CREDENTIALS_SOURCE")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// Build the Azure backend from account (config/env) plus a SAS token (env)
+/// or, when no SAS is set, AKS workload identity, honoring an optional
+/// endpoint override (Azurite/proxy).
+async fn build_azure_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
+    observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<AzureBackend> {
     let account = cfg.azure_account.clone().ok_or_else(|| {
         anyhow::anyhow!("azure_account is required (set TALON_WORKER_AZURE_ACCOUNT)")
     })?;
-    let sas = azure_sas_from_env()
-        .ok_or_else(|| anyhow::anyhow!("TALON_WORKER_AZURE_SAS must be set (SAS token)"))?;
     let azure_config = match cfg.azure_endpoint.clone() {
         Some(endpoint) => {
             let (host, tls) = split_scheme(&endpoint);
@@ -204,25 +239,59 @@ fn build_azure_backend(
         }
         None => AzureConfig::new(account),
     };
-    Ok(AzureBackend::new(azure_config, Some(sas), http))
+    match azure_sas_from_env() {
+        Some(sas) => {
+            tracing::info!(source = "sas", "origin Azure credentials resolved");
+            Ok(AzureBackend::new(azure_config, Some(sas), http))
+        }
+        None => {
+            let resolved = talon_backend::resolve_azure_bearer(Arc::clone(&http), observer)
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!(
+                        "TALON_WORKER_AZURE_SAS must be set (SAS token), or AKS \
+                         workload identity must be available: {error}"
+                    )
+                })?;
+            tracing::info!(
+                source = resolved.source,
+                "origin Azure credentials resolved"
+            );
+            Ok(AzureBackend::with_bearer_provider(
+                azure_config,
+                resolved.provider,
+                http,
+            ))
+        }
+    }
 }
 
-/// Build the S3 backend from region/endpoint/access-key (config) + secret key
-/// and optional session token (env only).
-fn build_s3_backend(
+/// Build the S3 backend from region/endpoint (config) plus either static keys
+/// (config + env) or a cloud workload identity (EKS IRSA, ACK RRSA, TKE OIDC
+/// auto-detected; Huawei agency via `TALON_ORIGIN_CREDENTIALS_SOURCE`).
+async fn build_s3_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
+    observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<S3Backend> {
     let region = cfg
         .s3_region
         .clone()
         .ok_or_else(|| anyhow::anyhow!("s3_region is required (set TALON_WORKER_S3_REGION)"))?;
-    let access_key_id = cfg.s3_access_key_id.clone().ok_or_else(|| {
-        anyhow::anyhow!("s3_access_key_id is required (set TALON_WORKER_S3_ACCESS_KEY_ID)")
-    })?;
-    let secret_access_key = s3_secret_key_from_env().ok_or_else(|| {
-        anyhow::anyhow!("TALON_WORKER_S3_SECRET_ACCESS_KEY must be set (secret key)")
-    })?;
+    let static_credentials = match (cfg.s3_access_key_id.clone(), s3_secret_key_from_env()) {
+        (Some(access_key_id), Some(secret_access_key)) => Some(S3Credentials {
+            access_key_id,
+            secret_access_key,
+            session_token: s3_session_token_from_env(),
+        }),
+        (None, None) => None,
+        (Some(_), None) => {
+            anyhow::bail!("TALON_WORKER_S3_SECRET_ACCESS_KEY must be set (secret key)")
+        }
+        (None, Some(_)) => {
+            anyhow::bail!("s3_access_key_id is required (set TALON_WORKER_S3_ACCESS_KEY_ID)")
+        }
+    };
     let mut config = S3Config::aws(&region);
     if let Some(endpoint) = cfg.s3_endpoint.clone() {
         let (host, tls) = split_scheme(&endpoint);
@@ -232,19 +301,29 @@ fn build_s3_backend(
     if let Some(path_style) = cfg.s3_path_style {
         config.path_style = path_style;
     }
-    let creds = S3Credentials {
-        access_key_id,
-        secret_access_key,
-        session_token: s3_session_token_from_env(),
-    };
-    Ok(S3Backend::new(config, creds, http))
+    let resolved = talon_backend::resolve_s3_credentials(
+        static_credentials,
+        origin_credentials_source().as_deref(),
+        Arc::clone(&http),
+        observer,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error))?;
+    tracing::info!(source = resolved.source, "origin S3 credentials resolved");
+    Ok(S3Backend::with_credentials_provider(
+        config,
+        resolved.provider,
+        http,
+    ))
 }
 
-/// Build the GCS backend from an optional endpoint override (fake-gcs-server) +
-/// bearer token (env only).
-fn build_gcs_backend(
+/// Build the GCS backend from an optional endpoint override (fake-gcs-server)
+/// plus a bearer token (env) or the GKE metadata service
+/// (`TALON_ORIGIN_CREDENTIALS_SOURCE=gcp-metadata`).
+async fn build_gcs_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
+    observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<GcsBackend> {
     let config = match cfg.gcs_endpoint.clone() {
         Some(endpoint) => {
@@ -253,7 +332,20 @@ fn build_gcs_backend(
         }
         None => GcsConfig::default(),
     };
-    Ok(GcsBackend::new(config, gcs_bearer_from_env(), http))
+    let resolved = talon_backend::resolve_gcs_bearer(
+        gcs_bearer_from_env(),
+        origin_credentials_source().as_deref(),
+        Arc::clone(&http),
+        observer,
+    )
+    .await
+    .map_err(|error| anyhow::anyhow!(error))?;
+    tracing::info!(source = resolved.source, "origin GCS credentials resolved");
+    Ok(GcsBackend::with_bearer_provider(
+        config,
+        resolved.provider,
+        http,
+    ))
 }
 
 #[tokio::main]
@@ -475,11 +567,17 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Select the object-store backend from config (default: azure). Each backend
-    // reads its endpoint from config and its secret from the environment only.
+    // reads its endpoint from config and its credentials from the environment
+    // only — static secrets, or a cloud workload identity refreshed in the
+    // background and counted through the worker registry.
+    let credentials_observer: Arc<dyn talon_backend::CredentialsObserver> =
+        Arc::new(CredentialsMetricsObserver {
+            observability: Arc::clone(&observability),
+        });
     let backend: Arc<dyn BackendStore> = match backend_kind {
-        "azure" => Arc::new(build_azure_backend(&cfg, http)?),
-        "s3" => Arc::new(build_s3_backend(&cfg, http)?),
-        "gcs" => Arc::new(build_gcs_backend(&cfg, http)?),
+        "azure" => Arc::new(build_azure_backend(&cfg, http, credentials_observer).await?),
+        "s3" => Arc::new(build_s3_backend(&cfg, http, credentials_observer).await?),
+        "gcs" => Arc::new(build_gcs_backend(&cfg, http, credentials_observer).await?),
         other => {
             anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
         }

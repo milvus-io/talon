@@ -28,6 +28,8 @@ secrets.*
 *_secret*
 credentials
 credentials.*
+# The blanket credential-file patterns above must not swallow source code.
+!crates/talon-backend/src/credentials.rs
 
 # Python client build artifacts.
 clients/python/target/

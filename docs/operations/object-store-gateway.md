@@ -33,8 +33,8 @@ with the process's origin identity.
 |---|---|---|
 | Client to S3 gateway | SigV4 access key, optional STS token, or presigned query | Identity file mounted read-only; never logged or forwarded. |
 | Client to Azure gateway | Shared Key, service SAS, or account SAS | Identity file mounted read-only; never logged or forwarded. |
-| Gateway to S3 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` | Environment/secret injection only. |
-| Gateway to Azure | Exactly one of `TALON_GATEWAY_AZURE_SHARED_KEY` or `TALON_GATEWAY_AZURE_SAS` | Environment/secret injection only. |
+| Gateway to S3 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN` — or a [cloud workload identity](cloud-backends.md#workload-identity-keyless) when no static keys are set | Environment/secret injection only; workload-identity credentials are refreshed in-process and never stored. |
+| Gateway to Azure | Exactly one of `TALON_GATEWAY_AZURE_SHARED_KEY` or `TALON_GATEWAY_AZURE_SAS` — or AKS workload identity when neither is set | Environment/secret injection only. |
 | Gateway to Talon | Coordinator and worker data-plane connection | Existing Talon cache-client boundary; mTLS integration is part of #446. |
 
 Use an origin identity limited to the advertised read and mutation operations
@@ -102,6 +102,7 @@ Common variables:
 | `TALON_GATEWAY_MTLS_IDENTITIES_PATH` | unset | JSON URI SAN to principal mapping file. |
 | `TALON_GATEWAY_AUTHORIZATION_PATH` | unset | JSON allow-grant file. Required for production readiness. |
 | `TALON_GATEWAY_AUTH_RELOAD_MS` | `5000` | Client identity and authorization file poll interval. |
+| `TALON_ORIGIN_CREDENTIALS_SOURCE` | `auto` | Origin credential mechanism (`static`, `aws-web-identity`, `aliyun-oidc`, `tencent-oidc`, `huawei-agency`, `gcp-metadata`); see [workload identity](cloud-backends.md#workload-identity-keyless). Static keys always win under `auto`. |
 
 The listener permits TLS 1.3 only and advertises HTTP/2 and HTTP/1.1. A bad
 rotation increments `talon_gateway_tls_events_total{event="reload_failure"}`
@@ -161,7 +162,8 @@ S3 variables:
 | Variable | Default | Meaning |
 |---|---|---|
 | `TALON_GATEWAY_S3_REGION` | `us-east-1` | Origin signing region, required incoming SigV4 scope region, `GetBucketLocation` answer, and the `x-amz-bucket-region` value stamped on `HeadBucket` responses. |
-| `TALON_GATEWAY_S3_ENDPOINT` | AWS regional endpoint | Optional `http[s]://host[:port]`; custom endpoints use path addressing. |
+| `TALON_GATEWAY_S3_ENDPOINT` | AWS regional endpoint | Optional `http[s]://host[:port]` for S3-compatible origins. |
+| `TALON_GATEWAY_S3_ORIGIN_PATH_STYLE` | `true` | Origin addressing for custom endpoints: `true` for MinIO/Ceph, `false` (virtual-host) for OSS and COS. |
 | `AWS_ACCESS_KEY_ID` | required | Scoped origin access key. |
 | `AWS_SECRET_ACCESS_KEY` | required | Scoped origin secret. |
 | `AWS_SESSION_TOKEN` | unset | Optional STS token. |

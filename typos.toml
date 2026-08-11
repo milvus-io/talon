@@ -10,6 +10,9 @@
 mis = "mis"
 # Accepted English spelling used in doc comments.
 clonable = "clonable"
+# Managed Kubernetes product names (Azure AKS, Tencent TKE), not "ask"/"take".
+AKS = "AKS"
+TKE = "TKE"
 
 [files]
 # Generated and vendored content should not be spell-checked.

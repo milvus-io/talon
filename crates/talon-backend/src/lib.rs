@@ -8,6 +8,7 @@
 
 pub mod azure;
 pub mod azure_sharedkey;
+pub mod credentials;
 pub mod delay;
 pub mod gcs;
 pub mod http;
@@ -16,9 +17,14 @@ pub mod reqwest_client;
 pub mod retry;
 pub mod s3;
 pub mod sigv4;
+pub mod workload_identity;
 pub mod xml;
 
 pub use azure::{AzureBackend, AzureConfig};
+pub use credentials::{
+    CredentialsFetch, CredentialsObserver, NoopObserver, ProvideBearerToken, ProvideS3Credentials,
+    RefreshPolicy, RefreshingCredentials, StaticBearerToken, StaticS3Credentials,
+};
 pub use delay::{DelayConfig, DelayingHttpClient};
 pub use gcs::{GcsBackend, GcsConfig};
 pub use http::{
@@ -29,3 +35,7 @@ pub use reqwest_client::ReqwestClient;
 pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
 pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest};
 pub use sigv4::{sign_request, AmzDate};
+pub use workload_identity::{
+    resolve_azure_bearer, resolve_gcs_bearer, resolve_s3_credentials, ResolvedBearerToken,
+    ResolvedS3Credentials,
+};
