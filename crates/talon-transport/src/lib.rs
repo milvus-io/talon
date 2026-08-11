@@ -19,7 +19,7 @@ pub mod pool;
 pub mod uring;
 
 pub use codec::{
-    decode, encode, encode_for_schema, CodecError, ControlMessage, ObjectEntry,
+    decode, encode, encode_for_schema, CodecError, ControlMessage, ObjectEntry, ZonedNodeInfo,
     CONTROL_SCHEMA_VERSION, MIN_CONTROL_SCHEMA_VERSION,
 };
 pub use data::{

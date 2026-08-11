@@ -16,7 +16,7 @@
 //! ```
 
 use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
-use talon_transport::codec::{self, ControlMessage, ObjectEntry};
+use talon_transport::codec::{self, ControlMessage, ObjectEntry, ZonedNodeInfo};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{FrameHeader, MsgType};
 
@@ -176,6 +176,37 @@ fn vectors() -> Vec<Vector> {
                 revision: 7,
                 worker_id: "worker-a".into(),
                 worker_incarnation: "worker-incarnation-1".into(),
+            },
+        ),
+        control(
+            "control.membership_query_v2",
+            "Schema v5: zone-aware membership request (ADR 0006)",
+            6,
+            &ControlMessage::MembershipQueryV2 {},
+        ),
+        control(
+            "control.membership_list_v2",
+            "Schema v5: nodes paired with optional zones; None is a zero tag",
+            6,
+            &ControlMessage::MembershipListV2 {
+                nodes: vec![
+                    ZonedNodeInfo {
+                        info: NodeInfo {
+                            id: NodeId::new("worker-a"),
+                            address: "10.0.0.1:7001".into(),
+                            role: NodeRole::Worker,
+                        },
+                        zone: Some("us-west-2a".into()),
+                    },
+                    ZonedNodeInfo {
+                        info: NodeInfo {
+                            id: NodeId::new("worker-b"),
+                            address: "10.0.0.2:7001".into(),
+                            role: NodeRole::Worker,
+                        },
+                        zone: None,
+                    },
+                ],
             },
         ),
         // --- Data plane -----------------------------------------------------

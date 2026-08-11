@@ -50,3 +50,35 @@ subjects:
   - kind: ServiceAccount
     name: talon-coordinator
     namespace: talon
+---
+# Zone-aware cache reads (ADR 0006): workers and gateways resolve their own
+# deployment zone by reading their node's `topology.kubernetes.io/zone` label.
+# Nodes are cluster-scoped, so this is a ClusterRole; it grants read access to
+# node objects only. Skip it entirely by injecting TALON_ZONE instead.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: talon-node-zone-reader
+  labels:
+    app.kubernetes.io/name: talon
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: talon-node-zone-reader
+  labels:
+    app.kubernetes.io/name: talon
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: talon-node-zone-reader
+subjects:
+  # Bind every ServiceAccount that runs a talon-worker or a zone-affine
+  # gateway; extend the list to match your deployment.
+  - kind: ServiceAccount
+    name: talon-worker
+    namespace: talon

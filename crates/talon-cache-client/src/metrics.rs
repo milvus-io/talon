@@ -114,6 +114,46 @@ impl ReadStatsSnapshot {
     }
 }
 
+/// Zone relationship of one served worker read (ADR 0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ZoneMatch {
+    /// The worker shares the reader's zone.
+    Same,
+    /// The worker is in a different zone (billable transfer).
+    Cross,
+    /// The reader or the worker has no known zone.
+    Unknown,
+}
+
+impl ZoneMatch {
+    /// Bounded label value for metrics.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Same => "same",
+            Self::Cross => "cross",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Observer for zone-classified reads, so each binary counts them into its
+/// own registry. Implementations must not block.
+pub trait ZoneReadObserver: Send + Sync {
+    /// One successfully served worker read of `bytes` bytes.
+    fn worker_read(&self, matched: ZoneMatch, bytes: u64) {
+        let _ = (matched, bytes);
+    }
+
+    /// Zone affinity was requested but the same-zone worker set was empty, so
+    /// this placement resolution used the full membership.
+    fn affinity_fallback(&self) {}
+}
+
+/// Observer that drops every event.
+pub struct NoopZoneReadObserver;
+
+impl ZoneReadObserver for NoopZoneReadObserver {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

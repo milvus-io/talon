@@ -19,7 +19,9 @@ pub use block_reader::{BlockReadError, BlockReader, FileView};
 pub use coordinator_client::{
     CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
 };
-pub use metrics::{ReadStats, ReadStatsSnapshot};
+pub use metrics::{
+    NoopZoneReadObserver, ReadStats, ReadStatsSnapshot, ZoneMatch, ZoneReadObserver,
+};
 pub use placement_cache::{Cached, PlacementCache, RefreshReason};
 pub use pool::{ConnectionPool, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT};
 pub use range_stream::{CacheReadError, RangeChunkStream, DEFAULT_TRANSFER_CHUNK_BYTES};

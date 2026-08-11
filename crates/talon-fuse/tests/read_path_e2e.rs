@@ -140,6 +140,22 @@ async fn spawn_coordinator(
                                 .collect(),
                         }
                     }
+                    ControlMessage::MembershipQueryV2 {} => {
+                        counters.membership_queries.fetch_add(1, Ordering::SeqCst);
+                        ControlMessage::MembershipListV2 {
+                            nodes: owners
+                                .iter()
+                                .map(|(id, a)| talon_transport::ZonedNodeInfo {
+                                    info: NodeInfo {
+                                        id: NodeId::new(id),
+                                        address: a.clone(),
+                                        role: NodeRole::Worker,
+                                    },
+                                    zone: None,
+                                })
+                                .collect(),
+                        }
+                    }
                     _ => ControlMessage::Ack {
                         ok: false,
                         detail: None,

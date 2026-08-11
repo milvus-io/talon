@@ -249,6 +249,18 @@ mod tests {
                                     role: NodeRole::Worker,
                                 }],
                             },
+                            ControlMessage::MembershipQueryV2 {} => {
+                                ControlMessage::MembershipListV2 {
+                                    nodes: vec![talon_transport::ZonedNodeInfo {
+                                        info: NodeInfo {
+                                            id: NodeId("w1".into()),
+                                            address: worker_addr.clone(),
+                                            role: NodeRole::Worker,
+                                        },
+                                        zone: None,
+                                    }],
+                                }
+                            }
                             other => panic!("unexpected control request: {other:?}"),
                         };
                         socket

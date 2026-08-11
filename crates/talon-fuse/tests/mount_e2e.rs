@@ -118,6 +118,16 @@ async fn spawn_coordinator(worker_addr: String) -> String {
                             role: NodeRole::Worker,
                         }],
                     },
+                    ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
+                        nodes: vec![talon_transport::ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new("w1"),
+                                address: worker_addr.clone(),
+                                role: NodeRole::Worker,
+                            },
+                            zone: None,
+                        }],
+                    },
                     _ => ControlMessage::Ack {
                         ok: false,
                         detail: None,

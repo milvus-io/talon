@@ -21,7 +21,7 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 /// Bumped when [`ControlMessage`] changes in an incompatible way. Carried in
 /// the envelope so a peer can reject a mismatched schema instead of
 /// misinterpreting bytes.
-pub const CONTROL_SCHEMA_VERSION: u16 = 4;
+pub const CONTROL_SCHEMA_VERSION: u16 = 5;
 
 /// Oldest control schema this build can decode.
 pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
@@ -187,6 +187,17 @@ pub enum ControlMessage {
         /// Current worker process incarnation.
         worker_incarnation: String,
     },
+    /// Client → coordinator: list live nodes with their zones. Schema v5.
+    ///
+    /// Zone-affine readers (ADR 0006) send this first and fall back to
+    /// [`MembershipQuery`](Self::MembershipQuery) when the coordinator
+    /// predates schema v5.
+    MembershipQueryV2 {},
+    /// Coordinator → client: membership with each node's optional zone.
+    MembershipListV2 {
+        /// All nodes the coordinator currently knows about, with zones.
+        nodes: Vec<ZonedNodeInfo>,
+    },
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -196,6 +207,18 @@ pub struct ObjectEntry {
     pub path: String,
     /// Object size in bytes.
     pub size: u64,
+}
+
+/// A membership entry paired with its deployment zone.
+///
+/// [`NodeInfo`] itself cannot grow fields (bincode encodes positionally), so
+/// the zone travels alongside it in the schema-v5 membership messages.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZonedNodeInfo {
+    /// The unchanged v1 node identity.
+    pub info: NodeInfo,
+    /// Deployment zone reported by the node, when known.
+    pub zone: Option<String>,
 }
 
 impl ControlMessage {
@@ -213,6 +236,9 @@ impl ControlMessage {
             | Self::MappingRevisionValue { .. }
             | Self::StaleMapping { .. } => 3,
             Self::MappingRevisionUpdate { .. } | Self::MappingRevisionAck { .. } => 4,
+            // Schema 5: zone-aware membership (ADR 0006). Older peers reject
+            // these at the envelope; the client falls back to MembershipQuery.
+            Self::MembershipQueryV2 {} | Self::MembershipListV2 { .. } => 5,
             _ => MIN_CONTROL_SCHEMA_VERSION,
         }
     }

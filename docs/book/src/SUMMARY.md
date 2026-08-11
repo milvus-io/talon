@@ -26,6 +26,7 @@
 
 - [Operator runbook](./operations/runbook.md)
 - [Cloud backends (S3/GCS/Azure)](./operations/cloud-backends.md)
+- [Zone-aware cache reads](./operations/zone-affinity.md)
 - [Security hardening](./operations/security.md)
 - [Latency lab](./testing/latency-lab.md)
 - [Object-store gateway deployment](./operations/object-store-gateway.md)
@@ -55,6 +56,7 @@
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)
 - [ADR 0004: Control-plane workload identity](./explanation/adr-0004-control-plane-workload-identity.md)
 - [ADR 0005: Object-store-compatible gateways](./explanation/adr-0005-object-store-compatible-gateways.md)
+- [ADR 0006: Zone-aware cache reads](./explanation/adr-0006-zone-aware-cache-reads.md)
 
 # Contributing
 

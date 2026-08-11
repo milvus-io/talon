@@ -103,6 +103,8 @@ Common variables:
 | `TALON_GATEWAY_AUTHORIZATION_PATH` | unset | JSON allow-grant file. Required for production readiness. |
 | `TALON_GATEWAY_AUTH_RELOAD_MS` | `5000` | Client identity and authorization file poll interval. |
 | `TALON_ORIGIN_CREDENTIALS_SOURCE` | `auto` | Origin credential mechanism (`static`, `aws-web-identity`, `aliyun-oidc`, `tencent-oidc`, `huawei-agency`, `gcp-metadata`); see [workload identity](cloud-backends.md#workload-identity-keyless). Static keys always win under `auto`. |
+| `TALON_ZONE` | auto-detected | Deployment zone; see [zone-aware cache reads](zone-affinity.md). |
+| `TALON_ZONE_AFFINITY` | `false` | Read from same-zone cache workers only; see [zone-aware cache reads](zone-affinity.md). |
 
 The listener permits TLS 1.3 only and advertises HTTP/2 and HTTP/1.1. A bad
 rotation increments `talon_gateway_tls_events_total{event="reload_failure"}`

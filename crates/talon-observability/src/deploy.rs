@@ -154,8 +154,46 @@ mod tests {
             let resources = rule["resources"].as_sequence().unwrap();
             assert!(resources.iter().all(|r| r.as_str() == Some("leases")));
         }
-        // No ClusterRole anywhere (would be over-broad).
-        assert!(!kinds(RBAC_YAML).contains(&"ClusterRole".to_string()));
+        // Cluster-wide grants are allowed only for the zone lookup (ADR
+        // 0006): nodes are cluster-scoped, so reading the node's zone label
+        // cannot be namespaced. Pin every ClusterRole to exactly read-only
+        // `get` on nodes — anything broader is over-broad again.
+        let cluster_roles: Vec<_> = docs
+            .iter()
+            .filter(|d| d.get("kind").and_then(|k| k.as_str()) == Some("ClusterRole"))
+            .collect();
+        for role in &cluster_roles {
+            assert_eq!(
+                role["metadata"]["name"].as_str(),
+                Some("talon-node-zone-reader")
+            );
+            let rules = role["rules"].as_sequence().unwrap();
+            assert_eq!(rules.len(), 1, "one rule only");
+            let resources: Vec<_> = rules[0]["resources"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|r| r.as_str())
+                .collect();
+            assert_eq!(resources, ["nodes"]);
+            let verbs: Vec<_> = rules[0]["verbs"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter_map(|v| v.as_str())
+                .collect();
+            assert_eq!(verbs, ["get"], "read-only, no list/watch");
+        }
+        // The binding must grant exactly that role, nothing else.
+        for binding in docs
+            .iter()
+            .filter(|d| d.get("kind").and_then(|k| k.as_str()) == Some("ClusterRoleBinding"))
+        {
+            assert_eq!(
+                binding["roleRef"]["name"].as_str(),
+                Some("talon-node-zone-reader")
+            );
+        }
     }
 
     #[test]

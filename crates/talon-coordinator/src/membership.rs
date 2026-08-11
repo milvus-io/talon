@@ -22,12 +22,23 @@ use talon_core::{NodeId, NodeInfo};
 
 use crate::Epoch;
 
+/// A registered node together with the deployment zone it last reported
+/// (ADR 0006).
+///
+/// Node and zone live in one record behind one lock so every reader sees them
+/// move together; the placement version stays a pure function of the
+/// [`NodeInfo`] projection alone.
+struct Member {
+    info: NodeInfo,
+    zone: Option<String>,
+}
+
 /// An in-memory registry of known cluster nodes.
 ///
 /// The placement version is a pure function of the node set, so the registry
 /// stores only the nodes; [`Membership::epoch`] computes the version on demand.
 pub struct Membership {
-    inner: RwLock<HashMap<NodeId, NodeInfo>>,
+    inner: RwLock<HashMap<NodeId, Member>>,
 }
 
 impl Default for Membership {
@@ -44,9 +55,22 @@ impl Membership {
         }
     }
 
-    /// Register or update a node.
+    /// Register or update a node, keeping any zone it reported earlier.
     pub fn register(&self, info: NodeInfo) {
-        self.inner.write().unwrap().insert(info.id.clone(), info);
+        let mut g = self.inner.write().unwrap();
+        let zone = g.get(&info.id).and_then(|m| m.zone.clone());
+        g.insert(info.id.clone(), Member { info, zone });
+    }
+
+    /// Register or update a node together with its reported zone (ADR 0006).
+    ///
+    /// One write, so no reader can observe the node without its zone; `None`
+    /// clears a previously reported zone.
+    pub fn register_zoned(&self, info: NodeInfo, zone: Option<String>) {
+        self.inner
+            .write()
+            .unwrap()
+            .insert(info.id.clone(), Member { info, zone });
     }
 
     /// Remove a node.
@@ -56,7 +80,22 @@ impl Membership {
 
     /// Return a snapshot of all currently known nodes.
     pub fn snapshot(&self) -> Vec<NodeInfo> {
-        self.inner.read().unwrap().values().cloned().collect()
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .map(|m| m.info.clone())
+            .collect()
+    }
+
+    /// Return all known nodes paired with their reported zones (ADR 0006).
+    pub fn snapshot_zoned(&self) -> Vec<(NodeInfo, Option<String>)> {
+        self.inner
+            .read()
+            .unwrap()
+            .values()
+            .map(|m| (m.info.clone(), m.zone.clone()))
+            .collect()
     }
 
     /// The current placement version, derived from the node set.
@@ -64,24 +103,53 @@ impl Membership {
     /// Deterministic across coordinators: any process holding the same
     /// membership computes the same value (see [`Epoch::for_nodes`]).
     pub fn epoch(&self) -> Epoch {
-        let nodes: Vec<NodeInfo> = self.inner.read().unwrap().values().cloned().collect();
+        let nodes: Vec<NodeInfo> = self
+            .inner
+            .read()
+            .unwrap()
+            .values()
+            .map(|m| m.info.clone())
+            .collect();
         Epoch::for_nodes(&nodes)
     }
 
-    /// Replace the node set with `desired`.
+    /// Replace the node set with `desired`, keeping reported zones for nodes
+    /// that survive.
     ///
     /// This is the reconcile step a [`MembershipSource`] poll feeds into:
     /// additions, removals, and address/role changes are all applied
-    /// atomically. Returns `true` if the set changed.
+    /// atomically. Returns `true` if the node set changed.
     pub fn reconcile(&self, desired: Vec<NodeInfo>) -> bool {
-        let desired: HashMap<NodeId, NodeInfo> =
-            desired.into_iter().map(|n| (n.id.clone(), n)).collect();
         let mut g = self.inner.write().unwrap();
-        if *g == desired {
-            return false;
-        }
-        *g = desired;
-        true
+        let desired = desired
+            .into_iter()
+            .map(|info| {
+                let zone = g.get(&info.id).and_then(|m| m.zone.clone());
+                (info, zone)
+            })
+            .collect();
+        Self::apply(&mut g, desired)
+    }
+
+    /// [`reconcile`](Self::reconcile) with the zones reported per node; zones
+    /// are replaced wholesale even when the node set is unchanged.
+    pub fn reconcile_zoned(&self, desired: Vec<(NodeInfo, Option<String>)>) -> bool {
+        Self::apply(&mut self.inner.write().unwrap(), desired)
+    }
+
+    /// Swap in the desired members; the returned change flag tracks the
+    /// [`NodeInfo`] projection only, mirroring what [`Membership::epoch`]
+    /// derives the placement version from.
+    fn apply(g: &mut HashMap<NodeId, Member>, desired: Vec<(NodeInfo, Option<String>)>) -> bool {
+        let changed = g.len() != desired.len()
+            || desired
+                .iter()
+                .any(|(info, _)| g.get(&info.id).map(|m| &m.info) != Some(info));
+        *g = desired
+            .into_iter()
+            .map(|(info, zone)| (info.id.clone(), Member { info, zone }))
+            .collect();
+        changed
     }
 }
 
@@ -274,6 +342,109 @@ mod tests {
         let ids: Vec<String> = m.snapshot().into_iter().map(|n| n.id.0).collect();
         assert_eq!(ids, vec!["w2".to_string()]);
         assert_ne!(m.epoch(), v1);
+    }
+
+    #[test]
+    fn zones_ride_the_member_record() {
+        let m = Membership::new();
+        m.register_zoned(worker("a", "1"), Some("us-east-1a".into()));
+        m.register_zoned(worker("b", "2"), None);
+        let mut zoned = m.snapshot_zoned();
+        zoned.sort_by(|(x, _), (y, _)| x.id.0.cmp(&y.id.0));
+        assert_eq!(zoned[0].1.as_deref(), Some("us-east-1a"));
+        assert_eq!(zoned[1].1, None);
+
+        // A zone-less re-register (legacy path) keeps the reported zone; an
+        // explicit `None` from the zoned path clears it.
+        m.register(worker("a", "1"));
+        assert!(m
+            .snapshot_zoned()
+            .iter()
+            .any(|(n, z)| n.id.0 == "a" && z.as_deref() == Some("us-east-1a")));
+        m.register_zoned(worker("a", "1"), None);
+        assert!(m
+            .snapshot_zoned()
+            .iter()
+            .any(|(n, z)| n.id.0 == "a" && z.is_none()));
+    }
+
+    #[test]
+    fn reconcile_keeps_zones_for_survivors_and_prunes_the_rest() {
+        let m = Membership::new();
+        m.register_zoned(worker("a", "1"), Some("z1".into()));
+        m.register_zoned(worker("b", "2"), Some("z2".into()));
+
+        // Zone-less reconcile (K8s source path): survivor keeps its zone,
+        // the removed node's zone leaves with it.
+        assert!(m.reconcile(vec![worker("a", "1"), worker("c", "3")]));
+        let mut zoned = m.snapshot_zoned();
+        zoned.sort_by(|(x, _), (y, _)| x.id.0.cmp(&y.id.0));
+        assert_eq!(zoned.len(), 2);
+        assert_eq!(zoned[0].1.as_deref(), Some("z1"));
+        assert_eq!(zoned[1].1, None);
+
+        // Zone changing with an identical node set: epoch and the change flag
+        // stay put (placement is a function of nodes alone), but the zones
+        // are replaced wholesale.
+        let before = m.epoch();
+        assert!(!m.reconcile_zoned(vec![
+            (worker("a", "1"), Some("z9".into())),
+            (worker("c", "3"), Some("z3".into())),
+        ]));
+        assert_eq!(m.epoch(), before);
+        let mut zoned = m.snapshot_zoned();
+        zoned.sort_by(|(x, _), (y, _)| x.id.0.cmp(&y.id.0));
+        assert_eq!(zoned[0].1.as_deref(), Some("z9"));
+        assert_eq!(zoned[1].1.as_deref(), Some("z3"));
+    }
+
+    #[test]
+    fn concurrent_reconcile_and_zoned_snapshot_never_wedge() {
+        // Regression for an ABBA deadlock: zones once lived behind their own
+        // lock, so `snapshot_zoned` (zones -> inner) racing `reconcile_zoned`
+        // (inner -> zones) could wedge every membership operation. The
+        // single-lock `Member` layout makes the inversion impossible; this
+        // hammers both paths from two threads and fails by timeout instead
+        // of hanging CI if the maps are ever split again.
+        use std::sync::mpsc;
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        let m = Arc::new(Membership::new());
+        let writer = {
+            let m = Arc::clone(&m);
+            std::thread::spawn(move || {
+                for i in 0..10_000u32 {
+                    let zone = if i % 2 == 0 { "z1" } else { "z2" };
+                    m.reconcile_zoned(vec![
+                        (worker("a", "1"), Some(zone.to_string())),
+                        (worker("b", "2"), None),
+                    ]);
+                }
+            })
+        };
+        let reader = {
+            let m = Arc::clone(&m);
+            std::thread::spawn(move || {
+                for _ in 0..10_000u32 {
+                    let _ = m.snapshot_zoned();
+                    let _ = m.epoch();
+                }
+            })
+        };
+
+        // Join through a channel so a wedge fails the test cleanly after the
+        // timeout (the leaked threads die with the test process) instead of
+        // hanging the run forever.
+        let (done_tx, done_rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = writer.join();
+            let _ = reader.join();
+            let _ = done_tx.send(());
+        });
+        done_rx.recv_timeout(Duration::from_secs(30)).expect(
+            "membership wedged: concurrent reconcile_zoned and snapshot_zoned never finished",
+        );
     }
 
     #[test]
