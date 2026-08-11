@@ -12,7 +12,7 @@ mod conformance;
 
 use std::sync::Arc;
 
-use talon_backend::{ReqwestClient, S3Backend, S3Config, S3Credentials};
+use talon_backend::{endpoint_host, ReqwestClient, S3Backend, S3Config, S3Credentials};
 use talon_core::{Backend, ObjectId};
 
 fn env(name: &str) -> Option<String> {
@@ -32,12 +32,7 @@ async fn s3_backend_conformance_end_to_end() {
     let secret_access_key =
         env("AWS_SECRET_ACCESS_KEY").expect("AWS_SECRET_ACCESS_KEY must be set");
 
-    let host = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(&endpoint)
-        .to_string();
-    let tls = !endpoint.starts_with("http://");
+    let (host, tls) = endpoint_host(&endpoint);
     let config = S3Config {
         region,
         endpoint: host,

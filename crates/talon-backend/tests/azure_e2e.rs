@@ -12,7 +12,7 @@ mod conformance;
 
 use std::sync::Arc;
 
-use talon_backend::{AzureBackend, AzureConfig, ReqwestClient};
+use talon_backend::{endpoint_host, AzureBackend, AzureConfig, ReqwestClient};
 use talon_core::{Backend, ObjectId};
 
 const DEV_ACCOUNT: &str = "devstoreaccount1";
@@ -33,12 +33,7 @@ async fn azure_backend_conformance_end_to_end() {
         env("TALON_AZURE_TEST_CONTAINER").expect("TALON_AZURE_TEST_CONTAINER must be set");
     let key = env("TALON_AZURE_TEST_KEY").unwrap_or_else(|| "e2e/object.bin".to_string());
 
-    let host = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(&endpoint)
-        .to_string();
-    let tls = !endpoint.starts_with("http://");
+    let (host, tls) = endpoint_host(&endpoint);
     let config = AzureConfig::emulator(DEV_ACCOUNT, host, tls);
     let backend = Arc::new(AzureBackend::with_shared_key(
         config,

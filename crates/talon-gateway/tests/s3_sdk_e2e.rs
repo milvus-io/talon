@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use talon_backend::{ReqwestClient, S3Backend, S3Config, S3Credentials};
+use talon_backend::{endpoint_host, ReqwestClient, S3Backend, S3Config, S3Credentials};
 use talon_cache_client::CacheReadError;
 use talon_core::{ObjectId, Version};
 use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache, S3CacheRequest};
@@ -114,20 +114,6 @@ impl S3Cache for ReadThroughCache {
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn endpoint_host(endpoint: &str) -> (String, bool) {
-    if let Some(host) = endpoint.strip_prefix("http://") {
-        (host.to_string(), false)
-    } else {
-        (
-            endpoint
-                .strip_prefix("https://")
-                .unwrap_or(endpoint)
-                .to_string(),
-            true,
-        )
-    }
 }
 
 #[tokio::test]

@@ -7,8 +7,9 @@ use std::sync::Arc;
 
 use serde::Deserialize;
 use talon_backend::{
-    resolve_azure_bearer, resolve_s3_credentials, AzureBackend, AzureConfig, CredentialsObserver,
-    ProvideBearerToken, ProvideS3Credentials, ReqwestClient, S3Backend, S3Config, S3Credentials,
+    endpoint_host, resolve_azure_bearer, resolve_s3_credentials, AzureBackend, AzureConfig,
+    CredentialsObserver, ProvideBearerToken, ProvideS3Credentials, ReqwestClient, S3Backend,
+    S3Config, S3Credentials,
 };
 use talon_cache_client::{
     BlockReader, CoordinatorClient, PlacementCache, ZoneMatch, ZoneReadObserver,
@@ -375,20 +376,6 @@ fn parse_bool(value: Option<&str>, default: bool, name: &str) -> MainResult<bool
     }
 }
 
-fn split_endpoint(endpoint: &str) -> (String, bool) {
-    if let Some(host) = endpoint.strip_prefix("http://") {
-        (host.to_string(), false)
-    } else {
-        (
-            endpoint
-                .strip_prefix("https://")
-                .unwrap_or(endpoint)
-                .to_string(),
-            true,
-        )
-    }
-}
-
 /// Bridges zone-classified cache reads into the gateway registry.
 struct ZoneReadMetrics(GatewayMetrics);
 
@@ -462,7 +449,7 @@ fn azure_adapter(
         .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
     let mut origin_config = match settings.azure_endpoint.as_deref() {
         Some(endpoint) => {
-            let (host, tls) = split_endpoint(endpoint);
+            let (host, tls) = endpoint_host(endpoint);
             AzureConfig::emulator(&account, host, tls)
         }
         None => AzureConfig::new(&account),
@@ -537,7 +524,7 @@ fn s3_adapter(
         .unwrap_or_else(|| "us-east-1".to_string());
     let origin_config = match settings.s3_endpoint.as_deref() {
         Some(endpoint) => {
-            let (host, tls) = split_endpoint(endpoint);
+            let (host, tls) = endpoint_host(endpoint);
             S3Config {
                 region: region.clone(),
                 endpoint: host,
@@ -1181,19 +1168,6 @@ mod tests {
             ("TALON_GATEWAY_AUTHORIZATION_PATH", "/policy.json"),
         ])
         .is_err());
-    }
-
-    #[test]
-    fn endpoint_scheme_selects_transport_without_retaining_the_scheme() {
-        assert_eq!(
-            split_endpoint("http://minio:9000"),
-            ("minio:9000".into(), false)
-        );
-        assert_eq!(
-            split_endpoint("https://blob.example"),
-            ("blob.example".into(), true)
-        );
-        assert_eq!(split_endpoint("s3.example"), ("s3.example".into(), true));
     }
 
     fn test_cache(settings: &Settings) -> Arc<BlockReader> {

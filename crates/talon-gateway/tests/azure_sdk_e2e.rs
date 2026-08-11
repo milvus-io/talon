@@ -10,7 +10,7 @@ use std::sync::{Arc, Mutex};
 
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
-use talon_backend::{AzureBackend, AzureConfig, ReqwestClient};
+use talon_backend::{endpoint_host, AzureBackend, AzureConfig, ReqwestClient};
 use talon_cache_client::CacheReadError;
 use talon_core::{ObjectId, Version};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache, AzureCacheRequest};
@@ -122,20 +122,6 @@ impl AzureCache for ReadThroughCache {
 
 fn env(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn endpoint_host(endpoint: &str) -> (String, bool) {
-    if let Some(host) = endpoint.strip_prefix("http://") {
-        (host.to_string(), false)
-    } else {
-        (
-            endpoint
-                .strip_prefix("https://")
-                .unwrap_or(endpoint)
-                .to_string(),
-            true,
-        )
-    }
 }
 
 #[tokio::test]

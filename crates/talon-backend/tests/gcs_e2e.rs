@@ -11,7 +11,7 @@ mod conformance;
 
 use std::sync::Arc;
 
-use talon_backend::{GcsBackend, GcsConfig, ReqwestClient};
+use talon_backend::{endpoint_host, GcsBackend, GcsConfig, ReqwestClient};
 use talon_core::{Backend, ObjectId};
 
 fn env(name: &str) -> Option<String> {
@@ -27,12 +27,7 @@ async fn gcs_backend_conformance_end_to_end() {
     let bucket = env("TALON_GCS_TEST_BUCKET").expect("TALON_GCS_TEST_BUCKET must be set");
     let key = env("TALON_GCS_TEST_KEY").unwrap_or_else(|| "e2e/object.bin".to_string());
 
-    let host = endpoint
-        .strip_prefix("http://")
-        .or_else(|| endpoint.strip_prefix("https://"))
-        .unwrap_or(&endpoint)
-        .to_string();
-    let tls = !endpoint.starts_with("http://");
+    let (host, tls) = endpoint_host(&endpoint);
     let config = GcsConfig::emulator(host, tls);
     let backend = Arc::new(GcsBackend::new(
         config,
