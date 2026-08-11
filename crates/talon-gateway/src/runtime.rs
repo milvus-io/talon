@@ -406,7 +406,7 @@ async fn adapter_handler(
         runtime.metrics.record_authentication("success");
     }
     let policy = runtime.authorization.read().unwrap().clone();
-    if let Some(policy) = policy {
+    if let Some(policy) = &policy {
         let access = match runtime.adapter.access(&request, &context) {
             Ok(access) => access,
             Err(result) => return record_adapter_result(&runtime, protocol, &context, *result),
@@ -449,6 +449,11 @@ async fn adapter_handler(
             "allow",
             "policy_allowed",
         ));
+    }
+    // Handlers that authorize body-named objects (S3 DeleteObjects) re-check
+    // each object against the same per-request policy snapshot.
+    if let Some(policy) = policy {
+        request.extensions_mut().insert(policy);
     }
     if let Some(principal) = authenticated {
         request.extensions_mut().insert(principal);

@@ -138,19 +138,38 @@ fn allows_requirement(
         })
 }
 
-fn target_parts(target: &GatewayTarget) -> (Backend, &str, Option<&str>) {
+fn target_parts(target: &GatewayTarget) -> (Backend, &str, RequestedPrefix<'_>) {
     match target {
         GatewayTarget::Object(object) => (
             object.backend,
             object.bucket.as_str(),
-            Some(object.object_path.as_str()),
+            RequestedPrefix::Exact(Some(object.object_path.as_str())),
         ),
         GatewayTarget::Namespace {
             backend,
             namespace,
             prefix,
-        } => (*backend, namespace.as_str(), prefix.as_deref()),
+        } => (
+            *backend,
+            namespace.as_str(),
+            RequestedPrefix::Exact(prefix.as_deref()),
+        ),
+        GatewayTarget::NamespaceBodyObjects { backend, namespace } => {
+            (*backend, namespace.as_str(), RequestedPrefix::Any)
+        }
     }
+}
+
+/// The prefix scope a request asks for.
+#[derive(Clone, Copy)]
+enum RequestedPrefix<'a> {
+    /// The request names this exact object path or listing prefix.
+    Exact(Option<&'a str>),
+    /// The request names its objects in the body, so any grant prefix on the
+    /// namespace passes this coarse check. The adapter is responsible for the
+    /// exact per-object checks once the body is read; this variant must never
+    /// be used for an operation the adapter does not re-check.
+    Any,
 }
 
 fn protocol_backend(protocol: ProviderProtocol) -> Backend {
@@ -160,11 +179,12 @@ fn protocol_backend(protocol: ProviderProtocol) -> Backend {
     }
 }
 
-fn prefix_contains(grant: Option<&str>, requested: Option<&str>) -> bool {
+fn prefix_contains(grant: Option<&str>, requested: RequestedPrefix<'_>) -> bool {
     match (grant, requested) {
-        (None, _) => true,
-        (Some(_), None) => false,
-        (Some(grant), Some(requested)) => requested.starts_with(grant),
+        (_, RequestedPrefix::Any) => true,
+        (None, RequestedPrefix::Exact(_)) => true,
+        (Some(_), RequestedPrefix::Exact(None)) => false,
+        (Some(grant), RequestedPrefix::Exact(Some(requested))) => requested.starts_with(grant),
     }
 }
 
@@ -355,6 +375,49 @@ mod tests {
             &list_access(Some("tenant/nested"))
         ));
         assert!(!policy.allows(&principal, ProviderProtocol::S3, &list_access(None)));
+    }
+
+    #[test]
+    fn body_object_namespaces_accept_any_prefixed_grant_for_the_operation() {
+        let policy = AuthorizationPolicy::new(vec![AuthorizationGrant {
+            operations: vec![GatewayOperation::Delete],
+            id: "deleter".into(),
+            ..grant(Some("tenant/"))
+        }])
+        .unwrap();
+        let principal = AuthenticatedPrincipal::new("principal-a", "account-a");
+        let batch = |namespace: &str, operation| GatewayAccess {
+            operation,
+            provider_account: None,
+            target: GatewayTarget::NamespaceBodyObjects {
+                backend: Backend::S3,
+                namespace: namespace.into(),
+            },
+            additional: Vec::new(),
+        };
+        assert!(
+            policy.allows(
+                &principal,
+                ProviderProtocol::S3,
+                &batch("bucket-a", GatewayOperation::Delete)
+            ),
+            "a prefixed delete grant passes the coarse body-objects check"
+        );
+        assert!(!policy.allows(
+            &principal,
+            ProviderProtocol::S3,
+            &batch("bucket-b", GatewayOperation::Delete)
+        ));
+        assert!(!policy.allows(
+            &principal,
+            ProviderProtocol::S3,
+            &batch("bucket-a", GatewayOperation::List)
+        ));
+        assert!(!policy.allows(
+            &AuthenticatedPrincipal::new("principal-b", "account-a"),
+            ProviderProtocol::S3,
+            &batch("bucket-a", GatewayOperation::Delete)
+        ));
     }
 
     #[test]

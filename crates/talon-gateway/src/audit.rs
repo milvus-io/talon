@@ -114,6 +114,11 @@ fn hash_requirement(
             update_hash(hash, namespace);
             update_hash(hash, prefix.as_deref().unwrap_or(""));
         }
+        GatewayTarget::NamespaceBodyObjects { backend, namespace } => {
+            update_hash(hash, backend.prefix());
+            update_hash(hash, namespace);
+            update_hash(hash, "*");
+        }
     }
 }
 

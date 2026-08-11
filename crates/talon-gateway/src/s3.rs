@@ -22,7 +22,7 @@ use talon_core::{Backend, ObjectId, Version};
 use tokio::io::AsyncWriteExt;
 
 use crate::{
-    AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess,
+    AuthenticatedPrincipal, AuthorizationPolicy, EffectiveDecision, FailureReason, GatewayAccess,
     GatewayAccessRequirement, GatewayAdapter, GatewayOperation, GatewayOutcome,
     GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
     S3_CACHE_MARK_HEADER,
@@ -231,6 +231,15 @@ pub trait S3Origin: Send + Sync + 'static {
         Err("S3 origin does not implement DELETE".into())
     }
 
+    async fn delete_objects(
+        &self,
+        _bucket: &str,
+        _headers: &[(String, String)],
+        _body: Bytes,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement DeleteObjects".into())
+    }
+
     async fn multipart(&self, _request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
         Err("S3 origin does not implement multipart requests".into())
     }
@@ -404,6 +413,15 @@ impl S3Origin for S3Backend {
         conditions: &[(String, String)],
     ) -> Result<HttpResponse, String> {
         self.execute_delete_raw(object, conditions).await
+    }
+
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        headers: &[(String, String)],
+        body: Bytes,
+    ) -> Result<HttpResponse, String> {
+        self.execute_delete_objects_raw(bucket, headers, body).await
     }
 
     async fn multipart(&self, request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
@@ -640,6 +658,7 @@ fn require_v1_list_shape(query: &S3Query) -> Result<(), S3RequestError> {
         || query.part_number.is_some()
         || query.part_number_marker.is_some()
         || query.max_parts.is_some()
+        || query.delete.is_some()
         || query.unknown.is_some()
     {
         return Err(S3RequestError::invalid(
@@ -648,6 +667,250 @@ fn require_v1_list_shape(query: &S3Query) -> Result<(), S3RequestError> {
         ));
     }
     Ok(())
+}
+
+/// A bucket-level `POST` is a DeleteObjects request only when its query is
+/// exactly the bare `delete` sub-resource. Any other parameter names a
+/// different operation, so the combination is rejected rather than guessed.
+fn require_delete_objects_shape(query: &S3Query) -> Result<(), S3RequestError> {
+    let bare_delete = query.delete.as_deref() == Some("")
+        && query.list_type.is_none()
+        && query.prefix.is_none()
+        && query.delimiter.is_none()
+        && query.continuation_token.is_none()
+        && query.max_keys.is_none()
+        && query.encoding_type.is_none()
+        && query.uploads.is_none()
+        && query.upload_id.is_none()
+        && query.part_number.is_none()
+        && query.part_number_marker.is_none()
+        && query.max_parts.is_none()
+        && query.location.is_none()
+        && query.marker.is_none()
+        && query.unknown.is_none();
+    if !bare_delete {
+        return Err(S3RequestError::invalid(
+            "InvalidRequest",
+            "invalid DeleteObjects request",
+        ));
+    }
+    Ok(())
+}
+
+/// The S3 DeleteObjects limit on objects per request.
+const MAX_DELETE_OBJECTS_KEYS: usize = 1000;
+
+fn malformed_delete_xml(message: &'static str) -> S3RequestError {
+    S3RequestError::invalid("MalformedXML", message)
+}
+
+/// Parse a DeleteObjects `<Delete>` document into its object keys.
+///
+/// The gateway authorizes exactly the keys it parses and then forwards the
+/// body unchanged, so any construct this parser and the origin's XML parser
+/// could interpret differently — doctypes, comments, CDATA, processing
+/// instructions, unknown elements, unresolved entities — fails closed
+/// instead of being skipped.
+fn parse_delete_objects(body: &[u8]) -> Result<Vec<String>, S3RequestError> {
+    let text = std::str::from_utf8(body)
+        .map_err(|_| malformed_delete_xml("the request body is not valid UTF-8"))?;
+    let mut input = skip_xml_whitespace(text.trim_start_matches('\u{feff}'));
+    if let Some(rest) = input.strip_prefix("<?xml") {
+        let end = rest
+            .find("?>")
+            .ok_or_else(|| malformed_delete_xml("unterminated XML declaration"))?;
+        input = skip_xml_whitespace(&rest[end + 2..]);
+    }
+    let mut rest = expect_open_tag(input, "Delete")?;
+    let mut keys = Vec::new();
+    loop {
+        rest = skip_xml_whitespace(rest);
+        if let Some(after) = rest.strip_prefix("</Delete>") {
+            if !skip_xml_whitespace(after).is_empty() {
+                return Err(malformed_delete_xml("content after the Delete element"));
+            }
+            break;
+        }
+        if peek_open_tag(rest, "Object") {
+            let (key, after) = parse_delete_object_entry(rest)?;
+            if keys.len() == MAX_DELETE_OBJECTS_KEYS {
+                return Err(malformed_delete_xml(
+                    "DeleteObjects accepts at most 1000 objects",
+                ));
+            }
+            keys.push(key);
+            rest = after;
+        } else if peek_open_tag(rest, "Quiet") {
+            let (value, after) = parse_text_element(rest, "Quiet")?;
+            if value != "true" && value != "false" {
+                return Err(malformed_delete_xml("Quiet must be true or false"));
+            }
+            rest = after;
+        } else {
+            return Err(malformed_delete_xml("unsupported content in Delete"));
+        }
+    }
+    if keys.is_empty() {
+        return Err(malformed_delete_xml("Delete names no objects"));
+    }
+    Ok(keys)
+}
+
+fn parse_delete_object_entry(input: &str) -> Result<(String, &str), S3RequestError> {
+    let mut rest = expect_open_tag(input, "Object")?;
+    let mut key = None;
+    loop {
+        rest = skip_xml_whitespace(rest);
+        if let Some(after) = rest.strip_prefix("</Object>") {
+            let key = key.ok_or_else(|| malformed_delete_xml("Object names no Key"))?;
+            return Ok((key, after));
+        }
+        if peek_open_tag(rest, "Key") {
+            if key.is_some() {
+                return Err(malformed_delete_xml("Object names more than one Key"));
+            }
+            let (value, after) = parse_text_element(rest, "Key")?;
+            if value.is_empty() {
+                return Err(malformed_delete_xml("Object names an empty Key"));
+            }
+            if value.len() > 1024 {
+                return Err(S3RequestError::invalid(
+                    "KeyTooLongError",
+                    "the object key is longer than 1024 bytes",
+                ));
+            }
+            key = Some(value);
+            rest = after;
+        } else if peek_open_tag(rest, "VersionId")
+            || peek_open_tag(rest, "ETag")
+            || peek_open_tag(rest, "LastModifiedTime")
+            || peek_open_tag(rest, "Size")
+        {
+            return Err(S3RequestError::invalid(
+                "NotImplemented",
+                "versioned or conditional DeleteObjects entries are not supported",
+            ));
+        } else {
+            return Err(malformed_delete_xml("unsupported content in Object"));
+        }
+    }
+}
+
+/// Consume `<tag ...attributes>` and return the remainder. Attribute values
+/// are tokenized with their quotes so a quoted `>` cannot truncate the tag,
+/// which would make this parser and the origin's disagree on the content.
+fn expect_open_tag<'a>(input: &'a str, tag: &str) -> Result<&'a str, S3RequestError> {
+    let rest = input
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_prefix(tag))
+        .ok_or_else(|| malformed_delete_xml("unexpected element"))?;
+    let bytes = rest.as_bytes();
+    match bytes.first() {
+        Some(b'>') => return Ok(&rest[1..]),
+        Some(byte) if byte.is_ascii_whitespace() => {}
+        _ => return Err(malformed_delete_xml("unexpected element")),
+    }
+    let mut index = 0;
+    loop {
+        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+            index += 1;
+        }
+        match bytes.get(index) {
+            None => return Err(malformed_delete_xml("unterminated tag")),
+            Some(b'>') => return Ok(&rest[index + 1..]),
+            Some(_) => {}
+        }
+        let name_start = index;
+        while index < bytes.len()
+            && bytes[index] != b'='
+            && bytes[index] != b'>'
+            && !bytes[index].is_ascii_whitespace()
+        {
+            index += 1;
+        }
+        if index == name_start || bytes.get(index) != Some(&b'=') {
+            return Err(malformed_delete_xml("malformed attribute"));
+        }
+        index += 1;
+        let quote = match bytes.get(index) {
+            Some(quote @ (b'"' | b'\'')) => *quote,
+            _ => return Err(malformed_delete_xml("malformed attribute")),
+        };
+        index += 1;
+        while index < bytes.len() && bytes[index] != quote {
+            index += 1;
+        }
+        if index >= bytes.len() {
+            return Err(malformed_delete_xml("malformed attribute"));
+        }
+        index += 1;
+    }
+}
+
+fn peek_open_tag(input: &str, tag: &str) -> bool {
+    input
+        .strip_prefix('<')
+        .and_then(|rest| rest.strip_prefix(tag))
+        .is_some_and(|rest| {
+            rest.starts_with('>') || rest.starts_with(|c: char| c.is_ascii_whitespace())
+        })
+}
+
+fn parse_text_element<'a>(input: &'a str, tag: &str) -> Result<(String, &'a str), S3RequestError> {
+    let rest = expect_open_tag(input, tag)?;
+    let end = rest
+        .find('<')
+        .ok_or_else(|| malformed_delete_xml("unterminated element"))?;
+    let text = &rest[..end];
+    let close = format!("</{tag}>");
+    let rest = rest[end..]
+        .strip_prefix(close.as_str())
+        .ok_or_else(|| malformed_delete_xml("unexpected markup inside an element"))?;
+    Ok((unescape_strict(text)?, rest))
+}
+
+/// Decode XML character data accepting only the five predefined entities and
+/// well-formed numeric character references. Anything else fails closed so
+/// the key text the gateway authorizes can never differ from the origin's
+/// decoding of the same body.
+fn unescape_strict(text: &str) -> Result<String, S3RequestError> {
+    let mut output = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find('&') {
+        output.push_str(&rest[..index]);
+        rest = &rest[index + 1..];
+        let end = rest
+            .find(';')
+            .ok_or_else(|| malformed_delete_xml("unterminated character reference"))?;
+        let entity = &rest[..end];
+        rest = &rest[end + 1..];
+        match entity {
+            "amp" => output.push('&'),
+            "lt" => output.push('<'),
+            "gt" => output.push('>'),
+            "quot" => output.push('"'),
+            "apos" => output.push('\''),
+            _ => {
+                let value = entity
+                    .strip_prefix("#x")
+                    .or_else(|| entity.strip_prefix("#X"))
+                    .map(|digits| u32::from_str_radix(digits, 16))
+                    .or_else(|| entity.strip_prefix('#').map(str::parse))
+                    .ok_or_else(|| malformed_delete_xml("unsupported character reference"))?
+                    .map_err(|_| malformed_delete_xml("unsupported character reference"))?;
+                let value = char::from_u32(value)
+                    .filter(|value| *value != '\0')
+                    .ok_or_else(|| malformed_delete_xml("unsupported character reference"))?;
+                output.push(value);
+            }
+        }
+    }
+    output.push_str(rest);
+    Ok(output)
+}
+
+fn skip_xml_whitespace(input: &str) -> &str {
+    input.trim_start_matches(|c: char| c.is_ascii_whitespace())
 }
 
 fn bucket_probe(
@@ -748,6 +1011,7 @@ struct S3Query {
     max_parts: Option<String>,
     location: Option<String>,
     marker: Option<String>,
+    delete: Option<String>,
     /// First query key outside the recognized set, kept so bucket-level
     /// requests can reject unknown sub-resources instead of approximating
     /// them with a listing.
@@ -785,6 +1049,7 @@ impl S3Query {
                     set_query_value(&mut parsed.location, value.into_owned(), "location")?
                 }
                 "marker" => set_query_value(&mut parsed.marker, value.into_owned(), "marker")?,
+                "delete" => set_query_value(&mut parsed.delete, value.into_owned(), "delete")?,
                 other => {
                     if parsed.unknown.is_none() {
                         parsed.unknown = Some(other.to_string());
@@ -1970,6 +2235,39 @@ where
     Ok((spool, format!("{:x}", hasher.finalize())))
 }
 
+/// Collect a small request body into memory, enforcing the declared
+/// Content-Length exactly. Used for bodies the gateway must parse before
+/// dispatch (DeleteObjects); the runtime body limit bounds them from above.
+async fn collect_body<S>(mut body: S, expected_len: u64) -> Result<Vec<u8>, S3RequestError>
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
+    let mut collected = Vec::new();
+    let mut received = 0u64;
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| {
+            S3RequestError::invalid("IncompleteBody", "The request body could not be read")
+        })?;
+        received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+            S3RequestError::invalid("InvalidArgument", "request body is too large")
+        })?;
+        if received > expected_len {
+            return Err(S3RequestError::invalid(
+                "InvalidArgument",
+                "request body exceeds Content-Length",
+            ));
+        }
+        collected.extend_from_slice(&chunk);
+    }
+    if received != expected_len {
+        return Err(S3RequestError::invalid(
+            "IncompleteBody",
+            "request body is shorter than Content-Length",
+        ));
+    }
+    Ok(collected)
+}
+
 #[async_trait]
 impl GatewayAdapter for S3Adapter {
     fn protocol(&self) -> ProviderProtocol {
@@ -2022,6 +2320,21 @@ impl S3Adapter {
                 additional: Vec::new(),
             });
         }
+        if request.method() == axum::http::Method::POST
+            && target.key.is_none()
+            && query.delete.is_some()
+        {
+            require_delete_objects_shape(&query)?;
+            return Ok(GatewayAccess {
+                operation: GatewayOperation::Delete,
+                provider_account: None,
+                target: GatewayTarget::NamespaceBodyObjects {
+                    backend: Backend::S3,
+                    namespace: target.bucket,
+                },
+                additional: Vec::new(),
+            });
+        }
         if request.method() == axum::http::Method::GET && target.key.is_none() {
             require_v1_list_shape(&query)?;
             return Ok(GatewayAccess {
@@ -2038,6 +2351,12 @@ impl S3Adapter {
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
+        if query.delete.is_some() {
+            return Err(S3RequestError::invalid(
+                "InvalidRequest",
+                "delete is a bucket-level sub-resource",
+            ));
+        }
         let multipart = query.multipart_operation(
             request.method(),
             request.headers().contains_key("x-amz-copy-source"),
@@ -2088,6 +2407,13 @@ impl S3Adapter {
             Some(BucketProbe::Location) => return Ok(self.bucket_location(target.bucket, context)),
             None => {}
         }
+        if request.method() == axum::http::Method::POST
+            && target.key.is_none()
+            && query.delete.is_some()
+        {
+            require_delete_objects_shape(&query)?;
+            return self.delete_objects(target.bucket, request, context).await;
+        }
         if request.method() == axum::http::Method::GET && target.key.is_none() {
             require_v1_list_shape(&query)?;
             return self.list_v1(target.bucket, query, context).await;
@@ -2095,6 +2421,12 @@ impl S3Adapter {
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
+        if query.delete.is_some() {
+            return Err(S3RequestError::invalid(
+                "InvalidRequest",
+                "delete is a bucket-level sub-resource",
+            ));
+        }
         let object = ObjectId::new(Backend::S3, target.bucket, key);
         if let Some(operation) = query.multipart_operation(
             request.method(),
@@ -2558,6 +2890,83 @@ impl S3Adapter {
             Some(GatewayTarget::Object(object)),
             context,
         ))
+    }
+
+    /// Batch DeleteObjects. The XML body is parsed so every named key is
+    /// authorized against the per-request policy snapshot before dispatch,
+    /// then the body passes through unchanged so client checksums stay
+    /// valid; a confirmed origin outcome invalidates every requested key
+    /// because quiet-mode responses omit the per-key results.
+    async fn delete_objects(
+        &self,
+        bucket: String,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        let policy = request.extensions().get::<AuthorizationPolicy>().cloned();
+        let principal = request
+            .extensions()
+            .get::<AuthenticatedPrincipal>()
+            .cloned();
+        let len = single_content_length(request.headers())?;
+        let payload_hash = payload_declaration(&request)?;
+        let headers = mutation_headers(request.headers(), false)?;
+        let body = collect_body(request.into_body().into_data_stream(), len).await?;
+        if payload_hash != "UNSIGNED-PAYLOAD" {
+            let actual_hash = format!("{:x}", Sha256::digest(&body));
+            if actual_hash != payload_hash {
+                return Err(S3RequestError::invalid(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided payload hash does not match the request body",
+                ));
+            }
+        }
+        let keys = parse_delete_objects(&body)?;
+        if let Some(policy) = policy {
+            let Some(principal) = principal else {
+                return Err(S3RequestError::access_denied());
+            };
+            for key in &keys {
+                let access = GatewayAccess {
+                    operation: GatewayOperation::Delete,
+                    provider_account: None,
+                    target: GatewayTarget::Object(ObjectId::new(
+                        Backend::S3,
+                        bucket.clone(),
+                        key.clone(),
+                    )),
+                    additional: Vec::new(),
+                };
+                if !policy.allows(&principal, ProviderProtocol::S3, &access) {
+                    return Err(S3RequestError::access_denied());
+                }
+            }
+        }
+        let response = self
+            .origin
+            .delete_objects(&bucket, &headers, Bytes::from(body))
+            .await
+            .map_err(|_| S3RequestError::indeterminate_commit())?;
+        if response.is_success() || response.status == 404 {
+            for key in &keys {
+                let _ = self.cache.invalidate_object(&ObjectId::new(
+                    Backend::S3,
+                    bucket.clone(),
+                    key.clone(),
+                ));
+            }
+        }
+        let mut response = raw_response(
+            response,
+            GatewayOperation::Delete,
+            Some(GatewayTarget::NamespaceBodyObjects {
+                backend: Backend::S3,
+                namespace: bucket,
+            }),
+            context,
+        );
+        response.requested_bytes = len;
+        Ok(response)
     }
 
     async fn head(
@@ -3167,6 +3576,18 @@ mod tests {
             *self.headers.lock().unwrap() = conditions.to_vec();
             self.response()
         }
+
+        async fn delete_objects(
+            &self,
+            _bucket: &str,
+            headers: &[(String, String)],
+            body: Bytes,
+        ) -> Result<HttpResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.headers.lock().unwrap() = headers.to_vec();
+            *self.body.lock().unwrap() = body.to_vec();
+            self.response()
+        }
     }
 
     #[async_trait]
@@ -3603,6 +4024,7 @@ mod tests {
             ("/bucket?uploads=", "NotImplemented"),
             ("/bucket?versions", "NotImplemented"),
             ("/bucket?acl", "NotImplemented"),
+            ("/bucket?delete=", "NotImplemented"),
             ("/bucket?list-type=3", "InvalidArgument"),
         ] {
             let error = adapter
@@ -3610,6 +4032,398 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, code, "{uri} must not become a V1 listing");
         }
+    }
+
+    fn delete_objects_xml(keys: &[&str]) -> String {
+        let mut body = String::from("<Delete>");
+        for key in keys {
+            body.push_str("<Object><Key>");
+            body.push_str(key);
+            body.push_str("</Key></Object>");
+        }
+        body.push_str("</Delete>");
+        body
+    }
+
+    fn batch_delete_request(uri: &str, body: &str, headers: &[(&str, &str)]) -> Request {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, body.len().to_string());
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::from(body.to_string())).unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("multipart-user", "account-a"));
+        request
+    }
+
+    async fn expect_request_error(adapter: &S3Adapter, request: Request) -> S3RequestError {
+        match adapter.handle_request(request, &context()).await {
+            Ok(_) => panic!("the request must fail"),
+            Err(error) => error,
+        }
+    }
+
+    fn batch_delete_policy(prefix: Option<&str>) -> AuthorizationPolicy {
+        AuthorizationPolicy::new(vec![crate::AuthorizationGrant {
+            id: "batch-deleter".into(),
+            principal: "multipart-user".into(),
+            protocol: ProviderProtocol::S3,
+            provider_account: "account-a".into(),
+            namespace: "bucket".into(),
+            prefix: prefix.map(str::to_string),
+            operations: vec![GatewayOperation::Delete],
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    fn batch_delete_classifies_as_a_body_object_namespace_delete() {
+        let adapter = bucket_probe_adapter(BucketOrigin::new([]), "us-east-1");
+        for uri in ["/bucket?delete=", "/bucket?delete"] {
+            let access = adapter
+                .classify_access(&request(axum::http::Method::POST, uri))
+                .unwrap();
+            assert_eq!(access.operation, GatewayOperation::Delete);
+            assert_eq!(
+                access.target,
+                GatewayTarget::NamespaceBodyObjects {
+                    backend: Backend::S3,
+                    namespace: "bucket".into(),
+                }
+            );
+            assert!(access.additional.is_empty());
+        }
+        for (method, uri, code) in [
+            (
+                axum::http::Method::POST,
+                "/bucket?delete=1",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::POST,
+                "/bucket?delete=&uploads=",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::POST,
+                "/bucket?delete=&prefix=a/",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::POST,
+                "/bucket/key?delete=",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::DELETE,
+                "/bucket/key?delete=",
+                "InvalidRequest",
+            ),
+        ] {
+            let error = adapter.classify_access(&request(method, uri)).unwrap_err();
+            assert_eq!(error.code, code, "{uri} must not be reinterpreted");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_forwards_the_body_and_invalidates_every_key() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/xml".into())],
+            body: Bytes::from_static(
+                b"<DeleteResult><Deleted><Key>logs/a</Key></Deleted></DeleteResult>",
+            ),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let body = delete_objects_xml(&["logs/a", "logs/b"]);
+        let request = batch_delete_request(
+            "/bucket?delete=",
+            &body,
+            &[
+                ("content-md5", "3ZG9/9OGCkoTBd6aa5jXbg=="),
+                ("authorization", "AWS4-HMAC-SHA256 client-material"),
+            ],
+        );
+        let response = adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(response.operation, GatewayOperation::Delete);
+        assert_eq!(response.requested_bytes, body.len() as u64);
+        assert_eq!(*origin.body.lock().unwrap(), body.as_bytes());
+        let headers = origin.headers.lock().unwrap().clone();
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "content-md5" && value == "3ZG9/9OGCkoTBd6aa5jXbg=="),
+            "the client checksum travels with the unmodified body"
+        );
+        assert!(
+            headers.iter().all(|(name, _)| name != "authorization"),
+            "client credentials never reach the origin"
+        );
+        assert_eq!(
+            cache.invalidations.load(Ordering::SeqCst),
+            2,
+            "confirmed outcomes invalidate every requested key, not the \
+             response echo, because quiet mode omits it"
+        );
+        let bytes = to_bytes(response.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .contains("<DeleteResult>"));
+    }
+
+    #[tokio::test]
+    async fn batch_delete_authorizes_every_key_before_dispatch() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+
+        let body = delete_objects_xml(&["tenant/a", "other/b"]);
+        let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
+        request
+            .extensions_mut()
+            .insert(batch_delete_policy(Some("tenant/")));
+        let error = expect_request_error(&adapter, request).await;
+        assert_eq!(error.code, "AccessDenied");
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "one uncovered key rejects the whole batch before dispatch"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+
+        let body = delete_objects_xml(&["tenant/a", "tenant/b"]);
+        let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
+        request
+            .extensions_mut()
+            .insert(batch_delete_policy(Some("tenant/")));
+        adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 2);
+
+        let body = delete_objects_xml(&["tenant/a"]);
+        let mut request = Request::builder()
+            .method("POST")
+            .uri("/bucket?delete=")
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, body.len().to_string())
+            .body(Body::from(body))
+            .unwrap();
+        request.extensions_mut().insert(batch_delete_policy(None));
+        let error = expect_request_error(&adapter, request).await;
+        assert_eq!(
+            error.code, "AccessDenied",
+            "an installed policy without a principal fails closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_rejects_bodies_it_cannot_prove_it_understood() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let thousand_and_one = {
+            let mut body = String::from("<Delete>");
+            for index in 0..=MAX_DELETE_OBJECTS_KEYS {
+                body.push_str(&format!("<Object><Key>k{index}</Key></Object>"));
+            }
+            body.push_str("</Delete>");
+            body
+        };
+        for (body, code) in [
+            ("<Delete></Delete>", "MalformedXML"),
+            ("not xml", "MalformedXML"),
+            (
+                "<Delete><Object><Key>a</Key><VersionId>v1</VersionId></Object></Delete>",
+                "NotImplemented",
+            ),
+            (
+                "<!DOCTYPE d [<!ENTITY x \"y\">]><Delete><Object><Key>a</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><!-- hidden --><Object><Key>a</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Object><Key><![CDATA[a]]></Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Object><Key>a</Key></Object></Delete>trailing",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Object><Key>&unknown;</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Unknown/><Object><Key>a</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            ("<Delete><Object></Object></Delete>", "MalformedXML"),
+            (thousand_and_one.as_str(), "MalformedXML"),
+        ] {
+            let request = batch_delete_request("/bucket?delete=", body, &[]);
+            let error = expect_request_error(&adapter, request).await;
+            assert_eq!(error.code, code, "{body:.60} must fail closed");
+        }
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "no unparsable body may reach the origin"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_delete_verifies_a_declared_payload_hash() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let body = delete_objects_xml(&["logs/a"]);
+        let tampered = batch_delete_request(
+            "/bucket?delete=",
+            &body,
+            &[(
+                "x-amz-content-sha256",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )],
+        );
+        let error = expect_request_error(&adapter, tampered).await;
+        assert_eq!(error.code, "XAmzContentSHA256Mismatch");
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+
+        let declared = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let verified = batch_delete_request(
+            "/bucket?delete=",
+            &body,
+            &[("x-amz-content-sha256", declared.as_str())],
+        );
+        adapter.handle_request(verified, &context()).await.unwrap();
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_delete_failures_do_not_invalidate() {
+        let body = delete_objects_xml(&["logs/a", "logs/b"]);
+
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Err("connection reset".into()));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let request = batch_delete_request("/bucket?delete=", &body, &[]);
+        let error = expect_request_error(&adapter, request).await;
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.indeterminate_commit);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 400,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<Error><Code>MalformedXML</Code></Error>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let request = batch_delete_request("/bucket?delete=", &body, &[]);
+        let response = adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.outcome, GatewayOutcome::Failed);
+        assert_eq!(
+            cache.invalidations.load(Ordering::SeqCst),
+            0,
+            "an origin-rejected batch deleted nothing"
+        );
+
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 404,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<Error><Code>NoSuchBucket</Code></Error>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let request = batch_delete_request("/bucket?delete=", &body, &[]);
+        adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(
+            cache.invalidations.load(Ordering::SeqCst),
+            2,
+            "a missing bucket confirms every key is absent, like single DELETE"
+        );
+    }
+
+    #[test]
+    fn parse_delete_objects_is_strict_and_decodes_entities() {
+        let keys = parse_delete_objects(
+            concat!(
+                "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
+                "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
+                "  <Object><Key>plain/key.bin</Key></Object>\n",
+                "  <Object><Key>escaped/&amp;&lt;&gt;&quot;&apos;</Key></Object>\n",
+                "  <Object><Key>numeric/&#65;&#x42;&#xA;</Key></Object>\n",
+                "  <Quiet>true</Quiet>\n",
+                "</Delete>",
+            )
+            .as_bytes(),
+        )
+        .unwrap();
+        assert_eq!(
+            keys,
+            vec![
+                "plain/key.bin".to_string(),
+                "escaped/&<>\"'".to_string(),
+                "numeric/AB\n".to_string(),
+            ]
+        );
+        assert!(parse_delete_objects(
+            b"<Delete><Object><Key>a</Key></Object><Quiet>maybe</Quiet></Delete>"
+        )
+        .is_err());
+        let long_key = "k".repeat(1025);
+        let error =
+            parse_delete_objects(delete_objects_xml(&[long_key.as_str()]).as_bytes()).unwrap_err();
+        assert_eq!(error.code, "KeyTooLongError");
+        let error = parse_delete_objects(
+            b"<Delete><Object attr=\"a>b\"><Key>trick</Key></Object></Delete>",
+        )
+        .map(|keys| keys.join(","));
+        assert_eq!(
+            error.unwrap(),
+            "trick",
+            "quoted '>' inside attributes must not truncate tag parsing"
+        );
     }
 
     #[tokio::test]
