@@ -700,6 +700,14 @@ fn require_delete_objects_shape(query: &S3Query) -> Result<(), S3RequestError> {
 /// The S3 DeleteObjects limit on objects per request.
 const MAX_DELETE_OBJECTS_KEYS: usize = 1000;
 
+/// Ceiling on a DeleteObjects body, which is the one request body the gateway
+/// must hold in memory: it is parsed to authorize each key and then forwarded
+/// unchanged, so it can neither stream nor spool. The largest legitimate
+/// document — 1000 keys of 1024 bytes with every byte entity-escaped, plus
+/// framing — stays under this, while the limit keeps the path independent of
+/// the object-upload body cap an operator may raise for large writes.
+const MAX_DELETE_OBJECTS_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 fn malformed_delete_xml(message: &'static str) -> S3RequestError {
     S3RequestError::invalid("MalformedXML", message)
 }
@@ -741,9 +749,15 @@ fn parse_delete_objects(body: &[u8]) -> Result<Vec<String>, S3RequestError> {
             keys.push(key);
             rest = after;
         } else if peek_open_tag(rest, "Quiet") {
+            // The flag never changes which keys are authorized, so accept the
+            // whole `xs:boolean` lexical space that origin parsers accept
+            // rather than rejecting a batch the origin would have run.
             let (value, after) = parse_text_element(rest, "Quiet")?;
-            if value != "true" && value != "false" {
-                return Err(malformed_delete_xml("Quiet must be true or false"));
+            if !matches!(
+                value.trim_matches(is_xml_whitespace),
+                "true" | "false" | "1" | "0"
+            ) {
+                return Err(malformed_delete_xml("Quiet must be a boolean"));
             }
             rest = after;
         } else {
@@ -807,12 +821,12 @@ fn expect_open_tag<'a>(input: &'a str, tag: &str) -> Result<&'a str, S3RequestEr
     let bytes = rest.as_bytes();
     match bytes.first() {
         Some(b'>') => return Ok(&rest[1..]),
-        Some(byte) if byte.is_ascii_whitespace() => {}
+        Some(byte) if is_xml_whitespace_byte(*byte) => {}
         _ => return Err(malformed_delete_xml("unexpected element")),
     }
     let mut index = 0;
     loop {
-        while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        while index < bytes.len() && is_xml_whitespace_byte(bytes[index]) {
             index += 1;
         }
         match bytes.get(index) {
@@ -824,7 +838,7 @@ fn expect_open_tag<'a>(input: &'a str, tag: &str) -> Result<&'a str, S3RequestEr
         while index < bytes.len()
             && bytes[index] != b'='
             && bytes[index] != b'>'
-            && !bytes[index].is_ascii_whitespace()
+            && !is_xml_whitespace_byte(bytes[index])
         {
             index += 1;
         }
@@ -851,9 +865,7 @@ fn peek_open_tag(input: &str, tag: &str) -> bool {
     input
         .strip_prefix('<')
         .and_then(|rest| rest.strip_prefix(tag))
-        .is_some_and(|rest| {
-            rest.starts_with('>') || rest.starts_with(|c: char| c.is_ascii_whitespace())
-        })
+        .is_some_and(|rest| rest.starts_with('>') || rest.starts_with(is_xml_whitespace))
 }
 
 fn parse_text_element<'a>(input: &'a str, tag: &str) -> Result<(String, &'a str), S3RequestError> {
@@ -891,12 +903,30 @@ fn unescape_strict(text: &str) -> Result<String, S3RequestError> {
             "quot" => output.push('"'),
             "apos" => output.push('\''),
             _ => {
-                let value = entity
+                // Rust's integer parsers accept a leading `+`, which the XML
+                // `CharRef` production does not, so the digit run is checked
+                // before parsing rather than after.
+                let (digits, radix) = match entity
                     .strip_prefix("#x")
                     .or_else(|| entity.strip_prefix("#X"))
-                    .map(|digits| u32::from_str_radix(digits, 16))
-                    .or_else(|| entity.strip_prefix('#').map(str::parse))
-                    .ok_or_else(|| malformed_delete_xml("unsupported character reference"))?
+                {
+                    Some(digits) => (digits, 16),
+                    None => (
+                        entity.strip_prefix('#').ok_or_else(|| {
+                            malformed_delete_xml("unsupported character reference")
+                        })?,
+                        10,
+                    ),
+                };
+                let digits_are_valid = !digits.is_empty()
+                    && digits.bytes().all(|digit| match radix {
+                        16 => digit.is_ascii_hexdigit(),
+                        _ => digit.is_ascii_digit(),
+                    });
+                if !digits_are_valid {
+                    return Err(malformed_delete_xml("unsupported character reference"));
+                }
+                let value = u32::from_str_radix(digits, radix)
                     .map_err(|_| malformed_delete_xml("unsupported character reference"))?;
                 let value = char::from_u32(value)
                     .filter(|value| *value != '\0')
@@ -910,7 +940,18 @@ fn unescape_strict(text: &str) -> Result<String, S3RequestError> {
 }
 
 fn skip_xml_whitespace(input: &str) -> &str {
-    input.trim_start_matches(|c: char| c.is_ascii_whitespace())
+    input.trim_start_matches(is_xml_whitespace)
+}
+
+/// The XML 1.0 `S` production. Deliberately narrower than Rust's ASCII
+/// whitespace, which also covers form feed and vertical tab — characters an
+/// origin parser rejects outright rather than treating as separators.
+fn is_xml_whitespace(value: char) -> bool {
+    matches!(value, ' ' | '\t' | '\r' | '\n')
+}
+
+fn is_xml_whitespace_byte(value: u8) -> bool {
+    matches!(value, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 fn bucket_probe(
@@ -2909,6 +2950,12 @@ impl S3Adapter {
             .get::<AuthenticatedPrincipal>()
             .cloned();
         let len = single_content_length(request.headers())?;
+        if len > MAX_DELETE_OBJECTS_BODY_BYTES {
+            return Err(S3RequestError::invalid(
+                "MaxMessageLengthExceeded",
+                "the DeleteObjects request body is too large",
+            ));
+        }
         let payload_hash = payload_declaration(&request)?;
         let headers = mutation_headers(request.headers(), false)?;
         let body = collect_body(request.into_body().into_data_stream(), len).await?;
@@ -4424,6 +4471,155 @@ mod tests {
             "trick",
             "quoted '>' inside attributes must not truncate tag parsing"
         );
+    }
+
+    #[test]
+    fn parse_delete_objects_matches_origin_parsers_on_boundary_syntax() {
+        for quiet in ["true", "false", "1", "0", " true ", "\n\tfalse\r\n"] {
+            let body =
+                format!("<Delete><Object><Key>a</Key></Object><Quiet>{quiet}</Quiet></Delete>");
+            assert_eq!(
+                parse_delete_objects(body.as_bytes()).unwrap(),
+                vec!["a".to_string()],
+                "<Quiet>{quiet}</Quiet> is a boolean origin parsers accept"
+            );
+        }
+
+        // Rust's integer parsers accept a leading `+`; the XML CharRef
+        // production does not, so accepting one would decode a key the origin
+        // rejects outright.
+        for reference in ["&#+65;", "&#x+41;", "&#;", "&#x;", "&#xzz;", "&#4 1;"] {
+            let body = format!("<Delete><Object><Key>{reference}</Key></Object></Delete>");
+            let error = parse_delete_objects(body.as_bytes()).unwrap_err();
+            assert_eq!(
+                error.code, "MalformedXML",
+                "{reference} is not a well-formed character reference"
+            );
+        }
+        assert_eq!(
+            parse_delete_objects(b"<Delete><Object><Key>&#x0041;</Key></Object></Delete>").unwrap(),
+            vec!["A".to_string()],
+            "leading zeros stay legal inside a character reference"
+        );
+
+        // Form feed and vertical tab are ASCII whitespace but not XML
+        // whitespace: an origin parser rejects the document outright.
+        for illegal in ["\u{0c}", "\u{0b}"] {
+            let body = format!("<Delete>{illegal}<Object><Key>a</Key></Object></Delete>");
+            let error = parse_delete_objects(body.as_bytes()).unwrap_err();
+            assert_eq!(
+                error.code, "MalformedXML",
+                "{illegal:?} is not XML whitespace"
+            );
+            let tagged =
+                format!("<Delete><Object{illegal}attr=\"v\"><Key>a</Key></Object></Delete>");
+            assert_eq!(
+                parse_delete_objects(tagged.as_bytes()).unwrap_err().code,
+                "MalformedXML",
+                "{illegal:?} does not separate attributes either"
+            );
+        }
+        assert_eq!(
+            parse_delete_objects(b"<Delete>\r\n\t <Object>\r\n<Key>a</Key>\t</Object>\n</Delete>")
+                .unwrap(),
+            vec!["a".to_string()],
+            "the XML S production stays accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_bounds_the_body_it_must_buffer() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let body = delete_objects_xml(&["logs/a"]);
+
+        // The declared length alone rejects the request: the body is parsed to
+        // authorize each key and forwarded unchanged, so it cannot stream or
+        // spool, and this ceiling must not follow the object-upload cap.
+        let oversized = Request::builder()
+            .method("POST")
+            .uri("/bucket?delete=")
+            .header(header::HOST, "localhost")
+            .header(
+                header::CONTENT_LENGTH,
+                (MAX_DELETE_OBJECTS_BODY_BYTES + 1).to_string(),
+            )
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let error = expect_request_error(&adapter, oversized).await;
+        assert_eq!(error.code, "MaxMessageLengthExceeded");
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "an oversized declaration is rejected before the body is read"
+        );
+
+        for (declared, code) in [
+            (body.len() as u64 + 1, "IncompleteBody"),
+            (body.len() as u64 - 1, "InvalidArgument"),
+        ] {
+            let mismatched = Request::builder()
+                .method("POST")
+                .uri("/bucket?delete=")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_LENGTH, declared.to_string())
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let error = expect_request_error(&adapter, mismatched).await;
+            assert_eq!(
+                error.code, code,
+                "a {declared}-byte declaration must not parse"
+            );
+        }
+
+        let unlabelled = Request::builder()
+            .method("POST")
+            .uri("/bucket?delete=")
+            .header(header::HOST, "localhost")
+            .body(Body::from(body))
+            .unwrap();
+        let error = expect_request_error(&adapter, unlabelled).await;
+        assert_eq!(error.code, "MissingContentLength");
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn object_level_delete_sub_resource_never_dispatches() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 204,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        // handle_request carries its own guard because a deployment without an
+        // installed policy never calls classify_access.
+        for method in ["DELETE", "POST", "GET", "PUT"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/bucket/key?delete=")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_LENGTH, "0")
+                .body(Body::empty())
+                .unwrap();
+            let error = expect_request_error(&adapter, request).await;
+            assert_eq!(
+                error.code, "InvalidRequest",
+                "{method} /bucket/key?delete= must not act on the object"
+            );
+        }
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

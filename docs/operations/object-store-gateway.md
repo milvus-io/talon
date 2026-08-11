@@ -269,6 +269,13 @@ forwarded unchanged so a client `Content-MD5` or `x-amz-checksum-*` header stays
 valid, the origin's per-key `Deleted`/`Error` XML passes back unchanged, and a
 confirmed outcome invalidates every requested key locally — quiet-mode
 responses omit per-key results, so the request list is the invalidation source.
+This is the one request body the gateway holds in memory, because it must be
+parsed to authorize and then forwarded byte for byte. It is capped at 8 MiB
+independently of the object-upload body limit, which an operator may raise for
+large writes; a larger declared length is rejected with
+`MaxMessageLengthExceeded` before the body is read. The largest legitimate
+document — 1000 keys of 1024 bytes with every byte entity-escaped — stays
+under that ceiling.
 
 Azure variables:
 
