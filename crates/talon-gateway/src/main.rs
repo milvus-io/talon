@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
-use talon_backend::{AzureBackend, AzureConfig, ReqwestClient, S3Backend, S3Config, S3Credentials};
+use talon_backend::{
+    resolve_azure_bearer, resolve_s3_credentials, AzureBackend, AzureConfig, CredentialsObserver,
+    ProvideBearerToken, ProvideS3Credentials, ReqwestClient, S3Backend, S3Config, S3Credentials,
+};
 use talon_cache_client::{BlockReader, CoordinatorClient, PlacementCache};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache};
 use talon_gateway::azure_auth::{AzureClientIdentity, AzureStorageAuthenticator};
@@ -53,11 +56,13 @@ struct Settings {
     s3_secret_key: Option<String>,
     s3_session_token: Option<String>,
     s3_client_identities_path: Option<PathBuf>,
+    s3_origin_path_style: bool,
     s3_max_clock_skew_ms: u64,
     s3_max_multipart_uploads: usize,
     s3_multipart_ttl_ms: u64,
     authorization_path: Option<PathBuf>,
     auth_reload_ms: u64,
+    origin_credentials_source: Option<String>,
     tls: Option<GatewayTlsConfig>,
 }
 
@@ -283,6 +288,13 @@ impl Settings {
             s3_session_token: value(&mut get, "AWS_SESSION_TOKEN"),
             s3_client_identities_path: value(&mut get, "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH")
                 .map(PathBuf::from),
+            // OSS and COS S3-compatible endpoints require virtual-host
+            // addressing; MinIO/Ceph-style stores require path style.
+            s3_origin_path_style: parse_bool(
+                value(&mut get, "TALON_GATEWAY_S3_ORIGIN_PATH_STYLE").as_deref(),
+                true,
+                "TALON_GATEWAY_S3_ORIGIN_PATH_STYLE",
+            )?,
             s3_max_clock_skew_ms: parse_or(
                 value(&mut get, "TALON_GATEWAY_S3_MAX_CLOCK_SKEW_MS"),
                 "900000",
@@ -301,6 +313,7 @@ impl Settings {
             authorization_path: value(&mut get, "TALON_GATEWAY_AUTHORIZATION_PATH")
                 .map(PathBuf::from),
             auth_reload_ms,
+            origin_credentials_source: value(&mut get, "TALON_ORIGIN_CREDENTIALS_SOURCE"),
             tls,
         };
         settings.validate_origin_auth()?;
@@ -376,7 +389,35 @@ fn cache_reader(settings: &Settings) -> Arc<BlockReader> {
     ))
 }
 
-fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
+/// The origin credential a gateway Azure adapter signs with.
+enum AzureOriginAuth {
+    /// Base64 account key (`Authorization: SharedKey`).
+    SharedKey(String),
+    /// SAS token appended to every URL.
+    Sas(String),
+    /// Azure AD bearer tokens from AKS workload identity.
+    Bearer(Arc<dyn ProvideBearerToken>),
+}
+
+/// The statically configured Azure credential, `None` when the environment
+/// configures neither form and workload identity should be resolved.
+fn azure_static_auth(settings: &Settings) -> MainResult<Option<AzureOriginAuth>> {
+    match (&settings.azure_shared_key, &settings.azure_sas) {
+        (Some(_), Some(_)) => Err(invalid(
+            "set only one of TALON_GATEWAY_AZURE_SHARED_KEY or TALON_GATEWAY_AZURE_SAS",
+        )),
+        (Some(key), None) => Ok(Some(AzureOriginAuth::SharedKey(key.clone()))),
+        (None, Some(sas)) => Ok(Some(AzureOriginAuth::Sas(
+            sas.trim_start_matches('?').to_string(),
+        ))),
+        (None, None) => Ok(None),
+    }
+}
+
+fn azure_adapter(
+    settings: &Settings,
+    auth: AzureOriginAuth,
+) -> MainResult<Arc<dyn GatewayAdapter>> {
     if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
         return Err(invalid(
             "trusted-passthrough Azure routing is not available in this build",
@@ -386,14 +427,6 @@ fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
         .azure_account
         .clone()
         .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
-    if settings.azure_shared_key.is_some() && settings.azure_sas.is_some() {
-        return Err(invalid(
-            "set only one of TALON_GATEWAY_AZURE_SHARED_KEY or TALON_GATEWAY_AZURE_SAS",
-        ));
-    }
-    if settings.azure_shared_key.is_none() && settings.azure_sas.is_none() {
-        return Err(invalid("an Azure shared key or SAS credential is required"));
-    }
     let mut origin_config = match settings.azure_endpoint.as_deref() {
         Some(endpoint) => {
             let (host, tls) = split_endpoint(endpoint);
@@ -407,14 +440,14 @@ fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
         }
     }
     let http = Arc::new(ReqwestClient::new());
-    let origin = match settings.azure_shared_key.as_deref() {
-        Some(key) => Arc::new(AzureBackend::with_shared_key(origin_config, key, http)),
-        None => Arc::new(AzureBackend::new(
+    let origin = match auth {
+        AzureOriginAuth::SharedKey(key) => {
+            Arc::new(AzureBackend::with_shared_key(origin_config, key, http))
+        }
+        AzureOriginAuth::Sas(sas) => Arc::new(AzureBackend::new(origin_config, Some(sas), http)),
+        AzureOriginAuth::Bearer(bearer) => Arc::new(AzureBackend::with_bearer_provider(
             origin_config,
-            settings
-                .azure_sas
-                .as_deref()
-                .map(|token| token.trim_start_matches('?').to_string()),
+            bearer,
             http,
         )),
     };
@@ -440,7 +473,26 @@ fn azure_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
     )?))
 }
 
-fn s3_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
+/// The statically configured S3 origin keys, `None` when the environment
+/// sets none and workload identity should be resolved.
+fn static_s3_credentials(settings: &Settings) -> MainResult<Option<S3Credentials>> {
+    match (&settings.s3_access_key, &settings.s3_secret_key) {
+        (Some(access_key), Some(secret_key)) => Ok(Some(S3Credentials {
+            access_key_id: access_key.clone(),
+            secret_access_key: secret_key.clone(),
+            session_token: settings.s3_session_token.clone(),
+        })),
+        (None, None) => Ok(None),
+        _ => Err(invalid(
+            "AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY must be set together",
+        )),
+    }
+}
+
+fn s3_adapter(
+    settings: &Settings,
+    credentials: Arc<dyn ProvideS3Credentials>,
+) -> MainResult<Arc<dyn GatewayAdapter>> {
     if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
         return Err(invalid(
             "trusted-passthrough S3 routing is not available in this build",
@@ -450,33 +502,21 @@ fn s3_adapter(settings: &Settings) -> MainResult<Arc<dyn GatewayAdapter>> {
         .s3_region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_string());
-    let access_key = settings
-        .s3_access_key
-        .clone()
-        .ok_or_else(|| invalid("AWS_ACCESS_KEY_ID is required"))?;
-    let secret_key = settings
-        .s3_secret_key
-        .clone()
-        .ok_or_else(|| invalid("AWS_SECRET_ACCESS_KEY is required"))?;
     let origin_config = match settings.s3_endpoint.as_deref() {
         Some(endpoint) => {
             let (host, tls) = split_endpoint(endpoint);
             S3Config {
                 region: region.clone(),
                 endpoint: host,
-                path_style: true,
+                path_style: settings.s3_origin_path_style,
                 tls,
             }
         }
         None => S3Config::aws(&region),
     };
-    let origin = Arc::new(S3Backend::new(
+    let origin = Arc::new(S3Backend::with_credentials_provider(
         origin_config,
-        S3Credentials {
-            access_key_id: access_key,
-            secret_access_key: secret_key,
-            session_token: settings.s3_session_token.clone(),
-        },
+        credentials,
         Arc::new(ReqwestClient::new()),
     ));
     let mut config = if settings.incoming_path_style {
@@ -813,6 +853,23 @@ fn spawn_auth_reload(
     });
 }
 
+/// Bridges origin credential refresh outcomes into the gateway registry.
+struct OriginCredentialsObserver(GatewayMetrics);
+
+impl CredentialsObserver for OriginCredentialsObserver {
+    fn refresh_succeeded(&self, expires_at: Option<std::time::SystemTime>) {
+        self.0.record_origin_credentials("refresh_success");
+        let unix_seconds = expires_at
+            .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0.0, |since_epoch| since_epoch.as_secs_f64());
+        self.0.set_origin_credentials_expiry(unix_seconds);
+    }
+
+    fn refresh_failed(&self) {
+        self.0.record_origin_credentials("refresh_failure");
+    }
+}
+
 fn load_mtls_identities(
     path: &Path,
     ca_certificate_path: PathBuf,
@@ -861,12 +918,71 @@ async fn main() -> MainResult<()> {
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
     let settings = Settings::from_env()?;
+    let metrics = GatewayMetrics::new();
+    let credentials_observer: Arc<dyn CredentialsObserver> =
+        Arc::new(OriginCredentialsObserver(metrics.clone()));
+    let exchange_http: Arc<dyn talon_backend::HttpClient> = Arc::new(ReqwestClient::new());
     let adapter = match settings.protocol.as_str() {
-        "azure" => azure_adapter(&settings)?,
-        "s3" => s3_adapter(&settings)?,
+        "azure" => {
+            if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
+                return Err(invalid(
+                    "trusted-passthrough Azure routing is not available in this build",
+                ));
+            }
+            let auth = match azure_static_auth(&settings)? {
+                Some(auth) => {
+                    info!(source = "static", "origin Azure credentials resolved");
+                    auth
+                }
+                None => match settings.origin_credentials_source.as_deref() {
+                    None | Some("auto") | Some("azure-workload-identity") => {
+                        let resolved = resolve_azure_bearer(
+                            Arc::clone(&exchange_http),
+                            Arc::clone(&credentials_observer),
+                        )
+                        .await
+                        .map_err(|error| {
+                            invalid(format!(
+                                "an Azure shared key or SAS credential is required, \
+                                 or AKS workload identity must be available: {error}"
+                            ))
+                        })?;
+                        info!(
+                            source = resolved.source,
+                            "origin Azure credentials resolved"
+                        );
+                        AzureOriginAuth::Bearer(resolved.provider)
+                    }
+                    Some(other) => {
+                        return Err(invalid(format!(
+                            "an Azure shared key or SAS credential is required \
+                             (origin credentials source {other:?} does not apply to azure)"
+                        )))
+                    }
+                },
+            };
+            azure_adapter(&settings, auth)?
+        }
+        "s3" => {
+            if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
+                return Err(invalid(
+                    "trusted-passthrough S3 routing is not available in this build",
+                ));
+            }
+            let resolved = resolve_s3_credentials(
+                static_s3_credentials(&settings)?,
+                settings.origin_credentials_source.as_deref(),
+                Arc::clone(&exchange_http),
+                Arc::clone(&credentials_observer),
+            )
+            .await
+            .map_err(invalid)?;
+            info!(source = resolved.source, "origin S3 credentials resolved");
+            s3_adapter(&settings, resolved.provider)?
+        }
         _ => unreachable!("validated protocol"),
     };
-    let runtime = Arc::new(GatewayRuntime::new(
+    let runtime = Arc::new(GatewayRuntime::new_with_metrics(
         GatewayConfig {
             bind: settings.bind,
             mode: settings.mode,
@@ -877,6 +993,7 @@ async fn main() -> MainResult<()> {
         },
         adapter,
         GatewaySecurity::default(),
+        metrics,
     )?);
     let reload_targets = configure_auth(&runtime, &settings)?;
     if !reload_targets.is_empty() {
@@ -936,6 +1053,7 @@ mod tests {
         assert!(!settings.incoming_path_style);
         assert!(settings.tls.is_none());
         assert!(settings.s3_client_identities_path.is_none());
+        assert!(settings.s3_origin_path_style);
         assert_eq!(settings.s3_max_clock_skew_ms, 900_000);
         assert_eq!(settings.s3_max_multipart_uploads, 1024);
         assert_eq!(settings.s3_multipart_ttl_ms, 86_400_000);
@@ -988,6 +1106,11 @@ mod tests {
             ("TALON_GATEWAY_PATH_STYLE", "maybe"),
         ])
         .is_err());
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_S3_ORIGIN_PATH_STYLE", "maybe"),
+        ])
+        .is_err());
     }
 
     #[test]
@@ -998,7 +1121,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(trusted.origin_auth, OriginAuthMode::TrustedPassthrough);
-        assert!(s3_adapter(&trusted).is_err());
+        assert!(s3_adapter(&trusted, test_s3_provider()).is_err());
 
         assert!(settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
@@ -1033,10 +1156,26 @@ mod tests {
         assert_eq!(split_endpoint("s3.example"), ("s3.example".into(), true));
     }
 
+    fn test_s3_provider() -> Arc<dyn ProvideS3Credentials> {
+        Arc::new(talon_backend::StaticS3Credentials::new(S3Credentials {
+            access_key_id: "AKIDTEST".into(),
+            secret_access_key: "secret".into(),
+            session_token: None,
+        }))
+    }
+
     #[test]
     fn provider_credentials_are_required_and_mutually_exclusive() {
+        // No static keys means workload identity must resolve at startup.
         let s3 = settings(&[("TALON_COORDINATOR_ADDR", "coordinator:7411")]).unwrap();
-        assert!(s3_adapter(&s3).is_err());
+        assert!(static_s3_credentials(&s3).unwrap().is_none());
+        // Half a static key pair is a configuration error, not auto-detection.
+        let half = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("AWS_ACCESS_KEY_ID", "AKIDONLY"),
+        ])
+        .unwrap();
+        assert!(static_s3_credentials(&half).is_err());
 
         let azure = settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
@@ -1044,7 +1183,14 @@ mod tests {
             ("TALON_GATEWAY_AZURE_ACCOUNT", "account"),
         ])
         .unwrap();
-        assert!(azure_adapter(&azure).is_err());
+        assert!(azure_static_auth(&azure).unwrap().is_none());
+
+        let no_account = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_PROTOCOL", "azure"),
+        ])
+        .unwrap();
+        assert!(azure_adapter(&no_account, AzureOriginAuth::Sas("sig=x".into())).is_err());
 
         let both = settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
@@ -1054,7 +1200,7 @@ mod tests {
             ("TALON_GATEWAY_AZURE_SAS", "sas"),
         ])
         .unwrap();
-        assert!(azure_adapter(&both).is_err());
+        assert!(azure_static_auth(&both).is_err());
     }
 
     #[test]

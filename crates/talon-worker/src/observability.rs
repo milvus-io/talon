@@ -403,6 +403,29 @@ impl WorkerMetrics {
         self.backend_timeouts_total.inc();
     }
 
+    /// Record one origin credential refresh outcome (workload identity).
+    pub fn record_origin_credentials(&self, result: &'static str) {
+        self.registry
+            .counter(
+                "talon_worker_origin_credentials_total",
+                "Origin credential refresh outcomes.",
+                labels(&[("result", result)]),
+            )
+            .inc();
+    }
+
+    /// Publish when the current origin credentials expire (unix seconds,
+    /// `0` when the mechanism reports no expiry or credentials are static).
+    pub fn set_origin_credentials_expiry(&self, unix_seconds: f64) {
+        self.registry
+            .gauge(
+                "talon_worker_origin_credentials_expiry_seconds",
+                "Unix time when the current origin credentials expire.",
+                labels(&[]),
+            )
+            .set(unix_seconds);
+    }
+
     /// Record a successful write-through PUT of `bytes` to the origin backend.
     pub fn record_backend_write_success(&self, bytes: u64) {
         self.backend_write_bytes_total.add(bytes);

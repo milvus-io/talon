@@ -16,6 +16,7 @@ bytes.workspace = true
 futures.workspace = true
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tokio = { workspace = true, features = ["time"] }
+tracing.workspace = true
 tokio-util.workspace = true
 url.workspace = true
 sha2 = "0.10"

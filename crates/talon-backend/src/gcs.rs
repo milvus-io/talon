@@ -68,17 +68,31 @@ impl GcsConfig {
 /// A GCS `BackendStore` over a pluggable HTTP client.
 pub struct GcsBackend {
     config: GcsConfig,
-    /// OAuth2 bearer token (short-lived; refreshed by the caller).
-    bearer_token: Option<String>,
+    /// OAuth2 bearer token source (fixed, or workload-identity refreshed).
+    bearer: Arc<dyn crate::credentials::ProvideBearerToken>,
     http: Arc<dyn HttpClient>,
 }
 
 impl GcsBackend {
-    /// Construct a backend from config, an optional bearer token, and a client.
+    /// Construct a backend from config, an optional fixed bearer token, and a
+    /// client.
     pub fn new(config: GcsConfig, bearer_token: Option<String>, http: Arc<dyn HttpClient>) -> Self {
+        Self::with_bearer_provider(
+            config,
+            Arc::new(crate::credentials::StaticBearerToken::new(bearer_token)),
+            http,
+        )
+    }
+
+    /// Construct a backend whose bearer token comes from a snapshot provider.
+    pub fn with_bearer_provider(
+        config: GcsConfig,
+        bearer: Arc<dyn crate::credentials::ProvideBearerToken>,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
         Self {
             config,
-            bearer_token,
+            bearer,
             http,
         }
     }
@@ -168,7 +182,7 @@ impl GcsBackend {
     }
 
     fn auth_headers(&self) -> Vec<(String, String)> {
-        match &self.bearer_token {
+        match self.bearer.current() {
             Some(t) => vec![("Authorization".to_string(), format!("Bearer {t}"))],
             None => Vec::new(),
         }

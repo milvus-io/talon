@@ -75,6 +75,50 @@ export TALON_WORKER_AZURE_SAS="sv=...&sig=..."     # env-only
 talon-worker --coordinator talon-coordinator:7000 --cluster-id demo
 ```
 
+## Workload identity (keyless)
+
+On Kubernetes, every major cloud can hand the pod an identity instead of a
+static key. When no static credential is configured, the worker and the
+gateway resolve one of these mechanisms at startup and then refresh the
+short-lived credentials in the background (at roughly 80% of their lifetime,
+clamped between 1 and 15 minutes of margin). A failed refresh keeps the last
+credentials, logs a warning without secret material, and retries every 30
+seconds; a failed **initial** resolution is a startup error, exactly like a
+missing static key.
+
+| Cloud | Mechanism | Detection | Verified |
+|---|---|---|---|
+| AWS EKS | IRSA: `sts:AssumeRoleWithWebIdentity` | auto: `AWS_ROLE_ARN` + `AWS_WEB_IDENTITY_TOKEN_FILE` (webhook-injected) | live EKS: exchange + signed request |
+| Alibaba ACK | RRSA: `sts:AssumeRoleWithOIDC` | auto: `ALIBABA_CLOUD_ROLE_ARN` + `ALIBABA_CLOUD_OIDC_PROVIDER_ARN` + `ALIBABA_CLOUD_OIDC_TOKEN_FILE` | live ACK: exchange + signed request |
+| Tencent TKE | OIDC: `sts:AssumeRoleWithWebIdentity` | auto: `TKE_ROLE_ARN` + `TKE_PROVIDER_ID` + `TKE_WEB_IDENTITY_TOKEN_FILE` | protocol-level |
+| Huawei CCE | agency metadata (`/openstack/latest/securitykey`) | explicit: `TALON_ORIGIN_CREDENTIALS_SOURCE=huawei-agency` | protocol-level; requires an agency bound to the node |
+| GCP GKE | Workload Identity metadata token (GCS `Bearer`) | explicit: `TALON_ORIGIN_CREDENTIALS_SOURCE=gcp-metadata` | protocol-level |
+| Azure AKS | Workload Identity: Azure AD token (`Bearer`) | auto when no SAS/key: `AZURE_CLIENT_ID` + `AZURE_TENANT_ID` + `AZURE_FEDERATED_TOKEN_FILE`; pods also need the `azure.workload.identity/use: "true"` label | protocol-level; injected env contract verified on live AKS |
+
+Static credentials always win, so existing deployments are unaffected.
+`TALON_ORIGIN_CREDENTIALS_SOURCE` (shared by the worker and the gateway)
+forces one mechanism — `static`, `aws-web-identity`, `aliyun-oidc`,
+`tencent-oidc`, `huawei-agency`, or `gcp-metadata` — instead of
+auto-detection; the GCP and Huawei metadata endpoints have no env marker and
+are never probed implicitly. Aliyun, Tencent, and Huawei OBS are consumed
+through their S3-compatible endpoints with SigV4 plus the temporary security
+token, the same shape their official Milvus storage integrations use. OSS and
+COS require virtual-host addressing (path style is rejected with `403`) and a
+bare region in the signing scope (`cn-hangzhou`, not `oss-cn-hangzhou`).
+"Protocol-level" means the exchange is implemented and tested against the
+documented API shape but has not yet been validated against a live cluster.
+To validate a cluster, build the verification probe
+(`cargo build -p talon-backend --example credentials_probe`) and run it in a
+pod bound to the target ServiceAccount: it resolves the production chain and
+HEADs one key with the resolved credentials, printing only redacted material.
+A `NotFound` answer proves the exchange and the signature end to end.
+
+Refresh outcomes are counted as
+`talon_worker_origin_credentials_total{result="refresh_success"|"refresh_failure"}`
+(the gateway equivalent is `talon_gateway_origin_credentials_total`), and
+`talon_worker_origin_credentials_expiry_seconds` publishes the current
+credentials' hard expiry so an alert can fire before it passes.
+
 ## Testing against emulators
 
 Each backend has an end-to-end test that reads a real object through the actual
@@ -109,4 +153,6 @@ Azurite is included in the [latency lab](../testing/latency-lab.md) stack.
 Credentials (`*_SECRET_ACCESS_KEY`, `*_SESSION_TOKEN`, `*_BEARER_TOKEN`,
 `*_AZURE_SAS`) are read **only** from the environment — never from a config file,
 and never logged. Inject them with your platform's secret mechanism (Kubernetes
-Secrets, a secrets manager) rather than baking them into images or manifests.
+Secrets, a secrets manager) rather than baking them into images or manifests —
+or configure no static credential at all and let
+[workload identity](#workload-identity-keyless) keep the cluster keyless.

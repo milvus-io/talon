@@ -128,7 +128,19 @@ impl GatewayRuntime {
     pub fn new(
         config: GatewayConfig,
         adapter: Arc<dyn GatewayAdapter>,
+        security: GatewaySecurity,
+    ) -> Result<Self, GatewayConfigError> {
+        Self::new_with_metrics(config, adapter, security, GatewayMetrics::new())
+    }
+
+    /// Construct a runtime that records into an externally created registry,
+    /// so events counted before construction (origin credential resolution in
+    /// the binary) land in the registry `/metrics` serves.
+    pub fn new_with_metrics(
+        config: GatewayConfig,
+        adapter: Arc<dyn GatewayAdapter>,
         mut security: GatewaySecurity,
+        metrics: GatewayMetrics,
     ) -> Result<Self, GatewayConfigError> {
         config.validate()?;
         security.authentication = false;
@@ -143,7 +155,7 @@ impl GatewayRuntime {
             readiness: Arc::new(GatewayReadiness::new(config.mode, security)),
             config,
             adapter,
-            metrics: GatewayMetrics::new(),
+            metrics,
             authorization: RwLock::new(None),
             authentication: RwLock::new(None),
             audit: RwLock::new(Arc::new(TracingAuditSink)),

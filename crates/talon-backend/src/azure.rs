@@ -100,6 +100,9 @@ pub struct AzureBackend {
     /// Optional base64 account key for Shared Key authorization (an alternative
     /// to SAS). When set, every request is signed just before execution.
     shared_key: Option<String>,
+    /// Optional Azure AD bearer-token source (workload identity), an
+    /// alternative to both SAS and Shared Key.
+    bearer: Option<Arc<dyn crate::credentials::ProvideBearerToken>>,
     http: Arc<dyn HttpClient>,
 }
 
@@ -110,6 +113,7 @@ impl AzureBackend {
             config,
             sas_token,
             shared_key: None,
+            bearer: None,
             http,
         }
     }
@@ -125,6 +129,24 @@ impl AzureBackend {
             config,
             sas_token: None,
             shared_key: Some(shared_key.into()),
+            bearer: None,
+            http,
+        }
+    }
+
+    /// Construct with an Azure AD bearer-token source (workload identity)
+    /// instead of a SAS token or Shared Key. Every request carries
+    /// `Authorization: Bearer` with the provider's current token.
+    pub fn with_bearer_provider(
+        config: AzureConfig,
+        bearer: Arc<dyn crate::credentials::ProvideBearerToken>,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
+        Self {
+            config,
+            sas_token: None,
+            shared_key: None,
+            bearer: Some(bearer),
             http,
         }
     }
@@ -316,6 +338,15 @@ impl AzureBackend {
     /// header. A SAS-only backend (no shared key) returns the request unchanged
     /// (the SAS travels in the URL query).
     fn authorized(&self, mut req: HttpRequest) -> HttpRequest {
+        if let Some(bearer) = &self.bearer {
+            // Azure AD auth: the always-stamped `x-ms-version` satisfies the
+            // minimum API version bearer tokens require.
+            if let Some(token) = bearer.current() {
+                req.headers
+                    .push(("Authorization".to_string(), format!("Bearer {token}")));
+            }
+            return req;
+        }
         let Some(key) = &self.shared_key else {
             return req;
         };
@@ -1107,6 +1138,34 @@ mod tests {
         );
         let auth = req.header("Authorization").expect("Authorization header");
         assert!(auth.starts_with("SharedKey acct:"), "got {auth}");
+    }
+
+    #[tokio::test]
+    async fn bearer_backend_sends_the_current_token_without_sas_or_key() {
+        let http = MockHttp::new(HttpResponse {
+            status: 206,
+            headers: vec![],
+            body: bytes::Bytes::from_static(b"az-bytes"),
+        });
+        let a = AzureBackend::with_bearer_provider(
+            AzureConfig::new("acct"),
+            Arc::new(crate::credentials::StaticBearerToken::new(Some(
+                "aad-token".into(),
+            ))),
+            http.clone(),
+        );
+        a.fetch_range(&obj(), 0, 8).await.unwrap();
+        let req = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(req.header("Authorization"), Some("Bearer aad-token"));
+        assert!(
+            req.header("x-ms-date").is_none(),
+            "bearer requests are not shared-key signed"
+        );
+        assert!(!req.url.contains('?'), "no SAS query is appended");
+        assert!(
+            req.header("x-ms-version").is_some(),
+            "bearer auth requires the API version header"
+        );
     }
 
     #[tokio::test]
