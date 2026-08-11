@@ -7,6 +7,14 @@ repository.workspace = true
 rust-version.workspace = true
 description = "Shared bounded HTTP runtime for Talon object-store gateways"
 
+# `http2` gates BOTH the h2 serving stack and the `h2` entry the TLS listener
+# advertises in ALPN (see `tls.rs::alpn_protocols`). They are one switch on
+# purpose: advertising a protocol this server cannot serve makes every
+# ALPN-capable client negotiate it and then have its connection reset.
+[features]
+default = ["http2"]
+http2 = ["axum/http2"]
+
 [dependencies]
 talon-core.workspace = true
 talon-backend = { path = "../talon-backend" }
@@ -36,4 +44,11 @@ url.workspace = true
 x509-cert.workspace = true
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
+# `http2` here is what makes the ALPN test meaningful: with it off, reqwest
+# only ever offers http/1.1, so a server advertising h2 it cannot serve still
+# looks healthy to every test in this crate.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+    "http2",
+] }

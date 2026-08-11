@@ -525,11 +525,29 @@ fn load_server_config(config: &GatewayTlsConfig) -> Result<LoadedServerConfig, G
     let mut server = builder
         .with_single_cert(certificates, key)
         .map_err(|_| GatewayTlsError::IncompatibleKey)?;
-    server.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    server.alpn_protocols = alpn_protocols();
     Ok(LoadedServerConfig {
         server,
         client_auth: config.client_auth.clone(),
     })
+}
+
+/// ALPN offer, derived from what this build can actually serve.
+///
+/// `axum::serve` dispatches through hyper-util's automatic connection builder,
+/// whose h2 side only exists when axum's `http2` feature is on. Deriving the
+/// offer from the same feature keeps the advertisement and the serving stack
+/// from drifting apart: a hardcoded `h2` entry in a build without the feature
+/// makes every ALPN-capable client negotiate h2 and then get its connection
+/// reset — Kubernetes HTTPS probes attempt h2 by default, so a TLS gateway can
+/// never pass a readiness probe.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    let mut protocols = Vec::new();
+    if cfg!(feature = "http2") {
+        protocols.push(b"h2".to_vec());
+    }
+    protocols.push(b"http/1.1".to_vec());
+    protocols
 }
 
 #[cfg(test)]
@@ -782,6 +800,92 @@ mod tests {
             .await
             .is_err());
         server.await.unwrap();
+    }
+
+    #[test]
+    fn alpn_offer_matches_what_this_build_can_serve() {
+        let offer = alpn_protocols();
+        assert!(
+            offer.contains(&b"http/1.1".to_vec()),
+            "http/1.1 is always served"
+        );
+        assert_eq!(
+            offer.contains(&b"h2".to_vec()),
+            cfg!(feature = "http2"),
+            "h2 may be advertised only by a build whose axum has the http2 feature"
+        );
+        assert_eq!(
+            offer.first().map(Vec::as_slice),
+            Some(if cfg!(feature = "http2") {
+                b"h2".as_slice()
+            } else {
+                b"http/1.1".as_slice()
+            }),
+            "the preferred protocol is the most capable one this build serves"
+        );
+    }
+
+    /// Regression: the listener used to advertise `h2` unconditionally while
+    /// axum's `http2` feature was off, so every client that negotiated h2 had
+    /// its connection reset. This drives a real request over the negotiated
+    /// protocol rather than inspecting the ALPN result, because a reset only
+    /// shows up once bytes are exchanged.
+    #[tokio::test]
+    async fn negotiated_protocol_serves_a_real_request() {
+        let temp = TempDir::new().unwrap();
+        let tls = write_material(temp.path());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let runtime = Arc::new(
+            GatewayRuntime::new(
+                GatewayConfig {
+                    bind: address,
+                    mode: GatewayMode::Production,
+                    ..GatewayConfig::default()
+                },
+                Arc::new(Adapter),
+                GatewaySecurity::default(),
+            )
+            .unwrap(),
+        );
+        runtime.install_authentication(Arc::new(Authenticator));
+        runtime.install_authorization(AuthorizationPolicy::new(Vec::new()).unwrap());
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let server_runtime = Arc::clone(&runtime);
+        let server = tokio::spawn(async move {
+            serve_tls(listener, server_runtime, tls, async move {
+                let _ = shutdown_rx.await;
+            })
+            .await
+        });
+
+        // Offers h2 and http/1.1, exactly like the ALPN-capable clients that
+        // hit this listener in production (Kubernetes probes, proxies, curl).
+        let client = reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .build()
+            .unwrap();
+        let response = client
+            .get(format!("https://{address}/readyz"))
+            .send()
+            .await
+            .expect("a protocol this server advertises must survive a request");
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        assert_eq!(
+            response.version(),
+            if cfg!(feature = "http2") {
+                reqwest::Version::HTTP_2
+            } else {
+                reqwest::Version::HTTP_11
+            },
+            "the client must have negotiated the protocol the offer promised"
+        );
+        // The body has to arrive too: an h2 connection that resets mid-stream
+        // still yields response headers first.
+        assert!(response.text().await.unwrap().contains("\"ready\""));
+
+        shutdown_tx.send(()).unwrap();
+        server.await.unwrap().unwrap();
     }
 
     #[tokio::test]
