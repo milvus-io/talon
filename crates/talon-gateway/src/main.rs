@@ -14,9 +14,9 @@ use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache};
 use talon_gateway::s3_auth::{S3ClientIdentity, S3SigV4Authenticator};
 use talon_gateway::{
     serve, serve_tls, AuthenticatedPrincipal, AuthorizationGrant, AuthorizationPolicy,
-    GatewayAdapter, GatewayClientAuthConfig, GatewayClientAuthMode, GatewayConfig, GatewayMode,
-    GatewayMtlsIdentity, GatewayOperation, GatewayRoute, GatewayRuntime, GatewaySecurity,
-    GatewayTlsConfig, OriginAuthMode, ProviderProtocol,
+    GatewayAdapter, GatewayClientAuthConfig, GatewayClientAuthMode, GatewayConfig, GatewayMetrics,
+    GatewayMode, GatewayMtlsIdentity, GatewayOperation, GatewayRoute, GatewayRuntime,
+    GatewaySecurity, GatewayTlsConfig, OriginAuthMode, ProviderProtocol,
 };
 use tokio::net::TcpListener;
 use tracing::info;
@@ -57,6 +57,7 @@ struct Settings {
     s3_max_multipart_uploads: usize,
     s3_multipart_ttl_ms: u64,
     authorization_path: Option<PathBuf>,
+    auth_reload_ms: u64,
     tls: Option<GatewayTlsConfig>,
 }
 
@@ -156,6 +157,16 @@ impl Settings {
             false,
             "TALON_GATEWAY_PATH_STYLE",
         )?;
+        let auth_reload_ms: u64 = parse_or(
+            value(&mut get, "TALON_GATEWAY_AUTH_RELOAD_MS"),
+            "5000",
+            "TALON_GATEWAY_AUTH_RELOAD_MS",
+        )?;
+        if auth_reload_ms == 0 {
+            return Err(invalid(
+                "TALON_GATEWAY_AUTH_RELOAD_MS must be greater than zero",
+            ));
+        }
         let tls_certificate = value(&mut get, "TALON_GATEWAY_TLS_CERT_PATH");
         let tls_private_key = value(&mut get, "TALON_GATEWAY_TLS_KEY_PATH");
         let client_auth_mode =
@@ -289,6 +300,7 @@ impl Settings {
             )?,
             authorization_path: value(&mut get, "TALON_GATEWAY_AUTHORIZATION_PATH")
                 .map(PathBuf::from),
+            auth_reload_ms,
             tls,
         };
         settings.validate_origin_auth()?;
@@ -556,12 +568,25 @@ struct AuthorizationGrantConfig {
     operations: Vec<String>,
 }
 
-fn load_s3_authenticator(
-    path: &Path,
+/// Parse one auth configuration file, replacing serde's error — which can
+/// echo file contents, and identity files hold secrets — with a stable
+/// location-only message safe for logs and startup stderr.
+fn parse_json<T: serde::de::DeserializeOwned>(bytes: &[u8], file: &'static str) -> MainResult<T> {
+    serde_json::from_slice(bytes).map_err(|error| {
+        invalid(format!(
+            "{file} is invalid at line {} column {}",
+            error.line(),
+            error.column()
+        ))
+    })
+}
+
+fn build_s3_authenticator(
+    bytes: &[u8],
     region: &str,
     max_clock_skew_ms: u64,
 ) -> MainResult<S3SigV4Authenticator> {
-    let configured: S3IdentityFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let configured: S3IdentityFile = parse_json(bytes, "gateway S3 client identity file")?;
     let identities = configured
         .identities
         .into_iter()
@@ -579,13 +604,13 @@ fn load_s3_authenticator(
     )?)
 }
 
-fn load_azure_authenticator(
-    path: &Path,
+fn build_azure_authenticator(
+    bytes: &[u8],
     account: &str,
     max_clock_skew_ms: u64,
     transport_https: bool,
 ) -> MainResult<AzureStorageAuthenticator> {
-    let configured: AzureIdentityFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+    let configured: AzureIdentityFile = parse_json(bytes, "gateway Azure client identity file")?;
     let identities = configured
         .identities
         .into_iter()
@@ -602,8 +627,8 @@ fn load_azure_authenticator(
     )?)
 }
 
-fn load_authorization(path: &Path) -> MainResult<AuthorizationPolicy> {
-    let configured: AuthorizationFile = serde_json::from_str(&std::fs::read_to_string(path)?)?;
+fn build_authorization(bytes: &[u8]) -> MainResult<AuthorizationPolicy> {
+    let configured: AuthorizationFile = parse_json(bytes, "gateway authorization file")?;
     let grants = configured
         .grants
         .into_iter()
@@ -638,6 +663,154 @@ fn load_authorization(path: &Path) -> MainResult<AuthorizationPolicy> {
         })
         .collect::<MainResult<Vec<_>>>()?;
     Ok(AuthorizationPolicy::new(grants)?)
+}
+
+type ApplyFn = Box<dyn FnMut(&[u8]) -> MainResult<()> + Send>;
+
+/// One polled configuration file and the bytes behind the active state.
+/// `file` is the bounded `file` label on the reload metric.
+struct ReloadTarget {
+    file: &'static str,
+    path: PathBuf,
+    last_applied: Vec<u8>,
+    apply: ApplyFn,
+}
+
+impl ReloadTarget {
+    /// Re-read the file and atomically swap the running configuration when
+    /// its bytes changed. Unreadable or invalid contents retain the active
+    /// configuration and keep counting as failures until the file is fixed.
+    fn poll(&mut self, metrics: &GatewayMetrics) {
+        let outcome = match std::fs::read(&self.path) {
+            Ok(bytes) if bytes == self.last_applied => Ok("unchanged"),
+            Ok(bytes) => (self.apply)(&bytes).map(|()| {
+                self.last_applied = bytes;
+                tracing::info!(file = self.file, "gateway auth configuration reloaded");
+                "success"
+            }),
+            Err(error) => Err(error.into()),
+        };
+        let result = match outcome {
+            Ok(result) => result,
+            Err(error) => {
+                // Safe to include: `parse_json` strips serde's content echoes
+                // and the constructor errors are stable, so no file contents
+                // (secrets) can reach this line.
+                tracing::warn!(
+                    file = self.file,
+                    %error,
+                    "gateway auth reload failed; retaining last valid configuration"
+                );
+                "failure"
+            }
+        };
+        metrics.record_auth_reload(self.file, result);
+    }
+}
+
+/// Install the configured identity and authorization files and return one
+/// reload target per file so updates apply without a restart.
+fn configure_auth(
+    runtime: &Arc<GatewayRuntime>,
+    settings: &Settings,
+) -> MainResult<Vec<ReloadTarget>> {
+    let mut targets = Vec::new();
+    if let Some(path) = &settings.s3_client_identities_path {
+        if settings.protocol != "s3" {
+            return Err(invalid(
+                "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH requires the s3 protocol",
+            ));
+        }
+        let region = settings
+            .s3_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let max_clock_skew_ms = settings.s3_max_clock_skew_ms;
+        let bytes = std::fs::read(path)?;
+        runtime.install_authentication(Arc::new(build_s3_authenticator(
+            &bytes,
+            &region,
+            max_clock_skew_ms,
+        )?));
+        let reload_runtime = Arc::clone(runtime);
+        targets.push(ReloadTarget {
+            file: "s3_identities",
+            path: path.clone(),
+            last_applied: bytes,
+            apply: Box::new(move |bytes| {
+                let authenticator = build_s3_authenticator(bytes, &region, max_clock_skew_ms)?;
+                reload_runtime.install_authentication(Arc::new(authenticator));
+                Ok(())
+            }),
+        });
+    }
+    if let Some(path) = &settings.azure_client_identities_path {
+        if settings.protocol != "azure" {
+            return Err(invalid(
+                "TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH requires the azure protocol",
+            ));
+        }
+        let account = settings
+            .azure_account
+            .clone()
+            .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
+        let max_clock_skew_ms = settings.azure_max_clock_skew_ms;
+        let transport_https = settings.tls.is_some();
+        let bytes = std::fs::read(path)?;
+        runtime.install_authentication(Arc::new(build_azure_authenticator(
+            &bytes,
+            &account,
+            max_clock_skew_ms,
+            transport_https,
+        )?));
+        let reload_runtime = Arc::clone(runtime);
+        targets.push(ReloadTarget {
+            file: "azure_identities",
+            path: path.clone(),
+            last_applied: bytes,
+            apply: Box::new(move |bytes| {
+                let authenticator =
+                    build_azure_authenticator(bytes, &account, max_clock_skew_ms, transport_https)?;
+                reload_runtime.install_authentication(Arc::new(authenticator));
+                Ok(())
+            }),
+        });
+    }
+    if let Some(path) = &settings.authorization_path {
+        let bytes = std::fs::read(path)?;
+        runtime.install_authorization(build_authorization(&bytes)?);
+        let reload_runtime = Arc::clone(runtime);
+        targets.push(ReloadTarget {
+            file: "authorization",
+            path: path.clone(),
+            last_applied: bytes,
+            apply: Box::new(move |bytes| {
+                reload_runtime.install_authorization(build_authorization(bytes)?);
+                Ok(())
+            }),
+        });
+    }
+    Ok(targets)
+}
+
+/// Poll every reload target on one shared interval for the process lifetime.
+fn spawn_auth_reload(
+    interval: std::time::Duration,
+    metrics: GatewayMetrics,
+    mut targets: Vec<ReloadTarget>,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Initial configuration was installed synchronously.
+        ticker.tick().await;
+        loop {
+            ticker.tick().await;
+            for target in &mut targets {
+                target.poll(&metrics);
+            }
+        }
+    });
 }
 
 fn load_mtls_identities(
@@ -705,38 +878,13 @@ async fn main() -> MainResult<()> {
         adapter,
         GatewaySecurity::default(),
     )?);
-    if let Some(path) = &settings.s3_client_identities_path {
-        if settings.protocol != "s3" {
-            return Err(invalid(
-                "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH requires the s3 protocol",
-            ));
-        }
-        let region = settings.s3_region.as_deref().unwrap_or("us-east-1");
-        runtime.install_authentication(Arc::new(load_s3_authenticator(
-            path,
-            region,
-            settings.s3_max_clock_skew_ms,
-        )?));
-    }
-    if let Some(path) = &settings.azure_client_identities_path {
-        if settings.protocol != "azure" {
-            return Err(invalid(
-                "TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH requires the azure protocol",
-            ));
-        }
-        let account = settings
-            .azure_account
-            .as_deref()
-            .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
-        runtime.install_authentication(Arc::new(load_azure_authenticator(
-            path,
-            account,
-            settings.azure_max_clock_skew_ms,
-            settings.tls.is_some(),
-        )?));
-    }
-    if let Some(path) = &settings.authorization_path {
-        runtime.install_authorization(load_authorization(path)?);
+    let reload_targets = configure_auth(&runtime, &settings)?;
+    if !reload_targets.is_empty() {
+        spawn_auth_reload(
+            std::time::Duration::from_millis(settings.auth_reload_ms),
+            runtime.metrics().clone(),
+            reload_targets,
+        );
     }
     let listener = TcpListener::bind(settings.bind).await?;
     info!(
@@ -757,6 +905,16 @@ async fn main() -> MainResult<()> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+    use axum::body::Body;
+    use axum::extract::Request;
+    use reqwest::StatusCode;
+    use talon_backend::sigv4::sign_request;
+    use talon_backend::{AmzDate, HttpRequest, Method};
+    use talon_core::{Backend, ObjectId};
+    use talon_gateway::{GatewayAccess, GatewayRequestContext, GatewayResponse, GatewayTarget};
     use tempfile::TempDir;
 
     fn settings(values: &[(&str, &str)]) -> MainResult<Settings> {
@@ -782,6 +940,7 @@ mod tests {
         assert_eq!(settings.s3_max_multipart_uploads, 1024);
         assert_eq!(settings.s3_multipart_ttl_ms, 86_400_000);
         assert!(settings.authorization_path.is_none());
+        assert_eq!(settings.auth_reload_ms, 5000);
         assert!(settings.azure_client_identities_path.is_none());
         assert_eq!(settings.azure_max_clock_skew_ms, 900_000);
         assert_eq!(settings.azure_max_block_bindings, 1024);
@@ -1014,8 +1173,446 @@ mod tests {
         )
         .unwrap();
 
-        assert!(load_s3_authenticator(&identities, "us-east-1", 900_000).is_ok());
-        assert!(load_azure_authenticator(&azure_identities, "account-a", 900_000, true).is_ok());
-        assert!(load_authorization(&authorization).is_ok());
+        let read = |path: &std::path::Path| std::fs::read(path).unwrap();
+        assert!(build_s3_authenticator(&read(&identities), "us-east-1", 900_000).is_ok());
+        assert!(
+            build_azure_authenticator(&read(&azure_identities), "account-a", 900_000, true).is_ok()
+        );
+        assert!(build_authorization(&read(&authorization)).is_ok());
+    }
+
+    #[test]
+    fn invalid_auth_files_never_echo_contents_in_errors() {
+        let leaked = br#"{"identities": ["hunter2-super-secret"]}"#;
+        // The authenticators deliberately lack Debug, so unwrap the Err side.
+        let error = build_s3_authenticator(leaked, "us-east-1", 900_000)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("hunter2-super-secret"));
+        assert!(error.contains("line 1"));
+        let error = build_azure_authenticator(leaked, "account-a", 900_000, true)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(!error.contains("hunter2-super-secret"));
+        let error = build_authorization(br#"{"grants": ["grant-blob"]}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains("grant-blob"));
+    }
+
+    #[test]
+    fn empty_identity_lists_are_rejected_and_empty_grants_deny_all() {
+        assert!(build_s3_authenticator(br#"{"identities": []}"#, "us-east-1", 900_000).is_err());
+        assert!(
+            build_azure_authenticator(br#"{"identities": []}"#, "account-a", 900_000, true)
+                .is_err()
+        );
+        assert!(build_authorization(br#"{"grants": []}"#).is_ok());
+    }
+
+    #[test]
+    fn auth_reload_interval_is_configurable_and_never_zero() {
+        let configured = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_AUTH_RELOAD_MS", "250"),
+        ])
+        .unwrap();
+        assert_eq!(configured.auth_reload_ms, 250);
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_AUTH_RELOAD_MS", "0"),
+        ])
+        .is_err());
+        assert!(settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_AUTH_RELOAD_MS", "soon"),
+        ])
+        .is_err());
+    }
+
+    struct StubAdapter;
+
+    #[async_trait]
+    impl GatewayAdapter for StubAdapter {
+        fn protocol(&self) -> ProviderProtocol {
+            ProviderProtocol::S3
+        }
+
+        fn access(
+            &self,
+            _request: &Request,
+            _context: &GatewayRequestContext,
+        ) -> Result<GatewayAccess, Box<GatewayResponse>> {
+            Ok(GatewayAccess {
+                operation: GatewayOperation::Read,
+                provider_account: Some("account-a".into()),
+                target: GatewayTarget::Object(ObjectId::new(
+                    Backend::S3,
+                    "bucket-a",
+                    "tenant/object",
+                )),
+                additional: Vec::new(),
+            })
+        }
+
+        async fn handle(
+            &self,
+            _request: Request,
+            _context: GatewayRequestContext,
+        ) -> GatewayResponse {
+            GatewayResponse::new(
+                axum::response::Response::new(Body::empty()),
+                GatewayOperation::Read,
+            )
+        }
+    }
+
+    fn identity_json(access_key: &str) -> String {
+        format!(
+            r#"{{"identities": [{{
+                "access_key_id": "{access_key}",
+                "secret_access_key": "secret-of-{access_key}",
+                "principal": "reader",
+                "provider_account": "account-a"
+            }}]}}"#
+        )
+    }
+
+    const READER_GRANTS: &str = r#"{"grants": [{
+        "id": "reader-tenant",
+        "principal": "reader",
+        "protocol": "s3",
+        "provider_account": "account-a",
+        "namespace": "bucket-a",
+        "prefix": "tenant/",
+        "operations": ["read"]
+    }]}"#;
+
+    fn dev_runtime(bind: SocketAddr) -> Arc<GatewayRuntime> {
+        Arc::new(
+            GatewayRuntime::new(
+                GatewayConfig {
+                    bind,
+                    mode: GatewayMode::Development,
+                    ..GatewayConfig::default()
+                },
+                Arc::new(StubAdapter),
+                GatewaySecurity::default(),
+            )
+            .unwrap(),
+        )
+    }
+
+    /// Gateway served over loopback with reload targets built exactly like
+    /// production `main`, plus deterministic manual polling.
+    struct LiveGateway {
+        temp: TempDir,
+        runtime: Arc<GatewayRuntime>,
+        targets: Vec<ReloadTarget>,
+        address: SocketAddr,
+        shutdown: tokio::sync::oneshot::Sender<()>,
+        server: tokio::task::JoinHandle<std::io::Result<()>>,
+    }
+
+    impl LiveGateway {
+        async fn start() -> Self {
+            let temp = TempDir::new().unwrap();
+            let identities = temp.path().join("identities.json");
+            let authorization = temp.path().join("authorization.json");
+            std::fs::write(&identities, identity_json("key-one")).unwrap();
+            std::fs::write(&authorization, READER_GRANTS).unwrap();
+            let configured = settings(&[
+                ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+                (
+                    "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH",
+                    identities.to_str().unwrap(),
+                ),
+                (
+                    "TALON_GATEWAY_AUTHORIZATION_PATH",
+                    authorization.to_str().unwrap(),
+                ),
+            ])
+            .unwrap();
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let runtime = dev_runtime(address);
+            let targets = configure_auth(&runtime, &configured).unwrap();
+            let (shutdown, shutdown_rx) = tokio::sync::oneshot::channel();
+            let server_runtime = Arc::clone(&runtime);
+            let server = tokio::spawn(async move {
+                serve(listener, server_runtime, async move {
+                    let _ = shutdown_rx.await;
+                })
+                .await
+            });
+            Self {
+                temp,
+                runtime,
+                targets,
+                address,
+                shutdown,
+                server,
+            }
+        }
+
+        fn identities_path(&self) -> PathBuf {
+            self.temp.path().join("identities.json")
+        }
+
+        fn authorization_path(&self) -> PathBuf {
+            self.temp.path().join("authorization.json")
+        }
+
+        fn poll(&mut self) {
+            let metrics = self.runtime.metrics().clone();
+            for target in &mut self.targets {
+                target.poll(&metrics);
+            }
+        }
+
+        async fn stop(self) {
+            self.shutdown.send(()).unwrap();
+            self.server.await.unwrap().unwrap();
+        }
+    }
+
+    async fn signed_status(address: SocketAddr, access_key: &str, secret_key: &str) -> StatusCode {
+        let url = format!("http://{address}/tenant/object");
+        let mut outgoing = HttpRequest::new(Method::Get, url.clone(), Vec::new());
+        sign_request(
+            &mut outgoing,
+            &S3Credentials {
+                access_key_id: access_key.into(),
+                secret_access_key: secret_key.into(),
+                session_token: None,
+            },
+            "us-east-1",
+            "s3",
+            &AmzDate::from_system_time(std::time::SystemTime::now()),
+        );
+        let mut request = reqwest::Client::new().get(&url);
+        for (name, value) in outgoing.headers {
+            if name.eq_ignore_ascii_case("host") {
+                continue; // reqwest derives the identical value from the URL
+            }
+            request = request.header(&name, &value);
+        }
+        request.send().await.unwrap().status()
+    }
+
+    fn reload_count(metrics: &GatewayMetrics, file: &str, result: &str) -> u64 {
+        let file = format!("file=\"{file}\"");
+        let result = format!("result=\"{result}\"");
+        metrics
+            .render()
+            .lines()
+            .find(|line| {
+                line.starts_with("talon_gateway_auth_reload_polls_total")
+                    && line.contains(&file)
+                    && line.contains(&result)
+            })
+            .and_then(|line| line.rsplit(' ').next()?.parse().ok())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn reload_applies_new_identities_and_rejects_removed_ones() {
+        let mut gateway = LiveGateway::start().await;
+        spawn_auth_reload(
+            Duration::from_millis(20),
+            gateway.runtime.metrics().clone(),
+            std::mem::take(&mut gateway.targets),
+        );
+        assert_eq!(
+            signed_status(gateway.address, "key-one", "secret-of-key-one").await,
+            StatusCode::OK
+        );
+
+        std::fs::write(gateway.identities_path(), identity_json("key-two")).unwrap();
+        let metrics = gateway.runtime.metrics().clone();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while reload_count(&metrics, "s3_identities", "success") == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("identity reload must be applied and counted");
+
+        assert_eq!(
+            signed_status(gateway.address, "key-two", "secret-of-key-two").await,
+            StatusCode::OK
+        );
+        assert_eq!(
+            signed_status(gateway.address, "key-one", "secret-of-key-one").await,
+            StatusCode::FORBIDDEN
+        );
+        gateway.stop().await;
+    }
+
+    #[tokio::test]
+    async fn invalid_reload_retains_last_good_and_counts_failures() {
+        let mut gateway = LiveGateway::start().await;
+        std::fs::write(gateway.identities_path(), "not json").unwrap();
+        gateway.poll();
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "s3_identities", "failure"),
+            1
+        );
+        assert_eq!(
+            signed_status(gateway.address, "key-one", "secret-of-key-one").await,
+            StatusCode::OK
+        );
+
+        // An empty identity list is invalid configuration, not deny-all.
+        std::fs::write(gateway.identities_path(), r#"{"identities": []}"#).unwrap();
+        gateway.poll();
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "s3_identities", "failure"),
+            2
+        );
+        assert_eq!(
+            signed_status(gateway.address, "key-one", "secret-of-key-one").await,
+            StatusCode::OK
+        );
+
+        // A vanished file is a failure that keeps the last-good configuration.
+        std::fs::remove_file(gateway.identities_path()).unwrap();
+        gateway.poll();
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "s3_identities", "failure"),
+            3
+        );
+
+        // Restoring the previously applied bytes reads as unchanged.
+        std::fs::write(gateway.identities_path(), identity_json("key-one")).unwrap();
+        gateway.poll();
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "s3_identities", "unchanged"),
+            1
+        );
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "s3_identities", "failure"),
+            3
+        );
+        assert_eq!(
+            signed_status(gateway.address, "key-one", "secret-of-key-one").await,
+            StatusCode::OK
+        );
+        gateway.stop().await;
+    }
+
+    #[test]
+    fn azure_identity_reload_target_swaps_and_retains() {
+        let temp = TempDir::new().unwrap();
+        let identities = temp.path().join("azure-identities.json");
+        let azure_identity = |account_key: &str| {
+            format!(
+                r#"{{"identities": [{{
+                    "account_key": "{account_key}",
+                    "principal": "azure-reader",
+                    "provider_account": "account-a"
+                }}]}}"#
+            )
+        };
+        std::fs::write(&identities, azure_identity("MDEyMzQ1Njc4OWFiY2RlZg==")).unwrap();
+        let configured = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_PROTOCOL", "azure"),
+            ("TALON_GATEWAY_AZURE_ACCOUNT", "account-a"),
+            (
+                "TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH",
+                identities.to_str().unwrap(),
+            ),
+        ])
+        .unwrap();
+        let runtime = dev_runtime("127.0.0.1:0".parse().unwrap());
+        let mut targets = configure_auth(&runtime, &configured).unwrap();
+        assert_eq!(targets.len(), 1);
+        let metrics = runtime.metrics().clone();
+
+        targets[0].poll(&metrics);
+        assert_eq!(reload_count(&metrics, "azure_identities", "unchanged"), 1);
+
+        std::fs::write(&identities, azure_identity("YWJjZGVmMDEyMzQ1Njc4OQ==")).unwrap();
+        targets[0].poll(&metrics);
+        assert_eq!(reload_count(&metrics, "azure_identities", "success"), 1);
+
+        std::fs::write(&identities, "not json").unwrap();
+        targets[0].poll(&metrics);
+        assert_eq!(reload_count(&metrics, "azure_identities", "failure"), 1);
+    }
+
+    #[test]
+    fn configure_auth_rejects_cross_protocol_identity_paths() {
+        let runtime = dev_runtime("127.0.0.1:0".parse().unwrap());
+        let azure_with_s3_path = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_PROTOCOL", "azure"),
+            (
+                "TALON_GATEWAY_S3_CLIENT_IDENTITIES_PATH",
+                "/identities.json",
+            ),
+        ])
+        .unwrap();
+        assert!(configure_auth(&runtime, &azure_with_s3_path).is_err());
+
+        let s3_with_azure_path = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            (
+                "TALON_GATEWAY_AZURE_CLIENT_IDENTITIES_PATH",
+                "/identities.json",
+            ),
+        ])
+        .unwrap();
+        assert!(configure_auth(&runtime, &s3_with_azure_path).is_err());
+    }
+
+    #[tokio::test]
+    async fn unchanged_files_still_count_reload_heartbeats() {
+        let mut gateway = LiveGateway::start().await;
+        gateway.poll();
+        gateway.poll();
+        let metrics = gateway.runtime.metrics();
+        assert_eq!(reload_count(metrics, "s3_identities", "unchanged"), 2);
+        assert_eq!(reload_count(metrics, "authorization", "unchanged"), 2);
+        assert_eq!(reload_count(metrics, "s3_identities", "success"), 0);
+        assert_eq!(reload_count(metrics, "s3_identities", "failure"), 0);
+        gateway.stop().await;
+    }
+
+    #[tokio::test]
+    async fn files_reload_independently_and_empty_grants_deny_all() {
+        let mut gateway = LiveGateway::start().await;
+        std::fs::write(gateway.identities_path(), identity_json("key-two")).unwrap();
+        std::fs::write(gateway.authorization_path(), "{").unwrap();
+        gateway.poll();
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "s3_identities", "success"),
+            1
+        );
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "authorization", "failure"),
+            1
+        );
+        // The new identity is live while the last-good policy still grants read.
+        assert_eq!(
+            signed_status(gateway.address, "key-two", "secret-of-key-two").await,
+            StatusCode::OK
+        );
+
+        // An empty grant list is a valid policy and denies every request.
+        std::fs::write(gateway.authorization_path(), r#"{"grants": []}"#).unwrap();
+        gateway.poll();
+        assert_eq!(
+            reload_count(gateway.runtime.metrics(), "authorization", "success"),
+            1
+        );
+        assert_eq!(
+            signed_status(gateway.address, "key-two", "secret-of-key-two").await,
+            StatusCode::FORBIDDEN
+        );
+        gateway.stop().await;
     }
 }
