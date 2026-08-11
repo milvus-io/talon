@@ -140,13 +140,18 @@ impl S3Backend {
         }
     }
 
-    /// Build the bucket URL (no key), used by listing.
+    /// Build the bucket URL (no key), used by listing and bucket sub-resources.
+    ///
+    /// Both styles end in a path segment, like [`Self::object_url`]: virtual-host
+    /// addressing puts the bucket in the host, leaving the root path, which must
+    /// still be written. Callers append `?query`, and a URL whose authority ran
+    /// straight into `?` would carry the query into the signed `Host` header.
     pub fn bucket_url(&self, bucket: &str) -> String {
         let scheme = if self.config.tls { "https" } else { "http" };
         if self.config.path_style {
             format!("{scheme}://{}/{bucket}", self.config.endpoint)
         } else {
-            format!("{scheme}://{bucket}.{}", self.config.endpoint)
+            format!("{scheme}://{bucket}.{}/", self.config.endpoint)
         }
     }
 
@@ -1144,6 +1149,45 @@ mod tests {
         assert!(request
             .header("authorization")
             .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256")));
+    }
+
+    #[tokio::test]
+    async fn virtual_host_bucket_requests_sign_the_bare_authority() {
+        // Virtual-host addressing leaves the bucket URL with no path segment of
+        // its own. Without the root path the appended `?query` runs straight
+        // into the authority, and the signer -- which splits the host off at the
+        // first `/` -- would carry the whole query into the signed `Host`
+        // header, so the origin resolves a bucket name that does not exist.
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(
+            S3Config {
+                region: "us-west-2".into(),
+                endpoint: "s3.us-west-2.amazonaws.com".into(),
+                path_style: false,
+                tls: true,
+            },
+            creds(),
+            http.clone(),
+        );
+        backend
+            .execute_list_v1_raw("my-bucket", "prefix/", None, None, 1000, None)
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            "https://my-bucket.s3.us-west-2.amazonaws.com/?max-keys=1000&prefix=prefix%2F",
+            "the bucket URL keeps its root path so the query stays out of the authority"
+        );
+        assert_eq!(
+            request.header("host"),
+            Some("my-bucket.s3.us-west-2.amazonaws.com"),
+            "the signed Host is the authority alone"
+        );
     }
 
     #[tokio::test]
