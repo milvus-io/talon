@@ -2,6 +2,7 @@
 
 mod audit;
 mod authorization;
+mod aws_chunked;
 pub mod azure;
 pub mod azure_auth;
 mod cache_mark;

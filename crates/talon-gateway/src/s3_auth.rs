@@ -15,6 +15,9 @@ use crate::{
 type HmacSha256 = Hmac<Sha256>;
 const ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const EMPTY_SHA256: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+/// `x-amz-content-sha256` for an unsigned aws-chunked body with a trailing
+/// checksum. Shared with the S3 adapter, which decodes that framing.
+pub(crate) const STREAMING_UNSIGNED_TRAILER: &str = "STREAMING-UNSIGNED-PAYLOAD-TRAILER";
 const MAX_PRESIGNED_EXPIRY: u64 = 7 * 24 * 60 * 60;
 
 /// One configured S3 client credential and its policy identity.
@@ -356,14 +359,17 @@ fn validate_payload_hash(request: &Request, signed: &SignedRequest) -> Result<()
             return Err(AuthFailure);
         }
     } else if signed.payload_hash != "UNSIGNED-PAYLOAD"
+        && signed.payload_hash != STREAMING_UNSIGNED_TRAILER
         && (signed.payload_hash.len() != 64
             || !signed
                 .payload_hash
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
     {
-        // Streaming SigV4 chunk modes need per-chunk verification and are not
-        // accepted as ordinary object PUTs.
+        // STREAMING-UNSIGNED-PAYLOAD-TRAILER is accepted: the adapter decodes
+        // the aws-chunked framing and verifies its declared length. Signed
+        // chunk modes (STREAMING-AWS4-HMAC-SHA256-PAYLOAD) still need per-chunk
+        // verification and remain rejected.
         return Err(AuthFailure);
     }
     Ok(())
@@ -1064,5 +1070,18 @@ mod tests {
         assert!(authenticator(None)
             .authenticate_at(&request, now())
             .is_err());
+    }
+
+    #[test]
+    fn accepts_unsigned_trailer_streaming_payload() {
+        // The AWS C++ SDK's default (STREAMING-UNSIGNED-PAYLOAD-TRAILER) must
+        // authenticate; the adapter decodes and length-checks the framing.
+        let request = signed_put("STREAMING-UNSIGNED-PAYLOAD-TRAILER");
+        assert_eq!(
+            authenticator(None)
+                .authenticate_at(&request, now())
+                .unwrap(),
+            AuthenticatedPrincipal::new("reader", "account-a")
+        );
     }
 }

@@ -1710,6 +1710,221 @@ fn unix_millis() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// A write body prepared for one origin request.
+enum WriteBody {
+    /// Streamed to the origin as `UNSIGNED-PAYLOAD` (a plain unsigned body, or
+    /// an aws-chunked body already decoded to its payload).
+    Stream {
+        body: HttpRequestBody,
+        len: u64,
+        payload_hash: String,
+    },
+    /// A declared-SHA-256 body spooled and verified before dispatch.
+    Spool {
+        spool: tempfile::NamedTempFile,
+        len: u64,
+        hash: String,
+    },
+}
+
+impl WriteBody {
+    fn len(&self) -> u64 {
+        match self {
+            Self::Stream { len, .. } | Self::Spool { len, .. } => *len,
+        }
+    }
+}
+
+/// Resolve the sanitized origin headers and forwardable body for a PutObject or
+/// UploadPart request, covering all three payload declarations: plain
+/// `UNSIGNED-PAYLOAD` (streamed), a hex SHA-256 (spooled and verified), and
+/// `STREAMING-UNSIGNED-PAYLOAD-TRAILER` (aws-chunked framing decoded to its
+/// payload, then streamed as `UNSIGNED-PAYLOAD`).
+async fn prepare_write_body(
+    request: Request,
+) -> Result<(Vec<(String, String)>, WriteBody), S3RequestError> {
+    let payload_hash = payload_declaration(&request)?;
+    if payload_hash == crate::s3_auth::STREAMING_UNSIGNED_TRAILER {
+        let len = decoded_content_length(request.headers())?;
+        let algorithm = declared_trailer_algorithm(request.headers())?;
+        let headers = strip_aws_chunked_encoding(mutation_headers(request.headers(), false)?);
+        let raw = request
+            .into_body()
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(|error| error.to_string()));
+        // Decode and verify into a spool: the trailer checksum arrives after
+        // the payload, so the whole body is verified before the origin is
+        // dispatched. A length or checksum mismatch fails closed here as a 4xx
+        // rather than a partial object at the origin.
+        let decoded = crate::aws_chunked::decode_aws_chunked(raw, len, algorithm);
+        let spool = spool_decoded(decoded, len).await?;
+        return Ok((
+            headers,
+            WriteBody::Spool {
+                spool,
+                len,
+                hash: "UNSIGNED-PAYLOAD".into(),
+            },
+        ));
+    }
+    let len = single_content_length(request.headers())?;
+    let headers = mutation_headers(request.headers(), false)?;
+    if payload_hash == "UNSIGNED-PAYLOAD" {
+        let body = request
+            .into_body()
+            .into_data_stream()
+            .map(|chunk| chunk.map_err(|error| error.to_string()));
+        Ok((
+            headers,
+            WriteBody::Stream {
+                body: Box::pin(body),
+                len,
+                payload_hash,
+            },
+        ))
+    } else {
+        let body = request.into_body().into_data_stream();
+        let (spool, actual_hash) = spool_and_hash(body, len).await?;
+        if actual_hash != payload_hash {
+            return Err(S3RequestError::invalid(
+                "XAmzContentSHA256Mismatch",
+                "The provided payload hash does not match the request body",
+            ));
+        }
+        Ok((
+            headers,
+            WriteBody::Spool {
+                spool,
+                len,
+                hash: actual_hash,
+            },
+        ))
+    }
+}
+
+/// Read the authoritative decoded length of an aws-chunked body. It replaces
+/// `Content-Length`, which the framing removes, so a missing value is refused
+/// rather than guessed, and a duplicated one is refused just like
+/// `Content-Length` itself.
+fn decoded_content_length(headers: &HeaderMap) -> Result<u64, S3RequestError> {
+    let mut values = headers.get_all("x-amz-decoded-content-length").iter();
+    let value = values.next().ok_or_else(|| {
+        S3RequestError::invalid(
+            "MissingContentLength",
+            "x-amz-decoded-content-length is required for an aws-chunked body",
+        )
+    })?;
+    if values.next().is_some() {
+        return Err(S3RequestError::invalid(
+            "InvalidArgument",
+            "x-amz-decoded-content-length must occur exactly once",
+        ));
+    }
+    value
+        .to_str()
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            S3RequestError::invalid("InvalidArgument", "x-amz-decoded-content-length is invalid")
+        })
+}
+
+/// Resolve the checksum algorithm the client promised in `x-amz-trailer`.
+/// `None` means the body carries no trailer checksum. A declared algorithm the
+/// gateway cannot compute is rejected before dispatch rather than skipped.
+fn declared_trailer_algorithm(
+    headers: &HeaderMap,
+) -> Result<Option<crate::aws_chunked::ChecksumAlgorithm>, S3RequestError> {
+    let Some(value) = headers.get("x-amz-trailer") else {
+        return Ok(None);
+    };
+    let name = value
+        .to_str()
+        .map_err(|_| S3RequestError::invalid("InvalidArgument", "x-amz-trailer is invalid"))?;
+    // aws-chunked declares exactly one trailer for the flexible checksum.
+    match crate::aws_chunked::ChecksumAlgorithm::from_trailer_name(name) {
+        Some(algorithm) => Ok(Some(algorithm)),
+        None => Err(S3RequestError::invalid(
+            "InvalidRequest",
+            "the declared aws-chunked trailer checksum is not supported",
+        )),
+    }
+}
+
+/// Consume a decoded aws-chunked stream into a spool file, mapping decode and
+/// verification failures to S3 client errors so they are rejected before the
+/// origin is dispatched.
+async fn spool_decoded<S>(
+    mut decoded: S,
+    expected_len: u64,
+) -> Result<tempfile::NamedTempFile, S3RequestError>
+where
+    S: Stream<Item = Result<Bytes, crate::aws_chunked::ChunkDecodeError>> + Unpin,
+{
+    use crate::aws_chunked::ChunkDecodeError;
+    let spool = tempfile::NamedTempFile::new()
+        .map_err(|_| S3RequestError::internal("could not create upload spool"))?;
+    let file = spool
+        .reopen()
+        .map_err(|_| S3RequestError::internal("could not open upload spool"))?;
+    let mut file = tokio::fs::File::from_std(file);
+    let mut received = 0u64;
+    while let Some(chunk) = decoded.next().await {
+        let chunk = chunk.map_err(|error| match error {
+            ChunkDecodeError::ChecksumMismatch => S3RequestError::invalid(
+                "BadDigest",
+                "The aws-chunked trailer checksum did not match the payload",
+            ),
+            ChunkDecodeError::LengthMismatch { .. } | ChunkDecodeError::MissingChecksum => {
+                S3RequestError::invalid(
+                    "IncompleteBody",
+                    "The aws-chunked body did not match its declared length or checksum",
+                )
+            }
+            ChunkDecodeError::Malformed(_) | ChunkDecodeError::Source(_) => {
+                S3RequestError::invalid("InvalidArgument", "The aws-chunked body is malformed")
+            }
+        })?;
+        received = received.saturating_add(chunk.len() as u64);
+        file.write_all(&chunk)
+            .await
+            .map_err(|_| S3RequestError::internal("could not spool upload body"))?;
+    }
+    debug_assert_eq!(
+        received, expected_len,
+        "decoder enforces the decoded length"
+    );
+    let _ = expected_len;
+    file.flush()
+        .await
+        .map_err(|_| S3RequestError::internal("could not flush upload spool"))?;
+    Ok(spool)
+}
+
+/// Remove the `aws-chunked` token from a forwarded `content-encoding` header so
+/// the origin is not told the decoded payload is still chunk-framed. Any other
+/// encodings (a real object `content-encoding`) are preserved.
+fn strip_aws_chunked_encoding(headers: Vec<(String, String)>) -> Vec<(String, String)> {
+    headers
+        .into_iter()
+        .filter_map(|(name, value)| {
+            if !name.eq_ignore_ascii_case("content-encoding") {
+                return Some((name, value));
+            }
+            let kept: Vec<&str> = value
+                .split(',')
+                .map(str::trim)
+                .filter(|token| !token.eq_ignore_ascii_case("aws-chunked") && !token.is_empty())
+                .collect();
+            if kept.is_empty() {
+                None
+            } else {
+                Some((name, kept.join(",")))
+            }
+        })
+        .collect()
+}
+
 async fn spool_and_hash<S>(
     mut body: S,
     expected_len: u64,
@@ -2066,46 +2281,43 @@ impl S3Adapter {
             }
             return Ok(response);
         }
-        let len = single_content_length(request.headers())?;
-        let payload_hash = payload_declaration(&request)?;
-        let headers = mutation_headers(request.headers(), false)?;
-        let body = request.into_body().into_data_stream();
-        let response = if payload_hash == "UNSIGNED-PAYLOAD" {
-            let body = body.map(|chunk| chunk.map_err(|error| error.to_string()));
-            self.origin
-                .multipart_body(
-                    S3MultipartRequest {
-                        method: Method::Put,
-                        object: &object,
-                        query: &query,
-                        headers: &headers,
-                    },
-                    Box::pin(body),
-                    len,
-                    &payload_hash,
-                )
-                .await
-        } else {
-            let (spool, actual_hash) = spool_and_hash(body, len).await?;
-            if actual_hash != payload_hash {
-                return Err(S3RequestError::invalid(
-                    "XAmzContentSHA256Mismatch",
-                    "The provided payload hash does not match the request body",
-                ));
+        let (headers, body) = prepare_write_body(request).await?;
+        let len = body.len();
+        let response = match body {
+            WriteBody::Stream {
+                body,
+                len,
+                payload_hash,
+            } => {
+                self.origin
+                    .multipart_body(
+                        S3MultipartRequest {
+                            method: Method::Put,
+                            object: &object,
+                            query: &query,
+                            headers: &headers,
+                        },
+                        body,
+                        len,
+                        &payload_hash,
+                    )
+                    .await
             }
-            self.origin
-                .multipart_file(
-                    S3MultipartRequest {
-                        method: Method::Put,
-                        object: &object,
-                        query: &query,
-                        headers: &headers,
-                    },
-                    spool.path(),
-                    len,
-                    &actual_hash,
-                )
-                .await
+            WriteBody::Spool { spool, len, hash } => {
+                self.origin
+                    .multipart_file(
+                        S3MultipartRequest {
+                            method: Method::Put,
+                            object: &object,
+                            query: &query,
+                            headers: &headers,
+                        },
+                        spool.path(),
+                        len,
+                        &hash,
+                    )
+                    .await
+            }
         }
         .map_err(|_| S3RequestError::indeterminate_commit())?;
         let mut response = raw_response(
@@ -2264,26 +2476,23 @@ impl S3Adapter {
         if copy_source(request.headers())?.is_some() {
             return self.copy(object, request.headers(), context).await;
         }
-        let len = single_content_length(request.headers())?;
-        let payload_hash = payload_declaration(&request)?;
-        let headers = mutation_headers(request.headers(), false)?;
-        let body = request.into_body().into_data_stream();
-        let response = if payload_hash == "UNSIGNED-PAYLOAD" {
-            let body = body.map(|chunk| chunk.map_err(|error| error.to_string()));
-            self.origin
-                .put_body(&object, &headers, Box::pin(body), len, &payload_hash)
-                .await
-        } else {
-            let (spool, actual_hash) = spool_and_hash(body, len).await?;
-            if actual_hash != payload_hash {
-                return Err(S3RequestError::invalid(
-                    "XAmzContentSHA256Mismatch",
-                    "The provided payload hash does not match the request body",
-                ));
+        let (headers, body) = prepare_write_body(request).await?;
+        let len = body.len();
+        let response = match body {
+            WriteBody::Stream {
+                body,
+                len,
+                payload_hash,
+            } => {
+                self.origin
+                    .put_body(&object, &headers, body, len, &payload_hash)
+                    .await
             }
-            self.origin
-                .put_file(&object, &headers, spool.path(), len, &actual_hash)
-                .await
+            WriteBody::Spool { spool, len, hash } => {
+                self.origin
+                    .put_file(&object, &headers, spool.path(), len, &hash)
+                    .await
+            }
         }
         .map_err(|_| S3RequestError::indeterminate_commit())?;
         if response.is_success() {
@@ -3910,6 +4119,141 @@ mod tests {
             &[("x-amz-meta-owner".into(), "team-a".into())]
         );
         assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_trailer_put_decodes_framing_before_the_origin() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: vec![("etag".into(), "\"v1\"".into())],
+            body: Bytes::new(),
+        }));
+        // Two aws-chunked frames wrapping "hello world", with a real sha256
+        // trailer checksum, exactly as an AWS SDK sends by default.
+        let wire = concat!(
+            "6\r\nhello \r\n",
+            "5\r\nworld\r\n",
+            "0\r\n",
+            "x-amz-checksum-sha256:uU0nuZNNPgilLlLX2n2r+sSE7+N6U4DukIj3rOLvzek=\r\n\r\n",
+        );
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .header("x-amz-decoded-content-length", "11")
+            .header("content-encoding", "aws-chunked")
+            .header("x-amz-trailer", "x-amz-checksum-sha256")
+            .header("x-amz-meta-owner", "team-a")
+            .body(Body::from(wire))
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin))
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(
+            origin.body.lock().unwrap().as_slice(),
+            b"hello world",
+            "the origin must receive the decoded payload, not the framing"
+        );
+        let forwarded = origin.headers.lock().unwrap().clone();
+        assert!(
+            !forwarded
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case("content-encoding")),
+            "the aws-chunked content-encoding must not reach the origin: {forwarded:?}"
+        );
+        assert!(forwarded
+            .iter()
+            .any(|(name, value)| name == "x-amz-meta-owner" && value == "team-a"));
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn streaming_trailer_put_without_decoded_length_is_refused() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .body(Body::from("6\r\nhello \r\n0\r\n\r\n"))
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin))
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_trailer_put_with_a_wrong_checksum_never_reaches_the_origin() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        // Correct framing and length, but the trailer checksum is wrong.
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .header("x-amz-decoded-content-length", "11")
+            .header("x-amz-trailer", "x-amz-checksum-sha256")
+            .body(Body::from(
+                "b\r\nhello world\r\n0\r\nx-amz-checksum-sha256:AAAA\r\n\r\n",
+            ))
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin))
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "a corrupt payload must be rejected before the origin, not stored"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn streaming_trailer_put_with_an_unsupported_algorithm_is_refused() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let request = Request::builder()
+            .method("PUT")
+            .uri("/bucket/key")
+            .header(header::HOST, "localhost")
+            .header("x-amz-content-sha256", "STREAMING-UNSIGNED-PAYLOAD-TRAILER")
+            .header("x-amz-decoded-content-length", "11")
+            .header("x-amz-trailer", "x-amz-checksum-md5")
+            .body(Body::from("b\r\nhello world\r\n0\r\n\r\n"))
+            .unwrap();
+        let response = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin))
+            .handle(request, context())
+            .await;
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

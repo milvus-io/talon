@@ -23,6 +23,7 @@ async-trait.workspace = true
 axum.workspace = true
 base64 = "0.22"
 bytes.workspace = true
+crc = "3.2"
 futures.workspace = true
 http-body-util.workspace = true
 httpdate.workspace = true

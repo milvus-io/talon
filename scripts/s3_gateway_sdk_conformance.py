@@ -4,11 +4,15 @@ import base64
 import hashlib
 import io
 import os
+import urllib.error
 import urllib.request
 from urllib.parse import urlparse
 
 import boto3
+from botocore.auth import SigV4Auth
+from botocore.awsrequest import AWSRequest
 from botocore.client import Config
+from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 from minio import Minio
 from minio.commonconfig import CopySource
@@ -156,6 +160,82 @@ def main() -> None:
 
     s3.put_object(Bucket=bucket, Key=mutation_key, Body=second_body)
     assert s3.get_object(Bucket=bucket, Key=mutation_key)["Body"].read() == second_body
+
+    # Streaming aws-chunked upload (STREAMING-UNSIGNED-PAYLOAD-TRAILER), the
+    # AWS C++ SDK's default write framing. boto3 pre-hashes an in-memory body
+    # into a header checksum, so the framing is built and SigV4-signed by hand
+    # to exercise the gateway's decoder and checksum verifier with real signed
+    # trailer traffic. Both sha256 and crc64nvme (the AWS SDK default and this
+    # feature's motivating algorithm) are driven end to end.
+    trailer_payload = b"streamed-through-the-aws-chunked-decoder-" * 64
+
+    def crc64nvme(data):
+        # CRC-64/NVME (reflected poly 0x9a6c9329ac4bc9b5), the AWS SDK default.
+        crc = 0xFFFFFFFFFFFFFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ (0x9A6C9329AC4BC9B5 & -(crc & 1))
+            crc &= 0xFFFFFFFFFFFFFFFF
+        return crc ^ 0xFFFFFFFFFFFFFFFF
+
+    def trailer_checksum(payload, algorithm):
+        if algorithm == "sha256":
+            return base64.b64encode(hashlib.sha256(payload).digest()).decode()
+        if algorithm == "crc64nvme":
+            return base64.b64encode(crc64nvme(payload).to_bytes(8, "big")).decode()
+        raise ValueError(algorithm)
+
+    def signed_trailer_put(key, payload, algorithm, checksum):
+        framed = bytearray()
+        framed += f"{len(payload):x}\r\n".encode() + payload + b"\r\n0\r\n"
+        framed += f"x-amz-checksum-{algorithm}:{checksum}\r\n\r\n".encode()
+        request = AWSRequest(
+            method="PUT",
+            url=f"{gateway_endpoint}/{bucket}/{key}",
+            data=bytes(framed),
+            headers={
+                "host": urlparse(gateway_endpoint).netloc,
+                "x-amz-content-sha256": "STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+                "x-amz-decoded-content-length": str(len(payload)),
+                "content-encoding": "aws-chunked",
+                "x-amz-trailer": f"x-amz-checksum-{algorithm}",
+                "content-length": str(len(framed)),
+            },
+        )
+        SigV4Auth(Credentials(access_key, secret_key), "s3", region).add_auth(request)
+        prepared = request.prepare()
+        return urllib.request.Request(
+            prepared.url, data=prepared.body, headers=dict(prepared.headers), method="PUT"
+        )
+
+    for algorithm in ("sha256", "crc64nvme"):
+        key = f"gateway/mutations/aws-chunked-{algorithm}.bin"
+        checksum = trailer_checksum(trailer_payload, algorithm)
+        with urllib.request.urlopen(
+            signed_trailer_put(key, trailer_payload, algorithm, checksum)
+        ) as response:
+            assert response.status == 200, (algorithm, response.status)
+        assert (
+            s3.get_object(Bucket=bucket, Key=key)["Body"].read() == trailer_payload
+        ), f"{algorithm}: origin must store the decoded payload, not the framing"
+        s3.delete_object(Bucket=bucket, Key=key)
+
+    # A corrupt trailer checksum must be rejected at the gateway, never stored.
+    corrupt_key = "gateway/mutations/aws-chunked-corrupt.bin"
+    try:
+        urllib.request.urlopen(
+            signed_trailer_put(corrupt_key, trailer_payload, "sha256", "AAAA")
+        )
+        raise AssertionError("a wrong trailer checksum was accepted")
+    except urllib.error.HTTPError as error:
+        assert error.code == 400, error.code
+    try:
+        s3.head_object(Bucket=bucket, Key=corrupt_key)
+        raise AssertionError("a checksum-mismatched object was stored")
+    except ClientError as error:
+        assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
     copied = s3.copy_object(
         Bucket=bucket,
         Key=copy_key,
