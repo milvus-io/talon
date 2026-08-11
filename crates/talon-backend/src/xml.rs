@@ -1,5 +1,12 @@
 //! A minimal reader for the XML shapes S3 and Azure listings return.
 //!
+//! This reader is deliberately lenient: it scans for the elements it wants and
+//! ignores everything around them, which suits a response from the origin this
+//! process authenticated to. It must not be used on a client-supplied body,
+//! where a construct skipped here but honored by the origin's parser would let
+//! the two disagree about what the request said — see the gateway's strict
+//! `s3_delete_xml` reader for that case.
+//!
 //! Both backends answer listings with XML, and neither response needs a general
 //! parser: the documents are flat sequences of elements with text content, and
 //! the fields wanted are a handful of known tag names. Pulling in a full XML

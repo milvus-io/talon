@@ -19,7 +19,9 @@ use tower::limit::ConcurrencyLimitLayer;
 use tower_http::timeout::TimeoutBody;
 
 use crate::audit::{GatewayAuditSink, SecurityAuditEvent, TracingAuditSink};
-use crate::authorization::{AuthenticatedPrincipal, AuthorizationPolicy, GatewayAuthenticator};
+use crate::authorization::{
+    AuthenticatedPrincipal, AuthorizationPolicy, AuthorizationTelemetry, GatewayAuthenticator,
+};
 use crate::config::{GatewayConfig, GatewayConfigError, GatewayMode, GatewaySecurity};
 use crate::metrics::{GatewayMetrics, RequestObservation, ResponseObserver};
 use crate::model::{
@@ -196,8 +198,11 @@ impl GatewayRuntime {
     }
 
     fn audit(&self, event: SecurityAuditEvent) {
-        let sink = self.audit.read().unwrap().clone();
-        sink.record(event);
+        self.audit_sink().record(event);
+    }
+
+    fn audit_sink(&self) -> Arc<dyn GatewayAuditSink> {
+        self.audit.read().unwrap().clone()
     }
 }
 
@@ -406,27 +411,42 @@ async fn adapter_handler(
         runtime.metrics.record_authentication("success");
     }
     let policy = runtime.authorization.read().unwrap().clone();
-    if let Some(policy) = &policy {
+    // One snapshot per request: the pre-dispatch check below and any deferred
+    // per-object check inside the adapter evaluate the same compiled grants,
+    // so an authorization reload cannot split one request across two policies.
+    let authorization = match (policy.as_ref(), authenticated.as_ref()) {
+        (Some(policy), Some(principal)) => Some(
+            policy
+                .bind(principal.clone(), protocol, &context.request_id)
+                .with_telemetry(AuthorizationTelemetry {
+                    metrics: runtime.metrics.clone(),
+                    audit: runtime.audit_sink(),
+                }),
+        ),
+        _ => None,
+    };
+    if policy.is_some() {
         let access = match runtime.adapter.access(&request, &context) {
             Ok(access) => access,
             Err(result) => return record_adapter_result(&runtime, protocol, &context, *result),
         };
-        if authenticated.as_ref().map_or(true, |principal| {
-            !policy.allows(principal, protocol, &access)
-        }) {
-            runtime.metrics.record_authorization("deny");
-            runtime.audit(SecurityAuditEvent::new(
-                &context.request_id,
-                protocol,
-                authenticated.as_ref(),
-                Some(&access),
-                "deny",
-                if authenticated.is_some() {
-                    "policy_denied"
-                } else {
-                    "missing_identity"
-                },
-            ));
+        let allowed = authorization
+            .as_ref()
+            .is_some_and(|authorization| authorization.allows(&access, "policy_denied"));
+        if !allowed {
+            if authorization.is_none() {
+                // No identity to bind, so the denial has no authorization
+                // capability to record it.
+                runtime.metrics.record_authorization("deny");
+                runtime.audit(SecurityAuditEvent::new(
+                    &context.request_id,
+                    protocol,
+                    authenticated.as_ref(),
+                    Some(&access),
+                    "deny",
+                    "missing_identity",
+                ));
+            }
             let result = GatewayResponse {
                 response: (StatusCode::FORBIDDEN, "request is not authorized").into_response(),
                 operation: access.operation,
@@ -440,20 +460,15 @@ async fn adapter_handler(
             };
             return record_adapter_result(&runtime, protocol, &context, result);
         }
-        runtime.metrics.record_authorization("allow");
-        runtime.audit(SecurityAuditEvent::new(
-            &context.request_id,
-            protocol,
-            authenticated.as_ref(),
-            Some(&access),
-            "allow",
-            "policy_allowed",
-        ));
+        if let Some(authorization) = authorization.as_ref() {
+            authorization.record_allow(&access, "policy_allowed");
+        }
     }
-    // Handlers that authorize body-named objects (S3 DeleteObjects) re-check
-    // each object against the same per-request policy snapshot.
-    if let Some(policy) = policy {
-        request.extensions_mut().insert(policy);
+    // Adapters that authorize objects named only in the request body (S3
+    // DeleteObjects) complete the decision with this capability, so those
+    // denials are counted and audited exactly like the check above.
+    if let Some(authorization) = authorization {
+        request.extensions_mut().insert(authorization);
     }
     if let Some(principal) = authenticated {
         request.extensions_mut().insert(principal);
@@ -1068,6 +1083,151 @@ mod tests {
             assert!(!rendered.contains("principal-a"));
             assert!(!rendered.contains("account-a"));
         }
+    }
+
+    /// An adapter whose objects are named in the request body, standing in for
+    /// the S3 DeleteObjects shape: the pre-dispatch check sees only the
+    /// namespace, and the handler completes the decision per object.
+    struct BodyObjectAdapter {
+        authorized: AtomicUsize,
+        denied: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl GatewayAdapter for BodyObjectAdapter {
+        fn protocol(&self) -> crate::ProviderProtocol {
+            crate::ProviderProtocol::S3
+        }
+
+        fn access(
+            &self,
+            _request: &Request,
+            _context: &GatewayRequestContext,
+        ) -> Result<GatewayAccess, Box<GatewayResponse>> {
+            Ok(GatewayAccess {
+                operation: GatewayOperation::Delete,
+                provider_account: None,
+                target: GatewayTarget::NamespaceBodyObjects {
+                    backend: Backend::S3,
+                    namespace: "bucket-a".into(),
+                },
+                additional: Vec::new(),
+            })
+        }
+
+        async fn handle(
+            &self,
+            request: Request,
+            _context: GatewayRequestContext,
+        ) -> GatewayResponse {
+            let authorization = request
+                .extensions()
+                .get::<crate::authorization::RequestAuthorization>()
+                .cloned()
+                .expect("an installed policy binds a per-request authorization");
+            for key in request.uri().path().trim_start_matches('/').split(',') {
+                let access = GatewayAccess {
+                    operation: GatewayOperation::Delete,
+                    provider_account: None,
+                    target: GatewayTarget::Object(ObjectId::new(Backend::S3, "bucket-a", key)),
+                    additional: Vec::new(),
+                };
+                if !authorization.allows(&access, "policy_denied_object") {
+                    self.denied.fetch_add(1, Ordering::SeqCst);
+                    return GatewayResponse {
+                        response: (StatusCode::FORBIDDEN, "denied").into_response(),
+                        operation: GatewayOperation::Delete,
+                        target: None,
+                        route: GatewayRoute::None,
+                        outcome: GatewayOutcome::Failed,
+                        failure: Some(FailureReason::Authorization),
+                        requested_bytes: 0,
+                        cache_bytes: 0,
+                        origin_bytes: 0,
+                    };
+                }
+            }
+            self.authorized.fetch_add(1, Ordering::SeqCst);
+            GatewayResponse::new(
+                (StatusCode::OK, "deleted").into_response(),
+                GatewayOperation::Delete,
+            )
+        }
+    }
+
+    #[tokio::test]
+    async fn body_named_objects_are_authorized_per_object_and_audited() {
+        let adapter = Arc::new(BodyObjectAdapter {
+            authorized: AtomicUsize::new(0),
+            denied: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with(
+            GatewayConfig::default(),
+            adapter.clone(),
+            GatewaySecurity::default(),
+        );
+        runtime.install_authorization(
+            AuthorizationPolicy::new(vec![AuthorizationGrant {
+                id: "delete-tenant".into(),
+                principal: "principal-a".into(),
+                protocol: crate::ProviderProtocol::S3,
+                provider_account: "account-a".into(),
+                namespace: "bucket-a".into(),
+                prefix: Some("tenant/".into()),
+                operations: vec![GatewayOperation::Delete],
+            }])
+            .unwrap(),
+        );
+        let audit = Arc::new(CapturingAuditSink::default());
+        runtime.install_audit_sink(audit.clone());
+        let app = gateway_router(Arc::clone(&runtime));
+
+        let deny = |uri: &str| {
+            let mut request = HttpRequest::get(uri).body(Body::empty()).unwrap();
+            request
+                .extensions_mut()
+                .insert(AuthenticatedPrincipal::new("principal-a", "account-a"));
+            request
+        };
+
+        // A prefixed grant passes the namespace pre-check, so only the
+        // per-object loop can reject the uncovered key.
+        let response = app
+            .clone()
+            .oneshot(deny("/tenant/a,other/b"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(adapter.denied.load(Ordering::SeqCst), 1);
+        assert_eq!(adapter.authorized.load(Ordering::SeqCst), 0);
+
+        let response = app.oneshot(deny("/tenant/a,tenant/b")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(adapter.authorized.load(Ordering::SeqCst), 1);
+
+        let events = audit.0.lock().unwrap();
+        let decisions: Vec<_> = events
+            .iter()
+            .map(|event| (event.decision, event.reason))
+            .collect();
+        assert_eq!(
+            decisions,
+            vec![
+                ("allow", "policy_allowed"),
+                ("deny", "policy_denied_object"),
+                ("allow", "policy_allowed"),
+            ],
+            "a deferred denial is audited, and its reason distinguishes it \
+             from the pre-dispatch decision"
+        );
+        for event in events.iter() {
+            let rendered = format!("{event:?}");
+            assert!(!rendered.contains("tenant/"));
+            assert!(!rendered.contains("principal-a"));
+        }
+        let metrics = runtime.metrics().render();
+        assert!(metrics.contains("decision=\"deny\""));
+        assert!(!metrics.contains("tenant/"));
     }
 
     #[tokio::test]

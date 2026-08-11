@@ -88,30 +88,104 @@ impl AuthorizationPolicy {
         Ok(())
     }
 
-    pub(crate) fn allows(
+    /// Bind the currently published policy to one request. Both the runtime's
+    /// pre-dispatch check and any deferred adapter check then evaluate the
+    /// same compiled grants, so a reload cannot split one request across two
+    /// policies.
+    pub(crate) fn bind(
         &self,
-        principal: &AuthenticatedPrincipal,
+        principal: AuthenticatedPrincipal,
         protocol: ProviderProtocol,
-        access: &GatewayAccess,
-    ) -> bool {
-        let current = self.current.read().unwrap().clone();
-        allows_requirement(
-            &current,
+        request_id: &str,
+    ) -> RequestAuthorization {
+        RequestAuthorization {
+            policy: self.current.read().unwrap().clone(),
             principal,
             protocol,
+            request_id: request_id.to_string(),
+            telemetry: None,
+        }
+    }
+}
+
+/// One request's authorization capability: the compiled policy snapshot bound
+/// to the authenticated principal, plus the decision telemetry the gateway
+/// owes for every decision.
+///
+/// Adapters that must authorize resources named in a request body — which
+/// [`GatewayAccess`] cannot describe before the body is read — receive this
+/// rather than the policy itself. They can ask whether one access is allowed;
+/// they cannot read grants, choose a different principal, or make a decision
+/// that escapes the audit trail.
+#[derive(Clone)]
+pub(crate) struct RequestAuthorization {
+    policy: Arc<CompiledPolicy>,
+    principal: AuthenticatedPrincipal,
+    protocol: ProviderProtocol,
+    request_id: String,
+    telemetry: Option<AuthorizationTelemetry>,
+}
+
+/// Where a decision is counted and recorded. Absent in unit tests that
+/// exercise policy semantics without a runtime.
+#[derive(Clone)]
+pub(crate) struct AuthorizationTelemetry {
+    pub(crate) metrics: crate::GatewayMetrics,
+    pub(crate) audit: Arc<dyn crate::GatewayAuditSink>,
+}
+
+impl RequestAuthorization {
+    pub(crate) fn with_telemetry(mut self, telemetry: AuthorizationTelemetry) -> Self {
+        self.telemetry = Some(telemetry);
+        self
+    }
+
+    /// Evaluate one access against this request's policy snapshot, recording
+    /// the outcome. `reason` labels the decision site so a deferred per-object
+    /// denial is distinguishable in the audit trail from the pre-dispatch one.
+    pub(crate) fn allows(&self, access: &GatewayAccess, reason: &'static str) -> bool {
+        let allowed = allows_requirement(
+            &self.policy,
+            &self.principal,
+            self.protocol,
             access.operation,
             access.provider_account.as_deref(),
             &access.target,
         ) && access.additional.iter().all(|requirement| {
             allows_requirement(
-                &current,
-                principal,
-                protocol,
+                &self.policy,
+                &self.principal,
+                self.protocol,
                 requirement.operation,
                 requirement.provider_account.as_deref(),
                 &requirement.target,
             )
-        })
+        });
+        if !allowed {
+            self.record("deny", reason, access);
+        }
+        allowed
+    }
+
+    /// Record an allow for a decision the caller already made, so the
+    /// pre-dispatch allow and any deferred denial share one code path.
+    pub(crate) fn record_allow(&self, access: &GatewayAccess, reason: &'static str) {
+        self.record("allow", reason, access);
+    }
+
+    fn record(&self, decision: &'static str, reason: &'static str, access: &GatewayAccess) {
+        let Some(telemetry) = self.telemetry.as_ref() else {
+            return;
+        };
+        telemetry.metrics.record_authorization(decision);
+        telemetry.audit.record(crate::SecurityAuditEvent::new(
+            &self.request_id,
+            self.protocol,
+            Some(&self.principal),
+            Some(access),
+            decision,
+            reason,
+        ));
     }
 }
 
@@ -249,6 +323,20 @@ pub enum AuthorizationPolicyError {
 mod tests {
     use super::*;
     use talon_core::ObjectId;
+
+    /// Policy semantics without a runtime: bind the snapshot to the principal
+    /// and evaluate one access, as `adapter_handler` does per request.
+    impl AuthorizationPolicy {
+        fn allows(
+            &self,
+            principal: &AuthenticatedPrincipal,
+            protocol: ProviderProtocol,
+            access: &GatewayAccess,
+        ) -> bool {
+            self.bind(principal.clone(), protocol, "test-request")
+                .allows(access, "policy_denied")
+        }
+    }
 
     fn grant(prefix: Option<&str>) -> AuthorizationGrant {
         AuthorizationGrant {

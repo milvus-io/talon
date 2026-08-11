@@ -21,14 +21,26 @@ use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER
 use talon_core::{Backend, ObjectId, Version};
 use tokio::io::AsyncWriteExt;
 
+use crate::authorization::RequestAuthorization;
+use crate::s3_delete_xml::{parse_delete_objects, DeleteXmlError};
 use crate::{
-    AuthenticatedPrincipal, AuthorizationPolicy, EffectiveDecision, FailureReason, GatewayAccess,
+    AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess,
     GatewayAccessRequirement, GatewayAdapter, GatewayOperation, GatewayOutcome,
     GatewayRequestContext, GatewayResponse, GatewayRoute, GatewayTarget, ProviderProtocol,
     S3_CACHE_MARK_HEADER,
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Ceiling on a DeleteObjects body, which is the one request body the gateway
+/// must hold in memory: it is parsed to authorize each key and then forwarded
+/// unchanged, so it can neither stream nor spool. Derived from the protocol
+/// rather than configured — the largest legitimate document, 1000 keys of
+/// 1024 bytes with every byte entity-escaped plus framing, stays under it —
+/// which also keeps the path independent of the object-upload body limit an
+/// operator may raise for large writes.
+const MAX_DELETE_OBJECTS_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 type CacheStream = Pin<Box<dyn Stream<Item = Result<Bytes, CacheReadError>> + Send>>;
 
 /// Exact cache range requested by the S3 adapter.
@@ -697,261 +709,19 @@ fn require_delete_objects_shape(query: &S3Query) -> Result<(), S3RequestError> {
     Ok(())
 }
 
-/// The S3 DeleteObjects limit on objects per request.
-const MAX_DELETE_OBJECTS_KEYS: usize = 1000;
-
-/// Ceiling on a DeleteObjects body, which is the one request body the gateway
-/// must hold in memory: it is parsed to authorize each key and then forwarded
-/// unchanged, so it can neither stream nor spool. The largest legitimate
-/// document — 1000 keys of 1024 bytes with every byte entity-escaped, plus
-/// framing — stays under this, while the limit keeps the path independent of
-/// the object-upload body cap an operator may raise for large writes.
-const MAX_DELETE_OBJECTS_BODY_BYTES: u64 = 8 * 1024 * 1024;
-
-fn malformed_delete_xml(message: &'static str) -> S3RequestError {
-    S3RequestError::invalid("MalformedXML", message)
-}
-
-/// Parse a DeleteObjects `<Delete>` document into its object keys.
-///
-/// The gateway authorizes exactly the keys it parses and then forwards the
-/// body unchanged, so any construct this parser and the origin's XML parser
-/// could interpret differently — doctypes, comments, CDATA, processing
-/// instructions, unknown elements, unresolved entities — fails closed
-/// instead of being skipped.
-fn parse_delete_objects(body: &[u8]) -> Result<Vec<String>, S3RequestError> {
-    let text = std::str::from_utf8(body)
-        .map_err(|_| malformed_delete_xml("the request body is not valid UTF-8"))?;
-    let mut input = skip_xml_whitespace(text.trim_start_matches('\u{feff}'));
-    if let Some(rest) = input.strip_prefix("<?xml") {
-        let end = rest
-            .find("?>")
-            .ok_or_else(|| malformed_delete_xml("unterminated XML declaration"))?;
-        input = skip_xml_whitespace(&rest[end + 2..]);
+/// Translate a reader refusal into the S3 error the client sees.
+fn delete_xml_error(error: DeleteXmlError) -> S3RequestError {
+    match error {
+        DeleteXmlError::Malformed(reason) => S3RequestError::invalid("MalformedXML", reason),
+        DeleteXmlError::UnsupportedEntry => S3RequestError::invalid(
+            "NotImplemented",
+            "versioned or conditional DeleteObjects entries are not supported",
+        ),
+        DeleteXmlError::KeyTooLong => S3RequestError::invalid(
+            "KeyTooLongError",
+            "the object key is longer than 1024 bytes",
+        ),
     }
-    let mut rest = expect_open_tag(input, "Delete")?;
-    let mut keys = Vec::new();
-    loop {
-        rest = skip_xml_whitespace(rest);
-        if let Some(after) = rest.strip_prefix("</Delete>") {
-            if !skip_xml_whitespace(after).is_empty() {
-                return Err(malformed_delete_xml("content after the Delete element"));
-            }
-            break;
-        }
-        if peek_open_tag(rest, "Object") {
-            let (key, after) = parse_delete_object_entry(rest)?;
-            if keys.len() == MAX_DELETE_OBJECTS_KEYS {
-                return Err(malformed_delete_xml(
-                    "DeleteObjects accepts at most 1000 objects",
-                ));
-            }
-            keys.push(key);
-            rest = after;
-        } else if peek_open_tag(rest, "Quiet") {
-            // The flag never changes which keys are authorized, so accept the
-            // whole `xs:boolean` lexical space that origin parsers accept
-            // rather than rejecting a batch the origin would have run.
-            let (value, after) = parse_text_element(rest, "Quiet")?;
-            if !matches!(
-                value.trim_matches(is_xml_whitespace),
-                "true" | "false" | "1" | "0"
-            ) {
-                return Err(malformed_delete_xml("Quiet must be a boolean"));
-            }
-            rest = after;
-        } else {
-            return Err(malformed_delete_xml("unsupported content in Delete"));
-        }
-    }
-    if keys.is_empty() {
-        return Err(malformed_delete_xml("Delete names no objects"));
-    }
-    Ok(keys)
-}
-
-fn parse_delete_object_entry(input: &str) -> Result<(String, &str), S3RequestError> {
-    let mut rest = expect_open_tag(input, "Object")?;
-    let mut key = None;
-    loop {
-        rest = skip_xml_whitespace(rest);
-        if let Some(after) = rest.strip_prefix("</Object>") {
-            let key = key.ok_or_else(|| malformed_delete_xml("Object names no Key"))?;
-            return Ok((key, after));
-        }
-        if peek_open_tag(rest, "Key") {
-            if key.is_some() {
-                return Err(malformed_delete_xml("Object names more than one Key"));
-            }
-            let (value, after) = parse_text_element(rest, "Key")?;
-            if value.is_empty() {
-                return Err(malformed_delete_xml("Object names an empty Key"));
-            }
-            if value.len() > 1024 {
-                return Err(S3RequestError::invalid(
-                    "KeyTooLongError",
-                    "the object key is longer than 1024 bytes",
-                ));
-            }
-            key = Some(value);
-            rest = after;
-        } else if peek_open_tag(rest, "VersionId")
-            || peek_open_tag(rest, "ETag")
-            || peek_open_tag(rest, "LastModifiedTime")
-            || peek_open_tag(rest, "Size")
-        {
-            return Err(S3RequestError::invalid(
-                "NotImplemented",
-                "versioned or conditional DeleteObjects entries are not supported",
-            ));
-        } else {
-            return Err(malformed_delete_xml("unsupported content in Object"));
-        }
-    }
-}
-
-/// Consume `<tag ...attributes>` and return the remainder. Attribute values
-/// are tokenized with their quotes so a quoted `>` cannot truncate the tag,
-/// which would make this parser and the origin's disagree on the content.
-fn expect_open_tag<'a>(input: &'a str, tag: &str) -> Result<&'a str, S3RequestError> {
-    let rest = input
-        .strip_prefix('<')
-        .and_then(|rest| rest.strip_prefix(tag))
-        .ok_or_else(|| malformed_delete_xml("unexpected element"))?;
-    let bytes = rest.as_bytes();
-    match bytes.first() {
-        Some(b'>') => return Ok(&rest[1..]),
-        Some(byte) if is_xml_whitespace_byte(*byte) => {}
-        _ => return Err(malformed_delete_xml("unexpected element")),
-    }
-    let mut index = 0;
-    loop {
-        while index < bytes.len() && is_xml_whitespace_byte(bytes[index]) {
-            index += 1;
-        }
-        match bytes.get(index) {
-            None => return Err(malformed_delete_xml("unterminated tag")),
-            Some(b'>') => return Ok(&rest[index + 1..]),
-            Some(_) => {}
-        }
-        let name_start = index;
-        while index < bytes.len()
-            && bytes[index] != b'='
-            && bytes[index] != b'>'
-            && !is_xml_whitespace_byte(bytes[index])
-        {
-            index += 1;
-        }
-        if index == name_start || bytes.get(index) != Some(&b'=') {
-            return Err(malformed_delete_xml("malformed attribute"));
-        }
-        index += 1;
-        let quote = match bytes.get(index) {
-            Some(quote @ (b'"' | b'\'')) => *quote,
-            _ => return Err(malformed_delete_xml("malformed attribute")),
-        };
-        index += 1;
-        while index < bytes.len() && bytes[index] != quote {
-            index += 1;
-        }
-        if index >= bytes.len() {
-            return Err(malformed_delete_xml("malformed attribute"));
-        }
-        index += 1;
-    }
-}
-
-fn peek_open_tag(input: &str, tag: &str) -> bool {
-    input
-        .strip_prefix('<')
-        .and_then(|rest| rest.strip_prefix(tag))
-        .is_some_and(|rest| rest.starts_with('>') || rest.starts_with(is_xml_whitespace))
-}
-
-fn parse_text_element<'a>(input: &'a str, tag: &str) -> Result<(String, &'a str), S3RequestError> {
-    let rest = expect_open_tag(input, tag)?;
-    let end = rest
-        .find('<')
-        .ok_or_else(|| malformed_delete_xml("unterminated element"))?;
-    let text = &rest[..end];
-    let close = format!("</{tag}>");
-    let rest = rest[end..]
-        .strip_prefix(close.as_str())
-        .ok_or_else(|| malformed_delete_xml("unexpected markup inside an element"))?;
-    Ok((unescape_strict(text)?, rest))
-}
-
-/// Decode XML character data accepting only the five predefined entities and
-/// well-formed numeric character references. Anything else fails closed so
-/// the key text the gateway authorizes can never differ from the origin's
-/// decoding of the same body.
-fn unescape_strict(text: &str) -> Result<String, S3RequestError> {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(index) = rest.find('&') {
-        output.push_str(&rest[..index]);
-        rest = &rest[index + 1..];
-        let end = rest
-            .find(';')
-            .ok_or_else(|| malformed_delete_xml("unterminated character reference"))?;
-        let entity = &rest[..end];
-        rest = &rest[end + 1..];
-        match entity {
-            "amp" => output.push('&'),
-            "lt" => output.push('<'),
-            "gt" => output.push('>'),
-            "quot" => output.push('"'),
-            "apos" => output.push('\''),
-            _ => {
-                // Rust's integer parsers accept a leading `+`, which the XML
-                // `CharRef` production does not, so the digit run is checked
-                // before parsing rather than after.
-                let (digits, radix) = match entity
-                    .strip_prefix("#x")
-                    .or_else(|| entity.strip_prefix("#X"))
-                {
-                    Some(digits) => (digits, 16),
-                    None => (
-                        entity.strip_prefix('#').ok_or_else(|| {
-                            malformed_delete_xml("unsupported character reference")
-                        })?,
-                        10,
-                    ),
-                };
-                let digits_are_valid = !digits.is_empty()
-                    && digits.bytes().all(|digit| match radix {
-                        16 => digit.is_ascii_hexdigit(),
-                        _ => digit.is_ascii_digit(),
-                    });
-                if !digits_are_valid {
-                    return Err(malformed_delete_xml("unsupported character reference"));
-                }
-                let value = u32::from_str_radix(digits, radix)
-                    .map_err(|_| malformed_delete_xml("unsupported character reference"))?;
-                let value = char::from_u32(value)
-                    .filter(|value| *value != '\0')
-                    .ok_or_else(|| malformed_delete_xml("unsupported character reference"))?;
-                output.push(value);
-            }
-        }
-    }
-    output.push_str(rest);
-    Ok(output)
-}
-
-fn skip_xml_whitespace(input: &str) -> &str {
-    input.trim_start_matches(is_xml_whitespace)
-}
-
-/// The XML 1.0 `S` production. Deliberately narrower than Rust's ASCII
-/// whitespace, which also covers form feed and vertical tab — characters an
-/// origin parser rejects outright rather than treating as separators.
-fn is_xml_whitespace(value: char) -> bool {
-    matches!(value, ' ' | '\t' | '\r' | '\n')
-}
-
-fn is_xml_whitespace_byte(value: u8) -> bool {
-    matches!(value, b' ' | b'\t' | b'\r' | b'\n')
 }
 
 fn bucket_probe(
@@ -2231,6 +2001,51 @@ fn strip_aws_chunked_encoding(headers: Vec<(String, String)>) -> Vec<(String, St
         .collect()
 }
 
+/// The Content-Length contract every request-body drain enforces: no chunk may
+/// push the total past the declared length, the counter may not overflow, and
+/// a body that ends early is incomplete. Written once because both drains
+/// below are security-adjacent — a correction to one must not miss the other.
+struct LengthGuard {
+    expected: u64,
+    received: u64,
+}
+
+impl LengthGuard {
+    fn new(expected: u64) -> Self {
+        Self {
+            expected,
+            received: 0,
+        }
+    }
+
+    fn accept(&mut self, chunk_len: usize) -> Result<(), S3RequestError> {
+        self.received = self.received.checked_add(chunk_len as u64).ok_or_else(|| {
+            S3RequestError::invalid("InvalidArgument", "request body is too large")
+        })?;
+        if self.received > self.expected {
+            return Err(S3RequestError::invalid(
+                "InvalidArgument",
+                "request body exceeds Content-Length",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), S3RequestError> {
+        if self.received != self.expected {
+            return Err(S3RequestError::invalid(
+                "IncompleteBody",
+                "request body is shorter than Content-Length",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn body_chunk_error() -> S3RequestError {
+    S3RequestError::invalid("IncompleteBody", "The request body could not be read")
+}
+
 async fn spool_and_hash<S>(
     mut body: S,
     expected_len: u64,
@@ -2245,31 +2060,16 @@ where
         .map_err(|_| S3RequestError::internal("could not open upload spool"))?;
     let mut file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
-    let mut received = 0u64;
+    let mut length = LengthGuard::new(expected_len);
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| {
-            S3RequestError::invalid("IncompleteBody", "The request body could not be read")
-        })?;
-        received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
-            S3RequestError::invalid("InvalidArgument", "request body is too large")
-        })?;
-        if received > expected_len {
-            return Err(S3RequestError::invalid(
-                "InvalidArgument",
-                "request body exceeds Content-Length",
-            ));
-        }
+        let chunk = chunk.map_err(|_| body_chunk_error())?;
+        length.accept(chunk.len())?;
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
             .map_err(|_| S3RequestError::internal("could not spool upload body"))?;
     }
-    if received != expected_len {
-        return Err(S3RequestError::invalid(
-            "IncompleteBody",
-            "request body is shorter than Content-Length",
-        ));
-    }
+    length.finish()?;
     file.flush()
         .await
         .map_err(|_| S3RequestError::internal("could not flush upload spool"))?;
@@ -2284,28 +2084,13 @@ where
     S: Stream<Item = Result<Bytes, axum::Error>> + Unpin,
 {
     let mut collected = Vec::new();
-    let mut received = 0u64;
+    let mut length = LengthGuard::new(expected_len);
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| {
-            S3RequestError::invalid("IncompleteBody", "The request body could not be read")
-        })?;
-        received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
-            S3RequestError::invalid("InvalidArgument", "request body is too large")
-        })?;
-        if received > expected_len {
-            return Err(S3RequestError::invalid(
-                "InvalidArgument",
-                "request body exceeds Content-Length",
-            ));
-        }
+        let chunk = chunk.map_err(|_| body_chunk_error())?;
+        length.accept(chunk.len())?;
         collected.extend_from_slice(&chunk);
     }
-    if received != expected_len {
-        return Err(S3RequestError::invalid(
-            "IncompleteBody",
-            "request body is shorter than Content-Length",
-        ));
-    }
+    length.finish()?;
     Ok(collected)
 }
 
@@ -2944,11 +2729,10 @@ impl S3Adapter {
         request: Request,
         context: &GatewayRequestContext,
     ) -> Result<GatewayResponse, S3RequestError> {
-        let policy = request.extensions().get::<AuthorizationPolicy>().cloned();
-        let principal = request
-            .extensions()
-            .get::<AuthenticatedPrincipal>()
-            .cloned();
+        // Absent exactly when no policy is installed, which is also when the
+        // runtime skips its own check; see `RequestedPrefix::Any`, whose
+        // weakened pre-dispatch check this loop is what discharges.
+        let authorization = request.extensions().get::<RequestAuthorization>().cloned();
         let len = single_content_length(request.headers())?;
         if len > MAX_DELETE_OBJECTS_BODY_BYTES {
             return Err(S3RequestError::invalid(
@@ -2968,11 +2752,8 @@ impl S3Adapter {
                 ));
             }
         }
-        let keys = parse_delete_objects(&body)?;
-        if let Some(policy) = policy {
-            let Some(principal) = principal else {
-                return Err(S3RequestError::access_denied());
-            };
+        let keys = parse_delete_objects(&body).map_err(delete_xml_error)?;
+        if let Some(authorization) = authorization {
             for key in &keys {
                 let access = GatewayAccess {
                     operation: GatewayOperation::Delete,
@@ -2984,7 +2765,7 @@ impl S3Adapter {
                     )),
                     additional: Vec::new(),
                 };
-                if !policy.allows(&principal, ProviderProtocol::S3, &access) {
+                if !authorization.allows(&access, "policy_denied_object") {
                     return Err(S3RequestError::access_denied());
                 }
             }
@@ -3360,6 +3141,7 @@ impl S3Adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3_delete_xml::MAX_DELETE_OBJECTS_KEYS;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -4115,8 +3897,10 @@ mod tests {
         }
     }
 
-    fn batch_delete_policy(prefix: Option<&str>) -> AuthorizationPolicy {
-        AuthorizationPolicy::new(vec![crate::AuthorizationGrant {
+    /// The capability `adapter_handler` binds for one request, without the
+    /// runtime's metrics and audit sink.
+    fn batch_delete_authorization(prefix: Option<&str>) -> RequestAuthorization {
+        crate::AuthorizationPolicy::new(vec![crate::AuthorizationGrant {
             id: "batch-deleter".into(),
             principal: "multipart-user".into(),
             protocol: ProviderProtocol::S3,
@@ -4126,6 +3910,11 @@ mod tests {
             operations: vec![GatewayOperation::Delete],
         }])
         .unwrap()
+        .bind(
+            AuthenticatedPrincipal::new("multipart-user", "account-a"),
+            ProviderProtocol::S3,
+            "test-request",
+        )
     }
 
     #[test]
@@ -4245,7 +4034,7 @@ mod tests {
         let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
         request
             .extensions_mut()
-            .insert(batch_delete_policy(Some("tenant/")));
+            .insert(batch_delete_authorization(Some("tenant/")));
         let error = expect_request_error(&adapter, request).await;
         assert_eq!(error.code, "AccessDenied");
         assert_eq!(
@@ -4259,24 +4048,26 @@ mod tests {
         let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
         request
             .extensions_mut()
-            .insert(batch_delete_policy(Some("tenant/")));
+            .insert(batch_delete_authorization(Some("tenant/")));
         adapter.handle_request(request, &context()).await.unwrap();
         assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
         assert_eq!(cache.invalidations.load(Ordering::SeqCst), 2);
 
+        // The capability carries the principal it was bound to, so a request
+        // extension cannot re-aim the decision at a different identity.
         let body = delete_objects_xml(&["tenant/a"]);
-        let mut request = Request::builder()
-            .method("POST")
-            .uri("/bucket?delete=")
-            .header(header::HOST, "localhost")
-            .header(header::CONTENT_LENGTH, body.len().to_string())
-            .body(Body::from(body))
-            .unwrap();
-        request.extensions_mut().insert(batch_delete_policy(None));
-        let error = expect_request_error(&adapter, request).await;
+        let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("other-user", "account-a"));
+        request
+            .extensions_mut()
+            .insert(batch_delete_authorization(Some("tenant/")));
+        adapter.handle_request(request, &context()).await.unwrap();
         assert_eq!(
-            error.code, "AccessDenied",
-            "an installed policy without a principal fails closed"
+            origin.calls.load(Ordering::SeqCst),
+            2,
+            "the bound principal decides, not a principal extension"
         );
     }
 
@@ -4428,102 +4219,6 @@ mod tests {
             cache.invalidations.load(Ordering::SeqCst),
             2,
             "a missing bucket confirms every key is absent, like single DELETE"
-        );
-    }
-
-    #[test]
-    fn parse_delete_objects_is_strict_and_decodes_entities() {
-        let keys = parse_delete_objects(
-            concat!(
-                "\u{feff}<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n",
-                "<Delete xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n",
-                "  <Object><Key>plain/key.bin</Key></Object>\n",
-                "  <Object><Key>escaped/&amp;&lt;&gt;&quot;&apos;</Key></Object>\n",
-                "  <Object><Key>numeric/&#65;&#x42;&#xA;</Key></Object>\n",
-                "  <Quiet>true</Quiet>\n",
-                "</Delete>",
-            )
-            .as_bytes(),
-        )
-        .unwrap();
-        assert_eq!(
-            keys,
-            vec![
-                "plain/key.bin".to_string(),
-                "escaped/&<>\"'".to_string(),
-                "numeric/AB\n".to_string(),
-            ]
-        );
-        assert!(parse_delete_objects(
-            b"<Delete><Object><Key>a</Key></Object><Quiet>maybe</Quiet></Delete>"
-        )
-        .is_err());
-        let long_key = "k".repeat(1025);
-        let error =
-            parse_delete_objects(delete_objects_xml(&[long_key.as_str()]).as_bytes()).unwrap_err();
-        assert_eq!(error.code, "KeyTooLongError");
-        let error = parse_delete_objects(
-            b"<Delete><Object attr=\"a>b\"><Key>trick</Key></Object></Delete>",
-        )
-        .map(|keys| keys.join(","));
-        assert_eq!(
-            error.unwrap(),
-            "trick",
-            "quoted '>' inside attributes must not truncate tag parsing"
-        );
-    }
-
-    #[test]
-    fn parse_delete_objects_matches_origin_parsers_on_boundary_syntax() {
-        for quiet in ["true", "false", "1", "0", " true ", "\n\tfalse\r\n"] {
-            let body =
-                format!("<Delete><Object><Key>a</Key></Object><Quiet>{quiet}</Quiet></Delete>");
-            assert_eq!(
-                parse_delete_objects(body.as_bytes()).unwrap(),
-                vec!["a".to_string()],
-                "<Quiet>{quiet}</Quiet> is a boolean origin parsers accept"
-            );
-        }
-
-        // Rust's integer parsers accept a leading `+`; the XML CharRef
-        // production does not, so accepting one would decode a key the origin
-        // rejects outright.
-        for reference in ["&#+65;", "&#x+41;", "&#;", "&#x;", "&#xzz;", "&#4 1;"] {
-            let body = format!("<Delete><Object><Key>{reference}</Key></Object></Delete>");
-            let error = parse_delete_objects(body.as_bytes()).unwrap_err();
-            assert_eq!(
-                error.code, "MalformedXML",
-                "{reference} is not a well-formed character reference"
-            );
-        }
-        assert_eq!(
-            parse_delete_objects(b"<Delete><Object><Key>&#x0041;</Key></Object></Delete>").unwrap(),
-            vec!["A".to_string()],
-            "leading zeros stay legal inside a character reference"
-        );
-
-        // Form feed and vertical tab are ASCII whitespace but not XML
-        // whitespace: an origin parser rejects the document outright.
-        for illegal in ["\u{0c}", "\u{0b}"] {
-            let body = format!("<Delete>{illegal}<Object><Key>a</Key></Object></Delete>");
-            let error = parse_delete_objects(body.as_bytes()).unwrap_err();
-            assert_eq!(
-                error.code, "MalformedXML",
-                "{illegal:?} is not XML whitespace"
-            );
-            let tagged =
-                format!("<Delete><Object{illegal}attr=\"v\"><Key>a</Key></Object></Delete>");
-            assert_eq!(
-                parse_delete_objects(tagged.as_bytes()).unwrap_err().code,
-                "MalformedXML",
-                "{illegal:?} does not separate attributes either"
-            );
-        }
-        assert_eq!(
-            parse_delete_objects(b"<Delete>\r\n\t <Object>\r\n<Key>a</Key>\t</Object>\n</Delete>")
-                .unwrap(),
-            vec!["a".to_string()],
-            "the XML S production stays accepted"
         );
     }
 

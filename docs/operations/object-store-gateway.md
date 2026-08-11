@@ -275,7 +275,10 @@ independently of the object-upload body limit, which an operator may raise for
 large writes; a larger declared length is rejected with
 `MaxMessageLengthExceeded` before the body is read. The largest legitimate
 document — 1000 keys of 1024 bytes with every byte entity-escaped — stays
-under that ceiling.
+under that ceiling. Size the process for it: resident batch-delete bodies are
+bounded by concurrency, up to `max_concurrency` × 8 MiB (8 GiB at the built-in
+concurrency default of 1024). Lowering `TALON_GATEWAY_MAX_BODY_BYTES` below
+8 MiB lowers this too, at the cost of capping uploads by the same value.
 
 Azure variables:
 

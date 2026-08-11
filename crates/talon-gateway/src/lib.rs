@@ -13,6 +13,7 @@ mod origin_metadata;
 mod runtime;
 pub mod s3;
 pub mod s3_auth;
+mod s3_delete_xml;
 mod tls;
 
 pub use audit::{GatewayAuditSink, SecurityAuditEvent};
