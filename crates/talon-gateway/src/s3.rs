@@ -21,6 +21,8 @@ use talon_cache_client::{BlockReader, CacheReadError, FileView, DEFAULT_TRANSFER
 use talon_core::{Backend, ObjectId, Version};
 use tokio::io::AsyncWriteExt;
 
+use crate::authorization::RequestAuthorization;
+use crate::s3_delete_xml::{parse_delete_objects, DeleteXmlError};
 use crate::{
     AuthenticatedPrincipal, EffectiveDecision, FailureReason, GatewayAccess,
     GatewayAccessRequirement, GatewayAdapter, GatewayOperation, GatewayOutcome,
@@ -29,6 +31,16 @@ use crate::{
 };
 
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Ceiling on a DeleteObjects body, which is the one request body the gateway
+/// must hold in memory: it is parsed to authorize each key and then forwarded
+/// unchanged, so it can neither stream nor spool. Derived from the protocol
+/// rather than configured — the largest legitimate document, 1000 keys of
+/// 1024 bytes with every byte entity-escaped plus framing, stays under it —
+/// which also keeps the path independent of the object-upload body limit an
+/// operator may raise for large writes.
+const MAX_DELETE_OBJECTS_BODY_BYTES: u64 = 8 * 1024 * 1024;
+
 type CacheStream = Pin<Box<dyn Stream<Item = Result<Bytes, CacheReadError>> + Send>>;
 
 /// Exact cache range requested by the S3 adapter.
@@ -231,6 +243,15 @@ pub trait S3Origin: Send + Sync + 'static {
         Err("S3 origin does not implement DELETE".into())
     }
 
+    async fn delete_objects(
+        &self,
+        _bucket: &str,
+        _headers: &[(String, String)],
+        _body: Bytes,
+    ) -> Result<HttpResponse, String> {
+        Err("S3 origin does not implement DeleteObjects".into())
+    }
+
     async fn multipart(&self, _request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
         Err("S3 origin does not implement multipart requests".into())
     }
@@ -404,6 +425,15 @@ impl S3Origin for S3Backend {
         conditions: &[(String, String)],
     ) -> Result<HttpResponse, String> {
         self.execute_delete_raw(object, conditions).await
+    }
+
+    async fn delete_objects(
+        &self,
+        bucket: &str,
+        headers: &[(String, String)],
+        body: Bytes,
+    ) -> Result<HttpResponse, String> {
+        self.execute_delete_objects_raw(bucket, headers, body).await
     }
 
     async fn multipart(&self, request: S3MultipartRequest<'_>) -> Result<HttpResponse, String> {
@@ -640,6 +670,7 @@ fn require_v1_list_shape(query: &S3Query) -> Result<(), S3RequestError> {
         || query.part_number.is_some()
         || query.part_number_marker.is_some()
         || query.max_parts.is_some()
+        || query.delete.is_some()
         || query.unknown.is_some()
     {
         return Err(S3RequestError::invalid(
@@ -648,6 +679,49 @@ fn require_v1_list_shape(query: &S3Query) -> Result<(), S3RequestError> {
         ));
     }
     Ok(())
+}
+
+/// A bucket-level `POST` is a DeleteObjects request only when its query is
+/// exactly the bare `delete` sub-resource. Any other parameter names a
+/// different operation, so the combination is rejected rather than guessed.
+fn require_delete_objects_shape(query: &S3Query) -> Result<(), S3RequestError> {
+    let bare_delete = query.delete.as_deref() == Some("")
+        && query.list_type.is_none()
+        && query.prefix.is_none()
+        && query.delimiter.is_none()
+        && query.continuation_token.is_none()
+        && query.max_keys.is_none()
+        && query.encoding_type.is_none()
+        && query.uploads.is_none()
+        && query.upload_id.is_none()
+        && query.part_number.is_none()
+        && query.part_number_marker.is_none()
+        && query.max_parts.is_none()
+        && query.location.is_none()
+        && query.marker.is_none()
+        && query.unknown.is_none();
+    if !bare_delete {
+        return Err(S3RequestError::invalid(
+            "InvalidRequest",
+            "invalid DeleteObjects request",
+        ));
+    }
+    Ok(())
+}
+
+/// Translate a reader refusal into the S3 error the client sees.
+fn delete_xml_error(error: DeleteXmlError) -> S3RequestError {
+    match error {
+        DeleteXmlError::Malformed(reason) => S3RequestError::invalid("MalformedXML", reason),
+        DeleteXmlError::UnsupportedEntry => S3RequestError::invalid(
+            "NotImplemented",
+            "versioned or conditional DeleteObjects entries are not supported",
+        ),
+        DeleteXmlError::KeyTooLong => S3RequestError::invalid(
+            "KeyTooLongError",
+            "the object key is longer than 1024 bytes",
+        ),
+    }
 }
 
 fn bucket_probe(
@@ -748,6 +822,7 @@ struct S3Query {
     max_parts: Option<String>,
     location: Option<String>,
     marker: Option<String>,
+    delete: Option<String>,
     /// First query key outside the recognized set, kept so bucket-level
     /// requests can reject unknown sub-resources instead of approximating
     /// them with a listing.
@@ -785,6 +860,7 @@ impl S3Query {
                     set_query_value(&mut parsed.location, value.into_owned(), "location")?
                 }
                 "marker" => set_query_value(&mut parsed.marker, value.into_owned(), "marker")?,
+                "delete" => set_query_value(&mut parsed.delete, value.into_owned(), "delete")?,
                 other => {
                     if parsed.unknown.is_none() {
                         parsed.unknown = Some(other.to_string());
@@ -1925,6 +2001,51 @@ fn strip_aws_chunked_encoding(headers: Vec<(String, String)>) -> Vec<(String, St
         .collect()
 }
 
+/// The Content-Length contract every request-body drain enforces: no chunk may
+/// push the total past the declared length, the counter may not overflow, and
+/// a body that ends early is incomplete. Written once because both drains
+/// below are security-adjacent — a correction to one must not miss the other.
+struct LengthGuard {
+    expected: u64,
+    received: u64,
+}
+
+impl LengthGuard {
+    fn new(expected: u64) -> Self {
+        Self {
+            expected,
+            received: 0,
+        }
+    }
+
+    fn accept(&mut self, chunk_len: usize) -> Result<(), S3RequestError> {
+        self.received = self.received.checked_add(chunk_len as u64).ok_or_else(|| {
+            S3RequestError::invalid("InvalidArgument", "request body is too large")
+        })?;
+        if self.received > self.expected {
+            return Err(S3RequestError::invalid(
+                "InvalidArgument",
+                "request body exceeds Content-Length",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish(&self) -> Result<(), S3RequestError> {
+        if self.received != self.expected {
+            return Err(S3RequestError::invalid(
+                "IncompleteBody",
+                "request body is shorter than Content-Length",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn body_chunk_error() -> S3RequestError {
+    S3RequestError::invalid("IncompleteBody", "The request body could not be read")
+}
+
 async fn spool_and_hash<S>(
     mut body: S,
     expected_len: u64,
@@ -1939,35 +2060,38 @@ where
         .map_err(|_| S3RequestError::internal("could not open upload spool"))?;
     let mut file = tokio::fs::File::from_std(file);
     let mut hasher = Sha256::new();
-    let mut received = 0u64;
+    let mut length = LengthGuard::new(expected_len);
     while let Some(chunk) = body.next().await {
-        let chunk = chunk.map_err(|_| {
-            S3RequestError::invalid("IncompleteBody", "The request body could not be read")
-        })?;
-        received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
-            S3RequestError::invalid("InvalidArgument", "request body is too large")
-        })?;
-        if received > expected_len {
-            return Err(S3RequestError::invalid(
-                "InvalidArgument",
-                "request body exceeds Content-Length",
-            ));
-        }
+        let chunk = chunk.map_err(|_| body_chunk_error())?;
+        length.accept(chunk.len())?;
         hasher.update(&chunk);
         file.write_all(&chunk)
             .await
             .map_err(|_| S3RequestError::internal("could not spool upload body"))?;
     }
-    if received != expected_len {
-        return Err(S3RequestError::invalid(
-            "IncompleteBody",
-            "request body is shorter than Content-Length",
-        ));
-    }
+    length.finish()?;
     file.flush()
         .await
         .map_err(|_| S3RequestError::internal("could not flush upload spool"))?;
     Ok((spool, format!("{:x}", hasher.finalize())))
+}
+
+/// Collect a small request body into memory, enforcing the declared
+/// Content-Length exactly. Used for bodies the gateway must parse before
+/// dispatch (DeleteObjects); the runtime body limit bounds them from above.
+async fn collect_body<S>(mut body: S, expected_len: u64) -> Result<Vec<u8>, S3RequestError>
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Unpin,
+{
+    let mut collected = Vec::new();
+    let mut length = LengthGuard::new(expected_len);
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|_| body_chunk_error())?;
+        length.accept(chunk.len())?;
+        collected.extend_from_slice(&chunk);
+    }
+    length.finish()?;
+    Ok(collected)
 }
 
 #[async_trait]
@@ -2022,6 +2146,21 @@ impl S3Adapter {
                 additional: Vec::new(),
             });
         }
+        if request.method() == axum::http::Method::POST
+            && target.key.is_none()
+            && query.delete.is_some()
+        {
+            require_delete_objects_shape(&query)?;
+            return Ok(GatewayAccess {
+                operation: GatewayOperation::Delete,
+                provider_account: None,
+                target: GatewayTarget::NamespaceBodyObjects {
+                    backend: Backend::S3,
+                    namespace: target.bucket,
+                },
+                additional: Vec::new(),
+            });
+        }
         if request.method() == axum::http::Method::GET && target.key.is_none() {
             require_v1_list_shape(&query)?;
             return Ok(GatewayAccess {
@@ -2038,6 +2177,12 @@ impl S3Adapter {
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
+        if query.delete.is_some() {
+            return Err(S3RequestError::invalid(
+                "InvalidRequest",
+                "delete is a bucket-level sub-resource",
+            ));
+        }
         let multipart = query.multipart_operation(
             request.method(),
             request.headers().contains_key("x-amz-copy-source"),
@@ -2088,6 +2233,13 @@ impl S3Adapter {
             Some(BucketProbe::Location) => return Ok(self.bucket_location(target.bucket, context)),
             None => {}
         }
+        if request.method() == axum::http::Method::POST
+            && target.key.is_none()
+            && query.delete.is_some()
+        {
+            require_delete_objects_shape(&query)?;
+            return self.delete_objects(target.bucket, request, context).await;
+        }
         if request.method() == axum::http::Method::GET && target.key.is_none() {
             require_v1_list_shape(&query)?;
             return self.list_v1(target.bucket, query, context).await;
@@ -2095,6 +2247,12 @@ impl S3Adapter {
         let key = target
             .key
             .ok_or_else(|| S3RequestError::invalid("InvalidURI", "request has no object key"))?;
+        if query.delete.is_some() {
+            return Err(S3RequestError::invalid(
+                "InvalidRequest",
+                "delete is a bucket-level sub-resource",
+            ));
+        }
         let object = ObjectId::new(Backend::S3, target.bucket, key);
         if let Some(operation) = query.multipart_operation(
             request.method(),
@@ -2560,6 +2718,85 @@ impl S3Adapter {
         ))
     }
 
+    /// Batch DeleteObjects. The XML body is parsed so every named key is
+    /// authorized against the per-request policy snapshot before dispatch,
+    /// then the body passes through unchanged so client checksums stay
+    /// valid; a confirmed origin outcome invalidates every requested key
+    /// because quiet-mode responses omit the per-key results.
+    async fn delete_objects(
+        &self,
+        bucket: String,
+        request: Request,
+        context: &GatewayRequestContext,
+    ) -> Result<GatewayResponse, S3RequestError> {
+        // Absent exactly when no policy is installed, which is also when the
+        // runtime skips its own check; see `RequestedPrefix::Any`, whose
+        // weakened pre-dispatch check this loop is what discharges.
+        let authorization = request.extensions().get::<RequestAuthorization>().cloned();
+        let len = single_content_length(request.headers())?;
+        if len > MAX_DELETE_OBJECTS_BODY_BYTES {
+            return Err(S3RequestError::invalid(
+                "MaxMessageLengthExceeded",
+                "the DeleteObjects request body is too large",
+            ));
+        }
+        let payload_hash = payload_declaration(&request)?;
+        let headers = mutation_headers(request.headers(), false)?;
+        let body = collect_body(request.into_body().into_data_stream(), len).await?;
+        if payload_hash != "UNSIGNED-PAYLOAD" {
+            let actual_hash = format!("{:x}", Sha256::digest(&body));
+            if actual_hash != payload_hash {
+                return Err(S3RequestError::invalid(
+                    "XAmzContentSHA256Mismatch",
+                    "The provided payload hash does not match the request body",
+                ));
+            }
+        }
+        let keys = parse_delete_objects(&body).map_err(delete_xml_error)?;
+        if let Some(authorization) = authorization {
+            for key in &keys {
+                let access = GatewayAccess {
+                    operation: GatewayOperation::Delete,
+                    provider_account: None,
+                    target: GatewayTarget::Object(ObjectId::new(
+                        Backend::S3,
+                        bucket.clone(),
+                        key.clone(),
+                    )),
+                    additional: Vec::new(),
+                };
+                if !authorization.allows(&access, "policy_denied_object") {
+                    return Err(S3RequestError::access_denied());
+                }
+            }
+        }
+        let response = self
+            .origin
+            .delete_objects(&bucket, &headers, Bytes::from(body))
+            .await
+            .map_err(|_| S3RequestError::indeterminate_commit())?;
+        if response.is_success() || response.status == 404 {
+            for key in &keys {
+                let _ = self.cache.invalidate_object(&ObjectId::new(
+                    Backend::S3,
+                    bucket.clone(),
+                    key.clone(),
+                ));
+            }
+        }
+        let mut response = raw_response(
+            response,
+            GatewayOperation::Delete,
+            Some(GatewayTarget::NamespaceBodyObjects {
+                backend: Backend::S3,
+                namespace: bucket,
+            }),
+            context,
+        );
+        response.requested_bytes = len;
+        Ok(response)
+    }
+
     async fn head(
         &self,
         object: ObjectId,
@@ -2904,6 +3141,7 @@ impl S3Adapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::s3_delete_xml::MAX_DELETE_OBJECTS_KEYS;
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -3165,6 +3403,18 @@ mod tests {
         ) -> Result<HttpResponse, String> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             *self.headers.lock().unwrap() = conditions.to_vec();
+            self.response()
+        }
+
+        async fn delete_objects(
+            &self,
+            _bucket: &str,
+            headers: &[(String, String)],
+            body: Bytes,
+        ) -> Result<HttpResponse, String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            *self.headers.lock().unwrap() = headers.to_vec();
+            *self.body.lock().unwrap() = body.to_vec();
             self.response()
         }
     }
@@ -3603,6 +3853,7 @@ mod tests {
             ("/bucket?uploads=", "NotImplemented"),
             ("/bucket?versions", "NotImplemented"),
             ("/bucket?acl", "NotImplemented"),
+            ("/bucket?delete=", "NotImplemented"),
             ("/bucket?list-type=3", "InvalidArgument"),
         ] {
             let error = adapter
@@ -3610,6 +3861,460 @@ mod tests {
                 .unwrap_err();
             assert_eq!(error.code, code, "{uri} must not become a V1 listing");
         }
+    }
+
+    fn delete_objects_xml(keys: &[&str]) -> String {
+        let mut body = String::from("<Delete>");
+        for key in keys {
+            body.push_str("<Object><Key>");
+            body.push_str(key);
+            body.push_str("</Key></Object>");
+        }
+        body.push_str("</Delete>");
+        body
+    }
+
+    fn batch_delete_request(uri: &str, body: &str, headers: &[(&str, &str)]) -> Request {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(header::HOST, "localhost")
+            .header(header::CONTENT_LENGTH, body.len().to_string());
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let mut request = builder.body(Body::from(body.to_string())).unwrap();
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("multipart-user", "account-a"));
+        request
+    }
+
+    async fn expect_request_error(adapter: &S3Adapter, request: Request) -> S3RequestError {
+        match adapter.handle_request(request, &context()).await {
+            Ok(_) => panic!("the request must fail"),
+            Err(error) => error,
+        }
+    }
+
+    /// The capability `adapter_handler` binds for one request, without the
+    /// runtime's metrics and audit sink.
+    fn batch_delete_authorization(prefix: Option<&str>) -> RequestAuthorization {
+        crate::AuthorizationPolicy::new(vec![crate::AuthorizationGrant {
+            id: "batch-deleter".into(),
+            principal: "multipart-user".into(),
+            protocol: ProviderProtocol::S3,
+            provider_account: "account-a".into(),
+            namespace: "bucket".into(),
+            prefix: prefix.map(str::to_string),
+            operations: vec![GatewayOperation::Delete],
+        }])
+        .unwrap()
+        .bind(
+            AuthenticatedPrincipal::new("multipart-user", "account-a"),
+            ProviderProtocol::S3,
+            "test-request",
+        )
+    }
+
+    #[test]
+    fn batch_delete_classifies_as_a_body_object_namespace_delete() {
+        let adapter = bucket_probe_adapter(BucketOrigin::new([]), "us-east-1");
+        for uri in ["/bucket?delete=", "/bucket?delete"] {
+            let access = adapter
+                .classify_access(&request(axum::http::Method::POST, uri))
+                .unwrap();
+            assert_eq!(access.operation, GatewayOperation::Delete);
+            assert_eq!(
+                access.target,
+                GatewayTarget::NamespaceBodyObjects {
+                    backend: Backend::S3,
+                    namespace: "bucket".into(),
+                }
+            );
+            assert!(access.additional.is_empty());
+        }
+        for (method, uri, code) in [
+            (
+                axum::http::Method::POST,
+                "/bucket?delete=1",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::POST,
+                "/bucket?delete=&uploads=",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::POST,
+                "/bucket?delete=&prefix=a/",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::POST,
+                "/bucket/key?delete=",
+                "InvalidRequest",
+            ),
+            (
+                axum::http::Method::DELETE,
+                "/bucket/key?delete=",
+                "InvalidRequest",
+            ),
+        ] {
+            let error = adapter.classify_access(&request(method, uri)).unwrap_err();
+            assert_eq!(error.code, code, "{uri} must not be reinterpreted");
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_delete_forwards_the_body_and_invalidates_every_key() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: vec![("content-type".into(), "application/xml".into())],
+            body: Bytes::from_static(
+                b"<DeleteResult><Deleted><Key>logs/a</Key></Deleted></DeleteResult>",
+            ),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let body = delete_objects_xml(&["logs/a", "logs/b"]);
+        let request = batch_delete_request(
+            "/bucket?delete=",
+            &body,
+            &[
+                ("content-md5", "3ZG9/9OGCkoTBd6aa5jXbg=="),
+                ("authorization", "AWS4-HMAC-SHA256 client-material"),
+            ],
+        );
+        let response = adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(response.response.status(), StatusCode::OK);
+        assert_eq!(response.operation, GatewayOperation::Delete);
+        assert_eq!(response.requested_bytes, body.len() as u64);
+        assert_eq!(*origin.body.lock().unwrap(), body.as_bytes());
+        let headers = origin.headers.lock().unwrap().clone();
+        assert!(
+            headers
+                .iter()
+                .any(|(name, value)| name == "content-md5" && value == "3ZG9/9OGCkoTBd6aa5jXbg=="),
+            "the client checksum travels with the unmodified body"
+        );
+        assert!(
+            headers.iter().all(|(name, _)| name != "authorization"),
+            "client credentials never reach the origin"
+        );
+        assert_eq!(
+            cache.invalidations.load(Ordering::SeqCst),
+            2,
+            "confirmed outcomes invalidate every requested key, not the \
+             response echo, because quiet mode omits it"
+        );
+        let bytes = to_bytes(response.response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert!(String::from_utf8(bytes.to_vec())
+            .unwrap()
+            .contains("<DeleteResult>"));
+    }
+
+    #[tokio::test]
+    async fn batch_delete_authorizes_every_key_before_dispatch() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+
+        let body = delete_objects_xml(&["tenant/a", "other/b"]);
+        let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
+        request
+            .extensions_mut()
+            .insert(batch_delete_authorization(Some("tenant/")));
+        let error = expect_request_error(&adapter, request).await;
+        assert_eq!(error.code, "AccessDenied");
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "one uncovered key rejects the whole batch before dispatch"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+
+        let body = delete_objects_xml(&["tenant/a", "tenant/b"]);
+        let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
+        request
+            .extensions_mut()
+            .insert(batch_delete_authorization(Some("tenant/")));
+        adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 2);
+
+        // The capability carries the principal it was bound to, so a request
+        // extension cannot re-aim the decision at a different identity.
+        let body = delete_objects_xml(&["tenant/a"]);
+        let mut request = batch_delete_request("/bucket?delete=", &body, &[]);
+        request
+            .extensions_mut()
+            .insert(AuthenticatedPrincipal::new("other-user", "account-a"));
+        request
+            .extensions_mut()
+            .insert(batch_delete_authorization(Some("tenant/")));
+        adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            2,
+            "the bound principal decides, not a principal extension"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_rejects_bodies_it_cannot_prove_it_understood() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let thousand_and_one = {
+            let mut body = String::from("<Delete>");
+            for index in 0..=MAX_DELETE_OBJECTS_KEYS {
+                body.push_str(&format!("<Object><Key>k{index}</Key></Object>"));
+            }
+            body.push_str("</Delete>");
+            body
+        };
+        for (body, code) in [
+            ("<Delete></Delete>", "MalformedXML"),
+            ("not xml", "MalformedXML"),
+            (
+                "<Delete><Object><Key>a</Key><VersionId>v1</VersionId></Object></Delete>",
+                "NotImplemented",
+            ),
+            (
+                "<!DOCTYPE d [<!ENTITY x \"y\">]><Delete><Object><Key>a</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><!-- hidden --><Object><Key>a</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Object><Key><![CDATA[a]]></Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Object><Key>a</Key></Object></Delete>trailing",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Object><Key>&unknown;</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            (
+                "<Delete><Unknown/><Object><Key>a</Key></Object></Delete>",
+                "MalformedXML",
+            ),
+            ("<Delete><Object></Object></Delete>", "MalformedXML"),
+            (thousand_and_one.as_str(), "MalformedXML"),
+        ] {
+            let request = batch_delete_request("/bucket?delete=", body, &[]);
+            let error = expect_request_error(&adapter, request).await;
+            assert_eq!(error.code, code, "{body:.60} must fail closed");
+        }
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "no unparsable body may reach the origin"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn batch_delete_verifies_a_declared_payload_hash() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let body = delete_objects_xml(&["logs/a"]);
+        let tampered = batch_delete_request(
+            "/bucket?delete=",
+            &body,
+            &[(
+                "x-amz-content-sha256",
+                "0000000000000000000000000000000000000000000000000000000000000000",
+            )],
+        );
+        let error = expect_request_error(&adapter, tampered).await;
+        assert_eq!(error.code, "XAmzContentSHA256Mismatch");
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+
+        let declared = format!("{:x}", Sha256::digest(body.as_bytes()));
+        let verified = batch_delete_request(
+            "/bucket?delete=",
+            &body,
+            &[("x-amz-content-sha256", declared.as_str())],
+        );
+        adapter.handle_request(verified, &context()).await.unwrap();
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_delete_failures_do_not_invalidate() {
+        let body = delete_objects_xml(&["logs/a", "logs/b"]);
+
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Err("connection reset".into()));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let request = batch_delete_request("/bucket?delete=", &body, &[]);
+        let error = expect_request_error(&adapter, request).await;
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.indeterminate_commit);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 400,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<Error><Code>MalformedXML</Code></Error>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let request = batch_delete_request("/bucket?delete=", &body, &[]);
+        let response = adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(response.response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(response.outcome, GatewayOutcome::Failed);
+        assert_eq!(
+            cache.invalidations.load(Ordering::SeqCst),
+            0,
+            "an origin-rejected batch deleted nothing"
+        );
+
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 404,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<Error><Code>NoSuchBucket</Code></Error>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let request = batch_delete_request("/bucket?delete=", &body, &[]);
+        adapter.handle_request(request, &context()).await.unwrap();
+        assert_eq!(
+            cache.invalidations.load(Ordering::SeqCst),
+            2,
+            "a missing bucket confirms every key is absent, like single DELETE"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_delete_bounds_the_body_it_must_buffer() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: Bytes::from_static(b"<DeleteResult/>"),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        let body = delete_objects_xml(&["logs/a"]);
+
+        // The declared length alone rejects the request: the body is parsed to
+        // authorize each key and forwarded unchanged, so it cannot stream or
+        // spool, and this ceiling must not follow the object-upload cap.
+        let oversized = Request::builder()
+            .method("POST")
+            .uri("/bucket?delete=")
+            .header(header::HOST, "localhost")
+            .header(
+                header::CONTENT_LENGTH,
+                (MAX_DELETE_OBJECTS_BODY_BYTES + 1).to_string(),
+            )
+            .body(Body::from(body.clone()))
+            .unwrap();
+        let error = expect_request_error(&adapter, oversized).await;
+        assert_eq!(error.code, "MaxMessageLengthExceeded");
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "an oversized declaration is rejected before the body is read"
+        );
+
+        for (declared, code) in [
+            (body.len() as u64 + 1, "IncompleteBody"),
+            (body.len() as u64 - 1, "InvalidArgument"),
+        ] {
+            let mismatched = Request::builder()
+                .method("POST")
+                .uri("/bucket?delete=")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_LENGTH, declared.to_string())
+                .body(Body::from(body.clone()))
+                .unwrap();
+            let error = expect_request_error(&adapter, mismatched).await;
+            assert_eq!(
+                error.code, code,
+                "a {declared}-byte declaration must not parse"
+            );
+        }
+
+        let unlabelled = Request::builder()
+            .method("POST")
+            .uri("/bucket?delete=")
+            .header(header::HOST, "localhost")
+            .body(Body::from(body))
+            .unwrap();
+        let error = expect_request_error(&adapter, unlabelled).await;
+        assert_eq!(error.code, "MissingContentLength");
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn object_level_delete_sub_resource_never_dispatches() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 204,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+        // handle_request carries its own guard because a deployment without an
+        // installed policy never calls classify_access.
+        for method in ["DELETE", "POST", "GET", "PUT"] {
+            let request = Request::builder()
+                .method(method)
+                .uri("/bucket/key?delete=")
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_LENGTH, "0")
+                .body(Body::empty())
+                .unwrap();
+            let error = expect_request_error(&adapter, request).await;
+            assert_eq!(
+                error.code, "InvalidRequest",
+                "{method} /bucket/key?delete= must not act on the object"
+            );
+        }
+        assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

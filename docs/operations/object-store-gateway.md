@@ -259,6 +259,29 @@ placement, and HTTP 200 completion responses carrying `<Error>` do not commit
 gateway state. Increase deployment limits only with corresponding disk,
 concurrency, and deadline capacity.
 
+Batch `DeleteObjects` (`POST /bucket?delete`, what minio-go `RemoveObjects` and
+the AWS C++ SDK's `DeleteObjectsRequest` — the milvus-storage `DeleteDir` path —
+emit) passes through once. The gateway parses the `<Delete>` document strictly
+before dispatch: doctypes, comments, CDATA, unknown elements, unresolved
+entities, more than 1000 objects, and versioned or conditional entries fail
+closed, because the gateway authorizes exactly the keys it parses. Every named
+key must be covered by a `delete` grant; the first uncovered key rejects the
+whole batch with `AccessDenied` before the origin sees it. The body is then
+forwarded unchanged so a client `Content-MD5` or `x-amz-checksum-*` header stays
+valid, the origin's per-key `Deleted`/`Error` XML passes back unchanged, and a
+confirmed outcome invalidates every requested key locally — quiet-mode
+responses omit per-key results, so the request list is the invalidation source.
+This is the one request body the gateway holds in memory, because it must be
+parsed to authorize and then forwarded byte for byte. It is capped at 8 MiB
+independently of the object-upload body limit, which an operator may raise for
+large writes; a larger declared length is rejected with
+`MaxMessageLengthExceeded` before the body is read. The largest legitimate
+document — 1000 keys of 1024 bytes with every byte entity-escaped — stays
+under that ceiling. Size the process for it: resident batch-delete bodies are
+bounded by concurrency, up to `max_concurrency` × 8 MiB (8 GiB at the built-in
+concurrency default of 1024). Lowering `TALON_GATEWAY_MAX_BODY_BYTES` below
+8 MiB lowers this too, at the cost of capping uploads by the same value.
+
 Azure variables:
 
 | Variable | Default | Meaning |

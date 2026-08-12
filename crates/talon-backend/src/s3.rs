@@ -596,6 +596,29 @@ impl S3Backend {
         self.http.execute(self.signed(request)).await
     }
 
+    /// Execute a batch DeleteObjects (`POST /{bucket}?delete`) with an
+    /// adapter-validated XML body. `headers` carries only sanitized client
+    /// headers such as `content-md5`; the origin's per-key Deleted/Error
+    /// result passes back unchanged.
+    pub async fn execute_delete_objects_raw(
+        &self,
+        bucket: &str,
+        headers: &[(String, String)],
+        body: bytes::Bytes,
+    ) -> std::result::Result<HttpResponse, String> {
+        let mut request = HttpRequest::with_body(
+            Method::Post,
+            format!("{}?delete=", self.bucket_url(bucket)),
+            self.session_headers(),
+            body,
+        );
+        request
+            .headers
+            .push(("content-length".into(), request.body.len().to_string()));
+        request.headers.extend_from_slice(headers);
+        self.http.execute(self.signed(request)).await
+    }
+
     /// Execute a bodyless multipart request with an adapter-validated query.
     pub async fn execute_multipart_raw(
         &self,
@@ -1117,6 +1140,52 @@ mod tests {
             request.url,
             "http://minio:9000/my-bucket?max-keys=1000&prefix=gateway%2Fa%20b&marker=start%2Fkey",
             "V1 pages carry no list-type and clamp max-keys"
+        );
+        assert!(request
+            .header("authorization")
+            .is_some_and(|value| value.starts_with("AWS4-HMAC-SHA256")));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_posts_the_bucket_delete_sub_resource() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: Vec::new(),
+            body: bytes::Bytes::new(),
+        });
+        let backend = S3Backend::new(
+            S3Config {
+                region: "us-east-1".into(),
+                endpoint: "minio:9000".into(),
+                path_style: true,
+                tls: false,
+            },
+            creds(),
+            http.clone(),
+        );
+        let body = bytes::Bytes::from_static(b"<Delete><Object><Key>a</Key></Object></Delete>");
+        backend
+            .execute_delete_objects_raw(
+                "my-bucket",
+                &[("content-md5".into(), "3ZG9/9OGCkoTBd6aa5jXbg==".into())],
+                body.clone(),
+            )
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(request.method, Method::Post);
+        assert_eq!(request.url, "http://minio:9000/my-bucket?delete=");
+        assert_eq!(request.body, body);
+        assert_eq!(request.header("content-length"), Some("46"));
+        assert_eq!(
+            request.header("content-md5"),
+            Some("3ZG9/9OGCkoTBd6aa5jXbg==")
+        );
+        assert!(
+            request.header("x-amz-content-sha256").is_some_and(|value| {
+                value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+            }),
+            "buffered bodies sign their real payload hash"
         );
         assert!(request
             .header("authorization")

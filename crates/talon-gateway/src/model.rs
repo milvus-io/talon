@@ -75,6 +75,17 @@ pub enum GatewayTarget {
         /// Optional provider prefix.
         prefix: Option<String>,
     },
+    /// A namespace mutation whose exact objects are named only in the
+    /// request body (S3 DeleteObjects). Policy passes when the principal
+    /// holds the operation on the namespace under any grant prefix; the
+    /// adapter must complete exact per-object authorization after reading
+    /// the body and fail the whole request on the first uncovered object.
+    NamespaceBodyObjects {
+        /// Canonical backend family.
+        backend: Backend,
+        /// Bucket or container.
+        namespace: String,
+    },
 }
 
 /// Internal cache/origin route selected after authorization.

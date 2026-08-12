@@ -16,6 +16,8 @@ from botocore.credentials import Credentials
 from botocore.exceptions import ClientError
 from minio import Minio
 from minio.commonconfig import CopySource
+from minio.deleteobjects import DeleteObject
+from minio.error import S3Error
 
 
 def expected_object() -> bytes:
@@ -257,6 +259,46 @@ def main() -> None:
         except ClientError as error:
             assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
 
+    # Batch DeleteObjects: one POST ?delete removes several keys with per-key
+    # results, and deleting a missing key still reports Deleted (S3 deletes
+    # are idempotent).
+    batch_keys = [f"gateway/mutations/batch-{index}.bin" for index in range(3)]
+    for key in batch_keys:
+        s3.put_object(Bucket=bucket, Key=key, Body=b"batch")
+    batch = s3.delete_objects(
+        Bucket=bucket,
+        Delete={
+            "Objects": [{"Key": key} for key in batch_keys]
+            + [{"Key": "gateway/mutations/batch-missing.bin"}],
+            "Quiet": False,
+        },
+    )
+    assert not batch.get("Errors"), batch.get("Errors")
+    deleted_keys = sorted(entry["Key"] for entry in batch.get("Deleted", []))
+    assert deleted_keys == sorted(
+        batch_keys + ["gateway/mutations/batch-missing.bin"]
+    ), deleted_keys
+    for key in batch_keys:
+        try:
+            s3.head_object(Bucket=bucket, Key=key)
+            raise AssertionError("batch-deleted object unexpectedly exists")
+        except ClientError as error:
+            assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
+    # Quiet mode omits the Deleted echo but still deletes.
+    quiet_key = "gateway/mutations/batch-quiet.bin"
+    s3.put_object(Bucket=bucket, Key=quiet_key, Body=b"quiet")
+    quiet = s3.delete_objects(
+        Bucket=bucket, Delete={"Objects": [{"Key": quiet_key}], "Quiet": True}
+    )
+    assert not quiet.get("Errors"), quiet.get("Errors")
+    assert not quiet.get("Deleted"), "quiet mode must not echo Deleted entries"
+    try:
+        s3.head_object(Bucket=bucket, Key=quiet_key)
+        raise AssertionError("quiet batch delete left the object behind")
+    except ClientError as error:
+        assert error.response["ResponseMetadata"]["HTTPStatusCode"] == 404
+
     multipart_key = "gateway/multipart/boto3.bin"
     multipart = s3.create_multipart_upload(
         Bucket=bucket, Key=multipart_key, Metadata={"owner": "boto3-multipart"}
@@ -407,6 +449,22 @@ def main() -> None:
     assert read_minio(minio.get_object(bucket, minio_copy_key)) == minio_body
     minio.remove_object(bucket, minio_key)
     minio.remove_object(bucket, minio_copy_key)
+
+    # minio-go/minio-py remove_objects batches into POST ?delete — the call
+    # milvus proxies issue for bulk cleanup.
+    minio_batch_keys = [f"gateway/mutations/minio-batch-{index}.bin" for index in range(2)]
+    for key in minio_batch_keys:
+        minio.put_object(bucket, key, io.BytesIO(b"mb"), 2)
+    batch_errors = list(
+        minio.remove_objects(bucket, [DeleteObject(key) for key in minio_batch_keys])
+    )
+    assert not batch_errors, batch_errors
+    for key in minio_batch_keys:
+        try:
+            minio.stat_object(bucket, key)
+            raise AssertionError("minio batch delete left an object behind")
+        except S3Error as error:
+            assert error.code == "NoSuchKey", error.code
 
     minio_multipart_key = "gateway/multipart/minio.bin"
     minio_multipart_body = b"m" * (6 * 1024 * 1024)
