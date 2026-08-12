@@ -461,15 +461,24 @@ async fn main() -> anyhow::Result<()> {
         address: cfg.advertise_addr.clone(),
         role: NodeRole::Worker,
     };
-    let observability = Arc::new(WorkerObservability::new_with_backend(
-        cfg.cluster_id.clone(),
-        node.clone(),
-        cfg.admin_listen.clone(),
-        cfg.capacity_bytes,
-        backend_kind,
-        Arc::clone(&index),
-        Arc::clone(&inflight),
-    )?);
+    let resolved_zone = talon_backend::resolve_zone().await;
+    tracing::info!(
+        zone = ?resolved_zone.zone,
+        source = resolved_zone.source,
+        "deployment zone resolved"
+    );
+    let observability = Arc::new(
+        WorkerObservability::new_with_backend(
+            cfg.cluster_id.clone(),
+            node.clone(),
+            cfg.admin_listen.clone(),
+            cfg.capacity_bytes,
+            backend_kind,
+            Arc::clone(&index),
+            Arc::clone(&inflight),
+        )?
+        .with_zone(resolved_zone.zone),
+    );
     observability.readiness().set_backend_ready(true);
     observability.readiness().set_store_ready(true);
     observability

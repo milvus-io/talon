@@ -67,6 +67,15 @@ spec:
             matchLabels:
               app.kubernetes.io/name: talon
               app.kubernetes.io/component: worker
+        # Zone-aware cache reads (ADR 0006) rely on every zone having
+        # workers; DoNotSchedule keeps the per-zone capacity balanced.
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: talon
+              app.kubernetes.io/component: worker
       volumes:
         # Local cache. Swap this emptyDir for a PVC (node-local SSD) in
         # production; the worker rebuilds its cache on restart either way.
@@ -95,6 +104,13 @@ spec:
               valueFrom:
                 fieldRef:
                   fieldPath: metadata.name
+            # Lets the worker look up its node's zone label for zone-aware
+            # cache reads (ADR 0006); requires the talon-node-zone-reader
+            # ClusterRole in rbac.yaml. TALON_ZONE overrides the lookup.
+            - name: TALON_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             # Advertise the pod IP so the coordinator routes peers to this pod.
             - name: TALON_WORKER_ADVERTISE_ADDR
               valueFrom:

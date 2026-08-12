@@ -61,6 +61,21 @@ fn optional_control_tls_patch(
     (!patch.is_empty()).then_some(patch)
 }
 
+/// Parse the boolean dialect every Talon surface accepts: `true|1|yes` /
+/// `false|0|no`, case-insensitive.
+///
+/// Returns `None` when the value is not a boolean; callers attach the
+/// variable name and their own error type, and decide what absence means.
+/// Shared so the worker, gateway, and FUSE binaries cannot drift into
+/// different dialects for the same `TALON_*` variable.
+pub fn parse_bool_value(value: &str) -> Option<bool> {
+    match value.to_ascii_lowercase().as_str() {
+        "true" | "1" | "yes" => Some(true),
+        "false" | "0" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// One configurable setting, described once and reused by both the runtime
 /// environment parser and the generated documentation.
 ///
@@ -809,10 +824,8 @@ impl WorkerConfigPatch {
             v.parse::<usize>()
                 .map_err(|_| Error::Other(format!("{k}: invalid usize: {v:?}")))
         };
-        let parse_bool = |v: String, k: &str| match v.to_ascii_lowercase().as_str() {
-            "true" | "1" | "yes" => Ok(true),
-            "false" | "0" | "no" => Ok(false),
-            _ => Err(Error::Other(format!("{k}: invalid bool: {v:?}"))),
+        let parse_bool = |v: String, k: &str| {
+            parse_bool_value(&v).ok_or_else(|| Error::Other(format!("{k}: invalid bool: {v:?}")))
         };
         Ok(Self {
             listen: get(worker_env::LISTEN),

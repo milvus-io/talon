@@ -687,7 +687,7 @@ impl CoordinatorObservability {
                 // leases are already absent from the snapshot; this additionally
                 // excludes present-but-unhealthy/not-ready workers so a degraded
                 // node is not handed to clients as an owner (issue #118).
-                let workers: Vec<NodeInfo> = snapshot
+                let workers: Vec<(NodeInfo, Option<String>)> = snapshot
                     .nodes
                     .iter()
                     .filter(|status| {
@@ -695,9 +695,14 @@ impl CoordinatorObservability {
                             && status.health == NodeHealth::Healthy
                             && status.ready
                     })
-                    .map(|status| status.node.clone())
+                    .map(|status| {
+                        (
+                            status.node.clone(),
+                            status.labels.get(talon_core::NODE_ZONE_LABEL).cloned(),
+                        )
+                    })
                     .collect();
-                membership.reconcile(workers);
+                membership.reconcile_zoned(workers);
                 self.ready.store(true, Ordering::Release);
                 Ok(())
             }

@@ -14,6 +14,9 @@ use crate::NodeInfo;
 /// Current node-status value schema.
 pub const NODE_STATUS_SCHEMA_VERSION: u16 = 1;
 
+/// `labels` key carrying the node's deployment zone (ADR 0006).
+pub const NODE_ZONE_LABEL: &str = "zone";
+
 /// Maximum size of an encoded node-status value.
 pub const MAX_NODE_STATUS_BYTES: usize = 16 * 1024;
 

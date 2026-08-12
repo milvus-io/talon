@@ -27,7 +27,7 @@ use talon_core::{BlockId, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::membership_cache::{MembershipCache, MembershipSnapshot};
-use crate::metrics::ReadStats;
+use crate::metrics::{ReadStats, ZoneMatch, ZoneReadObserver};
 use crate::placement_cache::{Cached, PlacementCache, RefreshReason};
 use crate::pool::ConnectionPool;
 use crate::range_stream::CacheReadError;
@@ -104,6 +104,10 @@ pub struct BlockReader {
     membership: Arc<MembershipCache>,
     /// Serializes cold refreshes so an expired snapshot causes one control request.
     membership_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// This reader's own deployment zone, for read classification (ADR 0006).
+    zone: Option<String>,
+    /// Sink for zone-classified read events; defaults to a no-op.
+    zone_observer: Arc<dyn ZoneReadObserver>,
 }
 
 impl BlockReader {
@@ -135,7 +139,31 @@ impl BlockReader {
             worker_pool: Arc::new(ConnectionPool::new()),
             membership,
             membership_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            zone: None,
+            zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
+    }
+
+    /// Configure zone-affine placement (ADR 0006).
+    ///
+    /// With `enabled` and a known `zone`, placement is computed over the
+    /// same-zone worker subset; an empty subset falls back to the full
+    /// membership and reports through `observer`. Served reads are classified
+    /// same/cross/unknown against `zone` regardless of `enabled`, so the
+    /// observer also measures the cross-zone baseline before the filter is
+    /// turned on.
+    pub fn with_zone_affinity(
+        mut self,
+        zone: Option<String>,
+        enabled: bool,
+        observer: Arc<dyn ZoneReadObserver>,
+    ) -> Self {
+        self.membership = Arc::new(
+            MembershipCache::new(self.cache.ttl_ms()).with_zone_affinity(zone.clone(), enabled),
+        );
+        self.zone = zone;
+        self.zone_observer = observer;
+        self
     }
 
     /// The coordinator address this reader resolves placement against.
@@ -180,7 +208,10 @@ impl BlockReader {
                 .fetch_cached_range(&block.object, &block.version, offset, u64::from(len))
                 .await
             {
-                Ok(bytes) if bytes.len() == len as usize => return Ok(bytes),
+                Ok(bytes) if bytes.len() == len as usize => {
+                    self.record_zone_read(address, bytes.len() as u64);
+                    return Ok(bytes);
+                }
                 Ok(bytes) => {
                     last_error = Some(CacheReadError::Protocol(
                         WorkerError::RangeLengthMismatch {
@@ -396,7 +427,10 @@ impl BlockReader {
                 .fetch_range(&block.object, abs_offset, len as u64)
                 .await
             {
-                Ok(bytes) if bytes.len() as u64 == u64::from(len) => return Ok(bytes),
+                Ok(bytes) if bytes.len() as u64 == u64::from(len) => {
+                    self.record_zone_read(addr, bytes.len() as u64);
+                    return Ok(bytes);
+                }
                 Ok(bytes) => {
                     self.stats.record_worker_failure();
                     last = Some(ReplicaFailure {
@@ -458,7 +492,10 @@ impl BlockReader {
                 .fetch_range_into(&block.object, abs_offset, dst)
                 .await
             {
-                Ok(n) if n == dst.len() => return Ok(n),
+                Ok(n) if n == dst.len() => {
+                    self.record_zone_read(addr, n as u64);
+                    return Ok(n);
+                }
                 Ok(n) => {
                     self.stats.record_worker_failure();
                     last = Some(ReplicaFailure {
@@ -642,6 +679,9 @@ impl BlockReader {
         let membership = self
             .membership_snapshot(now_ms, force_membership_refresh)
             .await?;
+        if membership.affinity_fallback {
+            self.zone_observer.affinity_fallback();
+        }
         let replicas = if self.replicas_k == 1 {
             vec![membership
                 .placement
@@ -667,6 +707,21 @@ impl BlockReader {
         Ok(cached)
     }
 
+    /// Classify one served worker read against this reader's zone and report
+    /// it. The last-good snapshot is authoritative enough for metrics; a
+    /// worker whose zone is not (yet) known classifies as `unknown`.
+    fn record_zone_read(&self, address: &str, bytes: u64) {
+        let matched = match (&self.zone, self.membership.last_good()) {
+            (Some(zone), Some(snapshot)) => match snapshot.zones_by_address.get(address) {
+                Some(worker_zone) if worker_zone == zone => ZoneMatch::Same,
+                Some(_) => ZoneMatch::Cross,
+                None => ZoneMatch::Unknown,
+            },
+            _ => ZoneMatch::Unknown,
+        };
+        self.zone_observer.worker_read(matched, bytes);
+    }
+
     async fn membership_snapshot(
         &self,
         now_ms: u64,
@@ -683,9 +738,9 @@ impl BlockReader {
                 return Ok(snapshot);
             }
         }
-        match self.coordinator.membership().await {
-            Ok(nodes) => {
-                let (snapshot, changed) = self.membership.replace(nodes, now_ms);
+        match self.coordinator.membership_zoned(now_ms).await {
+            Ok(members) => {
+                let (snapshot, changed) = self.membership.replace(members, now_ms);
                 if changed {
                     self.cache.clear();
                 }
@@ -774,6 +829,16 @@ mod tests {
                                 id: NodeId::new("w1"),
                                 address: worker_addr.clone(),
                                 role: NodeRole::Worker,
+                            }],
+                        },
+                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
+                            nodes: vec![talon_transport::ZonedNodeInfo {
+                                info: NodeInfo {
+                                    id: NodeId::new("w1"),
+                                    address: worker_addr.clone(),
+                                    role: NodeRole::Worker,
+                                },
+                                zone: None,
                             }],
                         },
                         _ => ControlMessage::Ack {
@@ -956,6 +1021,20 @@ mod tests {
                                 },
                             ],
                         },
+                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
+                            nodes: [w1.clone(), w2.clone()]
+                                .into_iter()
+                                .enumerate()
+                                .map(|(i, address)| talon_transport::ZonedNodeInfo {
+                                    info: NodeInfo {
+                                        id: NodeId::new(format!("w{}", i + 1)),
+                                        address,
+                                        role: NodeRole::Worker,
+                                    },
+                                    zone: None,
+                                })
+                                .collect(),
+                        },
                         _ => ControlMessage::Ack {
                             ok: false,
                             detail: None,
@@ -1002,6 +1081,144 @@ mod tests {
         assert_eq!(snap.hit_ratio(), 0.5);
     }
 
+    /// A schema-v5 coordinator advertising two workers in different zones.
+    async fn mock_zoned_coordinator(az_a: String, az_b: String) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut s, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                let (az_a, az_b) = (az_a.clone(), az_b.clone());
+                tokio::spawn(async move {
+                    loop {
+                        let mut hdr = [0u8; HEADER_LEN];
+                        if s.read_exact(&mut hdr).await.is_err() {
+                            return;
+                        }
+                        let h = FrameHeader::decode(&hdr).unwrap();
+                        let mut body = vec![0u8; h.length as usize];
+                        s.read_exact(&mut body).await.unwrap();
+                        let reply = ControlMessage::MembershipListV2 {
+                            nodes: vec![
+                                talon_transport::ZonedNodeInfo {
+                                    info: NodeInfo {
+                                        id: NodeId::new("w1"),
+                                        address: az_a.clone(),
+                                        role: NodeRole::Worker,
+                                    },
+                                    zone: Some("az-a".into()),
+                                },
+                                talon_transport::ZonedNodeInfo {
+                                    info: NodeInfo {
+                                        id: NodeId::new("w2"),
+                                        address: az_b.clone(),
+                                        role: NodeRole::Worker,
+                                    },
+                                    zone: Some("az-b".into()),
+                                },
+                            ],
+                        };
+                        s.write_all(&talon_transport::encode(0, &reply).unwrap())
+                            .await
+                            .unwrap();
+                        s.flush().await.unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[derive(Default)]
+    struct CountingZoneObserver {
+        same: std::sync::atomic::AtomicU32,
+        cross: std::sync::atomic::AtomicU32,
+        unknown: std::sync::atomic::AtomicU32,
+        fallbacks: std::sync::atomic::AtomicU32,
+    }
+
+    impl crate::metrics::ZoneReadObserver for CountingZoneObserver {
+        fn worker_read(&self, matched: crate::metrics::ZoneMatch, _bytes: u64) {
+            use std::sync::atomic::Ordering;
+            match matched {
+                crate::metrics::ZoneMatch::Same => self.same.fetch_add(1, Ordering::SeqCst),
+                crate::metrics::ZoneMatch::Cross => self.cross.fetch_add(1, Ordering::SeqCst),
+                crate::metrics::ZoneMatch::Unknown => self.unknown.fetch_add(1, Ordering::SeqCst),
+            };
+        }
+
+        fn affinity_fallback(&self) {
+            self.fallbacks
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// With affinity on, every block lands on the same-zone worker even when a
+    /// worker in another zone would rank first globally; the observer counts
+    /// only same-zone reads and no fallbacks.
+    #[tokio::test]
+    async fn zone_affinity_reads_stay_in_the_readers_zone() {
+        let hits_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_a = mock_worker(Arc::clone(&hits_a)).await;
+        let worker_b = mock_worker(Arc::clone(&hits_b)).await;
+        let coordinator = mock_zoned_coordinator(worker_a, worker_b).await;
+
+        let observer = Arc::new(CountingZoneObserver::default());
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1)
+            .with_zone_affinity(
+                Some("az-a".into()),
+                true,
+                Arc::clone(&observer) as Arc<dyn crate::metrics::ZoneReadObserver>,
+            );
+
+        // Several distinct blocks: all owners must come from az-a.
+        for i in 0..4u64 {
+            let mut blk = block();
+            blk.offset = i * u64::from(blk.block_size);
+            reader.read_block(&blk, 0, 16, 0).await.unwrap();
+        }
+        use std::sync::atomic::Ordering;
+        assert!(hits_a.load(Ordering::SeqCst) >= 4);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.same.load(Ordering::SeqCst), 4);
+        assert_eq!(observer.cross.load(Ordering::SeqCst), 0);
+        assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 0);
+    }
+
+    /// With affinity on but no same-zone worker, reads fall back to the full
+    /// membership and the fallback is observed.
+    #[tokio::test]
+    async fn missing_local_zone_falls_back_to_full_membership() {
+        let hits_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hits_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let worker_a = mock_worker(Arc::clone(&hits_a)).await;
+        let worker_b = mock_worker(Arc::clone(&hits_b)).await;
+        let coordinator = mock_zoned_coordinator(worker_a, worker_b).await;
+
+        let observer = Arc::new(CountingZoneObserver::default());
+        let cache = Arc::new(PlacementCache::new(10_000));
+        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1)
+            .with_zone_affinity(
+                Some("az-c".into()),
+                true,
+                Arc::clone(&observer) as Arc<dyn crate::metrics::ZoneReadObserver>,
+            );
+
+        reader.read_block(&block(), 0, 16, 0).await.unwrap();
+        use std::sync::atomic::Ordering;
+        assert_eq!(
+            hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
+            1
+        );
+        assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 1);
+        assert_eq!(observer.cross.load(Ordering::SeqCst), 1);
+    }
+
     #[tokio::test]
     async fn empty_cluster_yields_no_owners() {
         // Coordinator advertises an empty worker membership.
@@ -1014,7 +1231,7 @@ mod tests {
             let h = FrameHeader::decode(&hdr).unwrap();
             let mut body = vec![0u8; h.length as usize];
             s.read_exact(&mut body).await.unwrap();
-            let reply = ControlMessage::MembershipList { nodes: Vec::new() };
+            let reply = ControlMessage::MembershipListV2 { nodes: Vec::new() };
             s.write_all(&talon_transport::encode(0, &reply).unwrap())
                 .await
                 .unwrap();
@@ -1039,11 +1256,14 @@ mod tests {
             let header = FrameHeader::decode(&header).unwrap();
             let mut body = vec![0u8; header.length as usize];
             stream.read_exact(&mut body).await.unwrap();
-            let reply = ControlMessage::MembershipList {
-                nodes: vec![NodeInfo {
-                    id: NodeId::new("worker-a"),
-                    address: worker_addr,
-                    role: NodeRole::Worker,
+            let reply = ControlMessage::MembershipListV2 {
+                nodes: vec![talon_transport::ZonedNodeInfo {
+                    info: NodeInfo {
+                        id: NodeId::new("worker-a"),
+                        address: worker_addr,
+                        role: NodeRole::Worker,
+                    },
+                    zone: None,
                 }],
             };
             stream

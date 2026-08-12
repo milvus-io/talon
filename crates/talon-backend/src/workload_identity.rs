@@ -30,7 +30,7 @@ use crate::s3::S3Credentials;
 /// Environment lookup used by source resolution, injectable for tests.
 pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
 
-fn env_var(name: &str) -> Option<String> {
+pub(crate) fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 

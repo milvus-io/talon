@@ -12,12 +12,49 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use talon_core::{FuseConfig, FuseConfigPatch};
 use talon_fuse::{path_to_object, BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
 use talon_transport::ObjectEntry;
+
+/// Warn about a persisting zone-affinity fallback at most this often.
+const FALLBACK_WARN_INTERVAL_MS: u64 = 300_000;
+
+/// Zone-affinity events surfaced as throttled log lines. The mount has no
+/// metrics endpoint (the gateway exports real counters), and a fallback can
+/// persist for hours, so warn once per interval rather than per resolve.
+#[derive(Default)]
+struct LoggingZoneObserver {
+    last_fallback_warn_ms: AtomicU64,
+}
+
+impl talon_cache_client::ZoneReadObserver for LoggingZoneObserver {
+    fn affinity_fallback(&self) {
+        let now = now_unix_ms();
+        let last = self.last_fallback_warn_ms.load(Ordering::Relaxed);
+        if now.saturating_sub(last) >= FALLBACK_WARN_INTERVAL_MS
+            && self
+                .last_fallback_warn_ms
+                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            tracing::warn!(
+                "zone affinity fell back to full membership: no same-zone workers reachable"
+            );
+        }
+    }
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 /// Command-line arguments for the Talon FUSE mount.
 #[derive(Debug, Parser)]
@@ -83,7 +120,28 @@ async fn main() -> anyhow::Result<()> {
     // Read-path components, shared by the metadata and data callbacks.
     let coordinator = CoordinatorClient::new(cfg.coordinator.clone());
     let cache = Arc::new(PlacementCache::new(cfg.placement_ttl_ms));
-    let reader = BlockReader::new(coordinator.clone(), cache, 1);
+    // Zone affinity (ADR 0006): env-only for the mount — the FUSE client
+    // typically runs outside Kubernetes, so there is no node-label lookup.
+    let env = |name: &str| std::env::var(name).ok().filter(|value| !value.is_empty());
+    let zone = env("TALON_ZONE");
+    let zone_affinity = match env("TALON_ZONE_AFFINITY") {
+        None => false,
+        Some(value) => talon_core::parse_bool_value(&value).ok_or_else(|| {
+            anyhow::anyhow!("TALON_ZONE_AFFINITY must be true or false, got {value:?}")
+        })?,
+    };
+    if zone_affinity || zone.is_some() {
+        tracing::info!(
+            zone = zone.as_deref().unwrap_or("unknown"),
+            zone_affinity,
+            "zone affinity configuration"
+        );
+    }
+    let reader = BlockReader::new(coordinator.clone(), cache, 1).with_zone_affinity(
+        zone,
+        zone_affinity,
+        Arc::new(LoggingZoneObserver::default()),
+    );
 
     // Populate the namespace before mounting. A listing failure is fatal: an
     // apparently healthy mount with an empty tree hides backend/configuration

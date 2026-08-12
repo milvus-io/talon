@@ -474,6 +474,7 @@ impl Coordinator {
                     };
                 }
                 let node = status.node.clone();
+                let zone = status.labels.get(talon_core::NODE_ZONE_LABEL).cloned();
                 let healthy_ready =
                     status.health == talon_core::NodeHealth::Healthy && status.ready;
                 match self
@@ -491,7 +492,7 @@ impl Coordinator {
                             && node.role == NodeRole::Worker
                             && healthy_ready
                         {
-                            self.service.membership().register(node);
+                            self.service.membership().register_zoned(node, zone);
                         }
                         self.observability.metrics().record_heartbeat(true, true);
                         ControlMessage::Ack {
@@ -528,6 +529,23 @@ impl Coordinator {
                 }
                 ControlMessage::MembershipList {
                     nodes: self.service.membership().snapshot(),
+                }
+            }
+            ControlMessage::MembershipQueryV2 {} => {
+                if !self.observability.is_ready() {
+                    return ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("coordinator not ready: shared state unavailable".into()),
+                    };
+                }
+                ControlMessage::MembershipListV2 {
+                    nodes: self
+                        .service
+                        .membership()
+                        .snapshot_zoned()
+                        .into_iter()
+                        .map(|(info, zone)| talon_transport::ZonedNodeInfo { info, zone })
+                        .collect(),
                 }
             }
             listing @ ControlMessage::ListObjects { .. } => {

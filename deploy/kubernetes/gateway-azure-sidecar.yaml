@@ -48,6 +48,14 @@ spec:
                 secretKeyRef:
                   name: talon-gateway-azure
                   key: account-key
+            # Zone-aware cache reads (ADR 0006): the gateway resolves its zone
+            # from this node's label, which needs the talon-node-zone-reader
+            # ClusterRole (rbac.yaml) bound to this Pod's ServiceAccount — or
+            # set TALON_ZONE directly. Opt in with TALON_ZONE_AFFINITY=true.
+            - name: TALON_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

@@ -623,6 +623,8 @@ pub struct WorkerObservability {
     readiness: WorkerReadiness,
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
+    /// Deployment zone reported in status labels (ADR 0006).
+    zone: Option<String>,
 }
 
 impl WorkerObservability {
@@ -669,7 +671,14 @@ impl WorkerObservability {
             readiness: WorkerReadiness::default(),
             index,
             inflight,
+            zone: None,
         })
+    }
+
+    /// Set the deployment zone reported in status labels (ADR 0006).
+    pub fn with_zone(mut self, zone: Option<String>) -> Self {
+        self.zone = zone;
+        self
     }
 
     /// Worker metric handles for data and control paths.
@@ -722,7 +731,11 @@ impl WorkerObservability {
             metrics: self
                 .metrics
                 .snapshot(inflight_loads, block_count, page_count, resident_bytes),
-            labels: BTreeMap::new(),
+            labels: self
+                .zone
+                .iter()
+                .map(|zone| (talon_core::NODE_ZONE_LABEL.to_string(), zone.clone()))
+                .collect(),
         }
     }
 

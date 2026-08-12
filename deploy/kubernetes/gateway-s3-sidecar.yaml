@@ -45,6 +45,14 @@ spec:
               value: talon-coordinator:7411
             - name: TALON_GATEWAY_S3_REGION
               value: us-east-1
+            # Zone-aware cache reads (ADR 0006): the gateway resolves its zone
+            # from this node's label, which needs the talon-node-zone-reader
+            # ClusterRole (rbac.yaml) bound to this Pod's ServiceAccount — or
+            # set TALON_ZONE directly. Opt in with TALON_ZONE_AFFINITY=true.
+            - name: TALON_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
             - name: AWS_ACCESS_KEY_ID
               valueFrom:
                 secretKeyRef:

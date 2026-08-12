@@ -5,6 +5,11 @@
 //! Azure to follow. Each backend is generic over an [`http::HttpClient`] so
 //! request construction and response parsing are unit-testable offline; a real
 //! networked client is injected in production.
+//!
+//! The crate also hosts Talon's deployment-platform introspection — workload
+//! identity ([`credentials`]) and zone discovery ([`resolve_zone`]) — which
+//! shares the same env/HTTP seams and keeps heavier HTTP dependencies out of
+//! `talon-core`.
 
 pub mod azure;
 pub mod azure_sharedkey;
@@ -19,6 +24,7 @@ pub mod s3;
 pub mod sigv4;
 pub mod workload_identity;
 pub mod xml;
+pub mod zone;
 
 pub use azure::{AzureBackend, AzureConfig};
 pub use credentials::{
@@ -39,3 +45,4 @@ pub use workload_identity::{
     resolve_azure_bearer, resolve_gcs_bearer, resolve_s3_credentials, ResolvedBearerToken,
     ResolvedS3Credentials,
 };
+pub use zone::{resolve_zone, ResolvedZone};

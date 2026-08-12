@@ -69,6 +69,39 @@ impl GatewayMetrics {
             .set(unix_seconds);
     }
 
+    /// Count one zone-classified cache worker read (ADR 0006).
+    ///
+    /// Public because the reader lives in the gateway binary; `zone_match` is
+    /// bounded to `same`, `cross`, or `unknown`.
+    pub fn record_zone_read(&self, zone_match: &'static str, bytes: u64) {
+        self.registry
+            .counter(
+                "talon_gateway_zone_reads_total",
+                "Cache worker reads by zone relationship.",
+                labels(&[("zone_match", zone_match)]),
+            )
+            .inc();
+        self.registry
+            .counter(
+                "talon_gateway_zone_read_bytes_total",
+                "Cache worker read bytes by zone relationship.",
+                labels(&[("zone_match", zone_match)]),
+            )
+            .add(bytes);
+    }
+
+    /// Count one placement resolution that used the full membership because
+    /// the same-zone worker set was empty.
+    pub fn record_zone_affinity_fallback(&self) {
+        self.registry
+            .counter(
+                "talon_gateway_zone_affinity_fallback_total",
+                "Placement resolutions without a same-zone worker.",
+                labels(&[]),
+            )
+            .inc();
+    }
+
     /// Count one identity or authorization file reload poll outcome.
     ///
     /// Public because the reload loop lives in the gateway binary; both label

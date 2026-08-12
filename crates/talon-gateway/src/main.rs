@@ -10,7 +10,9 @@ use talon_backend::{
     resolve_azure_bearer, resolve_s3_credentials, AzureBackend, AzureConfig, CredentialsObserver,
     ProvideBearerToken, ProvideS3Credentials, ReqwestClient, S3Backend, S3Config, S3Credentials,
 };
-use talon_cache_client::{BlockReader, CoordinatorClient, PlacementCache};
+use talon_cache_client::{
+    BlockReader, CoordinatorClient, PlacementCache, ZoneMatch, ZoneReadObserver,
+};
 use talon_gateway::azure::{AzureAdapterConfig, AzureBlobAdapter, AzureCache};
 use talon_gateway::azure_auth::{AzureClientIdentity, AzureStorageAuthenticator};
 use talon_gateway::s3::{S3Adapter, S3AdapterConfig, S3Cache};
@@ -62,6 +64,7 @@ struct Settings {
     s3_multipart_ttl_ms: u64,
     authorization_path: Option<PathBuf>,
     auth_reload_ms: u64,
+    zone_affinity: bool,
     origin_credentials_source: Option<String>,
     tls: Option<GatewayTlsConfig>,
 }
@@ -172,6 +175,11 @@ impl Settings {
                 "TALON_GATEWAY_AUTH_RELOAD_MS must be greater than zero",
             ));
         }
+        let zone_affinity = parse_bool(
+            value(&mut get, "TALON_ZONE_AFFINITY").as_deref(),
+            false,
+            "TALON_ZONE_AFFINITY",
+        )?;
         let tls_certificate = value(&mut get, "TALON_GATEWAY_TLS_CERT_PATH");
         let tls_private_key = value(&mut get, "TALON_GATEWAY_TLS_KEY_PATH");
         let client_auth_mode =
@@ -313,6 +321,7 @@ impl Settings {
             authorization_path: value(&mut get, "TALON_GATEWAY_AUTHORIZATION_PATH")
                 .map(PathBuf::from),
             auth_reload_ms,
+            zone_affinity,
             origin_credentials_source: value(&mut get, "TALON_ORIGIN_CREDENTIALS_SOURCE"),
             tls,
         };
@@ -361,9 +370,8 @@ fn parse_or<T: std::str::FromStr>(
 fn parse_bool(value: Option<&str>, default: bool, name: &str) -> MainResult<bool> {
     match value {
         None => Ok(default),
-        Some("1" | "true" | "yes") => Ok(true),
-        Some("0" | "false" | "no") => Ok(false),
-        Some(_) => Err(invalid(format!("{name} must be true or false"))),
+        Some(value) => talon_core::parse_bool_value(value)
+            .ok_or_else(|| invalid(format!("{name} must be true or false"))),
     }
 }
 
@@ -381,12 +389,36 @@ fn split_endpoint(endpoint: &str) -> (String, bool) {
     }
 }
 
-fn cache_reader(settings: &Settings) -> Arc<BlockReader> {
-    Arc::new(BlockReader::new(
-        CoordinatorClient::new(&settings.coordinator),
-        Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
-        settings.replicas,
-    ))
+/// Bridges zone-classified cache reads into the gateway registry.
+struct ZoneReadMetrics(GatewayMetrics);
+
+impl ZoneReadObserver for ZoneReadMetrics {
+    fn worker_read(&self, matched: ZoneMatch, bytes: u64) {
+        self.0.record_zone_read(matched.label(), bytes);
+    }
+
+    fn affinity_fallback(&self) {
+        self.0.record_zone_affinity_fallback();
+    }
+}
+
+fn cache_reader(
+    settings: &Settings,
+    zone: Option<String>,
+    metrics: &GatewayMetrics,
+) -> Arc<BlockReader> {
+    Arc::new(
+        BlockReader::new(
+            CoordinatorClient::new(&settings.coordinator),
+            Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
+            settings.replicas,
+        )
+        .with_zone_affinity(
+            zone,
+            settings.zone_affinity,
+            Arc::new(ZoneReadMetrics(metrics.clone())),
+        ),
+    )
 }
 
 /// The origin credential a gateway Azure adapter signs with.
@@ -417,6 +449,7 @@ fn azure_static_auth(settings: &Settings) -> MainResult<Option<AzureOriginAuth>>
 fn azure_adapter(
     settings: &Settings,
     auth: AzureOriginAuth,
+    cache: Arc<BlockReader>,
 ) -> MainResult<Arc<dyn GatewayAdapter>> {
     if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
         return Err(invalid(
@@ -465,7 +498,6 @@ fn azure_adapter(
     config.max_block_bindings = settings.azure_max_block_bindings;
     config.block_binding_ttl =
         std::time::Duration::from_millis(settings.azure_block_binding_ttl_ms);
-    let cache = cache_reader(settings);
     Ok(Arc::new(AzureBlobAdapter::new(
         config,
         cache as Arc<dyn AzureCache>,
@@ -492,6 +524,7 @@ fn static_s3_credentials(settings: &Settings) -> MainResult<Option<S3Credentials
 fn s3_adapter(
     settings: &Settings,
     credentials: Arc<dyn ProvideS3Credentials>,
+    cache: Arc<BlockReader>,
 ) -> MainResult<Arc<dyn GatewayAdapter>> {
     if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
         return Err(invalid(
@@ -538,7 +571,6 @@ fn s3_adapter(
     config.default_route = settings.route;
     config.max_multipart_uploads = settings.s3_max_multipart_uploads;
     config.multipart_state_ttl = std::time::Duration::from_millis(settings.s3_multipart_ttl_ms);
-    let cache = cache_reader(settings);
     Ok(Arc::new(S3Adapter::new(
         config,
         cache as Arc<dyn S3Cache>,
@@ -922,6 +954,14 @@ async fn main() -> MainResult<()> {
     let credentials_observer: Arc<dyn CredentialsObserver> =
         Arc::new(OriginCredentialsObserver(metrics.clone()));
     let exchange_http: Arc<dyn talon_backend::HttpClient> = Arc::new(ReqwestClient::new());
+    let resolved_zone = talon_backend::resolve_zone().await;
+    info!(
+        zone = ?resolved_zone.zone,
+        source = resolved_zone.source,
+        zone_affinity = settings.zone_affinity,
+        "deployment zone resolved"
+    );
+    let cache = cache_reader(&settings, resolved_zone.zone, &metrics);
     let adapter = match settings.protocol.as_str() {
         "azure" => {
             if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
@@ -961,7 +1001,7 @@ async fn main() -> MainResult<()> {
                     }
                 },
             };
-            azure_adapter(&settings, auth)?
+            azure_adapter(&settings, auth, Arc::clone(&cache))?
         }
         "s3" => {
             if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
@@ -978,7 +1018,7 @@ async fn main() -> MainResult<()> {
             .await
             .map_err(invalid)?;
             info!(source = resolved.source, "origin S3 credentials resolved");
-            s3_adapter(&settings, resolved.provider)?
+            s3_adapter(&settings, resolved.provider, Arc::clone(&cache))?
         }
         _ => unreachable!("validated protocol"),
     };
@@ -1121,7 +1161,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(trusted.origin_auth, OriginAuthMode::TrustedPassthrough);
-        assert!(s3_adapter(&trusted, test_s3_provider()).is_err());
+        assert!(s3_adapter(&trusted, test_s3_provider(), test_cache(&trusted)).is_err());
 
         assert!(settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
@@ -1154,6 +1194,14 @@ mod tests {
             ("blob.example".into(), true)
         );
         assert_eq!(split_endpoint("s3.example"), ("s3.example".into(), true));
+    }
+
+    fn test_cache(settings: &Settings) -> Arc<BlockReader> {
+        Arc::new(BlockReader::new(
+            CoordinatorClient::new(&settings.coordinator),
+            Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
+            1,
+        ))
     }
 
     fn test_s3_provider() -> Arc<dyn ProvideS3Credentials> {
@@ -1190,7 +1238,12 @@ mod tests {
             ("TALON_GATEWAY_PROTOCOL", "azure"),
         ])
         .unwrap();
-        assert!(azure_adapter(&no_account, AzureOriginAuth::Sas("sig=x".into())).is_err());
+        assert!(azure_adapter(
+            &no_account,
+            AzureOriginAuth::Sas("sig=x".into()),
+            test_cache(&no_account)
+        )
+        .is_err());
 
         let both = settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
