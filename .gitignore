@@ -12,6 +12,8 @@
 # Editor / OS
 *.swp
 .DS_Store
+# JetBrains project files: per-developer, and regenerated on open.
+.idea/
 
 # Secrets / credentials — never commit these.
 # The Azure SAS token and account are supplied via environment variables at
