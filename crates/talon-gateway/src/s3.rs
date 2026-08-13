@@ -653,6 +653,27 @@ enum BucketProbe {
     Location,
 }
 
+/// In S3 a query parameter is not a modifier on the path's operation, it
+/// selects a different one: `DELETE /bucket/key` removes the object while
+/// `DELETE /bucket/key?tagging` removes only its tags and keeps the object.
+/// Ignoring a sub-resource the gateway does not implement would therefore run
+/// a different request than the client sent — silently, and for `?tagging`
+/// destructively — so an unrecognized key is refused for every method and
+/// every target.
+///
+/// This runs before dispatch on both the classification and handling paths.
+/// The bucket-level V1 listing shape stays checked separately because it must
+/// also reject sub-resources this parser does recognize.
+fn require_known_sub_resources(query: &S3Query) -> Result<(), S3RequestError> {
+    if let Some(name) = query.unknown.as_deref() {
+        return Err(S3RequestError::invalid(
+            "NotImplemented",
+            format!("the {name} sub-resource is not supported"),
+        ));
+    }
+    Ok(())
+}
+
 /// A bucket-level `GET` is a V1 listing only when its query carries nothing
 /// but listing parameters. Known sub-resources (`uploads`), multipart
 /// parameters, unrecognized query keys (`versions`, `acl`, ...), and
@@ -861,6 +882,13 @@ impl S3Query {
                 }
                 "marker" => set_query_value(&mut parsed.marker, value.into_owned(), "marker")?,
                 "delete" => set_query_value(&mut parsed.delete, value.into_owned(), "delete")?,
+                // `x-amz-` is AWS's reserved parameter namespace, not a
+                // sub-resource: presigned requests carry their whole SigV4
+                // credential there, and the signature and payload declaration
+                // are read from the raw query by the authenticator. Recording
+                // them as unrecognized sub-resources would reject every
+                // presigned URL.
+                other if other.len() > 6 && other[..6].eq_ignore_ascii_case("x-amz-") => {}
                 other => {
                     if parsed.unknown.is_none() {
                         parsed.unknown = Some(other.to_string());
@@ -2121,6 +2149,7 @@ impl S3Adapter {
     fn classify_access(&self, request: &Request) -> Result<GatewayAccess, S3RequestError> {
         let target = parse_target(request, &self.config)?;
         let query = S3Query::parse(request.uri().query())?;
+        require_known_sub_resources(&query)?;
         if request.method() == axum::http::Method::GET && target.key.is_none() && query.is_list_v2()
         {
             return Ok(GatewayAccess {
@@ -2224,6 +2253,7 @@ impl S3Adapter {
     ) -> Result<GatewayResponse, S3RequestError> {
         let target = parse_target(&request, &self.config)?;
         let query = S3Query::parse(request.uri().query())?;
+        require_known_sub_resources(&query)?;
         if request.method() == axum::http::Method::GET && target.key.is_none() && query.is_list_v2()
         {
             return self.list(target.bucket, query, context).await;
@@ -4315,6 +4345,108 @@ mod tests {
         }
         assert_eq!(origin.calls.load(Ordering::SeqCst), 0);
         assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn object_sub_resources_are_refused_before_the_object_is_touched() {
+        let cache = Arc::new(MutationCache {
+            invalidations: AtomicUsize::new(0),
+        });
+        // Any origin call at all is the failure this test exists to catch.
+        let origin = MutationOrigin::new(Ok(HttpResponse {
+            status: 204,
+            headers: Vec::new(),
+            body: Bytes::new(),
+        }));
+        let adapter = mutation_adapter(Arc::clone(&cache), Arc::clone(&origin));
+
+        // `DELETE /bucket/key?tagging` means "delete the tags, keep the
+        // object". Dropping the sub-resource would delete the object and
+        // answer 204, so the client reads success for data it still expects.
+        for (method, uri) in [
+            ("DELETE", "/bucket/key?tagging"),
+            ("PUT", "/bucket/key?tagging"),
+            ("GET", "/bucket/key?tagging"),
+            ("HEAD", "/bucket/key?acl"),
+            ("DELETE", "/bucket/key?versionId=abc"),
+            ("GET", "/bucket/key?legal-hold"),
+            ("PUT", "/bucket/key?retention"),
+            ("GET", "/bucket/key?uploadId=x&acl"),
+        ] {
+            let dispatched = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header(header::HOST, "localhost")
+                .header(header::CONTENT_LENGTH, "0")
+                .body(Body::empty())
+                .unwrap();
+            let error = match adapter.handle_request(dispatched, &context()).await {
+                Ok(_) => panic!("{method} {uri} must be refused"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.code, "NotImplemented",
+                "{method} {uri} must not run a different operation"
+            );
+            assert_eq!(
+                adapter
+                    .classify_access(&request(
+                        axum::http::Method::from_bytes(method.as_bytes()).unwrap(),
+                        uri
+                    ))
+                    .unwrap_err()
+                    .code,
+                "NotImplemented",
+                "{method} {uri} must be refused at classification too"
+            );
+        }
+        assert_eq!(
+            origin.calls.load(Ordering::SeqCst),
+            0,
+            "no sub-resource request may reach the origin"
+        );
+        assert_eq!(cache.invalidations.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn listings_reject_sub_resources_but_keep_presigned_credentials() {
+        let adapter = bucket_probe_adapter(BucketOrigin::new([]), "us-east-1");
+        // A V2 listing carries its own dispatch branch, so it needs the same
+        // guard as the V1 shape check.
+        for uri in ["/bucket?list-type=2&acl", "/bucket?list-type=2&versions"] {
+            assert_eq!(
+                adapter
+                    .classify_access(&request(axum::http::Method::GET, uri))
+                    .unwrap_err()
+                    .code,
+                "NotImplemented",
+                "{uri} must not become a listing"
+            );
+        }
+
+        // Presigned requests put their whole SigV4 credential in the query.
+        // Those parameters are reserved, not sub-resources, and must survive.
+        let presigned = "/bucket/key?X-Amz-Algorithm=AWS4-HMAC-SHA256\
+            &X-Amz-Credential=key%2F20260811%2Fus-east-1%2Fs3%2Faws4_request\
+            &X-Amz-Date=20260811T000000Z&X-Amz-Expires=900\
+            &X-Amz-SignedHeaders=host&X-Amz-Signature=abc\
+            &X-Amz-Security-Token=token&X-Amz-Content-Sha256=UNSIGNED-PAYLOAD";
+        let access = adapter
+            .classify_access(&request(axum::http::Method::GET, presigned))
+            .expect("a presigned credential is not a sub-resource");
+        assert_eq!(access.operation, GatewayOperation::Read);
+        let query = S3Query::parse(Some(presigned.split_once('?').unwrap().1)).unwrap();
+        assert!(query.unknown.is_none());
+        // The reserved prefix is matched case-insensitively, and `x-amz` alone
+        // is not in it.
+        assert!(S3Query::parse(Some("x-amz-meta-owner=me"))
+            .unwrap()
+            .unknown
+            .is_none());
+        assert_eq!(
+            S3Query::parse(Some("x-amz=1")).unwrap().unknown.as_deref(),
+            Some("x-amz")
+        );
     }
 
     #[tokio::test]
