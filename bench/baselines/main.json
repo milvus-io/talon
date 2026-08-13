@@ -20,5 +20,6 @@
   "read_path_benches::plan_eof_clamp": 77.62,
   "read_path_benches::plan_multi_block": 395.4,
   "read_path_benches::plan_single_block": 91.44,
+  "read_path_benches::readahead_byte_range_sequential_run": 157.3,
   "read_path_benches::readahead_sequential_run": 956.4
 }

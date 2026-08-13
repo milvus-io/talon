@@ -6,10 +6,11 @@
 //! consecutive reads it prefetches the next N block indices ahead of the
 //! cursor. Random access never triggers prefetch, so no bandwidth is wasted.
 //!
-//! [`ReadaheadState::on_read`] is called for each read (by block index) and
-//! returns the block indices to prefetch — empty until a sequential run is
-//! established, and bounded by the configured window so prefetch memory can't
-//! grow unbounded.
+//! [`ReadaheadState::on_read_range`] is called with each successful read's byte
+//! range and returns the block indices to prefetch — empty until a sequential
+//! run is established, and bounded by the configured window so prefetch memory
+//! can't grow unbounded. [`ReadaheadState::on_read`] remains available for
+//! block-granular callers.
 
 /// Tunable readahead parameters.
 #[derive(Debug, Clone, Copy)]
@@ -37,12 +38,20 @@ impl Default for ReadaheadConfig {
 #[derive(Debug)]
 pub struct ReadaheadState {
     config: ReadaheadConfig,
-    /// The block index expected next if the pattern is sequential.
+    /// Cursor expected next, in the units selected by `mode`.
     expected_next: Option<u64>,
+    /// Whether the current run tracks block indices or byte ranges.
+    mode: Option<TrackingMode>,
     /// Current run length of consecutive in-order reads.
     run: u32,
     /// Highest block index already scheduled for prefetch (exclusive frontier).
     prefetched_upto: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrackingMode {
+    Block,
+    ByteRange { block_size: u32 },
 }
 
 impl ReadaheadState {
@@ -51,6 +60,7 @@ impl ReadaheadState {
         Self {
             config,
             expected_next: None,
+            mode: None,
             run: 0,
             prefetched_upto: 0,
         }
@@ -68,22 +78,70 @@ impl ReadaheadState {
 
     /// Record a read at `block_index` and return blocks to prefetch.
     ///
-    /// A read is "sequential" if it lands on the block immediately after the
-    /// previous one. Once the run reaches `trigger_run`, this returns the next
-    /// up-to-`window` block indices ahead of the cursor that haven't already
-    /// been scheduled (deduplicated via a frontier, so re-reads don't re-issue).
-    /// Any non-consecutive read resets the run and returns nothing.
+    /// This block-granular API is retained for compatibility. Byte-range callers
+    /// should use [`Self::on_read_range`]. Switching between the two APIs resets
+    /// the current sequential run.
     pub fn on_read(&mut self, block_index: u64) -> Vec<u64> {
-        let sequential = self.expected_next == Some(block_index);
+        let Some(next_block) = block_index.checked_add(1) else {
+            self.reset();
+            return Vec::new();
+        };
+        self.observe(TrackingMode::Block, block_index, next_block, next_block)
+    }
+
+    /// Record a successful byte-range read and return blocks to prefetch.
+    ///
+    /// A read is sequential when `offset` is the first byte after the previous
+    /// successful read. `read_len` must be the number of bytes actually returned,
+    /// not merely requested. Prefetch starts after the final block touched by the
+    /// range. Zero-length reads are no-ops. A zero or changed `block_size`, an
+    /// overflowing range, or switching from [`Self::on_read`] safely resets the
+    /// current run.
+    pub fn on_read_range(&mut self, offset: u64, read_len: u64, block_size: u32) -> Vec<u64> {
+        if read_len == 0 {
+            return Vec::new();
+        }
+        if block_size == 0 {
+            self.reset();
+            return Vec::new();
+        }
+        let Some(next_byte) = offset.checked_add(read_len) else {
+            self.reset();
+            return Vec::new();
+        };
+        let last_block = (next_byte - 1) / u64::from(block_size);
+        let next_block = last_block + 1;
+        self.observe(
+            TrackingMode::ByteRange { block_size },
+            offset,
+            next_byte,
+            next_block,
+        )
+    }
+
+    fn observe(
+        &mut self,
+        mode: TrackingMode,
+        cursor: u64,
+        next_cursor: u64,
+        next_block: u64,
+    ) -> Vec<u64> {
+        if self.mode != Some(mode) {
+            self.expected_next = None;
+            self.run = 0;
+            self.prefetched_upto = next_block;
+            self.mode = Some(mode);
+        }
+
+        let sequential = self.expected_next == Some(cursor);
         if sequential {
             self.run = self.run.saturating_add(1);
         } else {
-            // Reset the pattern; a re-read of the same block or a jump is not a
-            // sequential step.
+            // Reset the pattern; a re-read or jump is not a sequential step.
             self.run = 1;
-            self.prefetched_upto = block_index + 1;
+            self.prefetched_upto = next_block;
         }
-        self.expected_next = Some(block_index + 1);
+        self.expected_next = Some(next_cursor);
 
         if !self.is_sequential() || self.config.window == 0 {
             return Vec::new();
@@ -91,13 +149,20 @@ impl ReadaheadState {
 
         // Prefetch the window ahead of the cursor, past what we've already
         // scheduled, so overlapping reads don't re-issue the same prefetch.
-        let start = self.prefetched_upto.max(block_index + 1);
-        let end = block_index + 1 + self.config.window as u64;
+        let start = self.prefetched_upto.max(next_block);
+        let end = next_block.saturating_add(self.config.window as u64);
         if start >= end {
             return Vec::new();
         }
         self.prefetched_upto = end;
         (start..end).collect()
+    }
+
+    fn reset(&mut self) {
+        self.expected_next = None;
+        self.mode = None;
+        self.run = 0;
+        self.prefetched_upto = 0;
     }
 }
 
@@ -181,5 +246,99 @@ mod tests {
         // Re-reading block 5 is not a sequential step; run resets.
         assert!(s.on_read(5).is_empty());
         assert!(!s.is_sequential());
+    }
+
+    #[test]
+    fn sequential_scan_with_production_block_size_triggers_prefetch() {
+        let mut s = ReadaheadState::new(ReadaheadConfig::default());
+        const BLOCK_SIZE: u32 = 256 << 20;
+        const READ_LEN: u64 = 128 << 10;
+
+        assert!(s.on_read_range(0, READ_LEN, BLOCK_SIZE).is_empty());
+        assert!(s.on_read_range(READ_LEN, READ_LEN, BLOCK_SIZE).is_empty());
+        assert_eq!(
+            s.on_read_range(2 * READ_LEN, READ_LEN, BLOCK_SIZE),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[test]
+    fn repeated_or_gapped_ranges_reset_the_run() {
+        const BLOCK_SIZE: u32 = 1024;
+        let mut s = state();
+
+        assert!(s.on_read_range(0, 128, BLOCK_SIZE).is_empty());
+        assert_eq!(s.on_read_range(128, 128, BLOCK_SIZE), vec![1, 2, 3, 4]);
+        assert!(s.on_read_range(128, 128, BLOCK_SIZE).is_empty());
+        assert_eq!(s.run(), 1);
+
+        assert!(s.on_read_range(512, 128, BLOCK_SIZE).is_empty());
+        assert_eq!(s.run(), 1);
+    }
+
+    #[test]
+    fn zero_length_range_is_a_noop() {
+        const BLOCK_SIZE: u32 = 1024;
+        let mut s = state();
+
+        assert!(s.on_read_range(0, 128, BLOCK_SIZE).is_empty());
+        assert!(s.on_read_range(128, 0, BLOCK_SIZE).is_empty());
+        assert_eq!(s.run(), 1);
+        assert_eq!(s.on_read_range(128, 128, BLOCK_SIZE), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn range_spanning_blocks_prefetches_after_final_block() {
+        let mut s = ReadaheadState::new(ReadaheadConfig {
+            trigger_run: 1,
+            window: 4,
+        });
+
+        assert_eq!(s.on_read_range(512, 1536, 1024), vec![2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn invalid_or_overflowing_ranges_reset_detection() {
+        const BLOCK_SIZE: u32 = 1024;
+        let mut s = state();
+
+        s.on_read_range(0, 128, BLOCK_SIZE);
+        assert!(s.on_read_range(u64::MAX, 1, BLOCK_SIZE).is_empty());
+        assert_eq!(s.run(), 0);
+
+        s.on_read_range(0, 128, BLOCK_SIZE);
+        assert!(s.on_read_range(128, 128, 0).is_empty());
+        assert_eq!(s.run(), 0);
+    }
+
+    #[test]
+    fn valid_range_ending_at_u64_max_is_safe() {
+        let mut s = ReadaheadState::new(ReadaheadConfig {
+            trigger_run: 1,
+            window: 4,
+        });
+
+        assert!(s.on_read_range(u64::MAX - 1, 1, 1).is_empty());
+        assert_eq!(s.run(), 1);
+    }
+
+    #[test]
+    fn changing_block_size_starts_a_new_run() {
+        let mut s = state();
+
+        s.on_read_range(0, 128, 1024);
+        assert!(s.on_read_range(128, 128, 2048).is_empty());
+        assert_eq!(s.run(), 1);
+        assert_eq!(s.on_read_range(256, 128, 2048), vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn switching_tracking_apis_starts_a_new_run() {
+        let mut s = state();
+
+        s.on_read(0);
+        assert!(s.on_read_range(1, 1, 1).is_empty());
+        assert_eq!(s.run(), 1);
+        assert_eq!(s.on_read_range(2, 1, 1), vec![3, 4, 5, 6]);
     }
 }
