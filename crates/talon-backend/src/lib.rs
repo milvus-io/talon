@@ -15,6 +15,7 @@ pub mod azure;
 pub mod azure_sharedkey;
 pub mod credentials;
 pub mod delay;
+pub mod endpoint;
 pub mod gcs;
 pub mod http;
 mod query_auth;
@@ -32,6 +33,7 @@ pub use credentials::{
     RefreshPolicy, RefreshingCredentials, StaticBearerToken, StaticS3Credentials,
 };
 pub use delay::{DelayConfig, DelayingHttpClient};
+pub use endpoint::endpoint_host;
 pub use gcs::{GcsBackend, GcsConfig};
 pub use http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,

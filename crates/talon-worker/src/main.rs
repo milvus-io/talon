@@ -27,8 +27,8 @@ use std::time::Duration;
 
 use clap::Parser;
 use talon_backend::{
-    AzureBackend, AzureConfig, GcsBackend, GcsConfig, ReqwestClient, S3Backend, S3Config,
-    S3Credentials,
+    endpoint_host, AzureBackend, AzureConfig, GcsBackend, GcsConfig, ReqwestClient, S3Backend,
+    S3Config, S3Credentials,
 };
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
@@ -196,21 +196,6 @@ impl Args {
     }
 }
 
-/// Split an endpoint URL into `(host, tls)`: an `http://` scheme selects
-/// plaintext, `https://` or a bare host keeps TLS.
-fn split_scheme(endpoint: &str) -> (String, bool) {
-    match endpoint.strip_prefix("http://") {
-        Some(rest) => (rest.to_string(), false),
-        None => (
-            endpoint
-                .strip_prefix("https://")
-                .unwrap_or(endpoint)
-                .to_string(),
-            true,
-        ),
-    }
-}
-
 /// Explicit origin credential mechanism (`static`, `aws-web-identity`,
 /// `aliyun-oidc`, `tencent-oidc`, `huawei-agency`, `gcp-metadata`); unset
 /// means static material first, then auto-detected workload identity. Read
@@ -234,7 +219,7 @@ async fn build_azure_backend(
     })?;
     let azure_config = match cfg.azure_endpoint.clone() {
         Some(endpoint) => {
-            let (host, tls) = split_scheme(&endpoint);
+            let (host, tls) = endpoint_host(&endpoint);
             AzureConfig::emulator(account, host, tls)
         }
         None => AzureConfig::new(account),
@@ -294,7 +279,7 @@ async fn build_s3_backend(
     };
     let mut config = S3Config::aws(&region);
     if let Some(endpoint) = cfg.s3_endpoint.clone() {
-        let (host, tls) = split_scheme(&endpoint);
+        let (host, tls) = endpoint_host(&endpoint);
         config.endpoint = host;
         config.tls = tls;
     }
@@ -327,7 +312,7 @@ async fn build_gcs_backend(
 ) -> anyhow::Result<GcsBackend> {
     let config = match cfg.gcs_endpoint.clone() {
         Some(endpoint) => {
-            let (host, tls) = split_scheme(&endpoint);
+            let (host, tls) = endpoint_host(&endpoint);
             GcsConfig::emulator(host, tls)
         }
         None => GcsConfig::default(),
