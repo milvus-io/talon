@@ -610,21 +610,19 @@ impl ReadOnlyFs {
     /// Convenience over [`insert_object`](Self::insert_object) for populating the
     /// namespace from a coordinator `ObjectList`. Idempotent: re-inserting an
     /// existing object is a no-op for the tree shape (the path already resolves).
-    /// Returns the number of entries processed.
+    /// Malformed and reserved entries are skipped. Returns the number of entries
+    /// successfully registered.
     pub fn populate_from_listing<'a, I>(&self, entries: I) -> usize
     where
         I: IntoIterator<Item = (&'a str, u64)>,
     {
         let mut n = 0;
         for (path, size) in entries {
-            if Self::is_internal_object_path(path) {
-                continue;
-            }
             if path.ends_with('/') {
                 if self.insert_directory_marker(path).is_ok() {
                     n += 1;
                 }
-            } else {
+            } else if Self::validate_visible_object_path(path).is_ok() {
                 self.insert_object(path, size);
                 n += 1;
             }
@@ -2356,12 +2354,6 @@ impl ReadOnlyFs {
         }
         Ok(())
     }
-
-    fn is_internal_object_path(path: &str) -> bool {
-        path_to_object(path).is_ok_and(|object| {
-            object.object_path.split('/').next() == Some(INTERNAL_OBJECT_PREFIX)
-        })
-    }
 }
 
 #[cfg(test)]
@@ -2593,6 +2585,33 @@ mod tests {
         assert_eq!(
             fs.mkdir(bucket.ino, INTERNAL_OBJECT_PREFIX),
             Err(FsError::Invalid)
+        );
+    }
+
+    #[test]
+    fn populate_from_listing_rejects_multiply_rooted_paths() {
+        let fs = ReadOnlyFs::new();
+        let count = fs.populate_from_listing([
+            ("s3/bkt/visible.bin", 1u64),
+            ("//s3/bkt/ambiguous.bin", 2u64),
+            ("//s3/bkt/ambiguous-dir/", 0u64),
+            ("//s3/bkt/.__talon_internal/unlinked/stale/7", 5u64),
+        ]);
+        assert_eq!(count, 1);
+
+        let s3 = fs.lookup(ROOT_INO, "s3").unwrap();
+        let bucket = fs.lookup(s3.ino, "bkt").unwrap();
+        assert_eq!(
+            fs.lookup(bucket.ino, "ambiguous.bin"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs.lookup(bucket.ino, "ambiguous-dir"),
+            Err(FsError::NotFound)
+        );
+        assert_eq!(
+            fs.lookup(bucket.ino, INTERNAL_OBJECT_PREFIX),
+            Err(FsError::NotFound)
         );
     }
 
