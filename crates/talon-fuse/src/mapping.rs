@@ -34,11 +34,11 @@ pub struct ReadTarget {
 
 /// Parse a mount-relative path into an [`ObjectId`].
 ///
-/// The path must be `/<backend>/<bucket>/<object key...>` with at least one
-/// non-empty object-key component. Returns [`Error::Other`] for malformed or
-/// ambiguous paths.
+/// The path must be `<backend>/<bucket>/<object key...>` with zero or one
+/// leading slash and at least one non-empty object-key component. Returns
+/// [`Error::Other`] for malformed or ambiguous paths.
 pub fn path_to_object(path: &str) -> Result<ObjectId> {
-    let trimmed = path.trim_start_matches('/');
+    let trimmed = path.strip_prefix('/').unwrap_or(path);
     let mut parts = trimmed.split('/');
 
     let backend: Backend = parts
@@ -105,6 +105,12 @@ mod tests {
     }
 
     #[test]
+    fn accepts_mount_relative_listing_paths() {
+        let obj = path_to_object("s3/bucket/key").unwrap();
+        assert_eq!(obj.to_path(), "/s3/bucket/key");
+    }
+
+    #[test]
     fn rejects_ambiguous_paths() {
         for bad in [
             "/s3/bucket",          // no object key
@@ -113,6 +119,7 @@ mod tests {
             "/s3/bucket/a//b",     // empty middle component
             "/s3/bucket/../etc",   // parent escape
             "/s3/bucket/./x",      // current-dir component
+            "//s3/bucket/key",     // multiple leading slashes
             "/unknown/bucket/key", // bad backend
             "/",                   // empty
         ] {
