@@ -2,10 +2,11 @@
 //!
 //! [`crate::readahead::ReadaheadState`] *detects* sequential
 //! access and *plans* which block indices to prefetch; this module *executes*
-//! that plan. On each read the caller feeds the block index to
-//! [`Prefetcher::on_read`], which asks the detector for the next-N block
-//! indices and issues a small, **fire-and-forget** warm-up read for each
-//! through a cloned [`BlockReader`].
+//! that plan. On each read the caller feeds the successful byte range to
+//! [`Prefetcher::on_read_range`], which asks the detector for the next-N block
+//! indices and issues a small, **fire-and-forget** warm-up read for each through
+//! a cloned [`BlockReader`]. [`Prefetcher::on_read`] remains available for
+//! block-granular callers.
 //!
 //! # Why a warm-up read warms anything
 //!
@@ -87,10 +88,28 @@ impl Prefetcher {
     /// Never blocks on the prefetch itself.
     pub fn on_read(&mut self, block_index: u64, now_ms: u64) -> Vec<u64> {
         let planned = self.state.on_read(block_index);
+        self.spawn_planned(planned, now_ms)
+    }
+
+    /// Record a successful foreground byte-range read and fire off prefetches.
+    ///
+    /// `read_len` must be the number of bytes actually returned. Empty reads are
+    /// no-ops. Returns the block indices for which a task was actually spawned.
+    pub fn on_read_range(&mut self, offset: u64, read_len: u64, now_ms: u64) -> Vec<u64> {
+        let planned = self.state.on_read_range(offset, read_len, self.block_size);
+        self.spawn_planned(planned, now_ms)
+    }
+
+    fn spawn_planned(&self, planned: Vec<u64>, now_ms: u64) -> Vec<u64> {
         let mut spawned = Vec::new();
-        let bs = self.block_size as u64;
+        let bs = u64::from(self.block_size);
+        if bs == 0 {
+            return spawned;
+        }
         for idx in planned {
-            let block_start = idx * bs;
+            let Some(block_start) = idx.checked_mul(bs) else {
+                continue;
+            };
             // Never prefetch a block that starts at or past EOF.
             if block_start >= self.size {
                 continue;
@@ -282,6 +301,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn contiguous_byte_ranges_prefetch_next_blocks() {
+        let count = Arc::new(AtomicU32::new(0));
+        let worker = mock_worker(Arc::clone(&count)).await;
+        let coord = mock_coordinator(worker).await;
+        let mut pf = prefetcher(reader(coord));
+
+        assert!(pf.on_read_range(0, 128, 0).is_empty());
+        let spawned = pf.on_read_range(128, 128, 0);
+        assert_eq!(spawned, vec![1, 2, 3]);
+        assert!(pf.is_sequential());
+
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert_eq!(count.load(Ordering::SeqCst), spawned.len() as u32);
+    }
+
+    #[tokio::test]
+    async fn zero_length_byte_range_does_not_advance_detection() {
+        let count = Arc::new(AtomicU32::new(0));
+        let worker = mock_worker(Arc::clone(&count)).await;
+        let coord = mock_coordinator(worker).await;
+        let mut pf = prefetcher(reader(coord));
+
+        assert!(pf.on_read_range(0, 128, 0).is_empty());
+        assert!(pf.on_read_range(128, 0, 0).is_empty());
+        assert_eq!(pf.on_read_range(128, 128, 0), vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
     async fn prefetch_skips_blocks_past_eof() {
         let count = Arc::new(AtomicU32::new(0));
         let worker = mock_worker(Arc::clone(&count)).await;
@@ -309,5 +356,23 @@ mod tests {
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(count.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn unrepresentable_block_start_is_skipped() {
+        let mut pf = Prefetcher::new(
+            reader("127.0.0.1:9".to_owned()),
+            ReadaheadConfig {
+                trigger_run: 1,
+                window: 1,
+            },
+            1,
+            ObjectId::new(Backend::S3, "b", "o/1"),
+            1024,
+            Version::new("v1"),
+            u64::MAX,
+        );
+
+        assert!(pf.on_read(u64::MAX / 1024, 0).is_empty());
     }
 }

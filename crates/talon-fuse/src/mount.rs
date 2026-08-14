@@ -299,9 +299,10 @@ impl TalonFuse {
         self
     }
 
-    /// Feed a read at `offset` on handle `fh` to that handle's prefetcher,
-    /// lazily creating it, and return the block indices a prefetch was spawned
-    /// for (empty until a sequential run is detected, or if readahead is off).
+    /// Feed a successful read at `offset` on handle `fh` to that handle's
+    /// prefetcher, lazily creating it, and return the block indices a prefetch
+    /// was spawned for (empty until a sequential run is detected, or if
+    /// readahead is off). `read_len` is the number of bytes actually returned.
     ///
     /// Split out of the `read` callback so the wiring is unit-testable without a
     /// kernel mount: the prefetcher only fires after `trigger_run` consecutive
@@ -310,18 +311,18 @@ impl TalonFuse {
         &self,
         fh: u64,
         offset: u64,
+        read_len: u64,
         file_size: u64,
         object: Option<ObjectId>,
         now_ms: u64,
     ) -> Vec<u64> {
-        if self.readahead.window == 0 {
+        if self.readahead.window == 0 || read_len == 0 {
             return Vec::new();
         }
         let object = match object {
             Some(o) => o,
             None => return Vec::new(),
         };
-        let block_index = offset / self.block_size as u64;
         let mut prefetchers = self.prefetchers.lock_recover();
         let prefetcher = prefetchers.entry(fh).or_insert_with(|| {
             Prefetcher::new(
@@ -337,7 +338,7 @@ impl TalonFuse {
         // The prefetcher spawns fetches on the runtime; enter it so the spawns
         // have a reactor even though we may be on a sync FUSE thread.
         let _guard = self.runtime.enter();
-        prefetcher.on_read(block_index, now_ms)
+        prefetcher.on_read_range(offset, read_len, now_ms)
     }
 
     /// Write `bytes` back to the object at mount-relative `path` through its
@@ -826,14 +827,23 @@ impl fuser::Filesystem for TalonFuse {
             reader.read(&view, offset, size as u64, now_ms).await
         });
 
-        // Drive client-side readahead: feed this read's starting block index to
-        // the per-handle prefetcher, which warms the next blocks on the owning
-        // worker only once a sequential run is detected (issue #206). Prefetch is
-        // fire-and-forget and bounded, so this never delays the reply.
-        self.drive_readahead(fh, offset, file_size, object_for_prefetch, now_ms);
-
         match result {
-            Ok(bytes) => reply.data(&bytes),
+            Ok(bytes) => {
+                // Feed the successful byte range to the per-handle prefetcher.
+                // Using the returned length keeps short reads sequential, while
+                // EOF-empty and failed reads leave detection untouched (#256).
+                // Prefetch is fire-and-forget and bounded, so this never delays
+                // the reply.
+                self.drive_readahead(
+                    fh,
+                    offset,
+                    bytes.len() as u64,
+                    file_size,
+                    object_for_prefetch,
+                    now_ms,
+                );
+                reply.data(&bytes);
+            }
             Err(_) => reply.error(libc::EIO),
         }
     }
@@ -1718,6 +1728,10 @@ mod tests {
     /// whether the speculative fetches succeed — they are fire-and-forget — so
     /// this exercises the mount→prefetcher wiring without any live server.
     fn adapter_with_readahead(window: u32) -> TalonFuse {
+        adapter_with_readahead_and_block_size(window, 8)
+    }
+
+    fn adapter_with_readahead_and_block_size(window: u32, block_size: u32) -> TalonFuse {
         let fs = Arc::new(ReadOnlyFs::new());
         let reader = BlockReader::new(
             CoordinatorClient::new("127.0.0.1:9"), // unused; prefetch fetches just fail
@@ -1728,7 +1742,7 @@ mod tests {
             fs,
             reader,
             tokio::runtime::Handle::current(),
-            8, // block_size
+            block_size,
             talon_core::Version::new(CANONICAL_MOUNT_VERSION),
         )
         .with_readahead(window)
@@ -1747,10 +1761,10 @@ mod tests {
         let size = 64 * 8; // 64 blocks of 8 bytes
         let o = Some(obj());
         // Reads at block 0,1 (offsets 0,8): run building, no prefetch yet.
-        assert!(fuse.drive_readahead(1, 0, size, o.clone(), 0).is_empty());
-        assert!(fuse.drive_readahead(1, 8, size, o.clone(), 0).is_empty());
+        assert!(fuse.drive_readahead(1, 0, 8, size, o.clone(), 0).is_empty());
+        assert!(fuse.drive_readahead(1, 8, 8, size, o.clone(), 0).is_empty());
         // Block 2: run reaches trigger_run=3 → prefetch the next blocks.
-        let spawned = fuse.drive_readahead(1, 16, size, o.clone(), 0);
+        let spawned = fuse.drive_readahead(1, 16, 8, size, o.clone(), 0);
         assert!(!spawned.is_empty(), "sequential run must prefetch");
         assert_eq!(spawned, vec![3, 4, 5, 6], "window of 4 ahead of block 2");
     }
@@ -1763,7 +1777,8 @@ mod tests {
         // Jumping around (0, 5, 2, 9) is never a sequential run → no prefetch.
         for off in [0u64, 40, 16, 72] {
             assert!(
-                fuse.drive_readahead(1, off, size, o.clone(), 0).is_empty(),
+                fuse.drive_readahead(1, off, 8, size, o.clone(), 0)
+                    .is_empty(),
                 "random access must not prefetch (offset {off})"
             );
         }
@@ -1778,7 +1793,7 @@ mod tests {
         let o = Some(obj());
         for i in 0..6u64 {
             assert!(
-                fuse.drive_readahead(1, i * 8, size, o.clone(), 0)
+                fuse.drive_readahead(1, i * 8, 8, size, o.clone(), 0)
                     .is_empty(),
                 "window 0 must never prefetch"
             );
@@ -1792,11 +1807,52 @@ mod tests {
         let fuse = adapter_with_readahead(4);
         let size = 64 * 8;
         let o = Some(obj());
-        let _ = fuse.drive_readahead(7, 0, size, o.clone(), 0);
+        let _ = fuse.drive_readahead(7, 0, 8, size, o.clone(), 0);
         assert!(fuse.prefetchers.lock().unwrap().contains_key(&7));
         // Simulate the release callback's cleanup.
         fuse.prefetchers.lock().unwrap().remove(&7);
         assert!(!fuse.prefetchers.lock().unwrap().contains_key(&7));
+    }
+
+    #[tokio::test]
+    async fn readahead_tracks_contiguous_reads_within_one_block() {
+        const READ_LEN: u64 = 128 << 10;
+        const BLOCK_SIZE: u32 = 256 << 20;
+        let fuse = adapter_with_readahead_and_block_size(4, BLOCK_SIZE);
+        let size = 8 * u64::from(BLOCK_SIZE);
+        let o = Some(obj());
+
+        assert!(fuse
+            .drive_readahead(1, 0, READ_LEN, size, o.clone(), 0)
+            .is_empty());
+        assert!(fuse
+            .drive_readahead(1, READ_LEN, READ_LEN, size, o.clone(), 0)
+            .is_empty());
+        assert_eq!(
+            fuse.drive_readahead(1, 2 * READ_LEN, READ_LEN, size, o, 0),
+            vec![1, 2, 3, 4]
+        );
+    }
+
+    #[tokio::test]
+    async fn readahead_uses_actual_short_read_length() {
+        let fuse = adapter_with_readahead(4);
+        let size = 64 * 8;
+        let o = Some(obj());
+
+        assert!(fuse.drive_readahead(1, 0, 3, size, o.clone(), 0).is_empty());
+        assert!(fuse.drive_readahead(1, 3, 5, size, o.clone(), 0).is_empty());
+        assert_eq!(fuse.drive_readahead(1, 8, 8, size, o, 0), vec![2, 3, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn readahead_empty_read_does_not_create_state() {
+        let fuse = adapter_with_readahead(4);
+
+        assert!(fuse
+            .drive_readahead(11, 0, 0, 64, Some(obj()), 0)
+            .is_empty());
+        assert!(!fuse.prefetchers.lock().unwrap().contains_key(&11));
     }
 
     #[test]

@@ -1,10 +1,11 @@
 //! Read-path microbenchmarks for the FUSE client.
 //!
-//! These measure the CPU cost of the per-read planning that runs on every
-//! `read(2)` before any I/O: splitting a POSIX byte range into per-block fetch
-//! segments ([`plan_read`]) and the sequential-detection / readahead planner
-//! ([`ReadaheadState::on_read`]). They are deterministic (no network, no disk)
-//! so they can be committed as a baseline and diffed by `scripts/bench.py`.
+//! These measure the CPU cost of per-read planning around `read(2)`: splitting
+//! a POSIX byte range into per-block fetch segments ([`plan_read`]) before I/O,
+//! and sequential detection / readahead planning after a successful read
+//! ([`ReadaheadState::on_read`] and [`ReadaheadState::on_read_range`]). They are
+//! deterministic (no network, no disk) so they can be committed as a baseline
+//! and diffed by `scripts/bench.py`.
 //!
 //! The end-to-end read *throughput* wins from sendfile (#179) and connection
 //! pooling (#181) are measured separately by real-loopback comparison benches
@@ -98,6 +99,27 @@ fn readahead_sequential_run(bencher: divan::Bencher) {
         let mut emitted = 0usize;
         for i in 0..64u64 {
             emitted += state.on_read(divan::black_box(i)).len();
+        }
+        emitted
+    });
+}
+
+/// Drive realistic byte-range reads through one large block, exercising the
+/// production detector path fixed by issue #256.
+#[divan::bench]
+fn readahead_byte_range_sequential_run(bencher: divan::Bencher) {
+    bencher.bench(|| {
+        let mut state = ReadaheadState::new(ReadaheadConfig::default());
+        let mut emitted = 0usize;
+        const READ_LEN: u64 = 128 << 10;
+        for i in 0..64u64 {
+            emitted += state
+                .on_read_range(
+                    divan::black_box(i * READ_LEN),
+                    divan::black_box(READ_LEN),
+                    BLOCK_SIZE,
+                )
+                .len();
         }
         emitted
     });
