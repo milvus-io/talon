@@ -18,6 +18,7 @@
 //! [`PagedBlockStore`](crate::PagedBlockStore), which the worker uses instead of
 //! this store when `l2_page_size_bytes` is set.
 
+use crate::fd_cache::{CachedFd, FdCache};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
@@ -27,7 +28,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use talon_core::{
     BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result,
 };
@@ -50,90 +51,6 @@ where
         Err(join_error) => Err(Error::Backend(format!(
             "blocking store task failed: {join_error}"
         ))),
-    }
-}
-
-/// Number of shards in the open-fd cache. Sharding keeps the per-request
-/// lookup off a single global mutex when many connections hit distinct blocks.
-const FD_CACHE_SHARDS: usize = 16;
-
-/// Per-shard capacity of the open-fd cache. The cache holds one descriptor per
-/// resident block, so the process-wide ceiling is
-/// `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY` = 1024 descriptors on top of the
-/// connection and listener fds.
-///
-/// Blocks default to 256 MiB, so 1024 cached descriptors already covers a
-/// ~256 GiB resident working set — well past the point where the per-request
-/// `openat` was measurable. The bound matters because an unbounded cache would
-/// pin one fd per block ever touched; capping it keeps worst-case fd usage
-/// predictable and independent of cache size.
-const FD_CACHE_SHARD_CAPACITY: usize = 64;
-
-/// A cached, shared descriptor for an immutable block file.
-#[derive(Clone)]
-struct CachedFd {
-    fd: Arc<OwnedFd>,
-    len: u64,
-}
-
-/// A sharded, bounded cache of open `.blk` descriptors.
-///
-/// Block files are immutable and content-addressed: once written and committed
-/// under `<root>/<shard>/<digest>.blk`, the bytes at a given path never change.
-/// That makes the `openat` + `statx` pair on the serving path pure overhead —
-/// path resolution, inode lookup, and `stx_size` all return the same answer
-/// every time, while contending on the same inode/dentry across every worker
-/// thread.
-///
-/// Eviction is a simple random-ish replacement within a shard (drop one
-/// arbitrary entry when full). Blocks are equally hot in the steady state and
-/// the cost of a miss is exactly the old behaviour — one `openat` — so a
-/// precise LRU is not worth the extra bookkeeping on this path.
-struct FdCache {
-    shards: Vec<Mutex<std::collections::HashMap<PathBuf, CachedFd>>>,
-}
-
-impl FdCache {
-    fn new() -> Self {
-        Self {
-            shards: (0..FD_CACHE_SHARDS)
-                .map(|_| Mutex::new(std::collections::HashMap::new()))
-                .collect(),
-        }
-    }
-
-    fn shard_for(&self, path: &Path) -> &Mutex<std::collections::HashMap<PathBuf, CachedFd>> {
-        let mut hasher = DefaultHasher::new();
-        path.hash(&mut hasher);
-        &self.shards[(hasher.finish() as usize) % FD_CACHE_SHARDS]
-    }
-
-    fn get(&self, path: &Path) -> Option<CachedFd> {
-        let shard = self.shard_for(path);
-        let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(path).cloned()
-    }
-
-    fn insert(&self, path: PathBuf, entry: CachedFd) {
-        let shard = self.shard_for(&path);
-        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= FD_CACHE_SHARD_CAPACITY && !guard.contains_key(&path) {
-            if let Some(victim) = guard.keys().next().cloned() {
-                guard.remove(&victim);
-            }
-        }
-        guard.insert(path, entry);
-    }
-
-    /// Drop any cached descriptor for `path`.
-    ///
-    /// Called when a block is removed so the cache does not pin an unlinked
-    /// inode. In-flight handles keep the file alive until they complete, which
-    /// is exactly the pre-existing behaviour for a block evicted mid-request.
-    fn invalidate(&self, path: &Path) {
-        let shard = self.shard_for(path);
-        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(path);
     }
 }
 

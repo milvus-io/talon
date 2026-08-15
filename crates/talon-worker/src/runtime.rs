@@ -40,18 +40,24 @@ const LIST_PAGE_SIZE: u32 = 1000;
 /// Smallest request that is worth serving with sendfile when the pages are
 /// already resident in L1.
 ///
-/// Zero-copy is not free: it costs one `openat` and one `sendfile` per page
-/// touched. When L1 already holds the bytes, the byte path answers from DRAM
-/// with a single small copy and no syscalls per page, so below this size the
-/// copy it avoids is cheaper than the syscalls it adds. Benchmarked on a
-/// 64 KiB read straddling a 1 MiB page boundary: byte path 236 µs vs sendfile
-/// 280 µs (+19 %). The two paths converge at 256 KiB (375 vs 359 µs) and
-/// sendfile pulls clearly ahead at 1 MiB (766 vs 599 µs, −22 %), so the
-/// threshold sits at the measured crossover.
+/// Zero-copy is not free: it costs one `sendfile` per page touched, plus an
+/// `openat` on an fd-cache miss. When L1 already holds the bytes, the byte path
+/// answers from DRAM with a single small copy and no per-page syscalls, so
+/// below some size the copy it avoids is cheaper than the syscalls it adds.
+///
+/// Measured on a read straddling a 1 MiB page boundary, with the paged store's
+/// fd cache warm (byte path vs sendfile): 4 KiB 215 vs 227 us, 16 KiB 213 vs
+/// 222 us, 64 KiB 234 vs 233 us, 256 KiB 364 vs 330 us, 1 MiB 843 vs 736 us.
+/// The crossover sits just under 32 KiB; the small-read deficit is ~5% and the
+/// large-read gain reaches 22%.
+///
+/// This threshold used to be 256 KiB. Giving the paged store an fd cache
+/// removed the per-page `openat` and moved the crossover down by 8x, which is
+/// what the fixed cost of zero-copy was mostly made of.
 ///
 /// With L1 off there is no such tradeoff — the byte path must hit the disk
 /// anyway — so sendfile is used at every size.
-const L1_SENDFILE_MIN_LEN: u64 = 256 << 10;
+const L1_SENDFILE_MIN_LEN: u64 = 32 << 10;
 
 /// A per-object resolved version with the instant it was resolved.
 struct CachedVersion {
@@ -1605,6 +1611,28 @@ impl WorkerRuntime {
     /// Bytes resident in L1.
     pub fn l1_resident_bytes(&self) -> u64 {
         self.l1.resident_bytes()
+    }
+
+    /// The block covering `offset` of `object`, at the currently cached
+    /// version.
+    ///
+    /// Exposed for benchmarks that need to name a specific page of a warmed
+    /// span. Returns `None` if the object's version has not been resolved yet.
+    #[doc(hidden)]
+    pub fn block_for_bench(&self, object: &ObjectId, offset: u64) -> Option<BlockId> {
+        let version = self.cached_version(object)?;
+        Some(self.block_for(object, offset, &version))
+    }
+
+    /// Drop one page from L1, leaving L2 untouched. Returns whether it was
+    /// resident.
+    ///
+    /// Exposed for tests that need to construct a *partially* L1-resident span
+    /// — the state a real worker reaches whenever L1 evicts under pressure
+    /// while L2 still holds every page.
+    #[doc(hidden)]
+    pub fn l1_drop_page_for_test(&self, block: &BlockId, page: PageIndex) -> bool {
+        self.l1.remove_page(block, page)
     }
 
     /// Number of backend loads currently in flight.
@@ -3839,6 +3867,68 @@ mod tests {
             "L1-resident cross-page read must go zero-copy"
         );
         assert_eq!(read_handle(outcome), expected(offset, len));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A span that is *partially* L1-resident — some pages in DRAM, the rest
+    /// only on disk — is the state a real worker reaches constantly, since L1
+    /// is much smaller than L2 and evicts under pressure while L2 keeps every
+    /// page.
+    ///
+    /// Zero-copy must decline here. L1 is inclusive and only the byte path
+    /// admits pages into it; serving the whole span with `sendfile` would leave
+    /// the missing pages permanently absent from L1, so a hot range that lost
+    /// one page could never be fully re-promoted. The byte path re-admits it,
+    /// and the *next* read of the span goes zero-copy.
+    #[tokio::test]
+    async fn a_partially_l1_resident_span_falls_back_and_re_admits_the_missing_page() {
+        let root = tmp_root();
+        let page = 256u32 << 10;
+        let backend = Arc::new(PagedRampBackend::new(8 << 20));
+        let runtime = paged_runtime_l1(
+            Arc::clone(&backend),
+            &root,
+            4 << 20,
+            page,
+            8 << 20,
+            WorkerMetrics::new(1 << 20),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        // Spans pages 0..=2 and clears the size threshold.
+        let offset = u64::from(page) - 1024;
+        let len = u64::from(page) + 4096;
+        let request = req(&object, offset, len);
+
+        // Warm: byte path admits every covered page into L1 and L2.
+        let _ = runtime.serve(&request).await.unwrap();
+        let block = runtime.block_for(&object, offset, &Version::new("v1"));
+
+        // Evict exactly one covered page from L1. L2 still has all three.
+        assert!(
+            runtime.l1_drop_page_for_test(&block, PageIndex(1)),
+            "page 1 must have been L1-resident to evict it"
+        );
+
+        // Partial residency: must fall back to the byte path, byte-exact.
+        let outcome = runtime.serve(&request).await.unwrap();
+        let bytes = match outcome {
+            ServeOutcome::Bytes(b) => b,
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => panic!(
+                "a partially L1-resident span must not go zero-copy: it would \
+                 leave the missing page out of L1 forever"
+            ),
+        };
+        assert_eq!(bytes, expected(offset, len));
+
+        // The fallback re-admitted the missing page, so the span is whole again
+        // and the next read is zero-copy.
+        let outcome = runtime.serve(&request).await.unwrap();
+        assert!(
+            matches!(outcome, ServeOutcome::SendfileMany(_)),
+            "once every page is back in L1 the read must go zero-copy again"
+        );
+        assert_eq!(read_handle(outcome), expected(offset, len));
+
         std::fs::remove_dir_all(root).ok();
     }
 

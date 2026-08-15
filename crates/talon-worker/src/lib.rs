@@ -8,6 +8,7 @@ pub mod block_store;
 pub mod capacity;
 mod data_error;
 pub mod eviction;
+mod fd_cache;
 pub mod flusher;
 pub mod index;
 pub mod loader;

@@ -642,3 +642,118 @@ fn straddle_1m_l1_sendfile(b: divan::Bencher) {
         true,
     );
 }
+
+/// Very small L1-resident straddling reads: the regime where the per-page
+/// syscall cost is least amortised, and so the last place a zero-copy
+/// regression could hide.
+#[divan::bench]
+fn straddle_4k_l1_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd4k-l1-bytes",
+        straddle_offset(4 << 10),
+        4 << 10,
+        false,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_4k_l1_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd4k-l1-sendfile",
+        straddle_offset(4 << 10),
+        4 << 10,
+        true,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_16k_l1_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd16k-l1-bytes",
+        straddle_offset(16 << 10),
+        16 << 10,
+        false,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_16k_l1_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd16k-l1-sendfile",
+        straddle_offset(16 << 10),
+        16 << 10,
+        true,
+        true,
+    );
+}
+
+// --- Partially L1-resident spans ------------------------------------------
+//
+// L1 is far smaller than L2, so in steady state a span is routinely part in
+// DRAM and part only on disk. Zero-copy must decline there (serving the whole
+// span with sendfile would leave the evicted pages out of inclusive L1
+// forever), which means these reads pay the byte path plus a re-admission.
+// This measures what that fallback actually costs relative to a fully resident
+// span and a fully L1-cold one.
+
+/// Warm a paged runtime over `span`, then drop every `nth` covered page from
+/// L1 so the span is partially resident while L2 still holds all of it.
+fn run_partial_l1(bencher: divan::Bencher, tag: &str, span: u64, drop_every: u32) {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()
+        .unwrap();
+    let root = tmp_root(tag);
+    let (runtime, addr, req) = rt.block_on(async {
+        let runtime = warm_paged_runtime(&root, span, true).await;
+        let addr = spawn_new_server(Arc::clone(&runtime)).await;
+        let req = RangeRequest {
+            object: obj(),
+            offset: 0,
+            len: span,
+        };
+        (runtime, addr, req)
+    });
+    let block = runtime
+        .block_for_bench(&obj(), 0)
+        .expect("warmed runtime must have a cached version");
+    let pages = (span / u64::from(PAGE_BYTES)) as u32;
+    bencher.bench(|| {
+        if drop_every > 0 {
+            // Re-create the partial state each iteration: the previous read
+            // re-admitted the pages it was missing.
+            for p in (0..pages).step_by(drop_every as usize) {
+                runtime.l1_drop_page_for_test(&block, talon_core::PageIndex(p));
+            }
+        }
+        let n = rt.block_on(client_fetch(&addr, &req));
+        assert_eq!(n, span as usize);
+    });
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Baseline: every page L1-resident, so the read goes zero-copy.
+#[divan::bench]
+fn partial_l1_4p_all_resident(b: divan::Bencher) {
+    run_partial_l1(b, "pl1-all", 4 * u64::from(PAGE_BYTES), 0);
+}
+/// One page in four missing from L1 — enough to disqualify the whole span.
+#[divan::bench]
+fn partial_l1_4p_one_missing(b: divan::Bencher) {
+    run_partial_l1(b, "pl1-one", 4 * u64::from(PAGE_BYTES), 4);
+}
+/// Every other page missing.
+#[divan::bench]
+fn partial_l1_4p_half_missing(b: divan::Bencher) {
+    run_partial_l1(b, "pl1-half", 4 * u64::from(PAGE_BYTES), 2);
+}
+/// Every page missing from L1 (still all present in L2).
+#[divan::bench]
+fn partial_l1_4p_none_resident(b: divan::Bencher) {
+    run_partial_l1(b, "pl1-none", 4 * u64::from(PAGE_BYTES), 1);
+}

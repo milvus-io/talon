@@ -21,6 +21,7 @@
 //!
 //! [`WholeBlockStore`]: crate::WholeBlockStore
 
+use crate::fd_cache::{CachedFd, FdCache};
 use bytes::Bytes;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
@@ -29,6 +30,7 @@ use std::os::fd::OwnedFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use talon_core::{
     BlockForm, BlockHandle, BlockId, BlockMeta, Error, PageIndex, PresentBitmap, Result,
 };
@@ -54,10 +56,23 @@ where
     }
 }
 
+/// Per-shard capacity of the paged store's open-fd cache. See the
+/// `fd_cache` field on [`PagedBlockStore`].
+const PAGE_FD_CACHE_SHARD_CAPACITY: usize = 512;
+
 /// A local, file-backed store for paged blocks (per-page files).
 pub struct PagedBlockStore {
     root: PathBuf,
     page_size: u32,
+    /// Open `.page` descriptors, so a warm cross-page read does not pay one
+    /// `openat` + `statx` per page it touches.
+    ///
+    /// Sized larger per shard than the whole-block store's: a page is orders of
+    /// magnitude smaller than a block, so covering a comparable resident
+    /// working set needs proportionally more descriptors. 16 shards x 512
+    /// caps this at 8192 descriptors, which at a 1 MiB page size covers an
+    /// 8 GiB hot set.
+    fd_cache: FdCache,
 }
 
 impl PagedBlockStore {
@@ -69,7 +84,11 @@ impl PagedBlockStore {
         }
         let root = root.into();
         std::fs::create_dir_all(&root)?;
-        Ok(Self { root, page_size })
+        Ok(Self {
+            root,
+            page_size,
+            fd_cache: FdCache::with_capacity(PAGE_FD_CACHE_SHARD_CAPACITY),
+        })
     }
 
     /// The configured page size in bytes.
@@ -243,7 +262,12 @@ impl PagedBlockStore {
             f.sync_all()?;
             std::fs::rename(&tmp, &path)
         })() {
-            Ok(()) => Ok(()),
+            Ok(()) => {
+                // The rename swapped in a new inode; drop any descriptor still
+                // pointing at the old one so reads cannot serve stale bytes.
+                self.fd_cache.invalidate(&path);
+                Ok(())
+            }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
                 Err(e.into())
@@ -255,6 +279,7 @@ impl PagedBlockStore {
     pub async fn put_page_async(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<()> {
         let dir = self.dir_for(id);
         let path = self.page_path(id, page);
+        let invalidate_path = path.clone();
         spawn_blocking_io(move || {
             std::fs::create_dir_all(&dir)?;
             let pid = std::process::id();
@@ -273,7 +298,11 @@ impl PagedBlockStore {
                 }
             }
         })
-        .await
+        .await?;
+        // The rename swapped in a new inode; drop any descriptor still pointing
+        // at the old one so reads cannot serve stale bytes.
+        self.fd_cache.invalidate(&invalidate_path);
+        Ok(())
     }
 
     /// Read one page's bytes into userspace, off the async reactor thread.
@@ -301,6 +330,7 @@ impl PagedBlockStore {
     /// Remove a single page off the async reactor thread. Idempotent.
     pub async fn evict_page_async(&self, id: &BlockId, page: PageIndex) -> Result<()> {
         let path = self.page_path(id, page);
+        self.fd_cache.invalidate(&path);
         spawn_blocking_io(move || match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -312,6 +342,8 @@ impl PagedBlockStore {
     /// Remove an entire paged block off the async reactor thread. Idempotent.
     pub async fn delete_block_async(&self, id: &BlockId) -> Result<()> {
         let dir = self.dir_for(id);
+        self.fd_cache.invalidate_prefix(&dir);
+        let dir = dir.clone();
         spawn_blocking_io(move || match std::fs::remove_dir_all(&dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -321,12 +353,35 @@ impl PagedBlockStore {
     }
 
     /// Open a resident page as a zero-copy handle over its whole file.
+    ///
+    /// Backed by [`FdCache`]: page files are immutable once committed, so a
+    /// repeat read reuses the open descriptor instead of paying `openat` +
+    /// `statx` again. This matters more here than for whole blocks — a read
+    /// spanning N pages opens N files, so the syscall count scales with the
+    /// span rather than being one per request.
     pub fn get_page(&self, id: &BlockId, page: PageIndex) -> Result<BlockHandle> {
+        let (fd, len) = self.open_page_ro(id, page)?;
+        Ok(BlockHandle::from_shared(fd, 0, len))
+    }
+
+    /// Open a present page read-only, returning a shared fd and its length.
+    fn open_page_ro(&self, id: &BlockId, page: PageIndex) -> Result<(Arc<OwnedFd>, u64)> {
         let path = self.page_path(id, page);
+        if let Some(hit) = self.fd_cache.get(&path) {
+            return Ok((hit.fd, hit.len));
+        }
         match std::fs::File::open(&path) {
             Ok(f) => {
                 let len = f.metadata()?.len();
-                Ok(BlockHandle::new(OwnedFd::from(f), 0, len))
+                let fd = Arc::new(OwnedFd::from(f));
+                self.fd_cache.insert(
+                    path,
+                    CachedFd {
+                        fd: Arc::clone(&fd),
+                        len,
+                    },
+                );
+                Ok((fd, len))
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 Err(Error::NotFound(format!("{id} page {}", page.0)))
@@ -373,7 +428,9 @@ impl PagedBlockStore {
     /// Remove a single page (e.g. page-level eviction), leaving the block dir
     /// and other pages intact. Idempotent.
     pub fn evict_page(&self, id: &BlockId, page: PageIndex) -> Result<()> {
-        match std::fs::remove_file(self.page_path(id, page)) {
+        let path = self.page_path(id, page);
+        self.fd_cache.invalidate(&path);
+        match std::fs::remove_file(&path) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
@@ -382,7 +439,9 @@ impl PagedBlockStore {
 
     /// Remove an entire paged block (all pages + directory). Idempotent.
     pub fn delete_block(&self, id: &BlockId) -> Result<()> {
-        match std::fs::remove_dir_all(self.dir_for(id)) {
+        let dir = self.dir_for(id);
+        self.fd_cache.invalidate_prefix(&dir);
+        match std::fs::remove_dir_all(&dir) {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
@@ -574,6 +633,64 @@ mod tests {
 
         // A sidecar alone contributes nothing resident.
         assert!(store.scan().unwrap().is_empty());
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The fd cache must never outlive the bytes it points at. A page that is
+    /// rewritten, evicted, or whose whole block is deleted must not keep
+    /// serving the old inode through a cached descriptor.
+    #[test]
+    fn the_page_fd_cache_does_not_serve_stale_bytes_after_rewrite_or_delete() {
+        let root = tmp_root();
+        let store = PagedBlockStore::open(&root, 8).unwrap();
+        let id = block(1);
+        let page = PageIndex(0);
+
+        let read_all = |h: BlockHandle| -> Vec<u8> {
+            let mut buf = vec![0_u8; h.len as usize];
+            let f = std::fs::File::from(h.fd.try_clone().expect("dup cached fd"));
+            f.read_exact_at(&mut buf, h.offset).unwrap();
+            buf
+        };
+
+        // Populate the cache.
+        store
+            .put_page(&id, page, Bytes::from_static(b"aaaaaaaa"))
+            .unwrap();
+        assert_eq!(read_all(store.get_page(&id, page).unwrap()), b"aaaaaaaa");
+
+        // Rewrite: the rename installs a new inode, so a stale descriptor
+        // would still read the old bytes.
+        store
+            .put_page(&id, page, Bytes::from_static(b"bbbbbbbb"))
+            .unwrap();
+        assert_eq!(
+            read_all(store.get_page(&id, page).unwrap()),
+            b"bbbbbbbb",
+            "rewrite must invalidate the cached descriptor"
+        );
+
+        // Page eviction: the page is gone, so opening it must fail rather than
+        // succeed from cache.
+        store.evict_page(&id, page).unwrap();
+        assert!(
+            store.get_page(&id, page).is_err(),
+            "an evicted page must not be served from the fd cache"
+        );
+
+        // Whole-block deletion must drop every page descriptor beneath it.
+        store
+            .put_page(&id, PageIndex(0), Bytes::from_static(b"cccccccc"))
+            .unwrap();
+        store
+            .put_page(&id, PageIndex(1), Bytes::from_static(b"dddddddd"))
+            .unwrap();
+        let _ = store.get_page(&id, PageIndex(0)).unwrap();
+        let _ = store.get_page(&id, PageIndex(1)).unwrap();
+        store.delete_block(&id).unwrap();
+        assert!(store.get_page(&id, PageIndex(0)).is_err());
+        assert!(store.get_page(&id, PageIndex(1)).is_err());
 
         std::fs::remove_dir_all(&root).ok();
     }
