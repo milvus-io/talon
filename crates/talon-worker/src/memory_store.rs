@@ -105,6 +105,21 @@ impl MemoryStore {
     }
 
     /// Fetch one page and mark it most-recently-used.
+    /// Whether `page` is resident, without touching recency.
+    ///
+    /// Used by the zero-copy serve path to decide whether `sendfile` may skip
+    /// the byte path: since L1 is inclusive and only the byte path admits
+    /// pages, serving a non-resident page with `sendfile` would stop L1 from
+    /// being populated. This is a pure lookup — it deliberately does not bump
+    /// `last_used`, because the sendfile path records its own LRU touch.
+    pub fn contains_page(&self, block: &BlockId, page: PageIndex) -> bool {
+        let inner = self.inner.lock().unwrap();
+        inner.entries.contains_key(&MemoryPageKey {
+            block: block.clone(),
+            page,
+        })
+    }
+
     pub fn get_page(&self, block: &BlockId, page: PageIndex) -> Option<Bytes> {
         let mut inner = self.inner.lock().unwrap();
         inner.clock = inner.clock.saturating_add(1);

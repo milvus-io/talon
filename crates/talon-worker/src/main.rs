@@ -1326,6 +1326,96 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// The Tokio data plane's cross-page guarantee, mirroring the io_uring test
+    /// in `uring_conn`. The two planes must not diverge in what they answer, so
+    /// a multi-`sendfile` bug in either shows up as wrong bytes here.
+    #[tokio::test]
+    async fn handle_conn_serves_a_cross_page_hit_byte_exact() {
+        use talon_transport::data::{encode_request, RangeRequest};
+
+        let root = tmp_root();
+        let index = Arc::new(BlockIndex::new());
+        let inflight = Arc::new(InFlightLoads::new());
+        let node = NodeInfo {
+            id: NodeId::new("w"),
+            address: "127.0.0.1:7001".into(),
+            role: NodeRole::Worker,
+        };
+        let observability = Arc::new(
+            WorkerObservability::new(
+                "c".into(),
+                node,
+                "127.0.0.1:8001".into(),
+                1024,
+                Arc::clone(&index),
+                Arc::clone(&inflight),
+            )
+            .unwrap(),
+        );
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        observability.readiness().set_control_registered(true);
+        let backend: Arc<dyn BackendStore> = Arc::new(RampBackend);
+        // 16-byte pages in a 64-byte block: a 40-byte read from offset 5 spans
+        // three pages, partial at both ends.
+        let worker = Arc::new(
+            WorkerRuntime::new(
+                WholeBlockStore::open(root.join("whole")).unwrap(),
+                index,
+                inflight,
+                backend,
+                64,
+                0,
+                observability.metrics().clone(),
+            )
+            .with_paged_store(talon_worker::PagedBlockStore::open(root.join("paged"), 16).unwrap()),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let srv_worker = Arc::clone(&worker);
+        let srv_obs = Arc::clone(&observability);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let _ = handle_conn(stream, srv_worker, srv_obs).await;
+        });
+
+        let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+        let req = RangeRequest {
+            object: obj,
+            offset: 5,
+            len: 40,
+        };
+        let mut client = TcpStream::connect(addr).await.unwrap();
+        let expected: Vec<u8> = (0..40u64).map(|i| ((5 + i) % 251) as u8).collect();
+
+        for pass in 0..3 {
+            let out = encode_request(0, &req).unwrap();
+            client.write_all(&out).await.unwrap();
+            client.flush().await.unwrap();
+
+            let mut hdr = [0u8; HEADER_LEN];
+            client.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            assert!(
+                !header.flags.contains(talon_transport::Flags::ERROR),
+                "pass {pass}: worker returned an error frame"
+            );
+            assert_eq!(
+                header.length as usize,
+                expected.len(),
+                "pass {pass}: advertised length must equal the request"
+            );
+            let mut body = vec![0u8; header.length as usize];
+            client.read_exact(&mut body).await.unwrap();
+            assert_eq!(body, expected, "pass {pass}: cross-page bytes must match");
+        }
+
+        drop(client);
+        server.await.unwrap();
+        std::fs::remove_dir_all(root).ok();
+    }
+
     /// A backend that stores whole-object PUTs in memory so a write-through can be
     /// read back, and records deletes.
     #[derive(Default)]

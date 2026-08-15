@@ -60,13 +60,13 @@ use monoio::net::TcpStream;
 use talon_core::{BlockHandle, RequestId};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
-use talon_transport::uring::{write_all, BufferedFrameReader};
+use talon_transport::uring::{write_all, write_all_buf, BufferedFrameReader};
 use talon_transport::DataErrorCode;
 
 use crate::data_error::encode_runtime_error;
 use crate::observability::WorkerObservability;
 use crate::runtime::{ServeOutcome, WorkerRuntime};
-use crate::{send_header_and_file_range, DEFAULT_CHUNK};
+use crate::{send_header_and_file_range, send_header_and_file_ranges, DEFAULT_CHUNK};
 
 /// Serve one accepted data-plane connection until EOF or a fatal error.
 pub async fn handle_conn(
@@ -241,11 +241,30 @@ pub async fn handle_conn(
                     }
                 }
             }
+            Ok(ServeOutcome::SendfileMany(handles)) => {
+                let len: u64 = handles.iter().map(|h| h.len).sum();
+                let hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
+                match sendfile_many_payload(&stream, hdr, handles).await {
+                    Ok(()) => observability
+                        .metrics()
+                        .record_request_success(len, request_started.elapsed()),
+                    Err(error) => {
+                        // Header already on the wire; the connection is desynced.
+                        observability
+                            .metrics()
+                            .record_request_error(request_started.elapsed());
+                        return Err(error);
+                    }
+                }
+            }
             Ok(ServeOutcome::Bytes(bytes)) => {
                 let hdr = data::response_header_ok(h.request_id, bytes.len() as u32).to_vec();
                 write_all(&mut stream, hdr).await?;
                 let n = bytes.len() as u64;
-                write_all(&mut stream, bytes.to_vec()).await?;
+                // `bytes` is already refcounted and monoio can submit it
+                // directly, so hand it to the ring rather than copying it into
+                // a fresh Vec.
+                write_all_buf(&mut stream, bytes).await?;
                 observability
                     .metrics()
                     .record_request_success(n, request_started.elapsed());
@@ -455,6 +474,35 @@ async fn sendfile_payload(
         // shorter than the index claimed. The header already promised `len`
         // bytes, so the connection is desynced.
         anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; block file truncated");
+    }
+    Ok(())
+}
+
+/// Send a header plus N page segments with one `sendfile` each.
+///
+/// The cross-page analogue of [`sendfile_payload`]. Pages of a paged block are
+/// separate files, so a spanning read cannot be one `sendfile` — but N calls
+/// still keep the payload out of userspace, which is what the byte path could
+/// not do.
+async fn sendfile_many_payload(
+    stream: &TcpStream,
+    header: Vec<u8>,
+    handles: Vec<BlockHandle>,
+) -> anyhow::Result<()> {
+    let sock_fd = stream.as_raw_fd();
+    let len: u64 = handles.iter().map(|h| h.len).sum();
+    let sent = monoio::spawn_blocking(move || {
+        let segments: Vec<_> = handles
+            .iter()
+            .map(|h| (FdRef(h.fd.as_raw_fd()), h.offset, h.len))
+            .collect();
+        send_header_and_file_ranges(&FdRef(sock_fd), &header, &segments, DEFAULT_CHUNK)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
+
+    if sent != len {
+        anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; page file truncated");
     }
     Ok(())
 }
@@ -934,6 +982,71 @@ mod tests {
                     "pass {pass}: worker returned an error frame"
                 );
                 assert_eq!(body, expected, "pass {pass}: range bytes must match");
+            }
+        });
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A paged build for cross-page wire tests.
+    fn build_paged(
+        root: &std::path::Path,
+        backend: Arc<dyn BackendStore>,
+        block_size: u32,
+        page_size: u32,
+    ) -> (Arc<WorkerRuntime>, Arc<WorkerObservability>) {
+        let (worker, obs) = build(&root.join("whole"), backend, block_size);
+        let worker = Arc::new(
+            Arc::try_unwrap(worker)
+                .unwrap_or_else(|_| panic!("sole owner"))
+                .with_paged_store(
+                    crate::PagedBlockStore::open(root.join("paged"), page_size).unwrap(),
+                ),
+        );
+        (worker, obs)
+    }
+
+    /// The cross-page guarantee, end to end over a real socket: a miss (byte
+    /// path) and a subsequent resident hit (N `sendfile` calls) must return
+    /// byte-identical ranges. A bug in segment ordering, offset clipping, or
+    /// short-send handling shows up here as wrong bytes on the wire — which
+    /// unit tests over handles alone cannot catch.
+    #[test]
+    fn serves_a_cross_page_hit_via_multi_sendfile_byte_exact() {
+        let root = tmp_root("xpage");
+        run(async {
+            // 16-byte pages inside a 64-byte block: a 40-byte read from offset
+            // 5 spans pages 0..=2 with partial pages at both ends.
+            let (worker, obs) = build_paged(&root, Arc::new(RampBackend), 64, 16);
+            let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = l.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (s, _) = l.accept().await.unwrap();
+                let _ = handle_conn(s, worker, obs).await;
+            });
+
+            let obj = ObjectId::new(talon_core::Backend::Azure, "c", "obj");
+            let req = RangeRequest {
+                object: obj,
+                offset: 5,
+                len: 40,
+            };
+            let expected: Vec<u8> = (0..40u64).map(|i| ((5 + i) % 251) as u8).collect();
+            let mut c = TcpStream::connect(addr).await.unwrap();
+
+            for pass in 0..3 {
+                let (r, _) = c.write_all(encode_request(0, &req).unwrap()).await;
+                r.unwrap();
+                let (header, body) = read_response(&mut c).await;
+                assert!(
+                    !header.flags.contains(Flags::ERROR),
+                    "pass {pass}: worker returned an error frame"
+                );
+                assert_eq!(
+                    header.length as usize,
+                    expected.len(),
+                    "pass {pass}: advertised length must equal the request"
+                );
+                assert_eq!(body, expected, "pass {pass}: cross-page bytes must match");
             }
         });
         std::fs::remove_dir_all(root).ok();

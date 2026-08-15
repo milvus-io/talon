@@ -58,6 +58,10 @@ struct CachedVersion {
 pub enum ServeOutcome {
     /// Serve these bytes with `sendfile` straight from the block file's fd.
     Sendfile(BlockHandle),
+    /// Serve these segments with one `sendfile` each, in order. A paged block
+    /// keeps every page in its own file, so a read spanning N pages is N
+    /// contiguous runs rather than one — still zero-copy, just N calls.
+    SendfileMany(Vec<BlockHandle>),
     /// Serve these already-in-memory bytes (miss just fetched, or a stitched
     /// multi-block read).
     Bytes(bytes::Bytes),
@@ -391,34 +395,58 @@ impl WorkerRuntime {
         if end <= start_block + block_size {
             let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
-            // Paged mode: a resident page can be served straight from its own
-            // file with sendfile, provided the read stays inside one page (the
-            // common point-query shape). Anything wider goes through the byte
-            // path, which stitches pages together.
-            if let (Some(paged), false) = (&self.paged, self.l1.is_enabled()) {
+            // Paged mode: pages live in their own files, so a read spanning N
+            // pages is N contiguous runs. Each run is still `sendfile`-able, so
+            // serve the whole span zero-copy rather than stitching pages in
+            // userspace.
+            //
+            // With L1 on, this is only safe when every covered page is already
+            // L1-resident: the byte path is what admits pages into L1, and
+            // sendfile never brings bytes through userspace to admit. Serving a
+            // non-resident page here would silently stop populating L1.
+            if let Some(paged) = &self.paged {
                 let page_size = u64::from(paged.page_size());
-                let page = PageIndex((offset_in_block / page_size) as u32);
-                let within_one_page =
-                    offset_in_block + request.len <= (u64::from(page.0) + 1) * page_size;
-                if within_one_page
+                let first = PageIndex((offset_in_block / page_size) as u32);
+                let last = PageIndex(((offset_in_block + request.len - 1) / page_size) as u32);
+                let l1_ok = !self.l1.is_enabled()
+                    || (first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)));
+                if request.len > 0
+                    && l1_ok
                     && matches!(
-                        self.index.presence(&block, page, PageIndex(page.0 + 1)),
+                        self.index.presence(&block, first, PageIndex(last.0 + 1)),
                         Presence::PageHit
                     )
                 {
                     match paged.get_range(&block, offset_in_block, request.len) {
-                        Ok(mut handles) if handles.len() == 1 => {
-                            let handle = handles.pop().expect("one handle");
-                            self.metrics.record_l2_hit();
-                            self.metrics.record_cache_hit();
-                            self.lru.touch(&CacheUnit::Page(block.clone(), page));
-                            tracing::info!(
-                                block = %block, page = page.0, tier = "l2", "HIT (sendfile)"
-                            );
-                            return Ok(ServeOutcome::Sendfile(handle));
+                        Ok(handles) if !handles.is_empty() => {
+                            let served: u64 = handles.iter().map(|h| h.len).sum();
+                            // Only take the fast path when the handles cover the
+                            // request exactly; a short cover means we raced an
+                            // eviction, so fall through and re-fetch.
+                            if served == request.len {
+                                self.metrics.record_l2_hit();
+                                self.metrics.record_cache_hit();
+                                for p in first.0..=last.0 {
+                                    self.lru
+                                        .touch(&CacheUnit::Page(block.clone(), PageIndex(p)));
+                                }
+                                tracing::info!(
+                                    block = %block,
+                                    first_page = first.0,
+                                    pages = handles.len(),
+                                    tier = "l2",
+                                    "HIT (sendfile)"
+                                );
+                                return Ok(if handles.len() == 1 {
+                                    let mut handles = handles;
+                                    ServeOutcome::Sendfile(handles.pop().expect("one handle"))
+                                } else {
+                                    ServeOutcome::SendfileMany(handles)
+                                });
+                            }
                         }
-                        // Lost the race with page eviction, or a multi-handle
-                        // result; fall through to the byte path, which re-fetches.
+                        // Lost the race with page eviction, or an absent page;
+                        // fall through to the byte path, which re-fetches.
                         Ok(_) | Err(_) => {}
                     }
                 }
@@ -1938,14 +1966,18 @@ mod tests {
 
         match runtime.serve(&request("l1")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("origin miss must return fetched bytes"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("origin miss must return fetched bytes")
+            }
         }
         assert_eq!(runtime.l1_page_count(), 1);
         assert_eq!(runtime.l1_resident_bytes(), 8);
 
         match runtime.serve(&request("l1")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("eligible warm block must hit L1"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("eligible warm block must hit L1")
+            }
         }
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         let rendered = metrics.render();
@@ -2002,7 +2034,9 @@ mod tests {
         assert_eq!(runtime.l1_resident_bytes(), 8);
         match runtime.serve(&request("boundary")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("entry at the limit must be admitted to L1"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("entry at the limit must be admitted to L1")
+            }
         }
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(root).ok();
@@ -2021,7 +2055,9 @@ mod tests {
         assert_eq!(runtime.l1_page_count(), 1);
         match runtime.serve(&request("large")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("hot page must be served from L1"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("hot page must be served from L1")
+            }
         }
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
         assert!(metrics
@@ -2186,7 +2222,9 @@ mod tests {
 
         match runtime.serve(&request("a")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("eligible L2 hit should promote to L1"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("eligible L2 hit should promote to L1")
+            }
         }
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
@@ -2275,7 +2313,9 @@ mod tests {
 
         match restarted.serve(&request("restart")).await.unwrap() {
             ServeOutcome::Bytes(bytes) => assert_eq!(bytes, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("eligible L2 block should promote after restart"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("eligible L2 block should promote after restart")
+            }
         }
         assert_eq!(
             backend.calls.load(Ordering::SeqCst),
@@ -2445,6 +2485,19 @@ mod tests {
                 f.read_exact(&mut buf).unwrap();
                 buf
             }
+            ServeOutcome::SendfileMany(handles) => {
+                // Concatenate the segments in order: this is what the wire sees
+                // after N sendfile calls, so tests can assert on the payload.
+                let mut out = Vec::new();
+                for handle in handles {
+                    let mut f = std::fs::File::from(handle.fd.try_clone().unwrap());
+                    f.seek(SeekFrom::Start(handle.offset)).unwrap();
+                    let mut buf = vec![0u8; handle.len as usize];
+                    f.read_exact(&mut buf).unwrap();
+                    out.extend_from_slice(&buf);
+                }
+                out
+            }
             ServeOutcome::Bytes(_) => panic!("expected Sendfile, got Bytes"),
         }
     }
@@ -2463,7 +2516,9 @@ mod tests {
         // Miss: bytes path.
         match runtime.serve(&request("ok")).await.unwrap() {
             ServeOutcome::Bytes(b) => assert_eq!(b, Bytes::from_static(b"abcd")),
-            ServeOutcome::Sendfile(_) => panic!("first serve (miss) must be Bytes"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("first serve (miss) must be Bytes")
+            }
         }
 
         // Hit: sendfile path, exact sub-range.
@@ -2658,7 +2713,9 @@ mod tests {
         };
         match runtime.serve(&req).await.unwrap() {
             ServeOutcome::Bytes(b) => assert_eq!(b, expected(6, 8)),
-            ServeOutcome::Sendfile(_) => panic!("boundary-spanning read must be Bytes"),
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("boundary-spanning read must be Bytes")
+            }
         }
         std::fs::remove_dir_all(root).ok();
     }
@@ -3697,6 +3754,179 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    /// Build a paged runtime that also has an inclusive L1.
+    fn paged_runtime_l1<B: BackendStore + 'static>(
+        backend: Arc<B>,
+        root: &Path,
+        block_size: u32,
+        page_size: u32,
+        l1_capacity: u64,
+        metrics: WorkerMetrics,
+    ) -> WorkerRuntime {
+        WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(root.join("whole")).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend,
+            block_size,
+            0,
+            l1_capacity,
+            u64::from(page_size),
+            metrics,
+        )
+        .with_paged_store(PagedBlockStore::open(root.join("paged"), page_size).unwrap())
+        .with_version_ttl(Duration::ZERO)
+    }
+
+    /// L1 is inclusive and only the byte path admits pages into it. Taking the
+    /// zero-copy path for a page that is *not* yet in L1 would silently stop L1
+    /// from ever being populated, so the fast path must decline until the pages
+    /// are L1-resident — and must still return correct bytes throughout.
+    #[tokio::test]
+    async fn with_l1_enabled_zero_copy_waits_until_the_pages_are_l1_resident() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let metrics = WorkerMetrics::new(1024);
+        let runtime =
+            paged_runtime_l1(Arc::clone(&backend), &root, 1024, 64, 4096, metrics.clone());
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        let request = req(&object, 100, 200);
+
+        // First read: origin miss, bytes, and it admits the pages into L1.
+        assert!(matches!(
+            runtime.serve(&request).await.unwrap(),
+            ServeOutcome::Bytes(_)
+        ));
+        assert!(runtime.l1_page_count() > 0, "byte path must populate L1");
+
+        // Now that every covered page is L1-resident, zero-copy is safe and
+        // must produce byte-identical output.
+        let outcome = runtime.serve(&request).await.unwrap();
+        assert!(
+            matches!(outcome, ServeOutcome::SendfileMany(_)),
+            "L1-resident cross-page read must go zero-copy"
+        );
+        assert_eq!(read_handle(outcome), expected(100, 200));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A read spanning several pages must come back as one `sendfile` segment
+    /// per page — never as stitched bytes — and the concatenation of those
+    /// segments must equal the requested range exactly.
+    #[tokio::test]
+    async fn paged_mode_serves_a_cross_page_read_via_multi_sendfile() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        // 200 bytes from offset 100 spans pages 1..=4 at a 64-byte page size.
+        let request = req(&object, 100, 200);
+
+        // Warm every covered page.
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            expected(100, 200)
+        );
+
+        match runtime.serve(&request).await.unwrap() {
+            ServeOutcome::SendfileMany(handles) => {
+                assert_eq!(handles.len(), 4, "one handle per covered page");
+                let total: u64 = handles.iter().map(|h| h.len).sum();
+                assert_eq!(total, 200, "segments must cover the request exactly");
+                assert_eq!(
+                    read_handle(ServeOutcome::SendfileMany(handles)),
+                    expected(100, 200)
+                );
+            }
+            ServeOutcome::Sendfile(_) => panic!("a 4-page span must not be one handle"),
+            ServeOutcome::Bytes(_) => panic!("a resident cross-page read must be zero-copy"),
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// A range whose ends land mid-page must be clipped at both ends, not
+    /// rounded out to whole pages.
+    #[tokio::test]
+    async fn cross_page_sendfile_clips_partial_pages_at_both_ends() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        // Starts 30 into page 0 and ends 10 into page 2.
+        let request = req(&object, 30, 108);
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            expected(30, 108)
+        );
+
+        let outcome = runtime.serve(&request).await.unwrap();
+        assert!(
+            matches!(outcome, ServeOutcome::SendfileMany(_)),
+            "resident cross-page read must be zero-copy"
+        );
+        assert_eq!(read_handle(outcome), expected(30, 108));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// If any covered page is missing, the fast path must decline and let the
+    /// byte path re-fetch, rather than serving a short or torn range.
+    #[tokio::test]
+    async fn cross_page_sendfile_declines_when_a_covered_page_is_absent() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        let request = req(&object, 100, 200);
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            expected(100, 200)
+        );
+
+        // Evict one interior page file behind the index's back.
+        let mut removed = 0;
+        for shard in std::fs::read_dir(root.join("paged")).unwrap().flatten() {
+            if !shard.file_type().unwrap().is_dir() {
+                continue;
+            }
+            for dir in std::fs::read_dir(shard.path()).unwrap().flatten() {
+                let page = dir.path().join("2.page");
+                if page.exists() {
+                    std::fs::remove_file(&page).unwrap();
+                    removed += 1;
+                }
+            }
+        }
+        assert_eq!(removed, 1, "found the interior page to delete");
+
+        // Must still return correct bytes, by falling back and re-fetching.
+        assert_eq!(
+            runtime.serve_range(&request).await.unwrap(),
+            expected(100, 200)
+        );
+        std::fs::remove_dir_all(root).ok();
+    }
+
     #[tokio::test]
     async fn paged_mode_serves_a_within_page_read_via_sendfile() {
         let root = tmp_root();
@@ -3725,6 +3955,9 @@ mod tests {
                 let file = std::fs::File::from(handle.fd.try_clone().unwrap());
                 file.read_exact_at(&mut buf, handle.offset).unwrap();
                 assert_eq!(Bytes::from(buf), expected(70, 10));
+            }
+            ServeOutcome::SendfileMany(_) => {
+                panic!("a within-page read must be a single sendfile handle")
             }
             ServeOutcome::Bytes(_) => panic!("expected a sendfile handle for a resident page"),
         }

@@ -127,6 +127,83 @@ pub fn send_header_and_file_range(
     send_file_range(sock, file, offset, len, chunk)
 }
 
+/// Send `header`, then every segment of `handles` in order, to `sock`.
+///
+/// This is the cross-page analogue of [`send_header_and_file_range`]. A paged
+/// block stores each page in its own file, so a read spanning N pages has no
+/// single contiguous source — but it is still N contiguous runs, each of which
+/// `sendfile(2)` can move without the payload entering userspace. Issuing one
+/// `sendfile` per segment keeps the whole read zero-copy instead of falling
+/// back to reading each page into a buffer and concatenating.
+///
+/// The header goes out corked with `MSG_MORE`, so the kernel coalesces it with
+/// the first page's bytes instead of emitting a header-only packet. Successive
+/// `sendfile` calls append into the same socket buffer, so adjacent pages fill
+/// full segments rather than one packet per page.
+///
+/// Returns the number of *payload* bytes sent (header bytes are not counted).
+/// A short return means some segment hit EOF early; the caller must treat that
+/// as a desynced connection, exactly as in the single-handle case.
+pub fn send_header_and_file_ranges<F: AsRawFd>(
+    sock: &impl AsRawFd,
+    header: &[u8],
+    segments: &[(F, u64, u64)],
+    chunk: usize,
+) -> io::Result<u64> {
+    let out_fd: RawFd = sock.as_raw_fd();
+
+    let mut written = 0usize;
+    while written < header.len() {
+        // SAFETY: valid fd; the pointer/length pair stays inside `header`.
+        let n = unsafe {
+            libc::send(
+                out_fd,
+                header[written..].as_ptr() as *const libc::c_void,
+                header.len() - written,
+                libc::MSG_MORE | libc::MSG_NOSIGNAL,
+            )
+        };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            match err.raw_os_error() {
+                Some(libc::EINTR) => continue,
+                _ => return Err(err),
+            }
+        }
+        if n == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::WriteZero,
+                "socket accepted no header bytes",
+            ));
+        }
+        written += n as usize;
+    }
+
+    let total: u64 = segments.iter().map(|(_, _, len)| *len).sum();
+    if total == 0 {
+        // `MSG_MORE` left the header corked and no payload will uncork it.
+        // SAFETY: valid fd; a zero-length send with no MSG_MORE flushes.
+        unsafe { libc::send(out_fd, [].as_ptr(), 0, libc::MSG_NOSIGNAL) };
+        return Ok(0);
+    }
+
+    let mut sent_total = 0u64;
+    for (file, offset, len) in segments {
+        if *len == 0 {
+            continue;
+        }
+        let sent = send_file_range(sock, file, *offset, *len, chunk)?;
+        sent_total += sent;
+        if sent != *len {
+            // EOF inside this segment: stop and let the caller detect the
+            // short send. Continuing would silently shift later pages into
+            // the gap and serve corrupt bytes.
+            break;
+        }
+    }
+    Ok(sent_total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
