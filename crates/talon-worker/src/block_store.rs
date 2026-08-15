@@ -144,7 +144,8 @@ impl WholeBlockStore {
     /// Open a present block file read-only, returning a shared fd and its byte
     /// length.
     ///
-    /// Backed by [`FdCache`]: a repeat read of a resident block reuses the
+    /// Backed by the shared open-fd cache: a repeat read of a resident block
+    /// reuses the
     /// already-open descriptor instead of issuing `openat` + `statx` + `close`
     /// per request. Under load that trio dominated the serving path — it does
     /// not scale with threads (all callers serialize on the same inode and

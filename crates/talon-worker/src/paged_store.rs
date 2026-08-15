@@ -354,7 +354,8 @@ impl PagedBlockStore {
 
     /// Open a resident page as a zero-copy handle over its whole file.
     ///
-    /// Backed by [`FdCache`]: page files are immutable once committed, so a
+    /// Backed by the shared open-fd cache: page files are immutable once
+    /// committed, so a
     /// repeat read reuses the open descriptor instead of paying `openat` +
     /// `statx` again. This matters more here than for whole blocks — a read
     /// spanning N pages opens N files, so the syscall count scales with the
