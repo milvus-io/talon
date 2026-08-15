@@ -37,28 +37,6 @@ const MAX_LIST_PAGES: usize = 20;
 /// Objects requested per backend page.
 const LIST_PAGE_SIZE: u32 = 1000;
 
-/// Smallest request that is worth serving with sendfile when the pages are
-/// already resident in L1.
-///
-/// Zero-copy is not free: it costs one `sendfile` per page touched, plus an
-/// `openat` on an fd-cache miss. When L1 already holds the bytes, the byte path
-/// answers from DRAM with a single small copy and no per-page syscalls, so
-/// below some size the copy it avoids is cheaper than the syscalls it adds.
-///
-/// Measured on a read straddling a 1 MiB page boundary, with the paged store's
-/// fd cache warm (byte path vs sendfile): 4 KiB 215 vs 227 us, 16 KiB 213 vs
-/// 222 us, 64 KiB 234 vs 233 us, 256 KiB 364 vs 330 us, 1 MiB 843 vs 736 us.
-/// The crossover sits just under 32 KiB; the small-read deficit is ~5% and the
-/// large-read gain reaches 22%.
-///
-/// This threshold used to be 256 KiB. Giving the paged store an fd cache
-/// removed the per-page `openat` and moved the crossover down by 8x, which is
-/// what the fixed cost of zero-copy was mostly made of.
-///
-/// With L1 off there is no such tradeoff — the byte path must hit the disk
-/// anyway — so sendfile is used at every size.
-const L1_SENDFILE_MIN_LEN: u64 = 32 << 10;
-
 /// A per-object resolved version with the instant it was resolved.
 struct CachedVersion {
     version: Version,
@@ -427,15 +405,19 @@ impl WorkerRuntime {
             // sendfile never brings bytes through userspace to admit. Serving a
             // non-resident page here would silently stop populating L1.
             //
-            // Even when resident, sendfile is only worth it above
-            // `L1_SENDFILE_MIN_LEN` — see that constant.
+            // Size is deliberately not a factor. A per-request latency
+            // benchmark makes sendfile look like a loss for small L1-resident
+            // reads, but that only holds at concurrency 1: the copy competes
+            // for memory bandwidth, so the byte path stops scaling while
+            // sendfile keeps going. At 64 connections a 4 KiB straddling read
+            // serves 40.5k rps zero-copy vs 21.9-38.8k copied, and the
+            // zero-copy figure is far more stable run to run.
             if let Some(paged) = &self.paged {
                 let page_size = u64::from(paged.page_size());
                 let first = PageIndex((offset_in_block / page_size) as u32);
                 let last = PageIndex(((offset_in_block + request.len - 1) / page_size) as u32);
                 let l1_ok = !self.l1.is_enabled()
-                    || ((first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)))
-                        && request.len >= L1_SENDFILE_MIN_LEN);
+                    || (first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)));
                 if request.len > 0
                     && l1_ok
                     && matches!(
@@ -3833,7 +3815,6 @@ mod tests {
     #[tokio::test]
     async fn with_l1_enabled_zero_copy_waits_until_the_pages_are_l1_resident() {
         let root = tmp_root();
-        // Sizes large enough to straddle `L1_SENDFILE_MIN_LEN` from both sides:
         // 4 MiB blocks of 256 KiB pages.
         let page = 256u32 << 10;
         let backend = Arc::new(PagedRampBackend::new(8 << 20));
@@ -3847,9 +3828,9 @@ mod tests {
             metrics.clone(),
         );
         let object = ObjectId::new(Backend::Azure, "bucket", "obj");
-        // Straddles the page-0/page-1 boundary and clears the threshold.
+        // Straddles the page-0/page-1 boundary.
         let offset = u64::from(page) - 1024;
-        let len = L1_SENDFILE_MIN_LEN + 4096;
+        let len = u64::from(page) + 4096;
         let request = req(&object, offset, len);
 
         // First read: origin miss, bytes, and it admits the pages into L1.
@@ -3932,11 +3913,13 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
-    /// Below `L1_SENDFILE_MIN_LEN` an L1-resident cross-page read is faster
-    /// served straight from DRAM than through one `openat` + `sendfile` per
-    /// page, so the fast path must decline even though the pages are resident.
+    /// Size must not disqualify a read from zero-copy. A per-request latency
+    /// benchmark makes small L1-resident reads look better on the byte path,
+    /// but that inverts under load — the copy competes for memory bandwidth,
+    /// so the byte path plateaus while sendfile keeps scaling. A tiny read
+    /// straddling a page boundary must still be served zero-copy.
     #[tokio::test]
-    async fn a_small_l1_resident_cross_page_read_stays_on_the_byte_path() {
+    async fn even_a_tiny_l1_resident_cross_page_read_goes_zero_copy() {
         let root = tmp_root();
         let page = 256u32 << 10;
         let backend = Arc::new(PagedRampBackend::new(8 << 20));
@@ -3949,23 +3932,22 @@ mod tests {
             WorkerMetrics::new(1 << 20),
         );
         let object = ObjectId::new(Backend::Azure, "bucket", "obj");
-        // Straddles a page boundary but stays under the threshold.
+        // 4 KiB straddling the page-0/page-1 boundary: the smallest realistic
+        // cross-page read, and the case a size threshold would have excluded.
         let offset = u64::from(page) - 2048;
         let len = 4096;
         let request = req(&object, offset, len);
 
-        // Warm L1 so residency is not what makes the fast path decline.
+        // Warm L1 so residency is not what decides the path.
         let _ = runtime.serve(&request).await.unwrap();
         assert!(runtime.l1_page_count() > 0, "byte path must populate L1");
 
         let outcome = runtime.serve(&request).await.unwrap();
-        let bytes = match outcome {
-            ServeOutcome::Bytes(b) => b,
-            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
-                panic!("a sub-threshold L1-resident read must stay on the byte path")
-            }
-        };
-        assert_eq!(bytes, expected(offset, len));
+        assert!(
+            matches!(outcome, ServeOutcome::SendfileMany(_)),
+            "a small L1-resident cross-page read must still go zero-copy"
+        );
+        assert_eq!(read_handle(outcome), expected(offset, len));
         std::fs::remove_dir_all(root).ok();
     }
 
