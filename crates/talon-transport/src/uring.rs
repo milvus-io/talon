@@ -118,7 +118,7 @@ where
 
 /// Write a whole buffer to a monoio stream, returning the buffer.
 ///
-/// Generic over any `IoBuf`, so callers holding a refcounted [`bytes::Bytes`]
+/// Generic over any `IoBuf`, so callers holding a refcounted `bytes::Bytes`
 /// can hand it straight to the ring instead of copying it into a fresh `Vec`.
 pub async fn write_all_buf<S, B>(stream: &mut S, buf: B) -> io::Result<B>
 where

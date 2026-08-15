@@ -367,17 +367,34 @@ async fn warm_paged_runtime(root: &std::path::Path, span: u64, l1: bool) -> Arc<
     runtime
 }
 
-/// Drive one cross-page bench: `pages` pages, byte path vs sendfile path.
-fn run_cross_page(bencher: divan::Bencher, tag: &str, pages: u64, zero_copy: bool, l1: bool) {
+/// Drive one paged bench over an explicit `[offset, offset + len)` window,
+/// byte path vs sendfile path.
+///
+/// Kept separate from page counts because the interesting regime is not only
+/// "how many pages" but *how much of them* is asked for: a 4 KiB read sitting
+/// on a page boundary touches two pages while copying almost nothing, so the
+/// per-page `openat` + `sendfile` syscalls are no longer amortised the way
+/// they are for a multi-megabyte span.
+fn run_paged_window(
+    bencher: divan::Bencher,
+    tag: &str,
+    offset: u64,
+    len: u64,
+    zero_copy: bool,
+    l1: bool,
+) {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
         .build()
         .unwrap();
     let root = tmp_root(tag);
-    let span = pages * u64::from(PAGE_BYTES);
+    // Warm whole pages covering the window so the serve path is a pure cache
+    // hit; otherwise the first iteration would measure a backend fetch.
+    let page = u64::from(PAGE_BYTES);
+    let warm_span = (offset + len).div_ceil(page) * page;
     let (addr, req) = rt.block_on(async {
-        let runtime = warm_paged_runtime(&root, span, l1).await;
+        let runtime = warm_paged_runtime(&root, warm_span, l1).await;
         let addr = if zero_copy {
             spawn_new_server(runtime).await
         } else {
@@ -385,16 +402,22 @@ fn run_cross_page(bencher: divan::Bencher, tag: &str, pages: u64, zero_copy: boo
         };
         let req = RangeRequest {
             object: obj(),
-            offset: 0,
-            len: span,
+            offset,
+            len,
         };
         (addr, req)
     });
     bencher.bench(|| {
         let n = rt.block_on(client_fetch(&addr, &req));
-        assert_eq!(n, span as usize);
+        assert_eq!(n, len as usize);
     });
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// Drive one cross-page bench: `pages` pages, byte path vs sendfile path.
+fn run_cross_page(bencher: divan::Bencher, tag: &str, pages: u64, zero_copy: bool, l1: bool) {
+    let span = pages * u64::from(PAGE_BYTES);
+    run_paged_window(bencher, tag, 0, span, zero_copy, l1);
 }
 
 #[divan::bench]
@@ -430,4 +453,192 @@ fn cross_page_4_l1_bytes(b: divan::Bencher) {
 #[divan::bench]
 fn cross_page_4_l1_sendfile(b: divan::Bencher) {
     run_cross_page(b, "xp4-l1-sendfile", 4, true, true);
+}
+
+// --- Small reads straddling a page boundary -------------------------------
+//
+// The community's actual workload is not a multi-megabyte scan: Parquet row
+// groups are ~1 MiB but their boundaries do not line up with cache pages, so
+// "quite a lot of IO ends up crossing a page" — each such IO being small. This
+// is the regime where multi-sendfile is *least* obviously a win, since the copy
+// it removes shrinks with the read while the extra `openat` + `sendfile` per
+// page stays fixed. Every bench below centres the window on the boundary
+// between page 0 and page 1, so exactly two pages are touched.
+
+/// A window of `len` bytes centred on the page-0/page-1 boundary.
+fn straddle_offset(len: u64) -> u64 {
+    u64::from(PAGE_BYTES) - len / 2
+}
+
+#[divan::bench]
+fn straddle_4k_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd4k-bytes",
+        straddle_offset(4 << 10),
+        4 << 10,
+        false,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_4k_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd4k-sendfile",
+        straddle_offset(4 << 10),
+        4 << 10,
+        true,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_16k_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd16k-bytes",
+        straddle_offset(16 << 10),
+        16 << 10,
+        false,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_16k_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd16k-sendfile",
+        straddle_offset(16 << 10),
+        16 << 10,
+        true,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_64k_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd64k-bytes",
+        straddle_offset(64 << 10),
+        64 << 10,
+        false,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_64k_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd64k-sendfile",
+        straddle_offset(64 << 10),
+        64 << 10,
+        true,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_256k_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd256k-bytes",
+        straddle_offset(256 << 10),
+        256 << 10,
+        false,
+        false,
+    );
+}
+#[divan::bench]
+fn straddle_256k_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd256k-sendfile",
+        straddle_offset(256 << 10),
+        256 << 10,
+        true,
+        false,
+    );
+}
+
+/// Control: the same 64 KiB read placed *inside* one page. The delta against
+/// `straddle_64k_*` isolates what crossing the boundary actually costs on each
+/// path.
+#[divan::bench]
+fn in_page_64k_bytes(b: divan::Bencher) {
+    run_paged_window(b, "ip64k-bytes", 4 << 10, 64 << 10, false, false);
+}
+#[divan::bench]
+fn in_page_64k_sendfile(b: divan::Bencher) {
+    run_paged_window(b, "ip64k-sendfile", 4 << 10, 64 << 10, true, false);
+}
+
+/// A small straddling read with L1 enabled — the configuration that previously
+/// had no zero-copy path at all.
+#[divan::bench]
+fn straddle_64k_l1_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd64k-l1-bytes",
+        straddle_offset(64 << 10),
+        64 << 10,
+        false,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_64k_l1_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd64k-l1-sendfile",
+        straddle_offset(64 << 10),
+        64 << 10,
+        true,
+        true,
+    );
+}
+
+/// L1-resident straddling reads across sizes, to locate the size at which
+/// zero-copy overtakes serving the bytes straight out of DRAM.
+#[divan::bench]
+fn straddle_256k_l1_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd256k-l1-bytes",
+        straddle_offset(256 << 10),
+        256 << 10,
+        false,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_256k_l1_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd256k-l1-sendfile",
+        straddle_offset(256 << 10),
+        256 << 10,
+        true,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_1m_l1_bytes(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd1m-l1-bytes",
+        straddle_offset(1 << 20),
+        1 << 20,
+        false,
+        true,
+    );
+}
+#[divan::bench]
+fn straddle_1m_l1_sendfile(b: divan::Bencher) {
+    run_paged_window(
+        b,
+        "sd1m-l1-sendfile",
+        straddle_offset(1 << 20),
+        1 << 20,
+        true,
+        true,
+    );
 }

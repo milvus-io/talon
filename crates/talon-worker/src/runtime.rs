@@ -37,6 +37,22 @@ const MAX_LIST_PAGES: usize = 20;
 /// Objects requested per backend page.
 const LIST_PAGE_SIZE: u32 = 1000;
 
+/// Smallest request that is worth serving with sendfile when the pages are
+/// already resident in L1.
+///
+/// Zero-copy is not free: it costs one `openat` and one `sendfile` per page
+/// touched. When L1 already holds the bytes, the byte path answers from DRAM
+/// with a single small copy and no syscalls per page, so below this size the
+/// copy it avoids is cheaper than the syscalls it adds. Benchmarked on a
+/// 64 KiB read straddling a 1 MiB page boundary: byte path 236 µs vs sendfile
+/// 280 µs (+19 %). The two paths converge at 256 KiB (375 vs 359 µs) and
+/// sendfile pulls clearly ahead at 1 MiB (766 vs 599 µs, −22 %), so the
+/// threshold sits at the measured crossover.
+///
+/// With L1 off there is no such tradeoff — the byte path must hit the disk
+/// anyway — so sendfile is used at every size.
+const L1_SENDFILE_MIN_LEN: u64 = 256 << 10;
+
 /// A per-object resolved version with the instant it was resolved.
 struct CachedVersion {
     version: Version,
@@ -404,12 +420,16 @@ impl WorkerRuntime {
             // L1-resident: the byte path is what admits pages into L1, and
             // sendfile never brings bytes through userspace to admit. Serving a
             // non-resident page here would silently stop populating L1.
+            //
+            // Even when resident, sendfile is only worth it above
+            // `L1_SENDFILE_MIN_LEN` — see that constant.
             if let Some(paged) = &self.paged {
                 let page_size = u64::from(paged.page_size());
                 let first = PageIndex((offset_in_block / page_size) as u32);
                 let last = PageIndex(((offset_in_block + request.len - 1) / page_size) as u32);
                 let l1_ok = !self.l1.is_enabled()
-                    || (first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)));
+                    || ((first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)))
+                        && request.len >= L1_SENDFILE_MIN_LEN);
                 if request.len > 0
                     && l1_ok
                     && matches!(
@@ -3785,12 +3805,24 @@ mod tests {
     #[tokio::test]
     async fn with_l1_enabled_zero_copy_waits_until_the_pages_are_l1_resident() {
         let root = tmp_root();
-        let backend = Arc::new(PagedRampBackend::new(4096));
-        let metrics = WorkerMetrics::new(1024);
-        let runtime =
-            paged_runtime_l1(Arc::clone(&backend), &root, 1024, 64, 4096, metrics.clone());
+        // Sizes large enough to straddle `L1_SENDFILE_MIN_LEN` from both sides:
+        // 4 MiB blocks of 256 KiB pages.
+        let page = 256u32 << 10;
+        let backend = Arc::new(PagedRampBackend::new(8 << 20));
+        let metrics = WorkerMetrics::new(1 << 20);
+        let runtime = paged_runtime_l1(
+            Arc::clone(&backend),
+            &root,
+            4 << 20,
+            page,
+            8 << 20,
+            metrics.clone(),
+        );
         let object = ObjectId::new(Backend::Azure, "bucket", "obj");
-        let request = req(&object, 100, 200);
+        // Straddles the page-0/page-1 boundary and clears the threshold.
+        let offset = u64::from(page) - 1024;
+        let len = L1_SENDFILE_MIN_LEN + 4096;
+        let request = req(&object, offset, len);
 
         // First read: origin miss, bytes, and it admits the pages into L1.
         assert!(matches!(
@@ -3806,7 +3838,44 @@ mod tests {
             matches!(outcome, ServeOutcome::SendfileMany(_)),
             "L1-resident cross-page read must go zero-copy"
         );
-        assert_eq!(read_handle(outcome), expected(100, 200));
+        assert_eq!(read_handle(outcome), expected(offset, len));
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// Below `L1_SENDFILE_MIN_LEN` an L1-resident cross-page read is faster
+    /// served straight from DRAM than through one `openat` + `sendfile` per
+    /// page, so the fast path must decline even though the pages are resident.
+    #[tokio::test]
+    async fn a_small_l1_resident_cross_page_read_stays_on_the_byte_path() {
+        let root = tmp_root();
+        let page = 256u32 << 10;
+        let backend = Arc::new(PagedRampBackend::new(8 << 20));
+        let runtime = paged_runtime_l1(
+            Arc::clone(&backend),
+            &root,
+            4 << 20,
+            page,
+            8 << 20,
+            WorkerMetrics::new(1 << 20),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+        // Straddles a page boundary but stays under the threshold.
+        let offset = u64::from(page) - 2048;
+        let len = 4096;
+        let request = req(&object, offset, len);
+
+        // Warm L1 so residency is not what makes the fast path decline.
+        let _ = runtime.serve(&request).await.unwrap();
+        assert!(runtime.l1_page_count() > 0, "byte path must populate L1");
+
+        let outcome = runtime.serve(&request).await.unwrap();
+        let bytes = match outcome {
+            ServeOutcome::Bytes(b) => b,
+            ServeOutcome::Sendfile(_) | ServeOutcome::SendfileMany(_) => {
+                panic!("a sub-threshold L1-resident read must stay on the byte path")
+            }
+        };
+        assert_eq!(bytes, expected(offset, len));
         std::fs::remove_dir_all(root).ok();
     }
 
