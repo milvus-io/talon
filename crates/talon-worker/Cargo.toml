@@ -25,6 +25,12 @@ harness = false
 name = "talon-loadgen"
 path = "src/bin/loadgen.rs"
 
+# Serve-path probe (#540): syscall counts, RSS, and concurrency for the paged
+# zero-copy path. Manual tool for a known machine, not a CI gate.
+[[bin]]
+name = "talon-serve-probe"
+path = "src/bin/serve_probe.rs"
+
 [dependencies]
 talon-core.workspace = true
 talon-metadata.workspace = true
