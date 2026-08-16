@@ -14,6 +14,7 @@
 //! [`CoordinatorClient`](crate::CoordinatorClient).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -24,7 +25,7 @@ use talon_transport::{
     encode_put_header, encode_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError,
     DeleteRequest, Flags, PutRequest, RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::pool::ConnectionPool;
@@ -442,12 +443,10 @@ impl WriteClient {
     /// `body` bytes, and returns the backend-committed [`Version`]. A worker- or
     /// backend-side failure surfaces as [`WorkerError::Remote`].
     ///
-    /// Retries once when a *reused* pooled connection fails with an I/O error
-    /// (the peer may have closed it while idle): because a retry re-sends the
-    /// full header+body on a fresh connection, it is safe — the first attempt
-    /// sent nothing the backend committed. A non-I/O failure (the worker
-    /// replied with a refusal) propagates immediately instead of re-sending
-    /// the body to a peer that already rejected it.
+    /// Retries once when a *reused* pooled connection fails while transmitting
+    /// the request (the peer may have closed it while idle). Once the complete
+    /// request has been sent, a response failure is ambiguous and propagates
+    /// instead of risking a duplicate backend write.
     pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
         let req_id = RequestId::next();
         let header = encode_put_header(
@@ -459,7 +458,7 @@ impl WriteClient {
         )?;
         match self.put_exchange(&header, body).await {
             Ok(version) => Ok(version),
-            Err((true, err)) if err.is_transport_failure() => {
+            Err((true, true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let version = self
                     .pool
@@ -473,7 +472,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err((_, err)) => {
+            Err((_, _, err)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -494,6 +493,11 @@ impl WriteClient {
         path: &Path,
         len: u64,
     ) -> Result<Version, WorkerError> {
+        let mut file = tokio::fs::File::open(path).await?;
+        let actual_len = file.metadata().await?.len();
+        if actual_len < len {
+            return Err(short_file_error(actual_len, len));
+        }
         let req_id = RequestId::next();
         let header = encode_put_header(
             req_id.0,
@@ -502,9 +506,10 @@ impl WriteClient {
                 body_len: len,
             },
         )?;
-        match self.put_file_exchange(&header, path, len).await {
+        match self.put_file_exchange(&header, &mut file, len).await {
             Ok(version) => Ok(version),
-            Err((true, err)) if err.is_transport_failure() => {
+            Err((true, true, err)) if err.is_transport_failure() => {
+                file.seek(std::io::SeekFrom::Start(0)).await?;
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let version = self
                     .pool
@@ -513,7 +518,7 @@ impl WriteClient {
                         streamed_put_timeout(len),
                         async {
                             stream.write_all(&header).await?;
-                            stream_file(&mut stream, path, len).await?;
+                            stream_file(&mut stream, &mut file, len, None).await?;
                             read_version_reply(&mut stream).await
                         },
                     )
@@ -521,7 +526,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err((_, error)) => {
+            Err((_, _, error)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -541,18 +546,20 @@ impl WriteClient {
         &self,
         header: &[u8],
         body: &[u8],
-    ) -> Result<Version, (bool, WorkerError)> {
+    ) -> Result<Version, (bool, bool, WorkerError)> {
         let (mut stream, reused) = self
             .pool
             .checkout(&self.addr)
             .await
-            .map_err(|e| (false, WorkerError::from(e)))?;
+            .map_err(|e| (false, false, WorkerError::from(e)))?;
+        let retry_safe = AtomicBool::new(true);
         let result: Result<Version, WorkerError> = self
             .pool
             .with_request_deadline("worker put_object", async {
                 stream.write_all(header).await?;
                 stream.write_all(body).await?;
                 stream.flush().await?;
+                retry_safe.store(false, Ordering::Relaxed);
                 read_version_reply(&mut stream).await
             })
             .await;
@@ -561,26 +568,28 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err(err) => Err((reused, err)),
+            Err(err) => Err((reused, retry_safe.load(Ordering::Relaxed), err)),
         }
     }
 
     async fn put_file_exchange(
         &self,
         header: &[u8],
-        path: &Path,
+        file: &mut tokio::fs::File,
         len: u64,
-    ) -> Result<Version, (bool, WorkerError)> {
+    ) -> Result<Version, (bool, bool, WorkerError)> {
         let (mut stream, reused) = self
             .pool
             .checkout(&self.addr)
             .await
-            .map_err(|error| (false, WorkerError::from(error)))?;
+            .map_err(|error| (false, false, WorkerError::from(error)))?;
+        let retry_safe = AtomicBool::new(true);
         let result: Result<Version, WorkerError> = self
             .pool
             .with_deadline("worker put_object_file", streamed_put_timeout(len), async {
                 stream.write_all(header).await?;
-                stream_file(&mut stream, path, len).await?;
+                stream_file(&mut stream, file, len, Some(&retry_safe)).await?;
+                retry_safe.store(false, Ordering::Relaxed);
                 read_version_reply(&mut stream).await
             })
             .await;
@@ -589,7 +598,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err(error) => Err((reused, error)),
+            Err(error) => Err((reused, retry_safe.load(Ordering::Relaxed), error)),
         }
     }
 
@@ -604,7 +613,7 @@ impl WriteClient {
         )?;
         match self.delete_exchange(&frame).await {
             Ok(()) => Ok(()),
-            Err((true, err)) if err.is_transport_failure() => {
+            Err((true, true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 self.pool
                     .with_request_deadline("worker delete_object retry", async {
@@ -616,7 +625,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(())
             }
-            Err((_, err)) => {
+            Err((_, _, err)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -629,17 +638,19 @@ impl WriteClient {
         }
     }
 
-    async fn delete_exchange(&self, frame: &[u8]) -> Result<(), (bool, WorkerError)> {
+    async fn delete_exchange(&self, frame: &[u8]) -> Result<(), (bool, bool, WorkerError)> {
         let (mut stream, reused) = self
             .pool
             .checkout(&self.addr)
             .await
-            .map_err(|e| (false, WorkerError::from(e)))?;
+            .map_err(|e| (false, false, WorkerError::from(e)))?;
+        let retry_safe = AtomicBool::new(true);
         let result: Result<(), WorkerError> = self
             .pool
             .with_request_deadline("worker delete_object", async {
                 stream.write_all(frame).await?;
                 stream.flush().await?;
+                retry_safe.store(false, Ordering::Relaxed);
                 read_version_reply(&mut stream).await.map(|_| ())
             })
             .await;
@@ -648,7 +659,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(())
             }
-            Err(err) => Err((reused, err)),
+            Err(err) => Err((reused, retry_safe.load(Ordering::Relaxed), err)),
         }
     }
 }
@@ -660,25 +671,38 @@ fn streamed_put_timeout(len: u64) -> Duration {
     Duration::from_secs((30 + transfer_seconds).min(MAX_SECONDS))
 }
 
-async fn stream_file(stream: &mut TcpStream, path: &Path, len: u64) -> Result<(), WorkerError> {
-    let file = tokio::fs::File::open(path).await?;
-    let actual_len = file.metadata().await?.len();
-    if actual_len < len {
-        return Err(WorkerError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("staged file is {actual_len} bytes, expected at least {len}"),
-        )));
-    }
-    let mut limited = file.take(len);
-    let copied = tokio::io::copy(&mut limited, stream).await?;
-    if copied != len {
-        return Err(WorkerError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof,
-            format!("streamed {copied} bytes, expected {len}"),
-        )));
+async fn stream_file(
+    stream: &mut TcpStream,
+    file: &mut tokio::fs::File,
+    len: u64,
+    retry_safe: Option<&AtomicBool>,
+) -> Result<(), WorkerError> {
+    let mut remaining = len;
+    let mut buffer = vec![0_u8; 64 * 1024];
+    while remaining > 0 {
+        if let Some(retry_safe) = retry_safe {
+            retry_safe.store(false, Ordering::Relaxed);
+        }
+        let limit = remaining.min(buffer.len() as u64) as usize;
+        let read = file.read(&mut buffer[..limit]).await?;
+        if read == 0 {
+            return Err(short_file_error(len - remaining, len));
+        }
+        if let Some(retry_safe) = retry_safe {
+            retry_safe.store(true, Ordering::Relaxed);
+        }
+        stream.write_all(&buffer[..read]).await?;
+        remaining -= read as u64;
     }
     stream.flush().await?;
     Ok(())
+}
+
+fn short_file_error(actual_len: u64, expected_len: u64) -> WorkerError {
+    WorkerError::Io(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        format!("staged file is {actual_len} bytes, expected at least {expected_len}"),
+    ))
 }
 
 /// Read a framed write/delete reply: OK carries the committed version bytes (a
@@ -1499,6 +1523,130 @@ mod tests {
             started.elapsed() < Duration::from_secs(2),
             "took {:?}",
             started.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn local_file_error_on_reused_connection_does_not_redial() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use talon_transport::decode_put_header;
+
+        let accepts = Arc::new(AtomicU32::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_accepts = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    loop {
+                        let mut header_bytes = [0_u8; HEADER_LEN];
+                        if socket.read_exact(&mut header_bytes).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&header_bytes).unwrap();
+                        let mut payload = vec![0_u8; header.length as usize];
+                        if socket.read_exact(&mut payload).await.is_err() {
+                            return;
+                        }
+                        let mut frame = header_bytes.to_vec();
+                        frame.extend_from_slice(&payload);
+                        let (_, request) = decode_put_header(&frame).unwrap();
+                        let mut body = vec![0_u8; request.body_len as usize];
+                        if socket.read_exact(&mut body).await.is_err() {
+                            return;
+                        }
+                        let mut response = response_header_ok(header.request_id, 2).to_vec();
+                        response.extend_from_slice(b"v1");
+                        socket.write_all(&response).await.unwrap();
+                        socket.flush().await.unwrap();
+                    }
+                });
+            }
+        });
+
+        let client = WriteClient::new(addr);
+        client.put_object(&object(), b"warm").await.unwrap();
+        let missing = tempfile::tempdir().unwrap().path().join("missing");
+        let error = client
+            .put_object_file(&object(), &missing, 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, WorkerError::Io(_)));
+
+        for _ in 0..100 {
+            if accepts.load(Ordering::SeqCst) >= 2 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "a local staged-file failure must not open a fresh connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn put_response_failure_after_request_is_sent_does_not_redial() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use talon_transport::decode_put_header;
+
+        let accepts = Arc::new(AtomicU32::new(0));
+        let requests = Arc::new(AtomicU32::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server_accepts = Arc::clone(&accepts);
+        let server_requests = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                let requests = Arc::clone(&server_requests);
+                tokio::spawn(async move {
+                    loop {
+                        let mut header_bytes = [0_u8; HEADER_LEN];
+                        if socket.read_exact(&mut header_bytes).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&header_bytes).unwrap();
+                        let mut payload = vec![0_u8; header.length as usize];
+                        socket.read_exact(&mut payload).await.unwrap();
+                        let mut frame = header_bytes.to_vec();
+                        frame.extend_from_slice(&payload);
+                        let (_, request) = decode_put_header(&frame).unwrap();
+                        let mut body = vec![0_u8; request.body_len as usize];
+                        socket.read_exact(&mut body).await.unwrap();
+
+                        if requests.fetch_add(1, Ordering::SeqCst) == 0 {
+                            let mut response = response_header_ok(header.request_id, 2).to_vec();
+                            response.extend_from_slice(b"v1");
+                            socket.write_all(&response).await.unwrap();
+                            socket.flush().await.unwrap();
+                        } else {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+
+        let client = WriteClient::new(addr);
+        client.put_object(&object(), b"warm").await.unwrap();
+        let error = client.put_object(&object(), b"commit-ambiguous").await;
+        assert!(matches!(error, Err(WorkerError::Io(_))));
+
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "an ambiguous response failure must not resend the PUT"
         );
     }
 }
