@@ -65,6 +65,32 @@ pub enum WorkerError {
     Remote(DataPlaneError),
 }
 
+impl WorkerError {
+    /// True when the failure is transport-level (the socket died) rather than
+    /// the worker answering with a refusal.
+    ///
+    /// This is the retry gate for pooled connections. A *reused* connection may
+    /// have been closed by the peer while it sat idle (server idle timeout,
+    /// restart), so a transport failure on one is retried once on a fresh dial
+    /// — see [`ConnectionPool::checkout`]. Every other variant means the worker
+    /// answered and refused; re-asking the same peer would only repeat the
+    /// refusal, so those propagate immediately.
+    ///
+    /// Matched exhaustively on purpose: a new variant has to be classified
+    /// here, in one place, instead of silently defaulting at each call site.
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        match self {
+            WorkerError::Io(_) => true,
+            WorkerError::Encode(_)
+            | WorkerError::Frame(_)
+            | WorkerError::NotGetRange(_)
+            | WorkerError::RangeLengthMismatch { .. }
+            | WorkerError::PayloadTooLarge { .. }
+            | WorkerError::Remote(_) => false,
+        }
+    }
+}
+
 /// A thin data-plane client bound to one worker address.
 ///
 /// Reuses connections from a shared [`ConnectionPool`] so warm fetches skip the
@@ -125,13 +151,15 @@ impl WorkerClient {
         // logs for this fetch can be joined with the client's (#304).
         let req_id = RequestId::next();
         let out = encode_request(req_id.0, &req)?;
-        // Try a pooled connection first; if it was reused and fails (the peer may
-        // have closed it while idle), retry once on a fresh dial so a stale
-        // pooled socket never turns a healthy peer into a spurious failure. A
-        // failure on a *fresh* connection is a real peer error and propagates.
+        // Try a pooled connection first; if it was reused and fails with an I/O
+        // error (the peer may have closed it while idle), retry once on a fresh
+        // dial so a stale pooled socket never turns a healthy peer into a
+        // spurious failure. A failure on a fresh connection, or a non-I/O error
+        // on a reused one (the peer answered but refused/rejected the request),
+        // propagates immediately rather than re-asking the same peer.
         match self.exchange(&out, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, _stale)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let bytes = self
                     .pool
@@ -144,7 +172,7 @@ impl WorkerClient {
                 self.pool.release(&self.addr, stream);
                 Ok(bytes)
             }
-            Err((false, err)) => {
+            Err((_, err)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -178,7 +206,7 @@ impl WorkerClient {
         let output = encode_request(request_id.0, &request)?;
         match self.exchange_into(&output, dst).await {
             Ok(n) => Ok(n),
-            Err((true, _)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let n = self
                     .pool
@@ -191,7 +219,7 @@ impl WorkerClient {
                 self.pool.release(&self.addr, stream);
                 Ok(n)
             }
-            Err((false, error)) => {
+            Err((_, error)) => {
                 tracing::error!(
                     req = %request_id,
                     worker = %self.addr,
@@ -227,7 +255,7 @@ impl WorkerClient {
         let output = encode_cached_request(request_id.0, &request)?;
         match self.exchange(&output, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, _)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let bytes = self
                     .pool
@@ -240,7 +268,7 @@ impl WorkerClient {
                 self.pool.release(&self.addr, stream);
                 Ok(bytes)
             }
-            Err((false, error)) => Err(error),
+            Err((_, error)) => Err(error),
         }
     }
 
@@ -263,7 +291,7 @@ impl WorkerClient {
         )?;
         match self.admit_exchange(&header, body).await {
             Ok(()) => Ok(()),
-            Err((true, _)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 self.pool
                     .with_deadline(
@@ -280,7 +308,7 @@ impl WorkerClient {
                 self.pool.release(&self.addr, stream);
                 Ok(())
             }
-            Err((false, error)) => Err(error),
+            Err((_, error)) => Err(error),
         }
     }
 
@@ -414,10 +442,12 @@ impl WriteClient {
     /// `body` bytes, and returns the backend-committed [`Version`]. A worker- or
     /// backend-side failure surfaces as [`WorkerError::Remote`].
     ///
-    /// Retries once on a *stale pooled* connection (the peer may have closed it
-    /// while idle): because a retry re-sends the full header+body on a fresh
-    /// connection, it is safe — the first attempt sent nothing the backend
-    /// committed (a mid-stream failure is not retried, it propagates).
+    /// Retries once when a *reused* pooled connection fails with an I/O error
+    /// (the peer may have closed it while idle): because a retry re-sends the
+    /// full header+body on a fresh connection, it is safe — the first attempt
+    /// sent nothing the backend committed. A non-I/O failure (the worker
+    /// replied with a refusal) propagates immediately instead of re-sending
+    /// the body to a peer that already rejected it.
     pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
         let req_id = RequestId::next();
         let header = encode_put_header(
@@ -429,8 +459,7 @@ impl WriteClient {
         )?;
         match self.put_exchange(&header, body).await {
             Ok(version) => Ok(version),
-            Err((true, _stale)) => {
-                // Stale pooled connection: retry once on a fresh dial.
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let version = self
                     .pool
@@ -444,7 +473,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err((false, err)) => {
+            Err((_, err)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -475,7 +504,7 @@ impl WriteClient {
         )?;
         match self.put_file_exchange(&header, path, len).await {
             Ok(version) => Ok(version),
-            Err((true, _stale)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let version = self
                     .pool
@@ -492,7 +521,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(version)
             }
-            Err((false, error)) => {
+            Err((_, error)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -575,7 +604,7 @@ impl WriteClient {
         )?;
         match self.delete_exchange(&frame).await {
             Ok(()) => Ok(()),
-            Err((true, _stale)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 self.pool
                     .with_request_deadline("worker delete_object retry", async {
@@ -587,7 +616,7 @@ impl WriteClient {
                 self.pool.release(&self.addr, stream);
                 Ok(())
             }
-            Err((false, err)) => {
+            Err((_, err)) => {
                 tracing::error!(
                     req = %req_id,
                     worker = %self.addr,
@@ -973,10 +1002,21 @@ mod tests {
     }
 
     /// A mock worker that loops, serving many sequential requests on the SAME
-    /// connection, and counts accepted connections.
-    async fn looping_mock_worker(accepts: Arc<std::sync::atomic::AtomicU32>) -> String {
+    /// connection. Counts accepted connections and requests served, and lets
+    /// the caller build each reply: `respond` gets the request header, the
+    /// decoded request, and the 0-based index of this request across all
+    /// connections.
+    async fn looping_mock_worker_with<F>(
+        accepts: Arc<std::sync::atomic::AtomicU32>,
+        requests: Arc<std::sync::atomic::AtomicU32>,
+        respond: F,
+    ) -> String
+    where
+        F: Fn(&FrameHeader, &RangeRequest, u32) -> Vec<u8> + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let respond = Arc::new(respond);
         tokio::spawn(async move {
             loop {
                 let (mut sock, _) = match listener.accept().await {
@@ -984,6 +1024,8 @@ mod tests {
                     Err(_) => return,
                 };
                 accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let requests = Arc::clone(&requests);
+                let respond = Arc::clone(&respond);
                 tokio::spawn(async move {
                     loop {
                         let mut hdr = [0u8; HEADER_LEN];
@@ -996,16 +1038,26 @@ mod tests {
                         let mut full = hdr.to_vec();
                         full.extend_from_slice(&body);
                         let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
-                        let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
-                        let mut out = response_header_ok(0, payload.len() as u32).to_vec();
-                        out.extend_from_slice(&payload);
-                        sock.write_all(&out).await.unwrap();
+                        let n = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        sock.write_all(&respond(&header, &req, n)).await.unwrap();
                         sock.flush().await.unwrap();
                     }
                 });
             }
         });
         addr
+    }
+
+    /// A looping mock worker that serves every request successfully.
+    async fn looping_mock_worker(accepts: Arc<std::sync::atomic::AtomicU32>) -> String {
+        let requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        looping_mock_worker_with(accepts, requests, |_header, req, _n| {
+            let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
+            let mut out = response_header_ok(0, payload.len() as u32).to_vec();
+            out.extend_from_slice(&payload);
+            out
+        })
+        .await
     }
 
     #[tokio::test]
@@ -1071,6 +1123,59 @@ mod tests {
         assert_eq!(b, vec![7u8; 8]);
         // Two connections were accepted (the retry dialed a fresh one).
         assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn remote_error_is_not_retried_on_the_same_replica() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        // A worker that serves the first request successfully, then refuses
+        // every request after that on the SAME (now reused) connection. A
+        // remote refusal must propagate on the first try, not re-dial the
+        // replica that just told us it doesn't have the block.
+        let accepts = Arc::new(AtomicU32::new(0));
+        let requests = Arc::new(AtomicU32::new(0));
+        let addr = looping_mock_worker_with(
+            Arc::clone(&accepts),
+            Arc::clone(&requests),
+            |header, _req, n| {
+                if n == 0 {
+                    let mut out = response_header_ok(header.request_id, 8).to_vec();
+                    out.extend_from_slice(&[7u8; 8]);
+                    out
+                } else {
+                    encode_error(header.request_id, "block not present")
+                }
+            },
+        )
+        .await;
+        let client = WorkerClient::new(addr);
+
+        // Warm the pool with a successful fetch.
+        let first = client.fetch_range(&object(), 0, 8).await.unwrap();
+        assert_eq!(first, vec![7u8; 8]);
+
+        // Second fetch reuses the pooled connection and gets a remote refusal.
+        let err = client.fetch_range(&object(), 0, 8).await.unwrap_err();
+        match err {
+            WorkerError::Remote(error) => {
+                assert_eq!(error.code, talon_transport::DataErrorCode::Unknown);
+                assert_eq!(error.message, "block not present");
+            }
+            other => panic!("expected Remote, got {other:?}"),
+        }
+
+        // The load-bearing assertions: a remote error on a reused connection
+        // must not open a second connection or double the request.
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "a remote error must not re-dial the same replica"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the wrong-owner round trip must not be doubled"
+        );
     }
 
     #[tokio::test]

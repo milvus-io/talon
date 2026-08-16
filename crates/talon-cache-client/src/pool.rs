@@ -168,7 +168,8 @@ impl ConnectionPool {
     /// Returns the stream and whether it came from the pool (`reused == true`).
     /// A reused connection may have been closed by the peer since it was pooled
     /// (server idle timeout, restart); callers should retry once on a fresh dial
-    /// if a reused connection errors — see [`fresh`](Self::fresh).
+    /// if a reused connection fails with an I/O error — see
+    /// [`fresh`](Self::fresh).
     pub async fn checkout(&self, addr: &str) -> std::io::Result<(TcpStream, bool)> {
         if let Some(stream) = self.take_idle(addr) {
             return Ok((stream, true));

@@ -80,6 +80,24 @@ pub enum CoordinatorError {
     },
 }
 
+impl CoordinatorError {
+    /// True when the failure is transport-level (the socket died) rather than
+    /// the coordinator answering with a refusal.
+    ///
+    /// This is the retry gate for pooled connections — see
+    /// [`WorkerError::is_transport_failure`](crate::WorkerError) for the full
+    /// rationale. Matched exhaustively on purpose: a new variant has to be
+    /// classified here rather than silently defaulting at the call site.
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        match self {
+            CoordinatorError::Io(_) => true,
+            CoordinatorError::Codec(_)
+            | CoordinatorError::PayloadTooLarge { .. }
+            | CoordinatorError::Unexpected { .. } => false,
+        }
+    }
+}
+
 /// A thin control-plane client bound to one coordinator address.
 ///
 /// Reuses connections from a shared [`ConnectionPool`] so warm lookups skip the
@@ -267,11 +285,13 @@ impl CoordinatorClient {
 
     /// Send one control message and read exactly one control reply.
     ///
-    /// Uses a pooled connection when warm; a reused connection that fails (the
-    /// peer may have closed it while idle) is retried once on a fresh dial, so a
-    /// stale pooled socket never turns a healthy coordinator into a spurious
-    /// failure. The connection is returned to the pool only after a fully
-    /// successful exchange.
+    /// Uses a pooled connection when warm; a reused connection that fails with
+    /// an I/O error (the peer may have closed it while idle) is retried once on
+    /// a fresh dial, so a stale pooled socket never turns a healthy coordinator
+    /// into a spurious failure. A non-I/O failure (a codec/protocol refusal)
+    /// propagates immediately rather than re-asking the same coordinator. The
+    /// connection is returned to the pool only after a fully successful
+    /// exchange.
     async fn round_trip(
         &self,
         msg: ControlMessage,
@@ -280,7 +300,7 @@ impl CoordinatorClient {
         let out = talon_transport::encode(0, &msg)?;
         match self.exchange(&out, expected).await {
             Ok(reply) => Ok(reply),
-            Err((true, _stale)) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let reply = self
                     .pool
@@ -293,7 +313,7 @@ impl CoordinatorClient {
                 self.pool.release(&self.addr, stream);
                 Ok(reply)
             }
-            Err((false, err)) => Err(err),
+            Err((_, err)) => Err(err),
         }
     }
 
@@ -593,6 +613,78 @@ mod tests {
         assert_eq!(
             resolved.address_of(&NodeId::new("w1")),
             Some("10.0.0.1:7001")
+        );
+    }
+
+    /// A codec-level refusal (e.g. a reply that isn't even a `Control` frame)
+    /// on a reused connection must propagate immediately, not re-dial the
+    /// same coordinator and re-ask.
+    #[tokio::test]
+    async fn not_control_reply_is_not_retried_on_the_coordinator() {
+        use std::sync::atomic::AtomicU32;
+        let accepts = Arc::new(AtomicU32::new(0));
+        let requests = Arc::new(AtomicU32::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts_srv = Arc::clone(&accepts);
+        let requests_srv = Arc::clone(&requests);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                let requests = Arc::clone(&requests_srv);
+                tokio::spawn(async move {
+                    loop {
+                        let mut hdr = [0u8; HEADER_LEN];
+                        if sock.read_exact(&mut hdr).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&hdr).unwrap();
+                        let mut body = vec![0u8; header.length as usize];
+                        sock.read_exact(&mut body).await.unwrap();
+                        let n = requests.fetch_add(1, Ordering::SeqCst);
+                        if n == 0 {
+                            let reply = ControlMessage::MembershipList {
+                                nodes: vec![worker("w1", "10.0.0.1:7001")],
+                            };
+                            sock.write_all(
+                                &talon_transport::encode(header.request_id, &reply).unwrap(),
+                            )
+                            .await
+                            .unwrap();
+                        } else {
+                            let bad =
+                                FrameHeader::new(MsgType::GetRange, header.request_id, 0).encode();
+                            sock.write_all(&bad).await.unwrap();
+                        }
+                        sock.flush().await.unwrap();
+                    }
+                });
+            }
+        });
+        let client = CoordinatorClient::new(addr);
+
+        let members = client.membership().await.unwrap();
+        assert_eq!(members.len(), 1);
+
+        let err = client.membership().await.unwrap_err();
+        assert!(matches!(
+            err,
+            CoordinatorError::Codec(talon_transport::CodecError::NotControl(MsgType::GetRange))
+        ));
+
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            1,
+            "a codec-level refusal must not re-dial the same coordinator"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "the refused round trip must not be doubled"
         );
     }
 
