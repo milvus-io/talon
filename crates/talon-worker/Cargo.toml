@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Worker node: stores and serves cached object data for Talon"
+# The crate ships the `talon-loadgen` benchmark driver alongside the server, so
+# a bare `cargo run -p talon-worker` is otherwise ambiguous. Name the server so
+# the documented command works without `--bin`.
+default-run = "talon-worker"
 
 [[bin]]
 name = "talon-worker"

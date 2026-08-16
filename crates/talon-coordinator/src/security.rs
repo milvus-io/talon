@@ -66,6 +66,10 @@ pub struct SecurityConfig {
     /// Authentication mode for `/api/v1` and the UI.
     pub auth: AuthMode,
     /// Whether to honor `X-Forwarded-For` from a trusted proxy for audit logs.
+    ///
+    /// Currently inert: audit logging is not implemented, so no code path reads
+    /// this field or inspects the header. Kept so the operator-facing setting
+    /// does not change shape when auditing lands.
     pub trust_forwarded_headers: bool,
 }
 
@@ -149,8 +153,10 @@ pub fn apply_security_headers(resp: &mut Response, protected: bool) {
         header::REFERRER_POLICY,
         HeaderValue::from_static("no-referrer"),
     );
-    // Protected (data/UI) responses must not be stored by shared caches; the UI
-    // asset layer sets its own long-lived caching and is exempt via `protected`.
+    // Protected (data/UI) responses must not be stored by shared caches. This
+    // runs as an outer layer and overwrites whatever the handler set, so UI
+    // assets get `no-store` too despite the asset handler's own `max-age`:
+    // only `is_public_path` routes keep their caching.
     if protected {
         h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     }

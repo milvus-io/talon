@@ -49,28 +49,34 @@ scratch.
 If shuffle is the primary workload, measure hit rate before committing to it.
 The per-worker metrics exposed to Prometheus make this straightforward.
 
-## Current limitation: block granularity
+## Block granularity: whole blocks by default, pages on request
 
-This is the most important caveat on this page, and it is a real one today.
+By default a worker materialises blocks **whole**. A read that touches a block
+fetches the entire block — 256 MiB at the default size — even if the query
+wanted a few kilobytes of one column chunk. For a sequential scan that is
+exactly right, and the cost is amortised immediately. For sparse random access
+across a large file it is not: the first touch of each block pays a full block
+fetch.
 
-Blocks are currently materialised **whole**. A read that touches a block fetches
-the entire block — 256 MiB at the default size — even if the query wanted a few
-kilobytes of one column chunk. For a sequential scan that is exactly right, and
-the cost is amortised immediately. For sparse random access across a large file
-it is not: the first touch of each block pays a full block fetch.
+For that second shape, a worker can cache **per page** instead. Set
+[`l2_page_size_bytes`](../reference/configuration.md#l2_page_size_bytes) to a
+non-zero page size and a block is materialised page by page against a present
+bitmap: a range touching absent pages fetches only those pages' byte ranges
+from the origin, not the whole block. Each present page is its own file on
+disk, served by its own `sendfile`, and both miss dedup and LRU accounting
+descend to `(block, page)` granularity.
 
-The design anticipates this. `DESIGN.md` specifies **paged blocks**, where a
-block is materialised page by page against a present bitmap, and a range
-touching absent pages fetches only those pages' byte ranges rather than the
-whole block. The supporting pieces exist in the tree — the block form enum, the
-present bitmap, a paged store implementation — but the serve path does not yet
-resolve reads through them, so the behaviour above is what actually ships.
+The setting defaults to `0`, which keeps the whole-block behaviour above. Two
+constraints apply when you enable it: the page size must divide `block_size`,
+and when the L1 DRAM cache is also enabled `l1_page_size_bytes` must equal
+`l2_page_size_bytes` (L1 is filled one L2 page at a time, so mismatched sizes
+would leave L1 entries unfillable). The worker validates both at startup.
 
-Practical consequence: **Talon suits analytics workloads that scan more than
-they seek.** Full-partition scans, repeated reads of hot dimension tables, and
-range reads that align with block boundaries all benefit now. Highly selective
-point lookups scattered across a large file will over-fetch until paged blocks
-are wired through.
+Practical consequence: **with the default settings Talon suits analytics
+workloads that scan more than they seek.** Full-partition scans, repeated reads
+of hot dimension tables, and range reads that align with block boundaries all
+benefit as shipped. For highly selective point lookups scattered across a large
+file, enable paged caching so a lookup costs one page rather than 256 MiB.
 
 ## Practical notes
 

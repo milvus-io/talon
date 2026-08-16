@@ -161,7 +161,7 @@ Bearer token (>= 16 chars) enabling API/UI authentication; unset disables auth.
 
 ### `(env only)`
 
-Honor X-Forwarded-For for audit attribution behind a trusted proxy.
+Reserved for X-Forwarded-For audit attribution; currently inert because request audit logging is not implemented.
 
 - **Environment variable:** `TALON_COORDINATOR_TRUST_FORWARDED`
 - **Default:** `false`

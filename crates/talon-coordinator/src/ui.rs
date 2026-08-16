@@ -136,6 +136,10 @@ mod tests {
             css.headers().get(header::CONTENT_TYPE).unwrap(),
             "text/css; charset=utf-8"
         );
+        // Note: this exercises the bare asset router. In a running coordinator
+        // the security layer wraps it and overwrites this header with
+        // `no-store` (see `security::apply_security_headers`), so this asserts
+        // what the handler sets, not what a client receives.
         assert!(css
             .headers()
             .get(header::CACHE_CONTROL)

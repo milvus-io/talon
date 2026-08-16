@@ -26,8 +26,9 @@ Concurrent misses for the same block are deduplicated, so a stampede produces
 **Range reads without whole-file transfer.** `GET_RANGE` is served with
 `sendfile` at an offset, so once a block is resident, reading a checkpoint
 footer transfers the footer — not the checkpoint, and not through userspace.
-Note that the *first* touch of a block still fetches the whole block from the
-origin; see [the granularity note](./analytics.md#current-limitation-block-granularity).
+Note that by default the *first* touch of a block fetches the whole block from
+the origin; see
+[the granularity note](./analytics.md#block-granularity-whole-blocks-by-default-pages-on-request).
 
 **Version-correct caching.** Blocks are keyed by the object's real ETag, and the
 worker sends a conditional `If-Match` on the miss path. Overwriting a checkpoint
