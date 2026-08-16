@@ -80,6 +80,24 @@ pub enum CoordinatorError {
     },
 }
 
+impl CoordinatorError {
+    /// True when the failure is transport-level (the socket died) rather than
+    /// the coordinator answering with a refusal.
+    ///
+    /// This is the retry gate for pooled connections — see
+    /// [`WorkerError::is_transport_failure`](crate::WorkerError) for the full
+    /// rationale. Matched exhaustively on purpose: a new variant has to be
+    /// classified here rather than silently defaulting at the call site.
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        match self {
+            CoordinatorError::Io(_) => true,
+            CoordinatorError::Codec(_)
+            | CoordinatorError::PayloadTooLarge { .. }
+            | CoordinatorError::Unexpected { .. } => false,
+        }
+    }
+}
+
 /// A thin control-plane client bound to one coordinator address.
 ///
 /// Reuses connections from a shared [`ConnectionPool`] so warm lookups skip the
@@ -282,7 +300,7 @@ impl CoordinatorClient {
         let out = talon_transport::encode(0, &msg)?;
         match self.exchange(&out, expected).await {
             Ok(reply) => Ok(reply),
-            Err((true, CoordinatorError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let reply = self
                     .pool
@@ -603,7 +621,7 @@ mod tests {
     /// same coordinator and re-ask.
     #[tokio::test]
     async fn not_control_reply_is_not_retried_on_the_coordinator() {
-        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::atomic::AtomicU32;
         let accepts = Arc::new(AtomicU32::new(0));
         let requests = Arc::new(AtomicU32::new(0));
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

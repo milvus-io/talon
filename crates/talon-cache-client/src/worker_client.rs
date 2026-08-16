@@ -65,6 +65,32 @@ pub enum WorkerError {
     Remote(DataPlaneError),
 }
 
+impl WorkerError {
+    /// True when the failure is transport-level (the socket died) rather than
+    /// the worker answering with a refusal.
+    ///
+    /// This is the retry gate for pooled connections. A *reused* connection may
+    /// have been closed by the peer while it sat idle (server idle timeout,
+    /// restart), so a transport failure on one is retried once on a fresh dial
+    /// — see [`ConnectionPool::checkout`]. Every other variant means the worker
+    /// answered and refused; re-asking the same peer would only repeat the
+    /// refusal, so those propagate immediately.
+    ///
+    /// Matched exhaustively on purpose: a new variant has to be classified
+    /// here, in one place, instead of silently defaulting at each call site.
+    pub(crate) fn is_transport_failure(&self) -> bool {
+        match self {
+            WorkerError::Io(_) => true,
+            WorkerError::Encode(_)
+            | WorkerError::Frame(_)
+            | WorkerError::NotGetRange(_)
+            | WorkerError::RangeLengthMismatch { .. }
+            | WorkerError::PayloadTooLarge { .. }
+            | WorkerError::Remote(_) => false,
+        }
+    }
+}
+
 /// A thin data-plane client bound to one worker address.
 ///
 /// Reuses connections from a shared [`ConnectionPool`] so warm fetches skip the
@@ -133,7 +159,7 @@ impl WorkerClient {
         // propagates immediately rather than re-asking the same peer.
         match self.exchange(&out, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, WorkerError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let bytes = self
                     .pool
@@ -180,7 +206,7 @@ impl WorkerClient {
         let output = encode_request(request_id.0, &request)?;
         match self.exchange_into(&output, dst).await {
             Ok(n) => Ok(n),
-            Err((true, WorkerError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let n = self
                     .pool
@@ -229,7 +255,7 @@ impl WorkerClient {
         let output = encode_cached_request(request_id.0, &request)?;
         match self.exchange(&output, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, WorkerError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let bytes = self
                     .pool
@@ -265,7 +291,7 @@ impl WorkerClient {
         )?;
         match self.admit_exchange(&header, body).await {
             Ok(()) => Ok(()),
-            Err((true, WorkerError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 self.pool
                     .with_deadline(
@@ -433,9 +459,7 @@ impl WriteClient {
         )?;
         match self.put_exchange(&header, body).await {
             Ok(version) => Ok(version),
-            Err((true, WorkerError::Io(_))) => {
-                // Reused pooled connection failed with an I/O error: retry
-                // once on a fresh dial.
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let version = self
                     .pool
@@ -480,7 +504,7 @@ impl WriteClient {
         )?;
         match self.put_file_exchange(&header, path, len).await {
             Ok(version) => Ok(version),
-            Err((true, WorkerError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 let version = self
                     .pool
@@ -580,7 +604,7 @@ impl WriteClient {
         )?;
         match self.delete_exchange(&frame).await {
             Ok(()) => Ok(()),
-            Err((true, WorkerError::Io(_))) => {
+            Err((true, err)) if err.is_transport_failure() => {
                 let mut stream = self.pool.fresh(&self.addr).await?;
                 self.pool
                     .with_request_deadline("worker delete_object retry", async {
@@ -978,10 +1002,21 @@ mod tests {
     }
 
     /// A mock worker that loops, serving many sequential requests on the SAME
-    /// connection, and counts accepted connections.
-    async fn looping_mock_worker(accepts: Arc<std::sync::atomic::AtomicU32>) -> String {
+    /// connection. Counts accepted connections and requests served, and lets
+    /// the caller build each reply: `respond` gets the request header, the
+    /// decoded request, and the 0-based index of this request across all
+    /// connections.
+    async fn looping_mock_worker_with<F>(
+        accepts: Arc<std::sync::atomic::AtomicU32>,
+        requests: Arc<std::sync::atomic::AtomicU32>,
+        respond: F,
+    ) -> String
+    where
+        F: Fn(&FrameHeader, &RangeRequest, u32) -> Vec<u8> + Send + Sync + 'static,
+    {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
+        let respond = Arc::new(respond);
         tokio::spawn(async move {
             loop {
                 let (mut sock, _) = match listener.accept().await {
@@ -989,6 +1024,8 @@ mod tests {
                     Err(_) => return,
                 };
                 accepts.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let requests = Arc::clone(&requests);
+                let respond = Arc::clone(&respond);
                 tokio::spawn(async move {
                     loop {
                         let mut hdr = [0u8; HEADER_LEN];
@@ -1001,16 +1038,26 @@ mod tests {
                         let mut full = hdr.to_vec();
                         full.extend_from_slice(&body);
                         let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
-                        let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
-                        let mut out = response_header_ok(0, payload.len() as u32).to_vec();
-                        out.extend_from_slice(&payload);
-                        sock.write_all(&out).await.unwrap();
+                        let n = requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        sock.write_all(&respond(&header, &req, n)).await.unwrap();
                         sock.flush().await.unwrap();
                     }
                 });
             }
         });
         addr
+    }
+
+    /// A looping mock worker that serves every request successfully.
+    async fn looping_mock_worker(accepts: Arc<std::sync::atomic::AtomicU32>) -> String {
+        let requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        looping_mock_worker_with(accepts, requests, |_header, req, _n| {
+            let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
+            let mut out = response_header_ok(0, payload.len() as u32).to_vec();
+            out.extend_from_slice(&payload);
+            out
+        })
+        .await
     }
 
     #[tokio::test]
@@ -1081,48 +1128,26 @@ mod tests {
     #[tokio::test]
     async fn remote_error_is_not_retried_on_the_same_replica() {
         use std::sync::atomic::{AtomicU32, Ordering};
-        // A worker that serves one request per connection successfully, then
-        // errors every request after that on the SAME (now reused) connection.
-        // A remote refusal must propagate on the first try, not re-dial the
+        // A worker that serves the first request successfully, then refuses
+        // every request after that on the SAME (now reused) connection. A
+        // remote refusal must propagate on the first try, not re-dial the
         // replica that just told us it doesn't have the block.
         let accepts = Arc::new(AtomicU32::new(0));
         let requests = Arc::new(AtomicU32::new(0));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let accepts_srv = Arc::clone(&accepts);
-        let requests_srv = Arc::clone(&requests);
-        tokio::spawn(async move {
-            loop {
-                let (mut sock, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                accepts_srv.fetch_add(1, Ordering::SeqCst);
-                let requests = Arc::clone(&requests_srv);
-                tokio::spawn(async move {
-                    loop {
-                        let mut hdr = [0u8; HEADER_LEN];
-                        if sock.read_exact(&mut hdr).await.is_err() {
-                            return;
-                        }
-                        let header = FrameHeader::decode(&hdr).unwrap();
-                        let mut body = vec![0u8; header.length as usize];
-                        sock.read_exact(&mut body).await.unwrap();
-                        let n = requests.fetch_add(1, Ordering::SeqCst);
-                        if n == 0 {
-                            let mut out = response_header_ok(header.request_id, 8).to_vec();
-                            out.extend_from_slice(&[7u8; 8]);
-                            sock.write_all(&out).await.unwrap();
-                        } else {
-                            sock.write_all(&encode_error(header.request_id, "block not present"))
-                                .await
-                                .unwrap();
-                        }
-                        sock.flush().await.unwrap();
-                    }
-                });
-            }
-        });
+        let addr = looping_mock_worker_with(
+            Arc::clone(&accepts),
+            Arc::clone(&requests),
+            |header, _req, n| {
+                if n == 0 {
+                    let mut out = response_header_ok(header.request_id, 8).to_vec();
+                    out.extend_from_slice(&[7u8; 8]);
+                    out
+                } else {
+                    encode_error(header.request_id, "block not present")
+                }
+            },
+        )
+        .await;
         let client = WorkerClient::new(addr);
 
         // Warm the pool with a successful fetch.
