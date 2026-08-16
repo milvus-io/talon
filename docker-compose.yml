@@ -54,6 +54,10 @@ services:
       # plane / UI work, but reading real objects needs real credentials.
       TALON_WORKER_AZURE_ACCOUNT: demo
       TALON_WORKER_AZURE_SAS: "sv=demo&sig=demo"
+      # Routable address other containers use to reach this worker's RPC port;
+      # the default (the listen address, 0.0.0.0:7001) is an unreachable
+      # wildcard bind, so the worker refuses to start without this.
+      TALON_WORKER_ADVERTISE_ADDR: "worker:7001"
     ports:
       - "8001:8001" # worker admin (metrics/health/status)
     depends_on:
@@ -132,6 +136,8 @@ services:
     environment:
       TALON_WORKER_AZURE_ACCOUNT: demo
       TALON_WORKER_AZURE_SAS: "sv=demo&sig=demo"
+      # See the default worker's TALON_WORKER_ADVERTISE_ADDR comment above.
+      TALON_WORKER_ADVERTISE_ADDR: "worker-ha:7001"
     ports:
       - "8001:8001"
     depends_on:
