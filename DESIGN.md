@@ -281,8 +281,11 @@ Two items that were previously listed here have since been measured (#273):
   capacity. Sharding the eviction *policy* is free; sharding the *budget* is
   not.
 
-The measured conclusion is to keep worker state **shared with lock-free reads**
-(`BlockIndex` is read-mostly), a per-ring buffer for LRU access marking, a
+The measured conclusion is to keep worker state **shared behind a single
+read-write lock** (`BlockIndex` is read-mostly, so presence and lookup take the
+shared side and only commit/remove/page updates take the exclusive side; a
+sharded map can replace it if the lock ever becomes hot), a per-ring buffer for
+LRU access marking, a
 **global** byte account for eviction, and a global `InFlightLoads` for miss
 dedup (a correctness requirement — per-shard dedup would refetch the same
 256 MiB block once per ring).
@@ -348,13 +351,20 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
     data-plane path.
   - **Paged virtual block:** only the hot pages within a block are materialized
     on demand. Best for point-query workloads (database lookups). Page size is
-    configurable **256KB–4MB** (per-namespace default). A 256MB block therefore
-    holds up to 1024 pages (256KB) or 64 pages (4MB). Addressed logically as
-    `block_id/page_index`.
-  - **Form is decided at LOAD time via a hint** (per-namespace or per-LOAD
-    request); e.g. checkpoint prefixes load as whole, database prefixes load as
-    paged. Dynamic promotion (paged → whole on detected sequential scan) is
-    deferred to a later version to keep the v1 state machine simple.
+    set by the worker's `l2_page_size_bytes`; a 256MB block holds up to 1024
+    pages at 256KB or 64 pages at 4MB. Addressed logically as
+    `block_id/page_index`. *As implemented*, the only constraints enforced are
+    that the page size divides `block_size` and matches `l1_page_size_bytes`
+    when L1 is enabled — 256KB–4MB is a sizing recommendation, not a validated
+    bound.
+  - **Form is chosen per worker, not per block.** *Target state:* the form is
+    decided at LOAD time via a hint (per-namespace or per-LOAD request), so
+    checkpoint prefixes load as whole and database prefixes load as paged.
+    *As implemented:* a worker is either whole-block or paged for every block it
+    caches, selected by `l2_page_size_bytes` (`0` = whole). `LoadHint` exists in
+    `talon-core` and the coordinator's load plan, but it is not carried on the
+    `Load` control message and no worker reads it. Dynamic promotion (paged →
+    whole on detected sequential scan) is likewise deferred.
   - **Page-level miss / in-flight / eviction:** for paged blocks, miss handling,
     `demand_loads_in_flight` tracking, and LRU accounting all descend to
     `(block_id, page_index)` granularity — a point query fetches only the pages
@@ -423,21 +433,3 @@ block cache, custom TCP data plane, read-only FUSE, and pluggable blob backends
 Add RF=2 and a protobuf control API once miss cost and compatibility
 requirements are demonstrated. Coordinator HA follows
 [`ADR 0001`](docs/adr/0001-management-plane-ha.md).
-
-## Follow-up skeleton changes
-
-Decisions above that diverge from the current code, to be addressed in later PRs:
-
-- Replace `CacheKey(String)` with a structured, reversible key
-  (`backend + bucket/container + object_path + offset + block_size + etag/version`).
-- Add a `BackendStore` trait in `talon-core`, distinct from `ObjectStore`
-  (cache access) — S3 / GCS / Azure Blob implementations to follow.
-- Adjust `ObjectStore` for block-level, byte-accounted access and an fd/offset
-  path for `sendfile`, rather than only returning `Bytes`.
-- Model block materialization as `enum { Whole, Paged { page_size,
-  present_bitmap } }` in the block index, decided by a LOAD-time hint; add
-  page-level miss / in-flight / eviction for paged blocks.
-- Replace control-plane `serde_json` with framed `bincode`; define a data-plane
-  frame header.
-- Extend `RendezvousPlacement` to top-K + epoch.
-- Introduce layered configuration (`CLI > env > config file > default`).

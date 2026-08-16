@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 description = "Cluster coordinator: metadata, membership, and object placement for Talon"
+# The crate ships doc generators alongside the server, so a bare
+# `cargo run -p talon-coordinator` is otherwise ambiguous. Name the server so
+# the documented command works without `--bin`.
+default-run = "talon-coordinator"
 
 [[bin]]
 name = "talon-coordinator"

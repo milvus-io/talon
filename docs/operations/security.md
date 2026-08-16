@@ -61,11 +61,15 @@ Every management response carries:
 - `X-Content-Type-Options: nosniff`
 - `X-Frame-Options: DENY` (plus the UI's `frame-ancestors 'none'` CSP)
 - `Referrer-Policy: no-referrer`
-- `Cache-Control: no-store` on protected data (the UI asset layer sets its own
-  long-lived caching for static files only)
+- `Cache-Control: no-store` on every non-public response. Only `/healthz`,
+  `/readyz`, and `/metrics` are exempt, so UI static assets are served
+  `no-store` as well: the asset handler sets a long-lived `max-age`, but the
+  security layer runs outside it and overwrites the header.
 
-Request bodies are capped at 64 KiB (the API is read-only), and each request is
-handled under the coordinator's bounded state-store timeout.
+Request bodies are capped at 64 KiB (the API is read-only). Individual
+state-store calls are bounded by `request_timeout_ms` (default 3000), so
+handlers that reach the store inherit that bound; there is no separate
+per-request timeout layer on the management router.
 
 ## Secret redaction
 
@@ -78,6 +82,11 @@ in logs, the management API, metrics, or error bodies.
 Brute-force protection against the bearer token is bounded by the constant-time
 comparison plus the request-size/timeout limits; for internet-facing
 deployments, configure connection/request rate limiting at the proxy (e.g.
-nginx `limit_req`). Audit fields for a protected request are: timestamp, method,
-path, response status, and — when `trust_forwarded_headers` is on — the
-forwarded client address. The token value is never part of an audit record.
+nginx `limit_req`).
+
+Request audit logging is **not implemented**. The coordinator emits no
+per-request record of method, path, or response status, and
+`TALON_COORDINATOR_TRUST_FORWARDED` is currently inert: the value is parsed and
+stored, but nothing reads it and no `X-Forwarded-For` header is consulted. If
+you need an audit trail today, collect it at the proxy in front of the
+management port. The token value is never logged.

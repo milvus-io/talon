@@ -52,7 +52,7 @@ cargo run -p talon-coordinator -- \
 - `--listen` is the control plane workers and clients connect to.
 - `--admin-listen` serves health, metrics, the management API, and the UI.
 
-Leave it running. You'll see it log `coordinator serving control plane`.
+Leave it running. You'll see it log `coordinator serving public control plane`.
 
 > The memory backend is development-only. It refuses to start in HA mode
 > (`ha_enabled` or `coordinator_replicas > 1`). For active-active coordinators
@@ -82,8 +82,14 @@ cargo run -p talon-worker -- \
   --node-id worker-0
 ```
 
-The worker logs `registered with coordinator`. Over on the coordinator you'll
-see `worker registered id=worker-0`.
+The worker logs `registered with coordinator`. The coordinator does not log a
+line per worker — membership is authoritative in the state store, kept fresh by
+status heartbeats — so confirm the worker arrived by asking the management API
+instead:
+
+```sh
+curl -s "http://127.0.0.1:8000/api/v1/nodes"
+```
 
 > **Placeholder credentials** are fine for exploring the control plane, the API,
 > and the UI. To read real objects you need genuine credentials for your blob

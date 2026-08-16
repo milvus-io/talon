@@ -427,7 +427,8 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("false"),
         cli: false,
         secret: false,
-        help: "Honor X-Forwarded-For for audit attribution behind a trusted proxy.",
+        help: "Reserved for X-Forwarded-For audit attribution; currently inert \
+               because request audit logging is not implemented.",
     },
     #[cfg(feature = "etcd")]
     ConfigVar {
