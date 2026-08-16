@@ -1,9 +1,10 @@
 //! Coordinator metrics, shared-state readiness, and administration HTTP API.
 //!
 //! Split into submodules along the file's three concerns: metric handles
-//! ([`metrics`]), readiness and shared-state access ([`state`]), and the admin
-//! HTTP surface that exposes them ([`admin`]). Cross-cutting helpers stay here
-//! so both siblings can reach them without widening visibility.
+//! ([`CoordinatorMetrics`]), readiness and shared-state access
+//! ([`CoordinatorObservability`]), and the admin HTTP surface that exposes them
+//! ([`serve_admin`]). Cross-cutting helpers stay here so both siblings can reach
+//! them without widening visibility.
 
 mod admin;
 mod metrics;
