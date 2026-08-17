@@ -8,6 +8,7 @@ pub mod block_store;
 pub mod capacity;
 mod data_error;
 pub mod eviction;
+mod fd_cache;
 pub mod flusher;
 pub mod index;
 pub mod loader;
@@ -39,7 +40,9 @@ pub use miss::{touched_pages, Admission, InFlightGuard, InFlightLoads, LoadKey};
 pub use observability::{serve_admin, WorkerMetrics, WorkerObservability, WorkerReadiness};
 pub use paged_store::PagedBlockStore;
 pub use runtime::{ServeOutcome, WorkerRuntime};
-pub use sendfile::{send_file_range, send_header_and_file_range, DEFAULT_CHUNK};
+pub use sendfile::{
+    send_file_range, send_header_and_file_range, send_header_and_file_ranges, DEFAULT_CHUNK,
+};
 pub use splice::{ingest_put, splice_to_file};
 pub use staging::{Checksum, Stager};
 pub use write_cache::{FlushItem, WriteCache};

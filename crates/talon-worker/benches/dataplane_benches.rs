@@ -185,6 +185,23 @@ fn spawn_tokio_server(runtime: Arc<WorkerRuntime>, rt: &tokio::runtime::Runtime)
                         .await
                         .unwrap();
                     }
+                    ServeOutcome::SendfileMany(handles) => {
+                        let total: u64 = handles.iter().map(|x| x.len).sum();
+                        let h = response_header_ok(0, total as u32);
+                        sock.write_all(&h).await.unwrap();
+                        sock.flush().await.unwrap();
+                        let std_sock = sock.into_std().unwrap();
+                        std_sock.set_nonblocking(false).unwrap();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            for x in &handles {
+                                send_file_range(&std_sock, &x.fd, x.offset, x.len, DEFAULT_CHUNK)
+                                    .unwrap();
+                            }
+                            std_sock
+                        })
+                        .await
+                        .unwrap();
+                    }
                     ServeOutcome::Bytes(b) => {
                         let h = response_header_ok(0, b.len() as u32);
                         sock.write_all(&h).await.unwrap();

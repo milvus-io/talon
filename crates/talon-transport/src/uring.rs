@@ -116,6 +116,20 @@ where
     Ok(buf)
 }
 
+/// Write a whole buffer to a monoio stream, returning the buffer.
+///
+/// Generic over any `IoBuf`, so callers holding a refcounted `bytes::Bytes`
+/// can hand it straight to the ring instead of copying it into a fresh `Vec`.
+pub async fn write_all_buf<S, B>(stream: &mut S, buf: B) -> io::Result<B>
+where
+    S: AsyncWriteRent,
+    B: monoio::buf::IoBuf,
+{
+    let (res, buf) = stream.write_all(buf).await;
+    res?;
+    Ok(buf)
+}
+
 /// Capacity of one refill read. Sized so a burst of pipelined range requests
 /// (a 16-byte header plus a small bincode body each) lands in a single `recv`.
 const REFILL_CAPACITY: usize = 64 * 1024;

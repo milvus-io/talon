@@ -221,6 +221,30 @@ pub async fn handle_conn(
                     }
                 }
             }
+            Ok(ServeOutcome::SendfileMany(handles)) => {
+                // Cross-page zero-copy: one `sendfile` per page file, all on
+                // the blocking pool. The advertised length is the sum of the
+                // segments, so a short send can never desync the client
+                // silently — it surfaces as an error and drops the connection.
+                let len: u64 = handles.iter().map(|h| h.len).sum();
+                let hdr = data::response_header_ok(h.request_id, len as u32);
+                stream.write_all(&hdr).await?;
+                stream.flush().await?;
+                match sendfile_many_payload(stream, handles).await {
+                    Ok(returned) => {
+                        stream = returned;
+                        observability
+                            .metrics()
+                            .record_request_success(len, request_started.elapsed());
+                    }
+                    Err(error) => {
+                        observability
+                            .metrics()
+                            .record_request_error(request_started.elapsed());
+                        return Err(error);
+                    }
+                }
+            }
             Ok(ServeOutcome::Bytes(bytes)) => {
                 let hdr = data::response_header_ok(h.request_id, bytes.len() as u32);
                 stream.write_all(&hdr).await?;
@@ -662,6 +686,53 @@ async fn handle_delete(
 ///
 /// [`into_std`]: tokio::net::TcpStream::into_std
 /// [`spawn_blocking`]: tokio::task::spawn_blocking
+/// Send N page segments with one `sendfile` each, in order.
+///
+/// The cross-page analogue of [`sendfile_payload`]: pages of a paged block live
+/// in separate files, so a spanning read is N contiguous runs rather than one.
+/// N `sendfile` calls still keep the payload out of userspace.
+async fn sendfile_many_payload(
+    stream: TcpStream,
+    handles: Vec<talon_core::BlockHandle>,
+) -> anyhow::Result<TcpStream> {
+    let expected: u64 = handles.iter().map(|h| h.len).sum();
+    let std_stream = stream.into_std()?;
+    std_stream.set_nonblocking(false)?;
+    let (std_stream, result) = tokio::task::spawn_blocking(move || {
+        let mut sent_total = 0u64;
+        let mut res = Ok(());
+        for h in &handles {
+            if h.len == 0 {
+                continue;
+            }
+            match send_file_range(&std_stream, &h.fd, h.offset, h.len, DEFAULT_CHUNK) {
+                Ok(sent) => {
+                    sent_total += sent;
+                    if sent != h.len {
+                        // EOF inside this segment. Stop rather than letting a
+                        // later page slide into the gap and serve corrupt bytes.
+                        break;
+                    }
+                }
+                Err(e) => {
+                    res = Err(e);
+                    break;
+                }
+            }
+        }
+        (std_stream, res.map(|()| sent_total))
+    })
+    .await?;
+    // Restore non-blocking mode before any early return: tokio refuses to
+    // register a blocking fd, so bailing first would poison the socket.
+    std_stream.set_nonblocking(true)?;
+    let sent = result?;
+    if sent != expected {
+        anyhow::bail!("sendfile short read: sent {sent} of {expected} bytes; page file truncated");
+    }
+    Ok(TcpStream::from_std(std_stream)?)
+}
+
 async fn sendfile_payload(
     stream: TcpStream,
     handle: talon_core::BlockHandle,
