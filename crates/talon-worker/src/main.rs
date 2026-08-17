@@ -174,6 +174,7 @@ impl Args {
             l1_capacity_bytes: None,
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
+            paged_miss_run_concurrency: None,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -363,6 +364,7 @@ async fn main() -> anyhow::Result<()> {
         l1_capacity_bytes = cfg.l1_capacity_bytes,
         l1_page_size_bytes = cfg.l1_page_size_bytes,
         l2_page_size_bytes = cfg.l2_page_size_bytes,
+        paged_miss_run_concurrency = cfg.paged_miss_run_concurrency,
         azure_account = ?cfg.azure_account,
         azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
@@ -589,7 +591,8 @@ async fn main() -> anyhow::Result<()> {
         cfg.l1_page_size_bytes,
         observability.metrics().clone(),
     )
-    .with_backend_kind(configured_backend);
+    .with_backend_kind(configured_backend)
+    .with_paged_miss_run_concurrency(cfg.paged_miss_run_concurrency);
     if let Some(paged) = paged {
         runtime = runtime.with_paged_store(paged);
     }

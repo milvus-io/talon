@@ -394,6 +394,14 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `paged_miss_run_concurrency`
+
+Maximum independent paged-miss runs fetched concurrently per read.
+
+- **Environment variable:** `TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY`
+- **Default:** `8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `backend`
 
 Object-store backend: azure (default), s3, or gcs.
