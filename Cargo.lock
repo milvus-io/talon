@@ -2782,6 +2782,7 @@ dependencies = [
  "bytes",
  "clap",
  "divan",
+ "futures",
  "libc",
  "monoio",
  "prost",
