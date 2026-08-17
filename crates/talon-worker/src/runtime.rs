@@ -5,6 +5,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use futures::stream::FuturesUnordered;
+use futures::StreamExt;
 use talon_core::{
     Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId,
     ObjectStore, PageIndex, Version,
@@ -715,7 +717,7 @@ impl WorkerRuntime {
     }
 
     /// Serve a block-relative range in paged mode: L1, then per-page L2 files,
-    /// then a per-page origin fetch for whatever is still absent.
+    /// then coalesced origin fetches for consecutive absent pages.
     ///
     /// Unlike the whole-block path this never materializes the full block: only
     /// the pages the read actually touches are fetched and committed, so a point
@@ -753,9 +755,94 @@ impl WorkerRuntime {
         // Idempotent: a concurrent reader's entry (and its bitmap) is preserved.
         self.index.init_paged(block.clone(), page_size, block_len);
 
+        let pages = touched_pages(offset, len, page_size);
+        let mut page_slots: Vec<Option<(bytes::Bytes, bool)>> = vec![None; pages.len()];
+        let mut followers = Vec::new();
+        let mut leader_runs = Vec::new();
+        let mut leader_run = Vec::new();
+
+        // Probe every page first. Consecutive misses for which this request owns
+        // the page-level in-flight markers form one backend range fetch. A hit
+        // or a page another request is already loading breaks the run: fetching
+        // across either would redownload resident/in-flight data.
+        for (slot, page) in pages.iter().copied().enumerate() {
+            if let Some(bytes) = self.cached_page(block, page).await? {
+                if !leader_run.is_empty() {
+                    leader_runs.push(std::mem::take(&mut leader_run));
+                }
+                page_slots[slot] = Some((bytes, true));
+                continue;
+            }
+
+            let key = LoadKey::Page(block.clone(), page);
+            if let Some(guard) = self.inflight.admit_owned(key) {
+                leader_run.push((slot, page, guard));
+            } else {
+                if !leader_run.is_empty() {
+                    leader_runs.push(std::mem::take(&mut leader_run));
+                }
+                followers.push((slot, page));
+            }
+        }
+        if !leader_run.is_empty() {
+            leader_runs.push(leader_run);
+        }
+
+        // Each run owns distinct page-level guards, so its backend fetch and
+        // page commits can proceed independently. Keep a run's guards alive
+        // until its commits complete, then release them so same-page followers
+        // can use the cache. Drain all started runs even after an error: a
+        // dropped future can otherwise release its guards while an already
+        // spawned blocking page write is still finishing.
+        let mut pending = FuturesUnordered::new();
+        for leader_run in leader_runs {
+            pending.push(async move {
+                let run_pages: Vec<_> = leader_run.iter().map(|(_, page, _)| *page).collect();
+                let fetched = self
+                    .fetch_and_commit_pages(request, block, &run_pages, block_len)
+                    .await;
+                (leader_run, fetched)
+            });
+        }
+
+        let mut first_error = None;
+        while let Some((leader_run, result)) = pending.next().await {
+            match result {
+                Ok(fetched) => {
+                    debug_assert_eq!(leader_run.len(), fetched.len());
+                    for ((slot, _, _), bytes) in leader_run.iter().zip(fetched) {
+                        page_slots[*slot] = Some((bytes, false));
+                    }
+                }
+                Err(error) if first_error.is_none() => first_error = Some(error),
+                Err(_) => {}
+            }
+            drop(leader_run);
+        }
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+
+        // A follower never joins the leader's request, but it still preserves
+        // the existing same-page de-duplication behavior. If its leader failed,
+        // retry that page directly, just as the prior per-page path did.
+        for (slot, page) in followers {
+            let key = LoadKey::Page(block.clone(), page);
+            self.inflight.wait(&key).await;
+            let entry = match self.cached_page(block, page).await? {
+                Some(bytes) => (bytes, true),
+                None => (
+                    self.fetch_and_commit_page(request, block, page, block_len)
+                        .await?,
+                    false,
+                ),
+            };
+            page_slots[slot] = Some(entry);
+        }
+
         let mut out = bytes::BytesMut::with_capacity(len as usize);
         let mut hit_all = true;
-        for page in touched_pages(offset, len, page_size) {
+        for (slot, page) in pages.into_iter().enumerate() {
             let page_start = u64::from(page.0) * u64::from(page_size);
             let page_bytes_len = talon_core::page_len(block_len, page_size, page);
             // Intersect the requested window with this page's span.
@@ -764,7 +851,9 @@ impl WorkerRuntime {
             if to <= from {
                 continue;
             }
-            let (page_bytes, hit) = self.page_bytes(request, block, page, block_len).await?;
+            let (page_bytes, hit) = page_slots[slot]
+                .take()
+                .expect("every touched page was resolved before stitching");
             hit_all &= hit;
             out.extend_from_slice(&slice(&page_bytes, from - page_start, to - from)?);
         }
@@ -774,47 +863,6 @@ impl WorkerRuntime {
             self.metrics.record_cache_miss();
         }
         Ok(out.freeze())
-    }
-
-    /// Return one page's bytes, and whether it was served from cache.
-    ///
-    /// Tries L1, then the on-disk page file, then a deduplicated origin fetch of
-    /// just that page. Concurrent misses for the same `(block, page)` collapse
-    /// to a single backend request via [`LoadKey::Page`], mirroring the
-    /// whole-block leader/follower protocol (issues #113, #162).
-    async fn page_bytes(
-        &self,
-        request: &RangeRequest,
-        block: &BlockId,
-        page: PageIndex,
-        block_len: u64,
-    ) -> anyhow::Result<(bytes::Bytes, bool)> {
-        if let Some(bytes) = self.cached_page(block, page).await? {
-            return Ok((bytes, true));
-        }
-        let key = LoadKey::Page(block.clone(), page);
-        match self.inflight.admit_owned(key.clone()) {
-            Some(guard) => {
-                let result = self
-                    .fetch_and_commit_page(request, block, page, block_len)
-                    .await;
-                drop(guard);
-                Ok((result?, false))
-            }
-            None => {
-                // A peer is fetching this exact page; wait and serve from cache.
-                self.inflight.wait(&key).await;
-                if let Some(bytes) = self.cached_page(block, page).await? {
-                    return Ok((bytes, true));
-                }
-                // The leader's load failed; fetch it ourselves rather than
-                // looping on admission, which could wait unboundedly.
-                let bytes = self
-                    .fetch_and_commit_page(request, block, page, block_len)
-                    .await?;
-                Ok((bytes, false))
-            }
-        }
     }
 
     /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.
@@ -870,10 +918,46 @@ impl WorkerRuntime {
         page: PageIndex,
         block_len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
+        let mut pages = self
+            .fetch_and_commit_pages(request, block, &[page], block_len)
+            .await?;
+        Ok(pages
+            .pop()
+            .expect("one requested page yields one fetched page"))
+    }
+
+    /// Fetch one consecutive run of pages in a single backend range request and
+    /// commit each returned page independently to the paged cache.
+    async fn fetch_and_commit_pages(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        pages: &[PageIndex],
+        block_len: u64,
+    ) -> anyhow::Result<Vec<bytes::Bytes>> {
+        debug_assert!(!pages.is_empty());
+        debug_assert!(
+            pages
+                .windows(2)
+                .all(|pair| pair[1].0 == pair[0].0.saturating_add(1)),
+            "page fetch runs must be consecutive"
+        );
         let page_size = self.paged_page_size().expect("paged store");
-        let page_start = u64::from(page.0) * u64::from(page_size);
-        let want = talon_core::page_len(block_len, page_size, page);
-        tracing::info!(block = %block, page = page.0, "MISS -> backend page fetch");
+        let first = pages[0];
+        let last = *pages.last().expect("non-empty page run");
+        let page_start = u64::from(first.0) * u64::from(page_size);
+        let last_start = u64::from(last.0) * u64::from(page_size);
+        let want = last_start
+            .checked_add(talon_core::page_len(block_len, page_size, last))
+            .and_then(|end| end.checked_sub(page_start))
+            .ok_or_else(|| anyhow::anyhow!("paged backend range overflows u64"))?;
+        tracing::info!(
+            block = %block,
+            first_page = first.0,
+            last_page = last.0,
+            bytes = want,
+            "MISS -> backend page fetch"
+        );
         let started = Instant::now();
         // Same If-Match precondition as the whole-block path: an overwrite
         // between version resolution and this GET must be rejected rather than
@@ -899,6 +983,43 @@ impl WorkerRuntime {
             }
         };
 
+        let expected = usize::try_from(want)
+            .map_err(|_| anyhow::anyhow!("paged backend range is too large for this platform"))?;
+        if bytes.len() != expected {
+            anyhow::bail!(
+                "backend returned {} bytes for paged range of {} bytes",
+                bytes.len(),
+                want
+            );
+        }
+
+        let mut committed = Vec::with_capacity(pages.len());
+        let mut cursor = 0_usize;
+        for page in pages {
+            let page_len = usize::try_from(talon_core::page_len(block_len, page_size, *page))
+                .map_err(|_| anyhow::anyhow!("page length is too large for this platform"))?;
+            let end = cursor
+                .checked_add(page_len)
+                .ok_or_else(|| anyhow::anyhow!("paged response offset overflows usize"))?;
+            let page_bytes = bytes.slice(cursor..end);
+            self.commit_fetched_page(block, *page, block_len, page_bytes.clone())
+                .await?;
+            committed.push(page_bytes);
+            cursor = end;
+        }
+        debug_assert_eq!(cursor, bytes.len());
+        Ok(committed)
+    }
+
+    /// Commit one fetched page and update its L1/L2 residency bookkeeping.
+    async fn commit_fetched_page(
+        &self,
+        block: &BlockId,
+        page: PageIndex,
+        block_len: u64,
+        bytes: bytes::Bytes,
+    ) -> anyhow::Result<()> {
+        let page_size = self.paged_page_size().expect("paged store");
         let paged = self.paged.as_ref().expect("paged store");
         // Record the block's identity once so a restart can rebuild its index
         // entry from the page files on disk.
@@ -923,10 +1044,10 @@ impl WorkerRuntime {
             self.refresh_l1_metrics();
         }
         if self.l1.is_enabled() {
-            self.admit_l1_page(block, page, bytes.clone());
+            self.admit_l1_page(block, page, bytes);
         }
-        tracing::info!(block = %block, page = page.0, bytes = bytes.len(), "committed page");
-        Ok(bytes)
+        tracing::info!(block = %block, page = page.0, "committed page");
+        Ok(())
     }
 
     /// Admit one page into L1, recording admissions and evictions.
@@ -3360,6 +3481,7 @@ mod tests {
     struct PagedRampBackend {
         object_len: u64,
         ranges: Mutex<Vec<(u64, u64)>>,
+        fetch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     }
 
     impl PagedRampBackend {
@@ -3367,6 +3489,7 @@ mod tests {
             Self {
                 object_len,
                 ranges: Mutex::new(Vec::new()),
+                fetch_barrier: Mutex::new(None),
             }
         }
 
@@ -3377,12 +3500,25 @@ mod tests {
         fn fetched_bytes(&self) -> u64 {
             self.ranges.lock().unwrap().iter().map(|(_, l)| l).sum()
         }
+
+        /// Make the next two fetches wait with the caller at a three-party
+        /// barrier. This lets tests prove two independent page runs are polled
+        /// concurrently, rather than merely producing the same final bytes.
+        fn pause_two_fetches(&self) -> Arc<tokio::sync::Barrier> {
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+            *self.fetch_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
+            barrier
+        }
     }
 
     #[async_trait]
     impl BackendStore for PagedRampBackend {
         async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
             self.ranges.lock().unwrap().push((offset, len));
+            let barrier = self.fetch_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
             let end = (offset + len).min(self.object_len);
             let n = end.saturating_sub(offset) as usize;
             Ok(Bytes::from(
@@ -3486,7 +3622,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_read_spanning_pages_stitches_them_and_fetches_only_those_pages() {
+    async fn a_read_spanning_pages_stitches_them_with_one_coalesced_fetch() {
         let root = tmp_root();
         let backend = Arc::new(PagedRampBackend::new(4096));
         let runtime = paged_runtime(
@@ -3506,10 +3642,92 @@ mod tests {
             .unwrap();
 
         assert_eq!(got, expected(64 + 32, 128));
-        let mut ranges = backend.ranges();
-        ranges.sort();
-        assert_eq!(ranges, vec![(64, 64), (128, 64), (192, 64)]);
+        assert_eq!(backend.ranges(), vec![(64, 192)]);
         assert_eq!(runtime.resident_bytes(), 3 * 64);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_cached_page_breaks_coalesced_miss_runs() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Warm the middle page first. The two misses around it must remain
+        // separate so this request does not redownload the resident page.
+        runtime.serve_range(&req(&object, 128, 1)).await.unwrap();
+        let fetches_before = backend.ranges().len();
+        let got = runtime.serve_range(&req(&object, 64, 192)).await.unwrap();
+
+        assert_eq!(got, expected(64, 192));
+        let mut new_ranges = backend.ranges()[fetches_before..].to_vec();
+        new_ranges.sort();
+        assert_eq!(new_ranges, vec![(64, 64), (192, 64)]);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn independent_coalesced_runs_fetch_and_commit_concurrently() {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = Arc::new(paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        ));
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Page 1 is already resident, splitting the upcoming misses for pages
+        // 0 and 2 into separate leader runs.
+        runtime.serve_range(&req(&object, 64, 1)).await.unwrap();
+        let barrier = backend.pause_two_fetches();
+        let read_runtime = Arc::clone(&runtime);
+        let read_object = object.clone();
+        let read = tokio::spawn(async move {
+            read_runtime
+                .serve_range(&req(&read_object, 0, 3 * 64))
+                .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), barrier.wait())
+            .await
+            .expect("the two independent leader runs should start together");
+        assert_eq!(read.await.unwrap().unwrap(), expected(0, 3 * 64));
+        assert_eq!(runtime.inflight_loads(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn a_coalesced_run_ends_at_the_short_final_page() {
+        let root = tmp_root();
+        // The final page has only 22 bytes (150-byte object, 64-byte pages).
+        let backend = Arc::new(PagedRampBackend::new(150));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "short-obj");
+
+        let got = runtime.serve_range(&req(&object, 0, 150)).await.unwrap();
+
+        assert_eq!(got, expected(0, 150));
+        assert_eq!(backend.ranges(), vec![(0, 150)]);
+        assert_eq!(runtime.resident_bytes(), 150);
         std::fs::remove_dir_all(root).ok();
     }
 
