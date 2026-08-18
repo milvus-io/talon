@@ -65,5 +65,9 @@ tokio = { workspace = true, features = ["test-util"] }
 name = "dataplane_benches"
 harness = false
 
+[[bench]]
+name = "rate_limit_benches"
+harness = false
+
 [build-dependencies]
 prost-build.workspace = true

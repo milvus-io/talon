@@ -13,7 +13,7 @@
 //! into the cache-miss path).
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
 use talon_core::{Gcra, MetricLimits, RateDecision, RateLimitPolicy, RateMetric, TenantId};
@@ -31,6 +31,27 @@ impl TenantCells {
             read_iops: limits.read_iops.map(Gcra::new),
             read_throughput: limits.read_throughput.map(Gcra::new),
         }
+    }
+
+    /// Charge one read of `read_bytes` against this tenant's cells.
+    fn charge(&self, read_bytes: u64, now_nanos: u64) -> Result<(), Throttled> {
+        if let Some(cell) = &self.read_iops {
+            if let RateDecision::Throttled { retry_after } = cell.charge_at(1, now_nanos) {
+                return Err(Throttled {
+                    metric: RateMetric::ReadIops,
+                    retry_after,
+                });
+            }
+        }
+        if let Some(cell) = &self.read_throughput {
+            if let RateDecision::Throttled { retry_after } = cell.charge_at(read_bytes, now_nanos) {
+                return Err(Throttled {
+                    metric: RateMetric::ReadThroughput,
+                    retry_after,
+                });
+            }
+        }
+        Ok(())
     }
 }
 
@@ -51,7 +72,7 @@ pub struct TenantRateLimiter {
     origin: Instant,
     /// Lazily-created per-tenant cells. A read lock covers the common warm
     /// lookup; the write lock is taken only the first time a tenant is seen.
-    cells: RwLock<HashMap<TenantId, Arc<TenantCells>>>,
+    cells: RwLock<HashMap<TenantId, TenantCells>>,
 }
 
 impl TenantRateLimiter {
@@ -77,6 +98,10 @@ impl TenantRateLimiter {
     /// Charge one read request expected to return `read_bytes` bytes against
     /// `tenant`, returning [`Throttled`] if it would exceed a configured limit.
     pub fn admit(&self, tenant: &TenantId, read_bytes: u64) -> Result<(), Throttled> {
+        // Skip the clock read entirely when the feature is off.
+        if !self.policy.enabled {
+            return Ok(());
+        }
         self.admit_at(tenant, read_bytes, self.now_nanos())
     }
 
@@ -94,38 +119,18 @@ impl TenantRateLimiter {
         if !self.policy.enabled {
             return Ok(());
         }
-        let cells = self.cells_for(tenant);
-        if let Some(cell) = &cells.read_iops {
-            if let RateDecision::Throttled { retry_after } = cell.charge_at(1, now_nanos) {
-                return Err(Throttled {
-                    metric: RateMetric::ReadIops,
-                    retry_after,
-                });
-            }
-        }
-        if let Some(cell) = &cells.read_throughput {
-            if let RateDecision::Throttled { retry_after } = cell.charge_at(read_bytes, now_nanos) {
-                return Err(Throttled {
-                    metric: RateMetric::ReadThroughput,
-                    retry_after,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    fn cells_for(&self, tenant: &TenantId) -> Arc<TenantCells> {
+        // Fast path: a warm tenant is charged in place under a shared read lock,
+        // so admits for different tenants never block each other and the
+        // same-tenant case is a single atomic CAS with no allocation or clone.
         if let Some(cells) = self.cells.read().unwrap().get(tenant) {
-            return Arc::clone(cells);
+            return cells.charge(read_bytes, now_nanos);
         }
-        let mut cells = self.cells.write().unwrap();
-        // Re-check: another task may have inserted between the two locks.
-        if let Some(existing) = cells.get(tenant) {
-            return Arc::clone(existing);
-        }
-        let created = Arc::new(TenantCells::from_limits(&self.policy.limits_for(tenant)));
-        cells.insert(tenant.clone(), Arc::clone(&created));
-        created
+        // Slow path (first time this tenant is seen): insert, then charge. The
+        // brief write lock is paid once per tenant, not per request.
+        let mut map = self.cells.write().unwrap();
+        map.entry(tenant.clone())
+            .or_insert_with(|| TenantCells::from_limits(&self.policy.limits_for(tenant)))
+            .charge(read_bytes, now_nanos)
     }
 
     fn now_nanos(&self) -> u64 {
@@ -229,5 +234,35 @@ mod tests {
         // ...the next byte is throttled on throughput, not iops.
         let throttled = limiter.admit_at(&tenant, 1, 0).unwrap_err();
         assert_eq!(throttled.metric, RateMetric::ReadThroughput);
+    }
+
+    #[test]
+    fn caps_the_sustained_rate_under_overload() {
+        // Capability: at read_iops rate 1000/s (burst 1000), offer 10x the rate
+        // across a simulated second and confirm the admitted count is the burst
+        // plus one second of the sustained rate (~2000), not the 10_000 offered.
+        let limiter = TenantRateLimiter::new(iops_policy(1000, 1.0));
+        let tenant = TenantId::named("a");
+        let offered = 10_000u64;
+        let mut admitted = 0u64;
+        // 1000 steps of 1ms across ~1s; 10 requests offered per step.
+        for step in 0..1000u64 {
+            let now = step * 1_000_000; // ns
+            for _ in 0..10 {
+                if limiter.admit_at(&tenant, 0, now).is_ok() {
+                    admitted += 1;
+                }
+            }
+        }
+        // The rate is capped far below the offered load...
+        assert!(
+            admitted < offered / 2,
+            "admitted {admitted} of {offered} offered"
+        );
+        // ...and close to burst (1000) + one second of rate (1000) = ~2000.
+        assert!(
+            (1800..=2200).contains(&admitted),
+            "admitted {admitted}, expected ~2000 (burst + 1s of rate)"
+        );
     }
 }
