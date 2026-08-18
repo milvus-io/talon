@@ -39,6 +39,10 @@ const MAX_LIST_PAGES: usize = 20;
 /// Objects requested per backend page.
 const LIST_PAGE_SIZE: u32 = 1000;
 
+/// Default maximum number of independent miss runs one paged read may poll at
+/// once. This bounds a heavily fragmented block's backend and page-commit I/O.
+const DEFAULT_PAGED_MISS_RUN_CONCURRENCY: usize = 8;
+
 /// A per-object resolved version with the instant it was resolved.
 struct CachedVersion {
     version: Version,
@@ -94,6 +98,10 @@ pub struct WorkerRuntime {
     /// Maximum resident cache bytes before eviction reclaims the coldest blocks.
     /// `0` disables capacity enforcement (unbounded — tests/dev only).
     capacity_bytes: u64,
+    /// Maximum independent paged miss runs a single read may fetch and commit
+    /// concurrently. This is a per-read bound; backend-wide connection and I/O
+    /// scheduling remains owned by the shared client/runtime.
+    paged_miss_run_concurrency: usize,
     /// Short-TTL cache of resolved object versions, so a warm read does not pay
     /// a backend `HEAD` per request (issue #163).
     version_cache: Mutex<HashMap<ObjectId, CachedVersion>>,
@@ -169,6 +177,7 @@ impl WorkerRuntime {
             metrics,
             lru,
             capacity_bytes,
+            paged_miss_run_concurrency: DEFAULT_PAGED_MISS_RUN_CONCURRENCY,
             version_cache: Mutex::new(HashMap::new()),
             version_ttl: DEFAULT_VERSION_TTL,
         }
@@ -183,6 +192,15 @@ impl WorkerRuntime {
     /// pages, leaving the block's other pages intact.
     pub fn with_paged_store(mut self, paged: PagedBlockStore) -> Self {
         self.paged = Some(paged);
+        self
+    }
+
+    /// Bound independent page-miss runs polled concurrently by one read.
+    ///
+    /// Production configuration rejects zero; clamping here keeps compact unit
+    /// test runtimes safe when they construct a runtime directly.
+    pub fn with_paged_miss_run_concurrency(mut self, concurrency: usize) -> Self {
+        self.paged_miss_run_concurrency = concurrency.max(1);
         self
     }
 
@@ -830,19 +848,26 @@ impl WorkerRuntime {
         // can use the cache. Drain all started runs even after an error: a
         // dropped future can otherwise release its guards while an already
         // spawned blocking page write is still finishing.
+        let mut leader_runs = leader_runs.into_iter();
         let mut pending = FuturesUnordered::new();
-        for leader_run in leader_runs {
-            pending.push(async move {
-                let run_pages: Vec<_> = leader_run.iter().map(|(_, page, _)| *page).collect();
-                let fetched = self
-                    .fetch_and_commit_pages(request, block, &run_pages, block_len)
-                    .await;
-                (leader_run, fetched)
-            });
-        }
-
         let mut first_error = None;
-        while let Some((leader_run, result)) = pending.next().await {
+        loop {
+            while pending.len() < self.paged_miss_run_concurrency {
+                let Some(leader_run) = leader_runs.next() else {
+                    break;
+                };
+                pending.push(async move {
+                    let run_pages: Vec<_> = leader_run.iter().map(|(_, page, _)| *page).collect();
+                    let fetched = self
+                        .fetch_and_commit_pages(request, block, &run_pages, block_len)
+                        .await;
+                    (leader_run, fetched)
+                });
+            }
+
+            let Some((leader_run, result)) = pending.next().await else {
+                break;
+            };
             match result {
                 Ok(fetched) => {
                     debug_assert_eq!(leader_run.len(), fetched.len());
@@ -3569,6 +3594,9 @@ mod tests {
         object_len: u64,
         ranges: Mutex<Vec<(u64, u64)>>,
         fetch_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
+        fetch_delay: Duration,
+        active_fetches: AtomicUsize,
+        peak_fetches: AtomicUsize,
     }
 
     impl PagedRampBackend {
@@ -3577,7 +3605,15 @@ mod tests {
                 object_len,
                 ranges: Mutex::new(Vec::new()),
                 fetch_barrier: Mutex::new(None),
+                fetch_delay: Duration::ZERO,
+                active_fetches: AtomicUsize::new(0),
+                peak_fetches: AtomicUsize::new(0),
             }
+        }
+
+        fn with_fetch_delay(mut self, delay: Duration) -> Self {
+            self.fetch_delay = delay;
+            self
         }
 
         fn ranges(&self) -> Vec<(u64, u64)> {
@@ -3586,6 +3622,14 @@ mod tests {
 
         fn fetched_bytes(&self) -> u64 {
             self.ranges.lock().unwrap().iter().map(|(_, l)| l).sum()
+        }
+
+        fn reset_peak_fetches(&self) {
+            self.peak_fetches.store(0, Ordering::SeqCst);
+        }
+
+        fn peak_fetches(&self) -> usize {
+            self.peak_fetches.load(Ordering::SeqCst)
         }
 
         /// Make the next two fetches wait with the caller at a three-party
@@ -3606,6 +3650,10 @@ mod tests {
             if let Some(barrier) = barrier {
                 barrier.wait().await;
             }
+            let active = self.active_fetches.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak_fetches.fetch_max(active, Ordering::SeqCst);
+            tokio::time::sleep(self.fetch_delay).await;
+            self.active_fetches.fetch_sub(1, Ordering::SeqCst);
             let end = (offset + len).min(self.object_len);
             let n = end.saturating_sub(offset) as usize;
             Ok(Bytes::from(
@@ -3791,6 +3839,40 @@ mod tests {
             .await
             .expect("the two independent leader runs should start together");
         assert_eq!(read.await.unwrap().unwrap(), expected(0, 3 * 64));
+        assert_eq!(runtime.inflight_loads(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn paged_miss_run_concurrency_caps_peak_backend_fetches() {
+        let root = tmp_root();
+        let backend =
+            Arc::new(PagedRampBackend::new(4096).with_fetch_delay(Duration::from_millis(25)));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            0,
+            WorkerMetrics::new(1024),
+        )
+        .with_paged_miss_run_concurrency(2);
+        let object = ObjectId::new(Backend::Azure, "bucket", "fragmented-obj");
+
+        // Warm every other page. The seven-page read below therefore has four
+        // one-page leader runs (0, 2, 4, 6), enough to exercise the bound.
+        for page in [1, 3, 5] {
+            runtime
+                .serve_range(&req(&object, page * 64, 1))
+                .await
+                .unwrap();
+        }
+        backend.reset_peak_fetches();
+
+        let got = runtime.serve_range(&req(&object, 0, 7 * 64)).await.unwrap();
+
+        assert_eq!(got, expected(0, 7 * 64));
+        assert_eq!(backend.peak_fetches(), 2);
         assert_eq!(runtime.inflight_loads(), 0);
         std::fs::remove_dir_all(root).ok();
     }

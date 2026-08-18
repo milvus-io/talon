@@ -141,6 +141,10 @@ pub struct WorkerConfig {
     /// where a miss fetches and stores only the pages a read touches — far less
     /// backend traffic and disk for point-query workloads.
     pub l2_page_size_bytes: u64,
+    /// Maximum independent paged-miss runs one read may fetch and commit at
+    /// once. This bounds a fragmented block's fan-out to the backend and local
+    /// cache while still overlapping unrelated misses.
+    pub paged_miss_run_concurrency: usize,
     /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
     /// per-backend endpoint/credential fields below apply to the selected one.
     pub backend: Option<String>,
@@ -269,6 +273,7 @@ impl Default for WorkerConfig {
             l1_capacity_bytes: 0,
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
+            paged_miss_run_concurrency: 8,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -329,6 +334,8 @@ pub struct WorkerConfigPatch {
     pub l1_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::l2_page_size_bytes`].
     pub l2_page_size_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
+    pub paged_miss_run_concurrency: Option<usize>,
     /// Override for [`WorkerConfig::backend`].
     pub backend: Option<String>,
     /// Override for [`WorkerConfig::azure_account`].
@@ -384,6 +391,9 @@ impl Patch for WorkerConfigPatch {
             l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
             l1_page_size_bytes: self.l1_page_size_bytes.or(base.l1_page_size_bytes),
             l2_page_size_bytes: self.l2_page_size_bytes.or(base.l2_page_size_bytes),
+            paged_miss_run_concurrency: self
+                .paged_miss_run_concurrency
+                .or(base.paged_miss_run_concurrency),
             backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
@@ -568,6 +578,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: false,
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY",
+        key: "paged_miss_run_concurrency",
+        default: Some("8"),
+        cli: false,
+        secret: false,
+        help: "Maximum independent paged-miss runs fetched concurrently per read.",
     },
     ConfigVar {
         env: "TALON_WORKER_BACKEND",
@@ -759,6 +777,7 @@ pub(crate) mod worker_env {
     pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
+    pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
     pub const BACKEND: &str = "TALON_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
@@ -862,6 +881,9 @@ impl WorkerConfigPatch {
             l2_page_size_bytes: get(worker_env::L2_PAGE_SIZE_BYTES)
                 .map(|v| parse_u64(v, worker_env::L2_PAGE_SIZE_BYTES))
                 .transpose()?,
+            paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
+                .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
             backend: get(worker_env::BACKEND),
@@ -949,6 +971,9 @@ impl WorkerConfig {
             l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
             l1_page_size_bytes: merged.l1_page_size_bytes.unwrap_or(d.l1_page_size_bytes),
             l2_page_size_bytes: merged.l2_page_size_bytes.unwrap_or(d.l2_page_size_bytes),
+            paged_miss_run_concurrency: merged
+                .paged_miss_run_concurrency
+                .unwrap_or(d.paged_miss_run_concurrency),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
             backend: merged.backend.or(d.backend),
@@ -1069,6 +1094,11 @@ impl WorkerConfig {
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
+        }
+        if self.paged_miss_run_concurrency == 0 {
+            return Err(Error::Other(
+                "paged_miss_run_concurrency must be > 0".into(),
+            ));
         }
         if self.cache_dirs.is_empty() {
             return Err(Error::Other("at least one cache_dir is required".into()));
@@ -1581,13 +1611,15 @@ mod tests {
     fn from_toml_parses_and_rejects_unknown() {
         let patch = WorkerConfigPatch::from_toml(
             "listen = \"0.0.0.0:9000\"\ncache_dirs = [\"/a\", \"/b\"]\n\
-             l1_capacity_bytes = 67108864\nl1_page_size_bytes = 1048576\n",
+             l1_capacity_bytes = 67108864\nl1_page_size_bytes = 1048576\n\
+             paged_miss_run_concurrency = 4\n",
         )
         .unwrap();
         assert_eq!(patch.listen.as_deref(), Some("0.0.0.0:9000"));
         assert_eq!(patch.cache_dirs.unwrap().len(), 2);
         assert_eq!(patch.l1_capacity_bytes, Some(64 << 20));
         assert_eq!(patch.l1_page_size_bytes, Some(1 << 20));
+        assert_eq!(patch.paged_miss_run_concurrency, Some(4));
         assert!(WorkerConfigPatch::from_toml("bogus_key = 1").is_err());
     }
 
@@ -1604,6 +1636,7 @@ mod tests {
             "TALON_WORKER_BACKEND_THROUGHPUT_BYTES" => Some("1048576".to_string()),
             "TALON_WORKER_L1_CAPACITY_BYTES" => Some("67108864".to_string()),
             "TALON_WORKER_L1_PAGE_SIZE_BYTES" => Some("1048576".to_string()),
+            "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY" => Some("4".to_string()),
             "TALON_WORKER_BACKEND" => Some("s3".to_string()),
             "TALON_WORKER_S3_REGION" => Some("us-east-1".to_string()),
             "TALON_WORKER_S3_PATH_STYLE" => Some("true".to_string()),
@@ -1624,6 +1657,7 @@ mod tests {
         assert_eq!(patch.backend_throughput_bytes, Some(1 << 20));
         assert_eq!(patch.l1_capacity_bytes, Some(64 << 20));
         assert_eq!(patch.l1_page_size_bytes, Some(1 << 20));
+        assert_eq!(patch.paged_miss_run_concurrency, Some(4));
         assert_eq!(patch.backend.as_deref(), Some("s3"));
         assert_eq!(patch.s3_region.as_deref(), Some("us-east-1"));
         assert_eq!(patch.s3_path_style, Some(true));
@@ -1682,6 +1716,13 @@ mod tests {
         };
         let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("must be > 0"));
+
+        let cli = WorkerConfigPatch {
+            paged_miss_run_concurrency: Some(0),
+            ..Default::default()
+        };
+        let err = WorkerConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
+        assert!(err.to_string().contains("paged_miss_run_concurrency"));
 
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
