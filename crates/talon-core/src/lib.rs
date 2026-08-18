@@ -15,6 +15,7 @@ pub mod node;
 pub mod placement;
 pub mod status;
 pub mod store;
+pub mod tenant;
 pub mod trace;
 
 pub use backend::{BackendStore, ListPage, ListedObject, ObjectStat};
@@ -39,4 +40,5 @@ pub use status::{
     MAX_STATUS_LABEL_VALUE_BYTES, NODE_STATUS_SCHEMA_VERSION, NODE_ZONE_LABEL,
 };
 pub use store::{BlockHandle, ObjectStore};
+pub use tenant::{TenantId, TenantIdError, MAX_TENANT_ID_BYTES};
 pub use trace::{init_tracing, RequestId};
