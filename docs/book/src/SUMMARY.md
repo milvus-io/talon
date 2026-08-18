@@ -51,6 +51,8 @@
 
 - [Design (v1)](./explanation/design.md)
 - [Data-plane runtime: choosing io_uring](./explanation/data-plane-runtime.md)
+- [Eventual global tenant rate limits](./explanation/eventual-global-tenant-rate-limits.md)
+- [Real-time tenant traffic observability](./explanation/tenant-traffic-observability.md)
 - [ADR 0001: Management-plane HA](./explanation/adr-0001-management-plane-ha.md)
 - [ADR 0002: Write-cache durability](./explanation/adr-0002-write-cache-durability.md)
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)
