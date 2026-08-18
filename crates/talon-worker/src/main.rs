@@ -42,8 +42,8 @@ use talon_worker::mapping_guard::MappingGuard;
 use talon_worker::tokio_conn::{handle_conn, read_control};
 use talon_worker::uring_conn;
 use talon_worker::{
-    serve_admin, BlockIndex, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerObservability,
-    WorkerRuntime,
+    serve_admin, BlockIndex, InFlightLoads, PagedBlockStore, TenantRateLimiter, WholeBlockStore,
+    WorkerObservability, WorkerRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -193,6 +193,8 @@ impl Args {
             s3_access_key_id: None,
             s3_path_style: None,
             gcs_endpoint: None,
+            // The [rate_limits] table is file-only; the CLI leaves it unset.
+            rate_limits: None,
         }
     }
 }
@@ -592,7 +594,11 @@ async fn main() -> anyhow::Result<()> {
         observability.metrics().clone(),
     )
     .with_backend_kind(configured_backend)
-    .with_paged_miss_run_concurrency(cfg.paged_miss_run_concurrency);
+    .with_paged_miss_run_concurrency(cfg.paged_miss_run_concurrency)
+    .with_rate_limiter(Arc::new(TenantRateLimiter::new(cfg.rate_limits.clone())));
+    if cfg.rate_limits.enabled {
+        tracing::info!("worker per-tenant rate limiting enabled");
+    }
     if let Some(paged) = paged {
         runtime = runtime.with_paged_store(paged);
     }

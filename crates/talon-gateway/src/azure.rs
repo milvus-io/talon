@@ -1569,6 +1569,14 @@ fn cache_error(error: CacheReadError) -> AzureRequestError {
             indeterminate_commit: false,
         },
         CacheReadError::Origin(message) => AzureRequestError::origin_unavailable(message),
+        CacheReadError::RateLimited(message) => AzureRequestError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "ServerBusy",
+            message,
+            failure: FailureReason::RateLimited,
+            content_range: None,
+            indeterminate_commit: false,
+        },
         CacheReadError::Protocol(message)
         | CacheReadError::Internal(message)
         | CacheReadError::Unknown(message) => AzureRequestError::internal(message),

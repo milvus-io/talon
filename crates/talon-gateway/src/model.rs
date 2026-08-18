@@ -168,6 +168,8 @@ pub enum FailureReason {
     Internal,
     /// The operation is not in the advertised compatibility matrix.
     Unsupported,
+    /// The tenant exceeded its rate limit and was throttled.
+    RateLimited,
 }
 
 impl FailureReason {
@@ -183,6 +185,7 @@ impl FailureReason {
             Self::Origin => "origin",
             Self::Internal => "internal",
             Self::Unsupported => "unsupported",
+            Self::RateLimited => "rate_limited",
         }
     }
 }

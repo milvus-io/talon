@@ -39,6 +39,9 @@ pub enum DataErrorCode {
     Origin,
     /// The worker encountered an internal or protocol failure.
     Internal,
+    /// The tenant exceeded its configured rate limit; the caller should back off
+    /// and retry. Added last so existing discriminants are unchanged.
+    RateLimited,
 }
 
 /// A decoded data-plane error, including legacy string-only replies.

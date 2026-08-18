@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use talon_core::RequestId;
+use talon_core::{RequestId, TenantId};
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, DataErrorCode, FrameHeader};
@@ -32,6 +32,24 @@ use tokio::net::TcpStream;
 
 use crate::data_error::encode_runtime_error;
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
+
+/// Decode a `GetRange` or `GetRangeTenant` frame into its request and the tenant
+/// it declared (`Unattributed` for a plain `GetRange`).
+fn decode_range_with_tenant(
+    header: &FrameHeader,
+    payload: &[u8],
+) -> Result<(FrameHeader, data::RangeRequest, TenantId), talon_transport::DataError> {
+    let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+    full.extend_from_slice(&header.encode());
+    full.extend_from_slice(payload);
+    if header.msg_type == MsgType::GetRangeTenant {
+        let (frame, scoped) = data::decode_tenant_request(&full)?;
+        Ok((frame, scoped.request, scoped.tenant))
+    } else {
+        let (frame, req) = data::decode_request(&full)?;
+        Ok((frame, req, TenantId::Unattributed))
+    }
+}
 
 /// Serve data-plane range and cache-only probe requests until EOF.
 pub async fn handle_conn(
@@ -132,7 +150,7 @@ pub async fn handle_conn(
         // Type check BEFORE any per-request work; a data listener only serves
         // GetRange (plus the Put/Delete/Control handled above); other frames are
         // capped tightly by read_frame.
-        if header.msg_type != MsgType::GetRange {
+        if header.msg_type != MsgType::GetRange && header.msg_type != MsgType::GetRangeTenant {
             let err = data::encode_typed_error(
                 header.request_id,
                 DataErrorCode::InvalidRequest,
@@ -146,10 +164,7 @@ pub async fn handle_conn(
             continue;
         }
 
-        let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
-        full.extend_from_slice(&header.encode());
-        full.extend_from_slice(&payload);
-        let (h, req) = match data::decode_request(&full) {
+        let (h, req, tenant) = match decode_range_with_tenant(&header, &payload) {
             Ok(v) => v,
             Err(e) => {
                 let err = data::encode_typed_error(
@@ -191,6 +206,24 @@ pub async fn handle_conn(
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
+            continue;
+        }
+
+        if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::RateLimited,
+                format!(
+                    "tenant rate limit exceeded on {}; retry after {} ms",
+                    throttled.metric.label(),
+                    throttled.retry_after.as_millis()
+                ),
+            );
+            stream.write_all(&err).await?;
+            stream.flush().await?;
+            observability
+                .metrics()
+                .record_rate_limited(throttled.metric);
             continue;
         }
 

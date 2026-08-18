@@ -17,6 +17,7 @@ pub mod memory_store;
 pub mod miss;
 pub mod observability;
 pub mod paged_store;
+pub mod rate_limit;
 pub mod runtime;
 pub mod sendfile;
 pub mod splice;
@@ -39,6 +40,7 @@ pub use memory_store::{MemoryInsert, MemoryPageKey, MemoryStore};
 pub use miss::{touched_pages, Admission, InFlightGuard, InFlightLoads, LoadKey};
 pub use observability::{serve_admin, WorkerMetrics, WorkerObservability, WorkerReadiness};
 pub use paged_store::PagedBlockStore;
+pub use rate_limit::{TenantRateLimiter, Throttled};
 pub use runtime::{ServeOutcome, WorkerRuntime};
 pub use sendfile::{
     send_file_range, send_header_and_file_range, send_header_and_file_ranges, DEFAULT_CHUNK,

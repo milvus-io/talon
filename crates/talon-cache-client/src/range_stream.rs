@@ -49,6 +49,11 @@ pub enum CacheReadError {
     /// A legacy worker returned only an unclassified string.
     #[error("unclassified legacy worker failure: {0}")]
     Unknown(String),
+    /// The tenant exceeded its rate limit; the caller should back off and
+    /// retry. Never origin-fallback-eligible — falling back would evade the
+    /// limit.
+    #[error("tenant rate limit exceeded: {0}")]
+    RateLimited(String),
 }
 
 impl CacheReadError {
@@ -79,6 +84,7 @@ impl From<WorkerError> for CacheReadError {
                 DataErrorCode::VersionMismatch => Self::VersionMismatch(error.message),
                 DataErrorCode::Origin => Self::Origin(error.message),
                 DataErrorCode::Internal => Self::Internal(error.message),
+                DataErrorCode::RateLimited => Self::RateLimited(error.message),
             },
             other => Self::Protocol(other.to_string()),
         }

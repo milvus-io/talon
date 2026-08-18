@@ -57,7 +57,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use monoio::net::TcpStream;
-use talon_core::{BlockHandle, RequestId};
+use talon_core::{BlockHandle, RequestId, TenantId};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::uring::{write_all, write_all_buf, BufferedFrameReader};
@@ -163,7 +163,7 @@ pub async fn handle_conn(
                 .await?;
                 continue;
             }
-            MsgType::GetRange => {}
+            MsgType::GetRange | MsgType::GetRangeTenant => {}
             // A data listener serves only GetRange/Put/Delete; anything else is
             // rejected before any per-request work.
             _ => {
@@ -180,7 +180,7 @@ pub async fn handle_conn(
             }
         }
 
-        let (h, req) = match data::decode_request(&rejoin(&header, &payload)) {
+        let (h, req, tenant) = match decode_range_with_tenant(&header, &payload) {
             Ok(v) => v,
             Err(e) => {
                 let err = data::encode_typed_error(
@@ -219,6 +219,23 @@ pub async fn handle_conn(
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
+            continue;
+        }
+
+        if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::RateLimited,
+                format!(
+                    "tenant rate limit exceeded on {}; retry after {} ms",
+                    throttled.metric.label(),
+                    throttled.retry_after.as_millis()
+                ),
+            );
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_rate_limited(throttled.metric);
             continue;
         }
 
@@ -285,6 +302,22 @@ pub async fn handle_conn(
                     .record_request_error(request_started.elapsed());
             }
         }
+    }
+}
+
+/// Decode a `GetRange` or `GetRangeTenant` frame into its request and the tenant
+/// it declared (`Unattributed` for a plain `GetRange`).
+fn decode_range_with_tenant(
+    header: &FrameHeader,
+    payload: &[u8],
+) -> Result<(FrameHeader, data::RangeRequest, TenantId), talon_transport::DataError> {
+    let buf = rejoin(header, payload);
+    if header.msg_type == MsgType::GetRangeTenant {
+        let (frame, scoped) = data::decode_tenant_request(&buf)?;
+        Ok((frame, scoped.request, scoped.tenant))
+    } else {
+        let (frame, req) = data::decode_request(&buf)?;
+        Ok((frame, req, TenantId::Unattributed))
     }
 }
 

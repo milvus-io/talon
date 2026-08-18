@@ -1752,6 +1752,14 @@ fn cache_error(error: CacheReadError) -> S3RequestError {
             indeterminate_commit: false,
         },
         CacheReadError::Origin(message) => S3RequestError::origin_unavailable(message),
+        CacheReadError::RateLimited(message) => S3RequestError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "SlowDown",
+            message,
+            failure: FailureReason::RateLimited,
+            content_range: None,
+            indeterminate_commit: false,
+        },
         CacheReadError::Protocol(message)
         | CacheReadError::Internal(message)
         | CacheReadError::Unknown(message) => S3RequestError::internal(message),
