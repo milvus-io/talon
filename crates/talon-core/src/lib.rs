@@ -13,6 +13,7 @@ pub mod metrics;
 pub mod namespace_policy;
 pub mod node;
 pub mod placement;
+pub mod rate_limit;
 pub mod status;
 pub mod store;
 pub mod tenant;
@@ -34,6 +35,7 @@ pub use metrics::{Counter, Gauge, Histogram, Metrics};
 pub use namespace_policy::{NamespacePolicy, ObjectNamespace};
 pub use node::{NodeId, NodeInfo, NodeRole};
 pub use placement::{cache_membership_epoch, rank_cache_workers, CachePlacementTable};
+pub use rate_limit::{Gcra, RateDecision, RateLimit, RateLimitError, RateMetric};
 pub use status::{
     NodeHealth, NodeMetricsSnapshot, NodeStatus, NodeStatusError, MAX_NODE_STATUS_BYTES,
     MAX_STATUS_FIELD_BYTES, MAX_STATUS_LABELS, MAX_STATUS_LABEL_KEY_BYTES,
