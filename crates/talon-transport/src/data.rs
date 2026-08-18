@@ -12,7 +12,7 @@
 //! module only handles the request encode/decode and the response header shape.
 
 use serde::{Deserialize, Serialize};
-use talon_core::{BlockId, ObjectId, Version};
+use talon_core::{BlockId, ObjectId, TenantId, Version};
 
 use crate::frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN};
 
@@ -73,6 +73,19 @@ pub struct RangeRequest {
     pub offset: u64,
     /// Number of bytes to read.
     pub len: u64,
+}
+
+/// A [`RangeRequest`] annotated with the tenant it is attributed to.
+///
+/// Sent as a [`MsgType::GetRangeTenant`] frame so per-tenant QoS on the direct
+/// data plane keys on a client-declared tenant. The reply is an ordinary
+/// `GetRange` frame, identical to a plain request's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantScopedRange {
+    /// The tenant this request is attributed to.
+    pub tenant: TenantId,
+    /// The underlying range request.
+    pub request: RangeRequest,
 }
 
 /// A cache-only range probe carrying the exact versioned cache identity.
@@ -181,6 +194,44 @@ pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, RangeRequest), DataErr
     }
     let req: RangeRequest = bincode::deserialize(body)?;
     Ok((header, req))
+}
+
+/// Encode a tenant-attributed range request as a [`MsgType::GetRangeTenant`]
+/// frame (`header || bincode(TenantScopedRange)`).
+///
+/// The reply is an ordinary `GetRange` frame, so a caller reads it back exactly
+/// as it reads a plain [`encode_request`] reply. A worker that predates
+/// per-tenant QoS rejects the distinct message type (fail-closed) rather than
+/// misreading the tenant prefix as part of the request, so this must be sent
+/// only to workers known to understand it.
+pub fn encode_tenant_request(
+    request_id: u32,
+    scoped: &TenantScopedRange,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(scoped)?;
+    let header = FrameHeader::new(MsgType::GetRangeTenant, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a [`MsgType::GetRangeTenant`] frame into its header and scoped request.
+pub fn decode_tenant_request(buf: &[u8]) -> Result<(FrameHeader, TenantScopedRange), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetRangeTenant {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let scoped = bincode::deserialize(body)?;
+    Ok((header, scoped))
 }
 
 /// Encode a cache-only range probe. Older workers reject its distinct message
@@ -435,6 +486,48 @@ mod tests {
         assert!(matches!(
             decode_request(&buf),
             Err(DataError::LengthMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn tenant_request_round_trips() {
+        let scoped = TenantScopedRange {
+            tenant: TenantId::named("acme"),
+            request: req(),
+        };
+        let buf = encode_tenant_request(5, &scoped).unwrap();
+        let header = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(header.msg_type, MsgType::GetRangeTenant);
+        let (decoded_header, back) = decode_tenant_request(&buf).unwrap();
+        assert_eq!(decoded_header.request_id, 5);
+        assert_eq!(back, scoped);
+        assert_eq!(back.tenant, TenantId::named("acme"));
+    }
+
+    #[test]
+    fn unattributed_tenant_request_round_trips() {
+        let scoped = TenantScopedRange {
+            tenant: TenantId::unattributed(),
+            request: req(),
+        };
+        let buf = encode_tenant_request(1, &scoped).unwrap();
+        let (_header, back) = decode_tenant_request(&buf).unwrap();
+        assert_eq!(back.tenant, TenantId::unattributed());
+        assert_eq!(back.request, req());
+    }
+
+    #[test]
+    fn tenant_frame_is_not_misread_by_the_plain_range_decoder() {
+        // Fail-closed: the distinct message type means an older GetRange decoder
+        // rejects the frame rather than reading the tenant prefix as a request.
+        let scoped = TenantScopedRange {
+            tenant: TenantId::named("acme"),
+            request: req(),
+        };
+        let buf = encode_tenant_request(5, &scoped).unwrap();
+        assert!(matches!(
+            decode_request(&buf),
+            Err(DataError::NotGetRange(MsgType::GetRangeTenant))
         ));
     }
 

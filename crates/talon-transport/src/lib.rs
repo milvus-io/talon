@@ -24,10 +24,11 @@ pub use codec::{
 };
 pub use data::{
     decode_cached_block_put_header, decode_cached_request, decode_delete, decode_error_payload,
-    decode_put_header, decode_request, encode_cached_block_put_header, encode_cached_request,
-    encode_delete, encode_error, encode_put_header, encode_request, encode_typed_error,
-    response_header_ok, CachedBlockPutRequest, CachedRangeRequest, DataError, DataErrorCode,
-    DataPlaneError, DeleteRequest, PutRequest, RangeRequest,
+    decode_put_header, decode_request, decode_tenant_request, encode_cached_block_put_header,
+    encode_cached_request, encode_delete, encode_error, encode_put_header, encode_request,
+    encode_tenant_request, encode_typed_error, response_header_ok, CachedBlockPutRequest,
+    CachedRangeRequest, DataError, DataErrorCode, DataPlaneError, DeleteRequest, PutRequest,
+    RangeRequest, TenantScopedRange,
 };
 pub use frame::{Flags, FrameError, FrameHeader, MsgType, HEADER_LEN, MAGIC, PROTOCOL_VERSION};
 pub use limits::{
