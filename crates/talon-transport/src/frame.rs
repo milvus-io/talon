@@ -70,6 +70,14 @@ pub enum MsgType {
     /// is an ordinary `GetRange` frame; an older worker rejects this distinct
     /// type rather than misreading the tenant prefix as part of the request.
     GetRangeTenant = 8,
+    /// A cache-only versioned range fetch that declares the tenant it is
+    /// attributed to (a bincode
+    /// [`TenantScopedCachedRange`](crate::data::TenantScopedCachedRange) header),
+    /// so resident-only reads are still metered per tenant. Like
+    /// `GetCachedRange` it must never access the worker backend, and like
+    /// `GetRangeTenant` an older worker rejects this distinct type rather than
+    /// misreading the tenant prefix.
+    GetCachedRangeTenant = 9,
 }
 
 impl MsgType {
@@ -85,6 +93,7 @@ impl MsgType {
             6 => MsgType::GetCachedRange,
             7 => MsgType::AdmitCachedBlock,
             8 => MsgType::GetRangeTenant,
+            9 => MsgType::GetCachedRangeTenant,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -228,6 +237,7 @@ mod tests {
             MsgType::GetCachedRange,
             MsgType::AdmitCachedBlock,
             MsgType::GetRangeTenant,
+            MsgType::GetCachedRangeTenant,
         ]
         .into_iter()
         .enumerate()

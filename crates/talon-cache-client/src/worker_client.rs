@@ -21,10 +21,11 @@ use std::time::Duration;
 use talon_core::{BlockId, ObjectId, RequestId, TenantId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_cached_block_put_header, encode_cached_request, encode_delete,
-    encode_put_header, encode_request, encode_tenant_request, CachedBlockPutRequest,
-    CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest, RangeRequest,
-    TenantScopedRange, MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_cached_block_put_header, encode_cached_request,
+    encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
+    encode_tenant_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest,
+    Flags, PutRequest, RangeRequest, TenantScopedCachedRange, TenantScopedRange,
+    MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -161,6 +162,28 @@ impl WorkerClient {
         }
     }
 
+    /// Encode a cache-only range request, as a tenant-scoped frame when this
+    /// client is bound to a named tenant, else as a plain `GetCachedRange`. A
+    /// named tenant keeps resident-only reads attributed so they are metered by
+    /// the worker like any other read.
+    fn encode_cached_range_request(
+        &self,
+        request_id: u32,
+        request: CachedRangeRequest,
+    ) -> Result<Vec<u8>, talon_transport::DataError> {
+        if self.tenant.is_unattributed() {
+            encode_cached_request(request_id, &request)
+        } else {
+            encode_cached_tenant_request(
+                request_id,
+                &TenantScopedCachedRange {
+                    tenant: self.tenant.clone(),
+                    request,
+                },
+            )
+        }
+    }
+
     /// Fetch `[offset, offset+len)` of `object` from the worker.
     ///
     /// Returns the raw range bytes on success. A worker-side error (block not
@@ -289,7 +312,7 @@ impl WorkerClient {
             len,
         };
         let request_id = RequestId::next();
-        let output = encode_cached_request(request_id.0, &request)?;
+        let output = self.encode_cached_range_request(request_id.0, request)?;
         match self.exchange(&output, len).await {
             Ok(bytes) => Ok(bytes),
             Err((true, err)) if err.is_transport_failure() => {
@@ -840,8 +863,8 @@ mod tests {
     use std::time::Duration;
     use talon_core::Backend;
     use talon_transport::{
-        decode_cached_block_put_header, decode_cached_request, decode_request,
-        decode_tenant_request, encode_error, response_header_ok,
+        decode_cached_block_put_header, decode_cached_request, decode_cached_tenant_request,
+        decode_request, decode_tenant_request, encode_error, response_header_ok,
     };
     use tokio::net::TcpListener;
 
@@ -1094,6 +1117,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, b"data");
+    }
+
+    #[tokio::test]
+    async fn tenant_client_sends_a_cached_tenant_scoped_frame() {
+        // A tenant-bound client attributes cache-only reads too, so a resident
+        // read cannot slip past per-tenant metering on the worker.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            assert_eq!(header.msg_type, MsgType::GetCachedRangeTenant);
+            let mut body = vec![0u8; header.length as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&body);
+            let (_h, scoped) = decode_cached_tenant_request(&full).unwrap();
+            assert_eq!(scoped.request.version, Version::new("etag-v2"));
+            *recorded.lock().unwrap() = Some(scoped.tenant);
+            let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
+            out.resize(out.len() + scoped.request.len as usize, 0);
+            sock.write_all(&out).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let bytes = client
+            .fetch_cached_range(&object(), &Version::new("etag-v2"), 0, 16)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
     }
 
     #[tokio::test]

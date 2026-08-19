@@ -104,6 +104,21 @@ pub struct CachedRangeRequest {
     pub len: u64,
 }
 
+/// A [`CachedRangeRequest`] annotated with the tenant it is attributed to.
+///
+/// Sent as a [`MsgType::GetCachedRangeTenant`] frame so resident-only reads on
+/// the direct data plane are still metered per tenant, closing the gap where a
+/// tenant could otherwise escape its limits whenever the version was resident.
+/// The reply is an ordinary `GetRange` frame, identical to a plain cached
+/// request's.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantScopedCachedRange {
+    /// The tenant this request is attributed to.
+    pub tenant: TenantId,
+    /// The underlying cache-only range request.
+    pub request: CachedRangeRequest,
+}
+
 /// A client→worker request to write a whole object (write-through, #226).
 ///
 /// This is the framed **header**; the raw object bytes (`body_len` of them)
@@ -267,6 +282,46 @@ pub fn decode_cached_request(buf: &[u8]) -> Result<(FrameHeader, CachedRangeRequ
     }
     let req = bincode::deserialize(body)?;
     Ok((header, req))
+}
+
+/// Encode a tenant-attributed cache-only range probe as a
+/// [`MsgType::GetCachedRangeTenant`] frame (`header || bincode(...)`).
+///
+/// Like [`encode_cached_request`] the reply is an ordinary `GetRange` frame, and
+/// like [`encode_tenant_request`] an older worker rejects this distinct message
+/// type (fail-closed) rather than misreading the tenant prefix, so it must be
+/// sent only to workers known to understand it.
+pub fn encode_cached_tenant_request(
+    request_id: u32,
+    scoped: &TenantScopedCachedRange,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(scoped)?;
+    let header = FrameHeader::new(MsgType::GetCachedRangeTenant, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a [`MsgType::GetCachedRangeTenant`] frame into its header and scoped
+/// cache-only request.
+pub fn decode_cached_tenant_request(
+    buf: &[u8],
+) -> Result<(FrameHeader, TenantScopedCachedRange), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetCachedRangeTenant {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let scoped = bincode::deserialize(body)?;
+    Ok((header, scoped))
 }
 
 /// Encode a [`PutRequest`] header into `header || bincode(req)`.
@@ -470,6 +525,46 @@ mod tests {
         assert_eq!(header.msg_type, MsgType::GetCachedRange);
         assert_eq!(header.request_id, 12);
         assert_eq!(decoded, request);
+    }
+
+    fn cached_req() -> CachedRangeRequest {
+        CachedRangeRequest {
+            object: req().object,
+            version: Version::new("etag-v9"),
+            offset: 5,
+            len: 9,
+        }
+    }
+
+    #[test]
+    fn cached_tenant_request_round_trips() {
+        let scoped = TenantScopedCachedRange {
+            tenant: TenantId::named("acme"),
+            request: cached_req(),
+        };
+        let buf = encode_cached_tenant_request(7, &scoped).unwrap();
+        let header = FrameHeader::decode(&buf).unwrap();
+        assert_eq!(header.msg_type, MsgType::GetCachedRangeTenant);
+        let (decoded_header, back) = decode_cached_tenant_request(&buf).unwrap();
+        assert_eq!(decoded_header.request_id, 7);
+        assert_eq!(back, scoped);
+        assert_eq!(back.tenant, TenantId::named("acme"));
+    }
+
+    #[test]
+    fn cached_tenant_frame_is_not_misread_by_the_plain_cached_decoder() {
+        // Fail-closed: the distinct message type means an older cache-only
+        // decoder rejects the frame rather than reading the tenant prefix as a
+        // CachedRangeRequest.
+        let scoped = TenantScopedCachedRange {
+            tenant: TenantId::named("acme"),
+            request: cached_req(),
+        };
+        let buf = encode_cached_tenant_request(1, &scoped).unwrap();
+        assert!(matches!(
+            decode_cached_request(&buf),
+            Err(DataError::NotGetRange(MsgType::GetCachedRangeTenant))
+        ));
     }
 
     #[test]
