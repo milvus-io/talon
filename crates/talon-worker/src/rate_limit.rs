@@ -334,6 +334,127 @@ mod tests {
         );
     }
 
+    // Build an iops-only override for a single tenant tier.
+    fn iops_override(rate: u64, burst_ratio: f64) -> MetricLimits {
+        MetricLimits {
+            read_iops: Some(RateLimit::new(rate, burst_ratio).unwrap()),
+            read_throughput: None,
+        }
+    }
+
+    #[test]
+    fn caps_each_tenant_independently_under_concurrent_overload() {
+        // Multi-tenant capability: three tenants with *different* read_iops
+        // limits all offer far more than their share at every simulated instant.
+        // Each must be capped at its own rate — a greedy tenant never borrows
+        // another's budget, and a small tenant is not dragged up by a large one.
+        let mut policy = iops_policy(1000, 1.0); // "a" falls back to this default
+        policy.overrides.insert("vip".to_string(), iops_override(5000, 1.0));
+        policy.overrides.insert("tiny".to_string(), iops_override(100, 1.0));
+        let limiter = TenantRateLimiter::new(policy);
+
+        // (tenant, configured rate/s).
+        let tenants = [
+            (TenantId::named("a"), 1000u64),
+            (TenantId::named("vip"), 5000),
+            (TenantId::named("tiny"), 100),
+        ];
+        let mut admitted = [0u64; 3];
+        // 1000 steps of 1ms across ~1s. At every step *each* tenant offers 20
+        // requests (>> even vip's per-ms share), so all three are overloaded at
+        // the same instants — the interleaving models simultaneous callers.
+        let offered_per_tenant = 1000u64 * 20;
+        for step in 0..1000u64 {
+            let now = step * 1_000_000; // ns
+            for (i, (tenant, _)) in tenants.iter().enumerate() {
+                for _ in 0..20 {
+                    if limiter.admit_at(tenant, 0, now).is_ok() {
+                        admitted[i] += 1;
+                    }
+                }
+            }
+        }
+
+        for (i, (tenant, rate)) in tenants.iter().enumerate() {
+            // Each tenant is capped near burst (1x rate) + one second of its own
+            // rate (1x rate) = ~2x rate, independent of the others.
+            let expected = 2 * rate;
+            let (lo, hi) = (expected * 9 / 10, expected * 11 / 10);
+            assert!(
+                (lo..=hi).contains(&admitted[i]),
+                "tenant {tenant} admitted {} of {offered_per_tenant} offered, \
+                 expected ~{expected} ({lo}..={hi})",
+                admitted[i],
+            );
+        }
+    }
+
+    #[test]
+    fn isolates_tenant_rates_under_real_thread_contention() {
+        // Same guarantee, but under genuine concurrency: one OS thread per
+        // tenant hammers the *shared* limiter with its own id for a fixed
+        // window. This exercises the lock-free cells under contention and
+        // confirms each tenant is throttled near its own rate — nowhere near the
+        // millions of calls each thread actually offers.
+        let mut policy = iops_policy(2000, 1.0);
+        policy.overrides.insert("vip".to_string(), iops_override(8000, 1.0));
+        let limiter = std::sync::Arc::new(TenantRateLimiter::new(policy));
+
+        let window = Duration::from_millis(300);
+        let tenants = [("a", 2000u64), ("vip", 8000u64)];
+        let handles: Vec<_> = tenants
+            .iter()
+            .map(|&(name, rate)| {
+                let limiter = std::sync::Arc::clone(&limiter);
+                let tenant = TenantId::named(name);
+                std::thread::spawn(move || {
+                    let start = Instant::now();
+                    let mut admitted = 0u64;
+                    // Tight batches so the offered rate dwarfs the limit; count
+                    // only what the limiter lets through.
+                    while start.elapsed() < window {
+                        for _ in 0..64 {
+                            if limiter.admit(&tenant, 0).is_ok() {
+                                admitted += 1;
+                            }
+                        }
+                    }
+                    (rate, admitted, start.elapsed())
+                })
+            })
+            .collect();
+
+        let mut results = Vec::new();
+        for h in handles {
+            results.push(h.join().unwrap());
+        }
+
+        for &(rate, admitted, elapsed) in &results {
+            // Expected ~ burst (1x rate) + rate * elapsed. Loose absolute bounds
+            // absorb scheduler jitter while still proving the cap holds: raw
+            // throughput over 300ms is in the millions, so [0.5x, 3x] rate can
+            // only be reached by real limiting.
+            let secs = elapsed.as_secs_f64();
+            let expected = rate as f64 * (1.0 + secs);
+            let (lo, hi) = ((rate / 2), (rate * 3));
+            assert!(
+                admitted >= lo && admitted <= hi,
+                "rate {rate}: admitted {admitted}, expected ~{expected:.0} \
+                 ({lo}..={hi}) over {secs:.3}s",
+            );
+        }
+
+        // Isolation is also visible in the ratio: both tiers ran the same
+        // window, so the 8000 tenant admits ~4x the 2000 tenant (burst and rate
+        // both scale with the tier), never the same amount.
+        let a = results.iter().find(|r| r.0 == 2000).unwrap().1;
+        let vip = results.iter().find(|r| r.0 == 8000).unwrap().1;
+        assert!(
+            vip > a * 2,
+            "vip (8000/s) admitted {vip} should far exceed a (2000/s) {a}",
+        );
+    }
+
     #[test]
     fn empty_limits_admit_without_allocating_a_cell() {
         // Enabled, but nothing configured (empty default, no overrides): every
