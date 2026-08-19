@@ -349,8 +349,12 @@ mod tests {
         // Each must be capped at its own rate — a greedy tenant never borrows
         // another's budget, and a small tenant is not dragged up by a large one.
         let mut policy = iops_policy(1000, 1.0); // "a" falls back to this default
-        policy.overrides.insert("vip".to_string(), iops_override(5000, 1.0));
-        policy.overrides.insert("tiny".to_string(), iops_override(100, 1.0));
+        policy
+            .overrides
+            .insert("vip".to_string(), iops_override(5000, 1.0));
+        policy
+            .overrides
+            .insert("tiny".to_string(), iops_override(100, 1.0));
         let limiter = TenantRateLimiter::new(policy);
 
         // (tenant, configured rate/s).
@@ -397,7 +401,9 @@ mod tests {
         // confirms each tenant is throttled near its own rate — nowhere near the
         // millions of calls each thread actually offers.
         let mut policy = iops_policy(2000, 1.0);
-        policy.overrides.insert("vip".to_string(), iops_override(8000, 1.0));
+        policy
+            .overrides
+            .insert("vip".to_string(), iops_override(8000, 1.0));
         let limiter = std::sync::Arc::new(TenantRateLimiter::new(policy));
 
         let window = Duration::from_millis(300);

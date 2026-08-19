@@ -23,8 +23,8 @@ use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
     decode_error_payload, encode_cached_block_put_header, encode_cached_request,
     encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
-    encode_tenant_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest,
-    Flags, PutRequest, RangeRequest, TenantScopedCachedRange, TenantScopedRange,
+    encode_tenant_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError,
+    DeleteRequest, Flags, PutRequest, RangeRequest, TenantScopedCachedRange, TenantScopedRange,
     MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
