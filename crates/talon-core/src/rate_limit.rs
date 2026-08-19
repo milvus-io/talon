@@ -206,8 +206,11 @@ const NANOS_PER_SEC: u64 = 1_000_000_000;
 pub struct Gcra {
     /// Theoretical arrival time, in nanoseconds from the caller's clock origin.
     tat_nanos: AtomicU64,
-    /// Emission interval: nanoseconds of TAT advance per unit of cost.
-    interval_nanos: u64,
+    /// Sustained ceiling in units per second. The per-cost TAT advance is
+    /// `cost * 1e9 / rate` with the multiply applied first, so rates above
+    /// 1e9 units/s keep full precision — a pre-divided per-unit interval would
+    /// round down to 0ns and silently cap every rate at 1e9 units/s.
+    rate: u64,
     /// Tolerance: how far ahead of "now" the TAT may sit — `burst_ratio`
     /// seconds, i.e. `rate * burst_ratio` units of credit.
     tolerance_nanos: u64,
@@ -216,20 +219,17 @@ pub struct Gcra {
 impl Gcra {
     /// Build a fresh, empty cell for the given limit.
     pub fn new(limit: RateLimit) -> Self {
-        // Nanoseconds of credit per unit. Clamped to at least 1ns so a single
-        // unit always advances the TAT and an admitted cost is never a no-op.
-        let interval_nanos = NANOS_PER_SEC
-            .checked_div(limit.rate)
-            .unwrap_or(NANOS_PER_SEC)
-            .max(1);
-        // The burst window is `burst_ratio` seconds of accumulation, which works
-        // out to `rate * burst_ratio` units. Clamp to at least one emission
-        // interval so a single unit is always admittable, even for a tiny ratio.
+        // A zero rate makes the per-cost increment ill-defined. `RateLimit::new`
+        // forbids it, but the fields are public, so clamp defensively.
+        let rate = limit.rate.max(1);
+        // The burst window is `burst_ratio` seconds of accumulation, i.e.
+        // `rate * burst_ratio` units of credit. A single charge is always
+        // admittable from an idle cell regardless of this value (see the
+        // per-charge ceiling in `charge_at`), so no interval floor is needed.
         let tolerance_nanos = ((limit.burst_ratio.max(0.0)) * NANOS_PER_SEC as f64) as u64;
-        let tolerance_nanos = tolerance_nanos.max(interval_nanos);
         Self {
             tat_nanos: AtomicU64::new(0),
-            interval_nanos,
+            rate,
             tolerance_nanos,
         }
     }
@@ -237,22 +237,32 @@ impl Gcra {
     /// Charge `cost` units against the cell at monotonic time `now_nanos`.
     ///
     /// A zero cost is always admitted without touching the cell. On success the
-    /// TAT advances by `cost` emission intervals; on throttle the cell is left
+    /// TAT advances by `cost / rate` seconds; on throttle the cell is left
     /// unchanged and the returned delay is when the same cost would next fit.
     pub fn charge_at(&self, cost: u64, now_nanos: u64) -> RateDecision {
         if cost == 0 {
             return RateDecision::Admitted;
         }
-        // Total TAT advance for this cost, saturating rather than wrapping for
-        // pathological (huge cost, tiny rate) combinations.
-        let increment = (cost as u128 * self.interval_nanos as u128).min(u64::MAX as u128) as u64;
+        // Total TAT advance for this cost: `cost / rate` seconds, in nanos.
+        // Multiply before dividing so rates above 1e9 units/s stay exact (a
+        // pre-divided per-unit interval rounds to 0ns and caps the rate), and
+        // saturate rather than wrap for pathological (huge cost, tiny rate).
+        let increment =
+            (cost as u128 * NANOS_PER_SEC as u128 / self.rate as u128).min(u64::MAX as u128) as u64;
+        // The ceiling for THIS charge is at least its own increment, so a single
+        // request larger than the configured burst is still admittable from an
+        // idle cell instead of being rejected forever with a retry_after that
+        // could never come true. Such a request is admitted only once the cell
+        // has drained to "now", then advances the TAT by the full increment,
+        // pacing the tenant for the oversized cost. For the common
+        // `increment <= tolerance` case the ceiling is exactly the burst.
+        let ceiling = self.tolerance_nanos.max(increment);
         loop {
             let tat = self.tat_nanos.load(Ordering::Relaxed);
             let base = tat.max(now_nanos);
             let new_tat = base.saturating_add(increment);
-            // Backlog after admitting = new_tat - now. Admit while it fits the
-            // burst tolerance.
-            if new_tat.saturating_sub(now_nanos) <= self.tolerance_nanos {
+            // Backlog after admitting = new_tat - now. Admit while it fits.
+            if new_tat.saturating_sub(now_nanos) <= ceiling {
                 match self.tat_nanos.compare_exchange_weak(
                     tat,
                     new_tat,
@@ -264,10 +274,8 @@ impl Gcra {
                     Err(_) => continue,
                 }
             }
-            // Earliest time the cost fits: when backlog drains to the tolerance.
-            let retry = new_tat
-                .saturating_sub(self.tolerance_nanos)
-                .saturating_sub(now_nanos);
+            // Earliest time the cost fits: when the backlog drains to `ceiling`.
+            let retry = new_tat.saturating_sub(ceiling).saturating_sub(now_nanos);
             return RateDecision::Throttled {
                 retry_after: Duration::from_nanos(retry),
             };
@@ -393,5 +401,47 @@ mod tests {
         assert_eq!(cell.charge_at(0, 0), RateDecision::Admitted);
         // The one unit of burst is still available afterwards.
         assert!(cell.charge_at(1, 0).is_admitted());
+    }
+
+    #[test]
+    fn oversized_cost_admits_from_idle_then_paces_with_truthful_retry() {
+        // Regression: a single cost larger than the burst capacity used to be
+        // rejected forever, and the returned retry_after never came true —
+        // retrying at `now + retry_after` was throttled identically because the
+        // cell had not advanced. At rate 10, burst_ratio 1.0 the burst is 10
+        // units; charge 25 (2.5x the burst).
+        let cell = Gcra::new(limit(10, 1.0));
+        // Admitted from an idle cell despite exceeding the 10-unit burst...
+        assert!(cell.charge_at(25, 0).is_admitted());
+        // ...the next identical charge is paced, not permanently stuck.
+        let retry = match cell.charge_at(25, 0) {
+            RateDecision::Throttled { retry_after } => retry_after,
+            other => panic!("expected throttle, got {other:?}"),
+        };
+        // 25 units at 10 units/s = 2.5s of backlog to drain.
+        assert_eq!(retry, Duration::from_millis(2500));
+        // Waiting exactly that long and retrying succeeds — the retry is real.
+        assert!(cell.charge_at(25, retry.as_nanos() as u64).is_admitted());
+    }
+
+    #[test]
+    fn rate_above_one_billion_is_not_capped_at_1e9() {
+        // Regression: `interval = 1e9 / rate` floored to 0 (clamped to 1ns) for
+        // rates above 1e9 units/s, capping every such rate at 1e9. At 2e9
+        // units/s with burst_ratio 1.0 the burst is a full 2e9 units, which the
+        // capped implementation could not admit within one second.
+        let cell = Gcra::new(limit(2_000_000_000, 1.0));
+        // A full second's worth (2e9 units) fits the burst — impossible if the
+        // rate were silently capped at 1e9.
+        assert!(cell.charge_at(2_000_000_000, 0).is_admitted());
+        // The next second's worth is paced by exactly one second.
+        match cell.charge_at(2_000_000_000, 0) {
+            RateDecision::Throttled { retry_after } => {
+                assert_eq!(retry_after, Duration::from_secs(1));
+            }
+            other => panic!("expected throttle, got {other:?}"),
+        }
+        // ...and admitted once that second has elapsed.
+        assert!(cell.charge_at(2_000_000_000, NANOS_PER_SEC).is_admitted());
     }
 }
