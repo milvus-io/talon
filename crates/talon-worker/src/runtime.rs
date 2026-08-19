@@ -18,7 +18,7 @@ use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LE
 use crate::data_error::CacheMiss;
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
-    MemoryStore, PagedBlockStore, Presence, WholeBlockStore, WorkerMetrics,
+    MemoryStore, PagedBlockStore, Presence, TenantRateLimiter, WholeBlockStore, WorkerMetrics,
 };
 
 /// Default lifetime of a cached resolved object version.
@@ -106,6 +106,8 @@ pub struct WorkerRuntime {
     /// a backend `HEAD` per request (issue #163).
     version_cache: Mutex<HashMap<ObjectId, CachedVersion>>,
     version_ttl: Duration,
+    /// Worker-global per-tenant rate limiter; disabled unless configured.
+    rate_limiter: Arc<TenantRateLimiter>,
 }
 
 impl WorkerRuntime {
@@ -180,6 +182,7 @@ impl WorkerRuntime {
             paged_miss_run_concurrency: DEFAULT_PAGED_MISS_RUN_CONCURRENCY,
             version_cache: Mutex::new(HashMap::new()),
             version_ttl: DEFAULT_VERSION_TTL,
+            rate_limiter: Arc::new(TenantRateLimiter::disabled()),
         }
     }
 
@@ -202,6 +205,18 @@ impl WorkerRuntime {
     pub fn with_paged_miss_run_concurrency(mut self, concurrency: usize) -> Self {
         self.paged_miss_run_concurrency = concurrency.max(1);
         self
+    }
+
+    /// Attach a per-tenant rate limiter. Without this the runtime admits every
+    /// request (the limiter is disabled).
+    pub fn with_rate_limiter(mut self, limiter: Arc<TenantRateLimiter>) -> Self {
+        self.rate_limiter = limiter;
+        self
+    }
+
+    /// The worker's per-tenant rate limiter.
+    pub fn rate_limiter(&self) -> &TenantRateLimiter {
+        &self.rate_limiter
     }
 
     /// The paged L2 page size, or `None` when paged mode is off.

@@ -16,7 +16,7 @@ use axum::{Json, Router};
 use talon_core::metrics::labels;
 use talon_core::{
     Counter, Gauge, Histogram, Metrics, NodeHealth, NodeInfo, NodeMetricsSnapshot, NodeStatus,
-    NODE_STATUS_SCHEMA_VERSION,
+    RateMetric, NODE_STATUS_SCHEMA_VERSION,
 };
 use tokio::net::TcpListener;
 
@@ -323,6 +323,22 @@ impl WorkerMetrics {
         self.requests_total.inc();
         self.request_errors_total.inc();
         self.request_duration_seconds.observe(elapsed.as_secs_f64());
+    }
+
+    /// Record a request rejected by per-tenant rate limiting.
+    ///
+    /// Labelled only by the exceeded metric, never by tenant, to keep the series
+    /// bounded; per-tenant drill-down is a management-API concern. A throttle is
+    /// a distinct outcome from success or error, so it does not touch the
+    /// request success/error counters.
+    pub fn record_rate_limited(&self, metric: RateMetric) {
+        self.registry
+            .counter(
+                "talon_worker_rate_limited_total",
+                "Requests rejected by per-tenant rate limiting, by exceeded metric.",
+                labels(&[("metric", metric.label())]),
+            )
+            .inc();
     }
 
     /// Record a whole-block cache hit.

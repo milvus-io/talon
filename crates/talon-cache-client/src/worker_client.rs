@@ -18,12 +18,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use talon_core::{BlockId, ObjectId, RequestId, Version};
+use talon_core::{BlockId, ObjectId, RequestId, TenantId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_cached_block_put_header, encode_cached_request, encode_delete,
-    encode_put_header, encode_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError,
-    DeleteRequest, Flags, PutRequest, RangeRequest, MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_cached_block_put_header, encode_cached_request,
+    encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
+    encode_tenant_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError,
+    DeleteRequest, Flags, PutRequest, RangeRequest, TenantScopedCachedRange, TenantScopedRange,
+    MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -100,6 +102,9 @@ impl WorkerError {
 pub struct WorkerClient {
     addr: String,
     pool: Arc<ConnectionPool>,
+    /// Tenant every fetch from this client is attributed to. `Unattributed`
+    /// unless set with [`with_tenant`](Self::with_tenant).
+    tenant: TenantId,
 }
 
 impl WorkerClient {
@@ -117,12 +122,66 @@ impl WorkerClient {
         Self {
             addr: addr.into(),
             pool,
+            tenant: TenantId::Unattributed,
         }
     }
 
     /// The worker address this client talks to.
     pub fn addr(&self) -> &str {
         &self.addr
+    }
+
+    /// Attribute every fetch from this client to `tenant` for per-tenant QoS.
+    ///
+    /// A named tenant is sent as a `GetRangeTenant` frame; the default
+    /// (`Unattributed`) sends an ordinary `GetRange`. Send a named tenant only
+    /// to workers known to understand the type — an older worker fails the
+    /// request closed rather than misreading it.
+    pub fn with_tenant(mut self, tenant: TenantId) -> Self {
+        self.tenant = tenant;
+        self
+    }
+
+    /// Encode a range request, as a tenant-scoped frame when this client is
+    /// bound to a named tenant, else as a plain `GetRange`.
+    fn encode_range_request(
+        &self,
+        request_id: u32,
+        request: RangeRequest,
+    ) -> Result<Vec<u8>, talon_transport::DataError> {
+        if self.tenant.is_unattributed() {
+            encode_request(request_id, &request)
+        } else {
+            encode_tenant_request(
+                request_id,
+                &TenantScopedRange {
+                    tenant: self.tenant.clone(),
+                    request,
+                },
+            )
+        }
+    }
+
+    /// Encode a cache-only range request, as a tenant-scoped frame when this
+    /// client is bound to a named tenant, else as a plain `GetCachedRange`. A
+    /// named tenant keeps resident-only reads attributed so they are metered by
+    /// the worker like any other read.
+    fn encode_cached_range_request(
+        &self,
+        request_id: u32,
+        request: CachedRangeRequest,
+    ) -> Result<Vec<u8>, talon_transport::DataError> {
+        if self.tenant.is_unattributed() {
+            encode_cached_request(request_id, &request)
+        } else {
+            encode_cached_tenant_request(
+                request_id,
+                &TenantScopedCachedRange {
+                    tenant: self.tenant.clone(),
+                    request,
+                },
+            )
+        }
     }
 
     /// Fetch `[offset, offset+len)` of `object` from the worker.
@@ -151,7 +210,7 @@ impl WorkerClient {
         // Allocate a correlation id and put it on the wire, so the worker's
         // logs for this fetch can be joined with the client's (#304).
         let req_id = RequestId::next();
-        let out = encode_request(req_id.0, &req)?;
+        let out = self.encode_range_request(req_id.0, req)?;
         // Try a pooled connection first; if it was reused and fails with an I/O
         // error (the peer may have closed it while idle), retry once on a fresh
         // dial so a stale pooled socket never turns a healthy peer into a
@@ -204,7 +263,7 @@ impl WorkerClient {
             len: dst.len() as u64,
         };
         let request_id = RequestId::next();
-        let output = encode_request(request_id.0, &request)?;
+        let output = self.encode_range_request(request_id.0, request)?;
         match self.exchange_into(&output, dst).await {
             Ok(n) => Ok(n),
             Err((true, err)) if err.is_transport_failure() => {
@@ -253,7 +312,7 @@ impl WorkerClient {
             len,
         };
         let request_id = RequestId::next();
-        let output = encode_cached_request(request_id.0, &request)?;
+        let output = self.encode_cached_range_request(request_id.0, request)?;
         match self.exchange(&output, len).await {
             Ok(bytes) => Ok(bytes),
             Err((true, err)) if err.is_transport_failure() => {
@@ -804,8 +863,8 @@ mod tests {
     use std::time::Duration;
     use talon_core::Backend;
     use talon_transport::{
-        decode_cached_block_put_header, decode_cached_request, decode_request, encode_error,
-        response_header_ok,
+        decode_cached_block_put_header, decode_cached_request, decode_cached_tenant_request,
+        decode_request, decode_tenant_request, encode_error, response_header_ok,
     };
     use tokio::net::TcpListener;
 
@@ -943,6 +1002,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_client_sends_a_tenant_scoped_frame() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            assert_eq!(header.msg_type, MsgType::GetRangeTenant);
+            let mut body = vec![0u8; header.length as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&body);
+            let (_h, scoped) = decode_tenant_request(&full).unwrap();
+            *recorded.lock().unwrap() = Some(scoped.tenant);
+            // Reply with the requested bytes so the client fetch succeeds; the
+            // reply is an ordinary GetRange frame.
+            let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
+            out.resize(out.len() + scoped.request.len as usize, 0);
+            sock.write_all(&out).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let bytes = client.fetch_range(&object(), 0, 16).await.unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
+    }
+
+    #[tokio::test]
+    async fn default_client_sends_a_plain_getrange() {
+        // Without a tenant the client sends an ordinary GetRange, which the
+        // GetRange-only mock worker decodes successfully (backward compatible).
+        let addr = mock_worker(|req| {
+            let mut out = response_header_ok(0, req.len as u32).to_vec();
+            out.resize(out.len() + req.len as usize, 0);
+            out
+        })
+        .await;
+        let bytes = WorkerClient::new(addr)
+            .fetch_range(&object(), 0, 8)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 8);
+    }
+
+    #[tokio::test]
     async fn fetch_returns_raw_bytes() {
         let addr = mock_worker(|req| {
             let payload: Vec<u8> = (0..req.len).map(|i| (i % 251) as u8).collect();
@@ -1009,6 +1117,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes, b"data");
+    }
+
+    #[tokio::test]
+    async fn tenant_client_sends_a_cached_tenant_scoped_frame() {
+        // A tenant-bound client attributes cache-only reads too, so a resident
+        // read cannot slip past per-tenant metering on the worker.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut hdr = [0u8; HEADER_LEN];
+            sock.read_exact(&mut hdr).await.unwrap();
+            let header = FrameHeader::decode(&hdr).unwrap();
+            assert_eq!(header.msg_type, MsgType::GetCachedRangeTenant);
+            let mut body = vec![0u8; header.length as usize];
+            sock.read_exact(&mut body).await.unwrap();
+            let mut full = hdr.to_vec();
+            full.extend_from_slice(&body);
+            let (_h, scoped) = decode_cached_tenant_request(&full).unwrap();
+            assert_eq!(scoped.request.version, Version::new("etag-v2"));
+            *recorded.lock().unwrap() = Some(scoped.tenant);
+            let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
+            out.resize(out.len() + scoped.request.len as usize, 0);
+            sock.write_all(&out).await.unwrap();
+            sock.flush().await.unwrap();
+        });
+
+        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let bytes = client
+            .fetch_cached_range(&object(), &Version::new("etag-v2"), 0, 16)
+            .await
+            .unwrap();
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
     }
 
     #[tokio::test]

@@ -57,7 +57,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use monoio::net::TcpStream;
-use talon_core::{BlockHandle, RequestId};
+use talon_core::{BlockHandle, RequestId, TenantId};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::uring::{write_all, write_all_buf, BufferedFrameReader};
@@ -151,7 +151,7 @@ pub async fn handle_conn(
                 .await?;
                 continue;
             }
-            MsgType::GetCachedRange => {
+            MsgType::GetCachedRange | MsgType::GetCachedRangeTenant => {
                 handle_cached_range(
                     &mut stream,
                     &header,
@@ -163,7 +163,7 @@ pub async fn handle_conn(
                 .await?;
                 continue;
             }
-            MsgType::GetRange => {}
+            MsgType::GetRange | MsgType::GetRangeTenant => {}
             // A data listener serves only GetRange/Put/Delete; anything else is
             // rejected before any per-request work.
             _ => {
@@ -180,7 +180,7 @@ pub async fn handle_conn(
             }
         }
 
-        let (h, req) = match data::decode_request(&rejoin(&header, &payload)) {
+        let (h, req, tenant) = match decode_range_with_tenant(&header, &payload) {
             Ok(v) => v,
             Err(e) => {
                 let err = data::encode_typed_error(
@@ -195,6 +195,22 @@ pub async fn handle_conn(
                 continue;
             }
         };
+
+        // The declared tenant is attacker-controlled on the unauthenticated data
+        // plane; reject an empty or over-long name before it is used as a cell
+        // key or telemetry label. `Unattributed` always validates.
+        if let Err(e) = tenant.validate() {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("invalid tenant: {e}"),
+            );
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
 
         if !observability.is_ready() {
             let err = data::encode_typed_error(
@@ -219,6 +235,23 @@ pub async fn handle_conn(
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());
+            continue;
+        }
+
+        if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::RateLimited,
+                format!(
+                    "tenant rate limit exceeded on {}; retry after {} ms",
+                    throttled.metric.label(),
+                    throttled.retry_after.as_millis()
+                ),
+            );
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_rate_limited(throttled.metric);
             continue;
         }
 
@@ -285,6 +318,39 @@ pub async fn handle_conn(
                     .record_request_error(request_started.elapsed());
             }
         }
+    }
+}
+
+/// Decode a `GetRange` or `GetRangeTenant` frame into its request and the tenant
+/// it declared (`Unattributed` for a plain `GetRange`).
+fn decode_range_with_tenant(
+    header: &FrameHeader,
+    payload: &[u8],
+) -> Result<(FrameHeader, data::RangeRequest, TenantId), talon_transport::DataError> {
+    let buf = rejoin(header, payload);
+    if header.msg_type == MsgType::GetRangeTenant {
+        let (frame, scoped) = data::decode_tenant_request(&buf)?;
+        Ok((frame, scoped.request, scoped.tenant))
+    } else {
+        let (frame, req) = data::decode_request(&buf)?;
+        Ok((frame, req, TenantId::Unattributed))
+    }
+}
+
+/// Decode a `GetCachedRange` or `GetCachedRangeTenant` frame into its cache-only
+/// request and the tenant it declared (`Unattributed` for a plain
+/// `GetCachedRange`).
+fn decode_cached_range_with_tenant(
+    header: &FrameHeader,
+    payload: &[u8],
+) -> Result<(FrameHeader, data::CachedRangeRequest, TenantId), talon_transport::DataError> {
+    let buf = rejoin(header, payload);
+    if header.msg_type == MsgType::GetCachedRangeTenant {
+        let (frame, scoped) = data::decode_cached_tenant_request(&buf)?;
+        Ok((frame, scoped.request, scoped.tenant))
+    } else {
+        let (frame, req) = data::decode_cached_request(&buf)?;
+        Ok((frame, req, TenantId::Unattributed))
     }
 }
 
@@ -367,7 +433,7 @@ async fn handle_cached_range(
     observability: &WorkerObservability,
     request_started: Instant,
 ) -> std::io::Result<()> {
-    let (decoded, request) = match data::decode_cached_request(&rejoin(header, payload)) {
+    let (decoded, request, tenant) = match decode_cached_range_with_tenant(header, payload) {
         Ok(value) => value,
         Err(error) => {
             let reply = data::encode_typed_error(
@@ -382,6 +448,18 @@ async fn handle_cached_range(
             return Ok(());
         }
     };
+    if let Err(error) = tenant.validate() {
+        let reply = data::encode_typed_error(
+            decoded.request_id,
+            DataErrorCode::InvalidRequest,
+            format!("invalid tenant: {error}"),
+        );
+        write_all(stream, reply).await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(());
+    }
     if !observability.is_ready() {
         let reply = data::encode_typed_error(
             decoded.request_id,
@@ -404,6 +482,25 @@ async fn handle_cached_range(
         observability
             .metrics()
             .record_request_error(request_started.elapsed());
+        return Ok(());
+    }
+    // Meter the cache-only read too, so a resident-version read cannot escape
+    // the tenant's read_iops / read_throughput limits (a plain GetCachedRange
+    // carries no tenant and is charged to Unattributed under the default).
+    if let Err(throttled) = worker.rate_limiter().admit(&tenant, request.len) {
+        let reply = data::encode_typed_error(
+            decoded.request_id,
+            DataErrorCode::RateLimited,
+            format!(
+                "tenant rate limit exceeded on {}; retry after {} ms",
+                throttled.metric.label(),
+                throttled.retry_after.as_millis()
+            ),
+        );
+        write_all(stream, reply).await?;
+        observability
+            .metrics()
+            .record_rate_limited(throttled.metric);
         return Ok(());
     }
     match worker.serve_cached(&request).await {

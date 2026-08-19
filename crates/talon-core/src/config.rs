@@ -23,7 +23,8 @@ use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
 use crate::{
-    ControlTlsConfig, ControlTlsConfigPatch, Error, NamespacePolicy, ObjectNamespace, Result,
+    ControlTlsConfig, ControlTlsConfigPatch, Error, NamespacePolicy, ObjectNamespace,
+    RateLimitPolicy, Result,
 };
 
 /// A configuration patch: a set of optionally-present overrides.
@@ -100,7 +101,7 @@ pub struct ConfigVar {
 }
 
 /// Fully-resolved worker configuration.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct WorkerConfig {
     /// Address the worker's RPC service binds to.
     pub listen: String,
@@ -216,6 +217,10 @@ pub struct WorkerConfig {
     /// `data_plane_rings = 1` with `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` to
     /// pin the legacy path explicitly.
     pub data_plane_rings: usize,
+    /// Static per-tenant rate-limit policy. Disabled unless a `[rate_limits]`
+    /// table sets `enabled = true`. This is the local, single-worker stage of
+    /// the eventual-global-tenant-rate-limits design.
+    pub rate_limits: RateLimitPolicy,
 }
 
 /// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
@@ -291,6 +296,7 @@ impl Default for WorkerConfig {
             s3_path_style: None,
             gcs_endpoint: None,
             data_plane_rings: 0,
+            rate_limits: RateLimitPolicy::default(),
         }
     }
 }
@@ -370,6 +376,8 @@ pub struct WorkerConfigPatch {
     pub gcs_endpoint: Option<String>,
     /// Override for [`WorkerConfig::data_plane_rings`].
     pub data_plane_rings: Option<usize>,
+    /// Optional `[rate_limits]` table: the per-tenant rate-limit policy.
+    pub rate_limits: Option<RateLimitPolicy>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -419,6 +427,7 @@ impl Patch for WorkerConfigPatch {
             s3_path_style: self.s3_path_style.or(base.s3_path_style),
             gcs_endpoint: self.gcs_endpoint.or(base.gcs_endpoint),
             data_plane_rings: self.data_plane_rings.or(base.data_plane_rings),
+            rate_limits: self.rate_limits.or(base.rate_limits),
         }
     }
 }
@@ -921,6 +930,8 @@ impl WorkerConfigPatch {
             backend_min_throughput_bytes: get(worker_env::BACKEND_MIN_THROUGHPUT_BYTES)
                 .map(|v| parse_u64(v, worker_env::BACKEND_MIN_THROUGHPUT_BYTES))
                 .transpose()?,
+            // The [rate_limits] table is file-only; env does not override it.
+            rate_limits: None,
         })
     }
 }
@@ -999,6 +1010,7 @@ impl WorkerConfig {
                 .backend_min_throughput_bytes
                 .or(d.backend_min_throughput_bytes),
             data_plane_rings: merged.data_plane_rings.unwrap_or(d.data_plane_rings),
+            rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1040,6 +1052,9 @@ impl WorkerConfig {
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
         }
+        self.rate_limits
+            .validate()
+            .map_err(|e| Error::Other(format!("invalid [rate_limits]: {e}")))?;
         if self.node_id.as_ref().is_some_and(String::is_empty) {
             return Err(Error::Other("node_id must not be empty when set".into()));
         }

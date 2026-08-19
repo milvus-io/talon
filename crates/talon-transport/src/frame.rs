@@ -64,6 +64,20 @@ pub enum MsgType {
     /// Admit one complete, versioned block into the worker cache without
     /// accessing the configured backend.
     AdmitCachedBlock = 7,
+    /// A sub-range fetch that declares the tenant it is attributed to, for
+    /// per-tenant QoS (a bincode
+    /// [`TenantScopedRange`](crate::data::TenantScopedRange) header). The reply
+    /// is an ordinary `GetRange` frame; an older worker rejects this distinct
+    /// type rather than misreading the tenant prefix as part of the request.
+    GetRangeTenant = 8,
+    /// A cache-only versioned range fetch that declares the tenant it is
+    /// attributed to (a bincode
+    /// [`TenantScopedCachedRange`](crate::data::TenantScopedCachedRange) header),
+    /// so resident-only reads are still metered per tenant. Like
+    /// `GetCachedRange` it must never access the worker backend, and like
+    /// `GetRangeTenant` an older worker rejects this distinct type rather than
+    /// misreading the tenant prefix.
+    GetCachedRangeTenant = 9,
 }
 
 impl MsgType {
@@ -78,6 +92,8 @@ impl MsgType {
             5 => MsgType::Delete,
             6 => MsgType::GetCachedRange,
             7 => MsgType::AdmitCachedBlock,
+            8 => MsgType::GetRangeTenant,
+            9 => MsgType::GetCachedRangeTenant,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -220,6 +236,8 @@ mod tests {
             MsgType::Delete,
             MsgType::GetCachedRange,
             MsgType::AdmitCachedBlock,
+            MsgType::GetRangeTenant,
+            MsgType::GetCachedRangeTenant,
         ]
         .into_iter()
         .enumerate()
