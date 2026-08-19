@@ -196,6 +196,22 @@ pub async fn handle_conn(
             }
         };
 
+        // The declared tenant is attacker-controlled on the unauthenticated data
+        // plane; reject an empty or over-long name before it is used as a cell
+        // key or telemetry label. `Unattributed` always validates.
+        if let Err(e) = tenant.validate() {
+            let err = data::encode_typed_error(
+                h.request_id,
+                DataErrorCode::InvalidRequest,
+                format!("invalid tenant: {e}"),
+            );
+            write_all(&mut stream, err).await?;
+            observability
+                .metrics()
+                .record_request_error(request_started.elapsed());
+            continue;
+        }
+
         if !observability.is_ready() {
             let err = data::encode_typed_error(
                 h.request_id,

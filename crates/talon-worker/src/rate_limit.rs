@@ -64,24 +64,67 @@ pub struct Throttled {
     pub retry_after: Duration,
 }
 
+/// The maximum number of distinct tenants that get their own dedicated GCRA
+/// cells on one worker.
+///
+/// The direct data plane is unauthenticated, so a client can declare
+/// arbitrarily many distinct tenant names; without a ceiling the cell map would
+/// grow without bound — a memory-exhaustion vector. Tenants first seen beyond
+/// this cap share a single overflow cell governed by the default limit, so
+/// memory stays bounded while the (almost certainly abusive or misconfigured)
+/// excess is still paced. Configured overrides are pre-created and never lost to
+/// the cap.
+const MAX_TENANT_CELLS: usize = 4096;
+
 /// Worker-global, `Arc`-shared per-tenant limiter.
 #[derive(Debug)]
 pub struct TenantRateLimiter {
     policy: RateLimitPolicy,
     /// Monotonic clock origin; GCRA cells advance in nanoseconds from here.
     origin: Instant,
-    /// Lazily-created per-tenant cells. A read lock covers the common warm
-    /// lookup; the write lock is taken only the first time a tenant is seen.
+    /// Per-tenant cells: created eagerly for configured overrides and lazily for
+    /// default-governed tenants. A read lock covers the common warm lookup; the
+    /// write lock is taken only the first time a default-governed tenant is
+    /// seen. Bounded at `max_cells` entries (see [`MAX_TENANT_CELLS`]).
     cells: RwLock<HashMap<TenantId, TenantCells>>,
+    /// Shared fallback cell for tenants first seen after the cap is reached,
+    /// governed by the default limit. `None` when the default limits nothing
+    /// (then default-governed tenants are admitted without a cell at all).
+    overflow: Option<TenantCells>,
+    /// Ceiling on the number of distinct tenant cells (see [`MAX_TENANT_CELLS`]).
+    max_cells: usize,
 }
 
 impl TenantRateLimiter {
     /// Build a limiter from a static local policy.
     pub fn new(policy: RateLimitPolicy) -> Self {
+        Self::with_max_cells(policy, MAX_TENANT_CELLS)
+    }
+
+    /// Build a limiter with an explicit cardinality cap (see
+    /// [`MAX_TENANT_CELLS`]); [`new`](Self::new) uses the default.
+    ///
+    /// Overrides are pre-created so each is honored regardless of arrival order
+    /// and never lost to the cap, and a shared overflow cell is prepared when
+    /// the default limits anything.
+    fn with_max_cells(policy: RateLimitPolicy, max_cells: usize) -> Self {
+        let mut cells = HashMap::new();
+        for (name, limits) in &policy.overrides {
+            if !limits.is_empty() {
+                cells.insert(
+                    TenantId::named(name.clone()),
+                    TenantCells::from_limits(limits),
+                );
+            }
+        }
+        let overflow =
+            (!policy.default.is_empty()).then(|| TenantCells::from_limits(&policy.default));
         Self {
             policy,
             origin: Instant::now(),
-            cells: RwLock::new(HashMap::new()),
+            cells: RwLock::new(cells),
+            overflow,
+            max_cells,
         }
     }
 
@@ -119,18 +162,43 @@ impl TenantRateLimiter {
         if !self.policy.enabled {
             return Ok(());
         }
-        // Fast path: a warm tenant is charged in place under a shared read lock,
+        // Fast path: a warm tenant (an override or a previously-seen
+        // default-governed tenant) is charged in place under a shared read lock,
         // so admits for different tenants never block each other and the
         // same-tenant case is a single atomic CAS with no allocation or clone.
         if let Some(cells) = self.cells.read().unwrap().get(tenant) {
             return cells.charge(read_bytes, now_nanos);
         }
-        // Slow path (first time this tenant is seen): insert, then charge. The
-        // brief write lock is paid once per tenant, not per request.
+        // Unseen tenant. If nothing limits it, admit without allocating a cell;
+        // this also keeps an empty default from ever growing the map.
+        let limits = self.policy.limits_for(tenant);
+        if limits.is_empty() {
+            return Ok(());
+        }
+        // Otherwise give it a dedicated cell — unless the cardinality cap is
+        // reached, in which case fall back to the shared overflow cell so the
+        // unauthenticated map cannot grow without bound.
         let mut map = self.cells.write().unwrap();
-        map.entry(tenant.clone())
-            .or_insert_with(|| TenantCells::from_limits(&self.policy.limits_for(tenant)))
-            .charge(read_bytes, now_nanos)
+        // Re-check under the write lock: another thread may have inserted.
+        if let Some(cells) = map.get(tenant) {
+            return cells.charge(read_bytes, now_nanos);
+        }
+        if map.len() < self.max_cells {
+            return map
+                .entry(tenant.clone())
+                .or_insert_with(|| TenantCells::from_limits(&limits))
+                .charge(read_bytes, now_nanos);
+        }
+        drop(map);
+        match &self.overflow {
+            Some(overflow) => overflow.charge(read_bytes, now_nanos),
+            None => Ok(()),
+        }
+    }
+
+    #[cfg(test)]
+    fn cell_count(&self) -> usize {
+        self.cells.read().unwrap().len()
     }
 
     fn now_nanos(&self) -> u64 {
@@ -264,5 +332,69 @@ mod tests {
             (1800..=2200).contains(&admitted),
             "admitted {admitted}, expected ~2000 (burst + 1s of rate)"
         );
+    }
+
+    #[test]
+    fn empty_limits_admit_without_allocating_a_cell() {
+        // Enabled, but nothing configured (empty default, no overrides): every
+        // tenant is admitted and no cell is ever created, so distinct tenant
+        // names cannot grow worker memory.
+        let limiter = TenantRateLimiter::new(RateLimitPolicy {
+            enabled: true,
+            default: MetricLimits::default(),
+            overrides: HashMap::new(),
+        });
+        for i in 0..1000 {
+            assert!(limiter
+                .admit_at(&TenantId::named(format!("t{i}")), 0, 0)
+                .is_ok());
+        }
+        assert_eq!(limiter.cell_count(), 0);
+    }
+
+    #[test]
+    fn bounds_cardinality_and_overflows_to_a_shared_cell() {
+        // A non-empty default with a tiny cap: only `max_cells` distinct tenants
+        // get their own cell; further tenants share the overflow cell, so the
+        // unauthenticated map cannot grow past the cap.
+        let limiter = TenantRateLimiter::with_max_cells(iops_policy(1, 1.0), 2);
+        // Two distinct tenants each get a dedicated cell (fresh burst each).
+        assert!(limiter.admit_at(&TenantId::named("t0"), 0, 0).is_ok());
+        assert!(limiter.admit_at(&TenantId::named("t1"), 0, 0).is_ok());
+        assert_eq!(limiter.cell_count(), 2);
+        // A third distinct tenant does not grow the map — it shares the overflow
+        // cell, and is admitted on the overflow cell's own fresh burst...
+        assert!(limiter.admit_at(&TenantId::named("t2"), 0, 0).is_ok());
+        assert_eq!(limiter.cell_count(), 2);
+        // ...while a fourth overflow tenant is throttled, because it shares that
+        // now-drained overflow cell (rate 1) rather than getting its own burst.
+        assert!(limiter.admit_at(&TenantId::named("t3"), 0, 0).is_err());
+        assert_eq!(limiter.cell_count(), 2);
+    }
+
+    #[test]
+    fn overrides_are_pre_created_and_exempt_from_the_cap() {
+        // With the cap already reached by dynamic tenants, a configured override
+        // is still honored (it was pre-created), not shunted to the overflow.
+        let mut policy = iops_policy(1, 1.0);
+        policy.overrides.insert(
+            "vip".to_string(),
+            MetricLimits {
+                read_iops: Some(talon_core::RateLimit::new(10, 1.0).unwrap()),
+                read_throughput: None,
+            },
+        );
+        // Cap of 1, already consumed by the pre-created override cell.
+        let limiter = TenantRateLimiter::with_max_cells(policy, 1);
+        assert_eq!(limiter.cell_count(), 1);
+        // A dynamic default tenant is already over the cap, so it shares the
+        // overflow cell rather than getting its own (the map does not grow)...
+        assert!(limiter.admit_at(&TenantId::named("t0"), 0, 0).is_ok());
+        assert_eq!(limiter.cell_count(), 1);
+        // ...while the override keeps its full rate-10 burst on its own cell.
+        for _ in 0..10 {
+            assert!(limiter.admit_at(&TenantId::named("vip"), 0, 0).is_ok());
+        }
+        assert!(limiter.admit_at(&TenantId::named("vip"), 0, 0).is_err());
     }
 }
