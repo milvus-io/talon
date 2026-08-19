@@ -1,0 +1,96 @@
+name: MinIO SDK E2E
+
+# Real distributed Talon instance (kind + Helm: 3 HA coordinators, workers,
+# local-built images, MinIO origin) driven by the Python, Java, and C SDK
+# end-to-end suites under test/. This is the only job that exercises all three
+# language clients against a real object store in one deployment.
+#
+# The SDK suites run inside the cluster from a dedicated runner pod (see
+# test/stack/deploy.sh), so they reach workers by pod IP — which the host
+# cannot — rather than relying on a host-side port-forward.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/minio-sdk-e2e.yml"
+      - "test/**"
+      - "deploy/docker/**"
+      - "deploy/helm/talon/**"
+      - "clients/python/**"
+      - "clients/java/**"
+      - "clients/c/**"
+      - "crates/talon-client/**"
+      - "crates/talon-worker/**"
+      - "crates/talon-coordinator/**"
+      - "crates/talon-cache-client/**"
+      - "crates/talon-transport/**"
+      # Shared protocol types (ObjectId/NodeInfo/Backend...) and the S3 origin
+      # backend drive every SDK; changes here affect the path this e2e covers.
+      - "crates/talon-core/**"
+      - "crates/talon-backend/**"
+
+# Cancel superseded runs so rapid pushes to a PR do not queue a fresh
+# 60-minute kind cluster per commit (mirrors ci.yml).
+concurrency:
+  group: minio-sdk-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  sdk-e2e:
+    name: python/java/c against MinIO cluster
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: helm/kind-action@v1.12.0
+        with:
+          install_only: true
+
+      - uses: azure/setup-helm@v4
+        with:
+          version: v3.18.4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      # maturin builds the Python wheel on the host for the in-cluster suite.
+      - name: Install maturin
+        run: python -m pip install --upgrade maturin
+
+      - name: Deploy the MinIO-backed Talon stack
+        run: test/stack/deploy.sh up
+
+      - name: Python SDK suite
+        run: test/stack/deploy.sh test-python
+
+      - name: Java SDK suite
+        run: test/stack/deploy.sh test-java
+
+      - name: C SDK suite
+        run: test/stack/deploy.sh test-c
+
+      # Tear down before upload so cmd_down collects worker/coordinator logs
+      # into the artifact dir first.
+      - name: Tear down the stack
+        if: always()
+        run: test/stack/deploy.sh down
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: minio-sdk-e2e
+          path: .artifacts/minio-sdk-e2e
+          if-no-files-found: warn

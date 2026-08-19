@@ -1,4 +1,6 @@
 # Build artifacts
+# /target also covers target/talon-wheel, where the multi-language SDK e2e
+# (test/run_all.sh / minio-sdk-e2e.yml) stages the built Python wheel.
 /target
 # Build output of the standalone io_uring probe crate (.github/probe).
 .github/probe/target/
@@ -8,6 +10,10 @@
 
 # Benchmark run output (baselines are committed; per-run results are not)
 /bench/results/
+
+# Test artifacts from the multi-language SDK e2e (test/stack/deploy.sh); the
+# committed .artifacts/zan-bench/ baseline is intentionally not ignored.
+/.artifacts/minio-sdk-e2e/
 
 # Editor / OS
 *.swp
