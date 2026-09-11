@@ -222,8 +222,11 @@ impl BufferedFrameReader {
             // the kernel, so a refill costs no allocation on the steady path.
             let need = (want - self.buffered()).max(REFILL_CAPACITY);
             let mut scratch = self.scratch.take().unwrap_or_default();
-            if scratch.len() < need {
-                scratch.resize(need, 0);
+            // Monoio receives into Vec capacity and resets its length to the
+            // bytes read. Growing length here would zero almost 64 KiB again
+            // after every small frame; only reserve missing capacity instead.
+            if scratch.capacity() < need {
+                scratch.reserve(need - scratch.len());
             }
             let (res, scratch) = match monoio::time::timeout(timeout, stream.read(scratch)).await {
                 Ok(pair) => pair,
