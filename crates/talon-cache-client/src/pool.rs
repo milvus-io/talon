@@ -92,6 +92,7 @@ struct Idle {
 /// released or dropped.
 pub struct ConnectionPool {
     idle: Mutex<HashMap<String, Vec<Idle>>>,
+    deadlines: crate::deadline::Deadlines,
     max_idle_per_addr: usize,
     idle_ttl: Duration,
     connect_timeout: Duration,
@@ -108,6 +109,7 @@ impl ConnectionPool {
     pub fn with_limits(max_idle_per_addr: usize, idle_ttl: Duration) -> Self {
         Self {
             idle: Mutex::new(HashMap::new()),
+            deadlines: crate::deadline::Deadlines::default(),
             max_idle_per_addr: max_idle_per_addr.max(1),
             idle_ttl,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
@@ -156,10 +158,7 @@ impl ConnectionPool {
         F: std::future::Future<Output = Result<T, E>>,
         E: From<std::io::Error>,
     {
-        match tokio::time::timeout(timeout, fut).await {
-            Ok(result) => result,
-            Err(_) => Err(E::from(timeout_error(what, timeout))),
-        }
+        self.deadlines.run(what, timeout, fut).await
     }
 
     /// Take a ready connection for `addr`: a fresh-enough pooled one, or a newly

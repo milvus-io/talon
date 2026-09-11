@@ -6,6 +6,7 @@
 
 pub mod block_reader;
 pub mod coordinator_client;
+mod deadline;
 mod lock;
 pub mod membership_cache;
 pub mod metrics;
