@@ -59,6 +59,12 @@ jobs:
         run: cargo build --workspace --exclude talon-python --all-targets --all-features --locked
       - name: Test
         run: cargo test --workspace --exclude talon-python --all-features --locked
+      - name: Test standalone Rust SDK error API consumer
+        # Seed the independent lockfile with workspace versions, then resolve
+        # offline using dependencies already fetched by the workspace build.
+        run: |
+          cp Cargo.lock clients/rust/tests/consumer/Cargo.lock
+          cargo test --manifest-path clients/rust/tests/consumer/Cargo.toml --offline --target-dir target
 
   fuse-mount:
     name: fuse mount e2e

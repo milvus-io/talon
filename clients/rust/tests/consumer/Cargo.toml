@@ -1,0 +1,16 @@
+[package]
+name = "talon-sdk-error-api-consumer"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+# An independent workspace prevents the SDK's own dependencies from masking
+# missing public exports. This must remain the only direct dependency.
+[workspace]
+
+[dependencies]
+talon-rust-client = { path = "../.." }
+
+[[test]]
+name = "public_error_api"
+path = "../public_error_api.rs"
