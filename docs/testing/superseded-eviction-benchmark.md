@@ -2,6 +2,8 @@
 
 The benchmark compares main `fc62db549cc5e2ecd3b014d823cd8f8aec52e65f` with the same source plus the logical-block version index in `eviction.rs`. The benchmark harness is identical in both builds. All runtime call sites retain their original superseded-version eviction behavior.
 
+The cold-fill timings below were collected for indexed revision `650a42e`. The subsequent sparse-index memory fix is validated separately below; these timings were not remeasured. That fix only shrinks page sets during removal, which this no-eviction cold-fill workload does not exercise.
+
 ## Workload and measurement boundary
 
 - A fresh WorkerRuntime and empty cache directory for every run.
@@ -89,6 +91,26 @@ The same probe reported 2,007 `mkdir` calls, 2,002 returning the expected existi
 
 Tracing changes timing, and its syscall percentages cover only the selected syscalls, not the full cold-read wall time. This diagnostic run is excluded from every performance table above.
 
+## Sparse-residency memory check
+
+Removing pages from a version's `HashSet` leaves its allocation in place until that set is empty. A block that retains one hot page can therefore retain storage for thousands of evicted page indices. The removal helper now shrinks sets with capacity above 32 when their occupancy falls below one quarter, requesting room for twice the remaining entries. This releases large sparse allocations while leaving growth headroom and avoiding repeated resizing of small sets.
+
+An independent LRU probe used the actual `eviction.rs` from main, `650a42e`, and the fixed source, with the same `talon-core` library and a counting `System` allocator. For each of 128 blocks, it inserted 4,096 pages at 64 KiB per page, pinned page 0, and evicted to one page per block seen so far. Earlier blocks retained their pinned hot pages. No cache payload buffers were allocated: the table measures live requested heap allocation for the LRU, excluding the logical cache-data byte count and allocator overhead; it is not RSS.
+
+| Implementation | Active heap (bytes) | Active heap (MiB) | Resident pages | Accounted cache data |
+| --- | ---: | ---: | ---: | ---: |
+| Main `fc62db5` | 2,114,466 | 2.02 | 128 | 8 MiB |
+| Indexed `650a42e` | 11,625,028 | 11.09 | 128 | 8 MiB |
+| Indexed with sparse-set shrinking | 2,224,708 | 2.12 | 128 | 8 MiB |
+
+All three variants verified the same 524,160 victims in eviction order, the same resident page and byte counts, and release of all measured allocations when the LRU was dropped. Shrinking reduced active heap by 8.96 MiB in this workload. This probe measures retained memory, not eviction throughput.
+
+Two permanent regression tests cover sparse capacity eviction across blocks and explicit/superseded removal followed by regrowth, pin release, and final index cleanup. Both fail on `650a42e` because the sparse sets retain peak capacity, and both pass with shrinking. Run them with:
+
+```sh
+cargo test -p talon-worker --all-features --locked sparse_version_index --lib
+```
+
 ## Scope
 
-This measures cold reads and real local page persistence with an in-memory origin. It does not establish S3/network end-to-end throughput. It covers the no-superseded-version fill case responsible for the unconditional full-LRU scan. It does not measure L1 eviction, capacity pressure, or reclamation of many pinned old versions.
+The cold-fill throughput comparison measures cold reads and real local page persistence with an in-memory origin. It does not establish S3/network end-to-end throughput. It covers the no-superseded-version fill case responsible for the unconditional full-LRU scan. It does not measure L1 eviction, capacity pressure, or reclamation of many pinned old versions.

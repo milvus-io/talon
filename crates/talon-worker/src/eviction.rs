@@ -93,6 +93,11 @@ impl Inner {
         debug_assert!(removed, "tracked cache unit missing from version index");
         if units.is_empty() {
             versions.remove(&block.version);
+        } else if units.capacity() > 32 && units.len() < units.capacity() / 4 {
+            // Release historical page capacity when a block becomes sparse.
+            // Leave growth headroom and skip tiny sets to avoid reallocating
+            // on every removal or when residency oscillates near a threshold.
+            units.shrink_to(units.len() * 2);
         }
         if versions.is_empty() {
             self.versions.remove(&key);
@@ -555,6 +560,72 @@ mod tests {
         assert!(lru.evict_superseded(&keep).is_empty());
         assert_eq!(lru.remove(&current), Some(60));
         assert_eq!(lru.total_bytes(), 0);
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+    }
+
+    #[test]
+    fn sparse_version_index_releases_capacity_after_page_eviction() {
+        let lru = Lru::new();
+        let page_bytes = 64 << 10;
+        // Fill and drain each block while earlier blocks retain a pinned hot
+        // page. The index must follow residency rather than each block's peak.
+        for n in 0..8 {
+            let block = blk(n);
+            let hot = CacheUnit::Page(block.clone(), PageIndex(0));
+            for page in 0..512 {
+                lru.insert(CacheUnit::Page(block.clone(), PageIndex(page)), page_bytes);
+            }
+            assert!(lru.pin(&hot));
+            assert_eq!(lru.evict_to_fit((n + 1) * page_bytes).len(), 511,);
+        }
+        assert_eq!(lru.len(), 8);
+        assert_eq!(lru.total_bytes(), 8 * page_bytes);
+        let g = lru.inner.lock().unwrap();
+        for versions in g.versions.values() {
+            let pages = &versions[&Version::new("v1")];
+            assert_eq!(pages, &HashSet::from([Some(PageIndex(0))]));
+            assert!(pages.capacity() <= 64, "sparse set retains peak capacity");
+        }
+    }
+
+    #[test]
+    fn sparse_version_index_preserves_pins_and_regrows_after_shrinking() {
+        let lru = Lru::new();
+        let old = blk(1);
+        let mut keep = old.clone();
+        keep.version = Version::new("v2");
+        let hot = CacheUnit::Page(old.clone(), PageIndex(0));
+        let current = CacheUnit::Whole(keep.clone());
+        lru.insert(hot.clone(), 1);
+        assert!(lru.pin(&hot));
+        lru.insert(current.clone(), 1);
+
+        for explicit in [true, false] {
+            for page in 1..512 {
+                lru.insert(CacheUnit::Page(old.clone(), PageIndex(page)), 1);
+            }
+            if explicit {
+                for page in 1..512 {
+                    assert_eq!(
+                        lru.remove(&CacheUnit::Page(old.clone(), PageIndex(page))),
+                        Some(1),
+                    );
+                }
+            } else {
+                assert_eq!(lru.evict_superseded(&keep).len(), 511);
+            }
+            assert_eq!(lru.len(), 2);
+            assert_eq!(lru.total_bytes(), 2);
+            assert!(lru.evict_superseded(&keep).is_empty());
+            let g = lru.inner.lock().unwrap();
+            let pages = &g.versions[&LogicalBlock::from(&old)][&old.version];
+            assert_eq!(pages, &HashSet::from([Some(PageIndex(0))]));
+            assert!(pages.capacity() <= 64, "sparse set retains peak capacity");
+        }
+
+        lru.unpin(&hot);
+        assert_eq!(lru.evict_superseded(&keep), vec![hot]);
+        assert_eq!(lru.remove(&current), Some(1));
         assert!(lru.inner.lock().unwrap().versions.is_empty());
     }
 
