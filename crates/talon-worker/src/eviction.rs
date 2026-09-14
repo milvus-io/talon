@@ -11,10 +11,10 @@
 //! is done by the caller with the returned unit list. Segmented-LRU / TinyLFU
 //! are deferred per DESIGN.md.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
-use talon_core::{BlockId, PageIndex};
+use talon_core::{BlockId, ObjectId, PageIndex, Version};
 
 /// A single evictable cache unit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -23,6 +23,39 @@ pub enum CacheUnit {
     Whole(BlockId),
     /// One page of a paged block.
     Page(BlockId, PageIndex),
+}
+
+impl CacheUnit {
+    fn block(&self) -> &BlockId {
+        match self {
+            Self::Whole(block) | Self::Page(block, _) => block,
+        }
+    }
+
+    fn page(&self) -> Option<PageIndex> {
+        match self {
+            Self::Whole(_) => None,
+            Self::Page(_, page) => Some(*page),
+        }
+    }
+}
+
+/// Version-independent identity; offsets and block sizes must remain distinct.
+#[derive(PartialEq, Eq, Hash)]
+struct LogicalBlock {
+    object: ObjectId,
+    offset: u64,
+    block_size: u32,
+}
+
+impl From<&BlockId> for LogicalBlock {
+    fn from(block: &BlockId) -> Self {
+        Self {
+            object: block.object.clone(),
+            offset: block.offset,
+            block_size: block.block_size,
+        }
+    }
 }
 
 /// Internal per-unit bookkeeping.
@@ -41,8 +74,32 @@ pub struct Lru {
 
 struct Inner {
     entries: HashMap<CacheUnit, Entry>,
+    /// Only live units are indexed. `None` denotes a whole block; storing page
+    /// indices avoids duplicating object paths and versions for every page.
+    versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>>,
     total_bytes: u64,
     clock: u64,
+}
+
+impl Inner {
+    /// All removal paths must update both maps under the same lock.
+    fn remove(&mut self, unit: &CacheUnit) -> Option<u64> {
+        let entry = self.entries.remove(unit)?;
+        let block = unit.block();
+        let key = LogicalBlock::from(block);
+        let versions = self.versions.get_mut(&key).expect("tracked logical block");
+        let units = versions.get_mut(&block.version).expect("tracked version");
+        let removed = units.remove(&unit.page());
+        debug_assert!(removed, "tracked cache unit missing from version index");
+        if units.is_empty() {
+            versions.remove(&block.version);
+        }
+        if versions.is_empty() {
+            self.versions.remove(&key);
+        }
+        Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
+        Some(entry.bytes)
+    }
 }
 
 impl Lru {
@@ -64,6 +121,7 @@ impl Lru {
         Self {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
+                versions: HashMap::new(),
                 total_bytes: 0,
                 clock: 0,
             }),
@@ -98,6 +156,13 @@ impl Lru {
             Self::add_bytes(&mut g.total_bytes, bytes);
         } else {
             Self::add_bytes(&mut g.total_bytes, bytes);
+            let block = unit.block();
+            g.versions
+                .entry(LogicalBlock::from(block))
+                .or_default()
+                .entry(block.version.clone())
+                .or_default()
+                .insert(unit.page());
             g.entries.insert(
                 unit,
                 Entry {
@@ -143,10 +208,7 @@ impl Lru {
 
     /// Remove a unit outright (e.g. explicit delete), returning its byte cost.
     pub fn remove(&self, unit: &CacheUnit) -> Option<u64> {
-        let mut g = self.inner.lock().unwrap();
-        let e = g.entries.remove(unit)?;
-        Self::subtract_bytes(&mut g.total_bytes, e.bytes);
-        Some(e.bytes)
+        self.inner.lock().unwrap().remove(unit)
     }
 
     /// Evict and return every *superseded* unit — whole block or page — for the
@@ -158,28 +220,39 @@ impl Lru {
     /// Called on commit of a fresh version, this reclaims the stale sibling(s)
     /// immediately. Pinned units (an in-flight reader still serving the old
     /// bytes) are left alone.
+    ///
+    /// Looks up only this logical block's versions and visits units belonging
+    /// to other versions. With only `keep` resident, no cache units are scanned,
+    /// regardless of the number of pages in this block or the rest of the cache.
     pub fn evict_superseded(&self, keep: &BlockId) -> Vec<CacheUnit> {
         let mut g = self.inner.lock().unwrap();
-        let victims: Vec<CacheUnit> = g
-            .entries
+        let Some(versions) = g.versions.get(&LogicalBlock::from(keep)) else {
+            return Vec::new();
+        };
+        if versions.len() == 1 && versions.contains_key(&keep.version) {
+            return Vec::new();
+        }
+        let victims: Vec<CacheUnit> = versions
             .iter()
-            .filter(|(unit, e)| {
-                let id = match unit {
-                    CacheUnit::Whole(id) => id,
-                    CacheUnit::Page(id, _) => id,
-                };
-                e.pins == 0
-                    && id.object == keep.object
-                    && id.offset == keep.offset
-                    && id.block_size == keep.block_size
-                    && id.version != keep.version
+            .filter(|(version, _)| *version != &keep.version)
+            .flat_map(|(version, units)| {
+                units.iter().map(move |page| {
+                    let block = BlockId::new(
+                        keep.object.clone(),
+                        keep.offset,
+                        keep.block_size,
+                        version.clone(),
+                    );
+                    match page {
+                        None => CacheUnit::Whole(block),
+                        Some(page) => CacheUnit::Page(block, *page),
+                    }
+                })
             })
-            .map(|(unit, _)| unit.clone())
+            .filter(|unit| g.entries.get(unit).expect("indexed cache unit").pins == 0)
             .collect();
         for unit in &victims {
-            if let Some(e) = g.entries.remove(unit) {
-                Self::subtract_bytes(&mut g.total_bytes, e.bytes);
-            }
+            g.remove(unit);
         }
         victims
     }
@@ -202,9 +275,7 @@ impl Lru {
                 .map(|(u, _)| u.clone());
             match victim {
                 Some(unit) => {
-                    if let Some(e) = g.entries.remove(&unit) {
-                        Self::subtract_bytes(&mut g.total_bytes, e.bytes);
-                    }
+                    g.remove(&unit);
                     evicted.push(unit);
                 }
                 None => break, // everything left is pinned
@@ -372,5 +443,130 @@ mod tests {
         };
         assert!(lru.evict_superseded(&keep).is_empty());
         assert_eq!(lru.total_bytes(), 200);
+        lru.unpin(&v1);
+        assert_eq!(lru.evict_superseded(&keep), vec![v1]);
+        assert_eq!(lru.total_bytes(), 100);
+    }
+
+    #[test]
+    fn superseded_pages_and_whole_blocks_preserve_pins_and_current_pages() {
+        let lru = Lru::new();
+        let old = blk(1);
+        let mut keep = old.clone();
+        keep.version = Version::new("v2");
+        let mut older = old.clone();
+        older.version = Version::new("v0");
+        let old_page = CacheUnit::Page(old.clone(), PageIndex(0));
+        let pinned_page = CacheUnit::Page(old.clone(), PageIndex(1));
+        let old_whole = CacheUnit::Whole(old);
+        let older_page = CacheUnit::Page(older, PageIndex(0));
+        let current_page = CacheUnit::Page(keep.clone(), PageIndex(0));
+        for unit in [
+            &old_page,
+            &pinned_page,
+            &old_whole,
+            &older_page,
+            &current_page,
+        ] {
+            lru.insert(unit.clone(), 10);
+        }
+        assert!(lru.pin(&pinned_page));
+        assert!(lru.pin(&pinned_page));
+        // Updating a page must neither duplicate its index entry nor reset pins.
+        lru.insert(pinned_page.clone(), 20);
+        lru.unpin(&pinned_page);
+
+        let victims: HashSet<_> = lru.evict_superseded(&keep).into_iter().collect();
+        assert_eq!(victims, HashSet::from([old_page, old_whole, older_page]));
+        assert_eq!(lru.total_bytes(), 30);
+        assert_eq!(lru.len(), 2);
+        assert!(lru.evict_superseded(&keep).is_empty());
+
+        lru.unpin(&pinned_page);
+        assert_eq!(lru.evict_superseded(&keep), vec![pinned_page]);
+        assert_eq!(lru.total_bytes(), 10);
+        assert_eq!(lru.remove(&current_page), Some(10));
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+    }
+
+    #[test]
+    fn superseded_lookup_respects_all_logical_block_fields() {
+        let lru = Lru::new();
+        let old = blk(1);
+        let mut keep = old.clone();
+        keep.version = Version::new("v2");
+        let mut different_blocks = vec![old.clone(); 5];
+        different_blocks[0].object.backend = Backend::Gcs;
+        different_blocks[1].object.bucket = "other-bucket".into();
+        different_blocks[2].object.object_path = "other-path".into();
+        different_blocks[3].offset += u64::from(old.block_size);
+        different_blocks[4].block_size /= 2;
+        let unrelated: Vec<_> = different_blocks
+            .into_iter()
+            .map(|block| CacheUnit::Page(block, PageIndex(0)))
+            .collect();
+        let victim = CacheUnit::Page(old, PageIndex(0));
+        lru.insert(victim.clone(), 10);
+        for unit in &unrelated {
+            lru.insert(unit.clone(), 10);
+        }
+        // `keep` need not already be tracked to reclaim its other versions.
+        assert_eq!(lru.evict_superseded(&keep), vec![victim]);
+        assert!(lru.evict_superseded(&keep).is_empty());
+        assert_eq!(lru.total_bytes(), 50);
+        for unit in unrelated {
+            assert_eq!(lru.remove(&unit), Some(10));
+        }
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+    }
+
+    #[test]
+    fn version_index_tracks_explicit_and_capacity_removal_and_reinsertion() {
+        let lru = Lru::new();
+        let old = blk(1);
+        let mut keep = old.clone();
+        keep.version = Version::new("v2");
+        let page0 = CacheUnit::Page(old.clone(), PageIndex(0));
+        let page1 = CacheUnit::Page(old, PageIndex(1));
+        let current = CacheUnit::Whole(keep.clone());
+        lru.insert(page0.clone(), 10);
+        lru.insert(page1.clone(), 20);
+        lru.insert(current.clone(), 30);
+
+        assert_eq!(lru.remove(&page0), Some(10));
+        assert_eq!(lru.remove(&page0), None);
+        assert_eq!(lru.evict_to_fit(30), vec![page1.clone()]);
+        assert!(lru.evict_superseded(&keep).is_empty());
+        {
+            let g = lru.inner.lock().unwrap();
+            let versions = &g.versions[&LogicalBlock::from(&keep)];
+            assert_eq!(versions.len(), 1);
+            assert_eq!(versions[&keep.version], HashSet::from([None]));
+        }
+        // The same identities can be admitted again after either removal path.
+        lru.insert(page0.clone(), 40);
+        lru.insert(page1.clone(), 50);
+        let victims: HashSet<_> = lru.evict_superseded(&keep).into_iter().collect();
+        assert_eq!(victims, HashSet::from([page0, page1]));
+        assert_eq!(lru.total_bytes(), 30);
+        assert_eq!(lru.evict_to_fit(0), vec![current.clone()]);
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+        lru.insert(current.clone(), 60);
+        assert!(lru.evict_superseded(&keep).is_empty());
+        assert_eq!(lru.remove(&current), Some(60));
+        assert_eq!(lru.total_bytes(), 0);
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+    }
+
+    #[test]
+    fn filling_current_pages_does_not_reclaim_them() {
+        let lru = Lru::new();
+        let block = blk(1);
+        for page in 0..4096 {
+            lru.insert(CacheUnit::Page(block.clone(), PageIndex(page)), 64);
+            assert!(lru.evict_superseded(&block).is_empty());
+        }
+        assert_eq!(lru.len(), 4096);
+        assert_eq!(lru.total_bytes(), 4096 * 64);
     }
 }
