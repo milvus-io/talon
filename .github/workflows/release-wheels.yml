@@ -43,6 +43,8 @@ jobs:
             runner: macos-14
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
 
       - name: Build the wheel
         uses: PyO3/maturin-action@v1

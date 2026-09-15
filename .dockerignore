@@ -14,8 +14,6 @@
 /docs
 /deploy
 *.md
-# Monoio includes this file in its crate documentation at compile time.
-!/vendor/monoio/README.md
 /bench
 
 # Editor / OS cruft and local secrets.
@@ -25,3 +23,6 @@
 .env.*
 *.pem
 *.key
+
+# Always regenerate the patched dependency inside the build.
+/.patched-deps

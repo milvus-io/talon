@@ -5,20 +5,24 @@
 
 FROM rust:1.96.1-bookworm AS chef
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
 
 FROM chef AS planner
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
+RUN python3 scripts/prepare_monoio.py \
+    && cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /src/recipe.json recipe.json
-# The patched path dependency also needs its compile-time README.
-COPY vendor/monoio vendor/monoio
+# Reuse the verified and patched release prepared in the planner stage.
+COPY --from=planner /src/.patched-deps/monoio .patched-deps/monoio
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
     --package talon-gateway
 COPY . .
