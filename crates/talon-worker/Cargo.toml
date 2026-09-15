@@ -78,3 +78,7 @@ prost-build.workspace = true
 
 [features]
 telemetry = ["talon-telemetry/export"]
+
+[[bench]]
+name = "eviction_benches"
+harness = false

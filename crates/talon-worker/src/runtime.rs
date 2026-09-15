@@ -159,7 +159,8 @@ impl WorkerRuntime {
                 Some(page) => CacheUnit::Page(id, page),
                 None => CacheUnit::Whole(id),
             };
-            lru.insert(unit, bytes);
+            let access = lru.insert(unit.clone(), bytes);
+            index.set_access(&unit, access);
         }
         let l1 = Arc::new(MemoryStore::with_limits(
             l1_capacity_bytes,
@@ -478,7 +479,8 @@ impl WorkerRuntime {
                 if request.len > 0
                     && l1_ok
                     && matches!(
-                        self.index.presence(&block, first, PageIndex(last.0 + 1)),
+                        self.index
+                            .presence_and_touch(&block, first, PageIndex(last.0 + 1)),
                         Presence::PageHit
                     )
                 {
@@ -492,10 +494,6 @@ impl WorkerRuntime {
                                 self.metrics.record_l2_hit();
                                 talon_telemetry::cache_tier("l2");
                                 self.metrics.record_cache_hit();
-                                for p in first.0..=last.0 {
-                                    self.lru
-                                        .touch(&CacheUnit::Page(block.clone(), PageIndex(p)));
-                                }
                                 tracing::info!(
                                     block = %block,
                                     first_page = first.0,
@@ -524,7 +522,8 @@ impl WorkerRuntime {
                 ));
             }
             if matches!(
-                self.index.presence(&block, PageIndex(0), PageIndex(1)),
+                self.index
+                    .presence_and_touch(&block, PageIndex(0), PageIndex(1)),
                 Presence::Whole
             ) {
                 // Open an fd over exactly the requested window. This can fail if
@@ -539,7 +538,7 @@ impl WorkerRuntime {
                     // the requested window.
                     Ok(mut handles) if handles.len() == 1 => {
                         let handle = handles.pop().expect("one handle");
-                        self.record_l2_hit(&block);
+                        self.record_l2_hit();
                         tracing::info!(block = %block, tier = "l2", "HIT (sendfile)");
                         return Ok(ServeOutcome::Sendfile(handle));
                     }
@@ -837,7 +836,8 @@ impl WorkerRuntime {
         // must hit). Serve such a block from the whole-block store rather than
         // re-fetching it a page at a time from the origin.
         if matches!(
-            self.index.presence(block, PageIndex(0), PageIndex(1)),
+            self.index
+                .presence_and_touch(block, PageIndex(0), PageIndex(1)),
             Presence::Whole
         ) {
             if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
@@ -983,14 +983,16 @@ impl WorkerRuntime {
             if let Some(bytes) = self.l1.get_page(block, page) {
                 self.metrics.record_l1_hit();
                 talon_telemetry::cache_tier("l1");
-                self.lru.touch(&CacheUnit::Page(block.clone(), page));
+                self.index
+                    .presence_and_touch(block, page, PageIndex(page.0 + 1));
                 tracing::debug!(block = %block, page = page.0, tier = "l1", "HIT");
                 return Ok(Some(bytes));
             }
             self.metrics.record_l1_miss();
         }
         if !matches!(
-            self.index.presence(block, page, PageIndex(page.0 + 1)),
+            self.index
+                .presence_and_touch(block, page, PageIndex(page.0 + 1)),
             Presence::PageHit
         ) {
             self.metrics.record_l2_miss();
@@ -1001,7 +1003,6 @@ impl WorkerRuntime {
             Ok(bytes) => {
                 self.metrics.record_l2_hit();
                 talon_telemetry::cache_tier("l2");
-                self.lru.touch(&CacheUnit::Page(block.clone(), page));
                 tracing::debug!(block = %block, page = page.0, tier = "l2", "HIT");
                 if self.l1.is_enabled() {
                     self.admit_l1_page(block, page, bytes.clone());
@@ -1170,7 +1171,8 @@ impl WorkerRuntime {
         self.index.mark_page(block, page);
 
         let unit = CacheUnit::Page(block.clone(), page);
-        self.lru.insert(unit.clone(), bytes.len() as u64);
+        let access = self.lru.insert(unit.clone(), bytes.len() as u64);
+        self.index.set_access(&unit, access);
         self.lru.pin(&unit);
         let superseded = self.lru.evict_superseded(block);
         self.unlink_units(superseded).await;
@@ -1297,7 +1299,7 @@ impl WorkerRuntime {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some(meta) = self.index.get(block) else {
+        let Some(meta) = self.index.get_and_touch(block) else {
             if self.l1.is_enabled() {
                 self.metrics.record_l1_miss();
             }
@@ -1315,7 +1317,6 @@ impl WorkerRuntime {
                     self.metrics.record_l1_hit();
                     talon_telemetry::cache_tier("l1");
                     self.metrics.record_cache_hit();
-                    self.lru.touch(&CacheUnit::Whole(block.clone()));
                     tracing::debug!(block = %block, offset, len, tier = "l1", "HIT");
                     return Ok(Some(bytes));
                 }
@@ -1325,7 +1326,7 @@ impl WorkerRuntime {
             }
         }
 
-        self.record_l2_hit(block);
+        self.record_l2_hit();
         tracing::debug!(block = %block, offset, len, tier = "l2", "HIT");
         if !self.l1.is_enabled() {
             let bytes = match self.store.get_range_bytes(block, offset, len).await {
@@ -1366,12 +1367,11 @@ impl WorkerRuntime {
         tracing::debug!(%block, "discarded stale L2 index entry after file miss");
     }
 
-    /// Record an L2 hit and touch its capacity LRU.
-    fn record_l2_hit(&self, block: &BlockId) {
+    /// Record an L2 hit. The preceding index lookup already marks recency.
+    fn record_l2_hit(&self) {
         self.metrics.record_l2_hit();
         talon_telemetry::cache_tier("l2");
         self.metrics.record_cache_hit();
-        self.lru.touch(&CacheUnit::Whole(block.clone()));
     }
 
     fn page_window(&self, offset: u64, len: u64, block_len: u64) -> anyhow::Result<(u64, u64)> {
@@ -1534,7 +1534,9 @@ impl WorkerRuntime {
             // #119) — then the coldest blocks until we are back under capacity. The
             // block just committed is pinned for the duration so it is never the
             // victim of its own commit.
-            self.lru.insert(CacheUnit::Whole(block.clone()), len);
+            let unit = CacheUnit::Whole(block.clone());
+            let access = self.lru.insert(unit.clone(), len);
+            self.index.set_access(&unit, access);
             self.lru.pin(&CacheUnit::Whole(block.clone()));
             let superseded = self.lru.evict_superseded(block);
             self.unlink_units(superseded).await;
@@ -1658,7 +1660,9 @@ impl WorkerRuntime {
             form: BlockForm::Whole,
             len,
         });
-        self.lru.insert(CacheUnit::Whole(block.clone()), len);
+        let unit = CacheUnit::Whole(block.clone());
+        let access = self.lru.insert(unit.clone(), len);
+        self.index.set_access(&unit, access);
         self.lru.pin(&CacheUnit::Whole(block.clone()));
         // Drop any superseded prior version of this object from the cache.
         let superseded = self.lru.evict_superseded(&block);

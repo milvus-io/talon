@@ -330,8 +330,15 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   only pages touched by L2 hits; L2 remains persistent and authoritative for
   cache residency. Disabling L1 retains the whole-block `sendfile` path. No
   `mmap` as the default abstraction.
-- **Eviction:** byte-accounted **LRU / segmented-LRU** first. LFU risks pinning
-  stale hotspots; TinyLFU is more complex — revisit with real workload data.
+- **Eviction:** byte-accounted **approximate LRU (second chance)**. Resident
+  index entries hold stable access tokens; a read marks an atomic reference bit
+  during its existing index lookup, without cloning the block identity or taking
+  the policy mutex. Strict tail order is intentionally relaxed; pins, version
+  identity and byte accounting remain exact. Capacity reclamation walks a live
+  ordered queue in batches of 64 candidates, giving referenced units a second
+  chance. A bounded second pass guarantees progress under continuous reads.
+  Explicit and superseded-version deletion remove queue nodes immediately;
+  there is no full-cache minimum search for each victim or stale-node backlog.
   Capacity is per-worker, with support for multiple cache dirs each with its own
   cap.
 - **Chunking:** the logical addressing unit is a fixed **256MB block**. Placement,

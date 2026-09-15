@@ -1,9 +1,9 @@
-//! Byte-accounted LRU eviction policy.
+//! Byte-accounted approximate LRU (second-chance) eviction policy.
 //!
 //! Tracks cache *units* — a whole block, or a single `(block, page)` for paged
-//! blocks — in least-recently-used order, keyed by their byte cost rather than
+//! blocks — in a second-chance queue, keyed by their byte cost rather than
 //! by count. When the tracked total exceeds capacity, [`Lru::evict_to_fit`]
-//! returns the coldest units to reclaim, skipping any unit currently *pinned*
+//! returns reclamation candidates, skipping any unit currently *pinned*
 //! by an in-flight reader (so a `sendfile` in progress is never evicted).
 //!
 //! This module is policy only: it decides *what* to evict and maintains byte
@@ -11,8 +11,9 @@
 //! is done by the caller with the returned unit list. Segmented-LRU / TinyLFU
 //! are deferred per DESIGN.md.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use talon_core::{BlockId, ObjectId, PageIndex, Version};
 
@@ -58,22 +59,38 @@ impl From<&BlockId> for LogicalBlock {
     }
 }
 
-/// Internal per-unit bookkeeping.
+/// Stable recency token for one resident unit. Keeping this token does not pin
+/// data. After removal it cannot affect a new admission of the same identity.
+#[derive(Clone, Default)]
+pub struct AccessHandle(Arc<AtomicBool>);
+
+impl AccessHandle {
+    /// Coalesce hits until the eviction hand consumes this second chance.
+    /// This is advisory recency only, so relaxed ordering is sufficient.
+    pub fn touch(&self) {
+        if !self.0.load(Ordering::Relaxed) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+}
+
 struct Entry {
     bytes: u64,
-    /// Monotonic tick of last access; higher = more recently used.
-    last_used: u64,
-    /// Active readers; a unit with `pins > 0` is never evicted.
+    position: u64,
+    access: AccessHandle,
     pins: u32,
 }
 
-/// A byte-accounted LRU tracker with reader pinning.
+/// Byte-accounted second-chance eviction with strict pinning. Reads use stable
+/// access handles; only membership changes and eviction take the policy lock.
 pub struct Lru {
     inner: Mutex<Inner>,
+    eviction: Mutex<()>,
 }
 
 struct Inner {
-    entries: HashMap<CacheUnit, Entry>,
+    entries: HashMap<Arc<CacheUnit>, Entry>,
+    queue: BTreeMap<u64, Arc<CacheUnit>>,
     /// Only live units are indexed. `None` denotes a whole block; storing page
     /// indices avoids duplicating object paths and versions for every page.
     versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>>,
@@ -85,6 +102,7 @@ impl Inner {
     /// All removal paths must update both maps under the same lock.
     fn remove(&mut self, unit: &CacheUnit) -> Option<u64> {
         let entry = self.entries.remove(unit)?;
+        self.queue.remove(&entry.position);
         let block = unit.block();
         let key = LogicalBlock::from(block);
         let versions = self.versions.get_mut(&key).expect("tracked logical block");
@@ -126,10 +144,12 @@ impl Lru {
         Self {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
+                queue: BTreeMap::new(),
                 versions: HashMap::new(),
                 total_bytes: 0,
                 clock: 0,
             }),
+            eviction: Mutex::new(()),
         }
     }
 
@@ -148,44 +168,49 @@ impl Lru {
         self.inner.lock().unwrap().entries.is_empty()
     }
 
-    /// Insert or update a unit with its byte cost, marking it most-recently-used.
-    pub fn insert(&self, unit: CacheUnit, bytes: u64) {
+    /// Insert or update a unit, returning its stable access token. Updating an
+    /// existing admission preserves its pins and token.
+    pub fn insert(&self, unit: CacheUnit, bytes: u64) -> AccessHandle {
         let mut g = self.inner.lock().unwrap();
-        g.clock += 1;
-        let tick = g.clock;
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
             e.bytes = bytes;
-            e.last_used = tick;
+            e.access.touch();
+            let access = e.access.clone();
             Self::subtract_bytes(&mut g.total_bytes, old);
             Self::add_bytes(&mut g.total_bytes, bytes);
-        } else {
-            Self::add_bytes(&mut g.total_bytes, bytes);
-            let block = unit.block();
-            g.versions
-                .entry(LogicalBlock::from(block))
-                .or_default()
-                .entry(block.version.clone())
-                .or_default()
-                .insert(unit.page());
-            g.entries.insert(
-                unit,
-                Entry {
-                    bytes,
-                    last_used: tick,
-                    pins: 0,
-                },
-            );
+            return access;
         }
+        Self::add_bytes(&mut g.total_bytes, bytes);
+        let block = unit.block();
+        g.versions
+            .entry(LogicalBlock::from(block))
+            .or_default()
+            .entry(block.version.clone())
+            .or_default()
+            .insert(unit.page());
+        let access = AccessHandle::default();
+        let position = g.clock;
+        g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
+        let unit = Arc::new(unit);
+        g.queue.insert(position, unit.clone());
+        g.entries.insert(
+            unit,
+            Entry {
+                bytes,
+                position,
+                access: access.clone(),
+                pins: 0,
+            },
+        );
+        access
     }
 
-    /// Record an access, moving the unit to most-recently-used. No-op if absent.
+    /// Compatibility lookup for callers without a resolved access token.
+    /// Data-path reads should touch the token obtained with their index lookup.
     pub fn touch(&self, unit: &CacheUnit) {
-        let mut g = self.inner.lock().unwrap();
-        g.clock += 1;
-        let tick = g.clock;
-        if let Some(e) = g.entries.get_mut(unit) {
-            e.last_used = tick;
+        if let Some(e) = self.inner.lock().unwrap().entries.get(unit) {
+            e.access.touch();
         }
     }
 
@@ -262,28 +287,53 @@ impl Lru {
         victims
     }
 
-    /// Evict coldest unpinned units until `total_bytes <= capacity`.
+    /// Reclaim capacity with a bounded second-chance walk. Queue membership is
+    /// exact: explicit/version removals also erase their queue nodes, so churn
+    /// cannot accumulate stale candidates. Each candidate costs O(log N), with
+    /// no full-map search per victim. Hits never reorder this queue.
     ///
-    /// Returns the evicted units (coldest first) so the caller can unlink files
-    /// and update the index. Pinned units are skipped; if only pinned units
-    /// remain, eviction stops even if still over capacity.
+    /// Two bounded passes guarantee progress even under continuous touches;
+    /// the second pass may reclaim recently touched units but never pinned ones.
+    /// Policy locks are released every 64 candidates to bound mutation stalls.
     pub fn evict_to_fit(&self, capacity: u64) -> Vec<CacheUnit> {
-        let mut g = self.inner.lock().unwrap();
+        // Most admissions do not need eviction or its serialization lock.
+        if self.total_bytes() <= capacity {
+            return Vec::new();
+        }
+        let _eviction = self.eviction.lock().unwrap();
+        let count = self.len();
         let mut evicted = Vec::new();
-        while g.total_bytes > capacity {
-            // Find the coldest unpinned unit.
-            let victim = g
-                .entries
-                .iter()
-                .filter(|(_, e)| e.pins == 0)
-                .min_by_key(|(_, e)| e.last_used)
-                .map(|(u, _)| u.clone());
-            match victim {
-                Some(unit) => {
-                    g.remove(&unit);
-                    evicted.push(unit);
+        for second_pass in [false, true] {
+            let mut remaining = count;
+            while remaining > 0 {
+                let mut g = self.inner.lock().unwrap();
+                let batch = remaining.min(64);
+                for _ in 0..batch {
+                    if g.total_bytes <= capacity {
+                        return evicted;
+                    }
+                    let Some((position, unit)) = g.queue.first_key_value() else {
+                        return evicted;
+                    };
+                    let position = *position;
+                    let unit = unit.clone();
+                    let e = g.entries.get(unit.as_ref()).expect("queued entry");
+                    let referenced = e.access.0.swap(false, Ordering::Relaxed);
+                    if e.pins == 0 && (second_pass || !referenced) {
+                        g.remove(&unit);
+                        evicted.push((*unit).clone());
+                    } else {
+                        g.queue.remove(&position);
+                        let next = g.clock;
+                        g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
+                        g.entries
+                            .get_mut(unit.as_ref())
+                            .expect("queued entry")
+                            .position = next;
+                        g.queue.insert(next, unit);
+                    }
                 }
-                None => break, // everything left is pinned
+                remaining -= batch;
             }
         }
         evicted
@@ -312,6 +362,79 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn stable_handle_never_touches_a_replacement_admission() {
+        let lru = Lru::new();
+        let old = lru.insert(whole(1), 10);
+        lru.remove(&whole(1));
+        lru.insert(whole(1), 10);
+        lru.insert(whole(2), 10);
+        old.touch();
+        assert_eq!(lru.evict_to_fit(10), vec![whole(1)]);
+    }
+
+    #[test]
+    fn handle_hits_do_not_need_the_policy_lock() {
+        let lru = Lru::new();
+        let handle = lru.insert(whole(1), 10);
+        lru.insert(whole(2), 10);
+        let guard = lru.inner.lock().unwrap();
+        // This would deadlock if a token lookup took the policy lock.
+        handle.touch();
+        drop(guard);
+        assert_eq!(lru.evict_to_fit(10), vec![whole(2)]);
+    }
+
+    #[test]
+    fn removal_churn_keeps_one_queue_node_per_resident_unit() {
+        let lru = Lru::new();
+        for i in 0..4096 {
+            lru.insert(whole(i % 8), 10);
+            lru.insert(whole(i % 8), 20);
+            if i % 3 == 0 {
+                lru.remove(&whole(i % 8));
+            }
+            let g = lru.inner.lock().unwrap();
+            assert_eq!(g.queue.len(), g.entries.len());
+            for (position, unit) in &g.queue {
+                assert_eq!(g.entries[unit].position, *position);
+            }
+        }
+        lru.evict_to_fit(0);
+        let g = lru.inner.lock().unwrap();
+        assert!(g.queue.is_empty());
+        assert!(g.versions.is_empty());
+    }
+
+    #[test]
+    fn continuously_touched_entries_do_not_prevent_capacity_reclamation() {
+        let lru = Lru::new();
+        let handles: Vec<_> = (0..2048).map(|i| lru.insert(whole(i), 10)).collect();
+        for i in 0..16 {
+            assert!(lru.pin(&whole(i)));
+        }
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                while !stop.load(Ordering::Relaxed) {
+                    for access in &handles {
+                        access.touch();
+                    }
+                }
+            });
+            for access in &handles {
+                access.touch();
+            }
+            let evicted = lru.evict_to_fit(160);
+            stop.store(true, Ordering::Relaxed);
+            assert_eq!(evicted.len(), 2032);
+            assert_eq!(lru.total_bytes(), 160);
+            for i in 0..16 {
+                assert!(!evicted.contains(&whole(i)));
+            }
+        });
     }
 
     #[test]
