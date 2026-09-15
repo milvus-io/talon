@@ -17,6 +17,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /src/recipe.json recipe.json
+# The patched path dependency also needs its compile-time README.
+COPY vendor/monoio vendor/monoio
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
     --package talon-gateway
 COPY . .

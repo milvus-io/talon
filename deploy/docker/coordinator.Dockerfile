@@ -42,6 +42,8 @@ RUN apt-get update \
 # source-only change. --locked on the cook makes a stale lockfile fail here
 # in seconds instead of after the multi-minute dependency build.
 COPY --from=planner /src/recipe.json recipe.json
+# The patched path dependency also needs its compile-time README.
+COPY vendor/monoio vendor/monoio
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
     --package talon-coordinator --features etcd,kubernetes
 

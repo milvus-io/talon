@@ -14,6 +14,8 @@
 /docs
 /deploy
 *.md
+# Monoio includes this file in its crate documentation at compile time.
+!/vendor/monoio/README.md
 /bench
 
 # Editor / OS cruft and local secrets.

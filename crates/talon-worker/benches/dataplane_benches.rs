@@ -33,8 +33,10 @@
 //!
 //! That is the expected result, not a disappointment. io_uring's advantage is
 //! amortizing syscalls across many in-flight operations; with one connection
-//! and one request in flight there is nothing to amortize, and the bulk bytes
-//! bypass the ring entirely via `sendfile` either way. The standalone harness in
+//! and one request in flight there is nothing to amortize. The historical
+//! comparison above used sendfile on both paths. The current ring uses file
+//! splice plus a nonblocking pipe drain, with per-connection pipe setup that
+//! this fresh-connection benchmark includes. The standalone harness in
 //! #273 measured its 35% win at **1024 concurrent connections**, where per-core
 //! efficiency and tail latency diverge sharply.
 //!
@@ -248,7 +250,7 @@ fn spawn_uring_server(
     let h = talon_worker::uring_conn::RingConnHandler::new(runtime, observability);
     let serve_addr = addr.clone();
     std::thread::spawn(move || {
-        let _ = talon_worker::uring_serve::serve(serve_addr, 1, 4, admission, h, handle);
+        let _ = talon_worker::uring_serve::serve(serve_addr, 1, admission, h, handle);
     });
 
     // Wait for the ring to bind before the harness starts timing.
