@@ -36,6 +36,11 @@ rather than serialised on the interpreter.
 connections retained per peer address in each coordinator/worker pool, not
 the number of concurrent requests. The idle timeout remains 30 seconds.
 
+Passing both `version` and `size` to `read` skips the metadata lookup and pins
+the read to that exact source generation; Talon never substitutes newer bytes.
+Supplying only one raises `ValueError` because both must describe the same
+generation. Omit both to resolve current metadata with `stat`.
+
 **Read-only in this release.** Writes go through the FUSE mount or the Rust
 client; `put`/`delete` are tracked separately.
 

@@ -37,6 +37,12 @@ Message types:
 | 3 | `Put` | data |
 | 4 | `Ping` | either |
 | 5 | `Delete` | data |
+| 6 | `GetCachedRange` | data |
+| 7 | `AdmitCachedBlock` | data |
+| 8 | `GetRangeTenant` | data |
+| 9 | `GetCachedRangeTenant` | data |
+| 10 | `GetVersionedRange` | data |
+| 11 | `GetVersionedRangeTenant` | data |
 
 A zero payload length is legal and must not be treated as end-of-stream.
 
@@ -133,6 +139,26 @@ A `GetRange` request frame carries a bincode `RangeRequest` body:
 ```
 struct RangeRequest { object: ObjectId, offset: u64, len: u64 }
 ```
+
+A client that already resolved an object's source version sends a distinct
+`GetVersionedRange` request (message type 10):
+
+```
+struct VersionedRangeRequest { request: RangeRequest, version: Version }
+```
+
+The worker must serve the exact versioned cache identity or fill it from the
+backend with `version` as a conditional request. It returns `VersionMismatch`
+if that generation is no longer available; it must not re-resolve and serve a
+newer generation. `GetVersionedRangeTenant` (message type 11) wraps the request
+with a `TenantId`. A paged miss may issue HEAD to obtain the block length;
+that metadata must match the requested version too. These distinct request types are fail-closed during rolling
+upgrades: an older worker rejects them instead of silently ignoring `version`.
+Deployments must therefore upgrade workers before enabling a client that emits
+these messages; old clients continue using `GetRange` against new workers.
+Custom `BackendStore` implementations must explicitly implement conditional
+range reads; the trait default rejects a supplied version rather than silently
+ignoring it.
 
 The response is a header followed by **raw object bytes with no envelope** —
 this is what allows the worker to `sendfile` from the block file directly into

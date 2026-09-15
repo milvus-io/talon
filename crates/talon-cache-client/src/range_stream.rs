@@ -227,7 +227,8 @@ mod tests {
     use talon_core::{Backend, NodeId, NodeInfo, NodeRole};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
     use talon_transport::{
-        decode_request, encode_typed_error, response_header_ok, ControlMessage, DataPlaneError,
+        decode_versioned_request, encode_typed_error, response_header_ok, ControlMessage,
+        DataPlaneError,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -301,7 +302,7 @@ mod tests {
                         socket.read_exact(&mut body).await.unwrap();
                         let mut frame = header.encode().to_vec();
                         frame.extend_from_slice(&body);
-                        let request = decode_request(&frame).unwrap().1;
+                        let request = decode_versioned_request(&frame).unwrap().1.request;
                         requests.fetch_add(1, Ordering::SeqCst);
                         let bytes: Vec<u8> = (request.offset..request.offset + request.len)
                             .map(|value| value as u8)

@@ -66,6 +66,8 @@ talon_read_async(
     0,
     buffer,
     1 << 20,
+    NULL,  /* version: resolve it */
+    NULL,  /* object size: resolve it */
     on_read,
     NULL,
     &request_id);
@@ -77,6 +79,11 @@ exclusive access to that byte range: do not read, write, free, or reuse
 overlapping storage for another operation until the callback runs. A zero-length
 read may pass `NULL` for the buffer. The callback receives a `talon_result`;
 release it with `talon_result_free`.
+
+Passing both the version and size from `talon_stat_async` skips another stat.
+The supplied version is exact: workers serve matching cached bytes or
+conditionally fetch that generation from the backend. If it is unavailable,
+the callback reports an error instead of returning replacement bytes.
 
 The client handle must also remain alive until callbacks for submitted
 operations have run. Freeing it earlier cancels in-flight work.

@@ -23,6 +23,23 @@ impl BackendStore for Origin {
             .collect::<Vec<_>>()
             .into())
     }
+    async fn fetch_range_if_match(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<Bytes> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != "v1" {
+                return Err(talon_core::Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: "v1".into(),
+                });
+            }
+        }
+        self.fetch_range(object, offset, len).await
+    }
     async fn head(&self, _: &ObjectId) -> Result<ObjectStat> {
         self.0
             .lock()
@@ -102,22 +119,58 @@ async fn v2_stat_cold_hit_cache_only_and_v1_on_same_connection() {
         codec::decode(&response).unwrap().1,
         codec::ControlMessage::ObjectStat { size: 64, .. }
     ));
-    for version in [2, 2, 1] {
-        let mut request = data::encode_request(
-            2,
-            &data::RangeRequest {
-                object: object.clone(),
-                offset: 0,
-                len: 4,
-            },
-        )
-        .unwrap();
+    for (index, version) in [2, 2, 1].into_iter().enumerate() {
+        let range = data::RangeRequest {
+            object: object.clone(),
+            offset: 0,
+            len: 4,
+        };
+        let versioned = data::VersionedRangeRequest {
+            request: range.clone(),
+            version: Version::new("v1"),
+        };
+        let mut request = match index {
+            0 => data::encode_versioned_request(2, &versioned).unwrap(),
+            1 => data::encode_versioned_tenant_request(
+                2,
+                &data::TenantScopedVersionedRange {
+                    tenant: talon_core::TenantId::named("acme"),
+                    request: versioned,
+                },
+            )
+            .unwrap(),
+            _ => data::encode_request(2, &range).unwrap(),
+        };
         if version == 2 {
             envelope::encode(&mut request, Some(&parent), None).unwrap();
         }
         let (header, response) = exchange(&mut stream, request).await;
         assert_eq!(header.version, version);
         assert_eq!(&response[HEADER_LEN..], &[0, 1, 2, 3]);
+    }
+    for (source_version, code) in [
+        ("stale", talon_transport::DataErrorCode::VersionMismatch),
+        (" ", talon_transport::DataErrorCode::InvalidRequest),
+    ] {
+        let mut request = data::encode_versioned_request(
+            4,
+            &data::VersionedRangeRequest {
+                request: data::RangeRequest {
+                    object: object.clone(),
+                    offset: 32,
+                    len: 4,
+                },
+                version: Version::new(source_version),
+            },
+        )
+        .unwrap();
+        envelope::encode(&mut request, Some(&parent), None).unwrap();
+        let (header, response) = exchange(&mut stream, request).await;
+        assert_eq!(header.version, 2);
+        assert_eq!(
+            data::decode_error_payload(&response[HEADER_LEN..]).code,
+            code
+        );
     }
     let calls_before = backend.0.lock().unwrap().len();
     let mut request = data::encode_cached_request(

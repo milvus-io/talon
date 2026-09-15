@@ -138,6 +138,10 @@ impl Client {
     }
 
     /// Read an object range into a newly allocated buffer.
+    ///
+    /// `known_stat` pins all returned bytes to its exact source version. Workers
+    /// serve matching cached bytes or conditionally fill them from the origin;
+    /// a version mismatch fails the read instead of substituting newer bytes.
     pub async fn read(
         &self,
         object: &ObjectId,
@@ -210,6 +214,8 @@ impl Client {
     }
 
     /// Read an object range into a caller-owned buffer.
+    ///
+    /// `known_stat` has the same exact-version semantics as [`read`](Self::read).
     pub async fn read_into(
         &self,
         object: &ObjectId,
@@ -270,6 +276,11 @@ impl Client {
     ) -> Result<usize, Error> {
         let requested = u64::try_from(dst.len())
             .map_err(|_| Error::InvalidArgument("destination length does not fit in u64".into()))?;
+        if stat.version.trim().is_empty() {
+            return Err(Error::InvalidArgument(
+                "object version must be non-empty".into(),
+            ));
+        }
         let version = Version::new(stat.version.as_str());
         let plan = plan_read(
             object,
@@ -298,7 +309,12 @@ impl Client {
             let reader = &self.reader;
             pending.push(async move {
                 reader
-                    .read_block_into(&segment.block, segment.offset_in_block, chunk, now_ms)
+                    .read_versioned_block_into(
+                        &segment.block,
+                        segment.offset_in_block,
+                        chunk,
+                        now_ms,
+                    )
                     .await
                     .map_err(Error::from)
             });
@@ -350,8 +366,8 @@ mod tests {
     use talon_core::{Backend, NodeId, NodeInfo, NodeRole};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
     use talon_transport::{
-        decode_request, encode_typed_error, response_header_ok, ControlMessage, DataErrorCode,
-        RangeRequest,
+        decode_versioned_request, encode_typed_error, response_header_ok, ControlMessage,
+        DataErrorCode,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -418,7 +434,9 @@ mod tests {
                     socket.read_exact(&mut payload).await.unwrap();
                     let mut frame = header_bytes.to_vec();
                     frame.extend_from_slice(&payload);
-                    let (_, request): (_, RangeRequest) = decode_request(&frame).unwrap();
+                    let (_, versioned) = decode_versioned_request(&frame).unwrap();
+                    assert_eq!(versioned.version, Version::new("test-version"));
+                    let request = versioned.request;
                     let bytes: Vec<u8> = (0..request.len)
                         .map(|index| ((request.offset + index) % 251) as u8)
                         .collect();
@@ -449,7 +467,9 @@ mod tests {
                     socket.read_exact(&mut payload).await.unwrap();
                     let mut frame = header_bytes.to_vec();
                     frame.extend_from_slice(&payload);
-                    let (_, request): (_, RangeRequest) = decode_request(&frame).unwrap();
+                    let (_, versioned) = decode_versioned_request(&frame).unwrap();
+                    assert_eq!(versioned.version, Version::new("test-version"));
+                    let request = versioned.request;
                     let short_len = request.len.saturating_sub(1) as usize;
                     let mut response = response_header_ok(0, short_len as u32).to_vec();
                     response.extend_from_slice(&vec![0_u8; short_len]);
@@ -483,7 +503,9 @@ mod tests {
                     socket.read_exact(&mut payload).await.unwrap();
                     let mut frame = header_bytes.to_vec();
                     frame.extend_from_slice(&payload);
-                    let (_, request): (_, RangeRequest) = decode_request(&frame).unwrap();
+                    let (_, versioned) = decode_versioned_request(&frame).unwrap();
+                    assert_eq!(versioned.version, Version::new("test-version"));
+                    let request = versioned.request;
                     if request.offset < 8 {
                         release_first_block.notified().await;
                     } else {
@@ -524,7 +546,9 @@ mod tests {
                     socket.read_exact(&mut payload).await.unwrap();
                     let mut frame = header_bytes.to_vec();
                     frame.extend_from_slice(&payload);
-                    let (_, request): (_, RangeRequest) = decode_request(&frame).unwrap();
+                    let (_, versioned) = decode_versioned_request(&frame).unwrap();
+                    assert_eq!(versioned.version, Version::new("test-version"));
+                    let request = versioned.request;
                     if request.offset < 8 {
                         stalled_block_started.notify_one();
                         let mut byte = [0_u8; 1];
@@ -747,8 +771,10 @@ mod tests {
                                     let response = if worker {
                                         let mut frame = header_bytes.to_vec();
                                         frame.extend_from_slice(&payload);
-                                        let (_, request): (_, RangeRequest) =
-                                            decode_request(&frame).unwrap();
+                                        let (_, versioned) =
+                                            decode_versioned_request(&frame).unwrap();
+                                        assert_eq!(versioned.version, Version::new("test-version"));
+                                        let request = versioned.request;
                                         assert_eq!(request.len, 8);
                                         let mut response = response_header_ok(0, 8).to_vec();
                                         response.extend_from_slice(&[7; 8]);

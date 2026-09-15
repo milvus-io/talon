@@ -24,6 +24,23 @@ impl BackendStore for Origin {
             .collect::<Vec<_>>()
             .into())
     }
+    async fn fetch_range_if_match(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<Bytes> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != "v1" {
+                return Err(talon_core::Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: "v1".into(),
+                });
+            }
+        }
+        self.fetch_range(object, offset, len).await
+    }
     async fn head(&self, _: &ObjectId) -> Result<ObjectStat> {
         self.0
             .lock()

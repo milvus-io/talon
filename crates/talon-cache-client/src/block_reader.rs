@@ -52,6 +52,13 @@ struct ReplicaFailure {
     retryable: bool,
 }
 
+/// Whether a miss follows the current origin or the block's exact version.
+#[derive(Clone, Copy)]
+enum OriginReadMode {
+    Current,
+    ExactVersion,
+}
+
 /// Errors from a block read.
 #[derive(Debug, thiserror::Error)]
 pub enum BlockReadError {
@@ -281,6 +288,9 @@ impl BlockReader {
     /// the entry and performs **one** membership refresh (which may return a
     /// different worker set), then retries against the fresh primary.
     /// Only if that also fails does the error propagate.
+    ///
+    /// This legacy/FUSE entry point follows the current origin generation. Use
+    /// [`read_versioned_block_into`](Self::read_versioned_block_into) to pin the source.
     pub async fn read_block(
         &self,
         block: &BlockId,
@@ -289,7 +299,13 @@ impl BlockReader {
         now_ms: u64,
     ) -> Result<Vec<u8>, BlockReadError> {
         match self
-            .read_block_detailed(block, offset_in_block, len, now_ms)
+            .read_block_detailed_with_mode(
+                block,
+                offset_in_block,
+                len,
+                now_ms,
+                OriginReadMode::Current,
+            )
             .await
         {
             Ok(bytes) => Ok(bytes),
@@ -310,6 +326,40 @@ impl BlockReader {
         dst: &mut [u8],
         now_ms: u64,
     ) -> Result<usize, BlockReadError> {
+        self.read_block_into_with_mode(block, offset_in_block, dst, now_ms, OriginReadMode::Current)
+            .await
+    }
+
+    /// Read into `dst` from the exact source version carried by `block`.
+    ///
+    /// A miss is conditionally fetched without resolving a newer generation.
+    /// Version mismatches retain their worker error classification. Legacy
+    /// [`read_block_into`](Self::read_block_into) keeps following the current origin.
+    pub async fn read_versioned_block_into(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        now_ms: u64,
+    ) -> Result<usize, BlockReadError> {
+        self.read_block_into_with_mode(
+            block,
+            offset_in_block,
+            dst,
+            now_ms,
+            OriginReadMode::ExactVersion,
+        )
+        .await
+    }
+
+    async fn read_block_into_with_mode(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        now_ms: u64,
+        mode: OriginReadMode,
+    ) -> Result<usize, BlockReadError> {
         let cached = match self.cache.get(block, now_ms) {
             Some(cached) => {
                 self.stats.record_cache_hit();
@@ -323,7 +373,7 @@ impl BlockReader {
         let abs_offset = block.offset + u64::from(offset_in_block);
 
         match self
-            .try_replicas_into(block, &cached.replicas, abs_offset, dst)
+            .try_replicas_into(block, &cached.replicas, abs_offset, dst, mode)
             .await
         {
             Ok(n) => {
@@ -342,7 +392,7 @@ impl BlockReader {
 
         let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
         let n = self
-            .try_replicas_into(block, &fresh.replicas, abs_offset, dst)
+            .try_replicas_into(block, &fresh.replicas, abs_offset, dst, mode)
             .await
             .map_err(|failure| BlockReadError::AllReplicasFailed {
                 worker: failure.worker,
@@ -352,7 +402,7 @@ impl BlockReader {
         Ok(n)
     }
 
-    /// Read one block slice while preserving the last worker failure.
+    /// Read one exact-version block slice while preserving the last worker failure.
     ///
     /// Exhausted retries retain the last worker address and typed failure in
     /// `AllReplicasFailed`. Streaming protocol frontends use that final failure
@@ -363,6 +413,24 @@ impl BlockReader {
         offset_in_block: u32,
         len: u32,
         now_ms: u64,
+    ) -> Result<Vec<u8>, DetailedBlockReadError> {
+        self.read_block_detailed_with_mode(
+            block,
+            offset_in_block,
+            len,
+            now_ms,
+            OriginReadMode::ExactVersion,
+        )
+        .await
+    }
+
+    async fn read_block_detailed_with_mode(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        len: u32,
+        now_ms: u64,
+        mode: OriginReadMode,
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
         let cached = match self.cache.get(block, now_ms) {
             Some(c) => {
@@ -378,7 +446,7 @@ impl BlockReader {
 
         // First pass: walk the cached replica list in order.
         match self
-            .try_replicas(block, &cached.replicas, abs_offset, len)
+            .try_replicas(block, &cached.replicas, abs_offset, len, mode)
             .await
         {
             Ok(bytes) => {
@@ -399,7 +467,7 @@ impl BlockReader {
 
         let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
         let bytes = self
-            .try_replicas(block, &fresh.replicas, abs_offset, len)
+            .try_replicas(block, &fresh.replicas, abs_offset, len, mode)
             .await
             .map_err(|failure| BlockReadError::AllReplicasFailed {
                 worker: failure.worker,
@@ -421,6 +489,7 @@ impl BlockReader {
         replicas: &[String],
         abs_offset: u64,
         len: u32,
+        mode: OriginReadMode,
     ) -> Result<Vec<u8>, ReplicaFailure> {
         if replicas.is_empty() {
             return Err(ReplicaFailure {
@@ -437,10 +506,24 @@ impl BlockReader {
         for addr in replicas {
             let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
             self.stats.record_worker_fetch();
-            match worker
-                .fetch_range(&block.object, abs_offset, len as u64)
-                .await
-            {
+            let result = match mode {
+                OriginReadMode::Current => {
+                    worker
+                        .fetch_range(&block.object, abs_offset, len as u64)
+                        .await
+                }
+                OriginReadMode::ExactVersion => {
+                    worker
+                        .fetch_versioned_range(
+                            &block.object,
+                            &block.version,
+                            abs_offset,
+                            len as u64,
+                        )
+                        .await
+                }
+            };
+            match result {
                 Ok(bytes) if bytes.len() as u64 == u64::from(len) => {
                     self.record_zone_read(addr, bytes.len() as u64);
                     return Ok(bytes);
@@ -489,6 +572,7 @@ impl BlockReader {
         replicas: &[String],
         abs_offset: u64,
         dst: &mut [u8],
+        mode: OriginReadMode,
     ) -> Result<usize, ReplicaFailure> {
         if replicas.is_empty() {
             return Err(ReplicaFailure {
@@ -505,10 +589,19 @@ impl BlockReader {
         for addr in replicas {
             let worker = WorkerClient::with_pool(addr.clone(), Arc::clone(&self.worker_pool));
             self.stats.record_worker_fetch();
-            match worker
-                .fetch_range_into(&block.object, abs_offset, dst)
-                .await
-            {
+            let result = match mode {
+                OriginReadMode::Current => {
+                    worker
+                        .fetch_range_into(&block.object, abs_offset, dst)
+                        .await
+                }
+                OriginReadMode::ExactVersion => {
+                    worker
+                        .fetch_versioned_range_into(&block.object, &block.version, abs_offset, dst)
+                        .await
+                }
+            };
+            match result {
                 Ok(n) if n == dst.len() => {
                     self.record_zone_read(addr, n as u64);
                     return Ok(n);

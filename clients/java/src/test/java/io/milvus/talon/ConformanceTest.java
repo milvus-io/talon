@@ -87,6 +87,7 @@ public final class ConformanceTest {
         localPlacementMatchesRust();
         statObjectEncodesIdentically(byName);
         listObjectsEncodesEmptyPrefix(byName);
+        versionedRangeEncodesIdentically(byName);
         errorResponseIsFlaggedAndCarriesAMessage(byName);
         connectionPooling();
 
@@ -257,6 +258,16 @@ public final class ConformanceTest {
                 assertBytes(v.get("control.list_objects.empty_prefix"), Messages.listObjects(4, "")));
     }
 
+    private static void versionedRangeEncodesIdentically(Map<String, byte[]> v) {
+        check("VersionedRangeRequest encodes byte-exactly", () -> {
+            ObjectId object =
+                    new ObjectId(ObjectId.Backend.AZURE, "container", "path/to/object");
+            assertBytes(
+                    v.get("data.versioned_range_request"),
+                    Messages.versionedRange(10, object, 65536, 4096, "etag-v1"));
+        });
+    }
+
     private static void errorResponseIsFlaggedAndCarriesAMessage(Map<String, byte[]> v) {
         check("error response sets the flag and carries UTF-8", () -> {
             byte[] bytes = v.get("data.error_response");
@@ -394,7 +405,7 @@ public final class ConformanceTest {
                     byte[] body = new byte[request.length()];
                     in.readFully(body);
                     byte[] response;
-                    if (request.type() == Frame.MsgType.GET_RANGE) {
+                    if (request.type() == Frame.MsgType.GET_VERSIONED_RANGE) {
                         arrived.countDown();
                         if (!release.await(5, TimeUnit.SECONDS)) {
                             throw new IOException("test response gate timed out");

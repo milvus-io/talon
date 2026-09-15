@@ -110,14 +110,16 @@ fn client_err(error: RustError) -> PyErr {
     }
 }
 
-fn complete_known_stat(
+fn known_stat_from_pair(
     known_version: Option<String>,
     known_size: Option<u64>,
-    resolved: RustObjectStat,
-) -> RustObjectStat {
-    RustObjectStat {
-        size: known_size.unwrap_or(resolved.size),
-        version: known_version.unwrap_or(resolved.version),
+) -> PyResult<Option<RustObjectStat>> {
+    match (known_version, known_size) {
+        (Some(version), Some(size)) => Ok(Some(RustObjectStat { size, version })),
+        (None, None) => Ok(None),
+        _ => Err(PyValueError::new_err(
+            "version and size must be supplied together",
+        )),
     }
 }
 
@@ -204,9 +206,10 @@ impl Client {
     /// Ranges spanning block boundaries are split and fetched per block, each
     /// benefiting independently from the placement cache.
     ///
-    /// `version` and `size` are resolved with a `stat` when omitted. Pass them
-    /// to skip that round trip when they are already known — for example when
-    /// reading many ranges of the same object.
+    /// `version` and `size` must be supplied together or both omitted. A supplied
+    /// pair skips `stat` and pins the read to that exact source generation.
+    /// Supplying only one raises `ValueError`, since metadata from different
+    /// generations cannot safely be combined.
     #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None))]
     #[allow(clippy::too_many_arguments)]
     fn read<'py>(
@@ -221,7 +224,7 @@ impl Client {
     ) -> PyResult<Bound<'py, PyBytes>> {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let known_version = version.map(str::to_owned);
+        let known_stat = known_stat_from_pair(version.map(str::to_owned), size)?;
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
 
@@ -240,16 +243,6 @@ impl Client {
                     );
                     let result = operation
                         .scope(async {
-                            let known_stat = match (known_version, size) {
-                                (Some(version), Some(size)) => {
-                                    Some(RustObjectStat { size, version })
-                                }
-                                (None, None) => None,
-                                (known_version, known_size) => {
-                                    let stat = client.stat(&object).await?;
-                                    Some(complete_known_stat(known_version, known_size, stat))
-                                }
-                            };
                             client
                                 .read(&object, offset, length, known_stat.as_ref())
                                 .await
@@ -391,18 +384,16 @@ mod tests {
     }
 
     #[test]
-    fn completing_partial_stat_preserves_caller_version() {
-        let completed = complete_known_stat(
-            Some("caller-version".into()),
-            None,
-            RustObjectStat {
-                size: 4096,
-                version: "coordinator-version".into(),
-            },
-        );
+    fn version_and_size_must_describe_one_generation() {
+        assert!(known_stat_from_pair(Some("v1".into()), None).is_err());
+        assert!(known_stat_from_pair(None, Some(4096)).is_err());
 
-        assert_eq!(completed.size, 4096);
-        assert_eq!(completed.version, "caller-version");
+        let complete = known_stat_from_pair(Some("v1".into()), Some(4096))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.version, "v1");
+        assert_eq!(complete.size, 4096);
+        assert!(known_stat_from_pair(None, None).unwrap().is_none());
     }
 
     #[test]

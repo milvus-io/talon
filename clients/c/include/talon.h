@@ -73,10 +73,11 @@ void talon_client_free(talon_client *client);
  *
  * version and object_size are each optional and independently nullable; NULL
  * means the caller does not have that value. The read skips the StatObject round
- * trip only when BOTH are non-NULL, using the caller-supplied version and size
- * (the caller owns keeping them current for the object generation being read).
- * If either is NULL the SDK resolves both with a StatObject first and any lone
- * value supplied is ignored, since a read cannot skip the stat without both.
+ * trip only when BOTH are non-NULL, using the caller-supplied size and exact
+ * source version. A worker may serve that generation from cache or conditionally
+ * fetch it from the backend, but never substitutes a newer generation. If either
+ * is NULL the SDK resolves both with a StatObject first and any lone value
+ * supplied is ignored, since a read cannot skip the stat without both.
  *
  * When used, *object_size is the object's total byte length and bounds the read
  * at EOF (a POSIX short read): a value smaller than offset + dst_len yields a

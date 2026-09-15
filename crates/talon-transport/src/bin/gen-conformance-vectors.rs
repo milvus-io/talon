@@ -17,7 +17,7 @@
 
 use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
 use talon_transport::codec::{self, ControlMessage, ObjectEntry, ZonedNodeInfo};
-use talon_transport::data::{self, RangeRequest};
+use talon_transport::data::{self, RangeRequest, VersionedRangeRequest};
 use talon_transport::frame::{FrameHeader, MsgType};
 
 /// One named vector: a message, the bytes it encodes to, and why it is here.
@@ -222,6 +222,22 @@ fn vectors() -> Vec<Vector> {
                 },
             )
             .expect("encode range request"),
+        },
+        Vector {
+            name: "data.versioned_range_request",
+            note: "Distinct fail-closed request carrying the exact source version",
+            bytes: data::encode_versioned_request(
+                10,
+                &VersionedRangeRequest {
+                    request: RangeRequest {
+                        object: object("container", "path/to/object"),
+                        offset: 65536,
+                        len: 4096,
+                    },
+                    version: Version::new("etag-v1"),
+                },
+            )
+            .expect("encode versioned range request"),
         },
         Vector {
             name: "data.response_header_ok",

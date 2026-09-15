@@ -53,6 +53,11 @@ for (long offset = 0; offset < info.size(); offset += chunkSize) {
 }
 ```
 
+The supplied version is an exact source identity. Talon may serve that
+generation from cache or conditionally fetch it from the origin, but it fails
+with an `IOException` if the generation is unavailable instead of returning
+bytes from a replacement object.
+
 ## Threads
 
 Instances are safe for concurrent use. Each call opens its own connection, so a

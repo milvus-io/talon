@@ -24,6 +24,7 @@ BIN = os.path.join(REPO, "target", "release")
 COORD_PORT, WORKER_PORT, ADMIN_PORT, ORIGIN_PORT = 17610, 17611, 17661, 17710
 BLOCK_SIZE = 8 << 20
 VERSION = "0x8LOADTEST"
+SIZE = 64 << 20
 URI = "az://container/bench"
 
 
@@ -112,16 +113,25 @@ def test_stat_returns_size_and_version(client):
     assert info.size > 0
 
 
-def test_read_with_only_version_preserves_supplied_version(client):
-    assert client.read(URI, version=VERSION, offset=0, length=4096) == ramp(0, 4096)
+def test_partial_metadata_is_rejected(client):
+    with pytest.raises(ValueError, match="version and size must be supplied together"):
+        client.read(URI, version=VERSION, offset=0, length=4096)
+    with pytest.raises(ValueError, match="version and size must be supplied together"):
+        client.read(URI, size=SIZE, offset=0, length=4096)
 
 
-def test_read_with_only_size_preserves_supplied_size(client):
-    assert client.read(URI, size=1024, offset=0, length=4096) == ramp(0, 1024)
+def test_stale_version_fails_closed(client):
+    with pytest.raises(OSError, match="[Vv]ersion|[Pp]recondition"):
+        client.read(URI, version="stale-etag", size=SIZE, offset=0, length=4096)
+
+
+def test_known_metadata_clamps_at_eof(client):
+    assert client.read(URI, version=VERSION, size=SIZE, offset=SIZE - 16,
+                       length=4096) == ramp(SIZE - 16, 16)
 
 
 def test_read_at_offset(client):
-    assert client.read(URI, version=VERSION, offset=1000, length=8192) == ramp(1000, 8192)
+    assert client.read(URI, version=VERSION, size=SIZE, offset=1000, length=8192) == ramp(1000, 8192)
 
 
 def test_read_spanning_block_boundaries(client):
@@ -129,7 +139,7 @@ def test_read_spanning_block_boundaries(client):
     reassembles in order. Getting the order or the boundary wrong here yields
     plausible-looking but corrupt data, so assert the bytes, not the length."""
     length = BLOCK_SIZE + (4 << 20)
-    got = client.read(URI, version=VERSION, offset=0, length=length)
+    got = client.read(URI, version=VERSION, size=SIZE, offset=0, length=length)
     assert len(got) == length
     assert got == ramp(0, length)
 
@@ -137,12 +147,12 @@ def test_read_spanning_block_boundaries(client):
 def test_read_crossing_a_single_boundary(client):
     """The narrow case: a small read straddling exactly one block edge."""
     offset = BLOCK_SIZE - 2048
-    got = client.read(URI, version=VERSION, offset=offset, length=4096)
+    got = client.read(URI, version=VERSION, size=SIZE, offset=offset, length=4096)
     assert got == ramp(offset, 4096)
 
 
 def test_zero_length_read_is_empty(client):
-    assert client.read(URI, version=VERSION, offset=0, length=0) == b""
+    assert client.read(URI, version=VERSION, size=SIZE, offset=0, length=0) == b""
 
 
 def test_concurrent_reads_from_threads(client):
@@ -153,7 +163,7 @@ def test_concurrent_reads_from_threads(client):
 
     def read(i):
         try:
-            results[i] = client.read(URI, version=VERSION, offset=i * 65536, length=65536)
+            results[i] = client.read(URI, version=VERSION, size=SIZE, offset=i * 65536, length=65536)
         except Exception as e:  # surfaced below so a failure names itself
             errors.append(e)
 
@@ -171,7 +181,7 @@ def test_concurrent_reads_from_threads(client):
 def test_bad_uri_raises_value_error(client):
     for bad in ["no-scheme", "ftp://bucket/key", "az://bucket", "az:///key"]:
         with pytest.raises(ValueError):
-            client.read(bad, version=VERSION, offset=0, length=1)
+            client.read(bad, version=VERSION, size=SIZE, offset=0, length=1)
 
 
 def test_client_repr_and_coordinator(client, cluster):
