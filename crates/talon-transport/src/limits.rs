@@ -53,7 +53,9 @@ pub fn max_payload_for(msg_type: MsgType) -> u32 {
         | MsgType::GetCachedRange
         | MsgType::AdmitCachedBlock
         | MsgType::GetRangeTenant
-        | MsgType::GetCachedRangeTenant => MAX_CONTROL_PAYLOAD_LEN,
+        | MsgType::GetCachedRangeTenant
+        | MsgType::GetVersionedRange
+        | MsgType::GetVersionedRangeTenant => MAX_CONTROL_PAYLOAD_LEN,
         MsgType::Get | MsgType::GetRange => MAX_PAYLOAD_LEN,
     }
 }

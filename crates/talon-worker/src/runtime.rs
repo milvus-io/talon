@@ -340,6 +340,28 @@ impl WorkerRuntime {
         }
     }
 
+    /// Serve an origin-backed range pinned to the caller's exact source version.
+    ///
+    /// Unlike [`serve`](Self::serve), this path never switches to the current
+    /// source version. A matching resident block remains readable; an origin
+    /// miss is fetched with `version` as an `If-Match` precondition. A paged miss
+    /// may HEAD for its length, but must reject metadata for another version.
+    /// A changed source propagates `VersionMismatch` to the caller.
+    pub async fn serve_versioned(
+        &self,
+        request: &RangeRequest,
+        version: &Version,
+    ) -> anyhow::Result<ServeOutcome> {
+        self.ensure_configured_backend(request.object.backend)?;
+        if version.0.trim().is_empty() {
+            anyhow::bail!("version-pinned range request has an empty source version");
+        }
+        if request.len == 0 {
+            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
+        }
+        self.serve_at(request, version).await
+    }
+
     /// Serve a versioned range only from resident cache state.
     ///
     /// Unlike [`serve`](Self::serve), this path neither resolves metadata nor
@@ -1202,6 +1224,13 @@ impl WorkerRuntime {
                     self.backend.head(object).await.map_err(|error| {
                         anyhow::anyhow!("resolve object length (HEAD): {error}")
                     })?;
+                if stat.version != block.version {
+                    return Err(Error::VersionMismatch {
+                        expected: block.version.0.clone(),
+                        found: stat.version.0,
+                    }
+                    .into());
+                }
                 self.store_version(object, &stat.version, stat.len);
                 stat.len
             }
@@ -1920,6 +1949,18 @@ mod tests {
 
     use super::*;
 
+    fn expect_test_version(if_match: Option<&Version>, current: &str) -> Result<()> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != current {
+                return Err(Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: current.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     struct MockBackend {
         calls: AtomicUsize,
     }
@@ -1933,6 +1974,17 @@ mod tests {
             } else {
                 Ok(Bytes::from_static(b"abcdefgh"))
             }
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -2987,6 +3039,17 @@ mod tests {
             Ok(Bytes::from(buf))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: u64::MAX,
@@ -3007,6 +3070,17 @@ mod tests {
             let n = len.min(self.block_size) as usize;
             let buf: Vec<u8> = (0..n).map(|i| ((offset + i as u64) % 251) as u8).collect();
             Ok(Bytes::from(buf))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3176,6 +3250,17 @@ mod tests {
             Ok(Bytes::from_static(b"abcdefgh"))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: 8,
@@ -3255,6 +3340,18 @@ mod tests {
         async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             Ok(self.body.lock().unwrap().clone())
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            let current = self.version.lock().unwrap().clone();
+            expect_test_version(if_match, &current)?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3483,9 +3580,12 @@ mod tests {
 
     #[async_trait]
     impl BackendStore for CondBackend {
-        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+        async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
-            Ok(self.body.lock().unwrap().clone())
+            let body = self.body.lock().unwrap();
+            let start = (offset as usize).min(body.len());
+            let end = start.saturating_add(len as usize).min(body.len());
+            Ok(body.slice(start..end))
         }
 
         async fn fetch_range_if_match(
@@ -3569,7 +3669,7 @@ mod tests {
         let root = tmp_root();
         let backend = Arc::new(CondBackend {
             version: std::sync::Mutex::new("v1".into()),
-            body: std::sync::Mutex::new(Bytes::from_static(b"old-data-old-data")),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-old-old-old-")),
             heads: AtomicUsize::new(0),
             fetches: AtomicUsize::new(0),
             enforce_precondition: true,
@@ -3588,7 +3688,7 @@ mod tests {
 
         // Overwrite the source; the version cache still holds v1.
         *backend.version.lock().unwrap() = "v2".into();
-        *backend.body.lock().unwrap() = Bytes::from_static(b"new-data-new-data");
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-new-new-new-");
 
         // block1 (offset 8): a miss under the stale cached v1 -> If-Match(v1)
         // 412 -> re-resolve v2 -> refetch. Must serve the fresh v2 bytes.
@@ -3598,6 +3698,172 @@ mod tests {
             Bytes::from_static(b"new-"),
             "must re-resolve and serve fresh bytes after a precondition failure"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    async fn assert_version_pinned_read_never_switches(paged: bool) {
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-old-old-old-")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: true,
+        });
+        let mut runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+        if paged {
+            runtime =
+                runtime.with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
+        }
+        let missing_offset = if paged { 4 } else { 8 };
+        let object = ObjectId::new(Backend::Azure, "container", "obj");
+        let request = |offset| RangeRequest {
+            object: object.clone(),
+            offset,
+            len: 4,
+        };
+        let version_v1 = Version::new("v1");
+
+        let first = runtime
+            .serve_versioned(&request(0), &version_v1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"old-")
+        ));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged));
+
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-new-new-new-");
+
+        let cached = runtime
+            .serve_versioned(&request(0), &version_v1)
+            .await
+            .unwrap();
+        let handles = match cached {
+            ServeOutcome::Sendfile(handle) => vec![handle],
+            ServeOutcome::SendfileMany(handles) => handles,
+            ServeOutcome::Bytes(_) => panic!("expected a resident cache hit"),
+        };
+        let mut cached_bytes = Vec::new();
+        for handle in handles {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::from(handle.fd.try_clone().unwrap());
+            let mut bytes = vec![0; handle.len as usize];
+            file.read_exact_at(&mut bytes, handle.offset).unwrap();
+            cached_bytes.extend(bytes);
+        }
+        assert_eq!(cached_bytes, b"old-");
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+
+        let error = runtime
+            .serve_versioned(&request(missing_offset), &version_v1)
+            .await
+            .err()
+            .expect("a pinned read must not refresh to v2");
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::VersionMismatch { expected, found })
+                if expected == "v1" && found == "v2"
+        ));
+        assert_eq!(
+            backend.heads.load(Ordering::SeqCst),
+            usize::from(paged),
+            "cached metadata must not be refreshed to another generation"
+        );
+
+        let current = runtime.serve(&request(missing_offset)).await.unwrap();
+        assert!(matches!(
+            current,
+            ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"new-")
+        ));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged) + 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn version_pinned_whole_read_never_switches_to_a_newer_generation() {
+        assert_version_pinned_read_never_switches(false).await;
+    }
+
+    #[tokio::test]
+    async fn version_pinned_paged_read_never_switches_to_a_newer_generation() {
+        assert_version_pinned_read_never_switches(true).await;
+    }
+
+    #[tokio::test]
+    async fn version_pinned_paged_miss_rejects_length_from_another_generation() {
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v2".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"new-")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: true,
+        });
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60))
+            .with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
+        // The replacement is shorter than this old-generation range. Its size
+        // must not turn the read into a successful short read or seed old metadata.
+        let request = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "obj"),
+            offset: 8,
+            len: 4,
+        };
+        let error = runtime
+            .serve_versioned(&request, &Version::new("v1"))
+            .await
+            .err()
+            .expect("a stale HEAD must fail the pinned read");
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::VersionMismatch { expected, found })
+            if expected == "v1" && found == "v2")
+        );
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.block_count(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    struct UnguardedBackend {
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for UnguardedBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_static(b"new-data"))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 8,
+                version: Version::new("v2"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn version_pinned_miss_fails_closed_when_backend_cannot_enforce_it() {
+        let root = tmp_root();
+        let backend = Arc::new(UnguardedBackend {
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with(Arc::clone(&backend), WorkerMetrics::new(1024), &root, 8);
+
+        let error = runtime
+            .serve_versioned(&request("obj"), &Version::new("v1"))
+            .await
+            .err()
+            .expect("an unguarded backend must not return newer bytes");
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::Unsupported(message))
+                if message.contains("version-conditional read")
+        ));
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.block_count(), 0);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3737,6 +4003,17 @@ mod tests {
                     .map(|i| ((offset + i as u64) % 251) as u8)
                     .collect::<Vec<u8>>(),
             ))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {

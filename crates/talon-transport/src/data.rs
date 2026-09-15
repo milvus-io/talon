@@ -91,6 +91,29 @@ pub struct TenantScopedRange {
     pub request: RangeRequest,
 }
 
+/// An origin-backed range request pinned to one exact source version.
+///
+/// This uses a distinct message type from [`RangeRequest`] so an older worker
+/// rejects it instead of silently ignoring the version and serving newer
+/// bytes. A cache miss may access the backend, but only with `version` as the
+/// conditional source identity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VersionedRangeRequest {
+    /// The ordinary object and byte-range coordinates.
+    pub request: RangeRequest,
+    /// Exact source version that every returned byte must belong to.
+    pub version: Version,
+}
+
+/// A [`VersionedRangeRequest`] annotated with the tenant it is attributed to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TenantScopedVersionedRange {
+    /// The tenant this request is attributed to.
+    pub tenant: TenantId,
+    /// The underlying version-pinned range request.
+    pub request: VersionedRangeRequest,
+}
+
 /// A cache-only range probe carrying the exact versioned cache identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CachedRangeRequest {
@@ -239,6 +262,81 @@ pub fn encode_tenant_request(
 pub fn decode_tenant_request(buf: &[u8]) -> Result<(FrameHeader, TenantScopedRange), DataError> {
     let header = FrameHeader::decode(buf)?;
     if header.msg_type != MsgType::GetRangeTenant {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let (_, body) = crate::envelope::decode(&header, body)?;
+    let scoped = bincode::deserialize(body)?;
+    Ok((header, scoped))
+}
+
+/// Encode a version-pinned, origin-backed range request.
+///
+/// The reply is an ordinary [`MsgType::GetRange`] frame. The distinct request
+/// type makes rolling upgrades fail closed when the selected worker is old.
+pub fn encode_versioned_request(
+    request_id: u32,
+    req: &VersionedRangeRequest,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(req)?;
+    let header = FrameHeader::new(MsgType::GetVersionedRange, request_id, body.len() as u32);
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a framed version-pinned range request.
+pub fn decode_versioned_request(
+    buf: &[u8],
+) -> Result<(FrameHeader, VersionedRangeRequest), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetVersionedRange {
+        return Err(DataError::NotGetRange(header.msg_type));
+    }
+    let declared = header.length as usize;
+    let body = &buf[HEADER_LEN..];
+    if body.len() != declared {
+        return Err(DataError::LengthMismatch {
+            declared,
+            actual: body.len(),
+        });
+    }
+    let (_, body) = crate::envelope::decode(&header, body)?;
+    let req = bincode::deserialize(body)?;
+    Ok((header, req))
+}
+
+/// Encode a tenant-attributed version-pinned range request.
+pub fn encode_versioned_tenant_request(
+    request_id: u32,
+    scoped: &TenantScopedVersionedRange,
+) -> Result<Vec<u8>, DataError> {
+    let body = bincode::serialize(scoped)?;
+    let header = FrameHeader::new(
+        MsgType::GetVersionedRangeTenant,
+        request_id,
+        body.len() as u32,
+    );
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
+    buf.extend_from_slice(&header.encode());
+    buf.extend_from_slice(&body);
+    Ok(buf)
+}
+
+/// Decode a tenant-attributed version-pinned range request.
+pub fn decode_versioned_tenant_request(
+    buf: &[u8],
+) -> Result<(FrameHeader, TenantScopedVersionedRange), DataError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::GetVersionedRangeTenant {
         return Err(DataError::NotGetRange(header.msg_type));
     }
     let declared = header.length as usize;
@@ -529,6 +627,39 @@ mod tests {
         assert_eq!(header.msg_type, MsgType::GetCachedRange);
         assert_eq!(header.request_id, 12);
         assert_eq!(decoded, request);
+    }
+
+    #[test]
+    fn versioned_request_round_trips_and_is_fail_closed() {
+        let request = VersionedRangeRequest {
+            request: req(),
+            version: Version::new("etag-v2"),
+        };
+        let encoded = encode_versioned_request(13, &request).unwrap();
+        let (header, decoded) = decode_versioned_request(&encoded).unwrap();
+        assert_eq!(header.msg_type, MsgType::GetVersionedRange);
+        assert_eq!(header.request_id, 13);
+        assert_eq!(decoded, request);
+        assert!(matches!(
+            decode_request(&encoded),
+            Err(DataError::NotGetRange(MsgType::GetVersionedRange))
+        ));
+    }
+
+    #[test]
+    fn versioned_tenant_request_round_trips() {
+        let scoped = TenantScopedVersionedRange {
+            tenant: TenantId::named("acme"),
+            request: VersionedRangeRequest {
+                request: req(),
+                version: Version::new("etag-v3"),
+            },
+        };
+        let encoded = encode_versioned_tenant_request(14, &scoped).unwrap();
+        let (header, decoded) = decode_versioned_tenant_request(&encoded).unwrap();
+        assert_eq!(header.msg_type, MsgType::GetVersionedRangeTenant);
+        assert_eq!(header.request_id, 14);
+        assert_eq!(decoded, scoped);
     }
 
     fn cached_req() -> CachedRangeRequest {

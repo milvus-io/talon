@@ -326,8 +326,9 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
 /// `version` and `object_size` are each optional and independently nullable;
 /// NULL means "the caller does not have this value". The read takes the fast
 /// path that skips the `StatObject` round trip **only when both are non-NULL** —
-/// then it reads under the caller-supplied version and size, and the caller owns
-/// keeping them current for the object generation being read. If either is NULL
+/// then it reads under the caller-supplied size and exact source version. A
+/// worker may serve that generation from cache or conditionally fetch it from
+/// the backend, but never substitutes newer bytes. If either is NULL
 /// the SDK resolves both with a `StatObject` first (the historical behavior) and
 /// any lone value that was supplied is ignored, since a stat is authoritative
 /// for both and a read cannot skip it without both halves.
@@ -776,7 +777,7 @@ mod tests {
 
     use talon_core::{NodeId, NodeInfo, NodeRole};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
-    use talon_transport::{decode_request, response_header_ok, ControlMessage, RangeRequest};
+    use talon_transport::{decode_versioned_request, response_header_ok, ControlMessage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -876,7 +877,7 @@ mod tests {
         }
     }
 
-    async fn mock_worker() -> String {
+    async fn mock_worker(observed_versions: Option<Arc<Mutex<Vec<String>>>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -885,6 +886,7 @@ mod tests {
                     Ok(v) => v,
                     Err(_) => return,
                 };
+                let observed_versions = observed_versions.clone();
                 tokio::spawn(async move {
                     let mut hdr = [0u8; HEADER_LEN];
                     if sock.read_exact(&mut hdr).await.is_err() {
@@ -895,7 +897,14 @@ mod tests {
                     sock.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_header, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    let (_header, versioned) = decode_versioned_request(&full).unwrap();
+                    if let Some(observed_versions) = observed_versions {
+                        observed_versions
+                            .lock()
+                            .unwrap()
+                            .push(versioned.version.as_str().to_owned());
+                    }
+                    let req = versioned.request;
                     let payload: Vec<u8> = (0..req.len)
                         .map(|i| ((req.offset + i) % 251) as u8)
                         .collect();
@@ -985,7 +994,7 @@ mod tests {
     }
 
     async fn new_client() -> (*mut TalonClient, String) {
-        let worker = mock_worker().await;
+        let worker = mock_worker(None).await;
         let coordinator = mock_coordinator(worker).await;
         let coordinator_c = cstring(&coordinator);
         let mut options = TalonClientOptions {
@@ -1005,8 +1014,11 @@ mod tests {
 
     /// Build a client with a caller-chosen block size whose coordinator counts
     /// the `StatObject` calls it serves.
-    async fn new_client_counting(block_size: u32) -> (*mut TalonClient, Arc<AtomicUsize>) {
-        let worker = mock_worker().await;
+    async fn new_client_counting(
+        block_size: u32,
+    ) -> (*mut TalonClient, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let observed_versions = Arc::new(Mutex::new(Vec::new()));
+        let worker = mock_worker(Some(Arc::clone(&observed_versions))).await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_coordinator_counting(worker, Arc::clone(&stat_calls)).await;
         let coordinator_c = cstring(&coordinator);
@@ -1019,7 +1031,7 @@ mod tests {
         let status = unsafe { talon_client_new(coordinator_c.as_ptr(), &options, &mut client) };
         assert_eq!(status, STATUS_OK);
         assert!(!client.is_null());
-        (client, stat_calls)
+        (client, stat_calls, observed_versions)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1120,12 +1132,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn read_with_version_skips_stat() {
-        let (client, stat_calls) = new_client_counting(0).await;
+    async fn read_with_exact_version_and_size_skips_stat_and_clamps() {
+        let (client, stat_calls, observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
-        let object_size: u64 = 8192;
+        let object_size: u64 = 512;
         let mut dst = vec![0u8; 4096];
         let mut request_id = 0u64;
 
@@ -1146,13 +1158,19 @@ mod tests {
         assert_eq!(status, STATUS_OK);
         let snapshot = state.wait();
         assert_eq!(snapshot.status, STATUS_OK);
-        assert_eq!(snapshot.bytes_written, dst.len());
-        let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
-        assert_eq!(dst, expected);
+        assert_eq!(snapshot.bytes_written, 412);
+        let expected: Vec<u8> = (0..412).map(|j| ((100 + j) % 251) as u8).collect();
+        assert_eq!(&dst[..412], expected);
+        assert!(dst[412..].iter().all(|byte| *byte == 0));
         assert_eq!(
             stat_calls.load(Ordering::SeqCst),
             0,
             "a caller-supplied version and size must skip the StatObject round trip"
+        );
+        assert_eq!(
+            observed_versions.lock().unwrap().as_slice(),
+            ["caller-known-version"],
+            "the C caller's version must reach the worker unchanged"
         );
         assert!(snapshot.error.is_none());
 
@@ -1163,7 +1181,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_without_version_calls_stat() {
-        let (client, stat_calls) = new_client_counting(0).await;
+        let (client, stat_calls, _observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let mut dst = vec![0u8; 4096];
@@ -1201,7 +1219,7 @@ mod tests {
     async fn version_without_size_falls_back_to_stat() {
         // A caller that knows the version but has no valid size passes a NULL
         // object_size; the read must resolve both via StatObject, not guess.
-        let (client, stat_calls) = new_client_counting(0).await;
+        let (client, stat_calls, _observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
@@ -1241,7 +1259,7 @@ mod tests {
     async fn empty_object_fast_path_reads_zero_without_stat() {
         // object_size pointing at 0 is a genuinely empty object, distinct from a
         // NULL "unknown": the read returns zero bytes and still skips the stat.
-        let (client, stat_calls) = new_client_counting(0).await;
+        let (client, stat_calls, _observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
@@ -1282,7 +1300,7 @@ mod tests {
     async fn multi_block_read_reassembles_concurrent_blocks() {
         // A 1 KiB block size makes a 4 KiB read span five blocks, so the
         // concurrent fetches must land in the right disjoint sub-slices.
-        let (client, _stat_calls) = new_client_counting(1024).await;
+        let (client, _stat_calls, observed_versions) = new_client_counting(1024).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
@@ -1312,6 +1330,14 @@ mod tests {
         // correct reassembly reproduces that sequence across every block.
         let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
         assert_eq!(dst, expected);
+        assert!(
+            observed_versions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|version| version == "caller-known-version"),
+            "every block request must carry the C caller's exact version"
+        );
 
         unsafe {
             talon_client_free(client);
@@ -1362,7 +1388,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn custom_scheduler_hook_receives_callback_job() {
-        let worker = mock_worker().await;
+        let worker = mock_worker(None).await;
         let coordinator = mock_coordinator(worker).await;
         let coordinator_c = cstring(&coordinator);
         let calls = AtomicUsize::new(0);

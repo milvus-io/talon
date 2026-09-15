@@ -41,7 +41,9 @@ public final class Frame {
         GET_RANGE(2),
         PUT(3),
         PING(4),
-        DELETE(5);
+        DELETE(5),
+        GET_VERSIONED_RANGE(10),
+        GET_VERSIONED_RANGE_TENANT(11);
 
         final int value;
 

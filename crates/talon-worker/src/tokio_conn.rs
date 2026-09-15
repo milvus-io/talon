@@ -23,7 +23,7 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use talon_core::{RequestId, TenantId};
+use talon_core::{RequestId, TenantId, Version};
 use talon_transport::data;
 use talon_transport::frame::{MsgType, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, DataErrorCode, FrameHeader};
@@ -33,21 +33,43 @@ use tokio::net::TcpStream;
 use crate::data_error::encode_runtime_error;
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
 
-/// Decode a `GetRange` or `GetRangeTenant` frame into its request and the tenant
-/// it declared (`Unattributed` for a plain `GetRange`).
+/// Decode origin-backed coordinates, the optional exact version, and tenant.
 fn decode_range_with_tenant(
     header: &FrameHeader,
     payload: &[u8],
-) -> Result<(FrameHeader, data::RangeRequest, TenantId), talon_transport::DataError> {
+) -> Result<(FrameHeader, data::RangeRequest, Option<Version>, TenantId), talon_transport::DataError>
+{
     let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
     full.extend_from_slice(&header.encode());
     full.extend_from_slice(payload);
-    if header.msg_type == MsgType::GetRangeTenant {
-        let (frame, scoped) = data::decode_tenant_request(&full)?;
-        Ok((frame, scoped.request, scoped.tenant))
-    } else {
-        let (frame, req) = data::decode_request(&full)?;
-        Ok((frame, req, TenantId::Unattributed))
+    match header.msg_type {
+        MsgType::GetRange => {
+            let (frame, request) = data::decode_request(&full)?;
+            Ok((frame, request, None, TenantId::Unattributed))
+        }
+        MsgType::GetRangeTenant => {
+            let (frame, scoped) = data::decode_tenant_request(&full)?;
+            Ok((frame, scoped.request, None, scoped.tenant))
+        }
+        MsgType::GetVersionedRange => {
+            let (frame, versioned) = data::decode_versioned_request(&full)?;
+            Ok((
+                frame,
+                versioned.request,
+                Some(versioned.version),
+                TenantId::Unattributed,
+            ))
+        }
+        MsgType::GetVersionedRangeTenant => {
+            let (frame, scoped) = data::decode_versioned_tenant_request(&full)?;
+            Ok((
+                frame,
+                scoped.request.request,
+                Some(scoped.request.version),
+                scoped.tenant,
+            ))
+        }
+        other => Err(talon_transport::DataError::NotGetRange(other)),
     }
 }
 
@@ -211,7 +233,13 @@ async fn handle_request(
     // Type check BEFORE any per-request work; a data listener only serves
     // GetRange (plus the Put/Delete/Control handled above); other frames are
     // capped tightly by read_frame.
-    if header.msg_type != MsgType::GetRange && header.msg_type != MsgType::GetRangeTenant {
+    if !matches!(
+        header.msg_type,
+        MsgType::GetRange
+            | MsgType::GetRangeTenant
+            | MsgType::GetVersionedRange
+            | MsgType::GetVersionedRangeTenant
+    ) {
         let mut err = data::encode_typed_error(
             header.request_id,
             DataErrorCode::InvalidRequest,
@@ -227,7 +255,7 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    let (h, req, tenant) = match decode_range_with_tenant(header, payload) {
+    let (h, req, expected_version, tenant) = match decode_range_with_tenant(header, payload) {
         Ok(v) => v,
         Err(e) => {
             let mut err = data::encode_typed_error(
@@ -297,6 +325,25 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
+    if expected_version
+        .as_ref()
+        .is_some_and(|version| version.0.trim().is_empty())
+    {
+        let mut err = data::encode_typed_error(
+            h.request_id,
+            DataErrorCode::InvalidRequest,
+            "version-pinned range request has an empty source version",
+        );
+        err[2] = response_version;
+        talon_telemetry::outcome("error");
+        stream.write_all(&err).await?;
+        stream.flush().await?;
+        observability
+            .metrics()
+            .record_request_error(request_started.elapsed());
+        return Ok(Some(stream));
+    }
+
     if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
         let mut err = data::encode_typed_error(
             h.request_id,
@@ -317,7 +364,11 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    match worker.serve(&req).await {
+    let outcome = match expected_version.as_ref() {
+        Some(version) => worker.serve_versioned(&req, version).await,
+        None => worker.serve(&req).await,
+    };
+    match outcome {
         Ok(ServeOutcome::Sendfile(handle)) => {
             // Zero-copy hit: write the frame header async, then stream the
             // block file's fd straight into the socket with sendfile(2) on

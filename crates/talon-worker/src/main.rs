@@ -1256,6 +1256,24 @@ mod tests {
             ))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if let Some(expected) = if_match {
+                if expected.as_str() != "v1" {
+                    return Err(Error::VersionMismatch {
+                        expected: expected.0.clone(),
+                        found: "v1".into(),
+                    });
+                }
+            }
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: u64::MAX,
@@ -1266,7 +1284,9 @@ mod tests {
 
     #[tokio::test]
     async fn handle_conn_serves_a_hit_via_sendfile_byte_exact() {
-        use talon_transport::data::{encode_request, RangeRequest};
+        use talon_transport::data::{
+            encode_request, encode_versioned_request, RangeRequest, VersionedRangeRequest,
+        };
 
         // Build a worker over a ramp backend so the first request commits a block
         // and the second is a resident hit served with sendfile.
@@ -1324,8 +1344,19 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let expected: Vec<u8> = (0..8u64).map(|i| ((3 + i) % 251) as u8).collect();
 
-        for _ in 0..2 {
-            let out = encode_request(0, &req).unwrap();
+        for pass in 0..2 {
+            let out = if pass == 0 {
+                encode_request(0, &req).unwrap()
+            } else {
+                encode_versioned_request(
+                    0,
+                    &VersionedRangeRequest {
+                        request: req.clone(),
+                        version: Version::new("v1"),
+                    },
+                )
+                .unwrap()
+            };
             client.write_all(&out).await.unwrap();
             client.flush().await.unwrap();
 
@@ -1460,6 +1491,23 @@ mod tests {
             let start = offset as usize;
             let end = (start + len as usize).min(full.len());
             Ok(full.slice(start..end))
+        }
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if let Some(expected) = if_match {
+                if expected.as_str() != "stored-v1" {
+                    return Err(Error::VersionMismatch {
+                        expected: expected.0.clone(),
+                        found: "stored-v1".into(),
+                    });
+                }
+            }
+            self.fetch_range(object, offset, len).await
         }
         async fn head(&self, object: &ObjectId) -> Result<ObjectStat> {
             let objs = self.objects.lock().unwrap();

@@ -452,22 +452,17 @@ public final class TalonClient implements AutoCloseable {
 
     private byte[] fetchRange(String workerAddress, Segment seg) throws IOException {
         int id = requestIds.getAndIncrement();
-        Bincode.Writer w = new Bincode.Writer();
-        Messages.writeObjectId(w, seg.block.object());
-        // The data-plane RangeRequest offset is absolute within the object.
-        w.u64(seg.block.offset() + seg.offsetInBlock);
-        w.u64(seg.length);
-        byte[] body = w.toBytes();
-        byte[] header = new Frame(Frame.MsgType.GET_RANGE, 0, id, body.length).encode();
+        byte[] request =
+                Messages.versionedRange(
+                        id,
+                        seg.block.object(),
+                        seg.block.offset() + seg.offsetInBlock,
+                        seg.length,
+                        seg.block.version());
 
         return workerPool.exchange(workerAddress, socket -> {
             OutputStream out = socket.getOutputStream();
-            if (Telemetry.canSend(workerAddress)) {
-            byte[] frame = new byte[header.length + body.length];
-            System.arraycopy(header, 0, frame, 0, header.length);
-            System.arraycopy(body, 0, frame, header.length, body.length);
-            out.write(Telemetry.envelope(frame, workerAddress));
-            } else { out.write(header); out.write(body); }
+            out.write(Telemetry.envelope(request, workerAddress));
             out.flush();
 
             InputStream in = socket.getInputStream();

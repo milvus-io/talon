@@ -144,8 +144,8 @@ mod tests {
     use crate::placement_cache::PlacementCache;
     use std::sync::atomic::{AtomicU32, Ordering};
     use talon_core::{Backend, NodeId, NodeInfo, NodeRole};
-    use talon_transport::frame::{FrameHeader, HEADER_LEN};
-    use talon_transport::{decode_request, response_header_ok, ControlMessage, RangeRequest};
+    use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
+    use talon_transport::{decode_request, response_header_ok, ControlMessage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -229,7 +229,8 @@ mod tests {
                     s.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    assert_eq!(h.msg_type, MsgType::GetRange);
+                    let (_h, req) = decode_request(&full).unwrap();
                     count.fetch_add(1, Ordering::SeqCst);
                     let payload = vec![0u8; req.len as usize];
                     let mut out = response_header_ok(0, payload.len() as u32).to_vec();

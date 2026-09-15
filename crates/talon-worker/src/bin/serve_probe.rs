@@ -115,6 +115,23 @@ impl BackendStore for RampBackend {
                 .collect::<Vec<u8>>(),
         ))
     }
+    async fn fetch_range_if_match(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> Result<bytes::Bytes> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != "v1" {
+                return Err(talon_core::Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: "v1".into(),
+                });
+            }
+        }
+        self.fetch_range(object, offset, len).await
+    }
     async fn head(&self, _obj: &ObjectId) -> Result<ObjectStat> {
         Ok(ObjectStat {
             len: u64::MAX,

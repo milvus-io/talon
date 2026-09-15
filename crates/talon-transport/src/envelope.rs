@@ -13,6 +13,8 @@ pub fn supports_v2(kind: MsgType) -> bool {
             | MsgType::GetRangeTenant
             | MsgType::GetCachedRange
             | MsgType::GetCachedRangeTenant
+            | MsgType::GetVersionedRange
+            | MsgType::GetVersionedRangeTenant
     )
 }
 

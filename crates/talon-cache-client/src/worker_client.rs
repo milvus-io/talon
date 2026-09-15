@@ -1,17 +1,16 @@
 //! Data-plane client for fetching byte ranges from a worker.
 //!
 //! Where the [`CoordinatorClient`](crate::CoordinatorClient) answers *where* a
-//! block lives, [`WorkerClient`] fetches the bytes. It speaks the data plane: a
-//! single [`MsgType::GetRange`] frame whose body is a bincode
-//! [`RangeRequest`] (object + `[offset, len)`), and a reply that is a
-//! `GetRange` frame carrying the **raw range bytes** — or, if the
+//! block lives, [`WorkerClient`] fetches the bytes. It speaks the data plane's
+//! legacy, version-pinned, and cache-only range operations. Every successful
+//! reply is a `GetRange` frame carrying the **raw range bytes** — or, if the
 //! [`Flags::ERROR`] bit is set, a typed error envelope (or a legacy string).
 //!
 //! The response body is raw (no bincode envelope) precisely so a production
 //! worker can `sendfile` the range straight from a file into the socket; this
-//! client only needs to read the framed bytes back. A fresh TCP connection is
-//! opened per fetch for simplicity, mirroring
-//! [`CoordinatorClient`](crate::CoordinatorClient).
+//! client only needs to read the framed bytes back. Successful exchanges return
+//! their TCP connection to a shared pool; stale pooled sockets are retried once
+//! on a fresh connection.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,9 +22,10 @@ use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
     decode_error_payload, encode_cached_block_put_header, encode_cached_request,
     encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
-    encode_tenant_request, CachedBlockPutRequest, CachedRangeRequest, DataPlaneError,
-    DeleteRequest, Flags, PutRequest, RangeRequest, TenantScopedCachedRange, TenantScopedRange,
-    MAX_CONTROL_PAYLOAD_LEN,
+    encode_tenant_request, encode_versioned_request, encode_versioned_tenant_request,
+    CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest,
+    RangeRequest, TenantScopedCachedRange, TenantScopedRange, TenantScopedVersionedRange,
+    VersionedRangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -184,6 +184,27 @@ impl WorkerClient {
         }
     }
 
+    /// Encode an origin-backed range request pinned to one source version.
+    /// Named tenants use a distinct attributed message type; both variants fail
+    /// closed on workers that predate version-pinned reads.
+    fn encode_versioned_range_request(
+        &self,
+        request_id: u32,
+        request: VersionedRangeRequest,
+    ) -> Result<Vec<u8>, talon_transport::DataError> {
+        if self.tenant.is_unattributed() {
+            encode_versioned_request(request_id, &request)
+        } else {
+            encode_versioned_tenant_request(
+                request_id,
+                &TenantScopedVersionedRange {
+                    tenant: self.tenant.clone(),
+                    request,
+                },
+            )
+        }
+    }
+
     /// Fetch `[offset, offset+len)` of `object` from the worker.
     ///
     /// Returns the raw range bytes on success. A worker-side error (block not
@@ -300,6 +321,118 @@ impl WorkerClient {
                     len = dst.len(),
                     error = %error,
                     "worker range fetch failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Fetch a range from the exact source `version`.
+    ///
+    /// The worker may serve an already-resident block or fill it from the
+    /// backend with a conditional request. It must return a version mismatch
+    /// instead of silently switching to the current source generation.
+    pub async fn fetch_versioned_range(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<u8>, WorkerError> {
+        let request = VersionedRangeRequest {
+            request: RangeRequest {
+                object: object.clone(),
+                offset,
+                len,
+            },
+            version: version.clone(),
+        };
+        let request_id = RequestId::next();
+        let mut output = self.encode_versioned_range_request(request_id.0, request)?;
+        match self.exchange(&mut output, len).await {
+            Ok(bytes) => Ok(bytes),
+            Err((true, error)) if error.is_transport_failure() => {
+                talon_telemetry::observe("talon.rpc", "client", async {
+                    talon_telemetry::text("server.address", &self.addr);
+                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let bytes = self
+                        .pool
+                        .with_request_deadline("worker fetch_versioned_range retry", async {
+                            stream.write_all(&output).await?;
+                            stream.flush().await?;
+                            read_range_reply(&mut stream, len).await
+                        })
+                        .await?;
+                    self.pool.release(&self.addr, stream);
+                    Ok(bytes)
+                })
+                .await
+            }
+            Err((_, error)) => {
+                tracing::error!(
+                    req = %request_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    version = %version,
+                    offset,
+                    len,
+                    error = %error,
+                    "worker versioned range fetch failed"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Fetch a range from the exact source `version` directly into `dst`.
+    pub async fn fetch_versioned_range_into(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        dst: &mut [u8],
+    ) -> Result<usize, WorkerError> {
+        let request = VersionedRangeRequest {
+            request: RangeRequest {
+                object: object.clone(),
+                offset,
+                len: dst.len() as u64,
+            },
+            version: version.clone(),
+        };
+        let request_id = RequestId::next();
+        let mut output = self.encode_versioned_range_request(request_id.0, request)?;
+        match self.exchange_into(&mut output, dst).await {
+            Ok(n) => Ok(n),
+            Err((true, error)) if error.is_transport_failure() => {
+                talon_telemetry::observe("talon.rpc", "client", async {
+                    talon_telemetry::text("server.address", &self.addr);
+                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let n = self
+                        .pool
+                        .with_request_deadline("worker fetch_versioned_range retry", async {
+                            stream.write_all(&output).await?;
+                            stream.flush().await?;
+                            read_range_reply_into(&mut stream, dst).await
+                        })
+                        .await?;
+                    self.pool.release(&self.addr, stream);
+                    Ok(n)
+                })
+                .await
+            }
+            Err((_, error)) => {
+                tracing::error!(
+                    req = %request_id,
+                    worker = %self.addr,
+                    object = %object.to_path(),
+                    version = %version,
+                    offset,
+                    len = dst.len(),
+                    error = %error,
+                    "worker versioned range fetch failed"
                 );
                 Err(error)
             }
@@ -899,7 +1032,8 @@ mod tests {
     use talon_core::Backend;
     use talon_transport::{
         decode_cached_block_put_header, decode_cached_request, decode_cached_tenant_request,
-        decode_request, decode_tenant_request, encode_error, response_header_ok,
+        decode_request, decode_tenant_request, decode_versioned_request, encode_error,
+        response_header_ok,
     };
     use tokio::net::TcpListener;
 
@@ -940,6 +1074,39 @@ mod tests {
             .admit_cached_block(&block, 13, b"tail!")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn versioned_fetch_sends_the_exact_source_identity() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header_bytes = [0_u8; HEADER_LEN];
+            socket.read_exact(&mut header_bytes).await.unwrap();
+            let header = FrameHeader::decode(&header_bytes).unwrap();
+            assert_eq!(header.msg_type, MsgType::GetVersionedRange);
+            let mut payload = vec![0_u8; header.length as usize];
+            socket.read_exact(&mut payload).await.unwrap();
+            let mut frame = header_bytes.to_vec();
+            frame.extend_from_slice(&payload);
+            let (_, request) = decode_versioned_request(&frame).unwrap();
+            assert_eq!(request.request.object, object());
+            assert_eq!((request.request.offset, request.request.len), (17, 4));
+            assert_eq!(request.version, Version::new("etag-v7"));
+
+            socket
+                .write_all(&response_header_ok(header.request_id, 4))
+                .await
+                .unwrap();
+            socket.write_all(b"data").await.unwrap();
+        });
+
+        let bytes = WorkerClient::new(addr)
+            .fetch_versioned_range(&object(), &Version::new("etag-v7"), 17, 4)
+            .await
+            .unwrap();
+        assert_eq!(bytes, b"data");
     }
 
     /// What a mock write-worker records: the object and body it received.

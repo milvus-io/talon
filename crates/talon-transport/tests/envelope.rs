@@ -95,6 +95,25 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             },
         )
         .unwrap(),
+        data::encode_versioned_request(
+            7,
+            &data::VersionedRangeRequest {
+                request: req.clone(),
+                version: cached.version.clone(),
+            },
+        )
+        .unwrap(),
+        data::encode_versioned_tenant_request(
+            7,
+            &data::TenantScopedVersionedRange {
+                tenant: TenantId::named("acme"),
+                request: data::VersionedRangeRequest {
+                    request: req.clone(),
+                    version: cached.version.clone(),
+                },
+            },
+        )
+        .unwrap(),
         data::encode_cached_request(7, &cached).unwrap(),
         data::encode_cached_tenant_request(
             7,
@@ -127,6 +146,17 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             }
             MsgType::GetRangeTenant => {
                 assert_eq!(data::decode_tenant_request(&frame).unwrap().1.request, req);
+            }
+            MsgType::GetVersionedRange => {
+                let decoded = data::decode_versioned_request(&frame).unwrap().1;
+                assert_eq!(decoded.request, req);
+                assert_eq!(decoded.version, cached.version);
+            }
+            MsgType::GetVersionedRangeTenant => {
+                let decoded = data::decode_versioned_tenant_request(&frame).unwrap().1;
+                assert_eq!(decoded.tenant, TenantId::named("acme"));
+                assert_eq!(decoded.request.request, req);
+                assert_eq!(decoded.request.version, cached.version);
             }
             MsgType::GetCachedRange => {
                 assert_eq!(data::decode_cached_request(&frame).unwrap().1, cached);

@@ -78,6 +78,14 @@ pub enum MsgType {
     /// `GetRangeTenant` an older worker rejects this distinct type rather than
     /// misreading the tenant prefix.
     GetCachedRangeTenant = 9,
+    /// An origin-backed range fetch pinned to an exact source version.
+    /// The worker may serve the matching cache entry or fill it from the
+    /// backend with a conditional request, but must never switch to a newer
+    /// source version.
+    GetVersionedRange = 10,
+    /// A version-pinned origin-backed range fetch attributed to a tenant.
+    /// The reply is an ordinary `GetRange` frame, like every range fetch.
+    GetVersionedRangeTenant = 11,
 }
 
 impl MsgType {
@@ -94,6 +102,8 @@ impl MsgType {
             7 => MsgType::AdmitCachedBlock,
             8 => MsgType::GetRangeTenant,
             9 => MsgType::GetCachedRangeTenant,
+            10 => MsgType::GetVersionedRange,
+            11 => MsgType::GetVersionedRangeTenant,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -248,6 +258,8 @@ mod tests {
             MsgType::AdmitCachedBlock,
             MsgType::GetRangeTenant,
             MsgType::GetCachedRangeTenant,
+            MsgType::GetVersionedRange,
+            MsgType::GetVersionedRangeTenant,
         ]
         .into_iter()
         .enumerate()

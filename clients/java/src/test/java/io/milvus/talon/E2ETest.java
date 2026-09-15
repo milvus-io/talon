@@ -76,6 +76,17 @@ public final class E2ETest {
                 assertBytes(first, second);
             });
 
+            check("stale supplied version fails closed", () -> {
+                String uncached = "az://container/version-mismatch-never-cached";
+                try {
+                    client.read(uncached, "definitely-not-the-current-etag", 0, 4096);
+                    throw new AssertionError("stale version unexpectedly returned current bytes");
+                } catch (java.io.IOException expected) {
+                    // The exact error wording is backend-specific; the
+                    // contract is that replacement bytes are never returned.
+                }
+            });
+
             check("concurrent reads from threads are correct", () -> {
                 int n = 8;
                 byte[][] results = new byte[n][];

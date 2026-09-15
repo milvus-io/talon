@@ -28,6 +28,9 @@ block size is 256 MiB and must match the workers' configuration.
 URIs use the same namespaces as the FUSE mount — `s3://`, `gcs://`, `az://` —
 so a path addresses the same object through either client.
 
+The supplied version is exact: if that source generation is no longer
+available, the read fails instead of silently returning replacement bytes.
+
 ## How correctness is maintained
 
 The wire protocol is implemented twice: here and in Rust. That duplication is
