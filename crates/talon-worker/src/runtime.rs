@@ -521,11 +521,7 @@ impl WorkerRuntime {
                         .await?,
                 ));
             }
-            if matches!(
-                self.index
-                    .presence_and_touch(&block, PageIndex(0), PageIndex(1)),
-                Presence::Whole
-            ) {
+            if self.index.is_whole_and_touch(&block) {
                 // Open an fd over exactly the requested window. This can fail if
                 // the block was evicted between the presence check and the open
                 // (a benign race); fall through to the byte path in that case.
@@ -835,11 +831,7 @@ impl WorkerRuntime {
         // A write-through commits the whole block as one file (read-after-write
         // must hit). Serve such a block from the whole-block store rather than
         // re-fetching it a page at a time from the origin.
-        if matches!(
-            self.index
-                .presence_and_touch(block, PageIndex(0), PageIndex(1)),
-            Presence::Whole
-        ) {
+        if self.index.is_whole_and_touch(block) {
             if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                 return Ok(bytes);
             }
@@ -4280,6 +4272,50 @@ mod tests {
         // Only the 36 real bytes are charged, not a full 64-byte page.
         assert_eq!(runtime.resident_bytes(), 36);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    async fn assert_whole_probe_does_not_heat_page_zero(use_sendfile: bool) {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            128,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Two-page capacity: loading page 2 must evict page 0. Probing the
+        // block form while reading other pages must not give page 0 a touch.
+        for page in [0, 1, 2, 1] {
+            let offset = page * 64;
+            let request = req(&object, offset, 8);
+            let got = if use_sendfile {
+                match runtime.serve(&request).await.unwrap() {
+                    ServeOutcome::Bytes(bytes) => bytes.to_vec(),
+                    outcome => read_handle(outcome),
+                }
+            } else {
+                runtime.serve_range(&request).await.unwrap().to_vec()
+            };
+            assert_eq!(got, expected(offset, 8));
+        }
+        let ranges = backend.ranges();
+        assert_eq!(runtime.resident_bytes(), 128);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(ranges, vec![(0, 64), (64, 64), (128, 64)]);
+    }
+
+    #[tokio::test]
+    async fn byte_read_whole_probe_does_not_heat_page_zero() {
+        assert_whole_probe_does_not_heat_page_zero(false).await;
+    }
+
+    #[tokio::test]
+    async fn sendfile_read_whole_probe_does_not_heat_page_zero() {
+        assert_whole_probe_does_not_heat_page_zero(true).await;
     }
 
     #[tokio::test]

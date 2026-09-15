@@ -114,6 +114,21 @@ impl BlockIndex {
         Some(entry.meta.clone())
     }
 
+    /// Probe the whole-block fast path without touching any paged entries.
+    pub(crate) fn is_whole_and_touch(&self, id: &BlockId) -> bool {
+        let g = self.inner.read().unwrap();
+        let Some(entry) = g.map.get(id) else {
+            return false;
+        };
+        if !matches!(entry.meta.form, BlockForm::Whole) {
+            return false;
+        }
+        if let Some(access) = entry.access.get(&None) {
+            access.touch();
+        }
+        true
+    }
+
     /// Attach the policy token after admission. The index owns only recency;
     /// pinning and byte accounting remain exclusively owned by the policy.
     pub(crate) fn set_access(&self, unit: &CacheUnit, access: AccessHandle) {
@@ -395,6 +410,27 @@ mod tests {
         // Ordinary metadata probes must not bias eviction.
         idx.presence(&id, PageIndex(0), PageIndex(1));
         assert_eq!(lru.evict_to_fit(4096), vec![p0]);
+    }
+
+    #[test]
+    fn whole_probe_preserves_whole_recency_without_heating_pages() {
+        use crate::eviction::Lru;
+        let idx = BlockIndex::new();
+        let lru = Lru::new();
+        assert!(!idx.is_whole_and_touch(&block(0)));
+        let whole = CacheUnit::Whole(block(1));
+        idx.commit(whole_meta(block(1), 4096));
+        idx.set_access(&whole, lru.insert(whole.clone(), 4096));
+        let paged = block(2);
+        idx.init_paged(paged.clone(), 4096, 8192);
+        let page = CacheUnit::Page(paged.clone(), PageIndex(0));
+        idx.mark_page(&paged, PageIndex(0));
+        idx.set_access(&page, lru.insert(page.clone(), 4096));
+
+        assert!(idx.is_whole_and_touch(&block(1)));
+        assert!(!idx.is_whole_and_touch(&paged));
+        // The older whole block received a real touch; the newer page did not.
+        assert_eq!(lru.evict_to_fit(4096), vec![page]);
     }
 
     #[test]
