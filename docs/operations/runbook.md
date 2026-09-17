@@ -309,3 +309,13 @@ coordinators and workers re-register within one heartbeat interval.
 
 "Protected" requires the bearer token when `TALON_COORDINATOR_AUTH_TOKEN` is set;
 see [security.md](security.md).
+
+### Coordinator worker-proxy limits
+
+`StatObject` and `ListObjects` share a limit of 64 active worker exchanges per
+coordinator. Waiting for capacity consumes the existing request deadline. The
+proxy retains at most 64 idle connections across all workers and discards
+connections idle for 20 seconds before reuse. Membership reconciliation removes
+idle sockets for departed workers. A failed exchange on a reused socket gets
+one fresh-connection attempt within the same deadline; an explicit worker
+rejection follows the existing next-worker fallback.

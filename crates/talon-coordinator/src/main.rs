@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use clap::Parser;
@@ -21,6 +21,7 @@ use talon_transport::frame::HEADER_LEN;
 use talon_transport::{codec, ControlMessage, FrameHeader};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::Semaphore;
 
 /// Upper bound on concurrent control-plane connections (issue #111). Beyond
 /// this, new peers wait for an in-flight connection to finish.
@@ -41,6 +42,11 @@ const PROXY_REQUEST_BUDGET: Duration = Duration::from_secs(5);
 /// shared deadline across retries—not 25 seconds per worker—and leaves headroom
 /// inside the FUSE client's default 30-second coordinator exchange deadline.
 const LIST_OBJECTS_PROXY_BUDGET: Duration = Duration::from_secs(25);
+
+const MAX_CONCURRENT_WORKER_PROXY_REQUESTS: usize = 64;
+const MAX_IDLE_WORKER_PROXY_CONNECTIONS: usize = 64;
+// Retire idle sockets before the worker's 30-second frame-read deadline.
+const WORKER_PROXY_IDLE_TTL: Duration = Duration::from_secs(20);
 
 /// Minimum time preserved for each worker that has not yet been attempted.
 /// When the request budget cannot cover this reserve, attempts share the
@@ -221,10 +227,125 @@ async fn build_capabilities(
     }
 }
 
+struct IdleWorkerConnection {
+    stream: TcpStream,
+    returned_at: Instant,
+}
+
+#[derive(Default)]
+struct WorkerProxyIdleState {
+    by_address: HashMap<String, Vec<IdleWorkerConnection>>,
+    total: usize,
+    /// `None` for direct/test calls that supply an explicit worker list. The
+    /// normal membership-driven path installs the current address set so a
+    /// request that finishes after removal cannot put its old socket back.
+    allowed_addresses: Option<HashSet<String>>,
+}
+
+/// Exclusive-checkout pool for coordinator -> worker request/response traffic.
+///
+/// A connection is returned only after a complete, successfully decoded
+/// exchange. No multiplexing is needed: the checkout owner is the sole user of
+/// the stream until it releases it, preserving the protocol's ordered framing.
+struct WorkerProxyPool {
+    idle: Mutex<WorkerProxyIdleState>,
+    max_idle: usize,
+    idle_ttl: Duration,
+}
+
+impl WorkerProxyPool {
+    fn new(max_idle: usize, idle_ttl: Duration) -> Self {
+        Self {
+            idle: Mutex::new(WorkerProxyIdleState::default()),
+            max_idle,
+            idle_ttl,
+        }
+    }
+
+    fn lock_idle(&self) -> std::sync::MutexGuard<'_, WorkerProxyIdleState> {
+        self.idle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn prune_expired(&self, state: &mut WorkerProxyIdleState) {
+        let idle_ttl = self.idle_ttl;
+        state.by_address.retain(|_, bucket| {
+            bucket.retain(|idle| idle.returned_at.elapsed() < idle_ttl);
+            !bucket.is_empty()
+        });
+        state.total = state.by_address.values().map(Vec::len).sum();
+    }
+
+    fn checkout(&self, address: &str) -> Option<TcpStream> {
+        let mut state = self.lock_idle();
+        let mut stream = None;
+        let mut removed = 0;
+        if let Some(bucket) = state.by_address.get_mut(address) {
+            while let Some(idle) = bucket.pop() {
+                removed += 1;
+                if idle.returned_at.elapsed() < self.idle_ttl {
+                    stream = Some(idle.stream);
+                    break;
+                }
+            }
+        }
+        state.total -= removed;
+        if state.by_address.get(address).is_some_and(Vec::is_empty) {
+            state.by_address.remove(address);
+        }
+        stream
+    }
+
+    fn release(&self, address: &str, stream: TcpStream) {
+        let mut state = self.lock_idle();
+        if state.total >= self.max_idle {
+            self.prune_expired(&mut state);
+        }
+        if state.total >= self.max_idle
+            || state
+                .allowed_addresses
+                .as_ref()
+                .is_some_and(|allowed| !allowed.contains(address))
+        {
+            return;
+        }
+        state
+            .by_address
+            .entry(address.to_owned())
+            .or_default()
+            .push(IdleWorkerConnection {
+                stream,
+                returned_at: Instant::now(),
+            });
+        state.total += 1;
+    }
+
+    /// Drop idle sockets for workers no longer present in the authoritative
+    /// membership snapshot. Checked-out sockets finish normally and are
+    /// rejected on release once the pool observes the new membership.
+    fn retain_workers(&self, addresses: &HashSet<String>) {
+        let mut state = self.lock_idle();
+        self.prune_expired(&mut state);
+        state
+            .by_address
+            .retain(|address, _| addresses.contains(address));
+        state.total = state.by_address.values().map(Vec::len).sum();
+        state.allowed_addresses = Some(addresses.clone());
+    }
+
+    #[cfg(test)]
+    fn idle_count(&self, address: &str) -> usize {
+        self.lock_idle().by_address.get(address).map_or(0, Vec::len)
+    }
+}
+
 struct Coordinator {
     service: PlacementService<RendezvousPlacement>,
     observability: Arc<CoordinatorObservability>,
     lease_ttl: Duration,
+    worker_proxy_pool: WorkerProxyPool,
+    worker_proxy_slots: Semaphore,
 }
 
 fn proxy_request_budget(message: &ControlMessage) -> Duration {
@@ -281,11 +402,41 @@ fn append_proxy_attempt_error(errors: &mut String, error: &str) {
 
 impl Coordinator {
     fn new(observability: Arc<CoordinatorObservability>, lease_ttl: Duration) -> Arc<Self> {
+        Self::with_proxy_limits(
+            observability,
+            lease_ttl,
+            MAX_CONCURRENT_WORKER_PROXY_REQUESTS,
+            MAX_IDLE_WORKER_PROXY_CONNECTIONS,
+            WORKER_PROXY_IDLE_TTL,
+        )
+    }
+
+    fn with_proxy_limits(
+        observability: Arc<CoordinatorObservability>,
+        lease_ttl: Duration,
+        max_concurrent: usize,
+        max_idle: usize,
+        idle_ttl: Duration,
+    ) -> Arc<Self> {
         Arc::new(Self {
             service: PlacementService::new(Membership::new(), RendezvousPlacement),
             observability,
             lease_ttl,
+            worker_proxy_pool: WorkerProxyPool::new(max_idle, idle_ttl),
+            worker_proxy_slots: Semaphore::new(max_concurrent.max(1)),
         })
+    }
+
+    fn refresh_worker_proxy_membership(&self) {
+        let addresses: HashSet<_> = self
+            .service
+            .membership()
+            .snapshot()
+            .into_iter()
+            .filter(|node| node.role == NodeRole::Worker)
+            .map(|node| node.address)
+            .collect();
+        self.worker_proxy_pool.retain_workers(&addresses);
     }
 
     /// Forward a message to any healthy worker and return its reply (#318).
@@ -315,15 +466,20 @@ impl Coordinator {
             };
         }
 
-        Self::proxy_to_workers(&workers, message).await
+        self.proxy_to_workers(&workers, message).await
     }
 
     /// Try workers in order, treating both transport errors and explicit worker
     /// rejections as retryable. A worker can be ready enough to advertise but
     /// still reject a request that a later healthy worker can serve.
-    async fn proxy_to_workers(workers: &[NodeInfo], message: ControlMessage) -> ControlMessage {
+    async fn proxy_to_workers(
+        &self,
+        workers: &[NodeInfo],
+        message: ControlMessage,
+    ) -> ControlMessage {
         let budget = proxy_request_budget(&message);
-        Self::proxy_to_workers_with_budget(workers, message, budget).await
+        self.proxy_to_workers_with_budget(workers, message, budget)
+            .await
     }
 
     /// Proxy under one deadline shared by every serial worker attempt.
@@ -333,6 +489,7 @@ impl Coordinator {
     /// consuming the whole request while leaving long-running listings most of
     /// their 25-second budget.
     async fn proxy_to_workers_with_budget(
+        &self,
         workers: &[NodeInfo],
         message: ControlMessage,
         budget: Duration,
@@ -352,7 +509,7 @@ impl Coordinator {
             tried += 1;
             let attempt = tokio::time::timeout_at(
                 attempt_deadline,
-                Self::round_trip_worker(&worker.address, &message, attempt_deadline),
+                self.round_trip_worker(&worker.address, &message, attempt_deadline),
             )
             .await;
             match attempt {
@@ -399,47 +556,105 @@ impl Coordinator {
 
     /// One request/response against a worker's data-plane port.
     async fn round_trip_worker(
+        &self,
         address: &str,
         message: &ControlMessage,
         attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<ControlMessage> {
         talon_telemetry::observe("talon.rpc", "client", async {
-            let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("worker attempt budget exhausted before connecting");
-            }
-            let connect_timeout = PROXY_CONNECT_TIMEOUT.min(remaining);
-            let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(address))
+            let _permit = tokio::time::timeout_at(attempt_deadline, self.worker_proxy_slots.acquire())
                 .await
-                .map_err(|_| anyhow::anyhow!("connect timed out after {connect_timeout:?}"))??;
-            let mut buf = codec::encode(0, message)?;
-            talon_transport::envelope::outbound(&mut buf, address)?;
-            stream.write_all(&buf).await?;
-            stream.flush().await?;
+                .map_err(|_| anyhow::anyhow!("worker proxy concurrency wait exhausted attempt budget"))?
+                .map_err(|_| anyhow::anyhow!("worker proxy concurrency limiter closed"))?;
 
-            let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
-            if remaining.is_zero() {
-                anyhow::bail!("worker attempt budget exhausted before reading response");
+            if let Some(stream) = self.worker_proxy_pool.checkout(address) {
+                match Self::exchange_with_worker(stream, address, message, attempt_deadline).await {
+                    Ok((stream, reply)) => {
+                        self.worker_proxy_pool.release(address, stream);
+                        return Ok(reply);
+                    }
+                    Err(reused_error) => {
+                        // The peer may have closed an otherwise healthy socket
+                        // while it sat idle. Retry only this transport exchange on
+                        // a fresh connection and keep the same attempt deadline.
+                        let stream = Self::connect_worker(address, attempt_deadline)
+                            .await
+                            .map_err(|fresh_error| {
+                                anyhow::anyhow!(
+                                    "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
+                                )
+                            })?;
+                        return match Self::exchange_with_worker(stream, address, message, attempt_deadline).await
+                        {
+                            Ok((stream, reply)) => {
+                                self.worker_proxy_pool.release(address, stream);
+                                Ok(reply)
+                            }
+                            Err(fresh_error) => Err(anyhow::anyhow!(
+                                "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
+                            )),
+                        };
+                    }
+                }
             }
-            let (header, payload) = tokio::time::timeout(
-                remaining,
-                talon_transport::read_frame(&mut stream, remaining),
-            )
-            .await
-            .map_err(|_| {
-                anyhow::anyhow!("worker response did not arrive within its attempt budget")
-            })?
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
-            full.extend_from_slice(&header.encode());
-            full.extend_from_slice(&payload);
-            let (_, reply) = codec::decode(&full)?;
-            if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
-                talon_telemetry::outcome("error");
+
+            let stream = Self::connect_worker(address, attempt_deadline).await?;
+            match Self::exchange_with_worker(stream, address, message, attempt_deadline).await {
+                Ok((stream, reply)) => {
+                    self.worker_proxy_pool.release(address, stream);
+                    Ok(reply)
+                }
+                Err(error) => Err(error),
             }
-            Ok(reply)
         })
         .await
+    }
+
+    async fn connect_worker(
+        address: &str,
+        attempt_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<TcpStream> {
+        let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("worker attempt budget exhausted before connecting");
+        }
+        let connect_timeout = PROXY_CONNECT_TIMEOUT.min(remaining);
+        tokio::time::timeout(connect_timeout, TcpStream::connect(address))
+            .await
+            .map_err(|_| anyhow::anyhow!("connect timed out after {connect_timeout:?}"))?
+            .map_err(Into::into)
+    }
+
+    async fn exchange_with_worker(
+        mut stream: TcpStream,
+        address: &str,
+        message: &ControlMessage,
+        attempt_deadline: tokio::time::Instant,
+    ) -> anyhow::Result<(TcpStream, ControlMessage)> {
+        let mut buf = codec::encode(0, message)?;
+        talon_transport::envelope::outbound(&mut buf, address)?;
+        stream.write_all(&buf).await?;
+        stream.flush().await?;
+
+        let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            anyhow::bail!("worker attempt budget exhausted before reading response");
+        }
+        let (header, payload) = tokio::time::timeout(
+            remaining,
+            talon_transport::read_frame(&mut stream, remaining),
+        )
+        .await
+        .map_err(|_| anyhow::anyhow!("worker response did not arrive within its attempt budget"))?
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+        full.extend_from_slice(&header.encode());
+        full.extend_from_slice(&payload);
+        let (_, reply) = codec::decode(&full)?;
+        if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
+            talon_telemetry::outcome("error");
+        }
+        Ok((stream, reply))
     }
 
     async fn dispatch(&self, message: ControlMessage) -> ControlMessage {
@@ -502,6 +717,7 @@ impl Coordinator {
                             && healthy_ready
                         {
                             self.service.membership().register_zoned(node, zone);
+                            self.refresh_worker_proxy_membership();
                         }
                         self.observability.metrics().record_heartbeat(true, true);
                         ControlMessage::Ack {
@@ -864,6 +1080,8 @@ fn spawn_membership_reconcile(
                 // Non-fatal: local membership is left last-good and readiness is
                 // cleared, so placement fails closed until the store recovers.
                 tracing::warn!(%error, "membership reconcile from shared state failed");
+            } else {
+                state.refresh_worker_proxy_membership();
             }
         }
     })
@@ -1330,6 +1548,7 @@ where
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use talon_coordinator::MemoryStateStore;
     use talon_core::{
@@ -1739,6 +1958,248 @@ mod tests {
         )
     }
 
+    fn proxy_test_coordinator() -> Arc<Coordinator> {
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        Coordinator::new(
+            observability_over(store, "proxy-test"),
+            Duration::from_secs(30),
+        )
+    }
+
+    fn proxy_worker(address: String) -> NodeInfo {
+        NodeInfo {
+            id: NodeId::new("proxy-worker"),
+            address,
+            role: NodeRole::Worker,
+        }
+    }
+
+    fn stat_request() -> ControlMessage {
+        ControlMessage::StatObject {
+            object: talon_core::ObjectId::new(talon_core::Backend::S3, "bucket", "object"),
+        }
+    }
+
+    fn stat_reply() -> ControlMessage {
+        ControlMessage::ObjectStat {
+            size: 42,
+            version: "version-1".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_idle_pool_bounds_all_addresses_and_rejects_departed_workers() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let pool = WorkerProxyPool::new(2, WORKER_PROXY_IDLE_TTL);
+        let mut peers = Vec::new();
+        for address in ["worker-a", "worker-b", "worker-c"] {
+            let stream = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            peers.push(listener.accept().await.unwrap().0);
+            pool.release(address, stream);
+        }
+        assert_eq!(pool.lock_idle().total, 2);
+        assert_eq!(pool.idle_count("worker-c"), 0);
+        pool.lock_idle().by_address.get_mut("worker-a").unwrap()[0].returned_at =
+            Instant::now() - Duration::from_secs(21);
+        assert!(pool.checkout("worker-a").is_none());
+        let active = pool.checkout("worker-b").unwrap();
+        pool.retain_workers(&HashSet::new());
+        pool.release("worker-b", active);
+        assert_eq!(pool.lock_idle().total, 0);
+        assert!(pool.lock_idle().by_address.is_empty());
+    }
+
+    #[tokio::test]
+    async fn proxy_capacity_wait_respects_the_request_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = Coordinator::with_proxy_limits(
+            observability_over(Arc::new(MemoryStateStore::new()), "waiting-proxy"),
+            Duration::from_secs(30),
+            1,
+            1,
+            WORKER_PROXY_IDLE_TTL,
+        );
+        let held = coordinator.worker_proxy_slots.acquire().await.unwrap();
+        let workers = [proxy_worker(listener.local_addr().unwrap().to_string())];
+        let result = coordinator
+            .proxy_to_workers_with_budget(&workers, stat_request(), Duration::from_millis(20))
+            .await;
+        assert!(matches!(result, ControlMessage::Ack { ok: false, .. }));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), listener.accept())
+                .await
+                .is_err()
+        );
+        drop(held);
+        assert_eq!(coordinator.worker_proxy_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_reuses_one_worker_connection_for_sequential_stats() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = Arc::clone(&accepts);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                let _connection = tokio::spawn(async move {
+                    while let Some((_, request, _)) = read_control(&mut stream).await.unwrap() {
+                        assert!(matches!(request, ControlMessage::StatObject { .. }));
+                        stream
+                            .write_all(&codec::encode(0, &stat_reply()).unwrap())
+                            .await
+                            .unwrap();
+                        stream.flush().await.unwrap();
+                    }
+                });
+            }
+        });
+        let workers = vec![proxy_worker(address.clone())];
+        let coordinator = proxy_test_coordinator();
+
+        for _ in 0..100 {
+            assert_eq!(
+                coordinator.proxy_to_workers(&workers, stat_request()).await,
+                stat_reply()
+            );
+        }
+
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        assert_eq!(coordinator.worker_proxy_pool.idle_count(&address), 1);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_retries_a_peer_closed_idle_connection_once() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let server_accepts = Arc::clone(&accepts);
+        let (first_closed_tx, first_closed_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_closed_tx = Some(first_closed_tx);
+            for accepted in 0..2 {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
+                assert!(matches!(request, ControlMessage::StatObject { .. }));
+                stream
+                    .write_all(&codec::encode(0, &stat_reply()).unwrap())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+                drop(stream);
+                if accepted == 0 {
+                    first_closed_tx.take().unwrap().send(()).unwrap();
+                }
+            }
+        });
+        let workers = vec![proxy_worker(address.clone())];
+        let coordinator = proxy_test_coordinator();
+
+        assert_eq!(
+            coordinator.proxy_to_workers(&workers, stat_request()).await,
+            stat_reply()
+        );
+        first_closed_rx.await.unwrap();
+        assert_eq!(
+            coordinator.proxy_to_workers(&workers, stat_request()).await,
+            stat_reply()
+        );
+
+        server.await.unwrap();
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn proxy_concurrency_limit_applies_backpressure_before_connecting() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let (started_tx, mut started_rx) = tokio::sync::mpsc::unbounded_channel();
+        let server_accepts = Arc::clone(&accepts);
+        let server_active = Arc::clone(&active);
+        let server_max_active = Arc::clone(&max_active);
+        let server_release = Arc::clone(&release);
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                server_accepts.fetch_add(1, Ordering::SeqCst);
+                let active = Arc::clone(&server_active);
+                let max_active = Arc::clone(&server_max_active);
+                let release = Arc::clone(&server_release);
+                let started_tx = started_tx.clone();
+                let _connection = tokio::spawn(async move {
+                    while let Some((_, request, _)) = read_control(&mut stream).await.unwrap() {
+                        assert!(matches!(request, ControlMessage::StatObject { .. }));
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(now_active, Ordering::SeqCst);
+                        started_tx.send(()).unwrap();
+                        let permit = Arc::clone(&release).acquire_owned().await.unwrap();
+                        permit.forget();
+                        stream
+                            .write_all(&codec::encode(0, &stat_reply()).unwrap())
+                            .await
+                            .unwrap();
+                        stream.flush().await.unwrap();
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    }
+                });
+            }
+        });
+
+        let coordinator = Coordinator::with_proxy_limits(
+            observability_over(Arc::new(MemoryStateStore::new()), "bounded-proxy"),
+            Duration::from_secs(30),
+            2,
+            2,
+            WORKER_PROXY_IDLE_TTL,
+        );
+        let workers = vec![proxy_worker(address)];
+        let mut requests = Vec::new();
+        for _ in 0..4 {
+            let coordinator = Arc::clone(&coordinator);
+            let workers = workers.clone();
+            requests.push(tokio::spawn(async move {
+                coordinator.proxy_to_workers(&workers, stat_request()).await
+            }));
+        }
+
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(1), started_rx.recv())
+                .await
+                .expect("two requests did not reach the worker")
+                .expect("worker start channel closed");
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), started_rx.recv())
+                .await
+                .is_err(),
+            "a third request reached the worker before a proxy slot was released"
+        );
+
+        release.add_permits(4);
+        for request in requests {
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(2), request)
+                    .await
+                    .expect("bounded proxy request stalled")
+                    .unwrap(),
+                stat_reply()
+            );
+        }
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
+        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
     #[test]
     fn listings_use_one_dedicated_total_proxy_budget() {
         let listing = ControlMessage::ListObjects {
@@ -1845,13 +2306,14 @@ mod tests {
                 role: NodeRole::Worker,
             },
         ];
-        let reply = Coordinator::proxy_to_workers(
-            &workers,
-            ControlMessage::ListObjects {
-                prefix: "s3/bucket".into(),
-            },
-        )
-        .await;
+        let reply = proxy_test_coordinator()
+            .proxy_to_workers(
+                &workers,
+                ControlMessage::ListObjects {
+                    prefix: "s3/bucket".into(),
+                },
+            )
+            .await;
 
         assert!(matches!(
             reply,
@@ -1912,14 +2374,15 @@ mod tests {
         ];
         let budget = Duration::from_secs(4);
         let proxy = tokio::spawn(async move {
-            Coordinator::proxy_to_workers_with_budget(
-                &workers,
-                ControlMessage::ListObjects {
-                    prefix: "s3/bucket".into(),
-                },
-                budget,
-            )
-            .await
+            proxy_test_coordinator()
+                .proxy_to_workers_with_budget(
+                    &workers,
+                    ControlMessage::ListObjects {
+                        prefix: "s3/bucket".into(),
+                    },
+                    budget,
+                )
+                .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), stalled_request_rx)
@@ -1986,14 +2449,15 @@ mod tests {
         let budget = Duration::from_secs(6);
         let started = tokio::time::Instant::now();
         let proxy = tokio::spawn(async move {
-            Coordinator::proxy_to_workers_with_budget(
-                &workers,
-                ControlMessage::ListObjects {
-                    prefix: "s3/bucket".into(),
-                },
-                budget,
-            )
-            .await
+            proxy_test_coordinator()
+                .proxy_to_workers_with_budget(
+                    &workers,
+                    ControlMessage::ListObjects {
+                        prefix: "s3/bucket".into(),
+                    },
+                    budget,
+                )
+                .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), first_request_rx)
