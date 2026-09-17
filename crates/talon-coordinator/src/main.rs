@@ -719,10 +719,28 @@ impl Coordinator {
                             self.service.membership().register_zoned(node, zone);
                             self.refresh_worker_proxy_membership();
                         }
-                        self.observability.metrics().record_heartbeat(true, true);
-                        ControlMessage::Ack {
-                            ok: true,
-                            detail: None,
+                        let accepted = matches!(
+                            result.disposition,
+                            WriteDisposition::Applied | WriteDisposition::Duplicate
+                        );
+                        self.observability
+                            .metrics()
+                            .record_heartbeat(true, accepted);
+                        match result.disposition {
+                            WriteDisposition::Stale => ControlMessage::Ack {
+                                ok: false,
+                                detail: Some("stale node status was not accepted".into()),
+                            },
+                            WriteDisposition::Applied | WriteDisposition::Duplicate => {
+                                ControlMessage::Ack {
+                                    ok: true,
+                                    detail: None,
+                                }
+                            }
+                            WriteDisposition::NotFound => ControlMessage::Ack {
+                                ok: false,
+                                detail: Some("node status upsert did not find its record".into()),
+                            },
                         }
                     }
                     Err(error) => {
@@ -1936,6 +1954,48 @@ mod tests {
             metrics: NodeMetricsSnapshot::default(),
             labels: BTreeMap::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn stale_status_heartbeat_is_rejected_in_the_ack() {
+        let store: Arc<dyn ClusterStateStore> = Arc::new(MemoryStateStore::new());
+        let observability = observability_over(Arc::clone(&store), "coordinator-1");
+        observability.check_ready().await.unwrap();
+        let coordinator = Coordinator::new(observability, Duration::from_secs(30));
+
+        let mut newer = worker_status(
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation",
+            "127.0.0.1:7001",
+        );
+        newer.heartbeat_seq = 2;
+        let accepted = coordinator
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(newer),
+            })
+            .await;
+        assert!(matches!(accepted, ControlMessage::Ack { ok: true, .. }));
+
+        let mut stale = worker_status(
+            "cluster-a",
+            "worker-1",
+            "worker-incarnation",
+            "127.0.0.1:7001",
+        );
+        stale.heartbeat_seq = 1;
+        let rejected = coordinator
+            .dispatch(ControlMessage::NodeStatusHeartbeat {
+                status: Box::new(stale),
+            })
+            .await;
+        assert!(matches!(
+            rejected,
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some(_)
+            }
+        ));
     }
 
     fn observability_over(

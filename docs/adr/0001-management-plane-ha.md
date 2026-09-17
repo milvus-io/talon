@@ -387,6 +387,12 @@ sequenceDiagram
     end
 ```
 
+Workers require a positive Ack for both heartbeat messages. Registration alone
+is insufficient to enable local data-plane readiness. A status heartbeat proposes
+readiness from local backend/store health; only its acceptance commits readiness
+locally. Coordinators acknowledge applied or duplicate status records and reject
+stale records and failed writes. This uses the existing Ack wire message.
+
 ### Placement lookup
 
 ```mermaid

@@ -616,6 +616,12 @@ impl WorkerReadiness {
             && !self.shutting_down.load(Ordering::Acquire)
     }
 
+    fn is_ready_assuming_control(&self) -> bool {
+        self.backend_ready.load(Ordering::Acquire)
+            && self.store_ready.load(Ordering::Acquire)
+            && !self.shutting_down.load(Ordering::Acquire)
+    }
+
     fn is_live(&self) -> bool {
         !self.shutting_down.load(Ordering::Acquire)
     }
@@ -745,7 +751,27 @@ impl WorkerObservability {
 
     /// Build a fresh bounded status snapshot.
     pub fn status(&self) -> NodeStatus {
-        let ready = self.readiness.is_ready();
+        self.status_inner(false)
+    }
+
+    /// Build the status proposed by an in-flight heartbeat.
+    ///
+    /// The control dependency is treated as ready in the proposed record, but
+    /// local readiness is not changed. The coordinator persists this record
+    /// before returning a positive Ack; only then does the worker commit the
+    /// same transition locally. This lets an expired worker rejoin in one
+    /// heartbeat without serving traffic before the heartbeat is accepted.
+    pub fn status_for_heartbeat(&self) -> NodeStatus {
+        self.status_inner(true)
+    }
+
+    fn status_inner(&self, assume_control_ready: bool) -> NodeStatus {
+        let locally_ready = self.readiness.is_ready();
+        let ready = if assume_control_ready {
+            self.readiness.is_ready_assuming_control()
+        } else {
+            locally_ready
+        };
         let inflight_loads = self.inflight.len() as u64;
         let block_count = self.index.len() as u64;
         let page_count = self.index.page_count();
@@ -756,7 +782,7 @@ impl WorkerObservability {
             page_count,
             resident_bytes,
             self.started,
-            ready,
+            locally_ready,
         );
         NodeStatus {
             schema_version: NODE_STATUS_SCHEMA_VERSION,
@@ -768,7 +794,11 @@ impl WorkerObservability {
             started_at_unix_ms: self.started_at_unix_ms,
             reported_at_unix_ms: now_unix_ms().max(self.started_at_unix_ms),
             heartbeat_seq: self.heartbeat_seq.fetch_add(1, Ordering::Relaxed),
-            health: self.readiness.health(),
+            health: if ready {
+                NodeHealth::Healthy
+            } else {
+                self.readiness.health()
+            },
             ready,
             metrics: self
                 .metrics
@@ -941,6 +971,10 @@ mod tests {
         observability.readiness().set_store_ready(true);
         assert_eq!(observability.status().health, NodeHealth::Degraded);
 
+        let proposed = observability.status_for_heartbeat();
+        assert!(proposed.ready);
+        assert_eq!(proposed.health, NodeHealth::Healthy);
+        assert!(!observability.is_ready());
         observability.readiness().set_control_registered(true);
         let ready = observability.status();
         assert!(ready.ready);
