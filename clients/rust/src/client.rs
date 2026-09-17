@@ -146,7 +146,7 @@ impl Client {
     /// serve matching cached bytes or conditionally fill them from the origin;
     /// a version mismatch fails the read instead of substituting newer bytes.
     /// Large ranges are planned lazily, with at most eight block reads in flight
-    /// per logical read. Results retain byte order and use the caller buffer directly.
+    /// per logical read. Assembly retains byte order without intermediate block buffers.
     pub async fn read(
         &self,
         object: &ObjectId,
