@@ -11,6 +11,11 @@ publish = false
 [dependencies]
 talon-rust-client = { path = "../.." }
 
+# Cargo patches are workspace-root scoped; reuse the prepared dependency
+# without adding another direct dependency to this standalone consumer.
+[patch.crates-io]
+monoio = { path = "../../../../.patched-deps/monoio" }
+
 [[test]]
 name = "public_error_api"
 path = "../public_error_api.rs"
