@@ -287,6 +287,79 @@ under real traffic.
 
 ---
 
+### page-access-checkpoint-lag
+
+**Alert:** `TalonPageAccessCheckpointLag` (warning) — dirty page access records
+remain unsaved beyond three configured checkpoint intervals for >2m. A restart
+can recover older access times and cause early eviction and extra origin reads.
+
+1. Check checkpoint error logs and
+   `talon_worker_page_access_checkpoint_errors_total` alongside dirty age and
+   the last successful checkpoint timestamp.
+2. Check free disk space, inodes, cache-root permissions, and file/directory
+   sync latency. Restore filesystem access so scheduled checkpoints can retry.
+3. Confirm dirty age falls and the checkpoint timestamp advances after recovery.
+   Avoid using repeated restarts to resolve a persistent storage failure.
+
+### page-gc-scan-lag
+
+**Alert:** `TalonPageGcScanLag` (warning) — the latest complete page GC scan
+takes more than 10% of the configured TTL for >2m.
+
+1. Compare `talon_worker_page_gc_scan_seconds` with page count, batch latency,
+   disk latency, and deletion errors.
+2. Review `page_gc_interval_ms`, `page_gc_scan_batch_size`,
+   `page_gc_delete_batch_size`, and `page_gc_io_concurrency`. Tune budgets against
+   foreground request latency and available I/O capacity.
+3. Confirm subsequent scans complete faster. TTL determines eviction eligibility;
+   it does not promise physical space release at a fixed deadline.
+
+### page-gc-delete-failures
+
+**Alert:** `TalonPageGcDeleteFailures` (warning) — page unlink failures persist
+or the observed retry count increases for >5m.
+
+1. Inspect logged page paths and filesystem errors; check directory permissions,
+   read-only mounts, and storage health.
+2. Restore the ability to unlink files. Failed unlinks retain resident byte
+   accounting and are retried automatically.
+3. Verify the error rate stops increasing and retry counts drain after complete
+   scans. Open file descriptors can delay physical space release after unlink.
+
+### page-cleanup-failures
+
+**Alert:** `TalonPageCleanupFailures` (warning) — disk cleanup errors recur or
+the latest completed scan reports unresolved paths for >5m, even with TTL off.
+
+1. Inspect paths in cleanup warnings and check cache-root permissions, mount
+   state, and filesystem health.
+2. Restore filesystem access; later disk passes rediscover failed temporary
+   files and metadata-only directories without relying on in-memory retries.
+3. Confirm `talon_worker_page_cleanup_errors_total` stops increasing and
+   `talon_worker_page_cleanup_pending` clears after a complete scan. Unknown
+   files and symlinks are intentionally retained; identify their owner before
+   any manual intervention, and do not recursively delete live page directories.
+
+### page-cleanup-scan-stalled
+
+**Alert:** `TalonPageCleanupScanStalled` (warning) — no disk cleanup pass has
+completed for 15 minutes, or none completed after 15 minutes of worker uptime,
+and this condition persists for >5m.
+
+1. Check whether `talon_worker_page_cleanup_scanned_total` is advancing and
+   inspect filesystem latency, cleanup errors, and long-running mutations.
+2. Review the shared scan/delete budgets and I/O concurrency settings. A large
+   cache root can require many background batches; compare its measured full
+   scan time with the alert threshold before increasing that threshold.
+3. Verify `talon_worker_page_cleanup_scan_timestamp_seconds` advances. Cleanup
+   runs even when TTL or paged reads are disabled, so disabling TTL alone does
+   not explain a stalled disk scan.
+
+See [page TTL](../explanation/page-ttl.md) for checkpoint recovery, cleanup
+ownership and performance limits.
+
+---
+
 ## 6. Backup and restore
 
 The shared store holds only ephemeral, rebuildable node records — **there is no

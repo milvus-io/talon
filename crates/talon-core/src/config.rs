@@ -146,6 +146,18 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
+    /// Idle page lifetime in milliseconds; 0 disables TTL.
+    pub page_ttl_ms: u64,
+    /// Dirty page access checkpoint interval in milliseconds.
+    pub page_access_checkpoint_interval_ms: u64,
+    /// Page GC batch interval in milliseconds.
+    pub page_gc_interval_ms: u64,
+    /// Maximum pages examined per GC batch.
+    pub page_gc_scan_batch_size: usize,
+    /// Maximum page deletion attempts per GC batch.
+    pub page_gc_delete_batch_size: usize,
+    /// Maximum concurrent page GC deletion tasks.
+    pub page_gc_io_concurrency: usize,
     /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
     /// per-backend endpoint/credential fields below apply to the selected one.
     pub backend: Option<String>,
@@ -279,6 +291,12 @@ impl Default for WorkerConfig {
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
+            page_ttl_ms: 0,
+            page_access_checkpoint_interval_ms: 60000,
+            page_gc_interval_ms: 1000,
+            page_gc_scan_batch_size: 65536,
+            page_gc_delete_batch_size: 1024,
+            page_gc_io_concurrency: 4,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -342,6 +360,18 @@ pub struct WorkerConfigPatch {
     pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
     pub paged_miss_run_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::page_ttl_ms`].
+    pub page_ttl_ms: Option<u64>,
+    /// Override for [`WorkerConfig::page_access_checkpoint_interval_ms`].
+    pub page_access_checkpoint_interval_ms: Option<u64>,
+    /// Override for [`WorkerConfig::page_gc_interval_ms`].
+    pub page_gc_interval_ms: Option<u64>,
+    /// Override for [`WorkerConfig::page_gc_scan_batch_size`].
+    pub page_gc_scan_batch_size: Option<usize>,
+    /// Override for [`WorkerConfig::page_gc_delete_batch_size`].
+    pub page_gc_delete_batch_size: Option<usize>,
+    /// Override for [`WorkerConfig::page_gc_io_concurrency`].
+    pub page_gc_io_concurrency: Option<usize>,
     /// Override for [`WorkerConfig::backend`].
     pub backend: Option<String>,
     /// Override for [`WorkerConfig::azure_account`].
@@ -402,6 +432,18 @@ impl Patch for WorkerConfigPatch {
             paged_miss_run_concurrency: self
                 .paged_miss_run_concurrency
                 .or(base.paged_miss_run_concurrency),
+            page_ttl_ms: self.page_ttl_ms.or(base.page_ttl_ms),
+            page_access_checkpoint_interval_ms: self
+                .page_access_checkpoint_interval_ms
+                .or(base.page_access_checkpoint_interval_ms),
+            page_gc_interval_ms: self.page_gc_interval_ms.or(base.page_gc_interval_ms),
+            page_gc_scan_batch_size: self
+                .page_gc_scan_batch_size
+                .or(base.page_gc_scan_batch_size),
+            page_gc_delete_batch_size: self
+                .page_gc_delete_batch_size
+                .or(base.page_gc_delete_batch_size),
+            page_gc_io_concurrency: self.page_gc_io_concurrency.or(base.page_gc_io_concurrency),
             backend: self.backend.or(base.backend),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
@@ -588,6 +630,12 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
+    ConfigVar { env: "TALON_WORKER_PAGE_TTL_MS", key: "page_ttl_ms", default: Some("0"), cli: false, secret: false, help: "Idle page lifetime in milliseconds; 0 disables TTL." },
+    ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS", key: "page_access_checkpoint_interval_ms", default: Some("60000"), cli: false, secret: false, help: "Dirty page access checkpoint interval in milliseconds." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MS", key: "page_gc_interval_ms", default: Some("1000"), cli: false, secret: false, help: "Page GC batch interval in milliseconds." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum pages examined per GC batch." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum page deletion attempts per GC batch." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent page GC deletion tasks." },
     ConfigVar {
         env: "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY",
         key: "paged_miss_run_concurrency",
@@ -787,6 +835,14 @@ pub(crate) mod worker_env {
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
+    pub const PAGE_TTL_MS: &str = "TALON_WORKER_PAGE_TTL_MS";
+    pub const PAGE_ACCESS_CHECKPOINT_INTERVAL_MS: &str =
+        "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS";
+    pub const PAGE_GC_INTERVAL_MS: &str = "TALON_WORKER_PAGE_GC_INTERVAL_MS";
+    pub const PAGE_GC_SCAN_BATCH_SIZE: &str = "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE";
+    pub const PAGE_GC_DELETE_BATCH_SIZE: &str = "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE";
+    pub const PAGE_GC_IO_CONCURRENCY: &str = "TALON_WORKER_PAGE_GC_IO_CONCURRENCY";
+
     pub const BACKEND: &str = "TALON_WORKER_BACKEND";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
@@ -893,6 +949,24 @@ impl WorkerConfigPatch {
             paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
                 .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
                 .transpose()?,
+            page_ttl_ms: get(worker_env::PAGE_TTL_MS)
+                .map(|v| parse_u64(v, worker_env::PAGE_TTL_MS))
+                .transpose()?,
+            page_access_checkpoint_interval_ms: get(worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MS)
+                .map(|v| parse_u64(v, worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MS))
+                .transpose()?,
+            page_gc_interval_ms: get(worker_env::PAGE_GC_INTERVAL_MS)
+                .map(|v| parse_u64(v, worker_env::PAGE_GC_INTERVAL_MS))
+                .transpose()?,
+            page_gc_scan_batch_size: get(worker_env::PAGE_GC_SCAN_BATCH_SIZE)
+                .map(|v| parse_usize(v, worker_env::PAGE_GC_SCAN_BATCH_SIZE))
+                .transpose()?,
+            page_gc_delete_batch_size: get(worker_env::PAGE_GC_DELETE_BATCH_SIZE)
+                .map(|v| parse_usize(v, worker_env::PAGE_GC_DELETE_BATCH_SIZE))
+                .transpose()?,
+            page_gc_io_concurrency: get(worker_env::PAGE_GC_IO_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::PAGE_GC_IO_CONCURRENCY))
+                .transpose()?,
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
             backend: get(worker_env::BACKEND),
@@ -985,6 +1059,20 @@ impl WorkerConfig {
             paged_miss_run_concurrency: merged
                 .paged_miss_run_concurrency
                 .unwrap_or(d.paged_miss_run_concurrency),
+            page_ttl_ms: merged.page_ttl_ms.unwrap_or(d.page_ttl_ms),
+            page_access_checkpoint_interval_ms: merged
+                .page_access_checkpoint_interval_ms
+                .unwrap_or(d.page_access_checkpoint_interval_ms),
+            page_gc_interval_ms: merged.page_gc_interval_ms.unwrap_or(d.page_gc_interval_ms),
+            page_gc_scan_batch_size: merged
+                .page_gc_scan_batch_size
+                .unwrap_or(d.page_gc_scan_batch_size),
+            page_gc_delete_batch_size: merged
+                .page_gc_delete_batch_size
+                .unwrap_or(d.page_gc_delete_batch_size),
+            page_gc_io_concurrency: merged
+                .page_gc_io_concurrency
+                .unwrap_or(d.page_gc_io_concurrency),
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
             backend: merged.backend.or(d.backend),
@@ -1109,6 +1197,50 @@ impl WorkerConfig {
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
+        }
+        if self.page_ttl_ms > 0 && self.l2_page_size_bytes == 0 {
+            return Err(Error::Other("page_ttl_ms requires paged L2".into()));
+        }
+        if self.page_ttl_ms > 0 && self.page_access_checkpoint_interval_ms > self.page_ttl_ms {
+            return Err(Error::Other(
+                "page_access_checkpoint_interval_ms must not exceed page_ttl_ms".into(),
+            ));
+        }
+        if self.page_access_checkpoint_interval_ms == 0 {
+            return Err(Error::Other(
+                "page_access_checkpoint_interval_ms must be > 0".into(),
+            ));
+        }
+        if self.page_gc_interval_ms == 0 {
+            return Err(Error::Other("page_gc_interval_ms must be > 0".into()));
+        }
+        if self.page_gc_scan_batch_size == 0 {
+            return Err(Error::Other("page_gc_scan_batch_size must be > 0".into()));
+        }
+        if self.page_gc_delete_batch_size == 0 {
+            return Err(Error::Other("page_gc_delete_batch_size must be > 0".into()));
+        }
+        if self.page_gc_io_concurrency > (usize::MAX >> 3) {
+            return Err(Error::Other(
+                "page_gc_io_concurrency exceeds semaphore capacity".into(),
+            ));
+        }
+        if self.page_gc_io_concurrency == 0 {
+            return Err(Error::Other("page_gc_io_concurrency must be > 0".into()));
+        }
+        for millis in [
+            self.page_ttl_ms,
+            self.page_access_checkpoint_interval_ms,
+            self.page_gc_interval_ms,
+        ] {
+            if std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(millis))
+                .is_none()
+            {
+                return Err(Error::Other(
+                    "page TTL duration overflows monotonic clock".into(),
+                ));
+            }
         }
         if self.paged_miss_run_concurrency == 0 {
             return Err(Error::Other(
@@ -1690,6 +1822,61 @@ mod tests {
         // An invalid bool for s3_path_style is a hard error too.
         let bad_bool = |k: &str| (k == "TALON_WORKER_S3_PATH_STYLE").then(|| "maybe".to_string());
         assert!(WorkerConfigPatch::from_env_with(bad_bool).is_err());
+    }
+
+    #[test]
+    fn page_ttl_config_layers_and_validation() {
+        let file = WorkerConfigPatch::from_toml(
+            "l2_page_size_bytes = 1048576\npage_ttl_ms = 120000\npage_gc_scan_batch_size = 10\n",
+        )
+        .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            "TALON_WORKER_PAGE_TTL_MS" => Some("180000".into()),
+            "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS" => Some("1000".into()),
+            "TALON_WORKER_PAGE_GC_INTERVAL_MS" => Some("500".into()),
+            "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE" => Some("100".into()),
+            "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE" => Some("5".into()),
+            "TALON_WORKER_PAGE_GC_IO_CONCURRENCY" => Some("2".into()),
+            _ => None,
+        })
+        .unwrap();
+        let c = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert_eq!(
+            (
+                c.page_ttl_ms,
+                c.page_access_checkpoint_interval_ms,
+                c.page_gc_interval_ms
+            ),
+            (180000, 1000, 500)
+        );
+        assert_eq!(
+            (
+                c.page_gc_scan_batch_size,
+                c.page_gc_delete_batch_size,
+                c.page_gc_io_concurrency
+            ),
+            (100, 5, 2)
+        );
+        assert_eq!(WorkerConfig::default().page_ttl_ms, 0);
+        for setting in [
+            "page_ttl_ms = 1",
+            "page_gc_interval_ms = 0",
+            "page_access_checkpoint_interval_ms = 0",
+            "page_gc_scan_batch_size = 0",
+            "page_gc_delete_batch_size = 0",
+            "page_gc_io_concurrency = 0",
+            "l2_page_size_bytes = 1048576\npage_ttl_ms = 1000",
+        ] {
+            let patch = WorkerConfigPatch::from_toml(setting).unwrap();
+            assert!(
+                WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err(),
+                "{setting}"
+            );
+        }
+        assert!(WorkerConfigPatch::from_env_with(
+            |key| (key == "TALON_WORKER_PAGE_TTL_MS").then(|| "bad".into())
+        )
+        .is_err());
     }
 
     #[test]

@@ -25,7 +25,7 @@ use crate::{BlockIndex, InFlightLoads};
 /// Pre-registered metric handles used on worker hot paths.
 #[derive(Clone)]
 pub struct WorkerMetrics {
-    registry: Metrics,
+    pub(crate) registry: Metrics,
     configured_capacity_bytes: u64,
     active_connection_count: Arc<AtomicU64>,
     connection_admission_saturated_total: Counter,
