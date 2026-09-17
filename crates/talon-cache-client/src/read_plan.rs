@@ -1,8 +1,8 @@
 //! Splitting a byte read into per-block fetch segments.
 //!
 //! A single POSIX `read(offset, len)` may span multiple 256 MiB blocks, and the
-//! read path fetches one block at a time. [`plan_read`] turns a request into an
-//! ordered list of [`BlockSegment`]s — each naming the [`BlockId`] to fetch, the
+//! read path fetches one block at a time. [`iter_read`] turns a request into an
+//! ordered stream of [`BlockSegment`]s — each naming the [`BlockId`] to fetch, the
 //! offset *within* that block, and how many bytes to take from it — so a caller
 //! can fetch each segment and concatenate the results in order to reconstruct
 //! the requested range.
@@ -25,6 +25,67 @@ pub struct BlockSegment {
     pub len: u32,
 }
 
+/// Lazy ordered block segments for one clamped byte-range read.
+///
+/// Keeping the plan lazy lets callers bound in-flight work without first
+/// allocating one descriptor per block in an arbitrarily large range.
+pub struct ReadPlan<'a> {
+    object: &'a ObjectId,
+    version: &'a Version,
+    block_size: u32,
+    position: u64,
+    end: u64,
+}
+
+impl Iterator for ReadPlan<'_> {
+    type Item = BlockSegment;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.position >= self.end {
+            return None;
+        }
+        let block_size = u64::from(self.block_size);
+        let block_start = (self.position / block_size) * block_size;
+        let offset_in_block = (self.position - block_start) as u32;
+        let segment_end = block_start.saturating_add(block_size).min(self.end);
+        let len = (segment_end - self.position) as u32;
+        self.position = segment_end;
+        Some(BlockSegment {
+            block: BlockId::new(
+                self.object.clone(),
+                block_start,
+                self.block_size,
+                self.version.clone(),
+            ),
+            offset_in_block,
+            len,
+        })
+    }
+}
+
+/// Lazily split `[offset, offset+len)` into ordered block-local segments.
+pub fn iter_read<'a>(
+    object: &'a ObjectId,
+    offset: u64,
+    len: u64,
+    block_size: u32,
+    version: &'a Version,
+    size: u64,
+) -> ReadPlan<'a> {
+    let end = if block_size == 0 || len == 0 || offset >= size {
+        offset
+    } else {
+        offset.saturating_add(len).min(size)
+    };
+    ReadPlan {
+        object,
+        version,
+        block_size,
+        position: offset,
+        end,
+    }
+}
+
 /// Split `[offset, offset+len)` of `obj` into ordered per-block segments.
 ///
 /// - `block_size` is the file's logical block size and `version` its source
@@ -41,30 +102,7 @@ pub fn plan_read(
     version: &Version,
     size: u64,
 ) -> Vec<BlockSegment> {
-    if block_size == 0 || len == 0 || offset >= size {
-        return Vec::new();
-    }
-    // Clamp the read to the end of the object (POSIX short read at EOF).
-    let end = offset.saturating_add(len).min(size);
-    let bs = block_size as u64;
-
-    let mut segments = Vec::new();
-    let mut pos = offset;
-    while pos < end {
-        let block_start = (pos / bs) * bs;
-        let offset_in_block = (pos - block_start) as u32;
-        let block_end = block_start + bs;
-        // Take up to the block boundary or the clamped read end, whichever first.
-        let seg_end = block_end.min(end);
-        let seg_len = (seg_end - pos) as u32;
-        segments.push(BlockSegment {
-            block: BlockId::new(obj.clone(), block_start, block_size, version.clone()),
-            offset_in_block,
-            len: seg_len,
-        });
-        pos = seg_end;
-    }
-    segments
+    iter_read(obj, offset, len, block_size, version, size).collect()
 }
 
 #[cfg(test)]
@@ -160,5 +198,24 @@ mod tests {
         assert!(plan.iter().all(|s| s.offset_in_block == 0 && s.len == 1024));
         assert_eq!(plan[0].block.offset, 1024);
         assert_eq!(plan[1].block.offset, 2048);
+    }
+
+    #[test]
+    fn lazy_plan_does_not_materialize_the_whole_range() {
+        let first_two: Vec<_> = iter_read(&obj(), 0, u64::MAX, 1, &v(), u64::MAX)
+            .take(2)
+            .collect();
+        assert_eq!(first_two.len(), 2);
+        assert_eq!(first_two[0].block.offset, 0);
+        assert_eq!(first_two[1].block.offset, 1);
+    }
+
+    #[test]
+    fn plan_near_u64_max_does_not_overflow_the_last_block_boundary() {
+        let plan = plan_read(&obj(), u64::MAX - 2, 2, 4, &v(), u64::MAX);
+        assert_eq!(plan.len(), 1);
+        assert_eq!(plan[0].block.offset, u64::MAX - 3);
+        assert_eq!(plan[0].offset_in_block, 1);
+        assert_eq!(plan[0].len, 2);
     }
 }
