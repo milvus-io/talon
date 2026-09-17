@@ -4,17 +4,14 @@
 //! `main.rs`. It serves the identical protocol — same frames, same limits, same
 //! error semantics — over monoio's owned-buffer I/O.
 //!
-//! # Why the sendfile path gets simpler
+//! # Ring-owned zero-copy sends
 //!
-//! The Tokio path cannot `sendfile` directly onto its socket: a Tokio
-//! `TcpStream` is non-blocking, so a blocking `sendfile` on it would spuriously
-//! `EAGAIN`. It therefore round-trips the socket out of and back into the
-//! runtime on **every transfer** — `into_std`, `set_nonblocking(false)`, move to
-//! a blocking thread, move back, `set_nonblocking(true)`, `from_std`.
-//!
-//! A ring-owned fd needs none of that. It is handed straight to the blocking
-//! pool, and the ring resumes on the same stream afterwards. Measured working
-//! in #273; the round-trip disappears entirely.
+//! Resident ranges travel file → pipe → socket without a user-space send pool.
+//! The connection's ring submits file reads with IORING_OP_SPLICE, then drains
+//! the ready pipe with nonblocking splice(2). EAGAIN waits on ring writability.
+//! Linux may dispatch the file operation to kernel io-wq. Each connection owns
+//! a lazily created pipe pair, drained before reuse; explicit file offsets
+//! allow concurrent requests to share immutable cache descriptors.
 //!
 //! # What is preserved exactly
 //!
@@ -25,7 +22,7 @@
 //! - readiness gating, so an unready worker returns an error frame rather than
 //!   serving;
 //! - the desync rule: once a response header promising `len` bytes is on the
-//!   wire, a short `sendfile` cannot be reported as an error frame, so the
+//!   wire, a short transfer cannot be reported as an error frame, so the
 //!   connection is dropped instead.
 //!
 //! # A Tokio context is still required on the ring thread
@@ -52,7 +49,6 @@
 //! worth doing eventually, but a separate change from the data plane itself.
 
 use std::io::{Seek, Write};
-use std::os::fd::AsRawFd;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -66,7 +62,8 @@ use talon_transport::DataErrorCode;
 use crate::data_error::encode_runtime_error;
 use crate::observability::WorkerObservability;
 use crate::runtime::{ServeOutcome, WorkerRuntime};
-use crate::{send_header_and_file_range, send_header_and_file_ranges, DEFAULT_CHUNK};
+use monoio::io::splice::splice_file_to_pipe;
+use monoio::net::unix::{new_pipe, Pipe};
 
 /// Serve one accepted data-plane connection until EOF or a fatal error.
 pub async fn handle_conn(
@@ -79,6 +76,7 @@ pub async fn handle_conn(
     // `recv` for the whole batch instead of two ring operations per request; a
     // client that does not is unaffected beyond a copy.
     let mut reader = BufferedFrameReader::new();
+    let mut send_pipe = None;
     loop {
         let request_started = Instant::now();
         let (header, payload) = match reader
@@ -107,6 +105,7 @@ pub async fn handle_conn(
                 &observability,
                 request_started,
                 &mut reader,
+                &mut send_pipe,
             ))
             .await
         {
@@ -135,6 +134,7 @@ async fn handle_request(
     observability: &Arc<WorkerObservability>,
     request_started: Instant,
     reader: &mut BufferedFrameReader,
+    send_pipe: &mut Option<(Pipe, Pipe)>,
 ) -> anyhow::Result<Option<TcpStream>> {
     let response_version = header.version;
     match header.msg_type {
@@ -340,7 +340,7 @@ async fn handle_request(
             let len = handle.len;
             let mut hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
             hdr[2] = response_version;
-            match sendfile_payload(&stream, hdr, handle).await {
+            match splice_payload(&mut stream, hdr, std::slice::from_ref(&handle), send_pipe).await {
                 Ok(()) => observability
                     .metrics()
                     .record_request_success(len, request_started.elapsed()),
@@ -359,7 +359,7 @@ async fn handle_request(
             let len: u64 = handles.iter().map(|h| h.len).sum();
             let mut hdr = data::response_header_ok(h.request_id, len as u32).to_vec();
             hdr[2] = response_version;
-            match sendfile_many_payload(&stream, hdr, handles).await {
+            match splice_payload(&mut stream, hdr, &handles, send_pipe).await {
                 Ok(()) => observability
                     .metrics()
                     .record_request_success(len, request_started.elapsed()),
@@ -705,92 +705,125 @@ fn rejoin(header: &FrameHeader, payload: &[u8]) -> Vec<u8> {
     full
 }
 
-/// Stream a resident block to the client with `sendfile(2)` from the blocking
-/// pool, writing the response frame header in the same blocking step.
-///
-/// The ring keeps ownership of the socket throughout: only the raw fd crosses
-/// to the blocking thread, so there is no `into_std`/`from_std` round-trip and
-/// no non-blocking-mode toggling. `sendfile` must not run on the ring — it is
-/// blocking, and a slow client would stall every connection this ring owns.
-///
-/// The header travels with the payload rather than being written from the ring
-/// first: that removes one ring-to-pool hand-off (and its futex wake) per
-/// request, and `MSG_MORE` lets the kernel put the header and the first
-/// payload chunk in one segment.
-async fn sendfile_payload(
-    stream: &TcpStream,
+/// Send a response through this connection's ring, retaining descriptors in
+/// submitted operations through completion. On any error the caller closes
+/// the connection (and pipe), because the advertised frame is incomplete.
+async fn splice_payload(
+    stream: &mut TcpStream,
     header: Vec<u8>,
-    handle: BlockHandle,
+    handles: &[BlockHandle],
+    pipe: &mut Option<(Pipe, Pipe)>,
 ) -> anyhow::Result<()> {
     talon_telemetry::observe("talon.response.send", "internal", async {
-        let sock_fd = stream.as_raw_fd();
-        let len = handle.len;
-        let sent = monoio::spawn_blocking(move || {
-            // SAFETY-adjacent note: the fd outlives this call because `stream` is
-            // borrowed for the duration of the await, and the connection task is the
-            // only owner.
-            send_header_and_file_range(
-                &FdRef(sock_fd),
-                &header,
-                &handle.fd,
-                handle.offset,
-                handle.len,
-                DEFAULT_CHUNK,
-            )
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
-
-        if sent != len {
-            // sendfile hit EOF before the advertised length: the block file is
-            // shorter than the index claimed. The header already promised `len`
-            // bytes, so the connection is desynced.
-            anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; block file truncated");
+        if pipe.is_none() {
+            // SPLICE_F_NONBLOCK only covers the pipe. Linux splice_to_socket
+            // derives MSG_DONTWAIT from the socket's O_NONBLOCK flag; without
+            // it a slow peer could block the ring thread.
+            use std::os::fd::AsRawFd;
+            let fd = stream.as_raw_fd();
+            // SAFETY: stream owns this live fd throughout both fcntl calls.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+            {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            *pipe = Some(new_pipe()?);
+        }
+        let (read_pipe, write_pipe) = pipe.as_mut().expect("initialized pipe");
+        let mut header = Some(header);
+        for handle in handles {
+            let mut offset = handle.offset;
+            let mut remaining = handle.len;
+            while remaining > 0 {
+                // The pipe may accept less than requested. Drain exactly that
+                // completion before refilling, so neither leg waits on us.
+                let fill = async {
+                    loop {
+                        match splice_file_to_pipe(
+                            handle.fd.clone(),
+                            offset,
+                            write_pipe,
+                            remaining.min(1 << 20) as u32,
+                        )
+                        .await
+                        {
+                            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                            result => break result.map_err(anyhow::Error::from),
+                        }
+                    }
+                };
+                let loaded = if let Some(header) = header.take() {
+                    // Header send and the first file read are independent. Queue
+                    // both before waiting; only drain the pipe after the header
+                    // has completed, preserving wire order on this socket.
+                    let (_, loaded) = futures::try_join!(send_splice_header(stream, header), fill)?;
+                    loaded
+                } else {
+                    fill.await?
+                };
+                anyhow::ensure!(loaded != 0, "splice short read: cache file truncated");
+                let mut pending = loaded;
+                while pending > 0 {
+                    match try_drain_pipe(read_pipe, stream, pending) {
+                        Ok(0) => anyhow::bail!("splice write made no progress"),
+                        Ok(sent) => pending -= sent,
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            stream.writable(false).await?;
+                        }
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                offset = offset
+                    .checked_add(u64::from(loaded))
+                    .ok_or_else(|| anyhow::anyhow!("splice offset overflow"))?;
+                remaining -= u64::from(loaded);
+            }
+        }
+        if let Some(header) = header {
+            // Empty payloads have no splice that could flush MSG_MORE.
+            write_all(stream, header).await?;
         }
         Ok(())
     })
     .await
 }
 
-/// Send a header plus N page segments with one `sendfile` each.
-///
-/// The cross-page analogue of [`sendfile_payload`]. Pages of a paged block are
-/// separate files, so a spanning read cannot be one `sendfile` — but N calls
-/// still keep the payload out of userspace, which is what the byte path could
-/// not do.
-async fn sendfile_many_payload(
-    stream: &TcpStream,
-    header: Vec<u8>,
-    handles: Vec<BlockHandle>,
-) -> anyhow::Result<()> {
-    talon_telemetry::observe("talon.response.send", "internal", async {
-        let sock_fd = stream.as_raw_fd();
-        let len: u64 = handles.iter().map(|h| h.len).sum();
-        let sent = monoio::spawn_blocking(move || {
-            let segments: Vec<_> = handles
-                .iter()
-                .map(|h| (FdRef(h.fd.as_raw_fd()), h.offset, h.len))
-                .collect();
-            send_header_and_file_ranges(&FdRef(sock_fd), &header, &segments, DEFAULT_CHUNK)
-        })
-        .await
-        .map_err(|e| anyhow::anyhow!("sendfile task failed: {e:?}"))??;
-
-        if sent != len {
-            anyhow::bail!("sendfile short read: sent {sent} of {len} bytes; page file truncated");
-        }
-        Ok(())
-    })
-    .await
-}
-
-/// A borrowed raw fd that satisfies [`AsRawFd`] without owning or closing it.
-struct FdRef(std::os::fd::RawFd);
-
-impl AsRawFd for FdRef {
-    fn as_raw_fd(&self) -> std::os::fd::RawFd {
-        self.0
+/// Only drain pages already read into this connection's private pipe.
+/// Both pipe and socket use nonblocking semantics; EAGAIN is handled by the
+/// ring's writable poll. Cached files must remain immutable while serving.
+fn try_drain_pipe(pipe: &Pipe, socket: &TcpStream, len: u32) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+    // SAFETY: both descriptors are borrowed and remain live for this syscall;
+    // null offsets are required for a pipe and socket.
+    let sent = unsafe {
+        libc::splice(
+            pipe.as_raw_fd(),
+            std::ptr::null_mut(),
+            socket.as_raw_fd(),
+            std::ptr::null_mut(),
+            len as usize,
+            libc::SPLICE_F_MOVE | libc::SPLICE_F_NONBLOCK,
+        )
+    };
+    if sent < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Ok(sent as u32)
     }
+}
+
+/// Coalesce the frame header with the following splice payload.
+async fn send_splice_header(stream: &mut TcpStream, mut header: Vec<u8>) -> anyhow::Result<()> {
+    use monoio::buf::IoBuf;
+    let mut offset = 0;
+    while offset < header.len() {
+        let (sent, buffer) = stream.send_more(header.slice(offset..)).await?;
+        anyhow::ensure!(sent > 0, "response header write made no progress");
+        header = buffer.into_inner();
+        offset += sent;
+    }
+    Ok(())
 }
 
 /// Handle a `Control` frame on the data plane.
@@ -1248,7 +1281,7 @@ mod tests {
             .expect("tokio runtime");
         let _guard = tokio_rt.enter();
         monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-            .attach_thread_pool(Box::new(monoio::blocking::DefaultThreadPool::new(4)))
+            .with_iowq_max_workers(1, 1)
             .enable_timer()
             .build()
             .expect("io_uring runtime")
@@ -1268,6 +1301,295 @@ mod tests {
             Vec::new()
         };
         (header, body)
+    }
+
+    fn splice_test_file(len: usize) -> Arc<std::os::fd::OwnedFd> {
+        let mut file = tempfile::tempfile().unwrap();
+        let body: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        file.write_all(&body).unwrap();
+        file.seek(std::io::SeekFrom::Start(17)).unwrap();
+        Arc::new(file.into())
+    }
+
+    #[test]
+    fn splice_shared_fd_offsets_and_reused_pipe_are_byte_exact() {
+        use std::os::fd::AsRawFd;
+        let file = splice_test_file(2 << 20);
+        run(async {
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let shared = file.clone();
+            let server = monoio::spawn(async move {
+                let mut tasks = Vec::new();
+                for client in 0..4 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let fd = shared.clone();
+                    tasks.push(monoio::spawn(async move {
+                        let mut pipe = None;
+                        for round in 0..8 {
+                            let offset = 31 + client * 997 + round * 8191;
+                            let handles = [
+                                BlockHandle {
+                                    fd: fd.clone(),
+                                    offset: 0,
+                                    len: 0,
+                                },
+                                BlockHandle {
+                                    fd: fd.clone(),
+                                    offset,
+                                    len: 131_111,
+                                },
+                                BlockHandle {
+                                    fd: fd.clone(),
+                                    offset: offset + 199_999,
+                                    len: 70_003,
+                                },
+                            ];
+                            let header = offset.to_le_bytes().to_vec();
+                            splice_payload(&mut stream, header, &handles, &mut pipe)
+                                .await
+                                .unwrap();
+                        }
+                        splice_payload(&mut stream, vec![7; 8], &[], &mut pipe)
+                            .await
+                            .unwrap();
+                    }));
+                }
+                for task in tasks {
+                    task.await;
+                }
+            });
+            let mut clients = Vec::new();
+            // Connect sequentially, then read concurrently so accepted order is known.
+            for _ in 0..4 {
+                clients.push(TcpStream::connect(addr).await.unwrap());
+            }
+            let readers = clients.into_iter().map(|mut client| async move {
+                for _ in 0..8 {
+                    let (result, header) = client.read_exact(vec![0; 8]).await;
+                    result.unwrap();
+                    let offset = u64::from_le_bytes(header.try_into().unwrap());
+                    let (result, body) = client.read_exact(vec![0; 201_114]).await;
+                    result.unwrap();
+                    let expected: Vec<_> = (offset..offset + 131_111)
+                        .chain(offset + 199_999..offset + 270_002)
+                        .map(|i| (i % 251) as u8)
+                        .collect();
+                    assert_eq!(body, expected);
+                }
+                let (result, empty_header) = client.read_exact(vec![0; 8]).await;
+                result.unwrap();
+                assert_eq!(empty_header, vec![7; 8]);
+            });
+            futures::future::join_all(readers).await;
+            server.await;
+        });
+        // SAFETY: the test owns a live descriptor; SEEK_CUR only reads its position.
+        assert_eq!(
+            unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) },
+            17
+        );
+        assert_eq!(Arc::strong_count(&file), 1);
+    }
+
+    #[test]
+    fn splice_eof_and_peer_disconnect_fail_without_a_helper_pool() {
+        run(async {
+            for truncated in [true, false] {
+                let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let addr = listener.local_addr().unwrap();
+                let file = splice_test_file(if truncated { 4 } else { 4 << 20 });
+                let task = monoio::spawn(async move {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let handle = BlockHandle {
+                        fd: file,
+                        offset: 0,
+                        len: 8 << 20,
+                    };
+                    let mut pipe = None;
+                    assert!(splice_payload(&mut stream, vec![1], &[handle], &mut pipe)
+                        .await
+                        .is_err());
+                });
+                let mut client = TcpStream::connect(addr).await.unwrap();
+                let (r, _) = client.read_exact(vec![0; 1]).await;
+                r.unwrap();
+                if truncated {
+                    let (r, _) = client.read_exact(vec![0; 4]).await;
+                    r.unwrap();
+                }
+                drop(client);
+                monoio::time::timeout(std::time::Duration::from_secs(3), task)
+                    .await
+                    .unwrap();
+            }
+        });
+    }
+
+    #[test]
+    fn cancelled_file_splice_retains_fd_until_the_ring_reaps_completion() {
+        let file = splice_test_file(2 << 20);
+        run(async {
+            let (read_pipe, mut write_pipe) = new_pipe().unwrap();
+            let loaded = splice_file_to_pipe(file.clone(), 0, &mut write_pipe, 1 << 20)
+                .await
+                .unwrap();
+            assert!(loaded > 0);
+            // A full pipe with no consumer keeps the second operation pending.
+            let mut pending = Box::pin(splice_file_to_pipe(
+                file.clone(),
+                0,
+                &mut write_pipe,
+                1 << 20,
+            ));
+            assert!(futures::poll!(&mut pending).is_pending());
+            drop(pending);
+            // Cancellation has been queued, but no CQE has been consumed yet.
+            assert_eq!(Arc::strong_count(&file), 2);
+            drop(read_pipe);
+            drop(write_pipe);
+            for _ in 0..100 {
+                if Arc::strong_count(&file) == 1 {
+                    break;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(Arc::strong_count(&file), 1);
+        });
+    }
+
+    #[test]
+    fn cancelling_a_backpressured_splice_releases_its_descriptors() {
+        use std::os::fd::AsRawFd;
+        let file = splice_test_file(8 << 20);
+        run(async {
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let fd = file.clone();
+            let task = monoio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let size: libc::c_int = 4096;
+                // SAFETY: valid socket and correctly sized integer option.
+                assert_eq!(
+                    unsafe {
+                        libc::setsockopt(
+                            stream.as_raw_fd(),
+                            libc::SOL_SOCKET,
+                            libc::SO_SNDBUF,
+                            (&size as *const libc::c_int).cast(),
+                            std::mem::size_of_val(&size) as libc::socklen_t,
+                        )
+                    },
+                    0
+                );
+                let handle = BlockHandle {
+                    fd,
+                    offset: 0,
+                    len: 8 << 20,
+                };
+                let mut pipe = None;
+                // The timeout can fire only if this ring remains schedulable
+                // while the peer deliberately does not consume the payload.
+                let result = monoio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    splice_payload(&mut stream, vec![1], &[handle], &mut pipe),
+                )
+                .await;
+                assert!(result.is_err());
+            });
+            let mut client = TcpStream::connect(addr).await.unwrap();
+            let (r, _) = client.read_exact(vec![0; 1]).await;
+            r.unwrap();
+            monoio::time::timeout(std::time::Duration::from_secs(3), task)
+                .await
+                .unwrap();
+            drop(client);
+            // Drive cancellation CQEs before checking that operation ownership
+            // has been released. Closing the connection never reuses its pipe.
+            for _ in 0..100 {
+                if Arc::strong_count(&file) == 1 {
+                    break;
+                }
+                monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert_eq!(Arc::strong_count(&file), 1);
+        });
+    }
+
+    /// Slow readers must not monopolize a ring's finite io-wq budget.
+    #[test]
+    fn backpressured_peers_do_not_starve_another_splice() {
+        use std::os::fd::AsRawFd;
+        run(async {
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let file = splice_test_file(8 << 20);
+            let server = monoio::spawn(async move {
+                let mut tasks = Vec::new();
+                for index in 0..7 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let fd = file.clone();
+                    tasks.push(monoio::spawn(async move {
+                        let size: libc::c_int = 4096;
+                        // SAFETY: live socket and correctly sized integer option.
+                        assert_eq!(
+                            unsafe {
+                                libc::setsockopt(
+                                    stream.as_raw_fd(),
+                                    libc::SOL_SOCKET,
+                                    libc::SO_SNDBUF,
+                                    (&size as *const libc::c_int).cast(),
+                                    std::mem::size_of_val(&size) as libc::socklen_t,
+                                )
+                            },
+                            0
+                        );
+                        let len = if index == 6 { 32768 } else { 8 << 20 };
+                        let mut pipe = None;
+                        let handle = BlockHandle { fd, offset: 0, len };
+                        let result =
+                            splice_payload(&mut stream, vec![1], &[handle], &mut pipe).await;
+                        if index == 6 {
+                            result.unwrap();
+                        }
+                    }));
+                }
+                for task in tasks {
+                    task.await;
+                }
+            });
+            let mut stalled = Vec::new();
+            for _ in 0..6 {
+                let mut peer = TcpStream::connect(addr).await.unwrap();
+                let (result, _) = monoio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    peer.read_exact(vec![0; 1]),
+                )
+                .await
+                .expect("a stalled reader monopolized the io-wq budget");
+                result.unwrap();
+                stalled.push(peer);
+            }
+            monoio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let mut fast = TcpStream::connect(addr).await.unwrap();
+            let (result, bytes) = monoio::time::timeout(
+                std::time::Duration::from_secs(2),
+                fast.read_exact(vec![0; 32769]),
+            )
+            .await
+            .expect("slow peers starved a ready peer with one io-wq worker per class");
+            result.unwrap();
+            assert_eq!(bytes[0], 1);
+            assert!(bytes[1..]
+                .iter()
+                .enumerate()
+                .all(|(i, value)| *value == (i % 251) as u8));
+            drop(stalled);
+            drop(fast);
+            monoio::time::timeout(std::time::Duration::from_secs(3), server)
+                .await
+                .unwrap();
+        });
     }
 
     /// The core guarantee: a miss (Bytes path) and a subsequent hit (sendfile
@@ -1732,7 +2054,7 @@ mod tests {
         let handle = tokio_rt.handle().clone();
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
-            let _ = serve(serve_addr, 2, 2, admission, handler, handle);
+            let _ = serve(serve_addr, 2, admission, handler, handle);
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);

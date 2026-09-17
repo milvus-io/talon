@@ -11,4 +11,5 @@
 exclude_path = [
     "docs/book/book",
     "target",
+    ".patched-deps",
 ]

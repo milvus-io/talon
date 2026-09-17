@@ -9,12 +9,10 @@
 //! - **`SO_REUSEPORT`**, so every ring binds the same listen address and the
 //!   *kernel* distributes accepts by 4-tuple hash. There is no shared accept
 //!   queue and no thundering herd;
-//! - **a per-ring blocking pool**, because the zero-copy `sendfile`/`splice`
-//!   syscalls are blocking and must never run on a ring (a slow client would
-//!   otherwise stall every connection that ring owns).
+//! - **ring-native file-to-pipe-to-socket splice**, with no per-ring send pool.
 //!
-//! Measured at 8.05x scaling on 8 rings, with per-core throughput flat from 1
-//! to 16 rings — i.e. no cross-ring contention (#273).
+//! Ring scaling and send throughput must be measured on the deployment kernel:
+//! io_uring submission can still dispatch splice operations to kernel io-wq.
 //!
 //! # What is *not* sharded
 //!
@@ -72,7 +70,14 @@ pub fn allowed_cpus() -> Vec<usize> {
 /// when it returns `false`, so the io_uring default is safe on hosts that
 /// cannot run it.
 pub fn io_uring_available() -> bool {
-    monoio::utils::detect_uring()
+    static AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *AVAILABLE.get_or_init(|| {
+        monoio::utils::detect_uring()
+            && monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .with_iowq_max_workers(8, 8)
+                .build()
+                .is_ok()
+    })
 }
 
 /// How many rings to run for a configured value.
@@ -123,8 +128,7 @@ pub trait RingHandler: Clone + 'static {
 ///
 /// Blocks until every ring thread exits. Each thread:
 /// 1. pins itself to a core,
-/// 2. builds an `IoUringDriver` runtime with `blocking_threads` helper threads
-///    for `sendfile`,
+/// 2. builds an `IoUringDriver` runtime without a send helper pool,
 /// 3. binds `addr` with `SO_REUSEPORT` and accepts forever.
 ///
 /// Every ring shares `admission`. A ring acquires capacity before `accept`, so
@@ -143,10 +147,9 @@ pub trait RingHandler: Clone + 'static {
 /// miss path use Tokio timers and sync primitives. Without an entered handle
 /// those calls panic with *"there is no reactor running"*.
 ///
-/// The split is deliberate: the ring owns protocol scheduling and hands
-/// `sendfile` to its own blocking pool, while Tokio's blocking pool absorbs
-/// filesystem work that belongs on neither. Note this means two blocking pools
-/// coexist, so size them with the pinned ring count in mind.
+/// The ring owns protocol scheduling and resident file-to-socket splice.
+/// Tokio's blocking pool still handles cache writes and other filesystem work.
+/// Kernel io-wq workers may execute buffered file I/O submitted via io_uring.
 ///
 /// # Errors
 ///
@@ -156,7 +159,6 @@ pub trait RingHandler: Clone + 'static {
 pub fn serve<H>(
     addr: String,
     rings: usize,
-    blocking_threads: usize,
     admission: ConnectionAdmission,
     handler: H,
     tokio_handle: tokio::runtime::Handle,
@@ -220,12 +222,12 @@ where
                         ),
                     }
 
-                    // The blocking pool is what keeps sendfile off the ring. monoio
-                    // panics if spawn_blocking is called without one attached, so
-                    // this is not optional.
-                    let pool = monoio::blocking::DefaultThreadPool::new(blocking_threads);
+                    // Resident sends submit splice operations to this same
+                    // ring. No user-space send helper threads are created. Bound
+                    // both io-wq classes: regular-file and pipe/socket splice
+                    // may otherwise grow kernel workers with connection count.
                     let mut rt = match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                        .attach_thread_pool(Box::new(pool))
+                        .with_iowq_max_workers(8, 8)
                         .enable_timer()
                         .build()
                     {
@@ -479,14 +481,7 @@ mod tests {
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let _ = serve(
-                serve_addr,
-                4,
-                2,
-                admission(128),
-                handler,
-                rt.handle().clone(),
-            );
+            let _ = serve(serve_addr, 4, admission(128), handler, rt.handle().clone());
         });
 
         // Wait for at least one ring to bind.
@@ -531,14 +526,7 @@ mod tests {
         let serve_addr = addr.clone();
         std::thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
-            let _ = serve(
-                serve_addr,
-                2,
-                1,
-                admission(128),
-                handler,
-                rt.handle().clone(),
-            );
+            let _ = serve(serve_addr, 2, admission(128), handler, rt.handle().clone());
         });
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -684,7 +672,6 @@ mod tests {
             let _ = serve(
                 serve_addr,
                 2,
-                1,
                 connection_admission,
                 handler,
                 rt.handle().clone(),

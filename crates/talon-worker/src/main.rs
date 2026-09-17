@@ -57,12 +57,6 @@ const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 /// of consuming a worker FD or task (issues #111 and #568).
 const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
 
-/// Blocking helper threads per io_uring ring, for the zero-copy `sendfile`
-/// path. Kept small because every ring has its own pool and the rings are
-/// pinned: a large pool per ring would oversubscribe the cores they sit on.
-#[cfg(target_os = "linux")]
-const URING_BLOCKING_THREADS_PER_RING: usize = 4;
-
 /// Bridges the backend retry decorator to the worker's metrics registry.
 ///
 /// `talon-backend` deliberately knows nothing about the worker's registry, so it
@@ -710,7 +704,6 @@ async fn run() -> anyhow::Result<()> {
             talon_worker::uring_serve::serve(
                 addr,
                 rings,
-                URING_BLOCKING_THREADS_PER_RING,
                 connection_admission,
                 handler,
                 tokio_handle,

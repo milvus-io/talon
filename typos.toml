@@ -23,4 +23,6 @@ TKE = "TKE"
 extend-exclude = [
     "docs/book/book/",
     "target/",
+    ".patched-deps/",
+    "patches/*.patch",
 ]

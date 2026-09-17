@@ -73,10 +73,14 @@ Clone and build:
 ```sh
 git clone https://github.com/milvus-io/talon.git
 cd talon
+python3 scripts/prepare_monoio.py
 cargo build --workspace
 ```
 
-Run `just` with no arguments to list available recipes.
+Run `just` with no arguments to list available recipes. Cargo needs the patched
+Monoio dependency prepared before resolving the workspace; rerun `just prepare`
+after changing the patch. See [the patch instructions](patches/README.md) for
+pinned-source verification and offline setup.
 
 ## Local checks (mirror CI)
 
