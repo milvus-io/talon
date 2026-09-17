@@ -11,6 +11,11 @@ publish = false
 [dependencies]
 talon-rust-client = { path = "../.." }
 
+# Cargo patches are workspace-local. Reuse the prepared Monoio source so this
+# independent consumer resolves offline without a separate registry download.
+[patch.crates-io]
+monoio = { path = "../../../../.patched-deps/monoio" }
+
 [[test]]
 name = "public_error_api"
 path = "../public_error_api.rs"
