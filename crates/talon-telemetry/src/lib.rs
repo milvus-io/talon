@@ -137,6 +137,7 @@ pub fn configure(config: Config) -> Result<(), String> {
 }
 pub fn enabled() -> bool {
     CONFIG.get().is_some_and(|c| c.mode != Mode::Off)
+        && (!CURRENT.is_set() || CURRENT.with(|op| op.active))
 }
 pub fn v2_enabled(endpoint: &str) -> bool {
     enabled()
@@ -158,7 +159,7 @@ pub struct Operation {
 impl Operation {
     pub fn new(name: &'static str, kind: &'static str, parent: TraceParent<'_>) -> Self {
         if !enabled() {
-            return Self::off();
+            return Self::disabled();
         }
         let carrier = match parent {
             TraceParent::Explicit(c) => Some(c.clone()),
@@ -182,7 +183,11 @@ impl Operation {
         let _ = (name, kind, &mut op);
         op
     }
-    fn off() -> Self {
+    /// A request-local opt-out, even when process telemetry is enabled.
+    /// Enter with `scope` or `in_scope` to suppress recording, ambient context
+    /// inheritance and v2 propagation for nested operations. The scope is
+    /// restored on each future poll, including Pending and unwinding.
+    pub fn disabled() -> Self {
         Self {
             active: false,
             carrier: None,
@@ -284,7 +289,13 @@ impl Operation {
     }
     pub fn in_scope<T>(&self, f: impl FnOnce() -> T) -> T {
         if !self.active {
-            return f();
+            // Keep the never-enabled fast path, but retain an explicit disabled
+            // request snapshot after process telemetry has been configured.
+            return if CONFIG.get().is_some_and(|c| c.mode != Mode::Off) {
+                CURRENT.set(self, f)
+            } else {
+                f()
+            };
         }
         #[cfg(feature = "recording")]
         if let Some(r) = &self.recording {
