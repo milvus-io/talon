@@ -650,6 +650,9 @@ impl Coordinator {
         full.extend_from_slice(&header.encode());
         full.extend_from_slice(&payload);
         let (_, reply) = codec::decode(&full)?;
+        if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
+            talon_telemetry::outcome("error");
+        }
         Ok((stream, reply))
     }
 
