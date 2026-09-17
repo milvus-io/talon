@@ -340,7 +340,7 @@ Mounted static namespace authorization policy (TOML).
 
 ### `heartbeat_interval_ms`
 
-Heartbeat interval (ms).
+Heartbeat interval (ms); detected control failures have a three-interval grace, capped at 15s.
 
 - **Environment variable:** `TALON_WORKER_HEARTBEAT_INTERVAL_MS`
 - **Default:** `5000`

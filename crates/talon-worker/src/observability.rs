@@ -579,12 +579,27 @@ impl WorkerMetrics {
 }
 
 /// Readiness of required worker dependencies.
-#[derive(Default)]
 pub struct WorkerReadiness {
     backend_ready: AtomicBool,
     store_ready: AtomicBool,
     control_registered: AtomicBool,
+    // Zero while healthy; a detected failure installs a monotonic deadline.
+    control_failure_deadline_ms: AtomicU64,
+    clock_started: Instant,
     shutting_down: AtomicBool,
+}
+
+impl Default for WorkerReadiness {
+    fn default() -> Self {
+        Self {
+            backend_ready: AtomicBool::new(false),
+            store_ready: AtomicBool::new(false),
+            control_registered: AtomicBool::new(false),
+            control_failure_deadline_ms: AtomicU64::new(0),
+            clock_started: Instant::now(),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
 }
 
 impl WorkerReadiness {
@@ -600,7 +615,35 @@ impl WorkerReadiness {
 
     /// Mark coordinator registration and heartbeat state.
     pub fn set_control_registered(&self, ready: bool) {
+        if ready {
+            self.control_failure_deadline_ms.store(0, Ordering::Release);
+        }
         self.control_registered.store(ready, Ordering::Release);
+    }
+
+    /// Bound an accepted registration after a detected control-plane failure.
+    ///
+    /// This does not enable registration. The deadline is checked by readers,
+    /// so expiration does not depend on another heartbeat attempt. The caller
+    /// derives `remaining` from the last accepted heartbeat, never a failed retry.
+    pub fn limit_control_registration_to(&self, remaining: Duration) {
+        let remaining_ms = u64::try_from(remaining.as_millis()).unwrap_or(u64::MAX);
+        self.control_failure_deadline_ms.store(
+            self.elapsed_ms().saturating_add(remaining_ms).max(1),
+            Ordering::Release,
+        );
+    }
+
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.clock_started.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn control_is_registered(&self) -> bool {
+        if !self.control_registered.load(Ordering::Acquire) {
+            return false;
+        }
+        let deadline = self.control_failure_deadline_ms.load(Ordering::Acquire);
+        deadline == 0 || self.elapsed_ms() < deadline
     }
 
     /// Mark process shutdown, which immediately removes readiness and liveness.
@@ -612,7 +655,7 @@ impl WorkerReadiness {
     pub fn is_ready(&self) -> bool {
         self.backend_ready.load(Ordering::Acquire)
             && self.store_ready.load(Ordering::Acquire)
-            && self.control_registered.load(Ordering::Acquire)
+            && self.control_is_registered()
             && !self.shutting_down.load(Ordering::Acquire)
     }
 
@@ -647,7 +690,7 @@ impl WorkerReadiness {
         if !self.store_ready.load(Ordering::Acquire) {
             reasons.push("store_not_ready");
         }
-        if !self.control_registered.load(Ordering::Acquire) {
+        if !self.control_is_registered() {
             reasons.push("coordinator_not_registered");
         }
         if self.shutting_down.load(Ordering::Acquire) {
@@ -996,6 +1039,53 @@ mod tests {
         assert!(rendered.contains("talon_worker_control_heartbeat_total{result=\"success\"} 1"));
         assert!(rendered.contains("talon_worker_control_heartbeat_total{result=\"failure\"} 1"));
         assert!(!observability.status().ready);
+    }
+
+    #[tokio::test]
+    async fn failure_grace_expires_without_another_control_attempt_and_recovers() {
+        let observability = observability();
+        let readiness = observability.readiness();
+        readiness.set_backend_ready(true);
+        readiness.set_store_ready(true);
+        readiness.limit_control_registration_to(Duration::from_secs(1));
+        assert!(
+            !observability.is_ready(),
+            "there is no grace before an accepted heartbeat"
+        );
+        readiness.set_control_registered(true);
+        readiness.limit_control_registration_to(Duration::from_millis(20));
+        assert!(observability.is_ready());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!observability.is_ready());
+        assert!(readiness
+            .blocking_reasons()
+            .contains(&"coordinator_not_registered"));
+        readiness.set_control_registered(true);
+        assert!(observability.is_ready());
+        readiness.limit_control_registration_to(Duration::from_secs(1));
+        readiness.set_shutting_down(true);
+        assert!(
+            !observability.is_ready(),
+            "grace never overrides local dependency failure or shutdown"
+        );
+    }
+
+    #[test]
+    fn healthy_registration_does_not_expire_between_long_heartbeat_intervals() {
+        let readiness = WorkerReadiness {
+            clock_started: Instant::now() - Duration::from_secs(60),
+            ..WorkerReadiness::default()
+        };
+        readiness.set_backend_ready(true);
+        readiness.set_store_ready(true);
+        readiness.set_control_registered(true);
+        assert!(readiness.is_ready());
+        assert_eq!(
+            readiness
+                .control_failure_deadline_ms
+                .load(Ordering::Acquire),
+            0
+        );
     }
 
     #[test]

@@ -159,6 +159,11 @@ Secret; see §1.
   `lease_ttl` (default 30s) after its last accepted heartbeat.
 - **Unhealthy marking**: a node shows `unhealthy` after `unhealthy_after`
   (default 15s) of silence, before removal.
+- **Worker control failure grace**: after a detected control failure, readiness
+  can survive until three heartbeat intervals after the last accepted status
+  heartbeat (capped at 15s). Registration and retries do not renew this bound;
+  initial registration failure has no grace. Readiness checks enforce expiration
+  without waiting for another heartbeat attempt.
 - **Failover interruption bound**: a client's request that hits a failing
   coordinator retries another via the load-balanced Service; placement stays
   correct because every coordinator derives the same deterministic version from
