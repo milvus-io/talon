@@ -4,11 +4,14 @@ use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
 use futures::stream::{FuturesUnordered, StreamExt};
 use talon_cache_client::pool::{DEFAULT_IDLE_TTL, DEFAULT_MAX_IDLE_PER_ADDR};
 use talon_cache_client::{
-    plan_read, BlockReader, ConnectionPool, CoordinatorClient, PlacementCache,
+    iter_read, BlockReader, BlockSegment, ConnectionPool, CoordinatorClient, PlacementCache,
 };
 
 const PLACEMENT_TTL_MS: u64 = 30_000;
 const REPLICAS_K: u8 = 1;
+
+// Limit task allocation and let other logical reads make progress.
+const MAX_CONCURRENT_BLOCK_READS_PER_READ: usize = 8;
 
 /// A reusable, runtime-owning-neutral Talon client.
 #[derive(Clone)]
@@ -142,6 +145,8 @@ impl Client {
     /// `known_stat` pins all returned bytes to its exact source version. Workers
     /// serve matching cached bytes or conditionally fill them from the origin;
     /// a version mismatch fails the read instead of substituting newer bytes.
+    /// Large ranges are planned lazily, with at most eight block reads in flight
+    /// per logical read. Assembly retains byte order without intermediate block buffers.
     pub async fn read(
         &self,
         object: &ObjectId,
@@ -282,7 +287,8 @@ impl Client {
             ));
         }
         let version = Version::new(stat.version.as_str());
-        let plan = plan_read(
+        let planned_len = requested.min(stat.size.saturating_sub(offset)) as usize;
+        let mut plan = iter_read(
             object,
             offset,
             requested,
@@ -290,10 +296,15 @@ impl Client {
             &version,
             stat.size,
         );
-        let planned_len: usize = plan.iter().map(|segment| segment.len as usize).sum();
         talon_telemetry::record("talon.range.offset", offset);
         talon_telemetry::record("talon.range.length", planned_len as u64);
-        talon_telemetry::record("talon.read.planned_blocks", plan.len() as u64);
+        let blocks = if planned_len == 0 {
+            0
+        } else {
+            (offset % u64::from(self.block_size) + planned_len as u64)
+                .div_ceil(u64::from(self.block_size))
+        };
+        talon_telemetry::record("talon.read.planned_blocks", blocks);
         if planned_len == 0 {
             return Ok(0);
         }
@@ -303,29 +314,35 @@ impl Client {
             .unwrap_or(0);
         let mut pending = FuturesUnordered::new();
         let mut rest = &mut dst[..planned_len];
-        for segment in plan {
+        for segment in plan.by_ref().take(MAX_CONCURRENT_BLOCK_READS_PER_READ) {
             let (chunk, tail) = rest.split_at_mut(segment.len as usize);
             rest = tail;
-            let reader = &self.reader;
-            pending.push(async move {
-                reader
-                    .read_versioned_block_into(
-                        &segment.block,
-                        segment.offset_in_block,
-                        chunk,
-                        now_ms,
-                    )
-                    .await
-                    .map_err(Error::from)
-            });
+            pending.push(read_segment_into(&self.reader, segment, chunk, now_ms));
         }
 
         let mut written = 0;
         while let Some(result) = pending.next().await {
             written += result?;
+            if let Some(segment) = plan.next() {
+                let (chunk, tail) = rest.split_at_mut(segment.len as usize);
+                rest = tail;
+                pending.push(read_segment_into(&self.reader, segment, chunk, now_ms));
+            }
         }
         Ok(written)
     }
+}
+
+async fn read_segment_into(
+    reader: &BlockReader,
+    segment: BlockSegment,
+    dst: &mut [u8],
+    now_ms: u64,
+) -> Result<usize, Error> {
+    reader
+        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, now_ms)
+        .await
+        .map_err(Error::from)
 }
 
 /// Parse a `scheme://bucket/key` URI into an object id.
@@ -371,7 +388,7 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
 
     async fn mock_coordinator() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -632,6 +649,72 @@ mod tests {
             }
         });
         addr
+    }
+
+    async fn mock_bounded_worker(
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        started: Arc<AtomicUsize>,
+        started_notify: Arc<Notify>,
+        release: Arc<Semaphore>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let started = Arc::clone(&started);
+                let started_notify = Arc::clone(&started_notify);
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    let mut header_bytes = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header_bytes).await.is_err() {
+                        return;
+                    }
+                    let header = FrameHeader::decode(&header_bytes).unwrap();
+                    let mut payload = vec![0_u8; header.length as usize];
+                    socket.read_exact(&mut payload).await.unwrap();
+                    let mut frame = header_bytes.to_vec();
+                    frame.extend_from_slice(&payload);
+                    let (_, request) = decode_versioned_request(&frame).unwrap();
+                    assert_eq!(request.version.0.as_str(), "test-version");
+                    let request = request.request;
+
+                    let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(active_now, Ordering::SeqCst);
+                    started.fetch_add(1, Ordering::SeqCst);
+                    started_notify.notify_waiters();
+                    release.acquire().await.unwrap().forget();
+
+                    let bytes: Vec<u8> = (0..request.len)
+                        .map(|index| ((request.offset + index) % 251) as u8)
+                        .collect();
+                    let mut response = response_header_ok(0, bytes.len() as u32).to_vec();
+                    response.extend_from_slice(&bytes);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    socket.write_all(&response).await.unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    async fn wait_for_started(started: &AtomicUsize, notify: &Notify, target: usize) {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if started.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            tokio::time::timeout(Duration::from_secs(2), notified)
+                .await
+                .expect("worker requests did not start");
+        }
     }
 
     async fn read_client(size: u64) -> (Client, Arc<AtomicUsize>) {
@@ -1007,6 +1090,63 @@ mod tests {
             "second block did not start while first was pending"
         );
         assert_eq!(bytes, vec![6, 7, 8, 9, 10, 11, 12, 13]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_block_read_refills_the_internal_eight_request_window() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_notify = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let worker = mock_bounded_worker(
+            Arc::clone(&active),
+            Arc::clone(&peak),
+            Arc::clone(&started),
+            Arc::clone(&started_notify),
+            Arc::clone(&release),
+        )
+        .await;
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = mock_read_coordinator(worker, 10, stat_calls).await;
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(1)
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        let stat = ObjectStat {
+            size: 10,
+            version: "test-version".into(),
+        };
+        let read =
+            tokio::spawn(async move { client.read(&object, 0, Some(10), Some(&stat)).await });
+
+        wait_for_started(
+            &started,
+            &started_notify,
+            MAX_CONCURRENT_BLOCK_READS_PER_READ,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            MAX_CONCURRENT_BLOCK_READS_PER_READ,
+            "a ninth block started before one of the first eight completed"
+        );
+
+        release.add_permits(1);
+        wait_for_started(&started, &started_notify, 9).await;
+        release.add_permits(9);
+        let bytes = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("bounded read did not finish")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bytes, (0_u8..10).collect::<Vec<_>>());
+        assert_eq!(started.load(Ordering::SeqCst), 10);
+        assert_eq!(peak.load(Ordering::SeqCst), 8);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
