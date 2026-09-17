@@ -35,6 +35,15 @@ pub struct CoordinatorObservability {
     pub(crate) started: Instant,
     sequence: AtomicU64,
     ready: AtomicBool,
+    /// Whether a state-store operation has failed since the last successful
+    /// membership reconciliation.
+    state_store_degraded: AtomicBool,
+    /// Monotonic timestamp of the last snapshot that was actually installed
+    /// into placement membership. Zero means no successful reconciliation.
+    last_membership_refresh_elapsed_ms: AtomicU64,
+    /// How long the installed last-good membership remains authoritative after
+    /// a transient state-store failure.
+    state_failure_grace: Duration,
     pub(crate) shutting_down: AtomicBool,
     request_timeout: Duration,
     pub(crate) metrics: CoordinatorMetrics,
@@ -76,6 +85,9 @@ impl CoordinatorObservability {
             started: Instant::now(),
             sequence: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            state_store_degraded: AtomicBool::new(false),
+            last_membership_refresh_elapsed_ms: AtomicU64::new(0),
+            state_failure_grace: Duration::ZERO,
             shutting_down: AtomicBool::new(false),
             request_timeout,
             metrics: CoordinatorMetrics::new(),
@@ -109,6 +121,20 @@ impl CoordinatorObservability {
     #[must_use]
     pub fn with_metadata_store(mut self, store: Arc<dyn MetadataStore>) -> Self {
         self.metadata_store = Some(store);
+        self
+    }
+
+    /// Keep serving the last successfully reconciled membership through a
+    /// short shared-state disturbance.
+    ///
+    /// The grace is intentionally bounded: once it expires, or before any
+    /// snapshot has been installed, authoritative reads fail closed. A later
+    /// successful readiness probe alone cannot restore service; only a
+    /// successful membership reconciliation can prove that local placement
+    /// state is current again.
+    #[must_use]
+    pub fn with_state_failure_grace(mut self, grace: Duration) -> Self {
+        self.state_failure_grace = grace;
         self
     }
 
@@ -189,9 +215,44 @@ impl CoordinatorObservability {
         &self.node.id.0
     }
 
+    fn elapsed_marker_ms(&self) -> u64 {
+        let elapsed = self.started.elapsed().as_millis();
+        u64::try_from(elapsed.min(u128::from(u64::MAX - 1))).unwrap_or(u64::MAX - 1) + 1
+    }
+
+    fn membership_within_failure_grace(&self) -> bool {
+        if self.state_failure_grace.is_zero() {
+            return false;
+        }
+        let refreshed = self
+            .last_membership_refresh_elapsed_ms
+            .load(Ordering::Acquire);
+        if refreshed == 0 {
+            return false;
+        }
+        let age_ms = self.elapsed_marker_ms().saturating_sub(refreshed);
+        Duration::from_millis(age_ms) <= self.state_failure_grace
+    }
+
+    fn record_state_store_failure(&self) {
+        self.state_store_degraded.store(true, Ordering::Release);
+        self.ready
+            .store(self.membership_within_failure_grace(), Ordering::Release);
+    }
+
+    fn record_membership_refresh(&self) {
+        self.last_membership_refresh_elapsed_ms
+            .store(self.elapsed_marker_ms(), Ordering::Release);
+        self.state_store_degraded.store(false, Ordering::Release);
+        self.ready.store(true, Ordering::Release);
+    }
+
     /// Whether authoritative shared state is currently ready.
     pub fn is_ready(&self) -> bool {
-        self.ready.load(Ordering::Acquire) && !self.shutting_down.load(Ordering::Acquire)
+        self.ready.load(Ordering::Acquire)
+            && (!self.state_store_degraded.load(Ordering::Acquire)
+                || self.membership_within_failure_grace())
+            && !self.shutting_down.load(Ordering::Acquire)
     }
 
     /// Read-only readiness check with deadline.
@@ -206,7 +267,17 @@ impl CoordinatorObservability {
             };
         self.metrics
             .record_state("readiness", &result, started.elapsed());
-        self.ready.store(result.is_ok(), Ordering::Release);
+        if result.is_err() {
+            self.record_state_store_failure();
+        } else if self.state_store_degraded.load(Ordering::Acquire) {
+            // Store reachability alone does not make the installed membership
+            // current. Keep the bounded last-good state until reconcile has
+            // successfully installed a fresh snapshot.
+            self.ready
+                .store(self.membership_within_failure_grace(), Ordering::Release);
+        } else {
+            self.ready.store(true, Ordering::Release);
+        }
         // Sampled alongside cluster-state readiness so reachability tracks the
         // present rather than startup. A metadata failure must not affect this
         // result: §6 keeps TMS outages away from the read path, and readiness
@@ -236,7 +307,7 @@ impl CoordinatorObservability {
         self.metrics
             .record_state("upsert", &result, started.elapsed());
         if result.is_err() {
-            self.ready.store(false, Ordering::Release);
+            self.record_state_store_failure();
         }
         result
     }
@@ -258,11 +329,10 @@ impl CoordinatorObservability {
         match result {
             Ok(snapshot) => {
                 self.metrics.update_snapshot(&snapshot);
-                self.ready.store(true, Ordering::Release);
                 Ok(())
             }
             Err(error) => {
-                self.ready.store(false, Ordering::Release);
+                self.record_state_store_failure();
                 Err(error)
             }
         }
@@ -278,8 +348,8 @@ impl CoordinatorObservability {
     /// Only non-expired **worker** records populate placement membership;
     /// coordinator records are tracked in the store for the management view but
     /// are not placement targets. On a store error the local membership is left
-    /// untouched (last-good), readiness is cleared, and the error is returned so
-    /// the caller can apply the #73 fail-closed policy.
+    /// untouched (last-good). A transient store error keeps that snapshot usable
+    /// only for the configured grace; after it expires readiness fails closed.
     pub async fn reconcile_membership(
         &self,
         membership: &crate::Membership,
@@ -319,11 +389,11 @@ impl CoordinatorObservability {
                     })
                     .collect();
                 membership.reconcile_zoned(workers);
-                self.ready.store(true, Ordering::Release);
+                self.record_membership_refresh();
                 Ok(())
             }
             Err(error) => {
-                self.ready.store(false, Ordering::Release);
+                self.record_state_store_failure();
                 Err(error)
             }
         }
@@ -348,9 +418,8 @@ impl CoordinatorObservability {
         match &result {
             Ok(snapshot) => {
                 self.metrics.update_snapshot(snapshot);
-                self.ready.store(true, Ordering::Release);
             }
-            Err(_) => self.ready.store(false, Ordering::Release),
+            Err(_) => self.record_state_store_failure(),
         }
         result
     }
@@ -426,6 +495,13 @@ fn generate_incarnation_id() -> std::io::Result<String> {
 
 #[cfg(test)]
 pub(crate) fn observability() -> (Arc<CoordinatorObservability>, Arc<MemoryStateStore>) {
+    observability_with_state_failure_grace(Duration::ZERO)
+}
+
+#[cfg(test)]
+pub(crate) fn observability_with_state_failure_grace(
+    grace: Duration,
+) -> (Arc<CoordinatorObservability>, Arc<MemoryStateStore>) {
     let store = Arc::new(MemoryStateStore::new());
     let state_store: Arc<dyn ClusterStateStore> = store.clone();
     let observability = Arc::new(
@@ -440,7 +516,8 @@ pub(crate) fn observability() -> (Arc<CoordinatorObservability>, Arc<MemoryState
             Duration::from_millis(100),
             state_store,
         )
-        .unwrap(),
+        .unwrap()
+        .with_state_failure_grace(grace),
     );
     (observability, store)
 }
@@ -729,5 +806,76 @@ mod tests {
         assert!(observability.metrics.render().contains(
             "talon_coordinator_state_store_errors_total{kind=\"unavailable\",operation=\"readiness\"} 1"
         ));
+    }
+
+    #[tokio::test]
+    async fn transient_store_failure_uses_bounded_last_good_membership() {
+        use crate::Membership;
+
+        let grace = Duration::from_millis(100);
+        let (observability, store) = observability_with_state_failure_grace(grace);
+        observability.check_ready().await.unwrap();
+        observability
+            .upsert_status(worker_status(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        let membership = Membership::new();
+        observability
+            .reconcile_membership(&membership)
+            .await
+            .unwrap();
+        assert!(observability.is_ready());
+
+        store.set_available(false);
+        assert!(observability
+            .reconcile_membership(&membership)
+            .await
+            .is_err());
+        assert!(
+            observability.is_ready(),
+            "one failed refresh must retain a recent last-good membership"
+        );
+
+        tokio::time::sleep(grace + Duration::from_millis(50)).await;
+        assert!(
+            !observability.is_ready(),
+            "last-good membership must fail closed after its grace expires"
+        );
+
+        store.set_available(true);
+        observability.check_ready().await.unwrap();
+        assert!(
+            !observability.is_ready(),
+            "a health probe cannot make stale local membership authoritative"
+        );
+        observability.snapshot_for_api().await.unwrap();
+        observability
+            .upsert_status(worker_status(), Duration::from_secs(30))
+            .await
+            .unwrap();
+        assert!(
+            !observability.is_ready(),
+            "other successful operations must not renew membership"
+        );
+        observability
+            .reconcile_membership(&membership)
+            .await
+            .unwrap();
+        assert!(observability.is_ready());
+        observability.begin_shutdown();
+        assert!(
+            !observability.is_ready(),
+            "grace must never override shutdown"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_installed_membership_means_no_failure_grace() {
+        let (observability, store) =
+            observability_with_state_failure_grace(Duration::from_secs(15));
+        observability.check_ready().await.unwrap();
+        store.set_available(false);
+        assert!(observability.check_ready().await.is_err());
+        assert!(!observability.is_ready());
     }
 }

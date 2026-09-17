@@ -128,7 +128,7 @@ Node heartbeat interval (ms).
 
 ### `unhealthy_after_ms`
 
-Silence before a node is unhealthy (ms); must exceed heartbeat.
+Silence before a node is unhealthy and last-good membership grace (ms); must exceed heartbeat.
 
 - **Environment variable:** `TALON_COORDINATOR_UNHEALTHY_AFTER_MS`
 - **Default:** `15000`

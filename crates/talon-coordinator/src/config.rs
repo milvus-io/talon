@@ -395,7 +395,7 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("15000"),
         cli: true,
         secret: false,
-        help: "Silence before a node is unhealthy (ms); must exceed heartbeat.",
+        help: "Silence before a node is unhealthy and last-good membership grace (ms); must exceed heartbeat.",
     },
     ConfigVar {
         env: "TALON_COORDINATOR_LEASE_TTL_MS",

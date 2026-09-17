@@ -73,7 +73,8 @@ Three backends, compared across the aspects that matter for an operator.
 - **Operational owner:** your Kubernetes control plane.
 - **Credentials:** pod ServiceAccount token.
 - **Liveness authority:** Lease `renewTime` + TTL.
-- **Failure mode:** API-server outage → coordinators fail closed.
+- **Failure mode:** API-server outage → coordinators retain recent membership for at most
+  `unhealthy_after_ms`, then fail closed.
 - **Migration:** ↔ etcd requires a drain + redeploy (records are rebuildable).
 
 ### External etcd
@@ -84,7 +85,8 @@ Three backends, compared across the aspects that matter for an operator.
 - **Operational owner:** your etcd operators.
 - **Credentials:** Secret (user/pass and/or mTLS).
 - **Liveness authority:** etcd lease TTL.
-- **Failure mode:** etcd outage → coordinators fail closed.
+- **Failure mode:** etcd outage → coordinators retain recent membership for at most
+  `unhealthy_after_ms`, then fail closed.
 - **Migration:** ↔ Kubernetes requires a drain + redeploy (records are rebuildable).
 
 Records in the shared store are **ephemeral and rebuildable** from live process
@@ -223,14 +225,16 @@ unscrapeable for >2m. Its cached blocks are unreachable via that endpoint.
 ### state-store-errors
 
 **Alert:** `TalonStateStoreErrors` (critical) — coordinators are failing shared
-state-store operations. New authoritative reads fail closed.
+state-store operations. A recent reconciled membership remains usable for at
+most `unhealthy_after_ms`; authoritative reads then fail closed.
 
 1. **etcd**: check etcd health/quorum, TLS/cert expiry, and auth. Verify the
    `talon-etcd` Secret endpoints/credentials.
 2. **Kubernetes**: check API-server availability and that the Lease RBAC is
    applied (`kubectl auth can-i --as=system:serviceaccount:talon:talon-coordinator update leases -n talon`).
 3. Coordinators recover automatically once the backend is healthy; readiness and
-   membership resume on the next successful snapshot.
+   membership resume on the next successful reconciliation. A health probe alone
+   does not promote stale membership.
 
 ### cluster-view-stale
 
@@ -302,7 +306,7 @@ coordinators and workers re-register within one heartbeat interval.
 | Endpoint | Auth | Meaning |
 |----------|------|---------|
 | `GET /healthz` | public | process liveness (200 unless shutting down) |
-| `GET /readyz` | public | shared-state reachable (503 fails closed) |
+| `GET /readyz` | public | recent reconciled membership remains usable within its failure grace; otherwise 503 |
 | `GET /metrics` | public | Prometheus exposition |
 | `GET /api/v1/*` | protected | versioned management API (see #82) |
 | `/ui` | protected | management console |
