@@ -50,7 +50,7 @@
 mod client;
 mod error;
 
-pub use client::{parse_uri, Client, ClientBuilder};
+pub use client::{parse_uri, Client, ClientBuilder, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS};
 pub use error::{Error, UriError};
 pub use talon_cache_client::{
     BlockReadError, CacheReadError, CoordinatorError, ObjectStat, WorkerError,
