@@ -47,3 +47,6 @@ __pycache__/
 
 # Java client build artifacts.
 clients/java/target/
+
+# Generated from the pinned Monoio release and our committed diff.
+/.patched-deps/

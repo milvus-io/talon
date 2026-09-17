@@ -175,7 +175,8 @@ impl WorkerRuntime {
                 Some(page) => CacheUnit::Page(id, page),
                 None => CacheUnit::Whole(id),
             };
-            lru.insert(unit, bytes);
+            let access = lru.insert(unit.clone(), bytes);
+            index.set_access(&unit, access);
         }
         let l1 = Arc::new(MemoryStore::with_limits(
             l1_capacity_bytes,
@@ -381,6 +382,28 @@ impl WorkerRuntime {
         }
     }
 
+    /// Serve an origin-backed range pinned to the caller's exact source version.
+    ///
+    /// Unlike [`serve`](Self::serve), this path never switches to the current
+    /// source version. A matching resident block remains readable; an origin
+    /// miss is fetched with `version` as an `If-Match` precondition. A paged miss
+    /// may HEAD for its length, but must reject metadata for another version.
+    /// A changed source propagates `VersionMismatch` to the caller.
+    pub async fn serve_versioned(
+        &self,
+        request: &RangeRequest,
+        version: &Version,
+    ) -> anyhow::Result<ServeOutcome> {
+        self.ensure_configured_backend(request.object.backend)?;
+        if version.0.trim().is_empty() {
+            anyhow::bail!("version-pinned range request has an empty source version");
+        }
+        if request.len == 0 {
+            return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
+        }
+        self.serve_at(request, version).await
+    }
+
     /// Serve a versioned range only from resident cache state.
     ///
     /// Unlike [`serve`](Self::serve), this path neither resolves metadata nor
@@ -497,7 +520,8 @@ impl WorkerRuntime {
                 if request.len > 0
                     && l1_ok
                     && matches!(
-                        self.index.presence(&block, first, PageIndex(last.0 + 1)),
+                        self.index
+                            .presence_and_touch(&block, first, PageIndex(last.0 + 1)),
                         Presence::PageHit
                     )
                 {
@@ -517,11 +541,8 @@ impl WorkerRuntime {
                                         guard.record_access(self.page_clock.now());
                                     }
                                     self.metrics.record_l2_hit();
+                                    talon_telemetry::cache_tier("l2");
                                     self.metrics.record_cache_hit();
-                                    for p in first.0..=last.0 {
-                                        self.lru
-                                            .touch(&CacheUnit::Page(block.clone(), PageIndex(p)));
-                                    }
                                     tracing::info!(
                                         block = %block,
                                         first_page = first.0,
@@ -550,10 +571,7 @@ impl WorkerRuntime {
                         .await?,
                 ));
             }
-            if matches!(
-                self.index.presence(&block, PageIndex(0), PageIndex(1)),
-                Presence::Whole
-            ) {
+            if self.index.is_whole_and_touch(&block) {
                 // Open an fd over exactly the requested window. This can fail if
                 // the block was evicted between the presence check and the open
                 // (a benign race); fall through to the byte path in that case.
@@ -566,7 +584,7 @@ impl WorkerRuntime {
                     // the requested window.
                     Ok(mut handles) if handles.len() == 1 => {
                         let handle = handles.pop().expect("one handle");
-                        self.record_l2_hit(&block);
+                        self.record_l2_hit();
                         tracing::info!(block = %block, tier = "l2", "HIT (sendfile)");
                         return Ok(ServeOutcome::Sendfile(handle));
                     }
@@ -751,23 +769,31 @@ impl WorkerRuntime {
     /// returns it. `force` bypasses the cache (used after a precondition
     /// failure) so the retry always sees the newest version (#163).
     async fn resolve_version(&self, object: &ObjectId, force: bool) -> anyhow::Result<Version> {
-        if !force {
-            if let Some(version) = self.cached_version(object) {
-                return Ok(version);
+        talon_telemetry::observe("talon.version.resolve", "internal", async {
+            if !force {
+                if let Some(version) = self.cached_version(object) {
+                    talon_telemetry::text("talon.version.source", "cache");
+                    return Ok(version);
+                }
             }
-        }
-        let stat = self
-            .backend
-            .head(object)
-            .await
-            .map_err(|error| anyhow::anyhow!("resolve object version (HEAD): {error}"))?;
-        if stat.version.0.trim().is_empty() {
-            anyhow::bail!(
+            talon_telemetry::text(
+                "talon.version.source",
+                if force { "forced_head" } else { "head" },
+            );
+            let stat = self
+                .backend
+                .head(object)
+                .await
+                .map_err(|error| anyhow::anyhow!("resolve object version (HEAD): {error}"))?;
+            if stat.version.0.trim().is_empty() {
+                anyhow::bail!(
                 "backend returned no version/etag for {object}; refusing to cache without a version"
             );
-        }
-        self.store_version(object, &stat.version, stat.len);
-        Ok(stat.version)
+            }
+            self.store_version(object, &stat.version, stat.len);
+            Ok(stat.version)
+        })
+        .await
     }
 
     /// Return a cached version for `object` if one is within the TTL.
@@ -855,10 +881,7 @@ impl WorkerRuntime {
         // A write-through commits the whole block as one file (read-after-write
         // must hit). Serve such a block from the whole-block store rather than
         // re-fetching it a page at a time from the origin.
-        if matches!(
-            self.index.presence(block, PageIndex(0), PageIndex(1)),
-            Presence::Whole
-        ) {
+        if self.index.is_whole_and_touch(block) {
             if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                 return Ok(bytes);
             }
@@ -894,13 +917,14 @@ impl WorkerRuntime {
             }
 
             let key = LoadKey::Page(block.clone(), page);
-            if let Some(guard) = self.inflight.admit_owned(key) {
+            let (admission, flight) = self.inflight.admit_traced(key);
+            if let Some(guard) = admission {
                 leader_run.push((slot, page, guard));
             } else {
                 if !leader_run.is_empty() {
                     leader_runs.push(std::mem::take(&mut leader_run));
                 }
-                followers.push((slot, page));
+                followers.push((slot, page, flight));
             }
         }
         if !leader_run.is_empty() {
@@ -924,7 +948,7 @@ impl WorkerRuntime {
                 pending.push(async move {
                     let run_pages: Vec<_> = leader_run.iter().map(|(_, page, _)| *page).collect();
                     let fetched = self
-                        .fetch_and_commit_pages(request, block, &run_pages, block_len)
+                        .fetch_and_commit_pages(request, block, &run_pages, block_len, true)
                         .await;
                     (leader_run, fetched)
                 });
@@ -952,9 +976,9 @@ impl WorkerRuntime {
         // A follower never joins the leader's request, but it still preserves
         // the existing same-page de-duplication behavior. If its leader failed,
         // retry that page directly, just as the prior per-page path did.
-        for (slot, page) in followers {
+        for (slot, page, flight) in followers {
             let key = LoadKey::Page(block.clone(), page);
-            self.inflight.wait(&key).await;
+            talon_telemetry::wait_for(&flight, self.inflight.wait(&key)).await;
             let entry = match self.cached_page(block, page).await? {
                 Some(bytes) => (bytes, true),
                 None => (
@@ -1006,7 +1030,9 @@ impl WorkerRuntime {
         if self.l1.is_enabled() {
             if let Some(bytes) = self.l1.get_page(block, page) {
                 self.metrics.record_l1_hit();
-                self.lru.touch(&CacheUnit::Page(block.clone(), page));
+                talon_telemetry::cache_tier("l1");
+                self.index
+                    .presence_and_touch(block, page, PageIndex(page.0 + 1));
                 access.record_access(self.page_clock.now());
                 tracing::debug!(block = %block, page = page.0, tier = "l1", "HIT");
                 return Ok(Some(bytes));
@@ -1014,7 +1040,8 @@ impl WorkerRuntime {
             self.metrics.record_l1_miss();
         }
         if !matches!(
-            self.index.presence(block, page, PageIndex(page.0 + 1)),
+            self.index
+                .presence_and_touch(block, page, PageIndex(page.0 + 1)),
             Presence::PageHit
         ) {
             self.metrics.record_l2_miss();
@@ -1024,7 +1051,7 @@ impl WorkerRuntime {
         match paged.get_page_bytes(block, page).await {
             Ok(bytes) => {
                 self.metrics.record_l2_hit();
-                self.lru.touch(&CacheUnit::Page(block.clone(), page));
+                talon_telemetry::cache_tier("l2");
                 access.record_access(self.page_clock.now());
                 tracing::debug!(block = %block, page = page.0, tier = "l2", "HIT");
                 if self.l1.is_enabled() {
@@ -1053,7 +1080,7 @@ impl WorkerRuntime {
         block_len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         let mut pages = self
-            .fetch_and_commit_pages(request, block, &[page], block_len)
+            .fetch_and_commit_pages(request, block, &[page], block_len, false)
             .await?;
         Ok(pages
             .pop()
@@ -1068,81 +1095,107 @@ impl WorkerRuntime {
         block: &BlockId,
         pages: &[PageIndex],
         block_len: u64,
+        owns_flight: bool,
     ) -> anyhow::Result<Vec<bytes::Bytes>> {
-        debug_assert!(!pages.is_empty());
-        debug_assert!(
-            pages
-                .windows(2)
-                .all(|pair| pair[1].0 == pair[0].0.saturating_add(1)),
-            "page fetch runs must be consecutive"
-        );
-        let page_size = self.paged_page_size().expect("paged store");
-        let first = pages[0];
-        let last = *pages.last().expect("non-empty page run");
-        let page_start = u64::from(first.0) * u64::from(page_size);
-        let last_start = u64::from(last.0) * u64::from(page_size);
-        let want = last_start
-            .checked_add(talon_core::page_len(block_len, page_size, last))
-            .and_then(|end| end.checked_sub(page_start))
-            .ok_or_else(|| anyhow::anyhow!("paged backend range overflows u64"))?;
-        tracing::info!(
-            block = %block,
-            first_page = first.0,
-            last_page = last.0,
-            bytes = want,
-            "MISS -> backend page fetch"
-        );
-        let started = Instant::now();
-        // Same If-Match precondition as the whole-block path: an overwrite
-        // between version resolution and this GET must be rejected rather than
-        // committing newer bytes under the older version's key (issue #163).
-        let fetched = self
-            .backend
-            .fetch_range_if_match(
-                &request.object,
-                block.offset + page_start,
-                want,
-                Some(&block.version),
+        talon_telemetry::observe("talon.refill", "internal", async {
+            talon_telemetry::cache_tier("origin");
+            talon_telemetry::text("talon.refill.form", "paged");
+            if owns_flight && talon_telemetry::is_recording() {
+                for page in pages {
+                    self.inflight
+                        .bind_trace(&LoadKey::Page(block.clone(), *page));
+                }
+                talon_telemetry::record("talon.refill.pages", pages.len() as u64);
+            }
+            debug_assert!(!pages.is_empty());
+            debug_assert!(
+                pages
+                    .windows(2)
+                    .all(|pair| pair[1].0 == pair[0].0.saturating_add(1)),
+                "page fetch runs must be consecutive"
+            );
+            let page_size = self.paged_page_size().expect("paged store");
+            let first = pages[0];
+            let last = *pages.last().expect("non-empty page run");
+            let page_start = u64::from(first.0) * u64::from(page_size);
+            let last_start = u64::from(last.0) * u64::from(page_size);
+            let want = last_start
+                .checked_add(talon_core::page_len(block_len, page_size, last))
+                .and_then(|end| end.checked_sub(page_start))
+                .ok_or_else(|| anyhow::anyhow!("paged backend range overflows u64"))?;
+            tracing::info!(
+                block = %block,
+                first_page = first.0,
+                last_page = last.0,
+                bytes = want,
+                "MISS -> backend page fetch"
+            );
+            talon_telemetry::record("talon.range.offset", block.offset + page_start);
+            talon_telemetry::record("talon.range.length", want);
+            let started = Instant::now();
+            // Same If-Match precondition as the whole-block path: an overwrite
+            // between version resolution and this GET must be rejected rather than
+            // committing newer bytes under the older version's key (issue #163).
+            let fetched = talon_telemetry::observe(
+                "talon.origin.fetch",
+                "internal",
+                self.backend.fetch_range_if_match(
+                    &request.object,
+                    block.offset + page_start,
+                    want,
+                    Some(&block.version),
+                ),
             )
             .await;
-        let bytes = match fetched {
-            Ok(bytes) => {
-                self.metrics
-                    .record_backend_fetch_success(bytes.len() as u64, started.elapsed());
-                bytes
-            }
-            Err(error) => {
-                self.metrics.record_backend_fetch_error(started.elapsed());
-                return Err(error.into());
-            }
-        };
+            let bytes = match fetched {
+                Ok(bytes) => {
+                    self.metrics
+                        .record_backend_fetch_success(bytes.len() as u64, started.elapsed());
+                    bytes
+                }
+                Err(error) => {
+                    self.metrics.record_backend_fetch_error(started.elapsed());
+                    return Err(error.into());
+                }
+            };
 
-        let expected = usize::try_from(want)
-            .map_err(|_| anyhow::anyhow!("paged backend range is too large for this platform"))?;
-        if bytes.len() != expected {
-            anyhow::bail!(
-                "backend returned {} bytes for paged range of {} bytes",
-                bytes.len(),
-                want
-            );
-        }
+            let expected = usize::try_from(want).map_err(|_| {
+                anyhow::anyhow!("paged backend range is too large for this platform")
+            })?;
+            if bytes.len() != expected {
+                anyhow::bail!(
+                    "backend returned {} bytes for paged range of {} bytes",
+                    bytes.len(),
+                    want
+                );
+            }
 
-        let mut committed = Vec::with_capacity(pages.len());
-        let mut cursor = 0_usize;
-        for page in pages {
-            let page_len = usize::try_from(talon_core::page_len(block_len, page_size, *page))
-                .map_err(|_| anyhow::anyhow!("page length is too large for this platform"))?;
-            let end = cursor
-                .checked_add(page_len)
-                .ok_or_else(|| anyhow::anyhow!("paged response offset overflows usize"))?;
-            let page_bytes = bytes.slice(cursor..end);
-            self.commit_fetched_page(block, *page, block_len, page_bytes.clone())
-                .await?;
-            committed.push(page_bytes);
-            cursor = end;
-        }
-        debug_assert_eq!(cursor, bytes.len());
-        Ok(committed)
+            talon_telemetry::record("talon.origin.validated_bytes", bytes.len() as u64);
+            talon_telemetry::observe("talon.cache.commit", "internal", async {
+                let mut committed = Vec::with_capacity(pages.len());
+                let mut cursor = 0_usize;
+                for page in pages {
+                    let page_len =
+                        usize::try_from(talon_core::page_len(block_len, page_size, *page))
+                            .map_err(|_| {
+                                anyhow::anyhow!("page length is too large for this platform")
+                            })?;
+                    let end = cursor
+                        .checked_add(page_len)
+                        .ok_or_else(|| anyhow::anyhow!("paged response offset overflows usize"))?;
+                    let page_bytes = bytes.slice(cursor..end);
+                    self.commit_fetched_page(block, *page, block_len, page_bytes.clone())
+                        .await?;
+                    talon_telemetry::record("talon.cache.committed_bytes", end as u64);
+                    committed.push(page_bytes);
+                    cursor = end;
+                }
+                debug_assert_eq!(cursor, bytes.len());
+                Ok(committed)
+            })
+            .await
+        })
+        .await
     }
 
     /// Commit one fetched page and update its L1/L2 residency bookkeeping.
@@ -1155,49 +1208,61 @@ impl WorkerRuntime {
     ) -> anyhow::Result<()> {
         let runtime = self.clone();
         let id = block.clone();
+        let operation = talon_telemetry::Operation::new(
+            "talon.cache.page_commit",
+            "internal",
+            talon_telemetry::TraceParent::Inherit,
+        );
         self.page_mutations
             .run(async move {
-                let state = runtime.page_lifecycle.block(&id);
-                let _gate = state.gate.lock().await;
-                if matches!(
-                    runtime.index.get(&id).map(|m| m.form),
-                    Some(BlockForm::Whole)
-                ) {
-                    return Ok::<_, anyhow::Error>(());
-                }
-                let paged = runtime.paged.as_ref().expect("paged store").clone();
-                let disk = paged.clone();
-                let block = id.clone();
-                let value = bytes.clone();
-                tokio::task::spawn_blocking(move || {
-                    disk.write_sidecar(&block, block_len)?;
-                    disk.put_page(&block, page, value)
-                })
-                .await??;
-                runtime
-                    .index
-                    .init_paged(id.clone(), paged.page_size(), block_len);
-                runtime.index.mark_page(&id, page);
-                state.register(
-                    page,
-                    Some(runtime.page_clock.now()),
-                    runtime.page_clock.now(),
-                    true,
-                );
-                let unit = CacheUnit::Page(id.clone(), page);
-                runtime.lru.insert(unit.clone(), bytes.len() as u64);
-                if runtime.l1.is_enabled() {
-                    runtime.admit_l1_page(&id, page, bytes);
-                }
-                // Keep pressure handling owned by the worker too: cancellation
-                // must not leave a completed admission above capacity.
-                let _read = state.acquire(page);
-                let _pin = runtime.lru.pin_guard(unit);
-                drop(_gate);
-                let superseded = runtime.lru.superseded_candidates(&id);
-                runtime.unlink_units(superseded, 2).await;
-                runtime.enforce_capacity().await;
-                Ok::<_, anyhow::Error>(())
+                let result = operation
+                    .scope(async move {
+                        let state = runtime.page_lifecycle.block(&id);
+                        let _gate = state.gate.lock().await;
+                        if matches!(
+                            runtime.index.get(&id).map(|m| m.form),
+                            Some(BlockForm::Whole)
+                        ) {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        let paged = runtime.paged.as_ref().expect("paged store").clone();
+                        let disk = paged.clone();
+                        let block = id.clone();
+                        let value = bytes.clone();
+                        crate::paged_store::spawn_blocking_io(move || {
+                            disk.write_sidecar(&block, block_len)?;
+                            disk.put_page(&block, page, value)
+                        })
+                        .await?;
+                        runtime
+                            .index
+                            .init_paged(id.clone(), paged.page_size(), block_len);
+                        runtime.index.mark_page(&id, page);
+                        state.register(
+                            page,
+                            Some(runtime.page_clock.now()),
+                            runtime.page_clock.now(),
+                            true,
+                        );
+                        let unit = CacheUnit::Page(id.clone(), page);
+                        let access = runtime.lru.insert(unit.clone(), bytes.len() as u64);
+                        runtime.index.set_access(&unit, access);
+                        if runtime.l1.is_enabled() {
+                            runtime.admit_l1_page(&id, page, bytes);
+                        }
+                        // Keep pressure handling owned by the worker too: cancellation
+                        // must not leave a completed admission above capacity.
+                        let _read = state.acquire(page);
+                        let _pin = runtime.lru.pin_guard(unit);
+                        drop(_gate);
+                        let superseded = runtime.lru.superseded_candidates(&id);
+                        runtime.unlink_units(superseded, 2).await;
+                        runtime.enforce_capacity().await;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                operation.outcome(if result.is_ok() { "success" } else { "error" });
+                result
             })
             .await?;
         tracing::info!(block = %block, page = page.0, "committed page");
@@ -1242,6 +1307,13 @@ impl WorkerRuntime {
                     self.backend.head(object).await.map_err(|error| {
                         anyhow::anyhow!("resolve object length (HEAD): {error}")
                     })?;
+                if stat.version != block.version {
+                    return Err(Error::VersionMismatch {
+                        expected: block.version.0.clone(),
+                        found: stat.version.0,
+                    }
+                    .into());
+                }
                 self.store_version(object, &stat.version, stat.len);
                 stat.len
             }
@@ -1258,11 +1330,12 @@ impl WorkerRuntime {
         len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         let key = LoadKey::Whole(block.clone());
-        match self.inflight.admit_owned(key.clone()) {
+        let (admission, flight) = self.inflight.admit_traced(key.clone());
+        match admission {
             Some(guard) => {
                 // Leader: fetch and commit; the guard wakes waiters on drop
                 // (including on cancellation/panic).
-                let result = self.fetch_and_commit(request, block).await;
+                let result = self.fetch_and_commit(request, block, true).await;
                 drop(guard);
                 let bytes = result?;
                 self.range_from_fetched(block, bytes, offset, len)
@@ -1270,15 +1343,16 @@ impl WorkerRuntime {
             None => {
                 // A peer is already fetching this block; wait for it and serve
                 // from cache rather than issuing a duplicate backend fetch.
-                self.inflight.wait(&key).await;
+                talon_telemetry::wait_for(&flight, self.inflight.wait(&key)).await;
                 if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                     return Ok(bytes);
                 }
                 // The leader's load failed (marker cleared, block still absent).
                 // Try to become the leader ourselves.
-                match self.inflight.admit_owned(key.clone()) {
+                let (admission, flight) = self.inflight.admit_traced(key.clone());
+                match admission {
                     Some(guard) => {
-                        let result = self.fetch_and_commit(request, block).await;
+                        let result = self.fetch_and_commit(request, block, true).await;
                         drop(guard);
                         let bytes = result?;
                         self.range_from_fetched(block, bytes, offset, len)
@@ -1287,11 +1361,11 @@ impl WorkerRuntime {
                         // Another peer already restarted the load; wait once
                         // more, then, if still absent, fetch without holding
                         // admission to avoid an unbounded wait loop.
-                        self.inflight.wait(&key).await;
+                        talon_telemetry::wait_for(&flight, self.inflight.wait(&key)).await;
                         if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                             return Ok(bytes);
                         }
-                        let bytes = self.fetch_and_commit(request, block).await?;
+                        let bytes = self.fetch_and_commit(request, block, false).await?;
                         self.range_from_fetched(block, bytes, offset, len)
                     }
                 }
@@ -1306,7 +1380,7 @@ impl WorkerRuntime {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some(meta) = self.index.get(block) else {
+        let Some(meta) = self.index.get_and_touch(block) else {
             if self.l1.is_enabled() {
                 self.metrics.record_l1_miss();
             }
@@ -1322,8 +1396,8 @@ impl WorkerRuntime {
             match self.l1.get_range(block, offset, len) {
                 Some(bytes) => {
                     self.metrics.record_l1_hit();
+                    talon_telemetry::cache_tier("l1");
                     self.metrics.record_cache_hit();
-                    self.lru.touch(&CacheUnit::Whole(block.clone()));
                     tracing::debug!(block = %block, offset, len, tier = "l1", "HIT");
                     return Ok(Some(bytes));
                 }
@@ -1333,7 +1407,7 @@ impl WorkerRuntime {
             }
         }
 
-        self.record_l2_hit(block);
+        self.record_l2_hit();
         tracing::debug!(block = %block, offset, len, tier = "l2", "HIT");
         if !self.l1.is_enabled() {
             let bytes = match self.store.get_range_bytes(block, offset, len).await {
@@ -1374,11 +1448,11 @@ impl WorkerRuntime {
         tracing::debug!(%block, "discarded stale L2 index entry after file miss");
     }
 
-    /// Record an L2 hit and touch its capacity LRU.
-    fn record_l2_hit(&self, block: &BlockId) {
+    /// Record an L2 hit. The preceding index lookup already marks recency.
+    fn record_l2_hit(&self) {
         self.metrics.record_l2_hit();
+        talon_telemetry::cache_tier("l2");
         self.metrics.record_cache_hit();
-        self.lru.touch(&CacheUnit::Whole(block.clone()));
     }
 
     fn page_window(&self, offset: u64, len: u64, block_len: u64) -> anyhow::Result<(u64, u64)> {
@@ -1473,35 +1547,49 @@ impl WorkerRuntime {
         &self,
         request: &RangeRequest,
         block: &BlockId,
+        owns_flight: bool,
     ) -> anyhow::Result<bytes::Bytes> {
-        tracing::info!(block = %block, "MISS -> backend fetch");
-        let started = Instant::now();
-        // Carry the resolved version as an If-Match precondition so an overwrite
-        // between version resolution and this GET is rejected (412) rather than
-        // committing newer bytes under the older version's key (issue #163).
-        let fetched = self
-            .backend
-            .fetch_range_if_match(
-                &request.object,
-                block.offset,
-                self.block_size as u64,
-                Some(&block.version),
+        talon_telemetry::observe("talon.refill", "internal", async {
+            talon_telemetry::cache_tier("origin");
+            talon_telemetry::text("talon.refill.form", "whole");
+            talon_telemetry::record("talon.range.offset", block.offset);
+            talon_telemetry::record("talon.range.length", self.block_size as u64);
+            if owns_flight {
+                self.inflight.bind_trace(&LoadKey::Whole(block.clone()));
+            }
+            tracing::info!(block = %block, "MISS -> backend fetch");
+            let started = Instant::now();
+            // Carry the resolved version as an If-Match precondition so an overwrite
+            // between version resolution and this GET is rejected (412) rather than
+            // committing newer bytes under the older version's key (issue #163).
+            let fetched = talon_telemetry::observe(
+                "talon.origin.fetch",
+                "internal",
+                self.backend.fetch_range_if_match(
+                    &request.object,
+                    block.offset,
+                    self.block_size as u64,
+                    Some(&block.version),
+                ),
             )
             .await;
-        let bytes = match fetched {
-            Ok(bytes) => {
-                self.metrics
-                    .record_backend_fetch_success(bytes.len() as u64, started.elapsed());
-                bytes
-            }
-            Err(error) => {
-                self.metrics.record_backend_fetch_error(started.elapsed());
-                return Err(error.into());
-            }
-        };
+            let bytes = match fetched {
+                Ok(bytes) => {
+                    self.metrics
+                        .record_backend_fetch_success(bytes.len() as u64, started.elapsed());
+                    bytes
+                }
+                Err(error) => {
+                    self.metrics.record_backend_fetch_error(started.elapsed());
+                    return Err(error.into());
+                }
+            };
 
-        self.commit_cached_block(block, bytes.clone()).await?;
-        Ok(bytes)
+            talon_telemetry::record("talon.origin.validated_bytes", bytes.len() as u64);
+            self.commit_cached_block(block, bytes.clone()).await?;
+            Ok(bytes)
+        })
+        .await
     }
 
     async fn commit_cached_block(
@@ -1512,48 +1600,62 @@ impl WorkerRuntime {
         let len = bytes.len() as u64;
         let runtime = self.clone();
         let id = block.clone();
+        let operation = talon_telemetry::Operation::new(
+            "talon.cache.commit",
+            "internal",
+            talon_telemetry::TraceParent::Inherit,
+        );
         self.page_mutations
             .run(async move {
-                let state = runtime.page_lifecycle.block(&id);
-                let gate = state.gate.lock().await;
-                // Keep same-version paged residency and complete the admission
-                // even when the original requester stops waiting.
-                let paged = !state.inner.lock().unwrap().pages.is_empty();
-                if paged {
-                    drop(gate);
-                    let size = runtime.paged_page_size().expect("paged state");
-                    for (page, chunk) in bytes.chunks(size as usize).enumerate() {
-                        runtime
-                            .commit_fetched_page(
-                                &id,
-                                PageIndex(page as u32),
-                                len,
-                                bytes::Bytes::copy_from_slice(chunk),
-                            )
-                            .await?;
-                    }
-                    return Ok::<_, anyhow::Error>(());
-                }
-                runtime.store.put(&id, bytes).await?;
-                runtime.index.commit(BlockMeta {
-                    id: id.clone(),
-                    form: BlockForm::Whole,
-                    len,
-                });
-                let unit = CacheUnit::Whole(id.clone());
-                runtime.lru.insert(unit.clone(), len);
-                // Pin before releasing the gate used by candidate validation.
-                let _pin = runtime.lru.pin_guard(unit);
-                drop(gate);
-                drop(state);
-                runtime.page_lifecycle.retire_empty(&id);
-                let superseded = runtime.lru.superseded_candidates(&id);
-                runtime.unlink_units(superseded, 2).await;
-                runtime.enforce_capacity().await;
-                if !runtime.l1.remove_superseded(&id).is_empty() {
-                    runtime.refresh_l1_metrics();
-                }
-                Ok::<_, anyhow::Error>(())
+                let result = operation
+                    .scope(async move {
+                        let state = runtime.page_lifecycle.block(&id);
+                        let gate = state.gate.lock().await;
+                        // Keep same-version paged residency and complete the admission
+                        // even when the original requester stops waiting.
+                        let paged = !state.inner.lock().unwrap().pages.is_empty();
+                        if paged {
+                            drop(gate);
+                            let size = runtime.paged_page_size().expect("paged state");
+                            for (page, chunk) in bytes.chunks(size as usize).enumerate() {
+                                runtime
+                                    .commit_fetched_page(
+                                        &id,
+                                        PageIndex(page as u32),
+                                        len,
+                                        bytes::Bytes::copy_from_slice(chunk),
+                                    )
+                                    .await?;
+                            }
+                            talon_telemetry::record("talon.cache.committed_bytes", len);
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        runtime.store.put(&id, bytes).await?;
+                        talon_telemetry::record("talon.cache.committed_bytes", len);
+                        runtime.index.commit(BlockMeta {
+                            id: id.clone(),
+                            form: BlockForm::Whole,
+                            len,
+                        });
+                        let unit = CacheUnit::Whole(id.clone());
+                        let access = runtime.lru.insert(unit.clone(), len);
+                        runtime.index.set_access(&unit, access);
+                        // Pin before releasing the gate used by candidate validation.
+                        let _pin = runtime.lru.pin_guard(unit);
+                        drop(gate);
+                        drop(state);
+                        runtime.page_lifecycle.retire_empty(&id);
+                        let superseded = runtime.lru.superseded_candidates(&id);
+                        runtime.unlink_units(superseded, 2).await;
+                        runtime.enforce_capacity().await;
+                        if !runtime.l1.remove_superseded(&id).is_empty() {
+                            runtime.refresh_l1_metrics();
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                operation.outcome(if result.is_ok() { "success" } else { "error" });
+                result
             })
             .await?;
         tracing::info!(block = %block, bytes = len, "committed block");
@@ -1891,6 +1993,18 @@ mod tests {
 
     use super::*;
 
+    fn expect_test_version(if_match: Option<&Version>, current: &str) -> Result<()> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != current {
+                return Err(Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: current.to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     struct MockBackend {
         calls: AtomicUsize,
     }
@@ -1904,6 +2018,17 @@ mod tests {
             } else {
                 Ok(Bytes::from_static(b"abcdefgh"))
             }
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -2958,6 +3083,17 @@ mod tests {
             Ok(Bytes::from(buf))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: u64::MAX,
@@ -2978,6 +3114,17 @@ mod tests {
             let n = len.min(self.block_size) as usize;
             let buf: Vec<u8> = (0..n).map(|i| ((offset + i as u64) % 251) as u8).collect();
             Ok(Bytes::from(buf))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3147,6 +3294,17 @@ mod tests {
             Ok(Bytes::from_static(b"abcdefgh"))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: 8,
@@ -3226,6 +3384,18 @@ mod tests {
         async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
             Ok(self.body.lock().unwrap().clone())
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            let current = self.version.lock().unwrap().clone();
+            expect_test_version(if_match, &current)?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3454,9 +3624,12 @@ mod tests {
 
     #[async_trait]
     impl BackendStore for CondBackend {
-        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+        async fn fetch_range(&self, _object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
             self.fetches.fetch_add(1, Ordering::SeqCst);
-            Ok(self.body.lock().unwrap().clone())
+            let body = self.body.lock().unwrap();
+            let start = (offset as usize).min(body.len());
+            let end = start.saturating_add(len as usize).min(body.len());
+            Ok(body.slice(start..end))
         }
 
         async fn fetch_range_if_match(
@@ -3540,7 +3713,7 @@ mod tests {
         let root = tmp_root();
         let backend = Arc::new(CondBackend {
             version: std::sync::Mutex::new("v1".into()),
-            body: std::sync::Mutex::new(Bytes::from_static(b"old-data-old-data")),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-old-old-old-")),
             heads: AtomicUsize::new(0),
             fetches: AtomicUsize::new(0),
             enforce_precondition: true,
@@ -3559,7 +3732,7 @@ mod tests {
 
         // Overwrite the source; the version cache still holds v1.
         *backend.version.lock().unwrap() = "v2".into();
-        *backend.body.lock().unwrap() = Bytes::from_static(b"new-data-new-data");
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-new-new-new-");
 
         // block1 (offset 8): a miss under the stale cached v1 -> If-Match(v1)
         // 412 -> re-resolve v2 -> refetch. Must serve the fresh v2 bytes.
@@ -3569,6 +3742,172 @@ mod tests {
             Bytes::from_static(b"new-"),
             "must re-resolve and serve fresh bytes after a precondition failure"
         );
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    async fn assert_version_pinned_read_never_switches(paged: bool) {
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v1".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"old-old-old-old-")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: true,
+        });
+        let mut runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60));
+        if paged {
+            runtime =
+                runtime.with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
+        }
+        let missing_offset = if paged { 4 } else { 8 };
+        let object = ObjectId::new(Backend::Azure, "container", "obj");
+        let request = |offset| RangeRequest {
+            object: object.clone(),
+            offset,
+            len: 4,
+        };
+        let version_v1 = Version::new("v1");
+
+        let first = runtime
+            .serve_versioned(&request(0), &version_v1)
+            .await
+            .unwrap();
+        assert!(matches!(
+            first,
+            ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"old-")
+        ));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged));
+
+        *backend.version.lock().unwrap() = "v2".into();
+        *backend.body.lock().unwrap() = Bytes::from_static(b"new-new-new-new-");
+
+        let cached = runtime
+            .serve_versioned(&request(0), &version_v1)
+            .await
+            .unwrap();
+        let handles = match cached {
+            ServeOutcome::Sendfile(handle) => vec![handle],
+            ServeOutcome::SendfileMany(handles) => handles,
+            ServeOutcome::Bytes(_) => panic!("expected a resident cache hit"),
+        };
+        let mut cached_bytes = Vec::new();
+        for handle in handles {
+            use std::os::unix::fs::FileExt;
+            let file = std::fs::File::from(handle.fd.try_clone().unwrap());
+            let mut bytes = vec![0; handle.len as usize];
+            file.read_exact_at(&mut bytes, handle.offset).unwrap();
+            cached_bytes.extend(bytes);
+        }
+        assert_eq!(cached_bytes, b"old-");
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+
+        let error = runtime
+            .serve_versioned(&request(missing_offset), &version_v1)
+            .await
+            .err()
+            .expect("a pinned read must not refresh to v2");
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::VersionMismatch { expected, found })
+                if expected == "v1" && found == "v2"
+        ));
+        assert_eq!(
+            backend.heads.load(Ordering::SeqCst),
+            usize::from(paged),
+            "cached metadata must not be refreshed to another generation"
+        );
+
+        let current = runtime.serve(&request(missing_offset)).await.unwrap();
+        assert!(matches!(
+            current,
+            ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"new-")
+        ));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged) + 1);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn version_pinned_whole_read_never_switches_to_a_newer_generation() {
+        assert_version_pinned_read_never_switches(false).await;
+    }
+
+    #[tokio::test]
+    async fn version_pinned_paged_read_never_switches_to_a_newer_generation() {
+        assert_version_pinned_read_never_switches(true).await;
+    }
+
+    #[tokio::test]
+    async fn version_pinned_paged_miss_rejects_length_from_another_generation() {
+        let root = tmp_root();
+        let backend = Arc::new(CondBackend {
+            version: std::sync::Mutex::new("v2".into()),
+            body: std::sync::Mutex::new(Bytes::from_static(b"new-")),
+            heads: AtomicUsize::new(0),
+            fetches: AtomicUsize::new(0),
+            enforce_precondition: true,
+        });
+        let runtime = cond_runtime(Arc::clone(&backend), &root, Duration::from_secs(60))
+            .with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
+        // The replacement is shorter than this old-generation range. Its size
+        // must not turn the read into a successful short read or seed old metadata.
+        let request = RangeRequest {
+            object: ObjectId::new(Backend::Azure, "container", "obj"),
+            offset: 8,
+            len: 4,
+        };
+        let error = runtime
+            .serve_versioned(&request, &Version::new("v1"))
+            .await
+            .err()
+            .expect("a stale HEAD must fail the pinned read");
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::VersionMismatch { expected, found })
+            if expected == "v1" && found == "v2")
+        );
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.block_count(), 0);
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    struct UnguardedBackend {
+        fetches: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for UnguardedBackend {
+        async fn fetch_range(&self, _object: &ObjectId, _offset: u64, _len: u64) -> Result<Bytes> {
+            self.fetches.fetch_add(1, Ordering::SeqCst);
+            Ok(Bytes::from_static(b"new-data"))
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            Ok(ObjectStat {
+                len: 8,
+                version: Version::new("v2"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn version_pinned_miss_fails_closed_when_backend_cannot_enforce_it() {
+        let root = tmp_root();
+        let backend = Arc::new(UnguardedBackend {
+            fetches: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with(Arc::clone(&backend), WorkerMetrics::new(1024), &root, 8);
+
+        let error = runtime
+            .serve_versioned(&request("obj"), &Version::new("v1"))
+            .await
+            .err()
+            .expect("an unguarded backend must not return newer bytes");
+        assert!(matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::Unsupported(message))
+                if message.contains("version-conditional read")
+        ));
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        assert_eq!(runtime.block_count(), 0);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3708,6 +4047,17 @@ mod tests {
                     .map(|i| ((offset + i as u64) % 251) as u8)
                     .collect::<Vec<u8>>(),
             ))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
         }
 
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
@@ -3970,6 +4320,50 @@ mod tests {
         // Only the 36 real bytes are charged, not a full 64-byte page.
         assert_eq!(runtime.resident_bytes(), 36);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    async fn assert_whole_probe_does_not_heat_page_zero(use_sendfile: bool) {
+        let root = tmp_root();
+        let backend = Arc::new(PagedRampBackend::new(4096));
+        let runtime = paged_runtime(
+            Arc::clone(&backend),
+            &root,
+            1024,
+            64,
+            128,
+            WorkerMetrics::new(1024),
+        );
+        let object = ObjectId::new(Backend::Azure, "bucket", "obj");
+
+        // Two-page capacity: loading page 2 must evict page 0. Probing the
+        // block form while reading other pages must not give page 0 a touch.
+        for page in [0, 1, 2, 1] {
+            let offset = page * 64;
+            let request = req(&object, offset, 8);
+            let got = if use_sendfile {
+                match runtime.serve(&request).await.unwrap() {
+                    ServeOutcome::Bytes(bytes) => bytes.to_vec(),
+                    outcome => read_handle(outcome),
+                }
+            } else {
+                runtime.serve_range(&request).await.unwrap().to_vec()
+            };
+            assert_eq!(got, expected(offset, 8));
+        }
+        let ranges = backend.ranges();
+        assert_eq!(runtime.resident_bytes(), 128);
+        std::fs::remove_dir_all(root).unwrap();
+        assert_eq!(ranges, vec![(0, 64), (64, 64), (128, 64)]);
+    }
+
+    #[tokio::test]
+    async fn byte_read_whole_probe_does_not_heat_page_zero() {
+        assert_whole_probe_does_not_heat_page_zero(false).await;
+    }
+
+    #[tokio::test]
+    async fn sendfile_read_whole_probe_does_not_heat_page_zero() {
+        assert_whole_probe_does_not_heat_page_zero(true).await;
     }
 
     #[tokio::test]

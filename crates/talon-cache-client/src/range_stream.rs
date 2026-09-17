@@ -109,6 +109,9 @@ impl From<DetailedBlockReadError> for CacheReadError {
             DetailedBlockReadError::Worker(error) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Worker(error)) => error.into(),
+            DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed { source, .. }) => {
+                source.into()
+            }
             DetailedBlockReadError::Block(error) => Self::Unavailable(error.to_string()),
         }
     }
@@ -224,7 +227,8 @@ mod tests {
     use talon_core::{Backend, NodeId, NodeInfo, NodeRole};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
     use talon_transport::{
-        decode_request, encode_typed_error, response_header_ok, ControlMessage, DataPlaneError,
+        decode_versioned_request, encode_typed_error, response_header_ok, ControlMessage,
+        DataPlaneError,
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
@@ -298,7 +302,7 @@ mod tests {
                         socket.read_exact(&mut body).await.unwrap();
                         let mut frame = header.encode().to_vec();
                         frame.extend_from_slice(&body);
-                        let request = decode_request(&frame).unwrap().1;
+                        let request = decode_versioned_request(&frame).unwrap().1.request;
                         requests.fetch_add(1, Ordering::SeqCst);
                         let bytes: Vec<u8> = (request.offset..request.offset + request.len)
                             .map(|value| value as u8)
@@ -394,6 +398,32 @@ mod tests {
             CacheReadError::from(error),
             CacheReadError::Timeout(_)
         ));
+    }
+
+    #[test]
+    fn exhausted_replicas_preserve_stream_error_classification() {
+        for code in [DataErrorCode::Timeout, DataErrorCode::Internal] {
+            let error = DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
+                worker: "127.0.0.1:1234".into(),
+                source: WorkerError::Remote(DataPlaneError {
+                    code,
+                    message: "original worker diagnostic".into(),
+                }),
+            });
+            let error = CacheReadError::from(error);
+            assert!(error.to_string().contains("original worker diagnostic"));
+            match code {
+                DataErrorCode::Timeout => {
+                    assert!(error.fallback_eligible());
+                    assert!(matches!(error, CacheReadError::Timeout(_)));
+                }
+                DataErrorCode::Internal => {
+                    assert!(!error.fallback_eligible());
+                    assert!(matches!(error, CacheReadError::Internal(_)));
+                }
+                _ => unreachable!(),
+            }
+        }
     }
 
     #[test]

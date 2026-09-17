@@ -26,6 +26,7 @@ use talon_gateway::{
 };
 use tokio::net::TcpListener;
 use tracing::info;
+#[cfg(not(feature = "telemetry"))]
 use tracing_subscriber::EnvFilter;
 
 type MainResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -933,9 +934,23 @@ async fn shutdown_signal() {
 
 #[tokio::main]
 async fn main() -> MainResult<()> {
+    #[cfg(feature = "telemetry")]
+    let _telemetry = talon_telemetry::export::init("talon-gateway")?;
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .init();
+    #[cfg(not(feature = "telemetry"))]
+    talon_telemetry::Config::from_env()
+        .and_then(talon_telemetry::configure)
+        .map_err(std::io::Error::other)?;
+    let result = run().await;
+    #[cfg(feature = "telemetry")]
+    let _ = tokio::task::spawn_blocking(move || _telemetry.shutdown()).await;
+    result
+}
+
+async fn run() -> MainResult<()> {
     let settings = Settings::from_env()?;
     let metrics = GatewayMetrics::new();
     let credentials_observer: Arc<dyn CredentialsObserver> =

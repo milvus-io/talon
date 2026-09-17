@@ -16,7 +16,11 @@ case "$OUTPUT_DIR" in
     *) OUTPUT_DIR="$(pwd)/$OUTPUT_DIR" ;;
 esac
 
-cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --release --locked
+if [ "${TALON_BUILD_TELEMETRY:-0}" = 1 ]; then
+    cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --release --locked --features telemetry
+else
+    cargo build --manifest-path "$SCRIPT_DIR/Cargo.toml" --release --locked
+fi
 
 mkdir -p "$OUTPUT_DIR/include" "$OUTPUT_DIR/lib"
 install -m 644 "$SCRIPT_DIR/include/talon.h" "$OUTPUT_DIR/include/talon.h"

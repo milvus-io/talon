@@ -44,6 +44,9 @@ typedef struct talon_callback_executor {
 typedef struct talon_client_options {
     uint32_t block_size;
     const talon_callback_executor *callback_executor;
+    /* Maximum idle connections per peer in each pool. Zero uses the default 8.
+     * This does not limit active connections. */
+    uint32_t max_idle_per_addr;
 } talon_client_options;
 
 void talon_client_options_init(talon_client_options *options);
@@ -70,10 +73,11 @@ void talon_client_free(talon_client *client);
  *
  * version and object_size are each optional and independently nullable; NULL
  * means the caller does not have that value. The read skips the StatObject round
- * trip only when BOTH are non-NULL, using the caller-supplied version and size
- * (the caller owns keeping them current for the object generation being read).
- * If either is NULL the SDK resolves both with a StatObject first and any lone
- * value supplied is ignored, since a read cannot skip the stat without both.
+ * trip only when BOTH are non-NULL, using the caller-supplied size and exact
+ * source version. A worker may serve that generation from cache or conditionally
+ * fetch it from the backend, but never substitutes a newer generation. If either
+ * is NULL the SDK resolves both with a StatObject first and any lone value
+ * supplied is ignored, since a read cannot skip the stat without both.
  *
  * When used, *object_size is the object's total byte length and bounds the read
  * at EOF (a POSIX short read): a value smaller than offset + dst_len yields a
@@ -83,6 +87,53 @@ void talon_client_free(talon_client *client);
  *
  * Blocks spanned by the read are fetched concurrently.
  */
+#define TALON_REQUEST_OPTIONS_VERSION_1 1u
+/* Explicit telemetry lifecycle; uses TALON_TELEMETRY_* environment variables.
+ * Defaults off. Shutdown after all operations, outside SDK callbacks. */
+int talon_telemetry_init(void);
+void talon_telemetry_shutdown(void);
+#define TALON_TRACE_PARENT_NONE 0u
+#define TALON_TRACE_PARENT_EXPLICIT 1u
+
+typedef struct talon_request_options {
+    uint32_t struct_size;
+    uint32_t version;
+    uint32_t flags;
+    uint32_t parent_mode;
+    const char *traceparent;
+    size_t traceparent_len;
+    const char *tracestate;
+    size_t tracestate_len;
+} talon_request_options;
+
+/* Initialize only the v1 fields; size must be at least sizeof(options).
+ * Submission copies the carrier before returning. NULL/NONE never inherits
+ * ambient context. Invalid W3C data does not fail a valid business request.
+ * Unknown version/flags/mode or a short struct returns INVALID_ARGUMENT
+ * synchronously, without scheduling a callback. */
+int talon_request_options_init(talon_request_options *options, size_t size);
+
+int talon_read_async_with_options(
+    talon_client *client,
+    const char *uri,
+    uint64_t offset,
+    uint8_t *dst,
+    size_t dst_len,
+    const char *version,
+    const uint64_t *object_size,
+    const talon_request_options *options,
+    talon_callback callback,
+    void *user_data,
+    uint64_t *request_id_out);
+
+int talon_stat_async_with_options(
+    talon_client *client,
+    const char *uri,
+    const talon_request_options *options,
+    talon_callback callback,
+    void *user_data,
+    uint64_t *request_id_out);
+
 int talon_read_async(
     talon_client *client,
     const char *uri,

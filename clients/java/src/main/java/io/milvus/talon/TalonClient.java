@@ -2,11 +2,13 @@ package io.milvus.talon;
 
 import java.io.ByteArrayOutputStream;
 import java.io.DataInputStream;
+import java.io.EOFException;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
+import java.net.SocketException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -27,9 +29,9 @@ import java.util.concurrent.atomic.AtomicInteger;
  *
  * <h2>Thread safety</h2>
  *
- * Instances are safe for concurrent use. Each call opens its own connection
- * rather than sharing one, so a slow read cannot block an unrelated one; the
- * placement cache is shared and synchronised.
+ * Instances are safe for concurrent use. Each call exclusively checks out a
+ * connection, so a slow read cannot block an unrelated one. Idle connections
+ * are reused; their limit does not constrain concurrent requests.
  *
  * <h2>Example</h2>
  *
@@ -51,27 +53,48 @@ public final class TalonClient implements AutoCloseable {
 
     private final String coordinator;
     private final int blockSize;
+    private final ConnectionPool coordinatorPool;
+    private final ConnectionPool workerPool;
     private final AtomicInteger requestIds = new AtomicInteger(1);
     private final Map<BlockId, CachedPlacement> placementCache = new HashMap<>();
     private final Object membershipLock = new Object();
     private CachedMembership membership;
 
-    private TalonClient(String coordinator, int blockSize) {
+    private TalonClient(String coordinator, int blockSize, int maxIdlePerAddr) {
         this.coordinator = coordinator;
         this.blockSize = blockSize;
+        this.coordinatorPool = new ConnectionPool(maxIdlePerAddr);
+        this.workerPool = new ConnectionPool(maxIdlePerAddr);
     }
 
     /**
-     * Connect to a coordinator.
+     * Connect to a coordinator with a configurable idle connection limit.
+     *
+     * @param blockSize must match the workers' configured block size
+     * @param maxIdlePerAddr positive maximum idle connections per address in each
+     *     coordinator/worker pool; does not limit concurrent requests
+     */
+    public static TalonClient connect(String coordinator, int blockSize, int maxIdlePerAddr) {
+        if (coordinator == null || coordinator.isBlank()) {
+            throw new IllegalArgumentException("coordinator is required");
+        }
+        if (blockSize <= 0) {
+            throw new IllegalArgumentException("blockSize must be positive, got " + blockSize);
+        }
+        if (maxIdlePerAddr <= 0) {
+            throw new IllegalArgumentException("maxIdlePerAddr must be positive, got " + maxIdlePerAddr);
+        }
+        return new TalonClient(coordinator, blockSize, maxIdlePerAddr);
+    }
+
+    /**
+     * Connect to a coordinator, retaining up to 8 idle connections per address.
      *
      * @param blockSize must match the workers' configured block size; placement
      *     is per block, so a mismatch addresses blocks that do not exist
      */
     public static TalonClient connect(String coordinator, int blockSize) {
-        if (blockSize <= 0) {
-            throw new IllegalArgumentException("blockSize must be positive, got " + blockSize);
-        }
-        return new TalonClient(coordinator, blockSize);
+        return connect(coordinator, blockSize, 8);
     }
 
     /** Connect using the worker default block size of 256 MiB. */
@@ -94,7 +117,14 @@ public final class TalonClient implements AutoCloseable {
      * {@link #read(String, String, long, long)} to supply a known version and
      * skip that round trip.
      */
-    public byte[] read(String uri, long offset, long length) throws IOException {
+    public byte[] read(String uri, long offset, long length) throws IOException { return read(uri, offset, length, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public byte[] read(String uri, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, offset, length));
+    }
+
+    private byte[] readInternal(String uri, long offset, long length) throws IOException {
         ObjectId object = ObjectId.parse(uri);
         ObjectStat stat = stat(object);
         return read(object, stat.version(), offset, Math.min(length, Math.max(0, stat.size() - offset)));
@@ -107,13 +137,26 @@ public final class TalonClient implements AutoCloseable {
      * stable for an object generation, so re-resolving it per read is wasted
      * work.
      */
-    public byte[] read(String uri, String version, long offset, long length) throws IOException {
+    public byte[] read(String uri, String version, long offset, long length) throws IOException { return read(uri, version, offset, length, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public byte[] read(String uri, String version, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, version, offset, length));
+    }
+
+    private byte[] readInternal(String uri, String version, long offset, long length) throws IOException {
         return read(ObjectId.parse(uri), version, offset, length);
     }
 
     /** As {@link #read(String, String, long, long)}, with a parsed object id. */
-    public byte[] read(ObjectId object, String version, long offset, long length)
-            throws IOException {
+    public byte[] read(ObjectId object, String version, long offset, long length) throws IOException { return read(object, version, offset, length, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public byte[] read(ObjectId object, String version, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(object, version, offset, length));
+    }
+
+    private byte[] readInternal(ObjectId object, String version, long offset, long length) throws IOException {
         if (offset < 0 || length < 0) {
             throw new IllegalArgumentException(
                     "offset and length must be non-negative, got offset=" + offset
@@ -130,19 +173,34 @@ public final class TalonClient implements AutoCloseable {
     }
 
     /** Return an object's size and version. */
-    public ObjectStat stat(String uri) throws IOException {
+    public ObjectStat stat(String uri) throws IOException { return stat(uri, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public ObjectStat stat(String uri, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(uri));
+    }
+
+    private ObjectStat statInternal(String uri) throws IOException {
         return stat(ObjectId.parse(uri));
     }
 
     /** As {@link #stat(String)}, with a parsed object id. */
-    public ObjectStat stat(ObjectId object) throws IOException {
+    public ObjectStat stat(ObjectId object) throws IOException { return stat(object, RequestOptions.INHERIT); }
+
+    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    public ObjectStat stat(ObjectId object, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(object));
+    }
+
+    private ObjectStat statInternal(ObjectId object) throws IOException {
         int id = requestIds.getAndIncrement();
-        Messages.Response resp = controlRoundTrip(Messages.statObject(id, object));
-        if (resp.tag == Messages.TAG_OBJECT_STAT) {
-            long size = resp.body.u64();
-            return new ObjectStat(size, resp.body.string());
-        }
-        throw unexpected("StatObject", resp);
+        return controlRoundTrip(Messages.statObject(id, object), resp -> {
+            if (resp.tag == Messages.TAG_OBJECT_STAT) {
+                long size = resp.body.u64();
+                return new ObjectStat(size, resp.body.string());
+            }
+            throw unexpected("StatObject", resp);
+        });
     }
 
     /**
@@ -159,20 +217,23 @@ public final class TalonClient implements AutoCloseable {
      */
     public List<ObjectEntry> list(String prefix) throws IOException {
         int id = requestIds.getAndIncrement();
-        Messages.Response resp = controlRoundTrip(Messages.listObjects(id, prefix));
-        if (resp.tag == Messages.TAG_OBJECT_LIST) {
-            int n = resp.body.seqLen();
-            List<ObjectEntry> entries = new ArrayList<>(n);
-            for (int i = 0; i < n; i++) {
-                entries.add(new ObjectEntry(resp.body.string(), resp.body.u64()));
+        return controlRoundTrip(Messages.listObjects(id, prefix), resp -> {
+            if (resp.tag == Messages.TAG_OBJECT_LIST) {
+                int n = resp.body.seqLen();
+                List<ObjectEntry> entries = new ArrayList<>(n);
+                for (int i = 0; i < n; i++) {
+                    entries.add(new ObjectEntry(resp.body.string(), resp.body.u64()));
+                }
+                return entries;
             }
-            return entries;
-        }
-        throw unexpected("ListObjects", resp);
+            throw unexpected("ListObjects", resp);
+        });
     }
 
     @Override
     public void close() {
+        coordinatorPool.close();
+        workerPool.close();
         synchronized (placementCache) {
             placementCache.clear();
         }
@@ -326,11 +387,12 @@ public final class TalonClient implements AutoCloseable {
             List<NodeInfo> nodes;
             try {
                 int id = requestIds.getAndIncrement();
-                Messages.Response resp = controlRoundTrip(Messages.membershipQuery(id));
-                if (resp.tag != Messages.TAG_MEMBERSHIP_LIST) {
-                    throw unexpected("MembershipQuery", resp);
-                }
-                nodes = Messages.readMembershipList(resp.body);
+                nodes = controlRoundTrip(Messages.membershipQuery(id), resp -> {
+                    if (resp.tag != Messages.TAG_MEMBERSHIP_LIST) {
+                        throw unexpected("MembershipQuery", resp);
+                    }
+                    return Messages.readMembershipList(resp.body);
+                });
             } catch (IOException refreshFailure) {
                 if (membership != null) {
                     return membership;
@@ -371,10 +433,11 @@ public final class TalonClient implements AutoCloseable {
 
     // --- transport ---------------------------------------------------------
 
-    private Messages.Response controlRoundTrip(byte[] request) throws IOException {
-        try (Socket socket = dial(coordinator)) {
+    private <T> T controlRoundTrip(byte[] request, IoFunction<Messages.Response, T> decode)
+            throws IOException {
+        return coordinatorPool.exchange(coordinator, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(request);
+            out.write(Telemetry.envelope(request, coordinator));
             out.flush();
 
             Frame header = readHeader(socket.getInputStream());
@@ -383,24 +446,23 @@ public final class TalonClient implements AutoCloseable {
                 throw new IOException(
                         "coordinator returned an error: " + new String(payload, java.nio.charset.StandardCharsets.UTF_8));
             }
-            return Messages.decodeBody(payload);
-        }
+            return decode.apply(Messages.decodeBody(payload));
+        });
     }
 
     private byte[] fetchRange(String workerAddress, Segment seg) throws IOException {
         int id = requestIds.getAndIncrement();
-        Bincode.Writer w = new Bincode.Writer();
-        Messages.writeObjectId(w, seg.block.object());
-        // The data-plane RangeRequest offset is absolute within the object.
-        w.u64(seg.block.offset() + seg.offsetInBlock);
-        w.u64(seg.length);
-        byte[] body = w.toBytes();
-        byte[] header = new Frame(Frame.MsgType.GET_RANGE, 0, id, body.length).encode();
+        byte[] request =
+                Messages.versionedRange(
+                        id,
+                        seg.block.object(),
+                        seg.block.offset() + seg.offsetInBlock,
+                        seg.length,
+                        seg.block.version());
 
-        try (Socket socket = dial(workerAddress)) {
+        return workerPool.exchange(workerAddress, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(header);
-            out.write(body);
+            out.write(Telemetry.envelope(request, workerAddress));
             out.flush();
 
             InputStream in = socket.getInputStream();
@@ -412,10 +474,110 @@ public final class TalonClient implements AutoCloseable {
                                 + new String(payload, java.nio.charset.StandardCharsets.UTF_8));
             }
             return payload;
+        });
+    }
+
+    @FunctionalInterface
+    private interface IoFunction<T, R> {
+        R apply(T input) throws IOException;
+    }
+
+    /** Exclusive checkout; only successfully decoded exchanges return to the pool. */
+    private static final class ConnectionPool {
+        private static final long IDLE_TTL_NANOS = 30_000_000_000L;
+        private record Idle(Socket socket, long returnedAt) {}
+
+        private final Map<String, List<Idle>> idle = new HashMap<>();
+        private final int maxIdlePerAddr;
+        private boolean closed;
+
+        ConnectionPool(int maxIdlePerAddr) {
+            this.maxIdlePerAddr = maxIdlePerAddr;
+        }
+
+        <T> T exchange(String address, IoFunction<Socket, T> request) throws IOException {
+            Socket socket = takeIdle(address);
+            boolean reused = socket != null;
+            for (;;) {
+                if (socket == null) {
+                    ensureOpen();
+                    // Dial and all request I/O run outside the pool lock.
+                    socket = dial(address);
+                }
+                boolean completed = false;
+                try {
+                    T result = request.apply(socket);
+                    release(address, socket);
+                    completed = true;
+                    return result;
+                } catch (EOFException | SocketException disconnected) {
+                    if (!reused) {
+                        throw disconnected;
+                    }
+                    // The peer may close an idle socket. Retry once, bypassing the pool.
+                    reused = false;
+                } finally {
+                    if (!completed) {
+                        closeSocket(socket);
+                    }
+                }
+                socket = null;
+            }
+        }
+
+        private synchronized void ensureOpen() throws IOException {
+            if (closed) {
+                throw new IOException("Talon client is closed");
+            }
+        }
+
+        private synchronized Socket takeIdle(String address) throws IOException {
+            ensureOpen();
+            List<Idle> bucket = idle.get(address);
+            while (bucket != null && !bucket.isEmpty()) {
+                Idle entry = bucket.remove(bucket.size() - 1);
+                if (bucket.isEmpty()) {
+                    idle.remove(address);
+                }
+                if (System.nanoTime() - entry.returnedAt() < IDLE_TTL_NANOS) {
+                    return entry.socket();
+                }
+                closeSocket(entry.socket());
+            }
+            return null;
+        }
+
+        private synchronized void release(String address, Socket socket) {
+            if (!closed) {
+                List<Idle> bucket = idle.computeIfAbsent(address, ignored -> new ArrayList<>());
+                if (bucket.size() < maxIdlePerAddr) {
+                    bucket.add(new Idle(socket, System.nanoTime()));
+                    return;
+                }
+            }
+            closeSocket(socket);
+        }
+
+        synchronized void close() {
+            closed = true;
+            for (List<Idle> bucket : idle.values()) {
+                for (Idle entry : bucket) {
+                    closeSocket(entry.socket());
+                }
+            }
+            idle.clear();
         }
     }
 
-    private Socket dial(String hostPort) throws IOException {
+    private static void closeSocket(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // Cleanup must not hide the original exchange failure.
+        }
+    }
+
+    private static Socket dial(String hostPort) throws IOException {
         int colon = hostPort.lastIndexOf(':');
         if (colon < 0) {
             throw new IOException("address is missing a port: " + hostPort);
@@ -423,10 +585,15 @@ public final class TalonClient implements AutoCloseable {
         String host = hostPort.substring(0, colon);
         int port = Integer.parseInt(hostPort.substring(colon + 1));
         Socket socket = new Socket();
-        socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
-        socket.setSoTimeout(READ_TIMEOUT_MS);
-        socket.setTcpNoDelay(true);
-        return socket;
+        try {
+            socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(READ_TIMEOUT_MS);
+            socket.setTcpNoDelay(true);
+            return socket;
+        } catch (IOException | RuntimeException failure) {
+            closeSocket(socket);
+            throw failure;
+        }
     }
 
     private static Frame readHeader(InputStream in) throws IOException {

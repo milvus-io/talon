@@ -1,0 +1,379 @@
+--- a/src/builder.rs
++++ b/src/builder.rs
+@@ -20,6 +20,9 @@
+     entries: Option<u32>,
+ 
+     #[cfg(all(target_os = "linux", feature = "iouring"))]
++    iowq_max_workers: Option<[u32; 2]>,
++
++    #[cfg(all(target_os = "linux", feature = "iouring"))]
+     urb: io_uring::Builder,
+ 
+     // blocking handle
+@@ -33,7 +36,6 @@
+ 
+ impl<T> Default for RuntimeBuilder<T> {
+     /// Create a default runtime builder
+-    #[must_use]
+     fn default() -> Self {
+         RuntimeBuilder::<T>::new()
+     }
+@@ -45,6 +47,8 @@
+     pub fn new() -> Self {
+         Self {
+             entries: None,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers: None,
+ 
+             #[cfg(all(target_os = "linux", feature = "iouring"))]
+             urb: io_uring::IoUring::builder(),
+@@ -116,10 +120,13 @@
+         let blocking_handle = this.blocking_handle;
+ 
+         BUILD_THREAD_ID.set(&thread_id, || {
+-            let driver = match this.entries {
++            let mut driver = match this.entries {
+                 Some(entries) => IoUringDriver::new_with_entries(&this.urb, entries)?,
+                 None => IoUringDriver::new(&this.urb)?,
+             };
++            if let Some(limits) = this.iowq_max_workers {
++                driver.set_iowq_max_workers(limits)?;
++            }
+             #[cfg(feature = "sync")]
+             let context = crate::runtime::Context::new(blocking_handle);
+             #[cfg(not(feature = "sync"))]
+@@ -144,6 +151,17 @@
+         self
+     }
+ 
++    /// Limit the bounded and unbounded kernel io-wq worker classes for this ring.
++    ///
++    /// Zero leaves that class unchanged. Registration errors fail runtime
++    /// construction. This has no effect on the legacy driver.
++    #[cfg(all(target_os = "linux", feature = "iouring"))]
++    #[must_use]
++    pub fn with_iowq_max_workers(mut self, bounded: u32, unbounded: u32) -> Self {
++        self.iowq_max_workers = Some([bounded, unbounded]);
++        self
++    }
++
+     /// Replaces the default [`io_uring::Builder`], which controls the settings for the
+     /// inner `io_uring` API.
+     ///
+@@ -171,6 +189,8 @@
+         if crate::utils::detect_uring() {
+             let builder = RuntimeBuilder::<IoUringDriver> {
+                 entries: self.entries,
++                #[cfg(all(target_os = "linux", feature = "iouring"))]
++                iowq_max_workers: self.iowq_max_workers,
+                 urb: self.urb,
+                 #[cfg(feature = "sync")]
+                 blocking_handle: self.blocking_handle,
+@@ -181,6 +201,8 @@
+         } else {
+             let builder = RuntimeBuilder::<LegacyDriver> {
+                 entries: self.entries,
++                #[cfg(all(target_os = "linux", feature = "iouring"))]
++                iowq_max_workers: self.iowq_max_workers,
+                 urb: self.urb,
+                 #[cfg(feature = "sync")]
+                 blocking_handle: self.blocking_handle,
+@@ -196,6 +218,8 @@
+     pub fn build(self) -> io::Result<crate::FusionRuntime<LegacyDriver>> {
+         let builder = RuntimeBuilder::<LegacyDriver> {
+             entries: self.entries,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers: self.iowq_max_workers,
+             #[cfg(feature = "sync")]
+             blocking_handle: self.blocking_handle,
+             _mark: PhantomData,
+@@ -208,6 +232,8 @@
+     pub fn build(self) -> io::Result<crate::FusionRuntime<IoUringDriver>> {
+         let builder = RuntimeBuilder::<IoUringDriver> {
+             entries: self.entries,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers: self.iowq_max_workers,
+             urb: self.urb,
+             #[cfg(feature = "sync")]
+             blocking_handle: self.blocking_handle,
+@@ -227,6 +253,8 @@
+         if crate::utils::detect_uring() {
+             let builder = RuntimeBuilder::<TimeDriver<IoUringDriver>> {
+                 entries: self.entries,
++                #[cfg(all(target_os = "linux", feature = "iouring"))]
++                iowq_max_workers: self.iowq_max_workers,
+                 urb: self.urb,
+                 #[cfg(feature = "sync")]
+                 blocking_handle: self.blocking_handle,
+@@ -237,6 +265,8 @@
+         } else {
+             let builder = RuntimeBuilder::<TimeDriver<LegacyDriver>> {
+                 entries: self.entries,
++                #[cfg(all(target_os = "linux", feature = "iouring"))]
++                iowq_max_workers: self.iowq_max_workers,
+                 urb: self.urb,
+                 #[cfg(feature = "sync")]
+                 blocking_handle: self.blocking_handle,
+@@ -252,6 +282,8 @@
+     pub fn build(self) -> io::Result<crate::FusionRuntime<TimeDriver<LegacyDriver>>> {
+         let builder = RuntimeBuilder::<TimeDriver<LegacyDriver>> {
+             entries: self.entries,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers: self.iowq_max_workers,
+             #[cfg(feature = "sync")]
+             blocking_handle: self.blocking_handle,
+             _mark: PhantomData,
+@@ -264,6 +296,8 @@
+     pub fn build(self) -> io::Result<crate::FusionRuntime<TimeDriver<IoUringDriver>>> {
+         let builder = RuntimeBuilder::<TimeDriver<IoUringDriver>> {
+             entries: self.entries,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers: self.iowq_max_workers,
+             urb: self.urb,
+             #[cfg(feature = "sync")]
+             blocking_handle: self.blocking_handle,
+@@ -297,6 +331,8 @@
+         } = Buildable::build(RuntimeBuilder::<D> {
+             entries: this.entries,
+             #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers: this.iowq_max_workers,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
+             urb: this.urb,
+             #[cfg(feature = "sync")]
+             blocking_handle: this.blocking_handle,
+@@ -325,6 +361,8 @@
+         let Self {
+             entries,
+             #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
+             urb,
+             #[cfg(feature = "sync")]
+             blocking_handle,
+@@ -332,6 +370,8 @@
+         } = self;
+         RuntimeBuilder {
+             entries,
++            #[cfg(all(target_os = "linux", feature = "iouring"))]
++            iowq_max_workers,
+             #[cfg(all(target_os = "linux", feature = "iouring"))]
+             urb,
+             #[cfg(feature = "sync")]
+--- a/src/driver/op/send.rs
++++ b/src/driver/op/send.rs
+@@ -29,11 +29,25 @@
+     fd: SharedFd,
+ 
+     pub(crate) buf: T,
++    extra_flags: libc::c_int,
+ }
+ 
+ impl<T: IoBuf> Op<Send<T>> {
+     pub(crate) fn send(fd: SharedFd, buf: T) -> io::Result<Self> {
+-        Op::submit_with(Send { fd, buf })
++        Op::submit_with(Send {
++            fd,
++            buf,
++            extra_flags: 0,
++        })
++    }
++
++    #[cfg(target_os = "linux")]
++    pub(crate) fn send_more(fd: SharedFd, buf: T) -> io::Result<Self> {
++        Op::submit_with(Send {
++            fd,
++            buf,
++            extra_flags: libc::MSG_MORE,
++        })
+     }
+ 
+     #[allow(unused)]
+@@ -41,6 +55,7 @@
+         Send {
+             fd: fd.clone(),
+             buf,
++            extra_flags: 0,
+         }
+     }
+ 
+@@ -80,7 +95,7 @@
+             self.buf.read_ptr(),
+             self.buf.bytes_init() as _,
+         )
+-        .flags(flags)
++        .flags(flags | self.extra_flags)
+         .build()
+     }
+ 
+@@ -97,7 +112,7 @@
+         let fd = self.fd.as_raw_fd();
+         #[cfg(target_os = "linux")]
+         #[allow(deprecated)]
+-        let flags = libc::MSG_NOSIGNAL as _;
++        let flags = libc::MSG_NOSIGNAL as libc::c_int;
+         #[cfg(not(target_os = "linux"))]
+         let flags = 0;
+ 
+@@ -105,7 +120,7 @@
+             fd,
+             self.buf.read_ptr() as _,
+             self.buf.bytes_init(),
+-            flags
++            flags | self.extra_flags
+         ))
+     }
+ 
+--- a/src/driver/op/splice.rs
++++ b/src/driver/op/splice.rs
+@@ -104,3 +104,67 @@
+         ))
+     }
+ }
++
++/// File input retains the shared cache descriptor until CQE completion, even
++/// when its awaiting future is dropped. An explicit offset never changes the
++/// open file description's shared position.
++pub(crate) struct SpliceFile {
++    file: std::sync::Arc<std::os::fd::OwnedFd>,
++    pipe: SharedFd,
++    offset: i64,
++    len: u32,
++}
++
++impl Op<SpliceFile> {
++    pub(crate) fn splice_file_to_pipe(
++        file: std::sync::Arc<std::os::fd::OwnedFd>,
++        offset: u64,
++        pipe: &SharedFd,
++        len: u32,
++    ) -> io::Result<Self> {
++        let offset = i64::try_from(offset).map_err(|_| {
++            io::Error::new(io::ErrorKind::InvalidInput, "splice offset exceeds i64")
++        })?;
++        Op::submit_with(SpliceFile {
++            file,
++            pipe: pipe.clone(),
++            offset,
++            len,
++        })
++    }
++
++    pub(crate) async fn splice(self) -> io::Result<u32> {
++        self.await.meta.result
++    }
++}
++
++impl OpAble for SpliceFile {
++    #[cfg(all(target_os = "linux", feature = "iouring"))]
++    fn uring_op(&mut self) -> io_uring::squeue::Entry {
++        use std::os::fd::AsRawFd;
++        opcode::Splice::new(
++            types::Fd(self.file.as_raw_fd()),
++            self.offset,
++            types::Fd(self.pipe.raw_fd()),
++            -1,
++            self.len,
++        )
++        .flags(libc::SPLICE_F_MOVE)
++        .build()
++    }
++
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_interest(&self) -> Option<(super::super::ready::Direction, usize)> {
++        None
++    }
++
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_call(&mut self) -> io::Result<u32> {
++        // A buffered file miss may block. Never execute it in the legacy
++        // readiness reactor as a supposedly nonblocking operation.
++        Err(io::Error::new(
++            io::ErrorKind::Unsupported,
++            "file splice requires io_uring",
++        ))
++    }
++}
+--- a/src/driver/uring/mod.rs
++++ b/src/driver/uring/mod.rs
+@@ -92,6 +92,16 @@
+ 
+ impl IoUringDriver {
+     const DEFAULT_ENTRIES: u32 = 1024;
++
++    pub(crate) fn set_iowq_max_workers(&mut self, mut limits: [u32; 2]) -> io::Result<()> {
++        // Only called by the builder, before the runtime can submit operations.
++        // No other access to the inner ring can overlap this registration.
++        let inner = unsafe { &*self.inner.get() };
++        inner
++            .uring
++            .submitter()
++            .register_iowq_max_workers(&mut limits)
++    }
+ 
+     pub(crate) fn new(b: &io_uring::Builder) -> io::Result<IoUringDriver> {
+         Self::new_with_entries(b, Self::DEFAULT_ENTRIES)
+--- a/src/io/splice.rs
++++ b/src/io/splice.rs
+@@ -50,3 +50,19 @@
+             .await
+     }
+ }
++
++/// Splice an immutable shared file range into a pipe on the current io_uring
++/// driver. The descriptor and pipe remain alive until completion, including
++/// after cancellation. Does not advance the file's shared seek position.
++/// Returns `Unsupported` on a legacy driver and `InvalidInput` for offsets
++/// outside the signed 64-bit kernel range. Short completions are permitted.
++pub async fn splice_file_to_pipe(
++    file: std::sync::Arc<std::os::fd::OwnedFd>,
++    offset: u64,
++    pipe: &mut Pipe,
++    len: u32,
++) -> std::io::Result<u32> {
++    Op::splice_file_to_pipe(file, offset, &pipe.fd, len)?
++        .splice()
++        .await
++}
+--- a/src/net/tcp/stream.rs
++++ b/src/net/tcp/stream.rs
+@@ -86,6 +86,16 @@
+         meta.set_zero_copy();
+ 
+         Self { fd, meta }
++    }
++
++    /// Send a buffer with Linux MSG_MORE, retaining normal completion ownership.
++    /// Returns the number sent and the original buffer on success, including
++    /// short sends. The caller must follow with a non-MSG_MORE payload to flush.
++    /// On an error the consumed buffer is dropped after operation completion.
++    #[cfg(target_os = "linux")]
++    pub async fn send_more<T: IoBuf>(&mut self, buf: T) -> io::Result<(usize, T)> {
++        let (result, buf) = Op::send_more(self.fd.clone(), buf)?.write().await;
++        result.map(|len| (len, buf))
+     }
+ 
+     /// Open a TCP connection to a remote host.
+--- a/src/net/unix/pipe.rs
++++ b/src/net/unix/pipe.rs
+@@ -24,9 +24,9 @@
+     #[cfg(target_os = "linux")]
+     let flag = {
+         if crate::driver::op::is_legacy() {
+-            libc::O_NONBLOCK
++            libc::O_NONBLOCK | libc::O_CLOEXEC
+         } else {
+-            0
++            libc::O_CLOEXEC
+         }
+     };
+     #[cfg(target_os = "linux")]
+@@ -35,3 +35,9 @@
+     crate::syscall!(pipe(pipes.as_mut_ptr() as _))?;
+     Ok((Pipe::from_raw_fd(pipes[0]), Pipe::from_raw_fd(pipes[1])))
+ }
++
++impl std::os::unix::io::AsRawFd for Pipe {
++    fn as_raw_fd(&self) -> RawFd {
++        self.fd.raw_fd()
++    }
++}

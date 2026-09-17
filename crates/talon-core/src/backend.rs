@@ -92,13 +92,15 @@ pub trait BackendStore: Send + Sync {
     /// rejected with [`Error::VersionMismatch`](crate::Error::VersionMismatch)
     /// instead of silently committing
     /// the newer bytes under the older version's key (the HEAD→GET TOCTOU,
-    /// issue #163). The worker keys cache blocks by the resolved version, so a
-    /// precondition failure means the caller must re-resolve and refetch.
+    /// issue #163). The worker keys cache blocks by source version. A legacy
+    /// current-version read may re-resolve after a mismatch; an explicitly
+    /// version-pinned read must propagate the mismatch instead.
     ///
-    /// The default implementation ignores the precondition and delegates to
-    /// [`fetch_range`](Self::fetch_range); real backends override it to carry the
-    /// precondition into the request. This keeps in-memory/test backends that
-    /// have no notion of preconditions working unchanged.
+    /// The default implementation delegates unguarded reads to
+    /// [`fetch_range`](Self::fetch_range), but rejects a supplied precondition.
+    /// Implementations must override this method before advertising guarded
+    /// reads: silently ignoring `if_match` can commit newer bytes under an older
+    /// version's cache key.
     async fn fetch_range_if_match(
         &self,
         obj: &ObjectId,
@@ -106,7 +108,13 @@ pub trait BackendStore: Send + Sync {
         len: u64,
         if_match: Option<&Version>,
     ) -> Result<Bytes> {
-        let _ = if_match;
+        if let Some(version) = if_match {
+            return Err(crate::Error::Unsupported(format!(
+                "backend does not support a version-conditional read of {} at {}",
+                obj.to_path(),
+                version
+            )));
+        }
         self.fetch_range(obj, offset, len).await
     }
 

@@ -22,8 +22,79 @@ use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use talon_rust_client::{
-    parse_uri, Client as RustClient, Error as RustError, ObjectStat as RustObjectStat,
+    parse_uri, Client as RustClient, ClientBuilder, Error as RustError,
+    ObjectStat as RustObjectStat,
 };
+
+/// Capture language context while the GIL and caller context are still active.
+fn capture_trace(
+    py: Python<'_>,
+    explicit: Option<std::collections::HashMap<String, String>>,
+) -> Option<talon_telemetry::TraceContext> {
+    if !talon_telemetry::enabled() {
+        return None;
+    }
+    let carrier = explicit.or_else(|| {
+        let module = py.import_bound("opentelemetry.propagate").ok()?;
+        let carrier = pyo3::types::PyDict::new_bound(py);
+        module.getattr("inject").ok()?.call1((&carrier,)).ok()?;
+        carrier.extract().ok()
+    })?;
+    talon_telemetry::TraceContext::from_w3c(
+        carrier.get("traceparent")?,
+        carrier.get("tracestate").map(String::as_str),
+    )
+}
+
+#[cfg(feature = "telemetry")]
+static TELEMETRY: std::sync::Mutex<
+    Option<(talon_telemetry::export::ExportOwner, tracing::Dispatch)>,
+> = std::sync::Mutex::new(None);
+
+/// Explicit initialization; Python host provider/subscriber is never replaced.
+#[pyfunction]
+fn configure_telemetry() -> PyResult<()> {
+    #[cfg(feature = "telemetry")]
+    {
+        let mut session = TELEMETRY.lock().unwrap();
+        if session.is_some() {
+            return Err(PyValueError::new_err("telemetry already initialized"));
+        }
+        *session = Some(
+            talon_telemetry::export::init_scoped("talon-python")
+                .map_err(|e| PyValueError::new_err(e.to_string()))?,
+        );
+        Ok(())
+    }
+    #[cfg(not(feature = "telemetry"))]
+    talon_telemetry::Config::from_env()
+        .and_then(talon_telemetry::configure)
+        .map_err(PyValueError::new_err)
+}
+
+/// Drain clients before shutdown. Export waiting happens without the GIL.
+#[pyfunction]
+fn shutdown_telemetry(py: Python<'_>) {
+    #[cfg(feature = "telemetry")]
+    {
+        let session = TELEMETRY.lock().unwrap().take();
+        if let Some((owner, _)) = session {
+            py.allow_threads(move || owner.shutdown());
+        }
+    }
+    let _ = py;
+}
+
+fn with_telemetry<T>(f: impl FnOnce() -> T) -> T {
+    #[cfg(feature = "telemetry")]
+    if talon_telemetry::enabled() {
+        let dispatch = TELEMETRY.lock().unwrap().as_ref().map(|(_, d)| d.clone());
+        if let Some(dispatch) = dispatch {
+            return tracing::dispatcher::with_default(&dispatch, f);
+        }
+    }
+    f()
+}
 
 /// Runtime construction failures are infrastructure errors.
 fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
@@ -39,14 +110,16 @@ fn client_err(error: RustError) -> PyErr {
     }
 }
 
-fn complete_known_stat(
+fn known_stat_from_pair(
     known_version: Option<String>,
     known_size: Option<u64>,
-    resolved: RustObjectStat,
-) -> RustObjectStat {
-    RustObjectStat {
-        size: known_size.unwrap_or(resolved.size),
-        version: known_version.unwrap_or(resolved.version),
+) -> PyResult<Option<RustObjectStat>> {
+    match (known_version, known_size) {
+        (Some(version), Some(size)) => Ok(Some(RustObjectStat { size, version })),
+        (None, None) => Ok(None),
+        _ => Err(PyValueError::new_err(
+            "version and size must be supplied together",
+        )),
     }
 }
 
@@ -102,18 +175,21 @@ impl Client {
     /// `block_size` must match the workers' configured block size; placement is
     /// computed per block, so a mismatch addresses the wrong blocks. It
     /// defaults to the worker default of 256 MiB.
+    /// `max_idle_per_addr` is the positive idle connection limit per peer in
+    /// both coordinator and worker pools; it does not limit active connections.
     #[new]
-    #[pyo3(signature = (coordinator, *, block_size = 256 << 20))]
-    fn new(coordinator: &str, block_size: u32) -> PyResult<Self> {
-        if block_size == 0 {
-            return Err(PyValueError::new_err("block_size must be non-zero"));
-        }
+    #[pyo3(signature = (coordinator, *, block_size = 256 << 20, max_idle_per_addr = 8))]
+    fn new(coordinator: &str, block_size: u32, max_idle_per_addr: usize) -> PyResult<Self> {
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(block_size)
+            .with_max_idle_per_addr(max_idle_per_addr)
+            .build()
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
             .map_err(io_err)?;
-        let client = RustClient::new(coordinator, block_size)
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
         Ok(Self {
             runtime: Arc::new(runtime),
             client: Arc::new(client),
@@ -130,10 +206,12 @@ impl Client {
     /// Ranges spanning block boundaries are split and fetched per block, each
     /// benefiting independently from the placement cache.
     ///
-    /// `version` and `size` are resolved with a `stat` when omitted. Pass them
-    /// to skip that round trip when they are already known — for example when
-    /// reading many ranges of the same object.
-    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None))]
+    /// `version` and `size` must be supplied together or both omitted. A supplied
+    /// pair skips `stat` and pins the read to that exact source generation.
+    /// Supplying only one raises `ValueError`, since metadata from different
+    /// generations cannot safely be combined.
+    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None))]
+    #[allow(clippy::too_many_arguments)]
     fn read<'py>(
         &self,
         py: Python<'py>,
@@ -142,27 +220,37 @@ impl Client {
         length: Option<u64>,
         version: Option<&str>,
         size: Option<u64>,
+        trace_context: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
+        let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let known_version = version.map(str::to_owned);
+        let known_stat = known_stat_from_pair(version.map(str::to_owned), size)?;
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
 
         // Release the GIL: this is network I/O, and holding it would serialise
         // every reader thread in the process on one request.
         let bytes = py.allow_threads(move || {
-            runtime.block_on(async move {
-                let known_stat = match (known_version, size) {
-                    (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
-                    (None, None) => None,
-                    (known_version, known_size) => {
-                        let stat = client.stat(&object).await?;
-                        Some(complete_known_stat(known_version, known_size, stat))
-                    }
-                };
-                client
-                    .read(&object, offset, length, known_stat.as_ref())
-                    .await
+            with_telemetry(|| {
+                runtime.block_on(async move {
+                    let operation = talon_telemetry::Operation::new(
+                        "talon.python.read",
+                        "internal",
+                        trace_context
+                            .as_ref()
+                            .map(talon_telemetry::TraceParent::Explicit)
+                            .unwrap_or(talon_telemetry::TraceParent::Root),
+                    );
+                    let result = operation
+                        .scope(async {
+                            client
+                                .read(&object, offset, length, known_stat.as_ref())
+                                .await
+                        })
+                        .await;
+                    operation.outcome(if result.is_ok() { "success" } else { "error" });
+                    result
+                })
             })
         });
         let bytes = bytes.map_err(client_err)?;
@@ -170,12 +258,30 @@ impl Client {
     }
 
     /// Return an object's size and version.
-    fn stat(&self, py: Python<'_>, uri: &str) -> PyResult<ObjectStat> {
+    #[pyo3(signature = (uri, *, trace_context = None))]
+    fn stat(
+        &self,
+        py: Python<'_>,
+        uri: &str,
+        trace_context: Option<std::collections::HashMap<String, String>>,
+    ) -> PyResult<ObjectStat> {
+        let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
-        let stat =
-            py.allow_threads(move || runtime.block_on(async move { client.stat(&object).await }));
+        let stat = py.allow_threads(move || {
+            with_telemetry(|| {
+                runtime.block_on(async move {
+                    let options = talon_telemetry::RequestOptions {
+                        parent: trace_context
+                            .as_ref()
+                            .map(talon_telemetry::TraceParent::Explicit)
+                            .unwrap_or(talon_telemetry::TraceParent::Root),
+                    };
+                    client.stat_with_options(&object, &options).await
+                })
+            })
+        });
         let stat = stat.map_err(client_err)?;
         Ok(ObjectStat {
             size: stat.size,
@@ -243,6 +349,8 @@ impl Client {
 
 #[pymodule]
 fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(configure_telemetry, m)?)?;
+    m.add_function(wrap_pyfunction!(shutdown_telemetry, m)?)?;
     m.add_class::<Client>()?;
     m.add_class::<ObjectStat>()?;
     m.add_class::<ObjectEntry>()?;
@@ -255,24 +363,43 @@ mod tests {
     use super::*;
 
     #[test]
-    fn completing_partial_stat_preserves_caller_version() {
-        let completed = complete_known_stat(
-            Some("caller-version".into()),
-            None,
-            RustObjectStat {
-                size: 4096,
-                version: "coordinator-version".into(),
-            },
-        );
+    fn constructor_accepts_pool_limit_keyword_and_rejects_zero() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let client_type = py.get_type_bound::<Client>();
+            client_type.call1(("127.0.0.1:7000",)).unwrap();
+            let kwargs = pyo3::types::PyDict::new_bound(py);
+            for limit in [1, 32] {
+                kwargs.set_item("max_idle_per_addr", limit).unwrap();
+                client_type
+                    .call(("127.0.0.1:7000",), Some(&kwargs))
+                    .unwrap();
+            }
+            kwargs.set_item("max_idle_per_addr", 0).unwrap();
+            let error = client_type
+                .call(("127.0.0.1:7000",), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py));
+        });
+    }
 
-        assert_eq!(completed.size, 4096);
-        assert_eq!(completed.version, "caller-version");
+    #[test]
+    fn version_and_size_must_describe_one_generation() {
+        assert!(known_stat_from_pair(Some("v1".into()), None).is_err());
+        assert!(known_stat_from_pair(None, Some(4096)).is_err());
+
+        let complete = known_stat_from_pair(Some("v1".into()), Some(4096))
+            .unwrap()
+            .unwrap();
+        assert_eq!(complete.version, "v1");
+        assert_eq!(complete.size, 4096);
+        assert!(known_stat_from_pair(None, None).unwrap().is_none());
     }
 
     #[test]
     fn invalid_read_argument_raises_value_error() {
         pyo3::prepare_freethreaded_python();
-        let client = Client::new("unused", 1).unwrap();
+        let client = Client::new("unused", 1, 8).unwrap();
         let oversized = (isize::MAX as u64).saturating_add(1);
 
         Python::with_gil(|py| {
@@ -283,6 +410,7 @@ mod tests {
                 Some(oversized),
                 Some("version"),
                 Some(oversized),
+                None,
             ) {
                 Ok(_) => panic!("oversized read must fail"),
                 Err(error) => error,
@@ -295,10 +423,10 @@ mod tests {
     #[test]
     fn coordinator_failure_raises_io_error() {
         pyo3::prepare_freethreaded_python();
-        let client = Client::new("127.0.0.1:0", 1).unwrap();
+        let client = Client::new("127.0.0.1:0", 1, 8).unwrap();
 
         Python::with_gil(|py| {
-            let error = match client.stat(py, "s3://bucket/key") {
+            let error = match client.stat(py, "s3://bucket/key", None) {
                 Ok(_) => panic!("stat without a coordinator must fail"),
                 Err(error) => error,
             };

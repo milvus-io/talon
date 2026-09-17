@@ -12,6 +12,7 @@ name = "talon-fuse"
 path = "src/main.rs"
 
 [dependencies]
+talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-cache-client.workspace = true
 talon-metadata.workspace = true
@@ -35,6 +36,7 @@ fuser = { version = "0.14", optional = true, default-features = false, features 
 libc = { version = "0.2", optional = true }
 
 [features]
+telemetry = ["talon-telemetry/export"]
 # Compile the kernel FUSE mount adapter (requires fuser).
 mount = ["dep:fuser", "dep:libc"]
 

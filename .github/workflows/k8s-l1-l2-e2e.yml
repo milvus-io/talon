@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   pull_request:
     paths:
+      - "patches/**"
+      - "scripts/prepare_monoio.py"
       - ".github/workflows/k8s-l1-l2-e2e.yml"
       - "crates/talon-client/**"
       - "crates/talon-core/src/config.rs"
@@ -22,6 +24,8 @@ jobs:
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
 
       - uses: Swatinem/rust-cache@v2
 

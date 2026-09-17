@@ -17,6 +17,11 @@ impl std::error::Error for CacheMiss {}
 
 /// Encode an error returned by [`crate::WorkerRuntime`] for a range request.
 pub(crate) fn encode_runtime_error(request_id: u32, error: &anyhow::Error) -> Vec<u8> {
+    talon_telemetry::outcome(if classify(error) == DataErrorCode::CacheMiss {
+        "cache_miss"
+    } else {
+        "error"
+    });
     encode_typed_error(request_id, classify(error), error.to_string())
 }
 

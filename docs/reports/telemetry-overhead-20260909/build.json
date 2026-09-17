@@ -1,0 +1,13 @@
+{
+  "head": "81e09496cc13cf270d1f919a56d109f6888b105f",
+  "work": "/tmp/talon-telemetry-bench-u9c5ty2f",
+  "binaries": {
+    "baseline": "/tmp/talon-telemetry-bench-u9c5ty2f/probe-baseline",
+    "compile-off": "/tmp/talon-telemetry-bench-u9c5ty2f/probe-compile-off",
+    "recording": "/tmp/talon-telemetry-bench-u9c5ty2f/probe-recording"
+  },
+  "cpus": [
+    62,
+    63
+  ]
+}

@@ -13,6 +13,7 @@ name = "talon-gen-conformance-vectors"
 path = "src/bin/gen-conformance-vectors.rs"
 
 [dependencies]
+talon-telemetry.workspace = true
 anyhow.workspace = true
 talon-core.workspace = true
 thiserror.workspace = true
@@ -31,3 +32,6 @@ base64 = "0.22"
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
+
+[features]
+telemetry = ["talon-telemetry/export"]

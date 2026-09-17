@@ -12,6 +12,7 @@ name = "talon-client"
 path = "src/main.rs"
 
 [dependencies]
+talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-transport.workspace = true
 anyhow.workspace = true
@@ -19,3 +20,6 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+
+[features]
+telemetry = ["talon-telemetry/export"]

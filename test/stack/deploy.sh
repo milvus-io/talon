@@ -52,6 +52,8 @@ MINIO_ACCESS_KEY="minioadmin"
 MINIO_SECRET_KEY="minioadmin"
 BUCKET="talon-e2e"
 SEED_KEY="bench"
+MINIO_IMAGE="${MINIO_IMAGE:-docker.io/pgsty/silo:RELEASE.2026-09-03T13-18-01Z}"
+MC_IMAGE="${MC_IMAGE:-docker.io/pgsty/mc:RELEASE.2026-09-13T00-00-00Z}"
 
 PF_PIDS=()
 
@@ -193,7 +195,7 @@ spec:
     spec:
       containers:
         - name: minio
-          image: minio/minio:latest
+          image: "$MINIO_IMAGE"
           args: ["server", "/data"]
           env:
             - { name: MINIO_ROOT_USER, value: "$MINIO_ACCESS_KEY" }
@@ -223,7 +225,7 @@ metadata:
 spec:
   containers:
     - name: mc
-      image: minio/mc:latest
+      image: "$MC_IMAGE"
       command: ["/bin/sh", "-c", "tail -f /dev/null"]
       resources:
         requests: { cpu: 10m, memory: 64Mi }

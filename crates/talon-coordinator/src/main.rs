@@ -403,34 +403,43 @@ impl Coordinator {
         message: &ControlMessage,
         attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<ControlMessage> {
-        let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("worker attempt budget exhausted before connecting");
-        }
-        let connect_timeout = PROXY_CONNECT_TIMEOUT.min(remaining);
-        let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(address))
-            .await
-            .map_err(|_| anyhow::anyhow!("connect timed out after {connect_timeout:?}"))??;
-        let buf = codec::encode(0, message)?;
-        stream.write_all(&buf).await?;
-        stream.flush().await?;
+        talon_telemetry::observe("talon.rpc", "client", async {
+            let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("worker attempt budget exhausted before connecting");
+            }
+            let connect_timeout = PROXY_CONNECT_TIMEOUT.min(remaining);
+            let mut stream = tokio::time::timeout(connect_timeout, TcpStream::connect(address))
+                .await
+                .map_err(|_| anyhow::anyhow!("connect timed out after {connect_timeout:?}"))??;
+            let mut buf = codec::encode(0, message)?;
+            talon_transport::envelope::outbound(&mut buf, address)?;
+            stream.write_all(&buf).await?;
+            stream.flush().await?;
 
-        let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            anyhow::bail!("worker attempt budget exhausted before reading response");
-        }
-        let (header, payload) = tokio::time::timeout(
-            remaining,
-            talon_transport::read_frame(&mut stream, remaining),
-        )
+            let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                anyhow::bail!("worker attempt budget exhausted before reading response");
+            }
+            let (header, payload) = tokio::time::timeout(
+                remaining,
+                talon_transport::read_frame(&mut stream, remaining),
+            )
+            .await
+            .map_err(|_| {
+                anyhow::anyhow!("worker response did not arrive within its attempt budget")
+            })?
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
+            full.extend_from_slice(&header.encode());
+            full.extend_from_slice(&payload);
+            let (_, reply) = codec::decode(&full)?;
+            if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
+                talon_telemetry::outcome("error");
+            }
+            Ok(reply)
+        })
         .await
-        .map_err(|_| anyhow::anyhow!("worker response did not arrive within its attempt budget"))?
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-        let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
-        full.extend_from_slice(&header.encode());
-        full.extend_from_slice(&payload);
-        let (_, reply) = codec::decode(&full)?;
-        Ok(reply)
     }
 
     async fn dispatch(&self, message: ControlMessage) -> ControlMessage {
@@ -576,12 +585,26 @@ impl Coordinator {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "telemetry")]
+    let _telemetry = talon_telemetry::export::init("talon-coordinator")
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    #[cfg(not(feature = "telemetry"))]
+    talon_telemetry::Config::from_env()
+        .and_then(talon_telemetry::configure)
+        .map_err(std::io::Error::other)?;
+    let result = run().await;
+    #[cfg(feature = "telemetry")]
+    let _ = tokio::task::spawn_blocking(move || _telemetry.shutdown()).await;
+    result
+}
 
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let file = match &args.config {
         Some(path) => CoordinatorConfigPatch::from_file(path)?,
@@ -1207,59 +1230,82 @@ where
 {
     let _connection = state.observability.metrics().track_connection();
     loop {
-        let message = match read_control(&mut stream).await {
-            Ok(Some((_header, message))) => message,
+        let (header, message, metadata) = match read_control(&mut stream).await {
+            Ok(Some(frame)) => frame,
             Ok(None) => return Ok(()),
             Err(error) => {
                 state.observability.metrics().record_protocol_error();
                 return Err(error);
             }
         };
-        let worker_service = matches!(
-            message,
-            ControlMessage::Register { .. }
-                | ControlMessage::Heartbeat { .. }
-                | ControlMessage::NodeStatusHeartbeat { .. }
-        );
-        let allowed = access.allows(worker_service);
-        let operation = talon_coordinator::ControlOperation::from_message(&message);
-        let started = Instant::now();
-        let reply = if !allowed {
-            ControlMessage::Ack {
-                ok: false,
-                detail: Some("message is not allowed on this control listener".into()),
-            }
-        } else if let Err(error) = access.authorize(&message) {
-            tracing::warn!(
-                identity = ?access.identity(),
-                %error,
-                "rejected worker control identity mismatch"
-            );
-            ControlMessage::Ack {
-                ok: false,
-                detail: Some(error),
-            }
-        } else {
-            state.dispatch(message).await
-        };
-        let error = matches!(&reply, ControlMessage::Ack { ok: false, .. });
-        state
-            .observability
-            .metrics()
-            .record_control(operation, error, started.elapsed());
-        if matches!(operation, talon_coordinator::ControlOperation::Placement) {
-            state
-                .observability
-                .metrics()
-                .record_placement(error, started.elapsed());
-        }
-        let buffer = codec::encode(0, &reply)?;
-        stream.write_all(&buffer).await?;
-        stream.flush().await?;
+        let operation =
+            talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
+        let result: anyhow::Result<()> = operation
+            .scope(async {
+                let worker_service = matches!(
+                    message,
+                    ControlMessage::Register { .. }
+                        | ControlMessage::Heartbeat { .. }
+                        | ControlMessage::NodeStatusHeartbeat { .. }
+                );
+                let allowed = access.allows(worker_service);
+                let operation = talon_coordinator::ControlOperation::from_message(&message);
+                let started = Instant::now();
+                let reply = if !allowed {
+                    ControlMessage::Ack {
+                        ok: false,
+                        detail: Some("message is not allowed on this control listener".into()),
+                    }
+                } else if let Err(error) = access.authorize(&message) {
+                    tracing::warn!(
+                        identity = ?access.identity(),
+                        %error,
+                        "rejected worker control identity mismatch"
+                    );
+                    ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error),
+                    }
+                } else {
+                    state.dispatch(message).await
+                };
+                let error = matches!(&reply, ControlMessage::Ack { ok: false, .. });
+                if error {
+                    talon_telemetry::outcome("error");
+                }
+                state
+                    .observability
+                    .metrics()
+                    .record_control(operation, error, started.elapsed());
+                if matches!(operation, talon_coordinator::ControlOperation::Placement) {
+                    state
+                        .observability
+                        .metrics()
+                        .record_placement(error, started.elapsed());
+                }
+                let buffer = talon_transport::envelope::response_version(
+                    codec::encode(header.request_id, &reply)?,
+                    header.version,
+                );
+                stream.write_all(&buffer).await?;
+                stream.flush().await?;
+                Ok(())
+            })
+            .await;
+        operation.outcome(if result.is_ok() { "success" } else { "error" });
+        result?;
     }
 }
 
-async fn read_control<S>(stream: &mut S) -> anyhow::Result<Option<(FrameHeader, ControlMessage)>>
+async fn read_control<S>(
+    stream: &mut S,
+) -> anyhow::Result<
+    Option<(
+        FrameHeader,
+        ControlMessage,
+        talon_transport::envelope::Metadata,
+    )>,
+>
 where
     S: AsyncRead + Unpin,
 {
@@ -1276,8 +1322,9 @@ where
     let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
     full.extend_from_slice(&header.encode());
     full.extend_from_slice(&payload);
-    let (header, message) = codec::decode(&full)?;
-    Ok(Some((header, message)))
+    let (metadata, _) = talon_transport::envelope::decode(&header, &payload)?;
+    let (header, message) = codec::decode_request(&full)?;
+    Ok(Some((header, message, metadata)))
 }
 
 #[cfg(test)]
@@ -1557,7 +1604,7 @@ mod tests {
             .write_all(&codec::encode(0, &spoofed).unwrap())
             .await
             .unwrap();
-        let (_, reply) = read_control(&mut client).await.unwrap().unwrap();
+        let (_, reply, _) = read_control(&mut client).await.unwrap().unwrap();
         assert!(matches!(reply, ControlMessage::Ack { ok: false, .. }));
         assert!(store.snapshot("cluster-a").await.unwrap().nodes.is_empty());
 
@@ -1573,7 +1620,7 @@ mod tests {
             .write_all(&codec::encode(0, &bound).unwrap())
             .await
             .unwrap();
-        let (_, reply) = read_control(&mut client).await.unwrap().unwrap();
+        let (_, reply, _) = read_control(&mut client).await.unwrap().unwrap();
         assert!(matches!(reply, ControlMessage::Ack { ok: true, .. }));
         let snapshot = store.snapshot("cluster-a").await.unwrap();
         assert_eq!(snapshot.nodes.len(), 1);
@@ -1752,7 +1799,7 @@ mod tests {
         let rejecting_address = rejecting_listener.local_addr().unwrap().to_string();
         let rejecting_server = tokio::spawn(async move {
             let (mut stream, _) = rejecting_listener.accept().await.unwrap();
-            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
             assert!(matches!(request, ControlMessage::ListObjects { .. }));
             let reply = codec::encode(
                 0,
@@ -1770,7 +1817,7 @@ mod tests {
         let serving_address = serving_listener.local_addr().unwrap().to_string();
         let serving_server = tokio::spawn(async move {
             let (mut stream, _) = serving_listener.accept().await.unwrap();
-            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
             assert!(matches!(request, ControlMessage::ListObjects { .. }));
             let reply = codec::encode(
                 0,
@@ -1825,7 +1872,7 @@ mod tests {
         let (stalled_request_tx, stalled_request_rx) = tokio::sync::oneshot::channel();
         let stalled_server = tokio::spawn(async move {
             let (mut stream, _) = stalled_listener.accept().await.unwrap();
-            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
             assert!(matches!(request, ControlMessage::ListObjects { .. }));
             stalled_request_tx.send(()).unwrap();
             std::future::pending::<()>().await;
@@ -1835,7 +1882,7 @@ mod tests {
         let serving_address = serving_listener.local_addr().unwrap().to_string();
         let serving_server = tokio::spawn(async move {
             let (mut stream, _) = serving_listener.accept().await.unwrap();
-            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
             assert!(matches!(request, ControlMessage::ListObjects { .. }));
             let reply = codec::encode(
                 0,
@@ -1907,7 +1954,7 @@ mod tests {
         let (first_request_tx, first_request_rx) = tokio::sync::oneshot::channel();
         let first_server = tokio::spawn(async move {
             let (mut stream, _) = first_listener.accept().await.unwrap();
-            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
             assert!(matches!(request, ControlMessage::ListObjects { .. }));
             first_request_tx.send(()).unwrap();
             std::future::pending::<()>().await;
@@ -1918,7 +1965,7 @@ mod tests {
         let (second_request_tx, second_request_rx) = tokio::sync::oneshot::channel();
         let second_server = tokio::spawn(async move {
             let (mut stream, _) = second_listener.accept().await.unwrap();
-            let (_, request) = read_control(&mut stream).await.unwrap().unwrap();
+            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
             assert!(matches!(request, ControlMessage::ListObjects { .. }));
             second_request_tx.send(()).unwrap();
             std::future::pending::<()>().await;

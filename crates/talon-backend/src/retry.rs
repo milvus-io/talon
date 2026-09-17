@@ -271,7 +271,25 @@ impl HttpClient for RetryingHttpClient {
         loop {
             // Clone per attempt: `HttpRequest` is cheap to clone (the body is
             // `Bytes`), and the inner client consumes it.
-            let outcome = tokio::time::timeout(timeout, self.inner.execute(req.clone())).await;
+            let operation = talon_telemetry::Operation::new(
+                "talon.origin.execute",
+                "internal",
+                talon_telemetry::TraceParent::Inherit,
+            );
+            operation.record("http.request.resend_count", attempt as u64);
+            let outcome = {
+                // Borrow the attempt across the timeout, so its completion guard
+                // observes the timeout reason before the inner future is dropped.
+                let attempt_future = operation.scope(self.inner.execute(req.clone()));
+                tokio::pin!(attempt_future);
+                let outcome = tokio::time::timeout(timeout, attempt_future.as_mut()).await;
+                operation.outcome(match &outcome {
+                    Err(_) => "timeout",
+                    Ok(Err(_)) => "error",
+                    Ok(Ok(_)) => "success",
+                });
+                outcome
+            };
 
             // `Err` here is the deadline, not a transport failure.
             let result = match outcome {
@@ -312,7 +330,13 @@ impl HttpClient for RetryingHttpClient {
             }
             let delay = self.backoff_delay(attempt, retry_after);
             if !delay.is_zero() {
-                tokio::time::sleep(delay).await;
+                let backoff = talon_telemetry::Operation::new(
+                    "talon.origin.backoff",
+                    "internal",
+                    talon_telemetry::TraceParent::Inherit,
+                );
+                backoff.scope(tokio::time::sleep(delay)).await;
+                backoff.outcome("success");
             }
             attempt += 1;
         }

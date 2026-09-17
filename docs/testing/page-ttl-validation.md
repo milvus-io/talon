@@ -150,3 +150,31 @@ sections for all five page maintenance alerts, preserving the existing tests.
   -D warnings`, formatting and diff whitespace checks passed.
 
 PromQL execution with `promtool` and production performance remain unvalidated.
+
+## Main merge compatibility (2026-09-17)
+
+Merged upstream `main` at `c391171` into PR #580. Deferred deletion now selects
+candidates through the second-chance queue and logical-block version index.
+Candidates remain charged until unlink succeeds; later access, replacement, or
+recency consumption invalidates an older snapshot. Page and whole admissions
+publish their stable access handles, and owned commit tasks retain their tracing
+scope. The shutdown wrapper follows the ring-owned splice API without the removed
+blocking-helper argument. The TTL test origin implements conditional version
+reads required by the updated backend contract.
+
+- `cargo test --workspace --exclude talon-python --all-features --locked`:
+  1,373 passed, 22 ignored. This includes 329 worker library tests, real
+  socket/io_uring coverage, TTL crash recovery, and telemetry integration tests.
+- `cargo test -p talon-python --locked`: 4 passed.
+- `cargo clippy --workspace --all-targets --all-features --locked -- -D warnings`:
+  passed.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --locked`: passed.
+- `cargo fmt --all --check`, `git diff --check`, and the four dependency patch
+  preparation tests: passed.
+- Four new eviction regressions cover deferred byte accounting, pinned/excluded
+  candidates, stable-handle access across repeated selection and replacement,
+  and version-index snapshots before unlink.
+
+All build, dependency cache, temporary data, and test logs used paths under
+`/data/yuruiz`. External-service E2E tests and production performance benchmarks
+were not run; ignored tests retain their existing opt-in requirements.

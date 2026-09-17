@@ -93,12 +93,26 @@ impl Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "telemetry")]
+    let _telemetry =
+        talon_telemetry::export::init("talon-fuse").map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    #[cfg(not(feature = "telemetry"))]
+    talon_telemetry::Config::from_env()
+        .and_then(talon_telemetry::configure)
+        .map_err(std::io::Error::other)?;
+    let result = run().await;
+    #[cfg(feature = "telemetry")]
+    let _ = tokio::task::spawn_blocking(move || _telemetry.shutdown()).await;
+    result
+}
 
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let file = match &args.config {
         Some(path) => FuseConfigPatch::from_file(path)?,

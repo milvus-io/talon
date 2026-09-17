@@ -27,6 +27,7 @@ name = "talon-gen-api-docs"
 path = "src/bin/gen-api-docs.rs"
 
 [features]
+telemetry = ["talon-telemetry/export"]
 state-store-testkit = []
 # Production Kubernetes Lease ClusterStateStore backend. Off by default so
 # non-Kubernetes builds do not pull in the kube/k8s-openapi client stack.
@@ -36,6 +37,7 @@ kubernetes = ["dep:kube", "dep:k8s-openapi", "dep:futures"]
 etcd = ["dep:etcd-client", "dep:tonic", "talon-metadata/etcd"]
 
 [dependencies]
+talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-metadata.workspace = true
 talon-transport.workspace = true

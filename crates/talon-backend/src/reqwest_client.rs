@@ -75,37 +75,99 @@ impl Default for ReqwestClient {
 #[async_trait]
 impl HttpClient for ReqwestClient {
     async fn execute(&self, req: HttpRequest) -> Result<HttpResponse, String> {
-        let method = match req.method {
-            Method::Get => reqwest::Method::GET,
-            Method::Head => reqwest::Method::HEAD,
-            Method::Put => reqwest::Method::PUT,
-            Method::Post => reqwest::Method::POST,
-            Method::Delete => reqwest::Method::DELETE,
-        };
-        let mut builder = self.inner.request(method, &req.url);
-        for (k, v) in &req.headers {
-            builder = builder.header(k.as_str(), v.as_str());
-        }
-        // Attach the request body for PUT (empty for the other verbs).
-        if !req.body.is_empty() {
-            builder = builder.body(req.body.clone());
-        }
-        let resp = builder.send().await.map_err(sanitize_error)?;
-        let status = resp.status().as_u16();
-        let headers = resp
-            .headers()
-            .iter()
-            .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
-            .collect();
-        let body = resp.bytes().await.map_err(sanitize_error)?;
-        Ok(HttpResponse {
-            status,
-            headers,
-            body,
-        })
+        let operation = talon_telemetry::Operation::new(
+            "HTTP attempt",
+            "client",
+            talon_telemetry::TraceParent::Inherit,
+        );
+        operation.text(
+            "http.request.method",
+            match req.method {
+                Method::Get => "GET",
+                Method::Head => "HEAD",
+                Method::Put => "PUT",
+                Method::Post => "POST",
+                Method::Delete => "DELETE",
+            },
+        );
+        // reqwest may redirect or transparently retry. This is execute-level,
+        // not a claim that exactly one physical send reached the origin.
+        operation.text("talon.http.attempt_boundary", "reqwest.execute");
+        let result = operation
+            .scope(async {
+                let method = match req.method {
+                    Method::Get => reqwest::Method::GET,
+                    Method::Head => reqwest::Method::HEAD,
+                    Method::Put => reqwest::Method::PUT,
+                    Method::Post => reqwest::Method::POST,
+                    Method::Delete => reqwest::Method::DELETE,
+                };
+                let mut builder = self.inner.request(method, &req.url);
+                for (k, v) in &req.headers {
+                    builder = builder.header(k.as_str(), v.as_str());
+                }
+                // Attach the request body for PUT (empty for the other verbs).
+                if !req.body.is_empty() {
+                    builder = builder.body(req.body.clone());
+                }
+                let started = operation.is_recording().then(std::time::Instant::now);
+                let mut resp = builder.send().await.map_err(sanitize_error)?;
+                if let Some(started) = started {
+                    operation.record(
+                        "talon.http.headers_wait_us",
+                        started.elapsed().as_micros() as u64,
+                    );
+                }
+                operation.record("http.response.status_code", resp.status().as_u16() as u64);
+                let status = resp.status().as_u16();
+                let headers = resp
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.as_str().to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let body = if operation.is_recording() {
+                    let mut body = bytes::BytesMut::new();
+                    while let Some(chunk) = resp.chunk().await.map_err(sanitize_error)? {
+                        body.extend_from_slice(&chunk);
+                        operation.record("talon.origin.body_bytes", body.len() as u64);
+                    }
+                    body.freeze()
+                } else {
+                    resp.bytes().await.map_err(sanitize_error)?
+                };
+                Ok(HttpResponse {
+                    status,
+                    headers,
+                    body,
+                })
+            })
+            .await;
+        operation.outcome(match &result {
+            Ok(response) if response.status >= 400 => "http_error",
+            Ok(_) => "success",
+            Err(_) => "error",
+        });
+        result
     }
 
     async fn execute_stream(&self, req: HttpRequest) -> Result<HttpStreamResponse, String> {
+        let operation = talon_telemetry::Operation::new(
+            "HTTP attempt",
+            "client",
+            talon_telemetry::TraceParent::Inherit,
+        );
+
+        operation.text(
+            "http.request.method",
+            match req.method {
+                Method::Get => "GET",
+                Method::Head => "HEAD",
+                Method::Put => "PUT",
+                Method::Post => "POST",
+                Method::Delete => "DELETE",
+            },
+        );
+        operation.text("talon.http.attempt_boundary", "reqwest.execute");
         let method = match req.method {
             Method::Get => reqwest::Method::GET,
             Method::Head => reqwest::Method::HEAD,
@@ -120,7 +182,28 @@ impl HttpClient for ReqwestClient {
         if !req.body.is_empty() {
             builder = builder.body(req.body.clone());
         }
-        let response = builder.send().await.map_err(sanitize_error)?;
+        let started = operation.is_recording().then(std::time::Instant::now);
+        let response = match operation.scope(builder.send()).await {
+            Ok(response) => response,
+            Err(error) => {
+                operation.outcome(if error.is_timeout() {
+                    "timeout"
+                } else {
+                    "error"
+                });
+                return Err(sanitize_error(error));
+            }
+        };
+        if let Some(started) = started {
+            operation.record(
+                "talon.http.headers_wait_us",
+                started.elapsed().as_micros() as u64,
+            );
+        }
+        operation.record(
+            "http.response.status_code",
+            response.status().as_u16() as u64,
+        );
         let status = response.status().as_u16();
         let headers = response
             .headers()
@@ -138,7 +221,16 @@ impl HttpClient for ReqwestClient {
         Ok(HttpStreamResponse {
             status,
             headers,
-            body: Box::pin(body),
+            body: if operation.is_recording() {
+                Box::pin(ObservedBody {
+                    inner: Box::pin(body),
+                    operation,
+                    bytes: 0,
+                    http_error: status >= 400,
+                })
+            } else {
+                Box::pin(body)
+            },
         })
     }
 
@@ -231,6 +323,39 @@ impl HttpClient for ReqwestClient {
             headers,
             body,
         })
+    }
+}
+
+struct ObservedBody {
+    inner: std::pin::Pin<Box<dyn futures::Stream<Item = Result<bytes::Bytes, String>> + Send>>,
+    operation: talon_telemetry::Operation,
+    bytes: u64,
+    http_error: bool,
+}
+impl futures::Stream for ObservedBody {
+    type Item = Result<bytes::Bytes, String>;
+    fn poll_next(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        let result = this
+            .operation
+            .in_scope(|| this.inner.as_mut().poll_next(cx));
+        match &result {
+            std::task::Poll::Ready(Some(Ok(chunk))) => {
+                self.bytes += chunk.len() as u64;
+                self.operation.record("talon.origin.body_bytes", self.bytes);
+            }
+            std::task::Poll::Ready(Some(Err(_))) => self.operation.outcome("error"),
+            std::task::Poll::Ready(None) => self.operation.outcome(if self.http_error {
+                "http_error"
+            } else {
+                "success"
+            }),
+            _ => {}
+        }
+        result
     }
 }
 

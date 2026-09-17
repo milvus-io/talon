@@ -5,6 +5,10 @@
 # flag: hyphenated prefixes and accepted spellings that appear in comments and
 # prose. Add real project vocabulary here rather than disabling the check.
 
+[default]
+# W3C traceparent values contain hexadecimal IDs, not prose.
+extend-ignore-re = ['\b[0-9a-f]{2}-[0-9a-f]{32}-[0-9a-f]{16}-[0-9a-f]{2}\b']
+
 [default.extend-words]
 # "mis-configured", "mis-bucket" — a valid hyphenated prefix, not "miss".
 mis = "mis"
@@ -19,4 +23,6 @@ TKE = "TKE"
 extend-exclude = [
     "docs/book/book/",
     "target/",
+    ".patched-deps/",
+    "patches/*.patch",
 ]

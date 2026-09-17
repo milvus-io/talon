@@ -14,6 +14,8 @@
 use std::collections::HashMap;
 use std::sync::RwLock;
 
+use crate::eviction::{AccessHandle, CacheUnit};
+
 use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
 
 /// The result of a presence query — how a read should be served.
@@ -37,8 +39,24 @@ pub struct BlockIndex {
 
 #[derive(Default)]
 struct Inner {
-    map: HashMap<BlockId, BlockMeta>,
+    map: HashMap<BlockId, IndexedBlock>,
     resident_bytes: u64,
+}
+
+struct IndexedBlock {
+    meta: BlockMeta,
+    // Sparse: allocating a token for every possible page would dwarf residency
+    // metadata when each large block has only one or two cached pages.
+    access: HashMap<Option<PageIndex>, AccessHandle>,
+}
+
+impl From<BlockMeta> for IndexedBlock {
+    fn from(meta: BlockMeta) -> Self {
+        Self {
+            meta,
+            access: HashMap::new(),
+        }
+    }
 }
 
 impl BlockIndex {
@@ -69,7 +87,7 @@ impl BlockIndex {
             .unwrap()
             .map
             .values()
-            .map(|meta| match &meta.form {
+            .map(|entry| match &entry.meta.form {
                 BlockForm::Whole => 0,
                 BlockForm::Paged { present, .. } => u64::from(present.count()),
             })
@@ -78,7 +96,57 @@ impl BlockIndex {
 
     /// Look up a copy of a block's metadata.
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
-        self.inner.read().unwrap().map.get(id).cloned()
+        self.inner
+            .read()
+            .unwrap()
+            .map
+            .get(id)
+            .map(|e| e.meta.clone())
+    }
+
+    /// Resolve metadata and mark a whole-block read in the same index lookup.
+    pub(crate) fn get_and_touch(&self, id: &BlockId) -> Option<BlockMeta> {
+        let g = self.inner.read().unwrap();
+        let entry = g.map.get(id)?;
+        if let Some(access) = entry.access.get(&None) {
+            access.touch();
+        }
+        Some(entry.meta.clone())
+    }
+
+    /// Probe the whole-block fast path without touching any paged entries.
+    pub(crate) fn is_whole_and_touch(&self, id: &BlockId) -> bool {
+        let g = self.inner.read().unwrap();
+        let Some(entry) = g.map.get(id) else {
+            return false;
+        };
+        if !matches!(entry.meta.form, BlockForm::Whole) {
+            return false;
+        }
+        if let Some(access) = entry.access.get(&None) {
+            access.touch();
+        }
+        true
+    }
+
+    /// Attach the policy token after admission. The index owns only recency;
+    /// pinning and byte accounting remain exclusively owned by the policy.
+    pub(crate) fn set_access(&self, unit: &CacheUnit, access: AccessHandle) {
+        let (block, page) = match unit {
+            CacheUnit::Whole(block) => (block, None),
+            CacheUnit::Page(block, page) => (block, Some(*page)),
+        };
+        let mut g = self.inner.write().unwrap();
+        if let Some(entry) = g.map.get_mut(block) {
+            let resident = match (&entry.meta.form, page) {
+                (BlockForm::Whole, None) => true,
+                (BlockForm::Paged { present, .. }, Some(page)) => present.is_present(page),
+                _ => false,
+            };
+            if resident {
+                entry.access.insert(page, access);
+            }
+        }
     }
 
     /// Snapshot the `(BlockId, len)` of every currently-tracked block.
@@ -92,7 +160,7 @@ impl BlockIndex {
             .unwrap()
             .map
             .values()
-            .map(|meta| (meta.id.clone(), meta.len))
+            .map(|e| (e.meta.id.clone(), e.meta.len))
             .collect()
     }
 
@@ -104,7 +172,8 @@ impl BlockIndex {
     pub fn snapshot_units(&self) -> Vec<(BlockId, Option<PageIndex>, u64)> {
         let g = self.inner.read().unwrap();
         let mut out = Vec::new();
-        for meta in g.map.values() {
+        for entry in g.map.values() {
+            let meta = &entry.meta;
             match &meta.form {
                 BlockForm::Whole => out.push((meta.id.clone(), None, meta.len)),
                 BlockForm::Paged { page_size, present } => {
@@ -132,8 +201,8 @@ impl BlockIndex {
     pub fn commit(&self, meta: BlockMeta) {
         let mut g = self.inner.write().unwrap();
         let added = meta.resident_bytes();
-        if let Some(prev) = g.map.insert(meta.id.clone(), meta) {
-            g.resident_bytes = g.resident_bytes.saturating_sub(prev.resident_bytes());
+        if let Some(prev) = g.map.insert(meta.id.clone(), meta.into()) {
+            g.resident_bytes = g.resident_bytes.saturating_sub(prev.meta.resident_bytes());
         }
         g.resident_bytes = g.resident_bytes.saturating_add(added);
     }
@@ -163,7 +232,8 @@ impl BlockIndex {
                     present: PresentBitmap::new(page_count),
                 },
                 len,
-            },
+            }
+            .into(),
         );
         // A fresh paged entry has no present pages, so it adds no resident bytes.
         true
@@ -176,9 +246,10 @@ impl BlockIndex {
     /// already-present pages), so byte accounting is never double-counted.
     pub fn mark_page(&self, id: &BlockId, page: PageIndex) -> bool {
         let mut g = self.inner.write().unwrap();
-        let Some(meta) = g.map.get_mut(id) else {
+        let Some(entry) = g.map.get_mut(id) else {
             return false;
         };
+        let meta = &mut entry.meta;
         let BlockForm::Paged { page_size, present } = &mut meta.form else {
             return false;
         };
@@ -197,9 +268,10 @@ impl BlockIndex {
     /// intact. Returns `true` if the page was present and is now cleared.
     pub fn clear_page(&self, id: &BlockId, page: PageIndex) -> bool {
         let mut g = self.inner.write().unwrap();
-        let Some(meta) = g.map.get_mut(id) else {
+        let Some(entry) = g.map.get_mut(id) else {
             return false;
         };
+        let meta = &mut entry.meta;
         let BlockForm::Paged { page_size, present } = &mut meta.form else {
             return false;
         };
@@ -207,6 +279,10 @@ impl BlockIndex {
             return false;
         }
         present.clear(page);
+        entry.access.remove(&Some(page));
+        if entry.access.capacity() > 32 && entry.access.len() < entry.access.capacity() / 4 {
+            entry.access.shrink_to(entry.access.len() * 2);
+        }
         let bytes = talon_core::page_len(meta.len, *page_size, page);
         g.resident_bytes = g.resident_bytes.saturating_sub(bytes);
         true
@@ -217,19 +293,53 @@ impl BlockIndex {
     /// `start_page`/`end_page` are only consulted for paged blocks; for a whole
     /// block the answer is always [`Presence::Whole`].
     pub fn presence(&self, id: &BlockId, start_page: PageIndex, end_page: PageIndex) -> Presence {
+        self.lookup_presence(id, start_page, end_page, false)
+    }
+
+    /// Mark resident read ranges without a second block-key lookup, key clone,
+    /// or acquisition of the capacity policy's mutex.
+    pub(crate) fn presence_and_touch(
+        &self,
+        id: &BlockId,
+        start: PageIndex,
+        end: PageIndex,
+    ) -> Presence {
+        self.lookup_presence(id, start, end, true)
+    }
+
+    fn lookup_presence(
+        &self,
+        id: &BlockId,
+        start: PageIndex,
+        end: PageIndex,
+        touch: bool,
+    ) -> Presence {
         let g = self.inner.read().unwrap();
-        match g.map.get(id) {
-            None => Presence::Miss,
-            Some(meta) => match &meta.form {
-                BlockForm::Whole => Presence::Whole,
-                BlockForm::Paged { present, .. } => {
-                    if present.range_present(start_page, end_page) {
-                        Presence::PageHit
-                    } else {
-                        Presence::PageMiss
+        let Some(entry) = g.map.get(id) else {
+            return Presence::Miss;
+        };
+        match &entry.meta.form {
+            BlockForm::Whole => {
+                if touch {
+                    if let Some(access) = entry.access.get(&None) {
+                        access.touch();
                     }
                 }
-            },
+                Presence::Whole
+            }
+            BlockForm::Paged { present, .. } => {
+                if !present.range_present(start, end) {
+                    return Presence::PageMiss;
+                }
+                if touch {
+                    for page in start.0..end.0 {
+                        if let Some(access) = entry.access.get(&Some(PageIndex(page))) {
+                            access.touch();
+                        }
+                    }
+                }
+                Presence::PageHit
+            }
         }
     }
 
@@ -238,7 +348,7 @@ impl BlockIndex {
     /// Byte accounting is decremented by the removed block's resident bytes.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut g = self.inner.write().unwrap();
-        let removed = g.map.remove(id);
+        let removed = g.map.remove(id).map(|entry| entry.meta);
         if let Some(meta) = &removed {
             g.resident_bytes = g.resident_bytes.saturating_sub(meta.resident_bytes());
         }
@@ -267,6 +377,60 @@ mod tests {
             form: BlockForm::Whole,
             len,
         }
+    }
+
+    #[test]
+    fn read_lookup_marks_only_the_requested_page_and_drops_retired_tokens() {
+        use crate::eviction::Lru;
+        let idx = BlockIndex::new();
+        let lru = Lru::new();
+        let id = block(1);
+        idx.init_paged(id.clone(), 4096, 8192);
+        let p0 = CacheUnit::Page(id.clone(), PageIndex(0));
+        let p1 = CacheUnit::Page(id.clone(), PageIndex(1));
+        for (unit, page) in [(&p0, PageIndex(0)), (&p1, PageIndex(1))] {
+            idx.mark_page(&id, page);
+            idx.set_access(unit, lru.insert(unit.clone(), 4096));
+        }
+        assert_eq!(
+            idx.presence_and_touch(&id, PageIndex(0), PageIndex(1)),
+            Presence::PageHit
+        );
+        assert_eq!(lru.evict_to_fit(4096), vec![p1.clone()]);
+        idx.clear_page(&id, PageIndex(1));
+        assert!(!idx.inner.read().unwrap().map[&id]
+            .access
+            .contains_key(&Some(PageIndex(1))));
+        lru.remove(&p0);
+        idx.clear_page(&id, PageIndex(0));
+        idx.mark_page(&id, PageIndex(0));
+        idx.set_access(&p0, lru.insert(p0.clone(), 4096));
+        idx.mark_page(&id, PageIndex(1));
+        idx.set_access(&p1, lru.insert(p1.clone(), 4096));
+        // Ordinary metadata probes must not bias eviction.
+        idx.presence(&id, PageIndex(0), PageIndex(1));
+        assert_eq!(lru.evict_to_fit(4096), vec![p0]);
+    }
+
+    #[test]
+    fn whole_probe_preserves_whole_recency_without_heating_pages() {
+        use crate::eviction::Lru;
+        let idx = BlockIndex::new();
+        let lru = Lru::new();
+        assert!(!idx.is_whole_and_touch(&block(0)));
+        let whole = CacheUnit::Whole(block(1));
+        idx.commit(whole_meta(block(1), 4096));
+        idx.set_access(&whole, lru.insert(whole.clone(), 4096));
+        let paged = block(2);
+        idx.init_paged(paged.clone(), 4096, 8192);
+        let page = CacheUnit::Page(paged.clone(), PageIndex(0));
+        idx.mark_page(&paged, PageIndex(0));
+        idx.set_access(&page, lru.insert(page.clone(), 4096));
+
+        assert!(idx.is_whole_and_touch(&block(1)));
+        assert!(!idx.is_whole_and_touch(&paged));
+        // The older whole block received a real touch; the newer page did not.
+        assert_eq!(lru.evict_to_fit(4096), vec![page]);
     }
 
     #[test]

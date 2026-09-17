@@ -43,12 +43,36 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Run blocking filesystem work on Tokio's blocking pool, so page I/O never
 /// stalls the async reactor thread and the connections multiplexed on it
 /// (issue #115).
-async fn spawn_blocking_io<F, T>(f: F) -> Result<T>
+pub(crate) async fn spawn_blocking_io<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    let task = if talon_telemetry::diagnostic() {
+        let operation = talon_telemetry::Operation::new(
+            "talon.cache.io",
+            "internal",
+            talon_telemetry::TraceParent::Inherit,
+        );
+        let submitted = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            operation.record(
+                "talon.blocking.queue_wait_us",
+                submitted.elapsed().as_micros() as u64,
+            );
+            let started = std::time::Instant::now();
+            let result = operation.in_scope(f);
+            operation.record(
+                "talon.blocking.execution_us",
+                started.elapsed().as_micros() as u64,
+            );
+            operation.outcome(if result.is_ok() { "success" } else { "error" });
+            result
+        })
+    } else {
+        tokio::task::spawn_blocking(f)
+    };
+    match task.await {
         Ok(result) => result,
         Err(join_error) => Err(Error::Backend(format!(
             "blocking store task failed: {join_error}"
@@ -163,9 +187,9 @@ impl PagedBlockStore {
         let tmp = dir.join(format!("block.meta.tmp.{pid}.{seq}"));
         match (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&encoded)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &meta_path)
+            talon_telemetry::sync_io("talon.cache.write", || f.write_all(&encoded))?;
+            talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
+            talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &meta_path))
         })() {
             Ok(()) => Ok(()),
             Err(e) => {
@@ -266,9 +290,9 @@ impl PagedBlockStore {
         let tmp = dir.join(format!("{}.page.tmp.{pid}.{seq}", page.0));
         match (|| -> std::io::Result<()> {
             let mut f = std::fs::File::create(&tmp)?;
-            f.write_all(&value)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, &path)
+            talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
+            talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
+            talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path))
         })() {
             Ok(()) => {
                 // The rename swapped in a new inode; drop any descriptor still
@@ -297,9 +321,9 @@ impl PagedBlockStore {
             let tmp = path.with_extension(format!("page.tmp.{pid}.{seq}"));
             match (|| -> std::io::Result<()> {
                 let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(&value)?;
-                f.sync_all()?;
-                std::fs::rename(&tmp, &path)
+                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
+                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
+                talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path))
             })() {
                 Ok(()) => Ok(()),
                 Err(e) => {

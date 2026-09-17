@@ -53,7 +53,7 @@ so a path addresses the same object through either.
 
 ## Reading many ranges of one object
 
-`read` resolves the object's version with a `stat` when one is not supplied.
+`read` resolves the object's size and version with a `stat` when both are omitted.
 That is one extra round trip per call, which is wasted work when reading many
 ranges of the same object: a version is stable for an object generation.
 
@@ -64,8 +64,12 @@ for offset in range(0, info.size, chunk_size):
                        offset=offset, length=chunk_size)
 ```
 
-Passing `size` as well lets the client clamp at end-of-file without another
-lookup.
+`version` and `size` must be passed together: the pair describes one source
+generation and lets the client clamp at end-of-file without another lookup.
+Passing only one raises `ValueError` instead of combining metadata from two
+different generations. Workers serve matching cached bytes or conditionally
+fetch that exact version from the origin. If it is unavailable, the read fails
+instead of returning bytes from a replacement object.
 
 ## Threads
 

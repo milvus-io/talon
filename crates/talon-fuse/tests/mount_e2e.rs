@@ -39,7 +39,7 @@ use talon_fuse::mount::TalonFuse;
 use talon_fuse::{BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
 use talon_transport::data;
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
-use talon_transport::{decode_request, response_header_ok, ControlMessage, RangeRequest};
+use talon_transport::{decode_request, response_header_ok, ControlMessage};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 
@@ -71,7 +71,8 @@ async fn spawn_worker(max_len: Arc<AtomicU32>) -> String {
                 sock.read_exact(&mut body).await.unwrap();
                 let mut full = hdr.to_vec();
                 full.extend_from_slice(&body);
-                let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                assert_eq!(h.msg_type, MsgType::GetRange);
+                let (_h, req) = decode_request(&full).unwrap();
                 max_len.fetch_max(req.len as u32, Ordering::SeqCst);
                 let payload: Vec<u8> = (0..req.len).map(|i| content_byte(req.offset + i)).collect();
                 let mut out = response_header_ok(0, payload.len() as u32).to_vec();
@@ -334,7 +335,8 @@ async fn spawn_rw_worker(store: Store) -> String {
                             sock.flush().await.unwrap();
                         }
                         _ => {
-                            let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                            assert_eq!(h.msg_type, MsgType::GetRange);
+                            let (_h, req) = decode_request(&full).unwrap();
                             let stored = store.lock().unwrap().get(&req.object.to_path()).cloned();
                             let payload: Vec<u8> = (0..req.len)
                                 .map(|i| {

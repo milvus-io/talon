@@ -73,7 +73,11 @@ where
     // Decode (validates magic/version/type and the global max), then enforce the
     // per-type cap BEFORE allocating the payload.
     let header = FrameHeader::decode(&header_buf)?;
-    let cap = max_payload_for(header.msg_type);
+    let cap = max_payload_for(header.msg_type).saturating_add(if header.version == 2 {
+        crate::envelope::ENVELOPE_OVERHEAD
+    } else {
+        0
+    });
     if header.length > cap {
         return Err(ReadFrameError::PayloadTooLarge {
             msg_type: header.msg_type,
@@ -218,8 +222,11 @@ impl BufferedFrameReader {
             // the kernel, so a refill costs no allocation on the steady path.
             let need = (want - self.buffered()).max(REFILL_CAPACITY);
             let mut scratch = self.scratch.take().unwrap_or_default();
-            if scratch.len() < need {
-                scratch.resize(need, 0);
+            // Monoio receives into Vec capacity and resets its length to the
+            // bytes read. Growing length here would zero almost 64 KiB again
+            // after every small frame; only reserve missing capacity instead.
+            if scratch.capacity() < need {
+                scratch.reserve(need - scratch.len());
             }
             let (res, scratch) = match monoio::time::timeout(timeout, stream.read(scratch)).await {
                 Ok(pair) => pair,
@@ -270,7 +277,11 @@ impl BufferedFrameReader {
 
         // Enforce the per-type cap BEFORE consuming the header or allocating the
         // payload, so a lying peer cannot pin memory (issue #111).
-        let cap = max_payload_for(header.msg_type);
+        let cap = max_payload_for(header.msg_type).saturating_add(if header.version == 2 {
+            crate::envelope::ENVELOPE_OVERHEAD
+        } else {
+            0
+        });
         if header.length > cap {
             return Err(ReadFrameError::PayloadTooLarge {
                 msg_type: header.msg_type,

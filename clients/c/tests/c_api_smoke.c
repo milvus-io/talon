@@ -31,9 +31,14 @@ int talon_c_api_smoke_test(void) {
     talon_client *client = NULL;
     uint64_t request_id = 0;
     const char *last_error;
+    talon_request_options trace_options;
+    if (talon_request_options_init(&trace_options, sizeof(trace_options)) != TALON_STATUS_OK ||
+        trace_options.struct_size != sizeof(trace_options) || trace_options.version != 1 ||
+        trace_options.flags != 0 || trace_options.parent_mode != 0) return 10;
 
     talon_client_options_init(&options);
-    if (options.block_size != (256u << 20) || options.callback_executor != NULL) {
+    if (options.block_size != (256u << 20) || options.callback_executor != NULL ||
+        options.max_idle_per_addr != 8) {
         return 1;
     }
 
@@ -45,6 +50,7 @@ int talon_c_api_smoke_test(void) {
         return 3;
     }
 
+    options.max_idle_per_addr = 32;
     if (talon_client_new("127.0.0.1:1", &options, &client) != TALON_STATUS_OK ||
         client == NULL) {
         return 4;
@@ -62,9 +68,16 @@ int talon_c_api_smoke_test(void) {
         return 6;
     }
 
+    trace_options.version = 2;
+    if (talon_stat_async_with_options(client, "s3://bucket/object", &trace_options,
+                                     capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT) {
+        talon_client_free(client);
+        return 11;
+    }
+    trace_options.version = 1;
     atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
     atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
-    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL,
+    if (talon_read_async_with_options(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL, &trace_options,
                          capture_zero_length_read, NULL, &request_id) != TALON_STATUS_OK ||
         request_id != 1) {
         talon_client_free(client);

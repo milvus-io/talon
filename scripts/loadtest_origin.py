@@ -66,6 +66,17 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
 
+        # Exact-generation reads use Azure's If-Match condition. Honour it so
+        # SDK end-to-end tests fail closed when a caller supplies a stale ETag.
+        if_match = self.headers.get("If-Match")
+        if (if_match and if_match != "*" and
+                if_match.strip('"') != ETAG.strip('"')):
+            self.send_response(412)
+            self.send_header("Content-Length", "0")
+            self._common()
+            self.end_headers()
+            return
+
         rng = self.headers.get("x-ms-range") or self.headers.get("Range")
         if rng and rng.startswith("bytes="):
             first, _, last = rng[len("bytes="):].partition("-")

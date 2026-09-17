@@ -6,15 +6,30 @@ JVM build, with no per-platform artifact, no `System.loadLibrary`, and no JNI
 crash surface.
 
 ```java
-try (TalonClient client = TalonClient.connect("coordinator-host:7000", 8 << 20)) {
+try (TalonClient client = TalonClient.connect("coordinator-host:7000", 8 << 20, 32)) {
     byte[] data = client.read("az://container/dataset.parquet",
                               "0x8DABCDEF",   // object version (ETag)
                               0, 1 << 20);
 }
 ```
 
+`maxIdlePerAddr` defaults to **8** when omitted and must be positive. It limits idle TCP
+connections retained per address, independently in the coordinator and worker
+pools; concurrent requests may open more connections. Idle connections expire
+after 30 seconds and are discarded on checkout. Failed exchanges close their
+connections; a reused connection that disconnects is retried once on a fresh
+connection. `close()` closes idle connections and prevents in-flight connections
+from returning to the pools.
+
+The existing `TalonClient.connect(coordinator, blockSize)` and
+`TalonClient.connect(coordinator)` calls use the default idle limit. The default
+block size is 256 MiB and must match the workers' configuration.
+
 URIs use the same namespaces as the FUSE mount — `s3://`, `gcs://`, `az://` —
 so a path addresses the same object through either client.
+
+The supplied version is exact: if that source generation is no longer
+available, the read fails instead of silently returning replacement bytes.
 
 ## How correctness is maintained
 
@@ -30,8 +45,8 @@ silently breaking a deployment.
 JAVA_HOME=/path/to/jdk scripts/java_client_e2e.sh
 ```
 
-That runs both suites: the vectors, and an end-to-end read against a live
-cluster.
+That runs the vectors and local TCP pool checks, followed by an end-to-end read
+against a live cluster.
 
 ## Current scope
 

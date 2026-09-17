@@ -34,6 +34,7 @@ static void on_read(talon_result *result, void *user_data) {
 int main(void) {
     talon_client_options options;
     talon_client_options_init(&options);
+    options.max_idle_per_addr = 32;
 
     talon_client *client = NULL;
     if (talon_client_new("127.0.0.1:7000", &options, &client) != TALON_STATUS_OK) {

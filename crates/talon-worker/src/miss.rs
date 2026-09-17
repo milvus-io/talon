@@ -54,7 +54,20 @@ pub enum Admission {
 /// followers can await the leader instead of each issuing a redundant fetch.
 #[derive(Default)]
 pub struct InFlightLoads {
-    inner: Mutex<HashMap<LoadKey, Arc<Notify>>>,
+    inner: Mutex<HashMap<LoadKey, FlightEntry>>,
+}
+
+struct FlightEntry {
+    notify: Arc<Notify>,
+    trace: talon_telemetry::Flight,
+}
+impl FlightEntry {
+    fn new() -> Self {
+        Self {
+            notify: Arc::new(Notify::new()),
+            trace: talon_telemetry::Flight::new(),
+        }
+    }
 }
 
 impl InFlightLoads {
@@ -74,7 +87,7 @@ impl InFlightLoads {
         match g.entry(key) {
             Entry::Occupied(_) => Admission::AlreadyLoading,
             Entry::Vacant(slot) => {
-                slot.insert(Arc::new(Notify::new()));
+                slot.insert(FlightEntry::new());
                 Admission::Started
             }
         }
@@ -91,17 +104,38 @@ impl InFlightLoads {
     /// #162). `None` means a load is already in flight (the caller should
     /// [`wait`](Self::wait)).
     pub fn admit_owned(self: &Arc<Self>, key: LoadKey) -> Option<InFlightGuard> {
+        self.admit_traced(key).0
+    }
+
+    /// Snapshot the flight while deciding admission, so waiters cannot link a later load.
+    pub fn admit_traced(
+        self: &Arc<Self>,
+        key: LoadKey,
+    ) -> (Option<InFlightGuard>, talon_telemetry::Flight) {
         use std::collections::hash_map::Entry;
         let mut g = self.inner.lock().unwrap();
         match g.entry(key.clone()) {
-            Entry::Occupied(_) => None,
+            Entry::Occupied(entry) => (None, entry.get().trace.clone()),
             Entry::Vacant(slot) => {
-                slot.insert(Arc::new(Notify::new()));
-                Some(InFlightGuard {
-                    inflight: Arc::clone(self),
-                    key: Some(key),
-                })
+                slot.insert(FlightEntry::new());
+                (
+                    Some(InFlightGuard {
+                        inflight: Arc::clone(self),
+                        key: Some(key),
+                    }),
+                    talon_telemetry::Flight::default(),
+                )
             }
+        }
+    }
+
+    /// Called by the owner while its existing admission guard is still alive.
+    pub fn bind_trace(&self, key: &LoadKey) {
+        if !talon_telemetry::is_recording() {
+            return;
+        }
+        if let Some(entry) = self.inner.lock().unwrap().get(key) {
+            entry.trace.bind_current();
         }
     }
 
@@ -115,7 +149,7 @@ impl InFlightLoads {
             let notify = {
                 let g = self.inner.lock().unwrap();
                 match g.get(key) {
-                    Some(n) => Arc::clone(n),
+                    Some(n) => Arc::clone(&n.notify),
                     None => return, // load already completed
                 }
             };
@@ -144,7 +178,7 @@ impl InFlightLoads {
         let notify = self.inner.lock().unwrap().remove(key);
         match notify {
             Some(n) => {
-                n.notify_waiters();
+                n.notify.notify_waiters();
                 true
             }
             None => false,

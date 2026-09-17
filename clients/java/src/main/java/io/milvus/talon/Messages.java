@@ -4,7 +4,8 @@ import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Control-plane message encoding and decoding.
+ * Bincode message encoding and decoding for the control plane and versioned
+ * data-plane reads.
  *
  * <p>Only the read path is implemented. Variant tags are the Rust enum's
  * declaration order and are wire-visible: inserting a variant renumbers
@@ -155,6 +156,28 @@ final class Messages {
         Bincode.Writer w = envelope(TAG_LIST_OBJECTS);
         w.string(prefix);
         return framed(requestId, w.toBytes());
+    }
+
+    /** {@code VersionedRangeRequest { request: RangeRequest, version }}. */
+    static byte[] versionedRange(
+            int requestId, ObjectId object, long offset, long length, String version) {
+        Bincode.Writer w = new Bincode.Writer();
+        writeObjectId(w, object);
+        w.u64(offset);
+        w.u64(length);
+        w.string(version);
+        byte[] body = w.toBytes();
+        byte[] header =
+                new Frame(
+                                Frame.MsgType.GET_VERSIONED_RANGE,
+                                0,
+                                requestId,
+                                body.length)
+                        .encode();
+        byte[] out = new byte[header.length + body.length];
+        System.arraycopy(header, 0, out, 0, header.length);
+        System.arraycopy(body, 0, out, header.length, body.length);
+        return out;
     }
 
     /** A decoded control response. */

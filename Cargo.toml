@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
+exclude = [".patched-deps/monoio"]
 members = [
+    "crates/talon-telemetry",
     "crates/talon-core",
     "crates/talon-cache-client",
     "crates/talon-gateway",
@@ -25,6 +27,7 @@ repository = "https://github.com/talon/talon"
 rust-version = "1.80"
 
 [workspace.dependencies]
+talon-telemetry = { path = "crates/talon-telemetry" }
 talon-core = { path = "crates/talon-core" }
 talon-cache-client = { path = "crates/talon-cache-client" }
 talon-rust-client = { path = "clients/rust" }
@@ -53,14 +56,15 @@ prost-build = "0.14"
 libc = "0.2"
 clap = { version = "4", features = ["derive"] }
 divan = "0.1"
-# Thread-per-core io_uring runtime for the data plane (#273, #285). The "sync"
-# feature provides spawn_blocking, which the zero-copy sendfile/splice path
-# needs to stay off the ring; it requires an explicitly attached thread pool.
-monoio = { version = "0.2.4", features = ["sync"] }
+# Thread-per-core io_uring runtime. Resident sends use splice on the same ring;
+# sync remains enabled for other runtime users. See patches/README.md
+# for the explicit-offset extension required by shared cache descriptors.
+monoio = { version = "0.2.4", features = ["sync", "splice"] }
 axum = "0.8"
 tower = { version = "0.5", features = ["limit", "util"] }
 tower-http = { version = "0.6", features = ["timeout"] }
 http-body-util = "0.1"
+http-body = "1"
 httpdate = "1"
 serde_yaml = "0.9"
 # Kubernetes client for the Lease-based ClusterStateStore backend (feature
@@ -84,3 +88,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 rustls-webpki = { version = "0.103", default-features = false, features = ["ring", "std"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["logging", "ring"] }
 x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+
+[patch.crates-io]
+monoio = { path = ".patched-deps/monoio" }

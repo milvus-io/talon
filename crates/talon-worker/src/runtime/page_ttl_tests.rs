@@ -9,6 +9,24 @@ struct Origin {
 }
 #[async_trait::async_trait]
 impl BackendStore for Origin {
+    async fn fetch_range_if_match(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        len: u64,
+        if_match: Option<&Version>,
+    ) -> talon_core::Result<Bytes> {
+        if let Some(expected) = if_match {
+            if expected.as_str() != "v1" {
+                return Err(Error::VersionMismatch {
+                    expected: expected.0.clone(),
+                    found: "v1".into(),
+                });
+            }
+        }
+        self.fetch_range(object, offset, len).await
+    }
+
     async fn fetch_range(&self, _: &ObjectId, offset: u64, len: u64) -> talon_core::Result<Bytes> {
         self.fetches.fetch_add(1, Ordering::SeqCst);
         Ok(Bytes::from(

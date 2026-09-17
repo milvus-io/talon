@@ -14,11 +14,65 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talon_rust_client::{
-    parse_uri as parse_rust_uri, Client as RustClient, Error as RustError, ObjectId,
+    parse_uri as parse_rust_uri, Client as RustClient, ClientBuilder, Error as RustError, ObjectId,
     ObjectStat as RustObjectStat, UriError,
 };
 
+mod trace_options;
+pub use trace_options::{talon_request_options_init, TalonRequestOptions};
+
+#[cfg(feature = "telemetry")]
+static TELEMETRY: std::sync::Mutex<
+    Option<(talon_telemetry::export::ExportOwner, tracing::Dispatch)>,
+> = std::sync::Mutex::new(None);
+
+/// Explicit process initialization. Subscriber remains scoped to Talon tasks.
+#[no_mangle]
+pub extern "C" fn talon_telemetry_init() -> c_int {
+    ffi_status(|| {
+        #[cfg(feature = "telemetry")]
+        {
+            let mut session = TELEMETRY.lock().unwrap();
+            if session.is_some() {
+                return Err((
+                    STATUS_INVALID_ARGUMENT,
+                    "telemetry already initialized".into(),
+                ));
+            }
+            *session = Some(
+                talon_telemetry::export::init_scoped("talon-c")
+                    .map_err(|e| (STATUS_RUNTIME_ERROR, e.to_string()))?,
+            );
+            Ok(())
+        }
+        #[cfg(not(feature = "telemetry"))]
+        {
+            talon_telemetry::Config::from_env()
+                .and_then(talon_telemetry::configure)
+                .map_err(|e| (STATUS_INVALID_ARGUMENT, e))
+        }
+    })
+}
+
+/// Call after all client operations finish, outside SDK callbacks.
+#[no_mangle]
+pub extern "C" fn talon_telemetry_shutdown() {
+    #[cfg(feature = "telemetry")]
+    if let Some((owner, _)) = TELEMETRY.lock().unwrap().take() {
+        owner.shutdown();
+    }
+}
+
+fn telemetry_dispatch() -> tracing::Dispatch {
+    #[cfg(feature = "telemetry")]
+    if let Some((_, dispatch)) = TELEMETRY.lock().unwrap().as_ref() {
+        return dispatch.clone();
+    }
+    tracing::dispatcher::get_default(Clone::clone)
+}
+
 const DEFAULT_BLOCK_SIZE: u32 = 256 << 20;
+const DEFAULT_MAX_IDLE_PER_ADDR: u32 = 8;
 
 const STATUS_OK: c_int = 0;
 const STATUS_INVALID_ARGUMENT: c_int = 1;
@@ -58,6 +112,9 @@ pub struct TalonClientOptions {
     /// Optional caller-owned callback executor. Without one, callbacks run on
     /// the Tokio runtime thread that completed the operation.
     pub callback_executor: *const TalonCallbackExecutor,
+    /// Maximum idle connections per peer in each pool. Zero uses the default 8.
+    /// Does not limit active connections.
+    pub max_idle_per_addr: u32,
 }
 
 /// Opaque client handle.
@@ -171,6 +228,7 @@ pub unsafe extern "C" fn talon_client_options_init(options: *mut TalonClientOpti
             TalonClientOptions {
                 block_size: DEFAULT_BLOCK_SIZE,
                 callback_executor: ptr::null(),
+                max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
             },
         );
     }
@@ -196,6 +254,7 @@ pub unsafe extern "C" fn talon_client_new(
             TalonClientOptions {
                 block_size: DEFAULT_BLOCK_SIZE,
                 callback_executor: ptr::null(),
+                max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
             }
         } else {
             unsafe { *options }
@@ -204,6 +263,11 @@ pub unsafe extern "C" fn talon_client_new(
             DEFAULT_BLOCK_SIZE
         } else {
             options.block_size
+        };
+        let max_idle_per_addr = if options.max_idle_per_addr == 0 {
+            DEFAULT_MAX_IDLE_PER_ADDR
+        } else {
+            options.max_idle_per_addr
         };
         let dispatcher = if options.callback_executor.is_null() {
             CallbackDispatcher::Inline
@@ -222,7 +286,11 @@ pub unsafe extern "C" fn talon_client_new(
             .enable_all()
             .build()
             .map_err(|error| (STATUS_RUNTIME_ERROR, error.to_string()))?;
-        let rust_client = RustClient::new(coordinator_addr, block_size)
+        let rust_client = ClientBuilder::default()
+            .with_coordinator(coordinator_addr)
+            .with_block_size(block_size)
+            .with_max_idle_per_addr(max_idle_per_addr as usize)
+            .build()
             .map_err(|error| (STATUS_INVALID_ARGUMENT, error.to_string()))?;
         let client = Box::new(TalonClient {
             inner: Arc::new(ClientInner {
@@ -258,8 +326,9 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
 /// `version` and `object_size` are each optional and independently nullable;
 /// NULL means "the caller does not have this value". The read takes the fast
 /// path that skips the `StatObject` round trip **only when both are non-NULL** —
-/// then it reads under the caller-supplied version and size, and the caller owns
-/// keeping them current for the object generation being read. If either is NULL
+/// then it reads under the caller-supplied size and exact source version. A
+/// worker may serve that generation from cache or conditionally fetch it from
+/// the backend, but never substitutes newer bytes. If either is NULL
 /// the SDK resolves both with a `StatObject` first (the historical behavior) and
 /// any lone value that was supplied is ignored, since a stat is authoritative
 /// for both and a read cannot skip it without both halves.
@@ -284,7 +353,40 @@ pub unsafe extern "C" fn talon_read_async(
     user_data: *mut c_void,
     request_id_out: *mut u64,
 ) -> c_int {
+    unsafe {
+        talon_read_async_with_options(
+            client,
+            uri,
+            offset,
+            dst,
+            dst_len,
+            version,
+            object_size,
+            ptr::null(),
+            callback,
+            user_data,
+            request_id_out,
+        )
+    }
+}
+
+/// Submit with copied request-local W3C context.
+#[no_mangle]
+pub unsafe extern "C" fn talon_read_async_with_options(
+    client: *mut TalonClient,
+    uri: *const c_char,
+    offset: u64,
+    dst: *mut u8,
+    dst_len: usize,
+    version: *const c_char,
+    object_size: *const u64,
+    options: *const TalonRequestOptions,
+    callback: Option<TalonCallback>,
+    user_data: *mut c_void,
+    request_id_out: *mut u64,
+) -> c_int {
     ffi_status(|| {
+        let trace_context = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -333,14 +435,21 @@ pub unsafe extern "C" fn talon_read_async(
             (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
             _ => None,
         };
-        runtime.spawn(async move {
+        use tracing::instrument::WithSubscriber;
+        let task = async move {
+            let options = talon_rust_client::RequestOptions {
+                parent: trace_context
+                    .as_ref()
+                    .map(talon_rust_client::TraceParent::Explicit)
+                    .unwrap_or(talon_rust_client::TraceParent::Root),
+            };
             let result = async {
                 if read_buffer.len == 0 {
                     return Ok(0);
                 }
                 let dst = unsafe { read_buffer.into_mut_slice() };
                 client
-                    .read_into(&object, offset, dst, known_stat.as_ref())
+                    .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
                     .await
                     .map_err(|error| error.to_string())
             }
@@ -351,7 +460,12 @@ pub unsafe extern "C" fn talon_read_async(
                 user_data,
                 TalonResult::read(request_id, result),
             );
-        });
+        };
+        if talon_telemetry::enabled() {
+            runtime.spawn(task.with_subscriber(telemetry_dispatch()));
+        } else {
+            runtime.spawn(task);
+        }
         Ok(())
     })
 }
@@ -365,7 +479,30 @@ pub unsafe extern "C" fn talon_stat_async(
     user_data: *mut c_void,
     request_id_out: *mut u64,
 ) -> c_int {
+    unsafe {
+        talon_stat_async_with_options(
+            client,
+            uri,
+            ptr::null(),
+            callback,
+            user_data,
+            request_id_out,
+        )
+    }
+}
+
+/// Submit with copied request-local W3C context.
+#[no_mangle]
+pub unsafe extern "C" fn talon_stat_async_with_options(
+    client: *mut TalonClient,
+    uri: *const c_char,
+    options: *const TalonRequestOptions,
+    callback: Option<TalonCallback>,
+    user_data: *mut c_void,
+    request_id_out: *mut u64,
+) -> c_int {
     ffi_status(|| {
+        let trace_context = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -388,9 +525,16 @@ pub unsafe extern "C" fn talon_stat_async(
         let runtime = Arc::clone(&inner.runtime);
         let client = Arc::clone(&inner.client);
         let dispatcher = Arc::clone(&inner.dispatcher);
-        runtime.spawn(async move {
+        use tracing::instrument::WithSubscriber;
+        let task = async move {
+            let options = talon_rust_client::RequestOptions {
+                parent: trace_context
+                    .as_ref()
+                    .map(talon_rust_client::TraceParent::Explicit)
+                    .unwrap_or(talon_rust_client::TraceParent::Root),
+            };
             let result = client
-                .stat(&object)
+                .stat_with_options(&object, &options)
                 .await
                 .map_err(|error| error.to_string());
             dispatch_result(
@@ -399,7 +543,12 @@ pub unsafe extern "C" fn talon_stat_async(
                 user_data,
                 TalonResult::stat(request_id, result),
             );
-        });
+        };
+        if talon_telemetry::enabled() {
+            runtime.spawn(task.with_subscriber(telemetry_dispatch()));
+        } else {
+            runtime.spawn(task);
+        }
         Ok(())
     })
 }
@@ -628,7 +777,7 @@ mod tests {
 
     use talon_core::{NodeId, NodeInfo, NodeRole};
     use talon_transport::frame::{FrameHeader, HEADER_LEN};
-    use talon_transport::{decode_request, response_header_ok, ControlMessage, RangeRequest};
+    use talon_transport::{decode_versioned_request, response_header_ok, ControlMessage};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
@@ -728,7 +877,7 @@ mod tests {
         }
     }
 
-    async fn mock_worker() -> String {
+    async fn mock_worker(observed_versions: Option<Arc<Mutex<Vec<String>>>>) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -737,6 +886,7 @@ mod tests {
                     Ok(v) => v,
                     Err(_) => return,
                 };
+                let observed_versions = observed_versions.clone();
                 tokio::spawn(async move {
                     let mut hdr = [0u8; HEADER_LEN];
                     if sock.read_exact(&mut hdr).await.is_err() {
@@ -747,7 +897,14 @@ mod tests {
                     sock.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_header, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    let (_header, versioned) = decode_versioned_request(&full).unwrap();
+                    if let Some(observed_versions) = observed_versions {
+                        observed_versions
+                            .lock()
+                            .unwrap()
+                            .push(versioned.version.as_str().to_owned());
+                    }
+                    let req = versioned.request;
                     let payload: Vec<u8> = (0..req.len)
                         .map(|i| ((req.offset + i) % 251) as u8)
                         .collect();
@@ -837,12 +994,13 @@ mod tests {
     }
 
     async fn new_client() -> (*mut TalonClient, String) {
-        let worker = mock_worker().await;
+        let worker = mock_worker(None).await;
         let coordinator = mock_coordinator(worker).await;
         let coordinator_c = cstring(&coordinator);
         let mut options = TalonClientOptions {
             block_size: 0,
             callback_executor: ptr::null(),
+            max_idle_per_addr: 0,
         };
         unsafe {
             talon_client_options_init(&mut options);
@@ -856,20 +1014,24 @@ mod tests {
 
     /// Build a client with a caller-chosen block size whose coordinator counts
     /// the `StatObject` calls it serves.
-    async fn new_client_counting(block_size: u32) -> (*mut TalonClient, Arc<AtomicUsize>) {
-        let worker = mock_worker().await;
+    async fn new_client_counting(
+        block_size: u32,
+    ) -> (*mut TalonClient, Arc<AtomicUsize>, Arc<Mutex<Vec<String>>>) {
+        let observed_versions = Arc::new(Mutex::new(Vec::new()));
+        let worker = mock_worker(Some(Arc::clone(&observed_versions))).await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_coordinator_counting(worker, Arc::clone(&stat_calls)).await;
         let coordinator_c = cstring(&coordinator);
         let options = TalonClientOptions {
             block_size,
             callback_executor: ptr::null(),
+            max_idle_per_addr: 0,
         };
         let mut client = ptr::null_mut();
         let status = unsafe { talon_client_new(coordinator_c.as_ptr(), &options, &mut client) };
         assert_eq!(status, STATUS_OK);
         assert!(!client.is_null());
-        (client, stat_calls)
+        (client, stat_calls, observed_versions)
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -970,12 +1132,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn read_with_version_skips_stat() {
-        let (client, stat_calls) = new_client_counting(0).await;
+    async fn read_with_exact_version_and_size_skips_stat_and_clamps() {
+        let (client, stat_calls, observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
-        let object_size: u64 = 8192;
+        let object_size: u64 = 512;
         let mut dst = vec![0u8; 4096];
         let mut request_id = 0u64;
 
@@ -996,13 +1158,19 @@ mod tests {
         assert_eq!(status, STATUS_OK);
         let snapshot = state.wait();
         assert_eq!(snapshot.status, STATUS_OK);
-        assert_eq!(snapshot.bytes_written, dst.len());
-        let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
-        assert_eq!(dst, expected);
+        assert_eq!(snapshot.bytes_written, 412);
+        let expected: Vec<u8> = (0..412).map(|j| ((100 + j) % 251) as u8).collect();
+        assert_eq!(&dst[..412], expected);
+        assert!(dst[412..].iter().all(|byte| *byte == 0));
         assert_eq!(
             stat_calls.load(Ordering::SeqCst),
             0,
             "a caller-supplied version and size must skip the StatObject round trip"
+        );
+        assert_eq!(
+            observed_versions.lock().unwrap().as_slice(),
+            ["caller-known-version"],
+            "the C caller's version must reach the worker unchanged"
         );
         assert!(snapshot.error.is_none());
 
@@ -1013,7 +1181,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn read_without_version_calls_stat() {
-        let (client, stat_calls) = new_client_counting(0).await;
+        let (client, stat_calls, _observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let mut dst = vec![0u8; 4096];
@@ -1051,7 +1219,7 @@ mod tests {
     async fn version_without_size_falls_back_to_stat() {
         // A caller that knows the version but has no valid size passes a NULL
         // object_size; the read must resolve both via StatObject, not guess.
-        let (client, stat_calls) = new_client_counting(0).await;
+        let (client, stat_calls, _observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
@@ -1091,7 +1259,7 @@ mod tests {
     async fn empty_object_fast_path_reads_zero_without_stat() {
         // object_size pointing at 0 is a genuinely empty object, distinct from a
         // NULL "unknown": the read returns zero bytes and still skips the stat.
-        let (client, stat_calls) = new_client_counting(0).await;
+        let (client, stat_calls, _observed_versions) = new_client_counting(0).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
@@ -1132,7 +1300,7 @@ mod tests {
     async fn multi_block_read_reassembles_concurrent_blocks() {
         // A 1 KiB block size makes a 4 KiB read span five blocks, so the
         // concurrent fetches must land in the right disjoint sub-slices.
-        let (client, _stat_calls) = new_client_counting(1024).await;
+        let (client, _stat_calls, observed_versions) = new_client_counting(1024).await;
         let state = CallbackState::new();
         let uri = cstring("s3://bucket/object.bin");
         let version = cstring("caller-known-version");
@@ -1162,6 +1330,14 @@ mod tests {
         // correct reassembly reproduces that sequence across every block.
         let expected: Vec<u8> = (0..dst.len()).map(|j| ((100 + j) % 251) as u8).collect();
         assert_eq!(dst, expected);
+        assert!(
+            observed_versions
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|version| version == "caller-known-version"),
+            "every block request must carry the C caller's exact version"
+        );
 
         unsafe {
             talon_client_free(client);
@@ -1212,7 +1388,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn custom_scheduler_hook_receives_callback_job() {
-        let worker = mock_worker().await;
+        let worker = mock_worker(None).await;
         let coordinator = mock_coordinator(worker).await;
         let coordinator_c = cstring(&coordinator);
         let calls = AtomicUsize::new(0);
@@ -1223,6 +1399,7 @@ mod tests {
         let options = TalonClientOptions {
             block_size: DEFAULT_BLOCK_SIZE,
             callback_executor: &executor,
+            max_idle_per_addr: 0,
         };
         let mut client = ptr::null_mut();
         let status = unsafe { talon_client_new(coordinator_c.as_ptr(), &options, &mut client) };

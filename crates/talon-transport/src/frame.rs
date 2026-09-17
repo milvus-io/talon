@@ -78,6 +78,14 @@ pub enum MsgType {
     /// `GetRangeTenant` an older worker rejects this distinct type rather than
     /// misreading the tenant prefix.
     GetCachedRangeTenant = 9,
+    /// An origin-backed range fetch pinned to an exact source version.
+    /// The worker may serve the matching cache entry or fill it from the
+    /// backend with a conditional request, but must never switch to a newer
+    /// source version.
+    GetVersionedRange = 10,
+    /// A version-pinned origin-backed range fetch attributed to a tenant.
+    /// The reply is an ordinary `GetRange` frame, like every range fetch.
+    GetVersionedRangeTenant = 11,
 }
 
 impl MsgType {
@@ -94,6 +102,8 @@ impl MsgType {
             7 => MsgType::AdmitCachedBlock,
             8 => MsgType::GetRangeTenant,
             9 => MsgType::GetCachedRangeTenant,
+            10 => MsgType::GetVersionedRange,
+            11 => MsgType::GetVersionedRangeTenant,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -140,11 +150,16 @@ pub enum FrameError {
     /// The advertised payload length exceeds [`MAX_PAYLOAD_LEN`].
     #[error("payload length {0} exceeds max {MAX_PAYLOAD_LEN}")]
     PayloadTooLarge(u32),
+    /// Malformed request metadata envelope.
+    #[error("invalid v2 request envelope")]
+    InvalidEnvelope,
 }
 
 /// A fixed-size, versioned frame header.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FrameHeader {
+    /// Wire version, retained on responses.
+    pub version: u8,
     /// Kind of message the frame carries.
     pub msg_type: MsgType,
     /// Frame flags.
@@ -159,6 +174,7 @@ impl FrameHeader {
     /// Construct a header with empty flags and the given request id/length.
     pub fn new(msg_type: MsgType, request_id: u32, length: u32) -> Self {
         Self {
+            version: 1,
             msg_type,
             flags: Flags::EMPTY,
             request_id,
@@ -170,7 +186,7 @@ impl FrameHeader {
     pub fn encode(&self) -> [u8; HEADER_LEN] {
         let mut buf = [0u8; HEADER_LEN];
         buf[0..2].copy_from_slice(&MAGIC.to_be_bytes());
-        buf[2] = PROTOCOL_VERSION;
+        buf[2] = self.version;
         buf[3] = self.msg_type as u8;
         buf[4..6].copy_from_slice(&self.flags.0.to_be_bytes());
         // buf[6..8] reserved, left zero.
@@ -192,10 +208,13 @@ impl FrameHeader {
             return Err(FrameError::BadMagic(magic));
         }
         let version = buf[2];
-        if version != PROTOCOL_VERSION {
+        if version != 1 && version != 2 {
             return Err(FrameError::UnsupportedVersion(version));
         }
         let msg_type = MsgType::from_u8(buf[3])?;
+        if version == 2 && !crate::envelope::supports_v2(msg_type) {
+            return Err(FrameError::InvalidEnvelope);
+        }
         let flags = Flags(u16::from_be_bytes([buf[4], buf[5]]));
         let request_id = u32::from_be_bytes([buf[8], buf[9], buf[10], buf[11]]);
         let length = u32::from_be_bytes([buf[12], buf[13], buf[14], buf[15]]);
@@ -203,6 +222,7 @@ impl FrameHeader {
             return Err(FrameError::PayloadTooLarge(length));
         }
         Ok(Self {
+            version,
             msg_type,
             flags,
             request_id,
@@ -238,11 +258,14 @@ mod tests {
             MsgType::AdmitCachedBlock,
             MsgType::GetRangeTenant,
             MsgType::GetCachedRangeTenant,
+            MsgType::GetVersionedRange,
+            MsgType::GetVersionedRangeTenant,
         ]
         .into_iter()
         .enumerate()
         {
             let h = FrameHeader {
+                version: 1,
                 msg_type: ty,
                 flags: Flags::EMPTY.with(Flags::END_OF_STREAM),
                 request_id: 0xDEAD_0000 + i as u32,
@@ -276,10 +299,10 @@ mod tests {
     #[test]
     fn decode_bad_version() {
         let mut bytes = FrameHeader::new(MsgType::Get, 1, 0).encode();
-        bytes[2] = PROTOCOL_VERSION + 1;
+        bytes[2] = PROTOCOL_VERSION + 2;
         assert_eq!(
             FrameHeader::decode(&bytes),
-            Err(FrameError::UnsupportedVersion(PROTOCOL_VERSION + 1))
+            Err(FrameError::UnsupportedVersion(PROTOCOL_VERSION + 2))
         );
     }
 

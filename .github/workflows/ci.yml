@@ -27,8 +27,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install toolchain (rustfmt)
         run: rustup component add rustfmt
+      - name: Test dependency patch preparation
+        run: python3 scripts/test_prepare_monoio.py
       - name: Check formatting
         run: cargo fmt --all --check
 
@@ -37,6 +41,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install toolchain (clippy)
         run: rustup component add clippy
       - name: Install protoc
@@ -50,6 +56,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -59,6 +67,12 @@ jobs:
         run: cargo build --workspace --exclude talon-python --all-targets --all-features --locked
       - name: Test
         run: cargo test --workspace --exclude talon-python --all-features --locked
+      - name: Test standalone Rust SDK error API consumer
+        # Seed the independent lockfile with workspace versions, then resolve
+        # offline using dependencies already fetched by the workspace build.
+        run: |
+          cp Cargo.lock clients/rust/tests/consumer/Cargo.lock
+          cargo test --manifest-path clients/rust/tests/consumer/Cargo.toml --offline --target-dir target
 
   fuse-mount:
     name: fuse mount e2e
@@ -75,6 +89,8 @@ jobs:
       TALON_REQUIRE_FUSE: "1"
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Capture the FUSE environment
         # /dev/fuse existing is necessary but not sufficient (#405). Capture
         # everything that can make an unprivileged mount fail, so a failing run
@@ -143,6 +159,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -158,6 +176,8 @@ jobs:
       MDBOOK_VERSION: "0.4.52"
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: Swatinem/rust-cache@v2
       - name: Install mdBook
         run: cargo install mdbook --version ${MDBOOK_VERSION} --locked
@@ -171,6 +191,8 @@ jobs:
     # OpenAPI spec. Fail if a committed copy is stale so docs cannot drift.
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - uses: Swatinem/rust-cache@v2
@@ -224,6 +246,8 @@ jobs:
       TALON_ETCD_TEST_ENDPOINT: 127.0.0.1:2379
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Start ephemeral etcd
@@ -380,6 +404,8 @@ jobs:
       TALON_S3_SDK_PYTHON: python
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -416,6 +442,8 @@ jobs:
       TALON_GCS_TEST_KEY: e2e/object.bin
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Start fake-gcs-server and seed a deterministic object
@@ -458,6 +486,8 @@ jobs:
       AZURE_STORAGE_CONNECTION_STRING: "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
@@ -494,6 +524,8 @@ jobs:
     # value of the binding is that it exercises the real protocol path.
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-python@v5
         with:
@@ -528,6 +560,8 @@ jobs:
     # maintainable; the second proves it actually reads bytes.
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-java@v4
         with:
@@ -550,6 +584,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: Swatinem/rust-cache@v2
       - name: Benchmark check vs committed baseline
         id: bench
@@ -570,6 +606,8 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - name: Install protoc
         run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
       - name: Install toolchain (llvm-tools)
@@ -600,6 +638,8 @@ jobs:
     # not depend on someone opening a PR.
     steps:
       - uses: actions/checkout@v4
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
       - uses: taiki-e/install-action@cargo-deny
       - name: Check advisories, bans, and sources
         run: cargo deny check advisories bans sources

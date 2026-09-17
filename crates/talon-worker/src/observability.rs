@@ -572,7 +572,9 @@ impl WorkerMetrics {
 
     /// Render the worker registry in Prometheus text exposition format.
     pub fn render(&self) -> String {
-        self.registry.render()
+        let mut output = self.registry.render();
+        output.push_str(&talon_telemetry::metrics());
+        output
     }
 }
 

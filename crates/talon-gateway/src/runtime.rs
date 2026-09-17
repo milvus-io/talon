@@ -4,7 +4,7 @@ use std::future::{Future, IntoFuture};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-use axum::body::Body;
+use axum::body::{Body, HttpBody};
 use axum::extract::{ConnectInfo, Request, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::middleware::Next;
@@ -221,11 +221,128 @@ pub fn gateway_router(runtime: Arc<GatewayRuntime>) -> Router {
         .route("/readyz", get(readiness_handler))
         .route("/metrics", get(metrics_handler))
         .merge(data)
+        .layer(axum::middleware::from_fn(telemetry_request))
         .layer(axum::middleware::from_fn_with_state(
             Arc::clone(&runtime),
             request_lifecycle,
         ))
         .with_state(runtime)
+}
+
+/// HTTP scope includes streaming consumption and drop, not just response headers.
+async fn telemetry_request(request: Request, next: axum::middleware::Next) -> Response {
+    if !talon_telemetry::enabled()
+        || matches!(request.uri().path(), "/healthz" | "/readyz" | "/metrics")
+    {
+        return next.run(request).await;
+    }
+    let parent = request
+        .headers()
+        .get("traceparent")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|p| {
+            talon_telemetry::TraceContext::from_w3c(
+                p,
+                request
+                    .headers()
+                    .get("tracestate")
+                    .and_then(|v| v.to_str().ok()),
+            )
+        });
+    let operation = talon_telemetry::Operation::new(
+        "talon.gateway",
+        "server",
+        parent
+            .as_ref()
+            .map(talon_telemetry::TraceParent::Explicit)
+            .unwrap_or(talon_telemetry::TraceParent::Root),
+    );
+    let head = request.method() == axum::http::Method::HEAD;
+    let response = operation.scope(next.run(request)).await;
+    operation.record(
+        "http.response.status_code",
+        response.status().as_u16() as u64,
+    );
+    let http_error = response.status().as_u16() >= 400;
+    let no_body = head
+        || response.status().is_informational()
+        || matches!(
+            response.status(),
+            StatusCode::NO_CONTENT | StatusCode::NOT_MODIFIED
+        );
+    let (parts, body) = response.into_parts();
+    let length = parts
+        .headers
+        .get(header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse::<u64>().ok());
+    if no_body || length == Some(0) || body.is_end_stream() {
+        operation.record("talon.response.bytes", 0);
+        operation.outcome(if http_error { "http_error" } else { "success" });
+        return Response::from_parts(parts, body);
+    }
+    Response::from_parts(
+        parts,
+        Body::new(TelemetryBody {
+            body,
+            operation,
+            bytes: 0,
+            length,
+            http_error,
+        }),
+    )
+}
+
+// Preserve the body's framing metadata. HTTP/1 can stop polling as soon as
+// Content-Length is satisfied, without polling the body for a final None.
+struct TelemetryBody {
+    body: Body,
+    operation: talon_telemetry::Operation,
+    bytes: u64,
+    length: Option<u64>,
+    http_error: bool,
+}
+impl HttpBody for TelemetryBody {
+    type Data = bytes::Bytes;
+    type Error = axum::Error;
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = &mut *self;
+        let result = this
+            .operation
+            .in_scope(|| std::pin::Pin::new(&mut this.body).poll_frame(cx));
+        match &result {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.bytes += data.len() as u64;
+                    this.operation.record("talon.response.bytes", this.bytes);
+                }
+                if this.body.is_end_stream() || this.length == Some(this.bytes) {
+                    this.operation.outcome(if this.http_error {
+                        "http_error"
+                    } else {
+                        "success"
+                    });
+                }
+            }
+            std::task::Poll::Ready(Some(Err(_))) => this.operation.outcome("error"),
+            std::task::Poll::Ready(None) => this.operation.outcome(if this.http_error {
+                "http_error"
+            } else {
+                "success"
+            }),
+            std::task::Poll::Pending => {}
+        }
+        result
+    }
+    fn is_end_stream(&self) -> bool {
+        self.body.is_end_stream()
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.body.size_hint()
+    }
 }
 
 /// Serve until shutdown, then wait a bounded time for active responses.
@@ -1645,3 +1762,7 @@ mod tests {
         task.await.unwrap().unwrap();
     }
 }
+
+#[cfg(all(test, feature = "telemetry"))]
+#[path = "telemetry_tests.rs"]
+mod telemetry_tests;

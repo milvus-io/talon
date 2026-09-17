@@ -79,3 +79,7 @@ per-block panels, keeping series cardinality bounded on large clusters.
 
 Alert `runbook_url` annotations link to `docs/operations/runbook.md` (operator
 runbook, #90), one anchor per alert.
+
+## OpenTelemetry
+
+Optional Collector/Tempo assets live in `otel/`. See the [tracing runbook](../../docs/how-to/opentelemetry.md) for build features, SDK initialization, endpoint capabilities, export health and rollout/rollback. The existing Prometheus metrics and dashboards retain their definitions.

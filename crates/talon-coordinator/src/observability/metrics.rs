@@ -387,7 +387,9 @@ impl CoordinatorMetrics {
 
     /// Render the Prometheus registry.
     pub fn render(&self) -> String {
-        self.registry.render()
+        let mut output = self.registry.render();
+        output.push_str(&talon_telemetry::metrics());
+        output
     }
 }
 

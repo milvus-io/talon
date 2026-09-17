@@ -15,10 +15,13 @@ name = "talon"
 crate-type = ["cdylib", "rlib"]
 
 [features]
+telemetry = ["talon-telemetry/export"]
 # Enabled by maturin when building a wheel; see the pyo3 dependency note.
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
+tracing.workspace = true
+talon-telemetry.workspace = true
 talon-rust-client.workspace = true
 # `extension-module` tells pyo3 not to link libpython, which is correct for a
 # wheel but breaks `cargo test` (the test harness needs a Python to link

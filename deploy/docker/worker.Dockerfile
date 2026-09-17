@@ -14,6 +14,9 @@
 # ---- chef stage ----------------------------------------------------------
 FROM rust:1.96.1-bookworm AS chef
 
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends python3 \
+    && rm -rf /var/lib/apt/lists/*
 RUN cargo install cargo-chef --locked --version 0.1.77
 WORKDIR /src
 
@@ -24,7 +27,8 @@ WORKDIR /src
 FROM chef AS planner
 
 COPY . .
-RUN cargo chef prepare --recipe-path recipe.json
+RUN python3 scripts/prepare_monoio.py \
+    && cargo chef prepare --recipe-path recipe.json
 
 # ---- build stage ---------------------------------------------------------
 FROM chef AS build
@@ -43,6 +47,8 @@ RUN apt-get update \
 # source-only change. --locked on the cook makes a stale lockfile fail here
 # in seconds instead of after the multi-minute dependency build.
 COPY --from=planner /src/recipe.json recipe.json
+# Reuse the verified and patched release prepared in the planner stage.
+COPY --from=planner /src/.patched-deps/monoio .patched-deps/monoio
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
     --package talon-worker
 

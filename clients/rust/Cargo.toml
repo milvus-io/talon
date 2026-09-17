@@ -9,6 +9,7 @@ description = "Native async Rust client for the Talon distributed object-store c
 publish = false
 
 [dependencies]
+talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-cache-client.workspace = true
 talon-transport.workspace = true
@@ -17,3 +18,6 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
+
+[features]
+telemetry = ["talon-telemetry/export"]

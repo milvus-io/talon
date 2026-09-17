@@ -98,7 +98,7 @@ layer** — that invariant is what makes Layer 2 possible, and it holds under an
 runtime.
 
 **Worker data plane: thread-per-core io_uring (default).** `worker/main.rs`
-probes io_uring at startup and, when available, serves on N rings — one per core
+probes io_uring and io-wq limit registration at startup and, when available, serves on N rings — one per core
 by default — each pinned and binding the listen address with `SO_REUSEPORT`.
 When the probe fails (older kernel, restrictive seccomp, some container
 runtimes) it falls back to the Tokio accept loop and logs the fallback, so the
@@ -140,11 +140,12 @@ it, and the same constraints apply to any further porting:
 - **Ecosystem lock-in.** `axum`, `reqwest`, `kube`, `etcd-client`, and `tonic`
   are Tokio-bound. Any migration yields ring + Tokio *coexistence*, not
   replacement.
-- **Not a blocker:** fd ownership across the ring/blocking boundary. A
-  ring-owned monoio `TcpStream` fd can be handed straight to a blocking
-  `sendfile` and the ring resumes on the same stream afterwards — none of the
-  `into_std` → `set_nonblocking` → `from_std` round-trip the Tokio path pays
-  per transfer is needed. The io_uring implementation is *smaller*.
+- **Completion-owned descriptors:** the ring-native splice operations retain
+  the pipe and cached file descriptors through CQE completion, including
+  cancellation. Socket sends retain their descriptors and header buffers until
+  completion; synchronous nonblocking pipe drains borrow the live socket. Shared cache FDs use explicit offsets, never a shared seek
+  position. Connections keep a lazily created pipe pair and fully drain it
+  before reuse. Errors after the response header close the connection.
 
 Ported: the `worker/main.rs` accept loop and `handle_conn` (including
 `handle_put`/`handle_delete`), plus a completion-based frame reader in
@@ -163,19 +164,30 @@ correctness requirement.
 
 Large payloads move via kernel zero-copy, not through Rust heap buffers:
 
-- **GET / cache read:** `sendfile(block_file_fd → socket_fd)`.
-- **PUT / ingest:** `splice(socket ↔ pipe ↔ file)`.
+- **GET / cache read (io_uring):** `IORING_OP_SPLICE(file → pipe)`, followed by
+  nonblocking `splice(pipe → socket)` on the same ring, with no
+  user-space send helper pool.
+- **GET / cache read (Tokio fallback):** blocking `sendfile(file → socket)`
+  offloaded to Tokio's blocking pool.
+- **PUT / ingest:** the existing runtime-specific staging/write path is unchanged.
 
-These blocking libc syscalls run on a `spawn_blocking` pool, off the reactor, so
-a slow client cannot stall protocol scheduling. (Under Tokio this parks one
-worker thread of many; under a single-threaded ring it would stall the ring
-outright — the isolation matters more, not less, after a monoio migration.)
+Ring-native submission does not imply worker-free execution inside the kernel.
+Upstream Linux 6.12.100 forces `IORING_OP_SPLICE` through io-wq, even for cached
+pages; throughput must therefore be compared against sendfile on the deployment
+kernel. Short completions refill/drain the pipe incrementally; backpressure
+suspends the connection future without blocking other tasks on the ring. The
+pipe contains completed reads from immutable cache files before the
+nonblocking socket drain begins. Both io-wq worker classes have explicit
+per-ring limits of eight workers. The socket uses
+O_NONBLOCK in addition to SPLICE_F_NONBLOCK; EAGAIN waits for ring-driven
+writability. Header send and the first file-to-pipe operation are submitted
+together, but the pipe is drained only after the header completes.
 Default chunk size **1 MiB**, block size **64 MiB** (our v1 default is 256 MiB —
 see §3 chunking; treat block size as configurable).
 
-This layer is **runtime-neutral**: `send_file_range` and `splice_to_file` take
-`&impl AsRawFd` and depend on no runtime types, so they survive a Layer 1
-change untouched.
+The fallback helpers `send_file_range` and `splice_to_file` remain runtime-neutral
+and take `&impl AsRawFd`. The Monoio send path uses completion-owned operations
+to retain descriptors across asynchronous file reads.
 
 ### Runtime split
 
@@ -203,20 +215,22 @@ eviction/delete/version replacement invalidates all child pages. No disk and no
 
 **L2 NVMe hit** (primary large-block path): decode header + key → `BlockIndex`
 lookup → open cached `.blk` fd → write response header →
-`sendfile(cached_fd → socket)` in the blocking helper. Large blocks are never
+file-to-pipe `IORING_OP_SPLICE` followed by a nonblocking pipe-to-socket
+splice on the ring
+(or `sendfile` in the Tokio fallback). Large blocks are never
 read into a `Vec<u8>`, avoiding NVMe→userspace and userspace→socket copies, heap
 pressure, and buffer bloat. When L1 is enabled, an L2 range hit reads and
 promotes only the aligned L1 pages touched by the request, never the whole block.
 With L1 disabled the large-block path remains
 `NVMe/page-cache → kernel → TCP socket`.
 
-**GET_RANGE hit:** identical to L2 hit but `sendfile` uses `(offset, length)` —
+**GET_RANGE hit:** identical to L2 hit with explicit `(offset, length)` —
 suited to Lance / checkpoint footer / partial reads.
 
 **Paged block hit:** for paged virtual blocks (see §3), a read resolves to the
 covered pages via the block's `present_bitmap`. Present pages are served with
-one `sendfile` per page (contiguous present pages coalesced into a single call
-by offset). Any page in the range that is absent triggers a **page-level miss**:
+ordered file-to-pipe-to-socket transfers for each page file; ranges within
+one file use explicit offsets. Any page in the range that is absent triggers a **page-level miss**:
 the loader fetches only those pages' byte ranges from the backend, not the whole
 256MB block. In-flight tracking is keyed by `(block_id, page_index)`.
 
@@ -253,16 +267,16 @@ client→worker zero-copy involved.
 
 The division of labour, independent of which Layer 1 runtime is in use:
 
-- **Protocol scheduling** (Tokio today, monoio targeted): async TCP, small
-  messages, scheduling, timers, metrics.
+- **Protocol scheduling** (Monoio on the worker data plane, Tokio elsewhere):
+  async TCP, small messages, scheduling, timers, metrics.
 - **sendfile / splice:** the actual large-block zero-copy movement.
-- **spawn_blocking:** isolates the blocking libc zero-copy syscalls off the
-  reactor, so a slow client cannot stall protocol scheduling.
+- **spawn_blocking:** isolates blocking filesystem work and Tokio fallback
+  sendfile. Resident reads on Monoio submit completion-owned file splice operations
+  and drain ready pipes with nonblocking socket splice.
 
 Future optimizations (drive by benchmarks, not speculation): fd registration,
-pipelined double-buffer splice, and evaluating `IORING_OP_SPLICE` /
-send-zero-copy. Current `sendfile`/`splice` is the simpler, stable Linux fast
-path.
+pipelined double-buffer splice and send-zero-copy. Changes must be evaluated
+on the deployment kernel because submission and kernel execution costs differ.
 
 Two items that were previously listed here have since been measured (#273):
 
@@ -330,8 +344,15 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   only pages touched by L2 hits; L2 remains persistent and authoritative for
   cache residency. Disabling L1 retains the whole-block `sendfile` path. No
   `mmap` as the default abstraction.
-- **Eviction:** byte-accounted **LRU / segmented-LRU** first. LFU risks pinning
-  stale hotspots; TinyLFU is more complex — revisit with real workload data.
+- **Eviction:** byte-accounted **approximate LRU (second chance)**. Resident
+  index entries hold stable access tokens; a read marks an atomic reference bit
+  during its existing index lookup, without cloning the block identity or taking
+  the policy mutex. Strict tail order is intentionally relaxed; pins, version
+  identity and byte accounting remain exact. Capacity reclamation walks a live
+  ordered queue in batches of 64 candidates, giving referenced units a second
+  chance. A bounded second pass guarantees progress under continuous reads.
+  Explicit and superseded-version deletion remove queue nodes immediately;
+  there is no full-cache minimum search for each victim or stale-node backlog.
   Capacity is per-worker, with support for multiple cache dirs each with its own
   cap.
 - **Chunking:** the logical addressing unit is a fixed **256MB block**. Placement,

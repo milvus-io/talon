@@ -17,7 +17,7 @@
 
 use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
 use talon_transport::codec::{self, ControlMessage, ObjectEntry, ZonedNodeInfo};
-use talon_transport::data::{self, RangeRequest};
+use talon_transport::data::{self, RangeRequest, VersionedRangeRequest};
 use talon_transport::frame::{FrameHeader, MsgType};
 
 /// One named vector: a message, the bytes it encodes to, and why it is here.
@@ -49,7 +49,7 @@ fn object(bucket: &str, path: &str) -> ObjectId {
 }
 
 fn vectors() -> Vec<Vector> {
-    vec![
+    let mut result = vec![
         // --- Frame header on its own ---------------------------------------
         Vector {
             name: "frame_header.get_range",
@@ -224,6 +224,22 @@ fn vectors() -> Vec<Vector> {
             .expect("encode range request"),
         },
         Vector {
+            name: "data.versioned_range_request",
+            note: "Distinct fail-closed request carrying the exact source version",
+            bytes: data::encode_versioned_request(
+                10,
+                &VersionedRangeRequest {
+                    request: RangeRequest {
+                        object: object("container", "path/to/object"),
+                        offset: 65536,
+                        len: 4096,
+                    },
+                    version: Version::new("etag-v1"),
+                },
+            )
+            .expect("encode versioned range request"),
+        },
+        Vector {
             name: "data.response_header_ok",
             note: "Success response header; the raw payload bytes follow unwrapped so the worker can sendfile them",
             bytes: data::response_header_ok(9, 4096).to_vec(),
@@ -233,7 +249,39 @@ fn vectors() -> Vec<Vector> {
             note: "ERROR flag set; the body is a UTF-8 message, not a payload",
             bytes: data::encode_error(9, "worker is not ready"),
         },
-    ]
+    ];
+    let parent = talon_telemetry::TraceContext::from_w3c(
+        "00-11111111111111111111111111111111-2222222222222222-01",
+        Some("vendor=value"),
+    )
+    .unwrap();
+    let original = result
+        .iter()
+        .find(|v| v.name == "data.range_request")
+        .unwrap()
+        .bytes
+        .clone();
+    for (name, context) in [
+        ("v2.range.context", Some(&parent)),
+        ("v2.range.empty", None),
+    ] {
+        let mut bytes = original.clone();
+        talon_transport::envelope::encode(&mut bytes, context, None).unwrap();
+        result.push(Vector {
+            name,
+            note: "v2 envelope; original v1 business payload unchanged",
+            bytes,
+        });
+    }
+    result.push(Vector {
+        name: "v2.response.raw",
+        note: "v2 response has no metadata prefix",
+        bytes: talon_transport::envelope::response_version(
+            data::response_header_ok(9, 4096).to_vec(),
+            2,
+        ),
+    });
+    result
 }
 
 fn main() -> anyhow::Result<()> {

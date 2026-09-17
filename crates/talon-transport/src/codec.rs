@@ -325,7 +325,7 @@ pub fn encode_for_schema(
     };
     let body = bincode::serialize(&env)?;
     let header = FrameHeader::new(MsgType::Control, request_id, body.len() as u32);
-    let mut buf = Vec::with_capacity(HEADER_LEN + body.len());
+    let mut buf = Vec::with_capacity(HEADER_LEN + body.len() + crate::envelope::outbound_reserve());
     buf.extend_from_slice(&header.encode());
     buf.extend_from_slice(&body);
     Ok(buf)
@@ -338,6 +338,19 @@ pub fn encode_for_schema(
 /// bytes present, and rejects an unknown schema version.
 pub fn decode(buf: &[u8]) -> Result<(FrameHeader, ControlMessage), CodecError> {
     decode_with_max_schema(buf, CONTROL_SCHEMA_VERSION)
+}
+
+/// Decode a request; v2 responses deliberately use the original decode API.
+pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, ControlMessage), CodecError> {
+    let header = FrameHeader::decode(buf)?;
+    if header.msg_type != MsgType::Control {
+        return Err(CodecError::NotControl(header.msg_type));
+    }
+    if header.version == 1 {
+        return decode(buf);
+    }
+    let (_, business) = crate::envelope::decode(&header, &buf[HEADER_LEN..])?;
+    decode_business(header, business, CONTROL_SCHEMA_VERSION)
 }
 
 fn decode_with_max_schema(
@@ -356,6 +369,14 @@ fn decode_with_max_schema(
             actual: body.len(),
         });
     }
+    decode_business(header, body, max_schema)
+}
+
+fn decode_business(
+    header: FrameHeader,
+    body: &[u8],
+    max_schema: u16,
+) -> Result<(FrameHeader, ControlMessage), CodecError> {
     // The schema is the first field in the fixed-int bincode envelope. Check it
     // before deserializing the message so an older peer rejects a newer enum
     // shape cleanly rather than reporting a misleading bincode failure.

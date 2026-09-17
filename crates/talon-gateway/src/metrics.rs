@@ -30,7 +30,9 @@ impl GatewayMetrics {
 
     /// Render Prometheus text exposition.
     pub fn render(&self) -> String {
-        self.registry.render()
+        let mut output = self.registry.render();
+        output.push_str(&talon_telemetry::metrics());
+        output
     }
 
     pub(crate) fn record_tls_event(&self, event: &'static str) {

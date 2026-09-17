@@ -46,7 +46,31 @@ where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    match tokio::task::spawn_blocking(f).await {
+    let task = if talon_telemetry::diagnostic() {
+        let operation = talon_telemetry::Operation::new(
+            "talon.cache.io",
+            "internal",
+            talon_telemetry::TraceParent::Inherit,
+        );
+        let submitted = std::time::Instant::now();
+        tokio::task::spawn_blocking(move || {
+            operation.record(
+                "talon.blocking.queue_wait_us",
+                submitted.elapsed().as_micros() as u64,
+            );
+            let started = std::time::Instant::now();
+            let result = operation.in_scope(f);
+            operation.record(
+                "talon.blocking.execution_us",
+                started.elapsed().as_micros() as u64,
+            );
+            operation.outcome(if result.is_ok() { "success" } else { "error" });
+            result
+        })
+    } else {
+        tokio::task::spawn_blocking(f)
+    };
+    match task.await {
         Ok(result) => result,
         Err(join_error) => Err(Error::Backend(format!(
             "blocking store task failed: {join_error}"
@@ -291,13 +315,13 @@ impl ObjectStore for WholeBlockStore {
             let tmp = path.with_extension(format!("blk.tmp.{pid}.{seq}"));
             {
                 let mut f = std::fs::File::create(&tmp)?;
-                f.write_all(&value)?;
-                f.sync_all()?;
+                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
+                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
             }
             // Rename our own unique temp into place. If a concurrent writer
             // already renamed theirs, this atomically replaces it with identical
             // bytes.
-            if let Err(e) = std::fs::rename(&tmp, &path) {
+            if let Err(e) = talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path)) {
                 // Best-effort cleanup of our staging file on failure so a failed
                 // commit never leaks a `.tmp`.
                 let _ = std::fs::remove_file(&tmp);
@@ -314,9 +338,9 @@ impl ObjectStore for WholeBlockStore {
             let meta_tmp = meta_path.with_extension(format!("meta.tmp.{pid}.{meta_seq}"));
             if let Err(error) = (|| -> std::io::Result<()> {
                 let mut f = std::fs::File::create(&meta_tmp)?;
-                f.write_all(&encoded)?;
-                f.sync_all()?;
-                std::fs::rename(&meta_tmp, &meta_path)
+                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&encoded))?;
+                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
+                talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&meta_tmp, &meta_path))
             })() {
                 let _ = std::fs::remove_file(&meta_tmp);
                 tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");

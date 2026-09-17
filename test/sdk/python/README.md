@@ -42,7 +42,8 @@ kubectl get pod -o wide -n <namespace> | grep <release>-coordinator
 
 # 2. If the bucket is empty, seed the ramp object via a throwaway mc pod
 #    (kubectl cp fails: the mc image has no tar, so pipe with exec -i + cat).
-kubectl -n <namespace> run mc-probe --image=minio/mc --restart=Never \
+kubectl -n <namespace> run mc-probe \
+  --image=docker.io/pgsty/mc:RELEASE.2026-09-13T00-00-00Z --restart=Never \
   --command -- /bin/sh -c "sleep 3600"
 kubectl -n <namespace> exec -i mc-probe -- sh -c 'cat >/tmp/bench' < /tmp/talon-bench.bin
 kubectl -n <namespace> exec mc-probe -- \

@@ -297,21 +297,31 @@ impl CoordinatorClient {
         msg: ControlMessage,
         expected: &'static str,
     ) -> Result<ControlMessage, CoordinatorError> {
-        let out = talon_transport::encode(0, &msg)?;
-        match self.exchange(&out, expected).await {
+        let mut out = talon_transport::encode(0, &msg)?;
+        match self.exchange(&mut out, expected).await {
             Ok(reply) => Ok(reply),
             Err((true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                let reply = self
-                    .pool
-                    .with_request_deadline("coordinator round_trip retry", async {
-                        stream.write_all(&out).await?;
-                        stream.flush().await?;
-                        read_control_frame(&mut stream, expected).await
-                    })
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(reply)
+                talon_telemetry::observe("talon.rpc", "client", async {
+                    talon_telemetry::text("server.address", &self.addr);
+                    talon_transport::envelope::outbound(&mut out, &self.addr)
+                        .map_err(talon_transport::CodecError::from)?;
+
+                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let reply = self
+                        .pool
+                        .with_request_deadline("coordinator round_trip retry", async {
+                            stream.write_all(&out).await?;
+                            stream.flush().await?;
+                            read_control_frame(&mut stream, expected).await
+                        })
+                        .await?;
+                    self.pool.release(&self.addr, stream);
+                    if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
+                        talon_telemetry::outcome("error");
+                    }
+                    Ok(reply)
+                })
+                .await
             }
             Err((_, err)) => Err(err),
         }
@@ -321,29 +331,40 @@ impl CoordinatorClient {
     /// `(was_reused, err)` on failure so the caller can retry a stale pooled one.
     async fn exchange(
         &self,
-        out: &[u8],
+        out: &mut Vec<u8>,
         expected: &'static str,
     ) -> Result<ControlMessage, (bool, CoordinatorError)> {
-        let (mut stream, reused) = self
-            .pool
-            .checkout(&self.addr)
-            .await
-            .map_err(|e| (false, CoordinatorError::from(e)))?;
-        let result: Result<ControlMessage, CoordinatorError> = self
-            .pool
-            .with_request_deadline("coordinator round_trip", async {
-                stream.write_all(out).await?;
-                stream.flush().await?;
-                read_control_frame(&mut stream, expected).await
-            })
-            .await;
-        match result {
-            Ok(reply) => {
-                self.pool.release(&self.addr, stream);
-                Ok(reply)
+        talon_telemetry::observe("talon.rpc", "client", async {
+            talon_telemetry::text("server.address", &self.addr);
+            talon_transport::envelope::outbound(out, &self.addr)
+                .map_err(|e| (false, CoordinatorError::Codec(e.into())))?;
+
+            let (mut stream, reused) = self
+                .pool
+                .checkout(&self.addr)
+                .await
+                .map_err(|e| (false, CoordinatorError::from(e)))?;
+            talon_telemetry::record("talon.pool.reused", reused as u64);
+            let result: Result<ControlMessage, CoordinatorError> = self
+                .pool
+                .with_request_deadline("coordinator round_trip", async {
+                    stream.write_all(out).await?;
+                    stream.flush().await?;
+                    read_control_frame(&mut stream, expected).await
+                })
+                .await;
+            match result {
+                Ok(reply) => {
+                    self.pool.release(&self.addr, stream);
+                    if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
+                        talon_telemetry::outcome("error");
+                    }
+                    Ok(reply)
+                }
+                Err(err) => Err((reused, err)),
             }
-            Err(err) => Err((reused, err)),
-        }
+        })
+        .await
     }
 }
 

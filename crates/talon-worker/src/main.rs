@@ -57,12 +57,6 @@ const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 /// of consuming a worker FD or task (issues #111 and #568).
 const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
 
-/// Blocking helper threads per io_uring ring, for the zero-copy `sendfile`
-/// path. Kept small because every ring has its own pool and the rings are
-/// pinned: a large pool per ring would oversubscribe the cores they sit on.
-#[cfg(target_os = "linux")]
-const URING_BLOCKING_THREADS_PER_RING: usize = 4;
-
 /// Bridges the backend retry decorator to the worker's metrics registry.
 ///
 /// `talon-backend` deliberately knows nothing about the worker's registry, so it
@@ -346,12 +340,26 @@ async fn build_gcs_backend(
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    #[cfg(feature = "telemetry")]
+    let _telemetry = talon_telemetry::export::init("talon-worker")
+        .map_err(|e| anyhow::anyhow!(e.to_string()))?;
+    #[cfg(not(feature = "telemetry"))]
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
         .init();
+    #[cfg(not(feature = "telemetry"))]
+    talon_telemetry::Config::from_env()
+        .and_then(talon_telemetry::configure)
+        .map_err(std::io::Error::other)?;
+    let result = run().await;
+    #[cfg(feature = "telemetry")]
+    let _ = tokio::task::spawn_blocking(move || _telemetry.shutdown()).await;
+    result
+}
 
+async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
     let file = match &args.config {
         Some(path) => WorkerConfigPatch::from_file(path)?,
@@ -748,7 +756,6 @@ async fn serve_data_plane(
             talon_worker::uring_serve::serve_with_shutdown(
                 addr,
                 rings,
-                URING_BLOCKING_THREADS_PER_RING,
                 connection_admission,
                 handler,
                 tokio_handle,
@@ -1295,6 +1302,24 @@ mod tests {
             ))
         }
 
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if let Some(expected) = if_match {
+                if expected.as_str() != "v1" {
+                    return Err(Error::VersionMismatch {
+                        expected: expected.0.clone(),
+                        found: "v1".into(),
+                    });
+                }
+            }
+            self.fetch_range(object, offset, len).await
+        }
+
         async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
             Ok(ObjectStat {
                 len: u64::MAX,
@@ -1305,7 +1330,9 @@ mod tests {
 
     #[tokio::test]
     async fn handle_conn_serves_a_hit_via_sendfile_byte_exact() {
-        use talon_transport::data::{encode_request, RangeRequest};
+        use talon_transport::data::{
+            encode_request, encode_versioned_request, RangeRequest, VersionedRangeRequest,
+        };
 
         // Build a worker over a ramp backend so the first request commits a block
         // and the second is a resident hit served with sendfile.
@@ -1363,8 +1390,19 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         let expected: Vec<u8> = (0..8u64).map(|i| ((3 + i) % 251) as u8).collect();
 
-        for _ in 0..2 {
-            let out = encode_request(0, &req).unwrap();
+        for pass in 0..2 {
+            let out = if pass == 0 {
+                encode_request(0, &req).unwrap()
+            } else {
+                encode_versioned_request(
+                    0,
+                    &VersionedRangeRequest {
+                        request: req.clone(),
+                        version: Version::new("v1"),
+                    },
+                )
+                .unwrap()
+            };
             client.write_all(&out).await.unwrap();
             client.flush().await.unwrap();
 
@@ -1510,6 +1548,23 @@ mod tests {
             let start = offset as usize;
             let end = (start + len as usize).min(full.len());
             Ok(full.slice(start..end))
+        }
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            if let Some(expected) = if_match {
+                if expected.as_str() != "stored-v1" {
+                    return Err(Error::VersionMismatch {
+                        expected: expected.0.clone(),
+                        found: "stored-v1".into(),
+                    });
+                }
+            }
+            self.fetch_range(object, offset, len).await
         }
         async fn head(&self, object: &ObjectId) -> Result<ObjectStat> {
             let objs = self.objects.lock().unwrap();
