@@ -305,14 +305,14 @@ impl Client {
         options: &RequestOptions<'_>,
     ) -> Result<Vec<u8>, Error>;
 
-    pub async fn read_into_with_options(
+    pub async fn read_into_with_options<B: ReadDestination>(
         &self,
         object: &ObjectId,
         offset: u64,
-        dst: &mut [u8],
+        dst: B,
         known_stat: Option<&ObjectStat>,
         options: &RequestOptions<'_>,
-    ) -> Result<usize, Error>;
+    ) -> (Result<usize, Error>, B);
 
     pub async fn stat_with_options(
         &self,
@@ -346,9 +346,10 @@ let options = RequestOptions {
         None => TraceParent::Root,
     },
 };
-let n = client
-    .read_into_with_options(&object, offset, &mut dst, known_stat.as_ref(), &options)
-    .await?;
+let (result, dst) = client
+    .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
+    .await;
+let n = result?;
 ```
 
 RequestOptions 借用的 TraceContext 在 future 完成/drop 前有效，由 Rust 生命周期保证。spawn 'static 任务时把拥有的 TraceContext move 进任务，在任务内构造借用 options；不要把借用的线程栈 options 交给后台执行器。完整 SDK 初始化另行执行，不发生在每次 read_with_options 中。

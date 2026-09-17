@@ -47,7 +47,11 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(target_os = "linux")]
+use crate::client_io::Config;
+use crate::client_io::{ClientIoBackend, Counts};
 use crate::lock::MutexExt;
+use crate::rpc::{self, Runtime};
 use tokio::net::TcpStream;
 
 /// Default maximum idle connections kept per peer address.
@@ -92,6 +96,12 @@ struct Idle {
 /// released or dropped.
 pub struct ConnectionPool {
     idle: Mutex<HashMap<String, Vec<Idle>>>,
+    counts: std::sync::Arc<Counts>,
+    #[cfg(target_os = "linux")]
+    native: std::sync::OnceLock<
+        Result<std::sync::Arc<crate::client_io::Endpoint>, (std::io::ErrorKind, String)>,
+    >,
+    io_backend: ClientIoBackend,
     deadlines: crate::deadline::Deadlines,
     max_idle_per_addr: usize,
     idle_ttl: Duration,
@@ -109,6 +119,14 @@ impl ConnectionPool {
     pub fn with_limits(max_idle_per_addr: usize, idle_ttl: Duration) -> Self {
         Self {
             idle: Mutex::new(HashMap::new()),
+            counts: std::sync::Arc::default(),
+            #[cfg(target_os = "linux")]
+            native: std::sync::OnceLock::new(),
+            io_backend: if std::env::var("TALON_CLIENT_FORCE_TOKIO").as_deref() == Ok("1") {
+                ClientIoBackend::Tokio
+            } else {
+                ClientIoBackend::Auto
+            },
             deadlines: crate::deadline::Deadlines::default(),
             max_idle_per_addr: max_idle_per_addr.max(1),
             idle_ttl,
@@ -117,8 +135,130 @@ impl ConnectionPool {
         }
     }
 
+    /// Select complete RPC execution on Monoio or Tokio. Changing the backend
+    /// releases native idle connections; public raw Tokio pool APIs stay available.
+    pub fn with_io_backend(mut self, backend: ClientIoBackend) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            self.native.take();
+        }
+        self.io_backend = backend;
+        self
+    }
+
+    pub(crate) async fn rpc_range_into(
+        &self,
+        addr: &str,
+        frame: Vec<u8>,
+        target: &mut crate::read_buffer::ReadTarget,
+    ) -> Result<rpc::Reply, rpc::Error> {
+        if self.io_backend != ClientIoBackend::Tokio {
+            let req = rpc::Request::range_into(frame, target.lend().await);
+            let result = self.rpc(addr, req).await;
+            target.wait_idle().await;
+            return result;
+        }
+        use rpc::Socket;
+        let expected = rpc::Expected::Range(target.len() as u64);
+        for attempt in 0..2 {
+            let (mut socket, reused) = if attempt == 0 {
+                self.checkout(addr).await?
+            } else {
+                (self.fresh(addr).await?, false)
+            };
+            talon_telemetry::record("talon.pool.reused", reused as u64);
+            let result = self
+                .with_request_deadline("RPC", async {
+                    tokio::io::AsyncWriteExt::write_all(&mut socket, &frame).await?;
+                    socket.response_into(expected, target).await
+                })
+                .await;
+            match result {
+                Ok(reply) => {
+                    self.release(addr, socket);
+                    return Ok(reply);
+                }
+                Err(error) if attempt == 0 && reused && error.transport() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("at most one retry")
+    }
+
+    pub(crate) async fn rpc(
+        &self,
+        addr: &str,
+        mut req: rpc::Request,
+    ) -> Result<rpc::Reply, rpc::Error> {
+        if self.io_backend != ClientIoBackend::Tokio {
+            #[cfg(target_os = "linux")]
+            {
+                let native = self.native.get_or_init(|| {
+                    crate::client_io::Endpoint::new(Config {
+                        max_idle: self.max_idle_per_addr,
+                        ttl: self.idle_ttl,
+                        connect: self.connect_timeout,
+                        request: self.request_timeout,
+                        counts: self.counts.clone(),
+                    })
+                    .map_err(|e| (e.kind(), e.to_string()))
+                });
+                match native {
+                    Ok(native) => {
+                        let outcome = native.call(addr, req).await;
+                        talon_telemetry::record("talon.pool.reused", outcome.reused as u64);
+                        return outcome.result;
+                    }
+                    Err((kind, text)) if self.io_backend == ClientIoBackend::IoUring => {
+                        return Err(std::io::Error::new(*kind, text.clone()).into())
+                    }
+                    Err(_) => {}
+                }
+            }
+            #[cfg(not(target_os = "linux"))]
+            if self.io_backend == ClientIoBackend::IoUring {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "io_uring requires Linux",
+                )
+                .into());
+            }
+        }
+        let timeout = req.timeout.unwrap_or(self.request_timeout);
+        let mut file = rpc::Tokio::timeout(timeout, rpc::prepare::<rpc::Tokio>(&req)).await??;
+        for attempt in 0..2 {
+            let (mut socket, reused) = if attempt == 0 {
+                self.checkout(addr).await?
+            } else {
+                (self.fresh(addr).await?, false)
+            };
+            talon_telemetry::record("talon.pool.reused", reused as u64);
+            let mut retry_safe = true;
+            let result = self
+                .with_deadline(
+                    "RPC",
+                    timeout,
+                    rpc::exchange::<rpc::Tokio>(&mut socket, &mut req, &mut file, &mut retry_safe),
+                )
+                .await;
+            match result {
+                Ok(reply) => {
+                    self.release(addr, socket);
+                    return Ok(reply);
+                }
+                Err(error) if attempt == 0 && reused && retry_safe && error.transport() => {}
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!("at most one retry")
+    }
+
     /// Override the connect and per-exchange deadlines (for tuning/tests).
     pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            self.native.take();
+        }
         self.connect_timeout = connect;
         self.request_timeout = request;
         self
@@ -161,6 +301,9 @@ impl ConnectionPool {
         self.deadlines.run(what, timeout, fut).await
     }
 
+    /// Raw Tokio connection API, retained for compatibility. SDK exchanges use
+    /// the selected backend internally and maintain a separate idle pool.
+    ///
     /// Take a ready connection for `addr`: a fresh-enough pooled one, or a newly
     /// dialed one if none is available.
     ///
@@ -227,6 +370,7 @@ impl ConnectionPool {
             .get(addr)
             .map(|b| b.len())
             .unwrap_or(0)
+            + self.counts.get(addr)
     }
 }
 
@@ -241,6 +385,7 @@ impl std::fmt::Debug for ConnectionPool {
         // TcpStream is not Debug; summarize the pool without touching sockets.
         let addrs = self.idle.lock_recover().len();
         f.debug_struct("ConnectionPool")
+            .field("io_backend", &self.io_backend)
             .field("max_idle_per_addr", &self.max_idle_per_addr)
             .field("idle_ttl", &self.idle_ttl)
             .field("connect_timeout", &self.connect_timeout)
