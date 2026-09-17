@@ -562,51 +562,52 @@ impl Coordinator {
         attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<ControlMessage> {
         talon_telemetry::observe("talon.rpc", "client", async {
-        let _permit = tokio::time::timeout_at(attempt_deadline, self.worker_proxy_slots.acquire())
-            .await
-            .map_err(|_| anyhow::anyhow!("worker proxy concurrency wait exhausted attempt budget"))?
-            .map_err(|_| anyhow::anyhow!("worker proxy concurrency limiter closed"))?;
+            let _permit = tokio::time::timeout_at(attempt_deadline, self.worker_proxy_slots.acquire())
+                .await
+                .map_err(|_| anyhow::anyhow!("worker proxy concurrency wait exhausted attempt budget"))?
+                .map_err(|_| anyhow::anyhow!("worker proxy concurrency limiter closed"))?;
 
-        if let Some(stream) = self.worker_proxy_pool.checkout(address) {
+            if let Some(stream) = self.worker_proxy_pool.checkout(address) {
+                match Self::exchange_with_worker(stream, address, message, attempt_deadline).await {
+                    Ok((stream, reply)) => {
+                        self.worker_proxy_pool.release(address, stream);
+                        return Ok(reply);
+                    }
+                    Err(reused_error) => {
+                        // The peer may have closed an otherwise healthy socket
+                        // while it sat idle. Retry only this transport exchange on
+                        // a fresh connection and keep the same attempt deadline.
+                        let stream = Self::connect_worker(address, attempt_deadline)
+                            .await
+                            .map_err(|fresh_error| {
+                                anyhow::anyhow!(
+                                    "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
+                                )
+                            })?;
+                        return match Self::exchange_with_worker(stream, address, message, attempt_deadline).await
+                        {
+                            Ok((stream, reply)) => {
+                                self.worker_proxy_pool.release(address, stream);
+                                Ok(reply)
+                            }
+                            Err(fresh_error) => Err(anyhow::anyhow!(
+                                "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
+                            )),
+                        };
+                    }
+                }
+            }
+
+            let stream = Self::connect_worker(address, attempt_deadline).await?;
             match Self::exchange_with_worker(stream, address, message, attempt_deadline).await {
                 Ok((stream, reply)) => {
                     self.worker_proxy_pool.release(address, stream);
-                    return Ok(reply);
+                    Ok(reply)
                 }
-                Err(reused_error) => {
-                    // The peer may have closed an otherwise healthy socket
-                    // while it sat idle. Retry only this transport exchange on
-                    // a fresh connection and keep the same attempt deadline.
-                    let stream = Self::connect_worker(address, attempt_deadline)
-                        .await
-                        .map_err(|fresh_error| {
-                            anyhow::anyhow!(
-                                "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
-                            )
-                        })?;
-                    return match Self::exchange_with_worker(stream, address, message, attempt_deadline).await
-                    {
-                        Ok((stream, reply)) => {
-                            self.worker_proxy_pool.release(address, stream);
-                            Ok(reply)
-                        }
-                        Err(fresh_error) => Err(anyhow::anyhow!(
-                            "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
-                        )),
-                    };
-                }
+                Err(error) => Err(error),
             }
-        }
-
-        let stream = Self::connect_worker(address, attempt_deadline).await?;
-        match Self::exchange_with_worker(stream, address, message, attempt_deadline).await {
-            Ok((stream, reply)) => {
-                self.worker_proxy_pool.release(address, stream);
-                Ok(reply)
-            }
-            Err(error) => Err(error),
-        }
-        }).await
+        })
+        .await
     }
 
     async fn connect_worker(
