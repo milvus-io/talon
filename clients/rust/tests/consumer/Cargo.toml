@@ -11,6 +11,11 @@ publish = false
 [dependencies]
 talon-rust-client = { path = "../.." }
 
+# Patches do not propagate from a dependency's workspace. Use the same
+# prepared Monoio source as the root workspace, including in offline CI.
+[patch.crates-io]
+monoio = { path = "../../../../.patched-deps/monoio" }
+
 [[test]]
 name = "public_error_api"
 path = "../public_error_api.rs"
