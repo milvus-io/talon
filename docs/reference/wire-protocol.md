@@ -193,7 +193,9 @@ entries and resolve them against the rebuilt table.
 
 **Replica fallback.** On a fetch failure, walk the cached replicas in order. If
 all are exhausted, invalidate the entry, refresh membership once, and retry
-before giving up. If membership refresh fails, an existing client retains its
+before giving up. Concurrent failures share a completed membership refresh; a
+later read can refresh again even if that attempt failed or returned unchanged
+membership. If membership refresh fails, an existing client retains its
 last-good snapshot so a coordinator outage does not interrupt cached data-plane
 placement.
 
