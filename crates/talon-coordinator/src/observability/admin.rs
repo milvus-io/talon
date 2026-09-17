@@ -106,17 +106,26 @@ async fn health_handler(State(state): State<Arc<CoordinatorObservability>>) -> R
 }
 
 async fn readiness_handler(State(state): State<Arc<CoordinatorObservability>>) -> Response {
-    match state.check_ready().await {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ready": true}))).into_response(),
-        Err(error) => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ready": false,
-                "reason": state_error_kind(&error),
-            })),
-        )
-            .into_response(),
+    let probe = state.check_ready().await;
+    if state.is_ready() {
+        // A failed probe is still recorded in metrics, but an isolated backend
+        // timeout must not eject a coordinator whose last reconciled snapshot
+        // remains inside the bounded failure grace.
+        return (StatusCode::OK, Json(serde_json::json!({"ready": true}))).into_response();
     }
+
+    let reason = probe
+        .as_ref()
+        .err()
+        .map_or("membership_snapshot_stale", |error| state_error_kind(error));
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({
+            "ready": false,
+            "reason": reason,
+        })),
+    )
+        .into_response()
 }
 
 #[cfg(test)]
@@ -126,7 +135,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     use super::*;
-    use crate::observability::state::observability;
+    use crate::observability::state::{observability, observability_with_state_failure_grace};
 
     #[tokio::test]
     async fn admin_endpoints_report_health_readiness_metrics_and_failure() {
@@ -149,6 +158,30 @@ mod tests {
         assert!(ready.starts_with("HTTP/1.1 503 Service Unavailable"));
         assert!(ready.contains("\"reason\":\"unavailable\""));
 
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn readiness_probe_tolerates_one_store_failure_with_recent_membership() {
+        let (observability, store) =
+            observability_with_state_failure_grace(std::time::Duration::from_secs(1));
+        observability.check_ready().await.unwrap();
+        observability
+            .reconcile_membership(&crate::Membership::new())
+            .await
+            .unwrap();
+        store.set_available(false);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_admin(listener, Arc::clone(&observability)));
+        let ready = request(address, "/readyz").await;
+
+        assert!(ready.starts_with("HTTP/1.1 200 OK"), "{ready}");
+        assert!(observability.is_ready());
+        assert!(observability.metrics.render().contains(
+            "talon_coordinator_state_store_errors_total{kind=\"unavailable\",operation=\"readiness\"} 1"
+        ));
         server.abort();
     }
 

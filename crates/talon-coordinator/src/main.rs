@@ -97,7 +97,7 @@ struct Args {
     /// Node heartbeat interval in milliseconds.
     #[arg(long)]
     heartbeat_interval_ms: Option<u64>,
-    /// Node unhealthy threshold in milliseconds.
+    /// Node unhealthy threshold and last-good membership grace in milliseconds.
     #[arg(long)]
     unhealthy_after_ms: Option<u64>,
     /// Node lease TTL in milliseconds.
@@ -871,6 +871,7 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(config.state.request_timeout_ms),
         store,
     )?
+    .with_state_failure_grace(Duration::from_millis(config.state.unhealthy_after_ms))
     .with_capabilities(capabilities);
     if let Some(metadata_store) = metadata_store.clone() {
         observability = observability.with_metadata_store(metadata_store);
@@ -881,6 +882,13 @@ async fn run() -> anyhow::Result<()> {
         Arc::clone(&observability),
         Duration::from_millis(config.state.lease_ttl_ms),
     );
+
+    // Install authoritative membership before opening listeners. A health
+    // probe alone cannot establish the placement view used during a failure.
+    observability
+        .reconcile_membership(state.service.membership())
+        .await?;
+    state.refresh_worker_proxy_membership();
 
     // Management security (#85): auth mode from the environment. A bearer token
     // in TALON_COORDINATOR_AUTH_TOKEN enables authentication on /api/v1 and the
@@ -1096,7 +1104,7 @@ fn spawn_membership_reconcile(
                 .await
             {
                 // Non-fatal: local membership is left last-good and readiness is
-                // cleared, so placement fails closed until the store recovers.
+                // retained only within the configured last-good grace.
                 tracing::warn!(%error, "membership reconcile from shared state failed");
             } else {
                 state.refresh_worker_proxy_membership();
