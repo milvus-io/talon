@@ -16,6 +16,10 @@ talon-transport.workspace = true
 futures.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 
 [features]
 telemetry = ["talon-telemetry/export"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio.workspace = true

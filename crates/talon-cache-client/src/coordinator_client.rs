@@ -11,24 +11,29 @@
 //! with older callers, but the current read path does not use them.
 //!
 //! Both are single request/response round-trips over the control plane: write
-//! one [`MsgType::Control`] frame carrying a bincode [`ControlMessage`], read
+//! one [`MsgType::Control`](talon_transport::MsgType::Control) frame carrying a bincode [`ControlMessage`], read
 //! one framed [`ControlMessage`] back. Connections are reused from a shared
 //! [`ConnectionPool`] so warm lookups skip the TCP handshake (issue #181). The
 //! transport framing/codec is reused verbatim
 //! ([`talon_transport::encode`]/[`decode`](talon_transport::decode)), so this
-//! module only owns the connect + read-a-frame glue and the response matching.
+//! module owns request construction and business-response matching; complete
+//! wire exchanges run on the selected transport.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
+#[cfg(test)]
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
-use talon_transport::{ControlMessage, ZonedNodeInfo, MAX_CONTROL_PAYLOAD_LEN};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+#[cfg(test)]
+use talon_transport::MAX_CONTROL_PAYLOAD_LEN;
+use talon_transport::{ControlMessage, ZonedNodeInfo};
+#[cfg(test)]
+use tokio::io::AsyncWriteExt;
 
 use crate::pool::ConnectionPool;
+use crate::rpc::RequestExecutor;
 
 /// How long to keep answering zoned membership from the v1 query after the
 /// schema-v5 query failed (an older coordinator drops the connection), so an
@@ -102,13 +107,35 @@ impl CoordinatorError {
 ///
 /// Reuses connections from a shared [`ConnectionPool`] so warm lookups skip the
 /// TCP handshake (issue #181). Cloneable — clones share the same pool.
-#[derive(Debug, Clone)]
-pub struct CoordinatorClient {
+#[derive(Debug)]
+pub struct CoordinatorClient<P = ConnectionPool> {
     addr: String,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<P>,
     /// Unix ms of the last failed schema-v5 membership query (`0` = none);
     /// shared across clones so the fallback cooldown is per coordinator.
     membership_v2_failed_at_ms: Arc<AtomicU64>,
+}
+
+impl<P> Clone for CoordinatorClient<P> {
+    fn clone(&self) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            pool: self.pool.clone(),
+            membership_v2_failed_at_ms: self.membership_v2_failed_at_ms.clone(),
+        }
+    }
+}
+
+impl<P> CoordinatorClient<P> {
+    /// Rebind transport while sharing coordinator compatibility state. The new
+    /// pool is owned by its runtime; no socket is transferred between runtimes.
+    pub fn with_transport<Q>(&self, pool: Arc<Q>) -> CoordinatorClient<Q> {
+        CoordinatorClient {
+            addr: self.addr.clone(),
+            pool,
+            membership_v2_failed_at_ms: self.membership_v2_failed_at_ms.clone(),
+        }
+    }
 }
 
 impl CoordinatorClient {
@@ -116,9 +143,11 @@ impl CoordinatorClient {
     pub fn new(addr: impl Into<String>) -> Self {
         Self::with_pool(addr, Arc::new(ConnectionPool::new()))
     }
+}
 
+impl<P: RequestExecutor> CoordinatorClient<P> {
     /// Create a client that reuses connections from the shared `pool`.
-    pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
+    pub fn with_pool(addr: impl Into<String>, pool: Arc<P>) -> Self {
         Self {
             addr: addr.into(),
             pool,
@@ -297,71 +326,25 @@ impl CoordinatorClient {
         msg: ControlMessage,
         expected: &'static str,
     ) -> Result<ControlMessage, CoordinatorError> {
-        let mut out = talon_transport::encode(0, &msg)?;
-        match self.exchange(&mut out, expected).await {
-            Ok(reply) => Ok(reply),
-            Err((true, err)) if err.is_transport_failure() => {
-                talon_telemetry::observe("talon.rpc", "client", async {
-                    talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut out, &self.addr)
-                        .map_err(talon_transport::CodecError::from)?;
-
-                    let mut stream = self.pool.fresh(&self.addr).await?;
-                    let reply = self
-                        .pool
-                        .with_request_deadline("coordinator round_trip retry", async {
-                            stream.write_all(&out).await?;
-                            stream.flush().await?;
-                            read_control_frame(&mut stream, expected).await
-                        })
-                        .await?;
-                    self.pool.release(&self.addr, stream);
-                    if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
-                        talon_telemetry::outcome("error");
-                    }
-                    Ok(reply)
-                })
-                .await
-            }
-            Err((_, err)) => Err(err),
-        }
-    }
-
-    /// One request/response over a pooled-or-fresh connection; returns
-    /// `(was_reused, err)` on failure so the caller can retry a stale pooled one.
-    async fn exchange(
-        &self,
-        out: &mut Vec<u8>,
-        expected: &'static str,
-    ) -> Result<ControlMessage, (bool, CoordinatorError)> {
+        let _ = expected;
+        let mut frame = talon_transport::encode(0, &msg)?;
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound(out, &self.addr)
-                .map_err(|e| (false, CoordinatorError::Codec(e.into())))?;
-
-            let (mut stream, reused) = self
+            talon_transport::envelope::outbound(&mut frame, &self.addr)
+                .map_err(talon_transport::CodecError::from)?;
+            match self
                 .pool
-                .checkout(&self.addr)
+                .execute_request(&self.addr, crate::rpc::Request::control(frame))
                 .await
-                .map_err(|e| (false, CoordinatorError::from(e)))?;
-            talon_telemetry::record("talon.pool.reused", reused as u64);
-            let result: Result<ControlMessage, CoordinatorError> = self
-                .pool
-                .with_request_deadline("coordinator round_trip", async {
-                    stream.write_all(out).await?;
-                    stream.flush().await?;
-                    read_control_frame(&mut stream, expected).await
-                })
-                .await;
-            match result {
-                Ok(reply) => {
-                    self.pool.release(&self.addr, stream);
+                .map_err(crate::rpc::Error::coordinator)?
+            {
+                crate::rpc::Reply::Control(reply) => {
                     if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
                         talon_telemetry::outcome("error");
                     }
                     Ok(reply)
                 }
-                Err(err) => Err((reused, err)),
+                _ => unreachable!("validated control reply"),
             }
         })
         .await
@@ -386,42 +369,6 @@ impl ResolvedPlacement {
     pub fn address_of(&self, id: &NodeId) -> Option<&str> {
         self.addresses.get(id).map(String::as_str)
     }
-}
-
-/// Read one framed [`ControlMessage`] from `stream`.
-///
-/// Reads the 16-byte header, validates the payload against
-/// [`MAX_CONTROL_PAYLOAD_LEN`] before allocation, then decodes the full frame
-/// with the control codec. `expected` names the request for error context only.
-async fn read_control_frame(
-    stream: &mut TcpStream,
-    expected: &'static str,
-) -> Result<ControlMessage, CoordinatorError> {
-    let mut header_buf = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header_buf).await?;
-    let header = FrameHeader::decode(&header_buf)
-        .map_err(|e| CoordinatorError::Codec(talon_transport::CodecError::Frame(e)))?;
-    if header.msg_type != MsgType::Control {
-        // Surface as a codec error to keep one error channel for framing.
-        return Err(CoordinatorError::Codec(
-            talon_transport::CodecError::NotControl(header.msg_type),
-        ));
-    }
-    if header.length > MAX_CONTROL_PAYLOAD_LEN {
-        return Err(CoordinatorError::PayloadTooLarge {
-            length: header.length,
-            cap: MAX_CONTROL_PAYLOAD_LEN,
-        });
-    }
-    let mut payload = vec![0u8; header.length as usize];
-    stream.read_exact(&mut payload).await?;
-    // Reassemble header || payload for the codec's decode.
-    let mut full = header_buf.to_vec();
-    full.extend_from_slice(&payload);
-    let (_hdr, msg) = talon_transport::decode(&full)?;
-    // `expected` retained for future richer diagnostics.
-    let _ = expected;
-    Ok(msg)
 }
 
 #[cfg(test)]

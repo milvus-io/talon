@@ -49,13 +49,21 @@
 
 mod client;
 mod error;
+mod hosted;
+pub use hosted::HostedClient;
+pub use talon_cache_client::read_buffer::ReadDestination;
 
 pub use client::{parse_uri, Client, ClientBuilder, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS};
 pub use error::{Error, UriError};
 pub use talon_cache_client::{
-    BlockReadError, CacheReadError, CoordinatorError, ObjectStat, WorkerError,
+    BlockReadError, CacheReadError, ClientIoBackend, CoordinatorError, ObjectStat, WorkerError,
 };
 pub use talon_core::{ObjectId, Version};
 pub use talon_transport::{DataErrorCode, DataPlaneError, ObjectEntry};
 
 pub use talon_telemetry::{RequestOptions, TraceContext, TraceParent};
+
+/// Thread-local Rust SDK client for a caller-owned Monoio runtime on Linux.
+/// Construct with [`ClientBuilder::build_native`]; no Tokio runtime is required.
+#[cfg(target_os = "linux")]
+pub type NativeClient = Client<talon_cache_client::monoio_client::MonoioClient>;

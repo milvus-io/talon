@@ -1,11 +1,14 @@
 use std::sync::Arc;
+use talon_cache_client::read_buffer::{ReadBuffer, ReadDestination, ReadTarget};
+use talon_cache_client::rpc::RequestExecutor;
 use tokio::sync::Semaphore;
 
 use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
 use futures::stream::{FuturesUnordered, StreamExt};
 use talon_cache_client::pool::{DEFAULT_IDLE_TTL, DEFAULT_MAX_IDLE_PER_ADDR};
 use talon_cache_client::{
-    iter_read, BlockReader, BlockSegment, ConnectionPool, CoordinatorClient, PlacementCache,
+    iter_read, BlockReader, BlockSegment, ClientIoBackend, ConnectionPool, CoordinatorClient,
+    PlacementCache,
 };
 
 const PLACEMENT_TTL_MS: u64 = 30_000;
@@ -16,11 +19,11 @@ const MAX_CONCURRENT_BLOCK_READS_PER_READ: usize = 8;
 /// Default active block-read budget shared by a client and all its clones.
 pub const DEFAULT_MAX_IN_FLIGHT_BLOCK_READS: usize = 1024;
 
-/// A reusable, runtime-owning-neutral Talon client.
-#[derive(Clone)]
-pub struct Client {
-    coordinator: CoordinatorClient,
-    reader: BlockReader,
+/// A reusable Talon client. The default transport accepts Tokio callers;
+/// `ClientBuilder::build_native` (Linux) uses the caller's Monoio runtime directly.
+pub struct Client<P = ConnectionPool> {
+    coordinator: CoordinatorClient<P>,
+    reader: BlockReader<P>,
     block_read_permits: Arc<Semaphore>,
     block_size: u32,
 }
@@ -29,11 +32,14 @@ pub struct Client {
 ///
 /// Defaults to 256 MiB blocks and 8 idle connections per peer address.
 /// A coordinator address must be supplied before [`build`](Self::build).
+#[derive(Clone)]
 pub struct ClientBuilder {
     coordinator: String,
     block_size: u32,
-    max_idle_per_addr: usize,
+    pub(crate) max_idle_per_addr: usize,
     max_in_flight_block_reads: usize,
+    io_backend: Option<ClientIoBackend>,
+    io_threads: Option<usize>,
 }
 
 impl Default for ClientBuilder {
@@ -43,6 +49,8 @@ impl Default for ClientBuilder {
             block_size: 256 << 20,
             max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
             max_in_flight_block_reads: DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
+            io_backend: None,
+            io_threads: None,
         }
     }
 }
@@ -77,13 +85,82 @@ impl ClientBuilder {
         self
     }
 
+    /// Set hosted execution parallelism. Must be positive. Only `build_hosted`
+    /// creates execution threads; `build` and `build_native` use caller runtimes.
+    /// Overrides TALON_CLIENT_IO_THREADS, then the legacy TOKIO_WORKER_THREADS;
+    /// the default is the number of CPUs available to this process.
+    pub fn with_io_threads(mut self, threads: usize) -> Self {
+        self.io_threads = Some(threads);
+        self
+    }
+
+    /// Select the TCP I/O backend for coordinator and worker exchanges.
+    /// Auto prefers io_uring on Linux. Tokio forces the portable backend;
+    /// IoUring fails on the first connection if the host cannot create a ring.
+    /// This explicit setting overrides `TALON_CLIENT_FORCE_TOKIO`.
+    pub fn with_io_backend(mut self, backend: ClientIoBackend) -> Self {
+        self.io_backend = Some(backend);
+        self
+    }
+
     /// Validate configuration and construct a client without selecting a Tokio runtime.
     pub fn build(self) -> Result<Client, Error> {
+        let max_idle = self.max_idle_per_addr;
+        let backend = self.io_backend;
+        self.build_with(|| {
+            let pool = ConnectionPool::with_limits(max_idle, DEFAULT_IDLE_TTL);
+            match backend {
+                Some(backend) => pool.with_io_backend(backend),
+                None => pool,
+            }
+        })
+    }
+
+    /// Build a thread-safe handle that executes entire SDK operations on an
+    /// owned runtime group. Auto selects Monoio on Linux and falls back to
+    /// Tokio only if runtime initialization fails. No caller runtime is needed.
+    pub fn build_hosted(self) -> Result<crate::HostedClient, Error> {
+        let backend = self.io_backend.unwrap_or_else(|| {
+            if std::env::var("TALON_CLIENT_FORCE_TOKIO").as_deref() == Ok("1") {
+                ClientIoBackend::Tokio
+            } else {
+                ClientIoBackend::Auto
+            }
+        });
+        let threads = crate::hosted::resolve_threads(self.io_threads)?;
+        crate::hosted::build(self, backend, threads)
+    }
+
+    /// Build a thread-local client for the caller's Monoio runtime on Linux.
+    /// Create, poll and drop it inside a timer-enabled Monoio runtime. This
+    /// explicit native entry does not use a dispatcher or automatic fallback.
+    /// `with_io_backend(Tokio)` conflicts with this entry and is rejected.
+    #[cfg(target_os = "linux")]
+    pub fn build_native(
+        self,
+    ) -> Result<Client<talon_cache_client::monoio_client::MonoioClient>, Error> {
+        if self.io_backend == Some(ClientIoBackend::Tokio) {
+            return Err(Error::InvalidArgument(
+                "Tokio backend conflicts with build_native".into(),
+            ));
+        }
+        let max_idle = self.max_idle_per_addr;
+        self.build_with(|| {
+            talon_cache_client::monoio_client::MonoioClient::new()
+                .with_limits(max_idle, DEFAULT_IDLE_TTL)
+        })
+    }
+
+    fn build_with<P: RequestExecutor + Default>(
+        self,
+        pool: impl Fn() -> P,
+    ) -> Result<Client<P>, Error> {
         let Self {
             coordinator,
             block_size,
             max_idle_per_addr,
             max_in_flight_block_reads,
+            ..
         } = self;
         if coordinator.is_empty() {
             return Err(Error::InvalidArgument(
@@ -103,19 +180,12 @@ impl ClientBuilder {
                 "max_in_flight_block_reads is outside the supported nonzero range".into(),
             ));
         }
+        let pool = || Arc::new(pool());
         // Keep control and data connections in separate pools.
-        let coordinator = CoordinatorClient::with_pool(
-            coordinator,
-            Arc::new(ConnectionPool::with_limits(
-                max_idle_per_addr,
-                DEFAULT_IDLE_TTL,
-            )),
-        );
+        let coordinator = CoordinatorClient::with_pool(coordinator, pool());
         let cache = Arc::new(PlacementCache::new(PLACEMENT_TTL_MS));
         let reader =
-            BlockReader::new(coordinator.clone(), cache, REPLICAS_K).with_worker_pool(Arc::new(
-                ConnectionPool::with_limits(max_idle_per_addr, DEFAULT_IDLE_TTL),
-            ));
+            BlockReader::new(coordinator.clone(), cache, REPLICAS_K).with_worker_pool(pool());
         Ok(Client {
             coordinator,
             reader,
@@ -125,7 +195,45 @@ impl ClientBuilder {
     }
 }
 
+impl<P> Clone for Client<P> {
+    fn clone(&self) -> Self {
+        Self {
+            coordinator: self.coordinator.clone(),
+            reader: self.reader.clone(),
+            block_read_permits: self.block_read_permits.clone(),
+            block_size: self.block_size,
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
 impl Client {
+    // Shared SDK types use Arc<P> for both backends. These native Arcs remain
+    // !Send/!Sync and are created, polled and dropped only on their owning ring.
+    #[allow(clippy::arc_with_non_send_sync)]
+    pub(crate) fn on_ring(
+        &self,
+        control: &talon_cache_client::monoio_client::SharedIdleBudget,
+        data: &talon_cache_client::monoio_client::SharedIdleBudget,
+    ) -> crate::NativeClient {
+        use talon_cache_client::monoio_client::MonoioClient;
+        let coordinator = self
+            .coordinator
+            .with_transport(Arc::new(MonoioClient::new().with_idle_budget(control)));
+        let reader = self.reader.with_transport(
+            coordinator.clone(),
+            Arc::new(MonoioClient::new().with_idle_budget(data)),
+        );
+        Client {
+            coordinator,
+            reader,
+            block_read_permits: self.block_read_permits.clone(),
+            block_size: self.block_size,
+        }
+    }
+}
+
+impl<P: RequestExecutor + Default> Client<P> {
     /// Address of the coordinator used by this client.
     pub fn coordinator_addr(&self) -> &str {
         self.coordinator.addr()
@@ -233,24 +341,31 @@ impl Client {
             return Ok(Vec::new());
         }
 
-        let mut bytes = vec![0_u8; planned];
-        let written = self
-            .read_into_resolved(object, offset, &mut bytes, &stat)
-            .await?;
-        bytes.truncate(written);
+        if stat.version.trim().is_empty() {
+            return Err(Error::InvalidArgument(
+                "object version must be non-empty".into(),
+            ));
+        }
+        let mut buffer = ReadBuffer::new(vec![0; planned]);
+        let target = buffer.take_target();
+        let result = self.read_into_resolved(object, offset, target, &stat).await;
+        let mut bytes = buffer.finish().await;
+        bytes.truncate(result?);
         Ok(bytes)
     }
 
-    /// Read an object range into a caller-owned buffer.
+    /// Receive directly into an owned destination and return that same buffer.
     ///
+    /// The destination remains owned by the operation through kernel completion,
+    /// even if the future is dropped. On error its contents may be partly modified.
     /// `known_stat` has the same exact-version semantics as [`read`](Self::read).
-    pub async fn read_into(
+    pub async fn read_into<B: ReadDestination>(
         &self,
         object: &ObjectId,
         offset: u64,
-        dst: &mut [u8],
+        dst: B,
         known_stat: Option<&ObjectStat>,
-    ) -> Result<usize, Error> {
+    ) -> (Result<usize, Error>, B) {
         self.read_into_with_options(
             object,
             offset,
@@ -261,45 +376,52 @@ impl Client {
         .await
     }
 
-    /// Read with explicit parent selection; stat and block RPCs share this scope.
-    pub async fn read_into_with_options(
+    /// Direct destination read with explicit parent selection.
+    pub async fn read_into_with_options<B: ReadDestination>(
         &self,
         object: &ObjectId,
         offset: u64,
-        dst: &mut [u8],
+        dst: B,
+        known_stat: Option<&ObjectStat>,
+        options: &crate::RequestOptions<'_>,
+    ) -> (Result<usize, Error>, B) {
+        let mut buffer = ReadBuffer::new(dst);
+        let result = self
+            .read_target_with_options(object, offset, buffer.take_target(), known_stat, options)
+            .await;
+        (result, buffer.finish().await)
+    }
+
+    pub(crate) async fn read_target_with_options(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        dst: ReadTarget,
         known_stat: Option<&ObjectStat>,
         options: &crate::RequestOptions<'_>,
     ) -> Result<usize, Error> {
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
         let result = op
-            .scope(self.read_into_inner(object, offset, dst, known_stat))
+            .scope(async {
+                if dst.is_empty() {
+                    return Ok(0);
+                }
+                let stat = match known_stat {
+                    Some(stat) => stat.clone(),
+                    None => self.stat_inner(object).await?,
+                };
+                self.read_into_resolved(object, offset, dst, &stat).await
+            })
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
-    }
-
-    async fn read_into_inner(
-        &self,
-        object: &ObjectId,
-        offset: u64,
-        dst: &mut [u8],
-        known_stat: Option<&ObjectStat>,
-    ) -> Result<usize, Error> {
-        if dst.is_empty() {
-            return Ok(0);
-        }
-        let stat = match known_stat {
-            Some(stat) => stat.clone(),
-            None => self.stat_inner(object).await?,
-        };
-        self.read_into_resolved(object, offset, dst, &stat).await
     }
 
     async fn read_into_resolved(
         &self,
         object: &ObjectId,
         offset: u64,
-        dst: &mut [u8],
+        dst: ReadTarget,
         stat: &ObjectStat,
     ) -> Result<usize, Error> {
         let requested = u64::try_from(dst.len())
@@ -335,10 +457,22 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_millis() as u64)
             .unwrap_or(0);
+        let mut rest = dst;
+        rest.truncate(planned_len);
+        if blocks == 1 {
+            let segment = plan.next().expect("nonempty single-block read");
+            return read_segment_into(
+                &self.reader,
+                &self.block_read_permits,
+                segment,
+                rest,
+                now_ms,
+            )
+            .await;
+        }
         let mut pending = FuturesUnordered::new();
-        let mut rest = &mut dst[..planned_len];
         for segment in plan.by_ref().take(MAX_CONCURRENT_BLOCK_READS_PER_READ) {
-            let (chunk, tail) = rest.split_at_mut(segment.len as usize);
+            let (chunk, tail) = rest.split_at(segment.len as usize);
             rest = tail;
             pending.push(read_segment_into(
                 &self.reader,
@@ -353,7 +487,7 @@ impl Client {
         while let Some(result) = pending.next().await {
             written += result?;
             if let Some(segment) = plan.next() {
-                let (chunk, tail) = rest.split_at_mut(segment.len as usize);
+                let (chunk, tail) = rest.split_at(segment.len as usize);
                 rest = tail;
                 pending.push(read_segment_into(
                     &self.reader,
@@ -368,11 +502,11 @@ impl Client {
     }
 }
 
-async fn read_segment_into(
-    reader: &BlockReader,
+async fn read_segment_into<P: RequestExecutor + Default>(
+    reader: &BlockReader<P>,
     permits: &Semaphore,
     segment: BlockSegment,
-    dst: &mut [u8],
+    mut dst: ReadTarget,
     now_ms: u64,
 ) -> Result<usize, Error> {
     let _permit = permits
@@ -380,7 +514,7 @@ async fn read_segment_into(
         .await
         .expect("client never closes its read budget");
     reader
-        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, now_ms)
+        .read_versioned_block_to(&segment.block, segment.offset_in_block, &mut dst, now_ms)
         .await
         .map_err(Error::from)
 }
@@ -1062,12 +1196,10 @@ mod tests {
             size: 10,
             version: "test-version".into(),
         };
-        let mut dst = [0_u8; 8];
+        let dst = Box::new([0_u8; 8]);
 
-        let written = client
-            .read_into(&object, 6, &mut dst, Some(&stat))
-            .await
-            .unwrap();
+        let (written, dst) = client.read_into(&object, 6, dst, Some(&stat)).await;
+        let written = written.unwrap();
 
         assert_eq!(written, 4);
         assert_eq!(&dst[..written], &[6, 7, 8, 9]);
@@ -1077,17 +1209,14 @@ mod tests {
     async fn empty_reads_do_not_stat_or_fetch() {
         let (client, stat_calls) = read_client(16).await;
         let object = parse_uri("s3://bucket/key").unwrap();
-        let mut dst = [];
+        let dst = Box::new([]);
 
         assert!(client
             .read(&object, 0, Some(0), None)
             .await
             .unwrap()
             .is_empty());
-        assert_eq!(
-            client.read_into(&object, 0, &mut dst, None).await.unwrap(),
-            0
-        );
+        assert_eq!(client.read_into(&object, 0, dst, None).await.0.unwrap(), 0);
         assert_eq!(stat_calls.load(Ordering::SeqCst), 0);
     }
 
@@ -1318,11 +1447,12 @@ mod tests {
             size: 16,
             version: "test-version".into(),
         };
-        let mut dst = [0_u8; 16];
+        let dst = Box::new([0_u8; 16]);
 
         let error = client
-            .read_into(&object, 0, &mut dst, Some(&stat))
+            .read_into(&object, 0, dst, Some(&stat))
             .await
+            .0
             .expect_err("one failed block must fail the whole read");
 
         assert!(matches!(error, Error::Block(_)));
@@ -1353,11 +1483,12 @@ mod tests {
             size: 8,
             version: "test-version".into(),
         };
-        let mut dst = [0_u8; 8];
+        let dst = Box::new([0_u8; 8]);
 
         let error = client
-            .read_into(&object, 0, &mut dst, Some(&stat))
+            .read_into(&object, 0, dst, Some(&stat))
             .await
+            .0
             .expect_err("short worker reply must fail the whole read");
 
         assert!(matches!(error, Error::Block(_)));

@@ -86,16 +86,17 @@ Each `coordinator` / `worker` / `client` process splits I/O into two layers: one
 for control and protocol scheduling, one for bulk data movement. **Layer 2 is
 built and runtime-neutral.** Layer 1 on the **worker data plane** runs on a
 thread-per-core io_uring runtime by default, falling back to Tokio where
-io_uring is unavailable; every other plane stays on Tokio deliberately (see
-*Runtime split*).
+io_uring is unavailable. Rust-based SDK TCP connections also default to
+io_uring; each complete TCP exchange runs on Monoio with owned buffers and
+native deadlines (see *Runtime split*).
 
 ### Layer 1 — control & protocol scheduling
 
 The layer owns `accept`, read/write of protocol headers, small control
 messages, task spawning, timers, and metrics. All connection management and
-scheduling lives here. **Large object bytes never enter userspace through this
-layer** — that invariant is what makes Layer 2 possible, and it holds under any
-runtime.
+scheduling lives here. Worker cache-hit payloads can use Layer 2's file-to-socket
+path. SDK receivers return bytes in application memory and use owned receive
+buffers; their TCP transport does not provide receive-side zero-copy.
 
 **Worker data plane: thread-per-core io_uring (default).** `worker/main.rs`
 probes io_uring and io-wq limit registration at startup and, when available, serves on N rings — one per core
@@ -155,10 +156,118 @@ crossing threads, not shared state within a ring. It does still reach Tokio
 internally (`block_store` uses `spawn_blocking`, the miss path uses Tokio
 timers), so ring threads enter a Tokio handle: coexistence, as predicted.
 
-Still on Tokio: `fuse::worker_client`, the client side of the same protocol.
-The wire format is plain framed TCP, so a Tokio client interoperates with a
-ring server unchanged — porting it is a client-side optimization, not a
-correctness requirement.
+**SDK TCP transport:** `talon-cache-client` executes complete worker reads,
+writes, deletes, cache admission and coordinator RPCs on Monoio. Its native
+`MonoioClient` owns sockets, idle pools, timers, response parsing and staged-file
+reads on the calling ring. `ClientBuilder::build_native()` exposes the complete
+Rust SDK, including stat, membership, placement and block reads, on a caller-owned,
+timer-enabled Monoio runtime. It requires no Tokio runtime and stays thread-local.
+Create, poll and drop it within that runtime; use one client per ring to scale.
+
+C and Python use `ClientBuilder::build_hosted()`: one owned command per complete
+SDK read/stat/list, with stat, membership, placement and concurrent block reads
+executed together on one selected ring in a client-owned Monoio execution group.
+Clones share the group and metadata caches. Each ring owns its sockets; control
+and data pools each enforce their per-peer idle limit across all rings. External submissions rotate across rings without shared per-request load counters.
+Continuations submitted by a native callback to the same client retain their ring
+and warm pool; other clients are independently dispatched. Default parallelism uses available CPUs;
+`with_io_threads`, `TALON_CLIENT_IO_THREADS`, then legacy `TOKIO_WORKER_THREADS`
+provide overrides in that order. Python releases the GIL and waits without a Tokio runtime. C defaults
+to inline callbacks on the operation thread; a configured callback executor
+receives the existing `submit` call. There is no default callback thread pool.
+The C destination handle stays with the operation through kernel completion.
+Block ranges receive directly into disjoint regions of that destination; callbacks
+run only after all kernel access has retired, including on errors. Python receives
+into a private, unpublished Python bytes allocation and publishes that same object.
+Hosted operations are spawned directly on the owning runtime. Native callback
+continuations bypass the cross-thread queue and boxed command/callback wrappers.
+A ring-local task registry handles shutdown without a global semaphore or an outer
+FuturesUnordered scheduler. A captured subscriber
+is restored on each poll. When tracing is disabled, polling avoids repeatedly
+installing an already inactive dispatcher; explicit suppression still overrides
+a global subscriber, including one installed after submission.
+
+Existing Rust `build()`, FUSE and Gateway entry points submit one owned RPC to a
+lazily started shared Monoio thread and await one owned reply. Neither entry
+adapts sockets to Tokio `AsyncRead`/`AsyncWrite` or dispatches each header/body I/O.
+Auto falls back only on ring initialization failure. The hosted fallback executes
+the whole SDK operation on an owned multi-thread Tokio runtime with the same
+parallelism and shared, explicitly Tokio pools; it does not re-enter the shared RPC dispatcher. Network/protocol
+errors preserve retry policy and never switch runtimes.
+`TALON_CLIENT_FORCE_TOKIO=1` selects the portable path; Rust also exposes
+`with_io_backend`. The explicit native builder has no automatic fallback and
+rejects a conflicting Tokio setting. Java and HTTP/S3 remain outside this layer.
+
+Hosted admission is nonblocking, without an SDK-wide active-operation cap, as
+with the previous C Tokio task submission. The external native command queue is
+unbounded; inline continuations submit directly to Monoio. Applications must bound
+their submitted concurrency and inline callbacks must not block. Dropping a future cancels its
+operation. Futures retain the runtime until completed or cancelled; callback
+operations require a live client handle. Dropping its last owner cancels remaining
+work and tears down sockets and the runtime on the owning thread. Inline callbacks
+must remain short; applications can supply their executor for expensive work.
+
+Each in-flight exchange exclusively owns its socket. The shared dispatcher bounds
+queued RPCs to 64 and active RPCs to 1,024; queue admission has the connect deadline.
+The direct native entry has no dispatcher limit. Idle limits and lazy TTL expiry
+remain per peer. DNS on cold hostname dials uses two blocking resolver threads and
+a bounded queue of 64; numeric addresses bypass them. No DNS runs on the ring.
+
+`read_into` transfers an owned destination into the operation and returns that
+same buffer with the result, including on errors. Rust callers pass
+`B: ReadDestination` (stable backing storage, e.g. Vec or Box); borrowed slices cannot be submitted because
+future cancellation may precede kernel completion. A stable owner retains the
+allocation; exclusive target views partition it into disjoint block ranges.
+Completion-owned leases keep storage alive after cancellation, and a retry waits
+for the previous lease to retire before writing the same range. Buffer return
+also waits for cancelled sibling blocks. Errors can leave partially modified
+contents. C retains its pointer/callback ABI and exclusive-until-callback contract.
+
+Direct range replies start with native `readv`: a separate fixed-size header and
+an iovec pointing into the final destination. The header and length limits are
+validated, and partial bodies continue at the received offset in that same
+allocation. Short error replies decode separately without waiting for the
+requested successful length. No successful payload is staged or copied.
+SDK `read()` allocates the final result once and receives all block ranges into
+it; multi-block reads need no assembly copy. Lower-level owned RPC responses
+without a destination retain the bounded 64 KiB speculative receive path.
+This removes extra userspace payload copies; regular TCP still copies from
+kernel socket buffers into the destination and does not use zero-copy RX.
+PUT accepts owned `Bytes`; staged files are opened once per request and read with
+native explicit offsets using a reusable 64 KiB buffer, including stale-socket
+retry. PUT/DELETE reply failures and local file failures do not replay writes.
+
+Dropping a dispatched request cancels its native exchange; Monoio retains pending
+operation buffers and descriptors through completion. Dropping a pool releases its
+idle sockets, and the shared runtime exits after the final pool and active requests
+are gone. Native sockets never cross runtimes. The public raw
+`ConnectionPool::checkout/fresh/release` Tokio API retains a separate pool.
+
+A shared ring and complete-RPC cross-thread notifications still carry costs.
+The native caller path avoids that handoff. Local comparisons and verification
+limits are recorded in [the SDK transport report](docs/reports/client-uring-validation.md);
+Worker benchmark gains from #591 do not establish SDK performance.
+
+### Client receive hot path
+
+Single-block destination reads bypass block aggregation and empty-tail splits.
+Local native and explicit Tokio executors borrow the target instead of allocating
+a cross-runtime loan. One allocation combines the destination owner, root-region
+access state and recovery notification; release/acquire owner accounting keeps
+cancelled CQEs alive until recovery is safe. Genuine cross-block splits and
+cross-runtime loans still retain independent cancellation state.
+
+Native receive metadata uses one stable allocation per active receive, reused from
+a thread-local cache bounded at 256 entries. Completed operations return it;
+in-flight/cancelled operations do not. Object payloads always land directly in the
+user destination. Ordinary TCP still copies bytes from kernel socket buffers.
+
+Native short exchanges share a 10 ms initial wakeup on each client/ring, then use
+the original absolute deadline if still pending. This mirrors the Tokio deadline
+policy. Range sends and receives are submitted concurrently using Monoio's owned
+read/write halves; each direction has exactly one operation at a time and a failed
+exchange discards the socket. The aggregate per-peer idle budget remains exact and
+therefore still coordinates rings when sockets enter or leave the idle pool.
 
 ### Layer 2 — bulk data movement (Linux zero-copy syscalls) — built
 
@@ -191,17 +300,16 @@ to retain descriptors across asynchronous file reads.
 
 ### Runtime split
 
-Which runtime each component targets, and why. Five of the seven already match
-today; only the data-plane TCP scheduling layer diverges.
+Which runtime each component targets, and why:
 
 | component | target | today | rationale |
 |---|---|---|---|
 | worker data plane | monoio + `sendfile`/`splice` | **monoio (default), Tokio fallback** ✅ | hot path; per-core efficiency and tail latency |
-| client ↔ worker data plane | monoio | Tokio | same hot path, client side |
+| Rust-based SDK ↔ worker/coordinator TCP | monoio | **monoio (Linux default), Tokio fallback** | native complete RPCs; direct Rust entry or request handoff |
 | coordinator ↔ worker control | either | Tokio | low volume; bincode over framed TCP |
 | coordinator admin / UI / etcd / k8s | **Tokio** | Tokio ✅ | axum/kube/etcd-client are Tokio-bound |
 | worker miss loader | Tokio or blocking pool, **off-ring** | Tokio + semaphore ✅ | TLS/HTTP breaks zero-copy anyway; slow path |
-| FUSE client | either | Tokio ✅ | `fuser` callbacks are synchronous regardless |
+| FUSE client callbacks | either | Tokio ✅ | synchronous callbacks; SDK sockets use the selected backend |
 | metrics / health | Tokio | Tokio ✅ | ecosystem-driven, not a data path |
 
 ### Data-plane paths

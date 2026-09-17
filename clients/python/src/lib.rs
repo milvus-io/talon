@@ -7,8 +7,8 @@
 //!
 //! Every blocking call releases the GIL for its duration, so a threaded data
 //! loader is limited by the network rather than serialised on the interpreter.
-//! The runtime is a multi-threaded Tokio runtime owned by the client, shared by
-//! all calls on it.
+//! Complete SDK operations run on a client-owned Monoio execution group, with Tokio
+//! fallback when io_uring cannot initialize. Calls share its pools and cache.
 
 // pyo3 0.22's #[pymethods] expansion converts every returned error through
 // Into<PyErr>, which is a no-op when the error already is one. clippy flags the
@@ -22,9 +22,45 @@ use pyo3::exceptions::{PyIOError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyBytes;
 use talon_rust_client::{
-    parse_uri, Client as RustClient, ClientBuilder, Error as RustError,
+    parse_uri, ClientBuilder, Error as RustError, HostedClient as RustClient,
     ObjectStat as RustObjectStat,
 };
+
+// Private, unpublished Python bytes. Its only reference travels with the receive
+// operation and is exposed to Python only after all kernel writes have retired.
+struct PythonDestination {
+    bytes: Py<PyBytes>,
+    ptr: *mut u8,
+    len: usize,
+}
+// The allocation stays alive through bytes; no Python code can access it yet.
+unsafe impl Send for PythonDestination {}
+impl PythonDestination {
+    fn new(py: Python<'_>, len: usize) -> PyResult<Self> {
+        let size = isize::try_from(len)
+            .map_err(|_| PyValueError::new_err("read length exceeds bytes capacity"))?;
+        // CPython permits filling bytes freshly allocated with a NULL source:
+        // https://docs.python.org/3/c-api/bytes.html#c.PyBytes_AsString
+        let bytes = unsafe {
+            Py::<PyBytes>::from_owned_ptr_or_err(
+                py,
+                pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), size),
+            )?
+        };
+        let ptr = unsafe { pyo3::ffi::PyBytes_AsString(bytes.as_ptr()).cast::<u8>() };
+        if ptr.is_null() {
+            return Err(PyErr::fetch(py));
+        }
+        Ok(Self { bytes, ptr, len })
+    }
+}
+// SAFETY: the owned Python bytes allocation is private and unpublished until
+// successful completion. Errors drop it without inspecting uninitialized data.
+unsafe impl talon_rust_client::ReadDestination for PythonDestination {
+    fn raw_parts(&mut self) -> (*mut u8, usize) {
+        (self.ptr, self.len)
+    }
+}
 
 /// Capture language context while the GIL and caller context are still active.
 fn capture_trace(
@@ -96,11 +132,6 @@ fn with_telemetry<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Runtime construction failures are infrastructure errors.
-fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
-    PyIOError::new_err(e.to_string())
-}
-
 /// Preserve the SDK's input-versus-I/O error distinction at the Python boundary.
 fn client_err(error: RustError) -> PyErr {
     let message = error.to_string();
@@ -164,7 +195,6 @@ impl ObjectEntry {
 /// A client for reading objects through a Talon cache cluster.
 #[pyclass(module = "talon")]
 pub struct Client {
-    runtime: Arc<tokio::runtime::Runtime>,
     client: Arc<RustClient>,
 }
 
@@ -184,14 +214,9 @@ impl Client {
             .with_coordinator(coordinator)
             .with_block_size(block_size)
             .with_max_idle_per_addr(max_idle_per_addr)
-            .build()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(io_err)?;
+            .build_hosted()
+            .map_err(client_err)?;
         Ok(Self {
-            runtime: Arc::new(runtime),
             client: Arc::new(client),
         })
     }
@@ -225,14 +250,13 @@ impl Client {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let known_stat = known_stat_from_pair(version.map(str::to_owned), size)?;
-        let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
 
         // Release the GIL: this is network I/O, and holding it would serialise
         // every reader thread in the process on one request.
         let bytes = py.allow_threads(move || {
             with_telemetry(|| {
-                runtime.block_on(async move {
+                futures::executor::block_on(async move {
                     let operation = talon_telemetry::Operation::new(
                         "talon.python.read",
                         "internal",
@@ -243,9 +267,32 @@ impl Client {
                     );
                     let result = operation
                         .scope(async {
-                            client
-                                .read(&object, offset, length, known_stat.as_ref())
-                                .await
+                            if length == Some(0) {
+                                return Python::with_gil(|py| {
+                                    PythonDestination::new(py, 0).map(|b| b.bytes)
+                                });
+                            }
+                            let stat = match known_stat {
+                                Some(stat) => stat,
+                                None => client
+                                    .stat_with_options(&object, &Default::default())
+                                    .await
+                                    .map_err(client_err)?,
+                            };
+                            let available = stat.size.saturating_sub(offset);
+                            let length =
+                                usize::try_from(length.unwrap_or(available).min(available))
+                                    .map_err(|_| {
+                                        PyValueError::new_err("read length exceeds bytes capacity")
+                                    })?;
+                            let buffer = Python::with_gil(|py| PythonDestination::new(py, length))?;
+                            let (result, buffer) =
+                                client.read_into(&object, offset, buffer, Some(&stat)).await;
+                            let written = result.map_err(client_err)?;
+                            if written != length {
+                                return Err(PyIOError::new_err("incomplete exact-version read"));
+                            }
+                            Ok(buffer.bytes)
                         })
                         .await;
                     operation.outcome(if result.is_ok() { "success" } else { "error" });
@@ -253,8 +300,7 @@ impl Client {
                 })
             })
         });
-        let bytes = bytes.map_err(client_err)?;
-        Ok(PyBytes::new_bound(py, &bytes))
+        Ok(bytes?.into_bound(py))
     }
 
     /// Return an object's size and version.
@@ -267,11 +313,10 @@ impl Client {
     ) -> PyResult<ObjectStat> {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
         let stat = py.allow_threads(move || {
             with_telemetry(|| {
-                runtime.block_on(async move {
+                futures::executor::block_on(async move {
                     let options = talon_telemetry::RequestOptions {
                         parent: trace_context
                             .as_ref()
@@ -300,11 +345,11 @@ impl Client {
     /// the server's object, page, or payload limit, the call fails explicitly
     /// instead of returning an incomplete list; use a narrower prefix.
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
-        let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
         let prefix = prefix.to_string();
-        let entries =
-            py.allow_threads(move || runtime.block_on(async move { client.list(&prefix).await }));
+        let entries = py.allow_threads(move || {
+            futures::executor::block_on(async move { client.list(&prefix).await })
+        });
         let entries = entries.map_err(client_err)?;
         Ok(entries
             .into_iter()
@@ -361,6 +406,220 @@ fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux io_uring; run explicitly with --ignored"]
+    fn native_python_entry_without_tokio() {
+        pyo3::prepare_freethreaded_python();
+        let client = Client::new("unused:1", 8, 8).unwrap();
+        assert_eq!(
+            client.client.io_backend(),
+            talon_rust_client::ClientIoBackend::IoUring
+        );
+        Python::with_gil(|py| {
+            assert!(client
+                .read(py, "s3://bucket/key", 0, Some(0), None, None, None)
+                .unwrap()
+                .as_bytes()
+                .is_empty());
+        });
+    }
+
+    fn python_direct_read(backend: talon_rust_client::ClientIoBackend) {
+        use std::{
+            io::{Read, Write},
+            net::{TcpListener, TcpStream},
+            time::Duration,
+        };
+        use talon_transport::{ControlMessage, FrameHeader, HEADER_LEN};
+        fn frame(peer: &mut TcpStream) -> Vec<u8> {
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut header = [0; HEADER_LEN];
+            peer.read_exact(&mut header).unwrap();
+            let h = FrameHeader::decode(&header).unwrap();
+            let mut frame = header.to_vec();
+            frame.resize(HEADER_LEN + h.length as usize, 0);
+            peer.read_exact(&mut frame[HEADER_LEN..]).unwrap();
+            frame
+        }
+        pyo3::prepare_freethreaded_python();
+        let worker = TcpListener::bind("127.0.0.1:0").unwrap();
+        let worker_addr = worker.local_addr().unwrap().to_string();
+        let coordinator = TcpListener::bind("127.0.0.1:0").unwrap();
+        let coordinator_addr = coordinator.local_addr().unwrap().to_string();
+        let serving = std::thread::spawn(move || {
+            let (mut peer, _) = worker.accept().unwrap();
+            for _ in 0..2 {
+                let bytes = frame(&mut peer);
+                let (h, request) = talon_transport::decode_versioned_request(&bytes).unwrap();
+                assert_eq!(request.version.as_str(), "v1");
+                assert_eq!((request.request.offset, request.request.len), (3, 17));
+                peer.write_all(&talon_transport::response_header_ok(h.request_id, 17))
+                    .unwrap();
+                peer.write_all(&(3u8..20).collect::<Vec<_>>()).unwrap();
+            }
+        });
+        let discovery = std::thread::spawn(move || {
+            let (mut peer, _) = coordinator.accept().unwrap();
+            let bytes = frame(&mut peer);
+            let (h, request) = talon_transport::decode(&bytes).unwrap();
+            assert!(matches!(request, ControlMessage::MembershipQueryV2 {}));
+            let response = ControlMessage::MembershipListV2 {
+                nodes: vec![talon_transport::ZonedNodeInfo {
+                    info: talon_core::NodeInfo {
+                        id: talon_core::NodeId::new("worker"),
+                        address: worker_addr,
+                        role: talon_core::NodeRole::Worker,
+                    },
+                    zone: None,
+                }],
+            };
+            peer.write_all(&talon_transport::encode(h.request_id, &response).unwrap())
+                .unwrap();
+            // Keep the coordinator connection alive while reads reuse membership.
+            let mut byte = [0];
+            assert_eq!(peer.read(&mut byte).unwrap(), 0);
+        });
+        let client = Client {
+            client: Arc::new(
+                ClientBuilder::default()
+                    .with_coordinator(coordinator_addr)
+                    .with_block_size(32)
+                    .with_io_threads(1)
+                    .with_io_backend(backend)
+                    .build_hosted()
+                    .unwrap(),
+            ),
+        };
+        Python::with_gil(|py| {
+            // Verify that a real SDK receive returns the very same Python object
+            // and its storage pointer, rather than allocating a second bytes.
+            let destination = PythonDestination::new(py, 17).unwrap();
+            let object_ptr = destination.bytes.as_ptr() as usize;
+            let body_ptr = destination.ptr as usize;
+            let object = parse_uri("s3://bucket/key").unwrap();
+            let stat = RustObjectStat {
+                size: 20,
+                version: "v1".into(),
+            };
+            let (result, destination) = py.allow_threads(|| {
+                futures::executor::block_on(client.client.read_into(
+                    &object,
+                    3,
+                    destination,
+                    Some(&stat),
+                ))
+            });
+            assert_eq!(result.unwrap(), 17);
+            assert_eq!(destination.bytes.as_ptr() as usize, object_ptr);
+            let bytes = destination.bytes.into_bound(py);
+            assert_eq!(bytes.as_bytes().as_ptr() as usize, body_ptr);
+            assert_eq!(bytes.as_bytes(), &(3u8..20).collect::<Vec<_>>());
+            // Exercise the public binding too, including EOF clamping.
+            let bytes = client
+                .read(
+                    py,
+                    "s3://bucket/key",
+                    3,
+                    Some(100),
+                    Some("v1"),
+                    Some(20),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(bytes.as_bytes(), &(3u8..20).collect::<Vec<_>>());
+        });
+        drop(client);
+        serving.join().unwrap();
+        discovery.join().unwrap();
+    }
+
+    #[test]
+    fn python_direct_destination_with_tokio() {
+        python_direct_read(talon_rust_client::ClientIoBackend::Tokio);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires Linux io_uring; run explicitly with --ignored"]
+    fn python_direct_destination_with_native_uring() {
+        python_direct_read(talon_rust_client::ClientIoBackend::IoUring);
+    }
+
+    #[test]
+    fn concurrent_python_stats_release_gil_and_share_hosted_client() {
+        use std::{
+            io::{Read, Write},
+            net::TcpListener,
+            sync::Barrier,
+            time::Duration,
+        };
+        use talon_transport::{ControlMessage, FrameHeader, HEADER_LEN};
+        pyo3::prepare_freethreaded_python();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let client =
+            Arc::new(Client::new(&listener.local_addr().unwrap().to_string(), 8, 8).unwrap());
+        let server = std::thread::spawn(move || {
+            let barrier = Arc::new(Barrier::new(2));
+            let mut peers = Vec::new();
+            for _ in 0..2 {
+                let (mut peer, _) = listener.accept().unwrap();
+                let barrier = barrier.clone();
+                peers.push(std::thread::spawn(move || {
+                    peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                    let mut header = [0; HEADER_LEN];
+                    peer.read_exact(&mut header).unwrap();
+                    let header = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0; header.length as usize];
+                    peer.read_exact(&mut body).unwrap();
+                    barrier.wait(); // Both Python threads must release the GIL.
+                    peer.write_all(
+                        &talon_transport::encode(
+                            header.request_id,
+                            &ControlMessage::ObjectStat {
+                                size: 20,
+                                version: "v1".into(),
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .unwrap();
+                }));
+            }
+            for peer in peers {
+                peer.join().unwrap();
+            }
+        });
+        let readers: Vec<_> = (0..2)
+            .map(|_| {
+                let client = client.clone();
+                std::thread::spawn(move || {
+                    Python::with_gil(|py| {
+                        let stat = client.stat(py, "s3://bucket/key", None).unwrap();
+                        assert_eq!(stat.size, 20);
+                        assert_eq!(stat.version, "v1");
+                        let bytes = client
+                            .read(
+                                py,
+                                "s3://bucket/key",
+                                20,
+                                Some(1),
+                                Some("v1"),
+                                Some(20),
+                                None,
+                            )
+                            .unwrap();
+                        assert!(bytes.as_bytes().is_empty());
+                    })
+                })
+            })
+            .collect();
+        for reader in readers {
+            reader.join().unwrap();
+        }
+        server.join().unwrap();
+    }
 
     #[test]
     fn constructor_accepts_pool_limit_keyword_and_rejects_zero() {

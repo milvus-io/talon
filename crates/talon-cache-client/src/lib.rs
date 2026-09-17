@@ -5,18 +5,24 @@
 //! use it without depending on a particular filesystem or HTTP adapter.
 
 pub mod block_reader;
+mod client_io;
 pub mod coordinator_client;
 mod deadline;
 mod lock;
 pub mod membership_cache;
 pub mod metrics;
+#[cfg(target_os = "linux")]
+pub mod monoio_client;
 pub mod placement_cache;
 pub mod pool;
 pub mod range_stream;
+pub mod read_buffer;
 pub mod read_plan;
+pub mod rpc;
 pub mod worker_client;
 
 pub use block_reader::{BlockReadError, BlockReader, FileView};
+pub use client_io::ClientIoBackend;
 pub use coordinator_client::{
     CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
 };

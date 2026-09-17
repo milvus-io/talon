@@ -28,4 +28,8 @@ talon-rust-client.workspace = true
 # against). It is therefore opt-in via the `extension-module` feature, which
 # maturin enables and `cargo test` does not.
 pyo3 = { version = "0.22", features = ["abi3-py38"] }
-tokio = { workspace = true }
+futures.workspace = true
+
+[dev-dependencies]
+talon-core.workspace = true
+talon-transport.workspace = true

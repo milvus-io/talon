@@ -4,7 +4,7 @@
 //! block lives, [`WorkerClient`] fetches the bytes. It speaks the data plane's
 //! legacy, version-pinned, and cache-only range operations. Every successful
 //! reply is a `GetRange` frame carrying the **raw range bytes** — or, if the
-//! [`Flags::ERROR`] bit is set, a typed error envelope (or a legacy string).
+//! [`Flags::ERROR`](talon_transport::Flags::ERROR) bit is set, a typed error envelope (or a legacy string).
 //!
 //! The response body is raw (no bincode envelope) precisely so a production
 //! worker can `sendfile` the range straight from a file into the socket; this
@@ -13,24 +13,27 @@
 //! on a fresh connection.
 
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use talon_core::{BlockId, ObjectId, RequestId, TenantId, Version};
-use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
+use talon_transport::frame::MsgType;
+#[cfg(test)]
+use talon_transport::frame::{FrameHeader, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_cached_block_put_header, encode_cached_request,
-    encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
-    encode_tenant_request, encode_versioned_request, encode_versioned_tenant_request,
-    CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest,
-    RangeRequest, TenantScopedCachedRange, TenantScopedRange, TenantScopedVersionedRange,
-    VersionedRangeRequest, MAX_CONTROL_PAYLOAD_LEN,
+    encode_cached_block_put_header, encode_cached_request, encode_cached_tenant_request,
+    encode_delete, encode_put_header, encode_request, encode_tenant_request,
+    encode_versioned_request, encode_versioned_tenant_request, CachedBlockPutRequest,
+    CachedRangeRequest, DataPlaneError, DeleteRequest, PutRequest, RangeRequest,
+    TenantScopedCachedRange, TenantScopedRange, TenantScopedVersionedRange, VersionedRangeRequest,
 };
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+#[cfg(test)]
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+#[cfg(test)]
 use tokio::net::TcpStream;
 
 use crate::pool::ConnectionPool;
+use crate::rpc::RequestExecutor;
 
 /// Errors from a worker range fetch.
 #[derive(Debug, thiserror::Error)]
@@ -98,13 +101,23 @@ impl WorkerError {
 ///
 /// Reuses connections from a shared [`ConnectionPool`] so warm fetches skip the
 /// TCP handshake (issue #181). Cloneable — clones share the same pool.
-#[derive(Debug, Clone)]
-pub struct WorkerClient {
+#[derive(Debug)]
+pub struct WorkerClient<P = ConnectionPool> {
     addr: String,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<P>,
     /// Tenant every fetch from this client is attributed to. `Unattributed`
     /// unless set with [`with_tenant`](Self::with_tenant).
     tenant: TenantId,
+}
+
+impl<P> Clone for WorkerClient<P> {
+    fn clone(&self) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            pool: self.pool.clone(),
+            tenant: self.tenant.clone(),
+        }
+    }
 }
 
 impl WorkerClient {
@@ -116,9 +129,11 @@ impl WorkerClient {
     pub fn new(addr: impl Into<String>) -> Self {
         Self::with_pool(addr, Arc::new(ConnectionPool::new()))
     }
+}
 
+impl<P: RequestExecutor> WorkerClient<P> {
     /// Create a client that reuses connections from the shared `pool`.
-    pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
+    pub fn with_pool(addr: impl Into<String>, pool: Arc<P>) -> Self {
         Self {
             addr: addr.into(),
             pool,
@@ -223,108 +238,46 @@ impl WorkerClient {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, WorkerError> {
-        let req = RangeRequest {
-            object: object.clone(),
-            offset,
-            len,
-        };
-        // Allocate a correlation id and put it on the wire, so the worker's
-        // logs for this fetch can be joined with the client's (#304).
-        let req_id = RequestId::next();
-        let mut out = self.encode_range_request(req_id.0, req)?;
-        // Try a pooled connection first; if it was reused and fails with an I/O
-        // error (the peer may have closed it while idle), retry once on a fresh
-        // dial so a stale pooled socket never turns a healthy peer into a
-        // spurious failure. A failure on a fresh connection, or a non-I/O error
-        // on a reused one (the peer answered but refused/rejected the request),
-        // propagates immediately rather than re-asking the same peer.
-        match self.exchange(&mut out, len).await {
-            Ok(bytes) => Ok(bytes),
-            Err((true, err)) if err.is_transport_failure() => {
-                talon_telemetry::observe("talon.rpc", "client", async {
-                    talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut out, &self.addr)?;
-
-                    let mut stream = self.pool.fresh(&self.addr).await?;
-                    let bytes = self
-                        .pool
-                        .with_request_deadline("worker fetch_range retry", async {
-                            stream.write_all(&out).await?;
-                            stream.flush().await?;
-                            read_range_reply(&mut stream, len).await
-                        })
-                        .await?;
-                    self.pool.release(&self.addr, stream);
-                    Ok(bytes)
-                })
-                .await
-            }
-            Err((_, err)) => {
-                tracing::error!(
-                    req = %req_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    offset,
-                    len,
-                    error = %err,
-                    "worker range fetch failed"
-                );
-                Err(err)
-            }
-        }
+        let frame = self.encode_range_request(
+            RequestId::next().0,
+            RangeRequest {
+                object: object.clone(),
+                offset,
+                len,
+            },
+        )?;
+        self.range_request(frame, len).await
     }
 
-    /// Fetch `[offset, offset + dst.len())` of `object` into `dst`.
-    ///
-    /// This avoids allocating an intermediate range buffer for callers that
-    /// retain ownership of their destination storage, such as C bindings.
-    pub async fn fetch_range_into(
+    /// Receive directly into an owned destination and return that same buffer.
+    /// Both success and error wait for all kernel access to the buffer to retire.
+    pub async fn fetch_range_into<B: crate::read_buffer::ReadDestination>(
         &self,
         object: &ObjectId,
         offset: u64,
-        dst: &mut [u8],
+        dst: B,
+    ) -> (Result<usize, WorkerError>, B) {
+        let mut buffer = crate::read_buffer::ReadBuffer::new(dst);
+        let mut target = buffer.take_target();
+        let result = self.fetch_range_to(object, offset, &mut target).await;
+        drop(target);
+        (result, buffer.finish().await)
+    }
+    pub(crate) async fn fetch_range_to(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        dst: &mut crate::read_buffer::ReadTarget,
     ) -> Result<usize, WorkerError> {
-        let request = RangeRequest {
-            object: object.clone(),
-            offset,
-            len: dst.len() as u64,
-        };
-        let request_id = RequestId::next();
-        let mut output = self.encode_range_request(request_id.0, request)?;
-        match self.exchange_into(&mut output, dst).await {
-            Ok(n) => Ok(n),
-            Err((true, err)) if err.is_transport_failure() => {
-                talon_telemetry::observe("talon.rpc", "client", async {
-                    talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
-
-                    let mut stream = self.pool.fresh(&self.addr).await?;
-                    let n = self
-                        .pool
-                        .with_request_deadline("worker fetch_range retry", async {
-                            stream.write_all(&output).await?;
-                            stream.flush().await?;
-                            read_range_reply_into(&mut stream, dst).await
-                        })
-                        .await?;
-                    self.pool.release(&self.addr, stream);
-                    Ok(n)
-                })
-                .await
-            }
-            Err((_, error)) => {
-                tracing::error!(
-                    req = %request_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    offset,
-                    len = dst.len(),
-                    error = %error,
-                    "worker range fetch failed"
-                );
-                Err(error)
-            }
-        }
+        let frame = self.encode_range_request(
+            RequestId::next().0,
+            RangeRequest {
+                object: object.clone(),
+                offset,
+                len: dst.len() as u64,
+            },
+        )?;
+        self.range_request_into(frame, dst).await
     }
 
     /// Fetch a range from the exact source `version`.
@@ -339,104 +292,74 @@ impl WorkerClient {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, WorkerError> {
-        let request = VersionedRangeRequest {
-            request: RangeRequest {
-                object: object.clone(),
-                offset,
-                len,
-            },
-            version: version.clone(),
-        };
-        let request_id = RequestId::next();
-        let mut output = self.encode_versioned_range_request(request_id.0, request)?;
-        match self.exchange(&mut output, len).await {
-            Ok(bytes) => Ok(bytes),
-            Err((true, error)) if error.is_transport_failure() => {
-                talon_telemetry::observe("talon.rpc", "client", async {
-                    talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
-                    let mut stream = self.pool.fresh(&self.addr).await?;
-                    let bytes = self
-                        .pool
-                        .with_request_deadline("worker fetch_versioned_range retry", async {
-                            stream.write_all(&output).await?;
-                            stream.flush().await?;
-                            read_range_reply(&mut stream, len).await
-                        })
-                        .await?;
-                    self.pool.release(&self.addr, stream);
-                    Ok(bytes)
-                })
-                .await
-            }
-            Err((_, error)) => {
-                tracing::error!(
-                    req = %request_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    version = %version,
+        let frame = self.encode_versioned_range_request(
+            RequestId::next().0,
+            VersionedRangeRequest {
+                request: RangeRequest {
+                    object: object.clone(),
                     offset,
                     len,
-                    error = %error,
-                    "worker versioned range fetch failed"
-                );
-                Err(error)
-            }
-        }
+                },
+                version: version.clone(),
+            },
+        )?;
+        self.range_request(frame, len).await
     }
 
-    /// Fetch a range from the exact source `version` directly into `dst`.
-    pub async fn fetch_versioned_range_into(
+    /// Receive an exact version directly into an owned buffer, returning it on errors too.
+    pub async fn fetch_versioned_range_into<B: crate::read_buffer::ReadDestination>(
         &self,
         object: &ObjectId,
         version: &Version,
         offset: u64,
-        dst: &mut [u8],
+        dst: B,
+    ) -> (Result<usize, WorkerError>, B) {
+        let mut buffer = crate::read_buffer::ReadBuffer::new(dst);
+        let mut target = buffer.take_target();
+        let result = self
+            .fetch_versioned_range_to(object, version, offset, &mut target)
+            .await;
+        drop(target);
+        (result, buffer.finish().await)
+    }
+    pub(crate) async fn fetch_versioned_range_to(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        dst: &mut crate::read_buffer::ReadTarget,
     ) -> Result<usize, WorkerError> {
-        let request = VersionedRangeRequest {
-            request: RangeRequest {
-                object: object.clone(),
-                offset,
-                len: dst.len() as u64,
-            },
-            version: version.clone(),
-        };
-        let request_id = RequestId::next();
-        let mut output = self.encode_versioned_range_request(request_id.0, request)?;
-        match self.exchange_into(&mut output, dst).await {
-            Ok(n) => Ok(n),
-            Err((true, error)) if error.is_transport_failure() => {
-                talon_telemetry::observe("talon.rpc", "client", async {
-                    talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
-                    let mut stream = self.pool.fresh(&self.addr).await?;
-                    let n = self
-                        .pool
-                        .with_request_deadline("worker fetch_versioned_range retry", async {
-                            stream.write_all(&output).await?;
-                            stream.flush().await?;
-                            read_range_reply_into(&mut stream, dst).await
-                        })
-                        .await?;
-                    self.pool.release(&self.addr, stream);
-                    Ok(n)
-                })
-                .await
-            }
-            Err((_, error)) => {
-                tracing::error!(
-                    req = %request_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    version = %version,
+        let frame = self.encode_versioned_range_request(
+            RequestId::next().0,
+            VersionedRangeRequest {
+                request: RangeRequest {
+                    object: object.clone(),
                     offset,
-                    len = dst.len(),
-                    error = %error,
-                    "worker versioned range fetch failed"
-                );
-                Err(error)
+                    len: dst.len() as u64,
+                },
+                version: version.clone(),
+            },
+        )?;
+        self.range_request_into(frame, dst).await
+    }
+    async fn range_request_into(
+        &self,
+        mut frame: Vec<u8>,
+        dst: &mut crate::read_buffer::ReadTarget,
+    ) -> Result<usize, WorkerError> {
+        talon_telemetry::observe("talon.rpc", "client", async {
+            talon_telemetry::text("server.address", &self.addr);
+            talon_transport::envelope::outbound(&mut frame, &self.addr)?;
+            let result = self.pool.execute_range_into(&self.addr, frame, dst).await;
+            // A timeout/cancelled receive can still own kernel access. In
+            // particular a replica retry must not race that previous receive.
+            dst.wait_idle().await;
+            match result.map_err(crate::rpc::Error::worker)? {
+                crate::rpc::Reply::Written(n) => Ok(n),
+                _ => unreachable!("direct range response"),
             }
-        }
+        })
+        .await
     }
 
     /// Fetch a versioned range only if it is already resident on the worker.
@@ -450,37 +373,16 @@ impl WorkerClient {
         offset: u64,
         len: u64,
     ) -> Result<Vec<u8>, WorkerError> {
-        let request = CachedRangeRequest {
-            object: object.clone(),
-            version: version.clone(),
-            offset,
-            len,
-        };
-        let request_id = RequestId::next();
-        let mut output = self.encode_cached_range_request(request_id.0, request)?;
-        match self.exchange(&mut output, len).await {
-            Ok(bytes) => Ok(bytes),
-            Err((true, err)) if err.is_transport_failure() => {
-                talon_telemetry::observe("talon.rpc", "client", async {
-                    talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
-
-                    let mut stream = self.pool.fresh(&self.addr).await?;
-                    let bytes = self
-                        .pool
-                        .with_request_deadline("worker fetch_cached_range retry", async {
-                            stream.write_all(&output).await?;
-                            stream.flush().await?;
-                            read_range_reply(&mut stream, len).await
-                        })
-                        .await?;
-                    self.pool.release(&self.addr, stream);
-                    Ok(bytes)
-                })
-                .await
-            }
-            Err((_, error)) => Err(error),
-        }
+        let frame = self.encode_cached_range_request(
+            RequestId::next().0,
+            CachedRangeRequest {
+                object: object.clone(),
+                version: version.clone(),
+                offset,
+                len,
+            },
+        )?;
+        self.range_request(frame, len).await
     }
 
     /// Admit one complete, versioned block without asking the worker to access
@@ -491,140 +393,36 @@ impl WorkerClient {
         object_len: u64,
         body: &[u8],
     ) -> Result<(), WorkerError> {
-        let request_id = RequestId::next();
-        let header = encode_cached_block_put_header(
-            request_id.0,
+        let frame = encode_cached_block_put_header(
+            RequestId::next().0,
             &CachedBlockPutRequest {
                 block: block.clone(),
                 object_len,
                 body_len: body.len() as u64,
             },
         )?;
-        match self.admit_exchange(&header, body).await {
-            Ok(()) => Ok(()),
-            Err((true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                self.pool
-                    .with_deadline(
-                        "worker admit_cached_block retry",
-                        streamed_put_timeout(body.len() as u64),
-                        async {
-                            stream.write_all(&header).await?;
-                            stream.write_all(body).await?;
-                            stream.flush().await?;
-                            read_range_reply(&mut stream, 0).await.map(|_| ())
-                        },
-                    )
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(())
-            }
-            Err((_, error)) => Err(error),
-        }
-    }
-
-    async fn admit_exchange(&self, header: &[u8], body: &[u8]) -> Result<(), (bool, WorkerError)> {
-        let (mut stream, reused) = self
-            .pool
-            .checkout(&self.addr)
-            .await
-            .map_err(|error| (false, WorkerError::from(error)))?;
-        talon_telemetry::record("talon.pool.reused", reused as u64);
-        let result = self
-            .pool
-            .with_deadline(
-                "worker admit_cached_block",
-                streamed_put_timeout(body.len() as u64),
-                async {
-                    stream.write_all(header).await?;
-                    stream.write_all(body).await?;
-                    stream.flush().await?;
-                    read_range_reply(&mut stream, 0).await.map(|_| ())
-                },
+        self.pool
+            .execute_request(
+                &self.addr,
+                crate::rpc::Request::admit(frame, bytes::Bytes::copy_from_slice(body)),
             )
-            .await;
-        match result {
-            Ok(()) => {
-                self.pool.release(&self.addr, stream);
-                Ok(())
-            }
-            Err(error) => Err((reused, error)),
-        }
+            .await
+            .map_err(crate::rpc::Error::worker)?;
+        Ok(())
     }
 
-    /// One request/response over a pooled-or-fresh connection.
-    ///
-    /// On success releases the connection for reuse. On error returns
-    /// `(was_reused, err)` so the caller can decide whether to retry (a reused
-    /// connection may simply have been closed while idle).
-    async fn exchange(
-        &self,
-        out: &mut Vec<u8>,
-        expected_len: u64,
-    ) -> Result<Vec<u8>, (bool, WorkerError)> {
+    async fn range_request(&self, mut frame: Vec<u8>, len: u64) -> Result<Vec<u8>, WorkerError> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound(out, &self.addr)
-                .map_err(|e| (false, WorkerError::Frame(e)))?;
-
-            let (mut stream, reused) = self
+            talon_transport::envelope::outbound(&mut frame, &self.addr)?;
+            match self
                 .pool
-                .checkout(&self.addr)
+                .execute_request(&self.addr, crate::rpc::Request::range(frame, len))
                 .await
-                .map_err(|e| (false, WorkerError::from(e)))?;
-            talon_telemetry::record("talon.pool.reused", reused as u64);
-            // On any error, `stream` is dropped (not released), so a half-broken
-            // connection is never returned to the pool.
-            let result: Result<Vec<u8>, WorkerError> = self
-                .pool
-                .with_request_deadline("worker fetch_range", async {
-                    stream.write_all(out).await?;
-                    stream.flush().await?;
-                    read_range_reply(&mut stream, expected_len).await
-                })
-                .await;
-            match result {
-                Ok(bytes) => {
-                    self.pool.release(&self.addr, stream);
-                    Ok(bytes)
-                }
-                Err(err) => Err((reused, err)),
-            }
-        })
-        .await
-    }
-
-    /// One request/response into a caller-owned buffer.
-    async fn exchange_into(
-        &self,
-        output: &mut Vec<u8>,
-        dst: &mut [u8],
-    ) -> Result<usize, (bool, WorkerError)> {
-        talon_telemetry::observe("talon.rpc", "client", async {
-            talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound(output, &self.addr)
-                .map_err(|e| (false, WorkerError::Frame(e)))?;
-
-            let (mut stream, reused) = self
-                .pool
-                .checkout(&self.addr)
-                .await
-                .map_err(|error| (false, WorkerError::from(error)))?;
-            talon_telemetry::record("talon.pool.reused", reused as u64);
-            let result: Result<usize, WorkerError> = self
-                .pool
-                .with_request_deadline("worker fetch_range", async {
-                    stream.write_all(output).await?;
-                    stream.flush().await?;
-                    read_range_reply_into(&mut stream, dst).await
-                })
-                .await;
-            match result {
-                Ok(n) => {
-                    self.pool.release(&self.addr, stream);
-                    Ok(n)
-                }
-                Err(error) => Err((reused, error)),
+                .map_err(crate::rpc::Error::worker)?
+            {
+                crate::rpc::Reply::Range(bytes) => Ok(bytes),
+                _ => unreachable!("validated range reply"),
             }
         })
         .await
@@ -639,10 +437,19 @@ impl WorkerClient {
 /// worker writes through to the backend and replies with the committed
 /// [`Version`] (or an `ERROR`-flagged frame). Reuses the shared
 /// [`ConnectionPool`] like the read path (issue #181, #226/#230).
-#[derive(Debug, Clone)]
-pub struct WriteClient {
+#[derive(Debug)]
+pub struct WriteClient<P = ConnectionPool> {
     addr: String,
-    pool: Arc<ConnectionPool>,
+    pool: Arc<P>,
+}
+
+impl<P> Clone for WriteClient<P> {
+    fn clone(&self) -> Self {
+        Self {
+            addr: self.addr.clone(),
+            pool: self.pool.clone(),
+        }
+    }
 }
 
 impl WriteClient {
@@ -650,9 +457,11 @@ impl WriteClient {
     pub fn new(addr: impl Into<String>) -> Self {
         Self::with_pool(addr, Arc::new(ConnectionPool::new()))
     }
+}
 
+impl<P: RequestExecutor> WriteClient<P> {
     /// Create a client that reuses connections from the shared `pool`.
-    pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
+    pub fn with_pool(addr: impl Into<String>, pool: Arc<P>) -> Self {
         Self {
             addr: addr.into(),
             pool,
@@ -675,42 +484,8 @@ impl WriteClient {
     /// request has been sent, a response failure is ambiguous and propagates
     /// instead of risking a duplicate backend write.
     pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
-        let req_id = RequestId::next();
-        let header = encode_put_header(
-            req_id.0,
-            &PutRequest {
-                object: object.clone(),
-                body_len: body.len() as u64,
-            },
-        )?;
-        match self.put_exchange(&header, body).await {
-            Ok(version) => Ok(version),
-            Err((true, true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                let version = self
-                    .pool
-                    .with_request_deadline("worker put_object retry", async {
-                        stream.write_all(&header).await?;
-                        stream.write_all(body).await?;
-                        stream.flush().await?;
-                        read_version_reply(&mut stream).await
-                    })
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(version)
-            }
-            Err((_, _, err)) => {
-                tracing::error!(
-                    req = %req_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    bytes = body.len(),
-                    error = %err,
-                    "worker put failed"
-                );
-                Err(err)
-            }
-        }
+        self.put_object_owned(object, bytes::Bytes::copy_from_slice(body))
+            .await
     }
 
     /// Stream a staged file through the worker without loading it into memory.
@@ -720,309 +495,79 @@ impl WriteClient {
         path: &Path,
         len: u64,
     ) -> Result<Version, WorkerError> {
-        let mut file = tokio::fs::File::open(path).await?;
-        let actual_len = file.metadata().await?.len();
-        if actual_len < len {
-            return Err(short_file_error(actual_len, len));
-        }
-        let req_id = RequestId::next();
-        let header = encode_put_header(
-            req_id.0,
+        let frame = encode_put_header(
+            RequestId::next().0,
             &PutRequest {
                 object: object.clone(),
                 body_len: len,
             },
         )?;
-        match self.put_file_exchange(&header, &mut file, len).await {
-            Ok(version) => Ok(version),
-            Err((true, true, err)) if err.is_transport_failure() => {
-                file.seek(std::io::SeekFrom::Start(0)).await?;
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                let version = self
-                    .pool
-                    .with_deadline(
-                        "worker put_object_file retry",
-                        streamed_put_timeout(len),
-                        async {
-                            stream.write_all(&header).await?;
-                            stream_file(&mut stream, &mut file, len, None).await?;
-                            read_version_reply(&mut stream).await
-                        },
-                    )
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(version)
-            }
-            Err((_, _, error)) => {
-                tracing::error!(
-                    req = %req_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    bytes = len,
-                    %error,
-                    "worker streamed put failed"
-                );
-                Err(error)
-            }
+        match self
+            .pool
+            .execute_request(
+                &self.addr,
+                crate::rpc::Request::put_file(frame, path.to_owned(), len),
+            )
+            .await
+            .map_err(crate::rpc::Error::worker)?
+        {
+            crate::rpc::Reply::Version(version) => Ok(version),
+            _ => unreachable!("validated version reply"),
         }
     }
 
-    /// One PUT exchange over a pooled-or-fresh connection; on error returns
-    /// `(was_reused, err)` so a stale pooled connection can be retried.
-    async fn put_exchange(
+    /// Write an owned body without copying it at the SDK boundary.
+    pub async fn put_object_owned(
         &self,
-        header: &[u8],
-        body: &[u8],
-    ) -> Result<Version, (bool, bool, WorkerError)> {
-        let (mut stream, reused) = self
+        object: &ObjectId,
+        body: bytes::Bytes,
+    ) -> Result<Version, WorkerError> {
+        let frame = encode_put_header(
+            RequestId::next().0,
+            &PutRequest {
+                object: object.clone(),
+                body_len: body.len() as u64,
+            },
+        )?;
+        match self
             .pool
-            .checkout(&self.addr)
+            .execute_request(&self.addr, crate::rpc::Request::put(frame, body))
             .await
-            .map_err(|e| (false, false, WorkerError::from(e)))?;
-        let retry_safe = AtomicBool::new(true);
-        let result: Result<Version, WorkerError> = self
-            .pool
-            .with_request_deadline("worker put_object", async {
-                stream.write_all(header).await?;
-                stream.write_all(body).await?;
-                stream.flush().await?;
-                retry_safe.store(false, Ordering::Relaxed);
-                read_version_reply(&mut stream).await
-            })
-            .await;
-        match result {
-            Ok(version) => {
-                self.pool.release(&self.addr, stream);
-                Ok(version)
-            }
-            Err(err) => Err((reused, retry_safe.load(Ordering::Relaxed), err)),
-        }
-    }
-
-    async fn put_file_exchange(
-        &self,
-        header: &[u8],
-        file: &mut tokio::fs::File,
-        len: u64,
-    ) -> Result<Version, (bool, bool, WorkerError)> {
-        let (mut stream, reused) = self
-            .pool
-            .checkout(&self.addr)
-            .await
-            .map_err(|error| (false, false, WorkerError::from(error)))?;
-        let retry_safe = AtomicBool::new(true);
-        let result: Result<Version, WorkerError> = self
-            .pool
-            .with_deadline("worker put_object_file", streamed_put_timeout(len), async {
-                stream.write_all(header).await?;
-                stream_file(&mut stream, file, len, Some(&retry_safe)).await?;
-                retry_safe.store(false, Ordering::Relaxed);
-                read_version_reply(&mut stream).await
-            })
-            .await;
-        match result {
-            Ok(version) => {
-                self.pool.release(&self.addr, stream);
-                Ok(version)
-            }
-            Err(error) => Err((reused, retry_safe.load(Ordering::Relaxed), error)),
+            .map_err(crate::rpc::Error::worker)?
+        {
+            crate::rpc::Reply::Version(version) => Ok(version),
+            _ => unreachable!("validated version reply"),
         }
     }
 
     /// Delete `object` at the worker (which deletes it at the backend).
     pub async fn delete_object(&self, object: &ObjectId) -> Result<(), WorkerError> {
-        let req_id = RequestId::next();
         let frame = encode_delete(
-            req_id.0,
+            RequestId::next().0,
             &DeleteRequest {
                 object: object.clone(),
             },
         )?;
-        match self.delete_exchange(&frame).await {
-            Ok(()) => Ok(()),
-            Err((true, true, err)) if err.is_transport_failure() => {
-                let mut stream = self.pool.fresh(&self.addr).await?;
-                self.pool
-                    .with_request_deadline("worker delete_object retry", async {
-                        stream.write_all(&frame).await?;
-                        stream.flush().await?;
-                        read_version_reply(&mut stream).await.map(|_| ())
-                    })
-                    .await?;
-                self.pool.release(&self.addr, stream);
-                Ok(())
-            }
-            Err((_, _, err)) => {
-                tracing::error!(
-                    req = %req_id,
-                    worker = %self.addr,
-                    object = %object.to_path(),
-                    error = %err,
-                    "worker delete failed"
-                );
-                Err(err)
-            }
-        }
-    }
-
-    async fn delete_exchange(&self, frame: &[u8]) -> Result<(), (bool, bool, WorkerError)> {
-        let (mut stream, reused) = self
-            .pool
-            .checkout(&self.addr)
+        self.pool
+            .execute_request(&self.addr, crate::rpc::Request::delete(frame))
             .await
-            .map_err(|e| (false, false, WorkerError::from(e)))?;
-        let retry_safe = AtomicBool::new(true);
-        let result: Result<(), WorkerError> = self
-            .pool
-            .with_request_deadline("worker delete_object", async {
-                stream.write_all(frame).await?;
-                stream.flush().await?;
-                retry_safe.store(false, Ordering::Relaxed);
-                read_version_reply(&mut stream).await.map(|_| ())
-            })
-            .await;
-        match result {
-            Ok(()) => {
-                self.pool.release(&self.addr, stream);
-                Ok(())
-            }
-            Err(err) => Err((reused, retry_safe.load(Ordering::Relaxed), err)),
-        }
+            .map_err(crate::rpc::Error::worker)?;
+        Ok(())
     }
 }
 
-fn streamed_put_timeout(len: u64) -> Duration {
+pub(crate) fn streamed_put_timeout(len: u64) -> Duration {
     const MIN_BYTES_PER_SECOND: u64 = 4 * 1024 * 1024;
     const MAX_SECONDS: u64 = 30 * 60;
     let transfer_seconds = len.div_ceil(MIN_BYTES_PER_SECOND);
     Duration::from_secs((30 + transfer_seconds).min(MAX_SECONDS))
 }
 
-async fn stream_file(
-    stream: &mut TcpStream,
-    file: &mut tokio::fs::File,
-    len: u64,
-    retry_safe: Option<&AtomicBool>,
-) -> Result<(), WorkerError> {
-    let mut remaining = len;
-    let mut buffer = vec![0_u8; 64 * 1024];
-    while remaining > 0 {
-        if let Some(retry_safe) = retry_safe {
-            retry_safe.store(false, Ordering::Relaxed);
-        }
-        let limit = remaining.min(buffer.len() as u64) as usize;
-        let read = file.read(&mut buffer[..limit]).await?;
-        if read == 0 {
-            return Err(short_file_error(len - remaining, len));
-        }
-        if let Some(retry_safe) = retry_safe {
-            retry_safe.store(true, Ordering::Relaxed);
-        }
-        stream.write_all(&buffer[..read]).await?;
-        remaining -= read as u64;
-    }
-    stream.flush().await?;
-    Ok(())
-}
-
-fn short_file_error(actual_len: u64, expected_len: u64) -> WorkerError {
+pub(crate) fn short_file_error(actual_len: u64, expected_len: u64) -> WorkerError {
     WorkerError::Io(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
         format!("staged file is {actual_len} bytes, expected at least {expected_len}"),
     ))
-}
-
-/// Read a framed write/delete reply: OK carries the committed version bytes (a
-/// UTF-8 [`Version`]); an `ERROR`-flagged frame carries a message.
-async fn read_version_reply(stream: &mut TcpStream) -> Result<Version, WorkerError> {
-    let mut header_buf = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header_buf).await?;
-    let header = FrameHeader::decode(&header_buf)?;
-    if header.msg_type != MsgType::GetRange {
-        return Err(WorkerError::NotGetRange(header.msg_type));
-    }
-    if header.length > MAX_CONTROL_PAYLOAD_LEN {
-        return Err(WorkerError::PayloadTooLarge {
-            length: header.length,
-            cap: MAX_CONTROL_PAYLOAD_LEN,
-        });
-    }
-    let mut body = vec![0u8; header.length as usize];
-    stream.read_exact(&mut body).await?;
-    if header.flags.contains(Flags::ERROR) {
-        return Err(WorkerError::Remote(decode_error_payload(&body)));
-    }
-    Ok(Version::new(String::from_utf8_lossy(&body).into_owned()))
-}
-
-/// Read one framed data-plane reply for a request of `expected_len` bytes.
-///
-/// A successful reply must advertise exactly `expected_len` before its buffer is
-/// allocated. If the header carries [`Flags::ERROR`], the body is instead a
-/// typed or legacy message capped at [`MAX_CONTROL_PAYLOAD_LEN`] and returned as
-/// [`WorkerError::Remote`].
-async fn read_range_reply(
-    stream: &mut TcpStream,
-    expected_len: u64,
-) -> Result<Vec<u8>, WorkerError> {
-    let mut header_buf = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header_buf).await?;
-    let header = FrameHeader::decode(&header_buf)?;
-    if header.msg_type != MsgType::GetRange {
-        return Err(WorkerError::NotGetRange(header.msg_type));
-    }
-    if header.flags.contains(Flags::ERROR) {
-        if header.length > MAX_CONTROL_PAYLOAD_LEN {
-            return Err(WorkerError::PayloadTooLarge {
-                length: header.length,
-                cap: MAX_CONTROL_PAYLOAD_LEN,
-            });
-        }
-    } else if u64::from(header.length) != expected_len {
-        return Err(WorkerError::RangeLengthMismatch {
-            expected: expected_len,
-            actual: u64::from(header.length),
-        });
-    }
-    let mut body = vec![0u8; header.length as usize];
-    stream.read_exact(&mut body).await?;
-    if header.flags.contains(Flags::ERROR) {
-        return Err(WorkerError::Remote(decode_error_payload(&body)));
-    }
-    Ok(body)
-}
-
-/// Read a successful range reply directly into `dst`.
-async fn read_range_reply_into(
-    stream: &mut TcpStream,
-    dst: &mut [u8],
-) -> Result<usize, WorkerError> {
-    let mut header_buf = [0u8; HEADER_LEN];
-    stream.read_exact(&mut header_buf).await?;
-    let header = FrameHeader::decode(&header_buf)?;
-    if header.msg_type != MsgType::GetRange {
-        return Err(WorkerError::NotGetRange(header.msg_type));
-    }
-    if header.flags.contains(Flags::ERROR) {
-        if header.length > MAX_CONTROL_PAYLOAD_LEN {
-            return Err(WorkerError::PayloadTooLarge {
-                length: header.length,
-                cap: MAX_CONTROL_PAYLOAD_LEN,
-            });
-        }
-        let mut body = vec![0u8; header.length as usize];
-        stream.read_exact(&mut body).await?;
-        return Err(WorkerError::Remote(decode_error_payload(&body)));
-    }
-    let expected_len = dst.len() as u64;
-    if u64::from(header.length) != expected_len {
-        return Err(WorkerError::RangeLengthMismatch {
-            expected: expected_len,
-            actual: u64::from(header.length),
-        });
-    }
-    stream.read_exact(dst).await?;
-    Ok(dst.len())
 }
 
 #[cfg(test)]
@@ -1035,6 +580,7 @@ mod tests {
         decode_request, decode_tenant_request, decode_versioned_request, encode_error,
         response_header_ok,
     };
+    use talon_transport::{Flags, MAX_CONTROL_PAYLOAD_LEN};
     use tokio::net::TcpListener;
 
     fn object() -> ObjectId {
@@ -1279,11 +825,11 @@ mod tests {
         })
         .await;
         let client = WorkerClient::new(addr);
-        let mut dst = vec![0u8; 4096];
-        let n = client
-            .fetch_range_into(&object(), 0, &mut dst)
-            .await
-            .unwrap();
+        let dst = vec![0u8; 4096];
+        let ptr = dst.as_ptr();
+        let (n, dst) = client.fetch_range_into(&object(), 0, dst).await;
+        let n = n.unwrap();
+        assert_eq!(dst.as_ptr(), ptr);
         assert_eq!(n, dst.len());
         assert_eq!(dst[0], 0);
         assert_eq!(dst[250], 250);
