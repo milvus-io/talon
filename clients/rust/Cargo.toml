@@ -15,9 +15,11 @@ talon-cache-client.workspace = true
 talon-transport.workspace = true
 futures.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
+tracing.workspace = true
 
 [features]
 telemetry = ["talon-telemetry/export"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+monoio.workspace = true
