@@ -23,7 +23,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use talon_backend::{
@@ -135,7 +135,8 @@ struct Args {
     /// Stable node identity; defaults to the RPC listen address.
     #[arg(long)]
     node_id: Option<String>,
-    /// Control-plane heartbeat interval in milliseconds.
+    /// Heartbeat interval in milliseconds; detected failures retain readiness
+    /// for at most three intervals since the last accepted heartbeat, capped at 15s.
     #[arg(long)]
     heartbeat_interval_ms: Option<u64>,
     /// Logical block size in bytes.
@@ -772,6 +773,25 @@ where
     Ok(())
 }
 
+const CONTROL_FAILURE_GRACE_INTERVALS: u32 = 3;
+const MAX_CONTROL_FAILURE_GRACE: Duration = Duration::from_secs(15);
+
+fn retain_readiness_after_control_failure(
+    observability: &WorkerObservability,
+    last_successful_heartbeat: Option<Instant>,
+    grace: Duration,
+) {
+    let remaining = last_successful_heartbeat
+        .and_then(|last| grace.checked_sub(last.elapsed()))
+        .filter(|remaining| !remaining.is_zero());
+    match remaining {
+        Some(remaining) => observability
+            .readiness()
+            .limit_control_registration_to(remaining),
+        None => observability.readiness().set_control_registered(false),
+    }
+}
+
 /// Maintain registration and send legacy plus versioned status heartbeats.
 fn spawn_control_plane(
     coordinator: String,
@@ -785,6 +805,10 @@ fn spawn_control_plane(
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut registered = false;
+        let mut last_successful_heartbeat = None;
+        let failure_grace = heartbeat_interval
+            .saturating_mul(CONTROL_FAILURE_GRACE_INTERVALS)
+            .min(MAX_CONTROL_FAILURE_GRACE);
         loop {
             ticker.tick().await;
 
@@ -800,13 +824,21 @@ fn spawn_control_plane(
                     }
                     Ok(Err(error)) => {
                         observability.metrics().record_heartbeat_failure();
-                        observability.readiness().set_control_registered(false);
+                        retain_readiness_after_control_failure(
+                            &observability,
+                            last_successful_heartbeat,
+                            failure_grace,
+                        );
                         tracing::warn!(%error, "worker registration failed; retrying");
                         continue;
                     }
                     Err(_) => {
                         observability.metrics().record_heartbeat_failure();
-                        observability.readiness().set_control_registered(false);
+                        retain_readiness_after_control_failure(
+                            &observability,
+                            last_successful_heartbeat,
+                            failure_grace,
+                        );
                         tracing::warn!("worker registration timed out; retrying");
                         continue;
                     }
@@ -827,19 +859,28 @@ fn spawn_control_plane(
             .await;
             match heartbeat {
                 Ok(Ok(())) => {
+                    last_successful_heartbeat = Some(Instant::now());
                     observability.readiness().set_control_registered(true);
                     observability.metrics().record_heartbeat_success();
                 }
                 Ok(Err(error)) => {
                     registered = false;
                     observability.metrics().record_heartbeat_failure();
-                    observability.readiness().set_control_registered(false);
+                    retain_readiness_after_control_failure(
+                        &observability,
+                        last_successful_heartbeat,
+                        failure_grace,
+                    );
                     tracing::warn!(%error, "control heartbeat failed; registration will retry");
                 }
                 Err(_) => {
                     registered = false;
                     observability.metrics().record_heartbeat_failure();
-                    observability.readiness().set_control_registered(false);
+                    retain_readiness_after_control_failure(
+                        &observability,
+                        last_successful_heartbeat,
+                        failure_grace,
+                    );
                     tracing::warn!("control heartbeat timed out; registration will retry");
                 }
             }
@@ -1281,6 +1322,38 @@ mod tests {
             .is_err());
             responder.await.unwrap();
         }
+    }
+
+    #[test]
+    fn recent_control_heartbeat_bridges_only_a_bounded_failure_window() {
+        let (_worker, observability, _node, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        observability.readiness().set_control_registered(true);
+        let grace = Duration::from_secs(15);
+
+        retain_readiness_after_control_failure(&observability, Some(Instant::now()), grace);
+        assert!(
+            observability.is_ready(),
+            "one failure after a recent heartbeat must not stop the data plane"
+        );
+
+        let stale = Instant::now()
+            .checked_sub(grace + Duration::from_millis(1))
+            .unwrap();
+        retain_readiness_after_control_failure(&observability, Some(stale), grace);
+        assert!(
+            !observability.is_ready(),
+            "a worker must become unready after the heartbeat grace expires"
+        );
+
+        observability.readiness().set_control_registered(true);
+        retain_readiness_after_control_failure(&observability, None, grace);
+        assert!(
+            !observability.is_ready(),
+            "a worker without any successful heartbeat has no grace"
+        );
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]

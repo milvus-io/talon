@@ -404,6 +404,14 @@ readiness from local backend/store health; only its acceptance commits readiness
 locally. Coordinators acknowledge applied or duplicate status records and reject
 stale records and failed writes. This uses the existing Ack wire message.
 
+After a detected registration or heartbeat failure, a worker may retain readiness
+until three heartbeat intervals after its last accepted status heartbeat, capped
+at 15 seconds. Re-registration and failed attempts do not renew that deadline.
+Readiness checks enforce expiration even before the next retry; local dependency
+failures and shutdown still remove readiness immediately. Before the first
+accepted heartbeat there is no grace. Healthy workers continue honoring their
+configured heartbeat interval; the grace applies only after a detected failure.
+
 ### Placement lookup
 
 ```mermaid
