@@ -244,9 +244,8 @@ are gone. Native sockets never cross runtimes. The public raw
 `ConnectionPool::checkout/fresh/release` Tokio API retains a separate pool.
 
 A shared ring and complete-RPC cross-thread notifications still carry costs.
-The native caller path avoids that handoff. Local comparisons and verification
-limits are recorded in [the SDK transport report](docs/reports/client-uring-validation.md);
-Worker benchmark gains from #591 do not establish SDK performance.
+The native caller path avoids that handoff. Worker benchmark gains from #591 do
+not establish SDK performance.
 
 ### Client receive hot path
 

@@ -147,8 +147,7 @@ C's pointer/callback ABI and Python's `bytes` result type are unchanged. Python
 receives into its final unpublished bytes allocation, without copying a Rust Vec.
 
 These paths avoid intermediate userspace payload copies; normal TCP still copies
-from kernel socket buffers. Existing [benchmark results](../reports/client-uring-validation.md)
-predate this direct-destination change and do not establish its performance.
+from kernel socket buffers.
 
 ## Current scope
 
