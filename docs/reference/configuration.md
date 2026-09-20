@@ -128,7 +128,7 @@ Node heartbeat interval (ms).
 
 ### `unhealthy_after_ms`
 
-Silence before a node is unhealthy (ms); must exceed heartbeat.
+Silence before a node is unhealthy and last-good membership grace (ms); must exceed heartbeat.
 
 - **Environment variable:** `TALON_COORDINATOR_UNHEALTHY_AFTER_MS`
 - **Default:** `15000`
@@ -340,7 +340,7 @@ Mounted static namespace authorization policy (TOML).
 
 ### `heartbeat_interval_ms`
 
-Heartbeat interval (ms).
+Heartbeat interval (ms); detected control failures have a three-interval grace, capped at 15s.
 
 - **Environment variable:** `TALON_WORKER_HEARTBEAT_INTERVAL_MS`
 - **Default:** `5000`

@@ -283,6 +283,10 @@ deploy_talon() {
     TALON_WORKER_S3_PATH_STYLE=true \
     TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 >/dev/null
 
+  # The old pods can still be ready immediately after set env. Wait for the
+  # new backend configuration to finish rolling out before counting workers.
+  kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE-worker" --timeout=5m
+
   log "waiting for $KIND_WORKERS ready workers"
   local ready=0
   for _ in $(seq 1 90); do

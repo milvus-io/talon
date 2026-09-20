@@ -1,20 +1,27 @@
 use std::sync::Arc;
+use tokio::sync::Semaphore;
 
 use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
 use futures::stream::{FuturesUnordered, StreamExt};
 use talon_cache_client::pool::{DEFAULT_IDLE_TTL, DEFAULT_MAX_IDLE_PER_ADDR};
 use talon_cache_client::{
-    plan_read, BlockReader, ConnectionPool, CoordinatorClient, PlacementCache,
+    iter_read, BlockReader, BlockSegment, ConnectionPool, CoordinatorClient, PlacementCache,
 };
 
 const PLACEMENT_TTL_MS: u64 = 30_000;
 const REPLICAS_K: u8 = 1;
+
+// Limit task allocation and let other logical reads make progress.
+const MAX_CONCURRENT_BLOCK_READS_PER_READ: usize = 8;
+/// Default active block-read budget shared by a client and all its clones.
+pub const DEFAULT_MAX_IN_FLIGHT_BLOCK_READS: usize = 1024;
 
 /// A reusable, runtime-owning-neutral Talon client.
 #[derive(Clone)]
 pub struct Client {
     coordinator: CoordinatorClient,
     reader: BlockReader,
+    block_read_permits: Arc<Semaphore>,
     block_size: u32,
 }
 
@@ -26,6 +33,7 @@ pub struct ClientBuilder {
     coordinator: String,
     block_size: u32,
     max_idle_per_addr: usize,
+    max_in_flight_block_reads: usize,
 }
 
 impl Default for ClientBuilder {
@@ -34,6 +42,7 @@ impl Default for ClientBuilder {
             coordinator: String::new(),
             block_size: 256 << 20,
             max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
+            max_in_flight_block_reads: DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
         }
     }
 }
@@ -58,12 +67,23 @@ impl ClientBuilder {
         self
     }
 
+    /// Set the active block-read limit shared by this client and its clones.
+    ///
+    /// Defaults to 1024. A permit covers placement resolution, worker attempts,
+    /// and retries for one block. Metadata calls and separate clients have
+    /// independent budgets. Waiting and active reads release capacity on cancellation.
+    pub fn with_max_in_flight_block_reads(mut self, max: usize) -> Self {
+        self.max_in_flight_block_reads = max;
+        self
+    }
+
     /// Validate configuration and construct a client without selecting a Tokio runtime.
     pub fn build(self) -> Result<Client, Error> {
         let Self {
             coordinator,
             block_size,
             max_idle_per_addr,
+            max_in_flight_block_reads,
         } = self;
         if coordinator.is_empty() {
             return Err(Error::InvalidArgument(
@@ -76,6 +96,11 @@ impl ClientBuilder {
         if max_idle_per_addr == 0 {
             return Err(Error::InvalidArgument(
                 "max_idle_per_addr must be non-zero".into(),
+            ));
+        }
+        if max_in_flight_block_reads == 0 || max_in_flight_block_reads > Semaphore::MAX_PERMITS {
+            return Err(Error::InvalidArgument(
+                "max_in_flight_block_reads is outside the supported nonzero range".into(),
             ));
         }
         // Keep control and data connections in separate pools.
@@ -94,6 +119,7 @@ impl ClientBuilder {
         Ok(Client {
             coordinator,
             reader,
+            block_read_permits: Arc::new(Semaphore::new(max_in_flight_block_reads)),
             block_size,
         })
     }
@@ -142,6 +168,8 @@ impl Client {
     /// `known_stat` pins all returned bytes to its exact source version. Workers
     /// serve matching cached bytes or conditionally fill them from the origin;
     /// a version mismatch fails the read instead of substituting newer bytes.
+    /// Large ranges are planned lazily, with at most eight block reads in flight
+    /// per logical read. Assembly retains byte order without intermediate block buffers.
     pub async fn read(
         &self,
         object: &ObjectId,
@@ -282,7 +310,8 @@ impl Client {
             ));
         }
         let version = Version::new(stat.version.as_str());
-        let plan = plan_read(
+        let planned_len = requested.min(stat.size.saturating_sub(offset)) as usize;
+        let mut plan = iter_read(
             object,
             offset,
             requested,
@@ -290,10 +319,15 @@ impl Client {
             &version,
             stat.size,
         );
-        let planned_len: usize = plan.iter().map(|segment| segment.len as usize).sum();
         talon_telemetry::record("talon.range.offset", offset);
         talon_telemetry::record("talon.range.length", planned_len as u64);
-        talon_telemetry::record("talon.read.planned_blocks", plan.len() as u64);
+        let blocks = if planned_len == 0 {
+            0
+        } else {
+            (offset % u64::from(self.block_size) + planned_len as u64)
+                .div_ceil(u64::from(self.block_size))
+        };
+        talon_telemetry::record("talon.read.planned_blocks", blocks);
         if planned_len == 0 {
             return Ok(0);
         }
@@ -303,29 +337,52 @@ impl Client {
             .unwrap_or(0);
         let mut pending = FuturesUnordered::new();
         let mut rest = &mut dst[..planned_len];
-        for segment in plan {
+        for segment in plan.by_ref().take(MAX_CONCURRENT_BLOCK_READS_PER_READ) {
             let (chunk, tail) = rest.split_at_mut(segment.len as usize);
             rest = tail;
-            let reader = &self.reader;
-            pending.push(async move {
-                reader
-                    .read_versioned_block_into(
-                        &segment.block,
-                        segment.offset_in_block,
-                        chunk,
-                        now_ms,
-                    )
-                    .await
-                    .map_err(Error::from)
-            });
+            pending.push(read_segment_into(
+                &self.reader,
+                &self.block_read_permits,
+                segment,
+                chunk,
+                now_ms,
+            ));
         }
 
         let mut written = 0;
         while let Some(result) = pending.next().await {
             written += result?;
+            if let Some(segment) = plan.next() {
+                let (chunk, tail) = rest.split_at_mut(segment.len as usize);
+                rest = tail;
+                pending.push(read_segment_into(
+                    &self.reader,
+                    &self.block_read_permits,
+                    segment,
+                    chunk,
+                    now_ms,
+                ));
+            }
         }
         Ok(written)
     }
+}
+
+async fn read_segment_into(
+    reader: &BlockReader,
+    permits: &Semaphore,
+    segment: BlockSegment,
+    dst: &mut [u8],
+    now_ms: u64,
+) -> Result<usize, Error> {
+    let _permit = permits
+        .acquire()
+        .await
+        .expect("client never closes its read budget");
+    reader
+        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, now_ms)
+        .await
+        .map_err(Error::from)
 }
 
 /// Parse a `scheme://bucket/key` URI into an object id.
@@ -371,7 +428,7 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
-    use tokio::sync::Notify;
+    use tokio::sync::{Notify, Semaphore};
 
     async fn mock_coordinator() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -632,6 +689,72 @@ mod tests {
             }
         });
         addr
+    }
+
+    async fn mock_bounded_worker(
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        started: Arc<AtomicUsize>,
+        started_notify: Arc<Notify>,
+        release: Arc<Semaphore>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let active = Arc::clone(&active);
+                let peak = Arc::clone(&peak);
+                let started = Arc::clone(&started);
+                let started_notify = Arc::clone(&started_notify);
+                let release = Arc::clone(&release);
+                tokio::spawn(async move {
+                    let mut header_bytes = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header_bytes).await.is_err() {
+                        return;
+                    }
+                    let header = FrameHeader::decode(&header_bytes).unwrap();
+                    let mut payload = vec![0_u8; header.length as usize];
+                    socket.read_exact(&mut payload).await.unwrap();
+                    let mut frame = header_bytes.to_vec();
+                    frame.extend_from_slice(&payload);
+                    let (_, request) = decode_versioned_request(&frame).unwrap();
+                    assert_eq!(request.version.0.as_str(), "test-version");
+                    let request = request.request;
+
+                    let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    peak.fetch_max(active_now, Ordering::SeqCst);
+                    started.fetch_add(1, Ordering::SeqCst);
+                    started_notify.notify_waiters();
+                    release.acquire().await.unwrap().forget();
+
+                    let bytes: Vec<u8> = (0..request.len)
+                        .map(|index| ((request.offset + index) % 251) as u8)
+                        .collect();
+                    let mut response = response_header_ok(0, bytes.len() as u32).to_vec();
+                    response.extend_from_slice(&bytes);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    socket.write_all(&response).await.unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    async fn wait_for_started(started: &AtomicUsize, notify: &Notify, target: usize) {
+        loop {
+            let notified = notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if started.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            tokio::time::timeout(Duration::from_secs(2), notified)
+                .await
+                .expect("worker requests did not start");
+        }
     }
 
     async fn read_client(size: u64) -> (Client, Arc<AtomicUsize>) {
@@ -1010,6 +1133,171 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn multi_block_read_refills_the_internal_eight_request_window() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_notify = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let worker = mock_bounded_worker(
+            Arc::clone(&active),
+            Arc::clone(&peak),
+            Arc::clone(&started),
+            Arc::clone(&started_notify),
+            Arc::clone(&release),
+        )
+        .await;
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = mock_read_coordinator(worker, 10, stat_calls).await;
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(1)
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        let stat = ObjectStat {
+            size: 10,
+            version: "test-version".into(),
+        };
+        let read =
+            tokio::spawn(async move { client.read(&object, 0, Some(10), Some(&stat)).await });
+
+        wait_for_started(
+            &started,
+            &started_notify,
+            MAX_CONCURRENT_BLOCK_READS_PER_READ,
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            MAX_CONCURRENT_BLOCK_READS_PER_READ,
+            "a ninth block started before one of the first eight completed"
+        );
+
+        release.add_permits(1);
+        wait_for_started(&started, &started_notify, 9).await;
+        release.add_permits(9);
+        let bytes = tokio::time::timeout(Duration::from_secs(2), read)
+            .await
+            .expect("bounded read did not finish")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(bytes, (0_u8..10).collect::<Vec<_>>());
+        assert_eq!(started.load(Ordering::SeqCst), 10);
+        assert_eq!(peak.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn aggregate_block_limit_is_shared_by_concurrent_reads() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(AtomicUsize::new(0));
+        let started_notify = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let worker = mock_bounded_worker(
+            Arc::clone(&active),
+            Arc::clone(&peak),
+            Arc::clone(&started),
+            Arc::clone(&started_notify),
+            Arc::clone(&release),
+        )
+        .await;
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = mock_read_coordinator(worker, 16, stat_calls).await;
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(8)
+            .with_max_in_flight_block_reads(1)
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        let stat = ObjectStat {
+            size: 16,
+            version: "test-version".into(),
+        };
+
+        let first_client = client.clone();
+        let first_object = object.clone();
+        let first_stat = stat.clone();
+        let first = tokio::spawn(async move {
+            first_client
+                .read(&first_object, 0, Some(8), Some(&first_stat))
+                .await
+        });
+        let second =
+            tokio::spawn(async move { client.read(&object, 8, Some(8), Some(&stat)).await });
+
+        wait_for_started(&started, &started_notify, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            started.load(Ordering::SeqCst),
+            1,
+            "a second logical read bypassed the shared aggregate limit"
+        );
+
+        release.add_permits(1);
+        wait_for_started(&started, &started_notify, 2).await;
+        release.add_permits(1);
+        let first_bytes = tokio::time::timeout(Duration::from_secs(2), first)
+            .await
+            .expect("first read did not finish")
+            .unwrap()
+            .unwrap();
+        let second_bytes = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("second read did not finish")
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(first_bytes, (0_u8..8).collect::<Vec<_>>());
+        assert_eq!(second_bytes, (8_u8..16).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn aggregate_budget_validates_capacity_and_clones_share_it() {
+        for invalid in [0, usize::MAX] {
+            assert!(ClientBuilder::default()
+                .with_coordinator("localhost:1")
+                .with_max_in_flight_block_reads(invalid)
+                .build()
+                .is_err());
+        }
+        let client = ClientBuilder::default()
+            .with_coordinator("localhost:1")
+            .build()
+            .unwrap();
+        let clone = client.clone();
+        assert!(Arc::ptr_eq(
+            &client.block_read_permits,
+            &clone.block_read_permits
+        ));
+        assert_eq!(client.block_read_permits.available_permits(), 1024);
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_budget_waiter_preserves_capacity() {
+        let client = ClientBuilder::default()
+            .with_coordinator("localhost:1")
+            .with_max_in_flight_block_reads(1)
+            .build()
+            .unwrap();
+        let held = client.block_read_permits.acquire().await.unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        let stat = ObjectStat {
+            size: 1,
+            version: "v1".into(),
+        };
+        let read = client.read(&object, 0, Some(1), Some(&stat));
+        assert!(tokio::time::timeout(Duration::from_millis(20), read)
+            .await
+            .is_err());
+        drop(held);
+        assert_eq!(client.block_read_permits.available_permits(), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn block_failure_drops_the_other_unfinished_read() {
         let stalled_block_started = Arc::new(Notify::new());
         let stalled_block_disconnected = Arc::new(Notify::new());
@@ -1044,6 +1332,10 @@ mod tests {
         )
         .await
         .expect("unfinished block connection was not cancelled");
+        assert_eq!(
+            client.block_read_permits.available_permits(),
+            DEFAULT_MAX_IN_FLIGHT_BLOCK_READS
+        );
     }
 
     #[tokio::test]

@@ -55,7 +55,8 @@ pub struct ClusterStateConfig {
     pub coordinator_replicas: u16,
     /// Node heartbeat interval in milliseconds.
     pub heartbeat_interval_ms: u64,
-    /// Silence interval after which a node is unhealthy.
+    /// Silence interval after which a node is unhealthy and maximum age of a
+    /// last-good membership during a state-store failure.
     pub unhealthy_after_ms: u64,
     /// Silence interval after which the node lease expires.
     pub lease_ttl_ms: u64,

@@ -11,8 +11,8 @@ publish = false
 [dependencies]
 talon-rust-client = { path = "../.." }
 
-# Cargo patches are workspace-root scoped; reuse the prepared dependency
-# without adding another direct dependency to this standalone consumer.
+# Patches do not propagate from a dependency's workspace. Use the same
+# prepared Monoio source as the root workspace, including in offline CI.
 [patch.crates-io]
 monoio = { path = "../../../../.patched-deps/monoio" }
 

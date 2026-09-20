@@ -21,6 +21,7 @@
 //! membership token is seen. Multi-block splitting is handled by
 //! [`crate::read_plan`]; protocol frontends own their prefetch policy.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use talon_core::{BlockId, ObjectId, Version};
@@ -118,6 +119,8 @@ pub struct BlockReader {
     membership: Arc<MembershipCache>,
     /// Serializes cold refreshes so an expired snapshot causes one control request.
     membership_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// Completed refresh attempts, sampled separately by each logical read.
+    membership_refresh_generation: Arc<AtomicU64>,
     /// This reader's own deployment zone, for read classification (ADR 0006).
     zone: Option<String>,
     /// Sink for zone-classified read events; defaults to a no-op.
@@ -141,6 +144,7 @@ impl BlockReader {
             worker_pool: Arc::new(ConnectionPool::new()),
             membership,
             membership_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            membership_refresh_generation: Arc::new(AtomicU64::new(0)),
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
@@ -175,6 +179,8 @@ impl BlockReader {
         self.membership = Arc::new(
             MembershipCache::new(self.cache.ttl_ms()).with_zone_affinity(zone.clone(), enabled),
         );
+        self.membership_refresh = Arc::new(tokio::sync::Mutex::new(()));
+        self.membership_refresh_generation = Arc::new(AtomicU64::new(0));
         self.zone = zone;
         self.zone_observer = observer;
         self
@@ -370,6 +376,7 @@ impl BlockReader {
                 self.resolve_and_cache(block, now_ms).await?
             }
         };
+        let observed_generation = self.membership_refresh_generation.load(Ordering::Acquire);
         let abs_offset = block.offset + u64::from(offset_in_block);
 
         match self
@@ -386,11 +393,12 @@ impl BlockReader {
                 }
                 tracing::debug!(%block, reason = ?failure.reason, "all cached replicas failed; refreshing placement");
                 self.cache.invalidate(block, failure.reason);
-                self.stats.record_coordinator_refresh();
             }
         }
 
-        let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
+        let fresh = self
+            .resolve_and_cache_forced(block, now_ms, observed_generation)
+            .await?;
         let n = self
             .try_replicas_into(block, &fresh.replicas, abs_offset, dst, mode)
             .await
@@ -442,6 +450,7 @@ impl BlockReader {
                 self.resolve_and_cache(block, now_ms).await?
             }
         };
+        let observed_generation = self.membership_refresh_generation.load(Ordering::Acquire);
         let abs_offset = block.offset + offset_in_block as u64;
 
         // First pass: walk the cached replica list in order.
@@ -461,11 +470,12 @@ impl BlockReader {
                 // single membership refresh before giving up.
                 tracing::debug!(%block, reason = ?failure.reason, "all cached replicas failed; refreshing placement");
                 self.cache.invalidate(block, failure.reason);
-                self.stats.record_coordinator_refresh();
             }
         }
 
-        let fresh = self.resolve_and_cache_forced(block, now_ms).await?;
+        let fresh = self
+            .resolve_and_cache_forced(block, now_ms, observed_generation)
+            .await?;
         let bytes = self
             .try_replicas(block, &fresh.replicas, abs_offset, len, mode)
             .await
@@ -771,22 +781,24 @@ impl BlockReader {
         block: &BlockId,
         now_ms: u64,
     ) -> Result<Cached, BlockReadError> {
-        self.resolve_and_cache_inner(block, now_ms, false).await
+        self.resolve_and_cache_inner(block, now_ms, None).await
     }
 
     async fn resolve_and_cache_forced(
         &self,
         block: &BlockId,
         now_ms: u64,
+        observed_generation: u64,
     ) -> Result<Cached, BlockReadError> {
-        self.resolve_and_cache_inner(block, now_ms, true).await
+        self.resolve_and_cache_inner(block, now_ms, Some(observed_generation))
+            .await
     }
 
     async fn resolve_and_cache_inner(
         &self,
         block: &BlockId,
         now_ms: u64,
-        force_membership_refresh: bool,
+        force_membership_refresh: Option<u64>,
     ) -> Result<Cached, BlockReadError> {
         let membership = self
             .membership_snapshot(now_ms, force_membership_refresh)
@@ -837,36 +849,48 @@ impl BlockReader {
     async fn membership_snapshot(
         &self,
         now_ms: u64,
-        force_refresh: bool,
+        force_after: Option<u64>,
     ) -> Result<MembershipSnapshot, BlockReadError> {
-        if !force_refresh {
+        if force_after.is_none() {
             if let Some(snapshot) = self.membership.fresh(now_ms) {
                 return Ok(snapshot);
             }
         }
         let _refresh = self.membership_refresh.lock().await;
-        if !force_refresh {
-            if let Some(snapshot) = self.membership.fresh(now_ms) {
-                return Ok(snapshot);
+        if let Some(observed) = force_after {
+            if self.membership_refresh_generation.load(Ordering::Acquire) != observed {
+                if let Some(snapshot) = self.membership.last_good() {
+                    return Ok(snapshot);
+                }
             }
+            self.stats.record_coordinator_refresh();
+        } else if let Some(snapshot) = self.membership.fresh(now_ms) {
+            return Ok(snapshot);
         }
-        match self.coordinator.membership_zoned(now_ms).await {
+        let snapshot = match self.coordinator.membership_zoned(now_ms).await {
             Ok(members) => {
                 let (snapshot, changed) = self.membership.replace(members, now_ms);
                 if changed {
                     self.cache.clear();
                 }
-                Ok(snapshot)
+                snapshot
             }
             Err(error) => {
                 if let Some(snapshot) = self.membership.last_good() {
                     tracing::warn!(%error, "membership refresh failed; using last-good snapshot");
-                    Ok(snapshot)
+                    snapshot
                 } else {
-                    Err(error.into())
+                    return Err(error.into());
                 }
             }
-        }
+        };
+        // Publish only after installing the snapshot and invalidating placements.
+        // Unchanged/failed attempts still coalesce overlapping reads. Each new
+        // read samples the current generation before its worker attempt, so it
+        // can refresh again after a later failure, including after recovery.
+        self.membership_refresh_generation
+            .fetch_add(1, Ordering::Release);
+        Ok(snapshot)
     }
 }
 
@@ -903,6 +927,7 @@ mod tests {
     };
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+    use tokio::sync::Barrier;
 
     fn block() -> BlockId {
         BlockId::new(
@@ -914,6 +939,144 @@ mod tests {
     }
 
     /// A mock coordinator that advertises one worker membership entry.
+    async fn mock_switching_coordinator(
+        first_worker: String,
+        next_worker: String,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let first_worker = first_worker.clone();
+                let next_worker = next_worker.clone();
+                let calls = Arc::clone(&calls);
+                tokio::spawn(async move {
+                    let mut header = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let decoded = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0_u8; decoded.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let worker = if call == 0 { first_worker } else { next_worker };
+                    let response = ControlMessage::MembershipListV2 {
+                        nodes: vec![talon_transport::ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new("w1"),
+                                address: worker,
+                                role: NodeRole::Worker,
+                            },
+                            zone: None,
+                        }],
+                    };
+                    socket
+                        .write_all(&talon_transport::encode(0, &response).unwrap())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    async fn spawn_barrier_error_worker(
+        requests: Arc<std::sync::atomic::AtomicU32>,
+        barrier: Arc<Barrier>,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let requests = Arc::clone(&requests);
+                let barrier = Arc::clone(&barrier);
+                tokio::spawn(async move {
+                    let mut header = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let decoded = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0_u8; decoded.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    requests.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    barrier.wait().await;
+                    socket
+                        .write_all(&encode_error(decoded.request_id, "stale owner"))
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        addr
+    }
+
+    async fn mock_intermediate_then_switching_coordinator(
+        stale_worker: String,
+        recovered_worker: String,
+        calls: Arc<std::sync::atomic::AtomicU32>,
+        fail_intermediate: bool,
+    ) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = match listener.accept().await {
+                    Ok(value) => value,
+                    Err(_) => return,
+                };
+                let stale_worker = stale_worker.clone();
+                let recovered_worker = recovered_worker.clone();
+                let calls = Arc::clone(&calls);
+                tokio::spawn(async move {
+                    let mut header = [0_u8; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let decoded = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0_u8; decoded.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let response = if call == 1 && fail_intermediate {
+                        ControlMessage::Ack {
+                            ok: false,
+                            detail: Some("control plane unavailable".into()),
+                        }
+                    } else {
+                        let worker = if call <= 1 {
+                            stale_worker
+                        } else {
+                            recovered_worker
+                        };
+                        ControlMessage::MembershipListV2 {
+                            nodes: vec![talon_transport::ZonedNodeInfo {
+                                info: NodeInfo {
+                                    id: NodeId::new("w1"),
+                                    address: worker,
+                                    role: NodeRole::Worker,
+                                },
+                                zone: None,
+                            }],
+                        }
+                    };
+                    socket
+                        .write_all(&talon_transport::encode(0, &response).unwrap())
+                        .await
+                        .unwrap();
+                });
+            }
+        });
+        addr
+    }
+
     async fn mock_coordinator(worker_addr: String) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1435,6 +1598,119 @@ mod tests {
 
         assert_eq!(bytes.len(), 16);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_block_failures_share_one_forced_membership_refresh() {
+        const BLOCKS: u32 = 4;
+        let stale_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stale_worker = spawn_barrier_error_worker(
+            Arc::clone(&stale_requests),
+            Arc::new(Barrier::new(BLOCKS as usize)),
+        )
+        .await;
+        let fresh_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let fresh_worker = mock_worker(Arc::clone(&fresh_requests)).await;
+        let membership_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let coordinator =
+            mock_switching_coordinator(stale_worker, fresh_worker, Arc::clone(&membership_calls))
+                .await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(10_000)),
+            1,
+        );
+
+        let reads = (0..BLOCKS).map(|index| {
+            let reader = reader.clone();
+            async move {
+                let mut requested = block();
+                requested.offset = u64::from(index) * u64::from(requested.block_size);
+                reader.read_block(&requested, 0, 16, 0).await
+            }
+        });
+        for result in futures::future::join_all(reads).await {
+            assert_eq!(result.unwrap().len(), 16);
+        }
+
+        assert_eq!(
+            stale_requests.load(std::sync::atomic::Ordering::SeqCst),
+            BLOCKS,
+            "every block must first observe the stale placement"
+        );
+        assert_eq!(
+            fresh_requests.load(std::sync::atomic::Ordering::SeqCst),
+            BLOCKS,
+            "every block must retry against the refreshed worker"
+        );
+        assert_eq!(
+            membership_calls.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "one cold lookup plus one shared forced refresh are sufficient"
+        );
+        assert_eq!(
+            reader.stats().snapshot().coordinator_refreshes,
+            1,
+            "the metric counts the one actual forced refresh, not its waiters"
+        );
+    }
+
+    async fn assert_intermediate_refresh_does_not_suppress_next(fail_intermediate: bool) {
+        let stale_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let stale_worker = spawn_erroring_worker(Arc::clone(&stale_requests)).await;
+        let recovered_requests = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let recovered_worker = mock_worker(Arc::clone(&recovered_requests)).await;
+        let membership_calls = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let coordinator = mock_intermediate_then_switching_coordinator(
+            stale_worker,
+            recovered_worker,
+            Arc::clone(&membership_calls),
+            fail_intermediate,
+        )
+        .await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(10_000)),
+            1,
+        );
+        let first = block();
+        let mut second = block();
+        second.offset += u64::from(second.block_size);
+
+        // Populate two placements from the same initial membership generation.
+        reader.resolve_and_cache(&first, 0).await.unwrap();
+        reader.resolve_and_cache(&second, 0).await.unwrap();
+
+        let observed = reader.membership_refresh_generation.load(Ordering::Acquire);
+        assert!(reader.read_block(&first, 0, 16, 0).await.is_err());
+        // Overlapping readers of the old generation reuse even an ineffective attempt.
+        for _ in 0..4 {
+            reader.membership_snapshot(0, Some(observed)).await.unwrap();
+        }
+        assert_eq!(membership_calls.load(Ordering::SeqCst), 2);
+        let bytes = reader.read_block(&second, 0, 16, 0).await.unwrap();
+
+        assert_eq!(bytes.len(), 16);
+        assert_eq!(
+            membership_calls.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "cold lookup, ineffective refresh, and recovered refresh must all run"
+        );
+        assert_eq!(
+            recovered_requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second read must recover without a user-visible extra failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_refresh_does_not_suppress_the_next_sequential_refresh() {
+        assert_intermediate_refresh_does_not_suppress_next(true).await;
+    }
+
+    #[tokio::test]
+    async fn unchanged_refresh_does_not_suppress_the_next_sequential_refresh() {
+        assert_intermediate_refresh_does_not_suppress_next(false).await;
     }
 
     #[tokio::test]

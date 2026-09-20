@@ -73,7 +73,8 @@ Three backends, compared across the aspects that matter for an operator.
 - **Operational owner:** your Kubernetes control plane.
 - **Credentials:** pod ServiceAccount token.
 - **Liveness authority:** Lease `renewTime` + TTL.
-- **Failure mode:** API-server outage → coordinators fail closed.
+- **Failure mode:** API-server outage → coordinators retain recent membership for at most
+  `unhealthy_after_ms`, then fail closed.
 - **Migration:** ↔ etcd requires a drain + redeploy (records are rebuildable).
 
 ### External etcd
@@ -84,7 +85,8 @@ Three backends, compared across the aspects that matter for an operator.
 - **Operational owner:** your etcd operators.
 - **Credentials:** Secret (user/pass and/or mTLS).
 - **Liveness authority:** etcd lease TTL.
-- **Failure mode:** etcd outage → coordinators fail closed.
+- **Failure mode:** etcd outage → coordinators retain recent membership for at most
+  `unhealthy_after_ms`, then fail closed.
 - **Migration:** ↔ Kubernetes requires a drain + redeploy (records are rebuildable).
 
 Records in the shared store are **ephemeral and rebuildable** from live process
@@ -157,6 +159,11 @@ Secret; see §1.
   `lease_ttl` (default 30s) after its last accepted heartbeat.
 - **Unhealthy marking**: a node shows `unhealthy` after `unhealthy_after`
   (default 15s) of silence, before removal.
+- **Worker control failure grace**: after a detected control failure, readiness
+  can survive until three heartbeat intervals after the last accepted status
+  heartbeat (capped at 15s). Registration and retries do not renew this bound;
+  initial registration failure has no grace. Readiness checks enforce expiration
+  without waiting for another heartbeat attempt.
 - **Failover interruption bound**: a client's request that hits a failing
   coordinator retries another via the load-balanced Service; placement stays
   correct because every coordinator derives the same deterministic version from
@@ -223,14 +230,16 @@ unscrapeable for >2m. Its cached blocks are unreachable via that endpoint.
 ### state-store-errors
 
 **Alert:** `TalonStateStoreErrors` (critical) — coordinators are failing shared
-state-store operations. New authoritative reads fail closed.
+state-store operations. A recent reconciled membership remains usable for at
+most `unhealthy_after_ms`; authoritative reads then fail closed.
 
 1. **etcd**: check etcd health/quorum, TLS/cert expiry, and auth. Verify the
    `talon-etcd` Secret endpoints/credentials.
 2. **Kubernetes**: check API-server availability and that the Lease RBAC is
    applied (`kubectl auth can-i --as=system:serviceaccount:talon:talon-coordinator update leases -n talon`).
 3. Coordinators recover automatically once the backend is healthy; readiness and
-   membership resume on the next successful snapshot.
+   membership resume on the next successful reconciliation. A health probe alone
+   does not promote stale membership.
 
 ### cluster-view-stale
 
@@ -375,10 +384,20 @@ coordinators and workers re-register within one heartbeat interval.
 | Endpoint | Auth | Meaning |
 |----------|------|---------|
 | `GET /healthz` | public | process liveness (200 unless shutting down) |
-| `GET /readyz` | public | shared-state reachable (503 fails closed) |
+| `GET /readyz` | public | recent reconciled membership remains usable within its failure grace; otherwise 503 |
 | `GET /metrics` | public | Prometheus exposition |
 | `GET /api/v1/*` | protected | versioned management API (see #82) |
 | `/ui` | protected | management console |
 
 "Protected" requires the bearer token when `TALON_COORDINATOR_AUTH_TOKEN` is set;
 see [security.md](security.md).
+
+### Coordinator worker-proxy limits
+
+`StatObject` and `ListObjects` share a limit of 64 active worker exchanges per
+coordinator. Waiting for capacity consumes the existing request deadline. The
+proxy retains at most 64 idle connections across all workers and discards
+connections idle for 20 seconds before reuse. Membership reconciliation removes
+idle sockets for departed workers. A failed exchange on a reused socket gets
+one fresh-connection attempt within the same deadline; an explicit worker
+rejection follows the existing next-worker fallback.

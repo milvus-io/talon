@@ -15,8 +15,6 @@ talon-cache-client.workspace = true
 talon-transport.workspace = true
 futures.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tokio.workspace = true
 
 [features]

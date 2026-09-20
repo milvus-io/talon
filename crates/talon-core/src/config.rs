@@ -125,7 +125,9 @@ pub struct WorkerConfig {
     pub namespace_policy: Option<NamespacePolicy>,
     /// Stable node identity; defaults to the RPC listen address when unset.
     pub node_id: Option<String>,
-    /// Control-plane heartbeat interval in milliseconds.
+    /// Control-plane heartbeat interval in milliseconds. After a detected failure,
+    /// readiness expires within three intervals of the last accepted heartbeat
+    /// (capped at 15 seconds).
     pub heartbeat_interval_ms: u64,
     /// Logical block size in bytes (256 MiB default).
     pub block_size: u32,
@@ -580,7 +582,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("5000"),
         cli: true,
         secret: false,
-        help: "Heartbeat interval (ms).",
+        help: "Heartbeat interval (ms); detected control failures have a three-interval grace, capped at 15s.",
     },
     ConfigVar {
         env: "TALON_WORKER_BLOCK_SIZE",

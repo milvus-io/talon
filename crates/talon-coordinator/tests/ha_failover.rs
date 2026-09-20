@@ -70,7 +70,8 @@ impl Coordinator {
                 Duration::from_millis(200),
                 store,
             )
-            .unwrap(),
+            .unwrap()
+            .with_state_failure_grace(STATE_FAILURE_GRACE),
         );
         Coordinator {
             obs,
@@ -121,6 +122,7 @@ fn block(n: u64) -> BlockId {
 
 const CLUSTER: &str = "ha";
 const TTL: Duration = Duration::from_secs(30);
+const STATE_FAILURE_GRACE: Duration = Duration::from_millis(100);
 
 /// Build a shared memory store with an injectable clock. Returns both the trait
 /// object (for coordinators) and the concrete handle (for fault injection).
@@ -226,12 +228,16 @@ async fn reads_fail_closed_during_backend_outage_and_recover() {
     assert!(a.reconcile().await);
     assert!(a.obs.is_ready());
 
-    // Inject a backend outage. The next reconcile fails and clears readiness,
-    // so the coordinator would fail placement/membership closed (per #73).
+    // Inject a backend outage. One failed reconcile retains the recent
+    // last-good view instead of turning a backend blip into a client storm.
     mem.set_available(false);
     assert!(!a.reconcile().await);
-    assert!(!a.obs.is_ready(), "must fail closed under backend outage");
+    assert!(a.obs.is_ready(), "recent last-good snapshot bridges a blip");
     assert!(a.obs.snapshot_for_api().await.is_err());
+
+    // A sustained outage still expires the bounded snapshot and fails closed.
+    tokio::time::sleep(STATE_FAILURE_GRACE + Duration::from_millis(50)).await;
+    assert!(!a.obs.is_ready(), "must fail closed after grace expires");
 
     // Recovery: the backend returns and the next reconcile restores service
     // within one request_timeout.
