@@ -394,6 +394,54 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `page_ttl_ms`
+
+Idle page lifetime in milliseconds; 0 disables TTL.
+
+- **Environment variable:** `TALON_WORKER_PAGE_TTL_MS`
+- **Default:** `0`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `page_access_checkpoint_interval_ms`
+
+Dirty page access checkpoint interval in milliseconds.
+
+- **Environment variable:** `TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS`
+- **Default:** `60000`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `page_gc_interval_ms`
+
+Page GC batch interval in milliseconds.
+
+- **Environment variable:** `TALON_WORKER_PAGE_GC_INTERVAL_MS`
+- **Default:** `1000`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `page_gc_scan_batch_size`
+
+Maximum pages examined per GC batch.
+
+- **Environment variable:** `TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE`
+- **Default:** `65536`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `page_gc_delete_batch_size`
+
+Maximum page deletion attempts per GC batch.
+
+- **Environment variable:** `TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `page_gc_io_concurrency`
+
+Maximum concurrent page GC deletion tasks.
+
+- **Environment variable:** `TALON_WORKER_PAGE_GC_IO_CONCURRENCY`
+- **Default:** `4`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `paged_miss_run_concurrency`
 
 Maximum independent paged-miss runs fetched concurrently per read.

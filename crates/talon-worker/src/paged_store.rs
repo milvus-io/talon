@@ -43,7 +43,7 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Run blocking filesystem work on Tokio's blocking pool, so page I/O never
 /// stalls the async reactor thread and the connections multiplexed on it
 /// (issue #115).
-async fn spawn_blocking_io<F, T>(f: F) -> Result<T>
+pub(crate) async fn spawn_blocking_io<F, T>(f: F) -> Result<T>
 where
     F: FnOnce() -> Result<T> + Send + 'static,
     T: Send + 'static,
@@ -97,9 +97,16 @@ pub struct PagedBlockStore {
     /// caps this at 8192 descriptors, which at a 1 MiB page size covers an
     /// 8 GiB hot set.
     fd_cache: FdCache,
+    root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
 impl PagedBlockStore {
+    /// Retain the root lease through detached blocking disk mutations.
+    pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
+        self.root_lock = Some(lock);
+        self
+    }
+
     /// Open (creating if needed) a paged store rooted at `root`, using
     /// `page_size`-byte pages.
     pub fn open(root: impl Into<PathBuf>, page_size: u32) -> Result<Self> {
@@ -109,6 +116,7 @@ impl PagedBlockStore {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
+            root_lock: None,
             root,
             page_size,
             fd_cache: FdCache::with_capacity(PAGE_FD_CACHE_SHARD_CAPACITY),
@@ -126,7 +134,7 @@ impl PagedBlockStore {
     }
 
     /// Directory holding a block's page files: `<root>/<shard>/<digest>.pages`.
-    fn dir_for(&self, id: &BlockId) -> PathBuf {
+    pub(crate) fn dir_for(&self, id: &BlockId) -> PathBuf {
         let mut hasher = DefaultHasher::new();
         id.hash(&mut hasher);
         let digest = hasher.finish();
@@ -304,7 +312,9 @@ impl PagedBlockStore {
         let dir = self.dir_for(id);
         let path = self.page_path(id, page);
         let invalidate_path = path.clone();
+        let root_lock = self.root_lock.clone();
         spawn_blocking_io(move || {
+            let _root_lock = root_lock;
             std::fs::create_dir_all(&dir)?;
             let pid = std::process::id();
             let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
@@ -355,10 +365,14 @@ impl PagedBlockStore {
     pub async fn evict_page_async(&self, id: &BlockId, page: PageIndex) -> Result<()> {
         let path = self.page_path(id, page);
         self.fd_cache.invalidate(&path);
-        spawn_blocking_io(move || match std::fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        let root_lock = self.root_lock.clone();
+        spawn_blocking_io(move || {
+            let _root_lock = root_lock;
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         })
         .await
     }
@@ -368,10 +382,14 @@ impl PagedBlockStore {
         let dir = self.dir_for(id);
         self.fd_cache.invalidate_prefix(&dir);
         let dir = dir.clone();
-        spawn_blocking_io(move || match std::fs::remove_dir_all(&dir) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
+        let root_lock = self.root_lock.clone();
+        spawn_blocking_io(move || {
+            let _root_lock = root_lock;
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(e.into()),
+            }
         })
         .await
     }

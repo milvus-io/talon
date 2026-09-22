@@ -1,9 +1,15 @@
 //! Instrumented worker cache request runtime.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod page_maintenance;
+#[cfg(test)]
+mod page_ttl_tests;
+use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
+use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
@@ -18,7 +24,7 @@ use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LE
 use crate::data_error::CacheMiss;
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
-    MemoryStore, PagedBlockStore, Presence, TenantRateLimiter, WholeBlockStore, WorkerMetrics,
+    MemoryStore, PagedBlockStore, TenantRateLimiter, WholeBlockStore, WorkerMetrics,
 };
 
 /// Default lifetime of a cached resolved object version.
@@ -74,16 +80,17 @@ pub enum ServeOutcome {
 }
 
 /// Shared state required to serve instrumented data-plane range requests.
+#[derive(Clone)]
 pub struct WorkerRuntime {
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
     l1: Arc<MemoryStore>,
     /// Persistent local-NVMe cache.
-    store: WholeBlockStore,
+    store: Arc<WholeBlockStore>,
     /// Per-page L2 cache, enabled when the worker runs in paged mode. When set,
     /// a miss materializes only the pages a read touches instead of the whole
     /// (256 MiB default) block, and eviction reclaims individual pages.
-    paged: Option<PagedBlockStore>,
+    paged: Option<Arc<PagedBlockStore>>,
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
     backend: Arc<dyn BackendStore>,
@@ -104,10 +111,19 @@ pub struct WorkerRuntime {
     paged_miss_run_concurrency: usize,
     /// Short-TTL cache of resolved object versions, so a warm read does not pay
     /// a backend `HEAD` per request (issue #163).
-    version_cache: Mutex<HashMap<ObjectId, CachedVersion>>,
+    version_cache: Arc<Mutex<HashMap<ObjectId, CachedVersion>>>,
     version_ttl: Duration,
     /// Worker-global per-tenant rate limiter; disabled unless configured.
     rate_limiter: Arc<TenantRateLimiter>,
+    page_lifecycle: Arc<PageLifecycle>,
+    page_clock: Arc<AccessClock>,
+    page_gc_config: PageGcConfig,
+    page_gc_metrics: PageGcMetrics,
+    page_mutations: Arc<Mutations>,
+    page_gc_io: Arc<tokio::sync::Semaphore>,
+    page_scan: Arc<tokio::sync::Mutex<(ScanCursor, Instant, usize)>>,
+    page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
+    page_cleanup: Arc<Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
 impl WorkerRuntime {
@@ -170,20 +186,35 @@ impl WorkerRuntime {
         metrics.update_l1_residency(0, 0);
         Self {
             l1,
-            store,
+            page_cleanup: Arc::new(Mutex::new(crate::page_cleanup::CleanupCursor::new(
+                store.root().join("paged"),
+            ))),
+            store: Arc::new(store),
             paged: None,
             index,
             inflight,
             backend,
             configured_backend: None,
             block_size,
+            page_gc_metrics: PageGcMetrics::new(&metrics.registry),
             metrics,
             lru,
             capacity_bytes,
             paged_miss_run_concurrency: DEFAULT_PAGED_MISS_RUN_CONCURRENCY,
-            version_cache: Mutex::new(HashMap::new()),
+            version_cache: Arc::new(Mutex::new(HashMap::new())),
             version_ttl: DEFAULT_VERSION_TTL,
             rate_limiter: Arc::new(TenantRateLimiter::disabled()),
+            page_lifecycle: Arc::new(PageLifecycle::new()),
+            page_clock: Arc::new(AccessClock::new()),
+            page_gc_config: PageGcConfig::default(),
+            page_mutations: Arc::new(Mutations::default()),
+            page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
+            page_scan: Arc::new(tokio::sync::Mutex::new((
+                ScanCursor::default(),
+                Instant::now(),
+                0,
+            ))),
+            page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
 
@@ -195,7 +226,17 @@ impl WorkerRuntime {
     /// of local disk rather than the whole block. Eviction reclaims individual
     /// pages, leaving the block's other pages intact.
     pub fn with_paged_store(mut self, paged: PagedBlockStore) -> Self {
-        self.paged = Some(paged);
+        self.page_cleanup = Arc::new(Mutex::new(crate::page_cleanup::CleanupCursor::new(
+            paged.root().to_owned(),
+        )));
+        for (id, page, _) in self.index.snapshot_units() {
+            if let Some(page) = page {
+                let state = self.page_lifecycle.block(&id);
+                let handle = state.register(page, None, self.page_clock.now(), false);
+                self.index.set_page_state(&id, page, handle);
+            }
+        }
+        self.paged = Some(Arc::new(paged));
         self
     }
 
@@ -476,14 +517,13 @@ impl WorkerRuntime {
                 let last = PageIndex(((offset_in_block + request.len - 1) / page_size) as u32);
                 let l1_ok = !self.l1.is_enabled()
                     || (first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)));
-                if request.len > 0
-                    && l1_ok
-                    && matches!(
+                let state = (request.len > 0 && l1_ok)
+                    .then(|| {
                         self.index
-                            .presence_and_touch(&block, first, PageIndex(last.0 + 1)),
-                        Presence::PageHit
-                    )
-                {
+                            .page_reads_and_touch(&block, first, PageIndex(last.0 + 1))
+                    })
+                    .flatten();
+                if let Some((first_guard, guards)) = state {
                     match paged.get_range(&block, offset_in_block, request.len) {
                         Ok(handles) if !handles.is_empty() => {
                             let served: u64 = handles.iter().map(|h| h.len).sum();
@@ -491,6 +531,11 @@ impl WorkerRuntime {
                             // request exactly; a short cover means we raced an
                             // eviction, so fall through and re-fetch.
                             if served == request.len {
+                                let now = self.page_access_time();
+                                first_guard.record_access_and_release(now);
+                                for guard in guards {
+                                    guard.record_access_and_release(now);
+                                }
                                 self.metrics.record_l2_hit();
                                 talon_telemetry::cache_tier("l2");
                                 self.metrics.record_cache_hit();
@@ -965,30 +1010,33 @@ impl WorkerRuntime {
         Ok(out.freeze())
     }
 
+    /// TTL-disabled hits need only read/delete arbitration, not timestamps or
+    /// checkpoint dirtiness. Configuration is immutable while serving.
+    fn page_access_time(&self) -> Option<u64> {
+        (self.page_gc_config.ttl_ms > 0).then(|| self.page_clock.now())
+    }
+
     /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.
     async fn cached_page(
         &self,
         block: &BlockId,
         page: PageIndex,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
+        let Some((access, _)) = self
+            .index
+            .page_reads_and_touch(block, page, PageIndex(page.0 + 1))
+        else {
+            return Ok(None);
+        };
         if self.l1.is_enabled() {
             if let Some(bytes) = self.l1.get_page(block, page) {
                 self.metrics.record_l1_hit();
                 talon_telemetry::cache_tier("l1");
-                self.index
-                    .presence_and_touch(block, page, PageIndex(page.0 + 1));
+                access.record_access_and_release(self.page_access_time());
                 tracing::debug!(block = %block, page = page.0, tier = "l1", "HIT");
                 return Ok(Some(bytes));
             }
             self.metrics.record_l1_miss();
-        }
-        if !matches!(
-            self.index
-                .presence_and_touch(block, page, PageIndex(page.0 + 1)),
-            Presence::PageHit
-        ) {
-            self.metrics.record_l2_miss();
-            return Ok(None);
         }
         let paged = self.paged.as_ref().expect("paged store");
         match paged.get_page_bytes(block, page).await {
@@ -999,13 +1047,16 @@ impl WorkerRuntime {
                 if self.l1.is_enabled() {
                     self.admit_l1_page(block, page, bytes.clone());
                 }
+                // Keep read ownership through L1 admission so GC cannot remove
+                // the page just before we publish an otherwise stale L1 entry.
+                access.record_access_and_release(self.page_access_time());
                 Ok(Some(bytes))
             }
             Err(Error::NotFound(_)) => {
                 // Index said present but the file is gone — an eviction race.
                 // Drop the stale bit so the miss path re-fetches it.
-                self.index.clear_page(block, page);
-                self.lru.remove(&CacheUnit::Page(block.clone(), page));
+                // Do not clear metadata after an asynchronous read: a concurrent
+                // same-key commit may have repaired the file. Commit/GC owns cleanup.
                 self.metrics.record_l2_miss();
                 Ok(None)
             }
@@ -1148,34 +1199,66 @@ impl WorkerRuntime {
         block_len: u64,
         bytes: bytes::Bytes,
     ) -> anyhow::Result<()> {
-        let page_size = self.paged_page_size().expect("paged store");
-        let paged = self.paged.as_ref().expect("paged store");
-        // Record the block's identity once so a restart can rebuild its index
-        // entry from the page files on disk.
-        if let Err(error) = paged.write_sidecar(block, block_len) {
-            tracing::warn!(block = %block, %error, "failed to write paged sidecar");
-        }
-        paged
-            .put_page_async(block, page, bytes.clone())
-            .await
-            .map_err(|error| anyhow::anyhow!("commit page failed: {error}"))?;
-        self.index.init_paged(block.clone(), page_size, block_len);
-        self.index.mark_page(block, page);
-
-        let unit = CacheUnit::Page(block.clone(), page);
-        let access = self.lru.insert(unit.clone(), bytes.len() as u64);
-        self.index.set_access(&unit, access);
-        self.lru.pin(&unit);
-        let superseded = self.lru.evict_superseded(block);
-        self.unlink_units(superseded).await;
-        self.enforce_capacity().await;
-        self.lru.unpin(&unit);
-        if !self.l1.remove_superseded(block).is_empty() {
-            self.refresh_l1_metrics();
-        }
-        if self.l1.is_enabled() {
-            self.admit_l1_page(block, page, bytes);
-        }
+        let runtime = self.clone();
+        let id = block.clone();
+        let operation = talon_telemetry::Operation::new(
+            "talon.cache.page_commit",
+            "internal",
+            talon_telemetry::TraceParent::Inherit,
+        );
+        self.page_mutations
+            .run(async move {
+                let result = operation
+                    .scope(async move {
+                        let state = runtime.page_lifecycle.block(&id);
+                        let _gate = state.gate.lock().await;
+                        if matches!(
+                            runtime.index.get(&id).map(|m| m.form),
+                            Some(BlockForm::Whole)
+                        ) {
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        let paged = runtime.paged.as_ref().expect("paged store").clone();
+                        let disk = paged.clone();
+                        let block = id.clone();
+                        let value = bytes.clone();
+                        crate::paged_store::spawn_blocking_io(move || {
+                            disk.write_sidecar(&block, block_len)?;
+                            disk.put_page(&block, page, value)
+                        })
+                        .await?;
+                        runtime
+                            .index
+                            .init_paged(id.clone(), paged.page_size(), block_len);
+                        let handle = state.register(
+                            page,
+                            Some(runtime.page_clock.now()),
+                            runtime.page_clock.now(),
+                            true,
+                        );
+                        runtime.index.mark_page(&id, page);
+                        let unit = CacheUnit::Page(id.clone(), page);
+                        let access = runtime.lru.insert(unit.clone(), bytes.len() as u64);
+                        runtime.index.set_access(&unit, access);
+                        runtime.index.set_page_state(&id, page, handle);
+                        if runtime.l1.is_enabled() {
+                            runtime.admit_l1_page(&id, page, bytes);
+                        }
+                        // Keep pressure handling owned by the worker too: cancellation
+                        // must not leave a completed admission above capacity.
+                        let _read = state.acquire(page);
+                        let _pin = runtime.lru.pin_guard(unit);
+                        drop(_gate);
+                        let superseded = runtime.lru.superseded_candidates(&id);
+                        runtime.unlink_units(superseded, 2).await;
+                        runtime.enforce_capacity().await;
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                operation.outcome(if result.is_ok() { "success" } else { "error" });
+                result
+            })
+            .await?;
         tracing::info!(block = %block, page = page.0, "committed page");
         Ok(())
     }
@@ -1508,39 +1591,69 @@ impl WorkerRuntime {
         block: &BlockId,
         bytes: bytes::Bytes,
     ) -> anyhow::Result<()> {
-        talon_telemetry::observe("talon.cache.commit", "internal", async {
-            let len = bytes.len() as u64;
-            self.store
-                .put(block, bytes)
-                .await
-                .map_err(|error| anyhow::anyhow!("commit block failed: {error}"))?;
-            self.index.commit(BlockMeta {
-                id: block.clone(),
-                form: BlockForm::Whole,
-                len,
-            });
-            talon_telemetry::record("talon.cache.committed_bytes", len);
-            // Track the freshly-committed block for eviction, then reclaim space:
-            // first any superseded version of the same (object, offset) — version
-            // churn would otherwise accumulate stale .blk files forever (issue #159,
-            // #119) — then the coldest blocks until we are back under capacity. The
-            // block just committed is pinned for the duration so it is never the
-            // victim of its own commit.
-            let unit = CacheUnit::Whole(block.clone());
-            let access = self.lru.insert(unit.clone(), len);
-            self.index.set_access(&unit, access);
-            self.lru.pin(&CacheUnit::Whole(block.clone()));
-            let superseded = self.lru.evict_superseded(block);
-            self.unlink_units(superseded).await;
-            self.enforce_capacity().await;
-            self.lru.unpin(&CacheUnit::Whole(block.clone()));
-            if !self.l1.remove_superseded(block).is_empty() {
-                self.refresh_l1_metrics();
-            }
-            tracing::info!(block = %block, bytes = len, "committed block");
-            Ok(())
-        })
-        .await
+        let len = bytes.len() as u64;
+        let runtime = self.clone();
+        let id = block.clone();
+        let operation = talon_telemetry::Operation::new(
+            "talon.cache.commit",
+            "internal",
+            talon_telemetry::TraceParent::Inherit,
+        );
+        self.page_mutations
+            .run(async move {
+                let result = operation
+                    .scope(async move {
+                        let state = runtime.page_lifecycle.block(&id);
+                        let gate = state.gate.lock().await;
+                        // Keep same-version paged residency and complete the admission
+                        // even when the original requester stops waiting.
+                        let paged = !state.inner.lock().unwrap().pages.is_empty();
+                        if paged {
+                            drop(gate);
+                            let size = runtime.paged_page_size().expect("paged state");
+                            for (page, chunk) in bytes.chunks(size as usize).enumerate() {
+                                runtime
+                                    .commit_fetched_page(
+                                        &id,
+                                        PageIndex(page as u32),
+                                        len,
+                                        bytes::Bytes::copy_from_slice(chunk),
+                                    )
+                                    .await?;
+                            }
+                            talon_telemetry::record("talon.cache.committed_bytes", len);
+                            return Ok::<_, anyhow::Error>(());
+                        }
+                        runtime.store.put(&id, bytes).await?;
+                        talon_telemetry::record("talon.cache.committed_bytes", len);
+                        runtime.index.commit(BlockMeta {
+                            id: id.clone(),
+                            form: BlockForm::Whole,
+                            len,
+                        });
+                        let unit = CacheUnit::Whole(id.clone());
+                        let access = runtime.lru.insert(unit.clone(), len);
+                        runtime.index.set_access(&unit, access);
+                        // Pin before releasing the gate used by candidate validation.
+                        let _pin = runtime.lru.pin_guard(unit);
+                        drop(gate);
+                        drop(state);
+                        runtime.page_lifecycle.retire_empty(&id);
+                        let superseded = runtime.lru.superseded_candidates(&id);
+                        runtime.unlink_units(superseded, 2).await;
+                        runtime.enforce_capacity().await;
+                        if !runtime.l1.remove_superseded(&id).is_empty() {
+                            runtime.refresh_l1_metrics();
+                        }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await;
+                operation.outcome(if result.is_ok() { "success" } else { "error" });
+                result
+            })
+            .await?;
+        tracing::info!(block = %block, bytes = len, "committed block");
+        Ok(())
     }
 
     /// Validate a gateway cache admission before its raw body is read.
@@ -1642,28 +1755,7 @@ impl WorkerRuntime {
         // read-after-write is a hit. Mirrors the miss-commit path.
         let block = self.block_for(object, 0, &version);
         let len = body.len() as u64;
-        self.store
-            .put(&block, body.clone())
-            .await
-            .map_err(|error| anyhow::anyhow!("commit written block failed: {error}"))?;
-        talon_telemetry::record("talon.cache.committed_bytes", len);
-        self.index.commit(BlockMeta {
-            id: block.clone(),
-            form: BlockForm::Whole,
-            len,
-        });
-        let unit = CacheUnit::Whole(block.clone());
-        let access = self.lru.insert(unit.clone(), len);
-        self.index.set_access(&unit, access);
-        self.lru.pin(&CacheUnit::Whole(block.clone()));
-        // Drop any superseded prior version of this object from the cache.
-        let superseded = self.lru.evict_superseded(&block);
-        self.unlink_units(superseded).await;
-        self.enforce_capacity().await;
-        self.lru.unpin(&CacheUnit::Whole(block.clone()));
-        if !self.l1.remove_superseded(&block).is_empty() {
-            self.refresh_l1_metrics();
-        }
+        self.commit_cached_block(&block, body.clone()).await?;
         self.admit_l1_pages(&block, 0, body);
         tracing::info!(object = %object.to_path(), bytes = len, version = %version, "wrote object");
         Ok(version)
@@ -1705,7 +1797,8 @@ impl WorkerRuntime {
         };
         if let Some(old_version) = old_version {
             let old_block = self.block_for(object, 0, &old_version);
-            self.unlink_units(vec![CacheUnit::Whole(old_block)]).await;
+            self.unlink_units(self.lru.block_candidates(&old_block), 2)
+                .await;
         }
         self.store_version(object, &version, len);
         tracing::info!(
@@ -1740,7 +1833,8 @@ impl WorkerRuntime {
         // drop the cached version so the next read re-resolves.
         if let Some(version) = self.cached_version(object) {
             let block = self.block_for(object, 0, &version);
-            self.unlink_units(vec![CacheUnit::Whole(block)]).await;
+            self.unlink_units(self.lru.block_candidates(&block), 2)
+                .await;
         }
         self.invalidate_version(object);
         tracing::info!(object = %object.to_path(), "deleted object");
@@ -1754,71 +1848,19 @@ impl WorkerRuntime {
         if self.capacity_bytes == 0 {
             return;
         }
-        let evicted = self.lru.evict_to_fit(self.capacity_bytes);
-        self.unlink_units(evicted).await;
-    }
-
-    /// Unlink each evicted cache unit: delete its on-disk file, drop it from the
-    /// index, and count the eviction. Best-effort — a failed unlink is logged
-    /// but does not abort the serve path (the space is reclaimed on the next
-    /// pass or restart scan).
-    async fn unlink_units(&self, units: Vec<CacheUnit>) {
-        for unit in units {
-            match unit {
-                CacheUnit::Whole(id) => {
-                    self.invalidate_l1(&id);
-                    if let Err(error) = self.store.delete(&id).await {
-                        tracing::warn!(block = %id, %error, "failed to unlink evicted block");
-                    }
-                    // A paged block's directory shares the block identity; drop
-                    // it too so a whole-block eviction cannot leave orphaned
-                    // pages behind.
-                    if let Some(paged) = &self.paged {
-                        if let Err(error) = paged.delete_block_async(&id).await {
-                            tracing::warn!(block = %id, %error, "failed to unlink evicted pages");
-                        }
-                    }
-                    self.index.remove(&id);
-                    self.metrics.record_eviction();
-                    tracing::info!(block = %id, "evicted block");
-                }
-                CacheUnit::Page(id, page) => {
-                    // Page-level eviction: unlink just this page file and clear
-                    // its bit. The block entry and its other pages stay intact.
-                    self.l1.remove_page(&id, page);
-                    if let Some(paged) = &self.paged {
-                        if let Err(error) = paged.evict_page_async(&id, page).await {
-                            tracing::warn!(
-                                block = %id, page = page.0, %error,
-                                "failed to unlink evicted page"
-                            );
-                        }
-                    }
-                    self.index.clear_page(&id, page);
-                    self.metrics.record_eviction();
-                    self.refresh_l1_metrics();
-                    tracing::info!(block = %id, page = page.0, "evicted page");
-                    // Evicting the last page leaves an empty entry that would
-                    // otherwise linger in the index (and its `.pages` directory
-                    // on disk) forever. Drop both once nothing is resident.
-                    if self
-                        .index
-                        .get(&id)
-                        .is_some_and(|meta| meta.resident_bytes() == 0)
-                    {
-                        if let Some(paged) = &self.paged {
-                            if let Err(error) = paged.delete_block_async(&id).await {
-                                tracing::warn!(
-                                    block = %id, %error,
-                                    "failed to remove emptied paged block directory"
-                                );
-                            }
-                        }
-                        self.index.remove(&id);
-                        tracing::debug!(block = %id, "dropped paged block with no resident pages");
-                    }
-                }
+        // A selected page can become protected or fail to unlink. Refill from
+        // other units using actual residency, attempting each unit at most once.
+        // Bound the pass even if concurrent admissions keep adding new units.
+        let budget = self.lru.len();
+        let mut attempted = HashSet::new();
+        while attempted.len() < budget {
+            let mut evicted = self.lru.candidates_to_fit(self.capacity_bytes, &attempted);
+            evicted.truncate(budget - attempted.len());
+            if evicted.is_empty() {
+                break;
             }
+            attempted.extend(evicted.iter().map(|c| c.unit.clone()));
+            self.unlink_units(evicted, 1).await;
         }
     }
 

@@ -1,0 +1,12 @@
+{"pages":100000,"rss_before_kib":4596,"rss_after_build_kib":16680}
+{"pages":100000,"scenario":"cold","build_ms":171.098,"metadata_ops_s":777197,"metadata_p99_ns":1249,"scan_ms":13.736,"expired_candidates":0,"entry_bytes":40}
+{"pages":100000,"scenario":"hot","build_ms":171.098,"metadata_ops_s":782087,"metadata_p99_ns":1261,"scan_ms":13.42,"expired_candidates":0,"entry_bytes":40}
+{"pages":100000,"scenario":"mixed","build_ms":171.098,"metadata_ops_s":781979,"metadata_p99_ns":1241,"scan_ms":17.758,"expired_candidates":50000,"entry_bytes":40}
+{"pages":100000,"scenario":"expired","build_ms":171.098,"metadata_ops_s":782119,"metadata_p99_ns":1242,"scan_ms":22.233,"expired_candidates":99902,"entry_bytes":40}
+{"pages":100000,"checkpoint_bytes":1216293,"checkpoint_ms":75.18}
+{"pages":1000000,"rss_before_kib":4596,"rss_after_build_kib":94560}
+{"pages":1000000,"scenario":"cold","build_ms":1702.967,"metadata_ops_s":689692,"metadata_p99_ns":2546,"scan_ms":111.243,"expired_candidates":0,"entry_bytes":40}
+{"pages":1000000,"scenario":"hot","build_ms":1702.967,"metadata_ops_s":1067596,"metadata_p99_ns":1712,"scan_ms":96.028,"expired_candidates":0,"entry_bytes":40}
+{"pages":1000000,"scenario":"mixed","build_ms":1702.967,"metadata_ops_s":1091807,"metadata_p99_ns":1442,"scan_ms":113.246,"expired_candidates":500000,"entry_bytes":40}
+{"pages":1000000,"scenario":"expired","build_ms":1702.967,"metadata_ops_s":1170781,"metadata_p99_ns":1353,"scan_ms":139.0,"expired_candidates":999023,"entry_bytes":40}
+{"pages":1000000,"checkpoint_bytes":12163452,"checkpoint_ms":620.956}

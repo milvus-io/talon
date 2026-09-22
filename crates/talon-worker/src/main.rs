@@ -172,6 +172,12 @@ impl Args {
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
             paged_miss_run_concurrency: None,
+            page_ttl_ms: None,
+            page_access_checkpoint_interval_ms: None,
+            page_gc_interval_ms: None,
+            page_gc_scan_batch_size: None,
+            page_gc_delete_batch_size: None,
+            page_gc_io_concurrency: None,
             backend: None,
             azure_account: None,
             azure_endpoint: None,
@@ -390,13 +396,17 @@ async fn run() -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/tmp/talon-cache"));
     std::fs::create_dir_all(&root)?;
-    let store = WholeBlockStore::open(&root)?;
+    let cache_root_lock = Arc::new(talon_worker::page_access_store::CacheRootLock::acquire(
+        &root,
+    )?);
+    let store = WholeBlockStore::open(&root)?.with_root_lock(cache_root_lock.clone());
     // Paged L2 is opt-in: with `l2_page_size_bytes` set, a miss materializes only
     // the pages a read touches, under `<root>/paged`, instead of whole blocks.
     let paged = match u32::try_from(cfg.l2_page_size_bytes) {
-        Ok(page_size) if page_size > 0 => {
-            Some(PagedBlockStore::open(root.join("paged"), page_size)?)
-        }
+        Ok(page_size) if page_size > 0 => Some(
+            PagedBlockStore::open(root.join("paged"), page_size)?
+                .with_root_lock(cache_root_lock.clone()),
+        ),
         _ => None,
     };
 
@@ -613,7 +623,13 @@ async fn run() -> anyhow::Result<()> {
     if let Some(paged) = paged {
         runtime = runtime.with_paged_store(paged);
     }
+    let page_gc_config = talon_worker::page_gc::PageGcConfig::from(&cfg);
+    runtime = runtime.with_page_gc(page_gc_config.clone())?;
     let worker = Arc::new(runtime);
+
+    // The cache root lease is held and no foreground mutations have started.
+    // This disk pass also finds directories omitted from residency recovery.
+    worker.recover_page_file_cleanup().await;
 
     let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
     tracing::info!(listen = %cfg.admin_listen, "worker serving administration API");
@@ -661,6 +677,42 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
+    let page_gc = talon_worker::page_gc::PageGcService::start(worker.clone(), page_gc_config);
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let data = serve_data_plane(cfg, worker, observability, stop.clone());
+    tokio::pin!(data);
+    let result = tokio::select! {
+        result = &mut data => result,
+        result = shutdown_signal() => {
+            stop.store(true, std::sync::atomic::Ordering::Release);
+            result
+        }
+    };
+    stop.store(true, std::sync::atomic::Ordering::Release);
+    _control_plane.abort();
+    if tokio::time::timeout(Duration::from_secs(10), page_gc.shutdown())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            "page maintenance shutdown timed out; restart will use the last valid checkpoint"
+        );
+    }
+    result
+}
+
+async fn shutdown_signal() -> anyhow::Result<()> {
+    let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    tokio::select! {r = tokio::signal::ctrl_c() => r?, _ = term.recv() => {}}
+    Ok(())
+}
+
+async fn serve_data_plane(
+    cfg: WorkerConfig,
+    worker: Arc<WorkerRuntime>,
+    observability: Arc<WorkerObservability>,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()> {
     // Serve the data plane, on io_uring rings if configured (#285) or on the
     // portable Tokio path otherwise.
     // The io_uring data plane is the default. Fall back to the portable Tokio
@@ -702,12 +754,13 @@ async fn run() -> anyhow::Result<()> {
             uring_conn::RingConnHandler::new(Arc::clone(&worker), Arc::clone(&observability));
         let tokio_handle = tokio::runtime::Handle::current();
         let joined = tokio::task::spawn_blocking(move || {
-            talon_worker::uring_serve::serve(
+            talon_worker::uring_serve::serve_with_shutdown(
                 addr,
                 rings,
                 connection_admission,
                 handler,
                 tokio_handle,
+                stop,
             )
         })
         .await?;
@@ -1578,7 +1631,13 @@ mod tests {
                 0,
                 observability.metrics().clone(),
             )
-            .with_paged_store(talon_worker::PagedBlockStore::open(root.join("paged"), 16).unwrap()),
+            .with_paged_store(talon_worker::PagedBlockStore::open(root.join("paged"), 16).unwrap())
+            .with_page_gc(talon_worker::page_gc::PageGcConfig {
+                ttl_ms: 1,
+                checkpoint_interval_ms: 1,
+                ..Default::default()
+            })
+            .unwrap(),
         );
 
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1600,6 +1659,11 @@ mod tests {
         let expected: Vec<u8> = (0..40u64).map(|i| ((5 + i) % 251) as u8).collect();
 
         for pass in 0..3 {
+            if pass == 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                assert_eq!(worker.gc_once().await.bytes, 48);
+                assert_eq!(worker.resident_bytes(), 0);
+            }
             let out = encode_request(0, &req).unwrap();
             client.write_all(&out).await.unwrap();
             client.flush().await.unwrap();

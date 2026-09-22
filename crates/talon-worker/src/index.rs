@@ -12,9 +12,10 @@
 //! if the lock becomes hot.
 
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use crate::eviction::{AccessHandle, CacheUnit};
+use crate::page_lifecycle::{PageReadGuard, PageState};
 
 use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
 
@@ -47,7 +48,12 @@ struct IndexedBlock {
     meta: BlockMeta,
     // Sparse: allocating a token for every possible page would dwarf residency
     // metadata when each large block has only one or two cached pages.
-    access: HashMap<Option<PageIndex>, AccessHandle>,
+    access: HashMap<Option<PageIndex>, IndexedAccess>,
+}
+
+struct IndexedAccess {
+    policy: AccessHandle,
+    page: Option<Arc<PageState>>,
 }
 
 impl From<BlockMeta> for IndexedBlock {
@@ -60,6 +66,50 @@ impl From<BlockMeta> for IndexedBlock {
 }
 
 impl BlockIndex {
+    /// Page protection is acquired through the existing index/token lookup.
+    /// No block lifecycle lock or second page-table lookup is needed. The single
+    /// page case keeps its guard inline and does not allocate a vector buffer.
+    pub(crate) fn page_reads_and_touch(
+        &self,
+        id: &BlockId,
+        start: PageIndex,
+        end: PageIndex,
+    ) -> Option<(PageReadGuard, Vec<PageReadGuard>)> {
+        if start.0 >= end.0 {
+            return None;
+        }
+        let g = self.inner.read().unwrap();
+        let entry = g.map.get(id)?;
+        let BlockForm::Paged { present, .. } = &entry.meta.form else {
+            return None;
+        };
+        if !present.range_present(start, end) {
+            return None;
+        }
+        let acquire = |page| {
+            let access = entry.access.get(&Some(PageIndex(page)))?;
+            let guard = access.page.as_ref()?.acquire()?;
+            access.policy.touch();
+            Some(guard)
+        };
+        let first = acquire(start.0)?;
+        let tail: Option<Vec<_>> = (start.0 + 1..end.0).map(acquire).collect();
+        Some((first, tail?))
+    }
+
+    pub(crate) fn set_page_state(&self, id: &BlockId, page: PageIndex, state: Arc<PageState>) {
+        if let Some(access) = self
+            .inner
+            .write()
+            .unwrap()
+            .map
+            .get_mut(id)
+            .and_then(|e| e.access.get_mut(&Some(page)))
+        {
+            access.page = Some(state);
+        }
+    }
+
     /// Create an empty index.
     pub fn new() -> Self {
         Self::default()
@@ -109,7 +159,7 @@ impl BlockIndex {
         let g = self.inner.read().unwrap();
         let entry = g.map.get(id)?;
         if let Some(access) = entry.access.get(&None) {
-            access.touch();
+            access.policy.touch();
         }
         Some(entry.meta.clone())
     }
@@ -124,13 +174,13 @@ impl BlockIndex {
             return false;
         }
         if let Some(access) = entry.access.get(&None) {
-            access.touch();
+            access.policy.touch();
         }
         true
     }
 
-    /// Attach the policy token after admission. The index owns only recency;
-    /// pinning and byte accounting remain exclusively owned by the policy.
+    /// Attach the policy token after admission, retaining any page lifecycle
+    /// handle. Capacity pinning and byte accounting remain owned by the policy.
     pub(crate) fn set_access(&self, unit: &CacheUnit, access: AccessHandle) {
         let (block, page) = match unit {
             CacheUnit::Whole(block) => (block, None),
@@ -144,7 +194,14 @@ impl BlockIndex {
                 _ => false,
             };
             if resident {
-                entry.access.insert(page, access);
+                let old_page = entry.access.get(&page).and_then(|old| old.page.clone());
+                entry.access.insert(
+                    page,
+                    IndexedAccess {
+                        policy: access,
+                        page: old_page,
+                    },
+                );
             }
         }
     }
@@ -293,50 +350,15 @@ impl BlockIndex {
     /// `start_page`/`end_page` are only consulted for paged blocks; for a whole
     /// block the answer is always [`Presence::Whole`].
     pub fn presence(&self, id: &BlockId, start_page: PageIndex, end_page: PageIndex) -> Presence {
-        self.lookup_presence(id, start_page, end_page, false)
-    }
-
-    /// Mark resident read ranges without a second block-key lookup, key clone,
-    /// or acquisition of the capacity policy's mutex.
-    pub(crate) fn presence_and_touch(
-        &self,
-        id: &BlockId,
-        start: PageIndex,
-        end: PageIndex,
-    ) -> Presence {
-        self.lookup_presence(id, start, end, true)
-    }
-
-    fn lookup_presence(
-        &self,
-        id: &BlockId,
-        start: PageIndex,
-        end: PageIndex,
-        touch: bool,
-    ) -> Presence {
         let g = self.inner.read().unwrap();
         let Some(entry) = g.map.get(id) else {
             return Presence::Miss;
         };
         match &entry.meta.form {
-            BlockForm::Whole => {
-                if touch {
-                    if let Some(access) = entry.access.get(&None) {
-                        access.touch();
-                    }
-                }
-                Presence::Whole
-            }
+            BlockForm::Whole => Presence::Whole,
             BlockForm::Paged { present, .. } => {
-                if !present.range_present(start, end) {
+                if !present.range_present(start_page, end_page) {
                     return Presence::PageMiss;
-                }
-                if touch {
-                    for page in start.0..end.0 {
-                        if let Some(access) = entry.access.get(&Some(PageIndex(page))) {
-                            access.touch();
-                        }
-                    }
                 }
                 Presence::PageHit
             }
@@ -380,6 +402,49 @@ mod tests {
     }
 
     #[test]
+    fn page_lookup_does_not_lock_block_and_partial_pin_failure_releases_readers() {
+        use crate::eviction::Lru;
+        let idx = BlockIndex::new();
+        let lru = Lru::new();
+        let id = block(1);
+        let life = crate::page_lifecycle::PageLifecycle::new();
+        let block = life.block(&id);
+        idx.init_paged(id.clone(), 4096, 8192);
+        for p in 0..2 {
+            let page = PageIndex(p);
+            let unit = CacheUnit::Page(id.clone(), page);
+            idx.mark_page(&id, page);
+            idx.set_access(&unit, lru.insert(unit.clone(), 4096));
+            idx.set_page_state(&id, page, block.register(page, Some(10), 10, false));
+        }
+        let locked = block.inner.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                tx.send(
+                    idx.page_reads_and_touch(&id, PageIndex(0), PageIndex(2))
+                        .is_some(),
+                )
+                .unwrap();
+            });
+            let result = rx.recv_timeout(std::time::Duration::from_secs(5));
+            // Release before asserting so a regression cannot strand the thread.
+            drop(locked);
+            assert!(result.unwrap());
+        });
+        let second = block.candidate(PageIndex(1)).unwrap();
+        assert!(block.claim(&second, 100, None));
+        assert!(idx
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(2))
+            .is_none());
+        let first = block.candidate(PageIndex(0)).unwrap();
+        assert!(
+            block.claim(&first, 100, None),
+            "partial range acquisition leaked the first pin"
+        );
+    }
+
+    #[test]
     fn read_lookup_marks_only_the_requested_page_and_drops_retired_tokens() {
         use crate::eviction::Lru;
         let idx = BlockIndex::new();
@@ -392,10 +457,12 @@ mod tests {
             idx.mark_page(&id, page);
             idx.set_access(unit, lru.insert(unit.clone(), 4096));
         }
-        assert_eq!(
-            idx.presence_and_touch(&id, PageIndex(0), PageIndex(1)),
-            Presence::PageHit
-        );
+        let life = crate::page_lifecycle::PageLifecycle::new();
+        let page = life.block(&id).register(PageIndex(0), None, 0, false);
+        idx.set_page_state(&id, PageIndex(0), page);
+        assert!(idx
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
+            .is_some());
         assert_eq!(lru.evict_to_fit(4096), vec![p1.clone()]);
         idx.clear_page(&id, PageIndex(1));
         assert!(!idx.inner.read().unwrap().map[&id]

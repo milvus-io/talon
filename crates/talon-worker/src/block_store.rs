@@ -82,14 +82,22 @@ where
 pub struct WholeBlockStore {
     root: PathBuf,
     fd_cache: FdCache,
+    root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
 impl WholeBlockStore {
+    /// Retain the root lease through detached blocking disk mutations.
+    pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
+        self.root_lock = Some(lock);
+        self
+    }
+
     /// Open (creating if needed) a store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
+            root_lock: None,
             root,
             fd_cache: FdCache::new(),
         })
@@ -290,7 +298,9 @@ impl ObjectStore for WholeBlockStore {
         // The write + fsync of a whole block is blocking disk I/O; keep it off
         // the reactor thread (issue #115).
         let commit_path = path.clone();
+        let root_lock = self.root_lock.clone();
         spawn_blocking_io(move || {
+            let _root_lock = root_lock;
             if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
@@ -353,7 +363,9 @@ impl ObjectStore for WholeBlockStore {
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
         let cached_path = path.clone();
+        let root_lock = self.root_lock.clone();
         let result = spawn_blocking_io(move || {
+            let _root_lock = root_lock;
             // Remove the sidecar too so a deleted block is not resurrected by a
             // startup scan.
             let _ = std::fs::remove_file(&meta_path);
