@@ -33,7 +33,6 @@ use crate::placement_cache::{Cached, PlacementCache, RefreshReason};
 use crate::pool::ConnectionPool;
 use crate::range_stream::CacheReadError;
 use crate::read_plan::plan_read;
-use crate::rpc::RequestExecutor;
 use crate::worker_client::{WorkerClient, WorkerError};
 
 pub(crate) enum DetailedBlockReadError {
@@ -105,8 +104,9 @@ pub struct FileView<'a> {
 }
 
 /// Orchestrates local block placement and worker reads with caching.
-pub struct BlockReader<P = ConnectionPool> {
-    coordinator: CoordinatorClient<P>,
+#[derive(Clone)]
+pub struct BlockReader {
+    coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
     /// Number of workers retained from local ranking (RF=1 -> 1 in v1).
     replicas_k: u8,
@@ -114,7 +114,7 @@ pub struct BlockReader<P = ConnectionPool> {
     stats: ReadStats,
     /// Shared pool of worker connections, so warm fetches skip the TCP handshake
     /// (issue #181).
-    worker_pool: Arc<P>,
+    worker_pool: Arc<ConnectionPool>,
     /// Last authoritative worker set; stale snapshots remain usable on outage.
     membership: Arc<MembershipCache>,
     /// Serializes cold refreshes so an expired snapshot causes one control request.
@@ -127,65 +127,30 @@ pub struct BlockReader<P = ConnectionPool> {
     zone_observer: Arc<dyn ZoneReadObserver>,
 }
 
-impl<P> Clone for BlockReader<P> {
-    fn clone(&self) -> Self {
+impl BlockReader {
+    /// Keep caches, refresh coordination and metrics, but use local connections.
+    pub fn with_sharded_connections(&self, coordinator: CoordinatorClient) -> Self {
         Self {
-            coordinator: self.coordinator.clone(),
-            cache: self.cache.clone(),
-            replicas_k: self.replicas_k,
-            stats: self.stats.clone(),
-            worker_pool: self.worker_pool.clone(),
-            membership: self.membership.clone(),
-            membership_refresh: self.membership_refresh.clone(),
-            membership_refresh_generation: self.membership_refresh_generation.clone(),
-            zone: self.zone.clone(),
-            zone_observer: self.zone_observer.clone(),
-        }
-    }
-}
-
-impl<P> BlockReader<P> {
-    /// Rebind runtime-local transports while retaining shared placement,
-    /// membership refresh coordination, metrics and zone configuration.
-    pub fn with_transport<Q>(
-        &self,
-        coordinator: CoordinatorClient<Q>,
-        worker_pool: Arc<Q>,
-    ) -> BlockReader<Q> {
-        BlockReader {
             coordinator,
-            worker_pool,
-            cache: self.cache.clone(),
-            replicas_k: self.replicas_k,
-            stats: self.stats.clone(),
-            membership: self.membership.clone(),
-            membership_refresh: self.membership_refresh.clone(),
-            membership_refresh_generation: self.membership_refresh_generation.clone(),
-            zone: self.zone.clone(),
-            zone_observer: self.zone_observer.clone(),
+            worker_pool: Arc::new(self.worker_pool.shard()),
+            ..self.clone()
         }
     }
-}
 
-impl<P: RequestExecutor + Default> BlockReader<P> {
     /// Create a reader over the given coordinator client and placement cache.
     ///
     /// `replicas_k` is how many owners to retain from local placement; with RF=1
     /// this is `1`, but a larger value reserves an ordered fallback list.
     /// Metrics are collected into a fresh [`ReadStats`]; use
     /// [`with_stats`](Self::with_stats) to share an existing one.
-    pub fn new(
-        coordinator: CoordinatorClient<P>,
-        cache: Arc<PlacementCache>,
-        replicas_k: u8,
-    ) -> Self {
+    pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
         let membership = Arc::new(MembershipCache::new(cache.ttl_ms()));
         Self {
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
             stats: ReadStats::new(),
-            worker_pool: Arc::new(P::default()),
+            worker_pool: Arc::new(ConnectionPool::new()),
             membership,
             membership_refresh: Arc::new(tokio::sync::Mutex::new(())),
             membership_refresh_generation: Arc::new(AtomicU64::new(0)),
@@ -201,7 +166,7 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
     }
 
     /// Use the provided worker connection pool, shared by reader clones.
-    pub fn with_worker_pool(mut self, worker_pool: Arc<P>) -> Self {
+    pub fn with_worker_pool(mut self, worker_pool: Arc<ConnectionPool>) -> Self {
         self.worker_pool = worker_pool;
         self
     }
@@ -364,81 +329,32 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
         }
     }
 
-    /// Read an exact-version block slice into an owned result. The native
-    /// transport transfers its receive allocation through this API.
-    pub async fn read_versioned_block(
+    /// Read `dst.len()` bytes at `offset_in_block` within `block` into `dst`.
+    ///
+    /// This follows the same placement-cache, replica fallback, and refresh
+    /// behavior as [`read_block`](Self::read_block), without allocating an
+    /// intermediate result buffer.
+    pub async fn read_block_into(
         &self,
         block: &BlockId,
         offset_in_block: u32,
-        len: u32,
+        dst: &mut [u8],
         now_ms: u64,
-    ) -> Result<Vec<u8>, BlockReadError> {
-        match self
-            .read_block_detailed_with_mode(
-                block,
-                offset_in_block,
-                len,
-                now_ms,
-                OriginReadMode::ExactVersion,
-            )
+    ) -> Result<usize, BlockReadError> {
+        self.read_block_into_with_mode(block, offset_in_block, dst, now_ms, OriginReadMode::Current)
             .await
-        {
-            Ok(bytes) => Ok(bytes),
-            Err(DetailedBlockReadError::Block(error)) => Err(error),
-            Err(DetailedBlockReadError::Worker(error)) => Err(BlockReadError::Worker(error)),
-        }
     }
 
-    /// Receive into an owned destination without a payload copy; return it even on error.
-    pub async fn read_block_into<B: crate::read_buffer::ReadDestination>(
+    /// Read into `dst` from the exact source version carried by `block`.
+    ///
+    /// A miss is conditionally fetched without resolving a newer generation.
+    /// Version mismatches retain their worker error classification. Legacy
+    /// [`read_block_into`](Self::read_block_into) keeps following the current origin.
+    pub async fn read_versioned_block_into(
         &self,
         block: &BlockId,
         offset_in_block: u32,
-        dst: B,
-        now_ms: u64,
-    ) -> (Result<usize, BlockReadError>, B) {
-        self.read_buffer_with_mode(block, offset_in_block, dst, now_ms, OriginReadMode::Current)
-            .await
-    }
-    /// Receive the block's exact version directly into the supplied owned buffer.
-    pub async fn read_versioned_block_into<B: crate::read_buffer::ReadDestination>(
-        &self,
-        block: &BlockId,
-        offset_in_block: u32,
-        dst: B,
-        now_ms: u64,
-    ) -> (Result<usize, BlockReadError>, B) {
-        self.read_buffer_with_mode(
-            block,
-            offset_in_block,
-            dst,
-            now_ms,
-            OriginReadMode::ExactVersion,
-        )
-        .await
-    }
-    async fn read_buffer_with_mode<B: crate::read_buffer::ReadDestination>(
-        &self,
-        block: &BlockId,
-        offset_in_block: u32,
-        dst: B,
-        now_ms: u64,
-        mode: OriginReadMode,
-    ) -> (Result<usize, BlockReadError>, B) {
-        let mut buffer = crate::read_buffer::ReadBuffer::new(dst);
-        let mut target = buffer.take_target();
-        let result = self
-            .read_block_into_with_mode(block, offset_in_block, &mut target, now_ms, mode)
-            .await;
-        drop(target);
-        (result, buffer.finish().await)
-    }
-    /// Read directly into a disjoint region of an owned SDK destination.
-    pub async fn read_versioned_block_to(
-        &self,
-        block: &BlockId,
-        offset_in_block: u32,
-        dst: &mut crate::read_buffer::ReadTarget,
+        dst: &mut [u8],
         now_ms: u64,
     ) -> Result<usize, BlockReadError> {
         self.read_block_into_with_mode(
@@ -455,7 +371,7 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
         &self,
         block: &BlockId,
         offset_in_block: u32,
-        dst: &mut crate::read_buffer::ReadTarget,
+        dst: &mut [u8],
         now_ms: u64,
         mode: OriginReadMode,
     ) -> Result<usize, BlockReadError> {
@@ -674,7 +590,7 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
         block: &BlockId,
         replicas: &[String],
         abs_offset: u64,
-        dst: &mut crate::read_buffer::ReadTarget,
+        dst: &mut [u8],
         mode: OriginReadMode,
     ) -> Result<usize, ReplicaFailure> {
         if replicas.is_empty() {
@@ -694,11 +610,13 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
             self.stats.record_worker_fetch();
             let result = match mode {
                 OriginReadMode::Current => {
-                    worker.fetch_range_to(&block.object, abs_offset, dst).await
+                    worker
+                        .fetch_range_into(&block.object, abs_offset, dst)
+                        .await
                 }
                 OriginReadMode::ExactVersion => {
                     worker
-                        .fetch_versioned_range_to(&block.object, &block.version, abs_offset, dst)
+                        .fetch_versioned_range_into(&block.object, &block.version, abs_offset, dst)
                         .await
                 }
             };
@@ -760,8 +678,9 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
     ///
     /// Splits the request into per-block segments via
     /// [`crate::read_plan::plan_read`] (clamped to `file.size` at EOF),
-    /// receives each segment into its final position in one allocation; each
-    /// segment independently benefits from the placement cache. A read at or past EOF returns an empty
+    /// fetches each segment through [`read_block`](Self::read_block) — so each
+    /// segment independently benefits from the placement cache — and
+    /// concatenates the results in order. A read at or past EOF returns an empty
     /// buffer (POSIX short read).
     pub async fn read(
         &self,
@@ -778,51 +697,65 @@ impl<P: RequestExecutor + Default> BlockReader<P> {
             file.version,
             file.size,
         );
-        let length = plan.iter().map(|s| s.len as usize).sum();
-        let (result, mut bytes) = self.read_into(file, offset, vec![0; length], now_ms).await;
-        bytes.truncate(result?);
-        Ok(bytes)
+        let mut out = Vec::with_capacity(plan.iter().map(|s| s.len as usize).sum());
+        for seg in plan {
+            let bytes = self
+                .read_block(&seg.block, seg.offset_in_block, seg.len, now_ms)
+                .await?;
+            if bytes.len() as u64 != u64::from(seg.len) {
+                return Err(WorkerError::RangeLengthMismatch {
+                    expected: u64::from(seg.len),
+                    actual: bytes.len() as u64,
+                }
+                .into());
+            }
+            out.extend_from_slice(&bytes);
+        }
+        Ok(out)
     }
 
-    /// Receive a possibly cross-block range directly into an owned buffer.
-    /// Return the same buffer and a short count at EOF; no payload assembly copy.
-    pub async fn read_into<B: crate::read_buffer::ReadDestination>(
+    /// Read from `file` at `offset` into `dst`, spanning block boundaries.
+    ///
+    /// The returned value is the number of bytes written. Reads at or past EOF
+    /// return `0`, and reads overlapping EOF return a short count, matching
+    /// [`read`](Self::read).
+    pub async fn read_into(
         &self,
         file: &FileView<'_>,
         offset: u64,
-        dst: B,
+        dst: &mut [u8],
         now_ms: u64,
-    ) -> (Result<usize, BlockReadError>, B) {
-        let mut buffer = crate::read_buffer::ReadBuffer::new(dst);
-        let mut rest = buffer.take_target();
+    ) -> Result<usize, BlockReadError> {
         let plan = plan_read(
             file.object,
             offset,
-            rest.len() as u64,
+            dst.len() as u64,
             file.block_size,
             file.version,
             file.size,
         );
-        let result = async {
-            let mut written = 0;
-            for seg in plan {
-                let (mut chunk, tail) = rest.split_at(seg.len as usize);
-                rest = tail;
-                written += self
-                    .read_block_into_with_mode(
-                        &seg.block,
-                        seg.offset_in_block,
-                        &mut chunk,
-                        now_ms,
-                        OriginReadMode::Current,
-                    )
-                    .await?;
+        let mut written = 0usize;
+        for seg in plan {
+            let len = seg.len as usize;
+            let end = written + len;
+            let n = self
+                .read_block_into(
+                    &seg.block,
+                    seg.offset_in_block,
+                    &mut dst[written..end],
+                    now_ms,
+                )
+                .await?;
+            if n != len {
+                return Err(WorkerError::RangeLengthMismatch {
+                    expected: len as u64,
+                    actual: n as u64,
+                }
+                .into());
             }
-            Ok(written)
+            written = end;
         }
-        .await;
-        // `rest` is moved into the operation, including on an early error.
-        (result, buffer.finish().await)
+        Ok(written)
     }
 
     /// Resolve the worker address that owns `object` (for a write/delete).
@@ -1816,9 +1749,8 @@ mod tests {
         let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
         let err = reader.read_block(&block(), 0, 16, 0).await.unwrap_err();
         let into_err = reader
-            .read_block_into(&block(), 0, Box::new([0; 16]), 0)
+            .read_block_into(&block(), 0, &mut [0; 16], 0)
             .await
-            .0
             .unwrap_err();
         for err in [err, into_err] {
             assert!(err.to_string().contains(&worker_addr));
@@ -1853,9 +1785,8 @@ mod tests {
                 );
                 let error = if into {
                     reader
-                        .read_block_into(&block(), 0, Box::new([0; 16]), 0)
+                        .read_block_into(&block(), 0, &mut [0; 16], 0)
                         .await
-                        .0
                         .unwrap_err()
                 } else {
                     reader.read_block(&block(), 0, 16, 0).await.unwrap_err()
@@ -2008,7 +1939,7 @@ mod tests {
         let object = ObjectId::new(Backend::S3, "b", "o/1");
         let version = Version::new("v1");
         let offset = 900u64;
-        let dst = vec![0u8; 2300];
+        let mut dst = vec![0u8; 2300];
         let file = FileView {
             object: &object,
             block_size: 1024,
@@ -2016,8 +1947,7 @@ mod tests {
             size: 100_000,
         };
 
-        let (n, dst) = reader.read_into(&file, offset, dst, 0).await;
-        let n = n.unwrap();
+        let n = reader.read_into(&file, offset, &mut dst, 0).await.unwrap();
         assert_eq!(n, dst.len());
         for (index, byte) in dst.iter().enumerate() {
             assert_eq!(*byte, ((offset + index as u64) % 256) as u8);
@@ -2062,10 +1992,9 @@ mod tests {
             version: &version,
             size: 1500,
         };
-        let dst = vec![7u8; 10];
+        let mut dst = vec![7u8; 10];
 
-        let (n, dst) = reader.read_into(&file, 5000, dst, 0).await;
-        let n = n.unwrap();
+        let n = reader.read_into(&file, 5000, &mut dst, 0).await.unwrap();
         assert_eq!(n, 0);
         assert_eq!(dst, vec![7u8; 10]);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);

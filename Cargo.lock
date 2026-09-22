@@ -2712,8 +2712,6 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
- "libc",
- "monoio",
  "opentelemetry",
  "opentelemetry_sdk",
  "talon-core",
@@ -2878,10 +2876,9 @@ version = "0.1.0"
 dependencies = [
  "futures",
  "pyo3",
- "talon-core",
  "talon-rust-client",
  "talon-telemetry",
- "talon-transport",
+ "tokio",
  "tracing",
 ]
 
@@ -2890,7 +2887,6 @@ name = "talon-rust-client"
 version = "0.1.0"
 dependencies = [
  "futures",
- "monoio",
  "talon-cache-client",
  "talon-core",
  "talon-telemetry",

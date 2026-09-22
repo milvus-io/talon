@@ -305,14 +305,14 @@ impl Client {
         options: &RequestOptions<'_>,
     ) -> Result<Vec<u8>, Error>;
 
-    pub async fn read_into_with_options<B: ReadDestination>(
+    pub async fn read_into_with_options<B: AsMut<[u8]> + Send + 'static>(
         &self,
         object: &ObjectId,
         offset: u64,
-        dst: B,
+        buffer: B,
         known_stat: Option<&ObjectStat>,
         options: &RequestOptions<'_>,
-    ) -> (Result<usize, Error>, B);
+    ) -> Result<(usize, B), Error>;
 
     pub async fn stat_with_options(
         &self,
@@ -324,7 +324,7 @@ impl Client {
 
 采用 Talon 自有 opaque carrier，基础 SDK 的 public API 不直接绑定某个 opentelemetry::Context crate 版本。可选 OTel adapter feature 提供 Context 到 TraceContext 的转换，只提取追踪所需 SpanContext/tracestate，不复制 baggage 或宿主请求数据。
 
-旧方法委托默认 options，业务返回值、known_stat、EOF、版本行为和错误类型不变。read 内部调用 stat 和 read_into_resolved 时传递同一个已经建立的 RequestTelemetry，不重新执行公共入口的 Inherit，也不重复创建 talon.read 根 span。
+不带 options 的方法委托默认 options，追踪选项不改变 known_stat、EOF、版本行为和错误类型。统一 runtime 后，Rust read_into 接收缓冲区所有权，成功时返回读取长度和原缓冲区；错误时释放缓冲区。read 内部调用 stat 和 read_into_resolved 时传递同一个已经建立的 RequestTelemetry，不重新执行公共入口的 Inherit，也不重复创建 talon.read 根 span。
 
 继承优先级为：进程 mode=off 直接走关闭路径；否则 Explicit > Inherit 中有效当前 tracing-OTel context > 本地 root 策略。Root 明确禁止 ambient 继承。显式 carrier 无效时适配层选择 Root，而不是回退到一个可能属于其他请求的 ambient span。
 
@@ -346,10 +346,9 @@ let options = RequestOptions {
         None => TraceParent::Root,
     },
 };
-let (result, dst) = client
+let (n, dst) = client
     .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
-    .await;
-let n = result?;
+    .await?;
 ```
 
 RequestOptions 借用的 TraceContext 在 future 完成/drop 前有效，由 Rust 生命周期保证。spawn 'static 任务时把拥有的 TraceContext move 进任务，在任务内构造借用 options；不要把借用的线程栈 options 交给后台执行器。完整 SDK 初始化另行执行，不发生在每次 read_with_options 中。

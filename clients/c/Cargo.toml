@@ -18,12 +18,10 @@ talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-rust-client.workspace = true
 talon-transport.workspace = true
+tokio.workspace = true
 
 [build-dependencies]
 cc = "1"
 
 [features]
 telemetry = ["talon-telemetry/export"]
-
-[dev-dependencies]
-tokio.workspace = true

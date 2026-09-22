@@ -78,9 +78,7 @@ valid until the callback runs. While the operation is in flight, the SDK has
 exclusive access to that byte range: do not read, write, free, or reuse
 overlapping storage for another operation until the callback runs. A zero-length
 read may pass `NULL` for the buffer. The callback receives a `talon_result`;
-release it with `talon_result_free`. The socket receives directly into the caller
-buffer, including across block boundaries; the buffer need not be initialized. The callback runs only after all
-kernel access has retired. An error may leave partially modified contents.
+release it with `talon_result_free`.
 
 Passing both the version and size from `talon_stat_async` skips another stat.
 The supplied version is exact: workers serve matching cached bytes or
@@ -92,15 +90,9 @@ operations have run. Freeing it earlier cancels in-flight work.
 
 ## Callback dispatch
 
-Each client owns an execution group sized to the CPUs available to the process.
-Set `TALON_CLIENT_IO_THREADS` to a positive integer before creating clients to
-choose its size; `TOKIO_WORKER_THREADS` is retained as a fallback override.
-Increasing threads does not multiply `max_idle_per_addr`: it remains the total
-per-peer idle limit in each of the control and data pools.
-
-By default, callbacks run inline on the SDK operation thread (Monoio normally,
-Tokio on fallback). Keep callbacks short and non-blocking so they do not delay
-other I/O work. To run callbacks on an application thread pool, set
+By default, callbacks run inline on the SDK's Tokio runtime thread that
+completed the operation. Keep callbacks short and non-blocking so they do not
+delay other I/O work. To run callbacks on an application thread pool, set
 `options.callback_executor` to a `talon_callback_executor`.
 
 The executor's `submit` function receives a task function and task context. It

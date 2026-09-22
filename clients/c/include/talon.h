@@ -62,17 +62,14 @@ void talon_client_free(talon_client *client);
  * The client must remain alive until callbacks for all submitted operations have
  * run. Freeing the client earlier cancels in-flight work.
  *
- * Without a callback executor, callbacks run inline on the SDK operation
- * thread. Callbacks must not block that thread;
+ * Without a callback executor, callbacks run inline on the SDK's Tokio runtime
+ * thread that completed the operation. Callbacks must not block that thread;
  * provide a callback executor to schedule blocking or expensive work elsewhere.
  *
  * If dst_len is greater than zero, dst must be non-NULL. The byte range
  * [dst, dst + dst_len) is exclusively owned by the SDK until the callback runs:
  * callers must not read, write, free, or reuse overlapping storage for another
- * operation during that interval. The storage need not be initialized: received
- * bytes go directly into dst. Completion (including error) retires all kernel
- * access; errors may leave partially modified contents.
- * A zero-length read may pass NULL for dst.
+ * operation during that interval. A zero-length read may pass NULL for dst.
  *
  * version and object_size are each optional and independently nullable; NULL
  * means the caller does not have that value. The read skips the StatObject round
