@@ -7,8 +7,8 @@
 //!
 //! Every blocking call releases the GIL for its duration, so a threaded data
 //! loader is limited by the network rather than serialised on the interpreter.
-//! The runtime is a multi-threaded Tokio runtime owned by the client, shared by
-//! all calls on it.
+//! The Rust SDK owns the fixed Tokio I/O threads and connection pools.
+//! Python only waits for completion; it never drives socket I/O.
 
 // pyo3 0.22's #[pymethods] expansion converts every returned error through
 // Into<PyErr>, which is a no-op when the error already is one. clippy flags the
@@ -96,11 +96,6 @@ fn with_telemetry<T>(f: impl FnOnce() -> T) -> T {
     f()
 }
 
-/// Runtime construction failures are infrastructure errors.
-fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
-    PyIOError::new_err(e.to_string())
-}
-
 /// Preserve the SDK's input-versus-I/O error distinction at the Python boundary.
 fn client_err(error: RustError) -> PyErr {
     let message = error.to_string();
@@ -164,7 +159,6 @@ impl ObjectEntry {
 /// A client for reading objects through a Talon cache cluster.
 #[pyclass(module = "talon")]
 pub struct Client {
-    runtime: Arc<tokio::runtime::Runtime>,
     client: Arc<RustClient>,
 }
 
@@ -185,13 +179,8 @@ impl Client {
             .with_block_size(block_size)
             .with_max_idle_per_addr(max_idle_per_addr)
             .build()
-            .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(io_err)?;
+            .map_err(client_err)?;
         Ok(Self {
-            runtime: Arc::new(runtime),
             client: Arc::new(client),
         })
     }
@@ -225,14 +214,13 @@ impl Client {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let known_stat = known_stat_from_pair(version.map(str::to_owned), size)?;
-        let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
 
         // Release the GIL: this is network I/O, and holding it would serialise
         // every reader thread in the process on one request.
         let bytes = py.allow_threads(move || {
             with_telemetry(|| {
-                runtime.block_on(async move {
+                futures::executor::block_on(async move {
                     let operation = talon_telemetry::Operation::new(
                         "talon.python.read",
                         "internal",
@@ -267,11 +255,10 @@ impl Client {
     ) -> PyResult<ObjectStat> {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
-        let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
         let stat = py.allow_threads(move || {
             with_telemetry(|| {
-                runtime.block_on(async move {
+                futures::executor::block_on(async move {
                     let options = talon_telemetry::RequestOptions {
                         parent: trace_context
                             .as_ref()
@@ -300,11 +287,11 @@ impl Client {
     /// the server's object, page, or payload limit, the call fails explicitly
     /// instead of returning an incomplete list; use a narrower prefix.
     fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
-        let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
         let prefix = prefix.to_string();
-        let entries =
-            py.allow_threads(move || runtime.block_on(async move { client.list(&prefix).await }));
+        let entries = py.allow_threads(move || {
+            futures::executor::block_on(async move { client.list(&prefix).await })
+        });
         let entries = entries.map_err(client_err)?;
         Ok(entries
             .into_iter()

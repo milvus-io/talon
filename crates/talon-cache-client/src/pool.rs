@@ -44,7 +44,10 @@
 //!   returns.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
 use std::time::{Duration, Instant};
 
 use crate::lock::MutexExt;
@@ -83,6 +86,19 @@ pub fn timeout_error(what: &str, after: Duration) -> std::io::Error {
 struct Idle {
     stream: TcpStream,
     returned_at: Instant,
+    _permit: IdlePermit,
+}
+
+struct IdlePermit(Arc<AtomicUsize>);
+impl Drop for IdlePermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+struct Bucket {
+    idle: Vec<Idle>,
+    count: Arc<AtomicUsize>,
 }
 
 /// A cloneable-by-`Arc` pool of reusable TCP connections keyed by peer address.
@@ -91,7 +107,8 @@ struct Idle {
 /// *idle* connections; a checked-out connection lives with its caller until
 /// released or dropped.
 pub struct ConnectionPool {
-    idle: Mutex<HashMap<String, Vec<Idle>>>,
+    idle: Mutex<HashMap<String, Bucket>>,
+    idle_counts: Arc<Mutex<HashMap<String, Arc<AtomicUsize>>>>,
     deadlines: crate::deadline::Deadlines,
     max_idle_per_addr: usize,
     idle_ttl: Duration,
@@ -109,12 +126,23 @@ impl ConnectionPool {
     pub fn with_limits(max_idle_per_addr: usize, idle_ttl: Duration) -> Self {
         Self {
             idle: Mutex::new(HashMap::new()),
+            idle_counts: Arc::default(),
             deadlines: crate::deadline::Deadlines::default(),
             max_idle_per_addr: max_idle_per_addr.max(1),
             idle_ttl,
             connect_timeout: DEFAULT_CONNECT_TIMEOUT,
             request_timeout: DEFAULT_REQUEST_TIMEOUT,
         }
+    }
+
+    /// Create an empty connection shard sharing the aggregate idle limit.
+    /// Existing sockets stay in their original pool; drive each shard on its
+    /// owning runtime to preserve connection/thread affinity.
+    pub fn shard(&self) -> Self {
+        let mut shard = Self::with_limits(self.max_idle_per_addr, self.idle_ttl)
+            .with_timeouts(self.connect_timeout, self.request_timeout);
+        shard.idle_counts = self.idle_counts.clone();
+        shard
     }
 
     /// Override the connect and per-exchange deadlines (for tuning/tests).
@@ -194,7 +222,7 @@ impl ConnectionPool {
     fn take_idle(&self, addr: &str) -> Option<TcpStream> {
         let mut guard = self.idle.lock_recover();
         let bucket = guard.get_mut(addr)?;
-        while let Some(idle) = bucket.pop() {
+        while let Some(idle) = bucket.idle.pop() {
             if idle.returned_at.elapsed() < self.idle_ttl {
                 return Some(idle.stream);
             }
@@ -209,11 +237,33 @@ impl ConnectionPool {
     /// connections beyond `max_idle_per_addr` are dropped rather than pooled.
     pub fn release(&self, addr: &str, stream: TcpStream) {
         let mut guard = self.idle.lock_recover();
-        let bucket = guard.entry(addr.to_string()).or_default();
-        if bucket.len() < self.max_idle_per_addr {
-            bucket.push(Idle {
+        if !guard.contains_key(addr) {
+            let count = self
+                .idle_counts
+                .lock_recover()
+                .entry(addr.to_owned())
+                .or_default()
+                .clone();
+            guard.insert(
+                addr.to_owned(),
+                Bucket {
+                    idle: Vec::new(),
+                    count,
+                },
+            );
+        }
+        let bucket = guard.get_mut(addr).expect("inserted above");
+        if bucket
+            .count
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |count| {
+                (count < self.max_idle_per_addr).then(|| count + 1)
+            })
+            .is_ok()
+        {
+            bucket.idle.push(Idle {
                 stream,
                 returned_at: Instant::now(),
+                _permit: IdlePermit(bucket.count.clone()),
             });
         }
         // else: at capacity; drop `stream` to close it.
@@ -225,7 +275,7 @@ impl ConnectionPool {
             .lock()
             .unwrap()
             .get(addr)
-            .map(|b| b.len())
+            .map(|b| b.idle.len())
             .unwrap_or(0)
     }
 }
@@ -280,6 +330,30 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test]
+    async fn shards_keep_sockets_separate_and_share_idle_capacity() {
+        let addr = echo_server(Arc::new(std::sync::atomic::AtomicU32::new(0))).await;
+        let first = ConnectionPool::with_limits(1, DEFAULT_IDLE_TTL);
+        let second = first.shard();
+        let (a, _) = first.checkout(&addr).await.unwrap();
+        let (b, reused) = second.checkout(&addr).await.unwrap();
+        assert!(!reused);
+        first.release(&addr, a);
+        second.release(&addr, b);
+        assert_eq!(first.idle_count(&addr) + second.idle_count(&addr), 1);
+        // The second shard cannot take the first shard's socket.
+        let (b, reused) = second.checkout(&addr).await.unwrap();
+        assert!(!reused);
+        // Dropping a shard releases its idle slots for another shard.
+        drop(first);
+        second.release(&addr, b);
+        assert_eq!(second.idle_count(&addr), 1);
+        let (b, reused) = second.checkout(&addr).await.unwrap();
+        assert!(reused);
+        second.release(&addr, b);
+        assert_eq!(second.idle_count(&addr), 1);
     }
 
     #[tokio::test]

@@ -112,6 +112,14 @@ pub struct CoordinatorClient {
 }
 
 impl CoordinatorClient {
+    /// Keep coordinator state while creating an empty connection shard.
+    pub fn with_sharded_connections(&self) -> Self {
+        Self {
+            pool: Arc::new(self.pool.shard()),
+            ..self.clone()
+        }
+    }
+
     /// Create a client that dials `addr` (`host:port`), with its own pool.
     pub fn new(addr: impl Into<String>) -> Self {
         Self::with_pool(addr, Arc::new(ConnectionPool::new()))

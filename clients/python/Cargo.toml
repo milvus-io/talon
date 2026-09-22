@@ -20,6 +20,7 @@ telemetry = ["talon-telemetry/export"]
 extension-module = ["pyo3/extension-module"]
 
 [dependencies]
+futures.workspace = true
 tracing.workspace = true
 talon-telemetry.workspace = true
 talon-rust-client.workspace = true

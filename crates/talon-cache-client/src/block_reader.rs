@@ -128,6 +128,15 @@ pub struct BlockReader {
 }
 
 impl BlockReader {
+    /// Keep caches, refresh coordination and metrics, but use local connections.
+    pub fn with_sharded_connections(&self, coordinator: CoordinatorClient) -> Self {
+        Self {
+            coordinator,
+            worker_pool: Arc::new(self.worker_pool.shard()),
+            ..self.clone()
+        }
+    }
+
     /// Create a reader over the given coordinator client and placement cache.
     ///
     /// `replicas_k` is how many owners to retain from local placement; with RF=1

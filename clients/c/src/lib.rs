@@ -123,7 +123,6 @@ pub struct TalonClient {
 }
 
 struct ClientInner {
-    runtime: Arc<tokio::runtime::Runtime>,
     client: Arc<RustClient>,
     dispatcher: Arc<CallbackDispatcher>,
     next_request_id: AtomicU64,
@@ -147,9 +146,13 @@ struct ReadBuffer {
 
 unsafe impl Send for ReadBuffer {}
 
-impl ReadBuffer {
-    unsafe fn into_mut_slice(self) -> &'static mut [u8] {
-        std::slice::from_raw_parts_mut(self.ptr, self.len)
+impl AsMut<[u8]> for ReadBuffer {
+    fn as_mut(&mut self) -> &mut [u8] {
+        if self.len == 0 {
+            return &mut [];
+        }
+        // The C caller grants exclusive writable access until the callback.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
     }
 }
 
@@ -282,19 +285,24 @@ pub unsafe extern "C" fn talon_client_new(
             CallbackDispatcher::new_custom(executor)
         };
 
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| (STATUS_RUNTIME_ERROR, error.to_string()))?;
         let rust_client = ClientBuilder::default()
             .with_coordinator(coordinator_addr)
             .with_block_size(block_size)
             .with_max_idle_per_addr(max_idle_per_addr as usize)
             .build()
-            .map_err(|error| (STATUS_INVALID_ARGUMENT, error.to_string()))?;
+            .map_err(|error| {
+                let status = if matches!(
+                    error,
+                    RustError::InvalidArgument(_) | RustError::InvalidUri(_)
+                ) {
+                    STATUS_INVALID_ARGUMENT
+                } else {
+                    STATUS_RUNTIME_ERROR
+                };
+                (status, error.to_string())
+            })?;
         let client = Box::new(TalonClient {
             inner: Arc::new(ClientInner {
-                runtime: Arc::new(runtime),
                 client: Arc::new(rust_client),
                 dispatcher: Arc::new(dispatcher),
                 next_request_id: AtomicU64::new(1),
@@ -313,12 +321,7 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
     if client.is_null() {
         return;
     }
-    let client = unsafe { Box::from_raw(client) };
-    if tokio::runtime::Handle::try_current().is_ok() {
-        let _ = std::thread::spawn(move || drop(client)).join();
-    } else {
-        drop(client);
-    }
+    drop(unsafe { Box::from_raw(client) });
 }
 
 /// Submit an async read.
@@ -428,43 +431,39 @@ pub unsafe extern "C" fn talon_read_async_with_options(
             len: dst_len,
         };
         let user_data = UserData(user_data);
-        let runtime = Arc::clone(&inner.runtime);
         let client = Arc::clone(&inner.client);
         let dispatcher = Arc::clone(&inner.dispatcher);
         let known_stat = match (known_version, known_size) {
             (Some(version), Some(size)) => Some(RustObjectStat { size, version }),
             _ => None,
         };
-        use tracing::instrument::WithSubscriber;
-        let task = async move {
-            let options = talon_rust_client::RequestOptions {
-                parent: trace_context
-                    .as_ref()
-                    .map(talon_rust_client::TraceParent::Explicit)
-                    .unwrap_or(talon_rust_client::TraceParent::Root),
-            };
-            let result = async {
-                if read_buffer.len == 0 {
-                    return Ok(0);
-                }
-                let dst = unsafe { read_buffer.into_mut_slice() };
-                client
-                    .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
-                    .await
-                    .map_err(|error| error.to_string())
-            }
-            .await;
-            dispatch_result(
-                dispatcher,
-                callback,
-                user_data,
-                TalonResult::read(request_id, result),
-            );
+        let options = talon_rust_client::RequestOptions {
+            parent: trace_context
+                .as_ref()
+                .map(talon_rust_client::TraceParent::Explicit)
+                .unwrap_or(talon_rust_client::TraceParent::Root),
+        };
+        let submit = || {
+            client.read_into_owned_with_callback(
+                object,
+                offset,
+                read_buffer,
+                known_stat,
+                &options,
+                move |result| {
+                    dispatch_result(
+                        dispatcher,
+                        callback,
+                        user_data,
+                        TalonResult::read(request_id, result.map_err(|error| error.to_string())),
+                    )
+                },
+            )
         };
         if talon_telemetry::enabled() {
-            runtime.spawn(task.with_subscriber(telemetry_dispatch()));
+            tracing::dispatcher::with_default(&telemetry_dispatch(), submit);
         } else {
-            runtime.spawn(task);
+            submit();
         }
         Ok(())
     })
@@ -522,32 +521,28 @@ pub unsafe extern "C" fn talon_stat_async_with_options(
         }
 
         let user_data = UserData(user_data);
-        let runtime = Arc::clone(&inner.runtime);
         let client = Arc::clone(&inner.client);
         let dispatcher = Arc::clone(&inner.dispatcher);
-        use tracing::instrument::WithSubscriber;
-        let task = async move {
-            let options = talon_rust_client::RequestOptions {
-                parent: trace_context
-                    .as_ref()
-                    .map(talon_rust_client::TraceParent::Explicit)
-                    .unwrap_or(talon_rust_client::TraceParent::Root),
-            };
-            let result = client
-                .stat_with_options(&object, &options)
-                .await
-                .map_err(|error| error.to_string());
-            dispatch_result(
-                dispatcher,
-                callback,
-                user_data,
-                TalonResult::stat(request_id, result),
-            );
+        let options = talon_rust_client::RequestOptions {
+            parent: trace_context
+                .as_ref()
+                .map(talon_rust_client::TraceParent::Explicit)
+                .unwrap_or(talon_rust_client::TraceParent::Root),
+        };
+        let submit = || {
+            client.stat_with_callback(object, &options, move |result| {
+                dispatch_result(
+                    dispatcher,
+                    callback,
+                    user_data,
+                    TalonResult::stat(request_id, result.map_err(|error| error.to_string())),
+                );
+            })
         };
         if talon_telemetry::enabled() {
-            runtime.spawn(task.with_subscriber(telemetry_dispatch()));
+            tracing::dispatcher::with_default(&telemetry_dispatch(), submit);
         } else {
-            runtime.spawn(task);
+            submit();
         }
         Ok(())
     })

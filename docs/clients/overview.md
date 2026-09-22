@@ -55,6 +55,45 @@ Rust sends the minimum version that can represent the message. Nothing would
 have crashed — an older coordinator would simply have rejected requests it could
 have served, invisibly from both ends.
 
+## Rust client execution
+
+`ClientBuilder::build()` creates the Rust client's fixed Tokio I/O threads.
+Rust, C and Python use this same executor; awaiting a Rust operation does not
+require a caller Tokio runtime. Each thread owns separate coordinator and worker
+connection pools. A connection stays on its owning OS thread for its lifetime;
+this does not pin the thread to a CPU core. Inline callback continuations submitted to
+the same client stay on that thread too.
+
+Client clones share metadata caches, refresh coordination and the active-read
+budget. `max_idle_per_addr` remains an aggregate limit across all I/O threads,
+not a separate allowance for each thread. Rust callers can set the thread count
+with `with_io_threads(n)`; otherwise `TOKIO_WORKER_THREADS` or the available CPU
+count is used.
+
+Rust `read_into` takes ownership of a writable buffer (`AsMut<[u8]> + Send +
+'static`) and returns `(bytes_written, buffer)` on success. It receives directly
+into that buffer without an intermediate allocation or payload copy. For example:
+
+```rust,ignore
+let buffer = vec![0; 4096];
+let (written, buffer) = client.read_into(&object, 0, buffer, None).await?;
+// Consume &buffer[..written], then reuse the buffer.
+```
+
+This replaces the borrowed `&mut [u8]` Rust signature. Passing a `Vec` or boxed
+slice moves ownership without copying its contents. On error the buffer is
+dropped; unread trailing bytes remain unchanged on success. Dropping a pending
+request cancels its I/O, and the task retains the buffer until it stops using it.
+Forgetting the future may leak resources but cannot cause a background write to
+freed memory. `read` returns its owned result directly.
+`read_into_owned_with_callback` and the C read API also receive directly into
+storage kept valid until the callback; the C and Python APIs are unchanged.
+
+Keep a client clone alive until callbacks finish. Dropping the last clone stops
+the executor and cancels outstanding work. Shutdown waits for the I/O threads
+when initiated outside the executor; from a callback it signals shutdown without
+joining those threads, avoiding self-deadlock. C/Python do not own extra runtimes.
+
 ## Current scope
 
 All native clients are **read-only** in this release.

@@ -2874,6 +2874,7 @@ dependencies = [
 name = "talon-python"
 version = "0.1.0"
 dependencies = [
+ "futures",
  "pyo3",
  "talon-rust-client",
  "talon-telemetry",
@@ -2892,6 +2893,7 @@ dependencies = [
  "talon-transport",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
