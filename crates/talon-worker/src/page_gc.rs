@@ -186,7 +186,7 @@ impl PageGcService {
             let config = config.clone();
             tasks.push(tokio::spawn(async move {
                 let millis = if maintenance == 1 {
-                    config.checkpoint_interval_ms
+                    (config.checkpoint_interval_ms / crate::page_lifecycle::SHARDS as u64).max(1)
                 } else {
                     config.interval_ms
                 };
@@ -206,7 +206,7 @@ impl PageGcService {
                         _ = ticker.tick() => {
                             match maintenance {
                                 0 => { worker.gc_once().await; }
-                                1 => { worker.checkpoint_access_times().await; }
+                                1 => { worker.checkpoint_next_shard().await; }
                                 _ => { worker.cleanup_page_files_once().await; }
                             }
                         }

@@ -17,6 +17,7 @@ pub mod mapping_guard;
 pub mod memory_store;
 pub mod miss;
 pub mod observability;
+mod page_access_shard;
 pub mod page_access_store;
 mod page_cleanup;
 pub mod page_gc;

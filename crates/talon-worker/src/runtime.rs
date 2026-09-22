@@ -24,7 +24,7 @@ use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LE
 use crate::data_error::CacheMiss;
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
-    MemoryStore, PagedBlockStore, Presence, TenantRateLimiter, WholeBlockStore, WorkerMetrics,
+    MemoryStore, PagedBlockStore, TenantRateLimiter, WholeBlockStore, WorkerMetrics,
 };
 
 /// Default lifetime of a cached resolved object version.
@@ -122,7 +122,7 @@ pub struct WorkerRuntime {
     page_mutations: Arc<Mutations>,
     page_gc_io: Arc<tokio::sync::Semaphore>,
     page_scan: Arc<tokio::sync::Mutex<(ScanCursor, Instant, usize)>>,
-    page_checkpoint: Arc<tokio::sync::Mutex<()>>,
+    page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
     page_cleanup: Arc<Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
@@ -214,7 +214,7 @@ impl WorkerRuntime {
                 Instant::now(),
                 0,
             ))),
-            page_checkpoint: Arc::new(tokio::sync::Mutex::new(())),
+            page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
 
@@ -231,9 +231,9 @@ impl WorkerRuntime {
         )));
         for (id, page, _) in self.index.snapshot_units() {
             if let Some(page) = page {
-                self.page_lifecycle
-                    .block(&id)
-                    .register(page, None, self.page_clock.now(), false);
+                let state = self.page_lifecycle.block(&id);
+                let handle = state.register(page, None, self.page_clock.now(), false);
+                self.index.set_page_state(&id, page, handle);
             }
         }
         self.paged = Some(Arc::new(paged));
@@ -517,51 +517,46 @@ impl WorkerRuntime {
                 let last = PageIndex(((offset_in_block + request.len - 1) / page_size) as u32);
                 let l1_ok = !self.l1.is_enabled()
                     || (first.0..=last.0).all(|p| self.l1.contains_page(&block, PageIndex(p)));
-                if request.len > 0
-                    && l1_ok
-                    && matches!(
+                let state = (request.len > 0 && l1_ok)
+                    .then(|| {
                         self.index
-                            .presence_and_touch(&block, first, PageIndex(last.0 + 1)),
-                        Presence::PageHit
-                    )
-                {
-                    let state = self.page_lifecycle.block(&block);
-                    let guards: Option<Vec<_>> = (first.0..=last.0)
-                        .map(|p| state.acquire(PageIndex(p)))
-                        .collect();
-                    if let Some(guards) = guards {
-                        match paged.get_range(&block, offset_in_block, request.len) {
-                            Ok(handles) if !handles.is_empty() => {
-                                let served: u64 = handles.iter().map(|h| h.len).sum();
-                                // Only take the fast path when the handles cover the
-                                // request exactly; a short cover means we raced an
-                                // eviction, so fall through and re-fetch.
-                                if served == request.len {
-                                    for guard in &guards {
-                                        guard.record_access(self.page_clock.now());
-                                    }
-                                    self.metrics.record_l2_hit();
-                                    talon_telemetry::cache_tier("l2");
-                                    self.metrics.record_cache_hit();
-                                    tracing::info!(
-                                        block = %block,
-                                        first_page = first.0,
-                                        pages = handles.len(),
-                                        tier = "l2",
-                                        "HIT (sendfile)"
-                                    );
-                                    return Ok(if handles.len() == 1 {
-                                        let mut handles = handles;
-                                        ServeOutcome::Sendfile(handles.pop().expect("one handle"))
-                                    } else {
-                                        ServeOutcome::SendfileMany(handles)
-                                    });
+                            .page_reads_and_touch(&block, first, PageIndex(last.0 + 1))
+                    })
+                    .flatten();
+                if let Some((first_guard, guards)) = state {
+                    match paged.get_range(&block, offset_in_block, request.len) {
+                        Ok(handles) if !handles.is_empty() => {
+                            let served: u64 = handles.iter().map(|h| h.len).sum();
+                            // Only take the fast path when the handles cover the
+                            // request exactly; a short cover means we raced an
+                            // eviction, so fall through and re-fetch.
+                            if served == request.len {
+                                let now = self.page_access_time();
+                                first_guard.record_access_and_release(now);
+                                for guard in guards {
+                                    guard.record_access_and_release(now);
                                 }
+                                self.metrics.record_l2_hit();
+                                talon_telemetry::cache_tier("l2");
+                                self.metrics.record_cache_hit();
+                                tracing::info!(
+                                    block = %block,
+                                    first_page = first.0,
+                                    pages = handles.len(),
+                                    tier = "l2",
+                                    "HIT (sendfile)"
+                                );
+                                return Ok(if handles.len() == 1 {
+                                    let mut handles = handles;
+                                    ServeOutcome::Sendfile(handles.pop().expect("one handle"))
+                                } else {
+                                    ServeOutcome::SendfileMany(handles)
+                                });
                             }
-                            // Lost the race with page eviction, or an absent page;
-                            // fall through to the byte path, which re-fetches.
-                            Ok(_) | Err(_) => {}
                         }
+                        // Lost the race with page eviction, or an absent page;
+                        // fall through to the byte path, which re-fetches.
+                        Ok(_) | Err(_) => {}
                     }
                 }
             }
@@ -1015,48 +1010,46 @@ impl WorkerRuntime {
         Ok(out.freeze())
     }
 
+    /// TTL-disabled hits need only read/delete arbitration, not timestamps or
+    /// checkpoint dirtiness. Configuration is immutable while serving.
+    fn page_access_time(&self) -> Option<u64> {
+        (self.page_gc_config.ttl_ms > 0).then(|| self.page_clock.now())
+    }
+
     /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.
     async fn cached_page(
         &self,
         block: &BlockId,
         page: PageIndex,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        let Some(state) = self.page_lifecycle.get(block) else {
-            return Ok(None);
-        };
-        let Some(access) = state.acquire(page) else {
+        let Some((access, _)) = self
+            .index
+            .page_reads_and_touch(block, page, PageIndex(page.0 + 1))
+        else {
             return Ok(None);
         };
         if self.l1.is_enabled() {
             if let Some(bytes) = self.l1.get_page(block, page) {
                 self.metrics.record_l1_hit();
                 talon_telemetry::cache_tier("l1");
-                self.index
-                    .presence_and_touch(block, page, PageIndex(page.0 + 1));
-                access.record_access(self.page_clock.now());
+                access.record_access_and_release(self.page_access_time());
                 tracing::debug!(block = %block, page = page.0, tier = "l1", "HIT");
                 return Ok(Some(bytes));
             }
             self.metrics.record_l1_miss();
-        }
-        if !matches!(
-            self.index
-                .presence_and_touch(block, page, PageIndex(page.0 + 1)),
-            Presence::PageHit
-        ) {
-            self.metrics.record_l2_miss();
-            return Ok(None);
         }
         let paged = self.paged.as_ref().expect("paged store");
         match paged.get_page_bytes(block, page).await {
             Ok(bytes) => {
                 self.metrics.record_l2_hit();
                 talon_telemetry::cache_tier("l2");
-                access.record_access(self.page_clock.now());
                 tracing::debug!(block = %block, page = page.0, tier = "l2", "HIT");
                 if self.l1.is_enabled() {
                     self.admit_l1_page(block, page, bytes.clone());
                 }
+                // Keep read ownership through L1 admission so GC cannot remove
+                // the page just before we publish an otherwise stale L1 entry.
+                access.record_access_and_release(self.page_access_time());
                 Ok(Some(bytes))
             }
             Err(Error::NotFound(_)) => {
@@ -1237,16 +1230,17 @@ impl WorkerRuntime {
                         runtime
                             .index
                             .init_paged(id.clone(), paged.page_size(), block_len);
-                        runtime.index.mark_page(&id, page);
-                        state.register(
+                        let handle = state.register(
                             page,
                             Some(runtime.page_clock.now()),
                             runtime.page_clock.now(),
                             true,
                         );
+                        runtime.index.mark_page(&id, page);
                         let unit = CacheUnit::Page(id.clone(), page);
                         let access = runtime.lru.insert(unit.clone(), bytes.len() as u64);
                         runtime.index.set_access(&unit, access);
+                        runtime.index.set_page_state(&id, page, handle);
                         if runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes);
                         }

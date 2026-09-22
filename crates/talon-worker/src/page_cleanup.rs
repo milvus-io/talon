@@ -238,6 +238,36 @@ impl CleanupCursor {
                     Some(Ok(entry)) => {
                         report.checked += 1;
                         let path = entry.path();
+                        if entry.file_name().to_str().is_some_and(|name| {
+                            name.starts_with(crate::page_access_shard::TEMP_PREFIX)
+                        }) {
+                            let shard = path
+                                .parent()
+                                .and_then(|p| p.file_name())
+                                .and_then(|n| n.to_str())
+                                .and_then(|n| usize::from_str_radix(n, 16).ok());
+                            if let Some(shard) =
+                                shard.filter(|s| *s < crate::page_lifecycle::SHARDS)
+                            {
+                                let gate = lifecycle.checkpoint_gate(shard);
+                                // An active writer owns its temp until publication completes.
+                                if let Ok(_guard) = gate.try_lock() {
+                                    match entry.file_type() {
+                                        Ok(kind) if kind.is_file() => {
+                                            if !self.unlink(&path, false, &mut report) {
+                                                self.pending += 1;
+                                            }
+                                        }
+                                        Ok(_) => {}
+                                        Err(error) => {
+                                            Self::failed(&mut report, &path, error);
+                                            self.pending += 1;
+                                        }
+                                    }
+                                };
+                            }
+                            continue;
+                        }
                         let Some(digest) = directory_digest(&path) else {
                             continue;
                         };

@@ -93,6 +93,83 @@ async fn collect_all(r: &WorkerRuntime) -> u64 {
 }
 
 #[tokio::test]
+async fn disabled_ttl_hits_leave_access_and_dirtiness_unchanged() {
+    for l1 in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), l1, 0, 0);
+        r.page_clock.set(10000);
+        r.serve_range(&request(0, 32)).await.unwrap();
+        let block = r.page_lifecycle.get(&id()).unwrap();
+        let before = {
+            let state = block.inner.lock().unwrap();
+            (
+                state.revision,
+                state.dirty_since(),
+                state.pages[&0].handle.last_access(),
+            )
+        };
+        r.page_clock.set(20000);
+        assert_eq!(r.page_access_time(), None);
+        assert_eq!(
+            r.serve_range(&request(0, 16)).await.unwrap(),
+            Bytes::from((0u8..16).collect::<Vec<_>>())
+        );
+        assert!(matches!(
+            r.serve(&request(0, 32)).await.unwrap(),
+            ServeOutcome::SendfileMany(_)
+        ));
+        let state = block.inner.lock().unwrap();
+        assert_eq!(
+            (
+                state.revision,
+                state.dirty_since(),
+                state.pages[&0].handle.last_access()
+            ),
+            before
+        );
+    }
+}
+
+#[tokio::test]
+async fn access_only_checkpoint_failure_retries_without_structural_changes() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 1000);
+    r.page_clock.set(10000);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    assert_eq!(r.checkpoint_access_times().await.blocks, 1);
+    let block = r.page_lifecycle.get(&id()).unwrap();
+    let revision = block.inner.lock().unwrap().revision;
+    r.page_clock.set(10100);
+    r.serve_range(&request(0, 1)).await.unwrap();
+    {
+        let state = block.inner.lock().unwrap();
+        assert_eq!(state.revision, revision);
+        assert_eq!(state.dirty_since, None);
+        assert_eq!(state.dirty_since(), Some(10100));
+    }
+    let dir = r.paged.as_ref().unwrap().dir_for(&id());
+    let path = dir.parent().unwrap().join("access.shard");
+    std::fs::remove_file(&path).unwrap();
+    std::fs::create_dir(&path).unwrap();
+    assert_eq!(r.checkpoint_access_times().await.failures, 1);
+    assert_eq!(block.inner.lock().unwrap().dirty_since(), Some(10100));
+    std::fs::remove_dir(&path).unwrap();
+    assert_eq!(r.checkpoint_access_times().await.blocks, 1);
+    assert_eq!(block.inner.lock().unwrap().dirty_since(), None);
+    let recovered = crate::page_access_shard::load(
+        dir.parent().unwrap(),
+        crate::page_lifecycle::disk_shard(&id()),
+        16,
+        10100,
+    )
+    .unwrap();
+    assert_eq!(recovered.records[&id()].records[&0], 10100);
+    // Coalescing a durable timestamp must not schedule another shard rewrite.
+    r.serve_range(&request(0, 1)).await.unwrap();
+    assert_eq!(r.checkpoint_access_times().await.blocks, 0);
+}
+
+#[tokio::test]
 async fn ttl_strict_boundary_and_l1_l2_access_refresh_only_touched_page() {
     for l1 in [false, true] {
         let root = tempfile::tempdir().unwrap();
@@ -154,7 +231,7 @@ async fn restart_and_failback_never_renew_missing_or_old_access() {
         let r = runtime(root.path(), false, 0, 100);
         let state = r.page_lifecycle.get(&id()).unwrap();
         assert_eq!(
-            state.inner.lock().unwrap().pages[&0].last_access,
+            state.inner.lock().unwrap().pages[&0].handle.last_access(),
             Some(10000)
         );
     }
@@ -186,7 +263,7 @@ async fn no_checkpoint_corrupt_checkpoint_and_disabled_ttl() {
     r.checkpoint_access_times().await;
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
     drop(r);
-    std::fs::write(dir.join("access.meta"), b"torn").unwrap();
+    std::fs::write(dir.parent().unwrap().join("access.shard"), b"torn").unwrap();
     let r = runtime(root.path(), false, 0, 100);
     assert_eq!(collect_all(&r).await, 16);
 }
@@ -245,7 +322,7 @@ async fn checkpoint_failure_retries_and_does_not_recreate_empty_directory() {
     r.page_clock.set(10000);
     r.serve_range(&request(0, 16)).await.unwrap();
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
-    std::fs::create_dir(dir.join("access.meta")).unwrap();
+    std::fs::create_dir(dir.parent().unwrap().join("access.shard")).unwrap();
     assert_eq!(r.checkpoint_access_times().await.failures, 1);
     assert!(r
         .page_lifecycle
@@ -254,9 +331,9 @@ async fn checkpoint_failure_retries_and_does_not_recreate_empty_directory() {
         .inner
         .lock()
         .unwrap()
-        .dirty_since
+        .dirty_since()
         .is_some());
-    std::fs::remove_dir(dir.join("access.meta")).unwrap();
+    std::fs::remove_dir(dir.parent().unwrap().join("access.shard")).unwrap();
     assert_eq!(r.checkpoint_access_times().await.blocks, 1);
     r.page_clock.set(10101);
     collect_all(&r).await;
@@ -379,7 +456,9 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
         .as_ref()
         .unwrap()
         .dir_for(&id())
-        .join("access.meta")
+        .parent()
+        .unwrap()
+        .join("access.shard")
         .exists());
     assert_eq!(r.page_mutations.active_count(), 0);
 }
@@ -433,15 +512,14 @@ fn page_ttl_metadata_scale() {
             ("expired", usize::MAX),
         ] {
             for block in &blocks {
-                let mut state = block.inner.lock().unwrap();
-                for (&p, e) in state.pages.iter_mut() {
-                    e.last_access = Some(
-                        if hot_modulus != usize::MAX && p as usize % hot_modulus == 0 {
-                            1999
-                        } else {
-                            1000
-                        },
-                    );
+                let pages: Vec<_> = block.inner.lock().unwrap().pages.keys().copied().collect();
+                for p in pages {
+                    let age = if hot_modulus != usize::MAX && p as usize % hot_modulus == 0 {
+                        1999
+                    } else {
+                        1000
+                    };
+                    block.register(PageIndex(p), Some(age), age, false);
                 }
             }
             let now = if scenario == "cold" { 1050 } else { 2000 };
@@ -486,7 +564,7 @@ fn page_ttl_metadata_scale() {
                 records: state
                     .pages
                     .iter()
-                    .map(|(&p, e)| (p, e.last_access.unwrap()))
+                    .map(|(&p, e)| (p, e.handle.last_access().unwrap()))
                     .collect(),
             };
             drop(state);
@@ -892,14 +970,20 @@ fn orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries() {
                 assert!(std::fs::read_dir(&dir)
                     .unwrap()
                     .all(|e| { !e.unwrap().file_name().to_string_lossy().contains(".tmp.") }));
-                let recovery = crate::page_access_store::PageAccessStore::load(
-                    &dir,
-                    &id(),
+                assert!(std::fs::read_dir(dir.parent().unwrap()).unwrap().all(|e| !e
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with("access.shard.tmp.")));
+                let mut recovery = crate::page_access_shard::load(
+                    dir.parent().unwrap(),
+                    crate::page_lifecycle::disk_shard(&id()),
                     16,
                     r.page_clock.now(),
-                );
+                )
+                .unwrap();
                 assert!(!recovery.corrupt);
-                assert_eq!(recovery.records.len(), 1);
+                assert_eq!(recovery.records.remove(&id()).unwrap().records.len(), 1);
                 assert_eq!(
                     r.serve_range(&request(0, 16)).await.unwrap(),
                     Bytes::from((0..16).collect::<Vec<u8>>())
@@ -907,4 +991,243 @@ fn orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries() {
             }
         });
     }
+}
+
+#[tokio::test]
+async fn shard_checkpoint_preserves_clean_blocks_migrates_legacy_and_drops_deleted_records() {
+    use crate::page_access_store::{AccessSnapshot, PageAccessStore};
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 1000);
+    r.page_clock.set(10000);
+    let a = id();
+    let b = (0..10000)
+        .map(|n| {
+            BlockId::new(
+                ObjectId::new(Backend::S3, "bucket", format!("other-{n}")),
+                0,
+                256,
+                Version::new("v1"),
+            )
+        })
+        .find(|b| crate::page_lifecycle::disk_shard(b) == crate::page_lifecycle::disk_shard(&a))
+        .unwrap();
+    for block in [&a, &b] {
+        r.commit_fetched_page(block, PageIndex(0), 256, Bytes::from(vec![1; 16]))
+            .await
+            .unwrap();
+        PageAccessStore::checkpoint(
+            &r.paged.as_ref().unwrap().dir_for(block),
+            block,
+            16,
+            &AccessSnapshot {
+                revision: 1,
+                sampled_at: 10000,
+                records: vec![(0, 10000)],
+            },
+        )
+        .unwrap();
+    }
+    drop(r);
+    let r = runtime(root.path(), false, 0, 1000);
+    r.page_clock.set(10010);
+    assert_eq!(
+        r.page_lifecycle
+            .get(&b)
+            .unwrap()
+            .inner
+            .lock()
+            .unwrap()
+            .pages[&0]
+            .handle
+            .last_access(),
+        Some(10000)
+    );
+    assert_eq!(r.checkpoint_access_times().await.blocks, 2);
+    r.page_lifecycle
+        .get(&a)
+        .unwrap()
+        .acquire(PageIndex(0))
+        .unwrap()
+        .record_access(10010);
+    assert_eq!(r.checkpoint_access_times().await.blocks, 2);
+    let dir = r.paged.as_ref().unwrap().dir_for(&a);
+    let load = || {
+        crate::page_access_shard::load(
+            dir.parent().unwrap(),
+            crate::page_lifecycle::disk_shard(&a),
+            16,
+            20000,
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        load().records[&b].records[&0],
+        10000,
+        "clean block must survive a sibling checkpoint"
+    );
+    let candidate = r
+        .page_lifecycle
+        .get(&a)
+        .unwrap()
+        .candidate(PageIndex(0))
+        .unwrap();
+    r.evict_page_candidate(candidate, 2).await.unwrap();
+    r.checkpoint_access_times().await;
+    assert!(!load().records.contains_key(&a));
+    // A stale legacy record must not override the new shard, even on corruption.
+    std::fs::write(dir.parent().unwrap().join("access.shard"), b"corrupt").unwrap();
+    drop(r);
+    let r = runtime(root.path(), false, 0, 1000);
+    assert_eq!(
+        r.page_lifecycle
+            .get(&b)
+            .unwrap()
+            .inner
+            .lock()
+            .unwrap()
+            .pages[&0]
+            .handle
+            .last_access(),
+        None
+    );
+}
+
+#[tokio::test]
+async fn index_lifecycle_handle_survives_read_delete_recreate_races() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), true, 0, 100);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let state = r.page_lifecycle.get(&id()).unwrap();
+    let old = state.inner.lock().unwrap().pages[&0].handle.clone();
+    let candidate = state.candidate(PageIndex(0)).unwrap();
+    let read = r
+        .index
+        .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
+        .unwrap();
+    assert!(r.evict_page_candidate(candidate.clone(), 2).await.is_none());
+    drop(read);
+    assert!(r.evict_page_candidate(candidate, 2).await.is_some());
+    assert!(r
+        .index
+        .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
+        .is_none());
+    assert!(old.acquire().is_none());
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let fresh = state.inner.lock().unwrap().pages[&0].handle.clone();
+    assert!(!Arc::ptr_eq(&old, &fresh));
+    assert!(
+        old.acquire().is_none(),
+        "retired handle must remain closed after recreation"
+    );
+    assert!(fresh.acquire().is_some());
+    let newer = state.candidate(PageIndex(0)).unwrap();
+    r.evict_page_candidate(newer, 2).await.unwrap();
+    drop(state);
+    r.page_lifecycle.retire_empty(&id());
+    assert!(r.page_lifecycle.get(&id()).is_none());
+    r.serve_range(&request(0, 16)).await.unwrap();
+    assert!(r
+        .index
+        .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
+        .is_some());
+    assert!(old.acquire().is_none());
+    assert!(fresh.acquire().is_none());
+}
+
+#[tokio::test]
+async fn cancelled_shard_checkpoint_keeps_publication_owned_and_serialized() {
+    let root = tempfile::tempdir().unwrap();
+    let r = Arc::new(runtime(root.path(), false, 0, 100));
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let gate = r
+        .page_lifecycle
+        .checkpoint_gate(crate::page_lifecycle::disk_shard(&id()));
+    // Hold the gate in a blocking thread, never a runtime thread across await.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = tokio::task::spawn_blocking(move || {
+        let _guard = gate.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.await.unwrap();
+    let worker = r.clone();
+    let caller = tokio::spawn(async move { worker.checkpoint_access_times().await });
+    while r.page_mutations.active_count() == 0 {
+        tokio::task::yield_now().await;
+    }
+    caller.abort();
+    assert_eq!(
+        r.checkpoint_access_times().await.blocks,
+        0,
+        "cancelled caller must not release checkpoint serialization"
+    );
+    release_tx.send(()).unwrap();
+    holder.await.unwrap();
+    r.drain_page_mutations().await;
+    let dir = r.paged.as_ref().unwrap().dir_for(&id());
+    let recovered = crate::page_access_shard::load(
+        dir.parent().unwrap(),
+        crate::page_lifecycle::disk_shard(&id()),
+        16,
+        r.page_clock.now(),
+    )
+    .unwrap();
+    assert_eq!(recovered.records[&id()].records.len(), 1);
+    assert!(r
+        .page_lifecycle
+        .get(&id())
+        .unwrap()
+        .inner
+        .lock()
+        .unwrap()
+        .dirty_since()
+        .is_none());
+}
+
+#[tokio::test]
+async fn recovery_prunes_snapshot_without_pages_and_cleanup_protects_active_shard_temp() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 100);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    r.checkpoint_access_times().await;
+    let shard = crate::page_lifecycle::disk_shard(&id());
+    let dir = r.paged.as_ref().unwrap().dir_for(&id());
+    // Model a crash after the final file disappeared but before checkpoint.
+    r.paged
+        .as_ref()
+        .unwrap()
+        .delete_block_async(&id())
+        .await
+        .unwrap();
+    drop(r);
+    let r = runtime(root.path(), false, 0, 100);
+    assert!(r.checkpoint_access_times().await.bytes > 0);
+    let recovered =
+        crate::page_access_shard::load(dir.parent().unwrap(), shard, 16, r.page_clock.now())
+            .unwrap();
+    assert!(recovered.records.is_empty());
+    drop(r);
+    let r = runtime(root.path(), false, 0, 0);
+    let temp = dir.parent().unwrap().join("access.shard.tmp.active");
+    std::fs::write(&temp, b"partial").unwrap();
+    let gate = r.page_lifecycle.checkpoint_gate(shard);
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let holder = tokio::task::spawn_blocking(move || {
+        let _guard = gate.lock().unwrap();
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    ready_rx.await.unwrap();
+    r.recover_page_file_cleanup().await;
+    assert!(temp.exists());
+    release_tx.send(()).unwrap();
+    holder.await.unwrap();
+    r.recover_page_file_cleanup().await;
+    assert!(!temp.exists());
+    assert!(
+        dir.parent().unwrap().join("access.shard").exists(),
+        "empty snapshot prevents legacy fallback"
+    );
 }

@@ -1,16 +1,18 @@
 //! Versioned, checksummed per-block access checkpoints; never the residency authority.
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Write};
+use std::io::Read;
+#[cfg(test)]
+use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::path::Path;
 use talon_core::BlockId;
 use xxhash_rust::xxh3::xxh3_64;
 
-const MAGIC: &[u8; 8] = b"TLNACC01";
+pub(crate) const MAGIC: &[u8; 8] = b"TLNACC01";
 
 #[cfg(test)]
-thread_local! { static FAIL_CHECKPOINT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
+thread_local! { pub(crate) static FAIL_CHECKPOINT: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) }; }
 #[cfg(test)]
 pub(crate) fn crash_barrier(stage: &'static str) -> std::io::Result<()> {
     // A child-process regression stops at actual write/rename boundaries. The
@@ -26,7 +28,7 @@ pub(crate) fn crash_barrier(stage: &'static str) -> std::io::Result<()> {
     Ok(())
 }
 #[cfg(test)]
-fn checkpoint_fault(stage: &'static str) -> anyhow::Result<()> {
+pub(crate) fn checkpoint_fault(stage: &'static str) -> anyhow::Result<()> {
     crash_barrier(stage)?;
     anyhow::ensure!(
         !FAIL_CHECKPOINT.with(|fault| fault.get() == Some(stage)),
@@ -48,27 +50,14 @@ pub(crate) struct AccessRecovery {
 }
 pub(crate) struct PageAccessStore;
 impl PageAccessStore {
+    #[cfg(test)]
     pub fn checkpoint(
         dir: &Path,
         id: &BlockId,
         page_size: u32,
         snapshot: &AccessSnapshot,
     ) -> anyhow::Result<usize> {
-        let identity = serde_json::to_vec(id)?;
-        let mut bytes = Vec::with_capacity(identity.len() + snapshot.records.len() * 12 + 48);
-        bytes.extend_from_slice(MAGIC);
-        bytes.extend_from_slice(&1_u32.to_le_bytes());
-        bytes.extend_from_slice(&(u32::try_from(identity.len())?).to_le_bytes());
-        bytes.extend_from_slice(&identity);
-        bytes.extend_from_slice(&page_size.to_le_bytes());
-        bytes.extend_from_slice(&snapshot.revision.to_le_bytes());
-        bytes.extend_from_slice(&snapshot.sampled_at.to_le_bytes());
-        bytes.extend_from_slice(&(u32::try_from(snapshot.records.len())?).to_le_bytes());
-        for &(page, access) in &snapshot.records {
-            bytes.extend_from_slice(&page.to_le_bytes());
-            bytes.extend_from_slice(&access.to_le_bytes());
-        }
-        bytes.extend_from_slice(&xxh3_64(&bytes).to_le_bytes());
+        let bytes = Self::encode(id, page_size, snapshot)?;
         // Do not create the directory: a checkpoint cannot resurrect a deleted block.
         let mut tmp = tempfile::Builder::new()
             .prefix("access.meta.tmp.")
@@ -84,6 +73,28 @@ impl PageAccessStore {
         checkpoint_fault("directory_sync")?;
         File::open(dir)?.sync_all()?;
         Ok(bytes.len())
+    }
+    pub(crate) fn encode(
+        id: &BlockId,
+        page_size: u32,
+        snapshot: &AccessSnapshot,
+    ) -> anyhow::Result<Vec<u8>> {
+        let identity = serde_json::to_vec(id)?;
+        let mut bytes = Vec::with_capacity(identity.len() + snapshot.records.len() * 12 + 48);
+        bytes.extend_from_slice(MAGIC);
+        bytes.extend_from_slice(&1_u32.to_le_bytes());
+        bytes.extend_from_slice(&(u32::try_from(identity.len())?).to_le_bytes());
+        bytes.extend_from_slice(&identity);
+        bytes.extend_from_slice(&page_size.to_le_bytes());
+        bytes.extend_from_slice(&snapshot.revision.to_le_bytes());
+        bytes.extend_from_slice(&snapshot.sampled_at.to_le_bytes());
+        bytes.extend_from_slice(&(u32::try_from(snapshot.records.len())?).to_le_bytes());
+        for &(page, access) in &snapshot.records {
+            bytes.extend_from_slice(&page.to_le_bytes());
+            bytes.extend_from_slice(&access.to_le_bytes());
+        }
+        bytes.extend_from_slice(&xxh3_64(&bytes).to_le_bytes());
+        Ok(bytes)
     }
     pub fn load(dir: &Path, id: &BlockId, page_size: u32, now: u64) -> AccessRecovery {
         let path = dir.join("access.meta");
@@ -117,6 +128,15 @@ impl PageAccessStore {
             bytes.len() as u64 <= max_len && bytes.len() >= 48,
             "invalid checkpoint length"
         );
+        Self::decode_bytes(&bytes, id, page_size, now)
+    }
+    pub(crate) fn decode_bytes(
+        bytes: &[u8],
+        id: &BlockId,
+        page_size: u32,
+        now: u64,
+    ) -> anyhow::Result<AccessRecovery> {
+        anyhow::ensure!(bytes.len() >= 48, "invalid checkpoint length");
         let checksum_at = bytes.len() - 8;
         anyhow::ensure!(
             xxh3_64(&bytes[..checksum_at]) == u64::from_le_bytes(bytes[checksum_at..].try_into()?),

@@ -2,7 +2,7 @@
 use super::*;
 use crate::page_access_store::{AccessSnapshot, PageAccessStore};
 use crate::page_gc::{CheckpointReport, GcReport};
-use crate::page_lifecycle::GcCandidate;
+use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
 
 impl WorkerRuntime {
     /// Configure page idle collection and restore persisted ages before serving traffic.
@@ -41,21 +41,52 @@ impl WorkerRuntime {
                 "checkpoint interval exceeds TTL"
             );
             let now = self.page_clock.now();
-            for (id, _) in self.index.snapshot_lens() {
-                let state = self.page_lifecycle.block(&id);
-                let recovered =
-                    PageAccessStore::load(&paged.dir_for(&id), &id, paged.page_size(), now);
-                let pages: Vec<_> = state.inner.lock().unwrap().pages.keys().copied().collect();
-                if recovered.corrupt {
-                    self.page_gc_metrics.corrupt.add(pages.len() as u64);
+            // Load each shard once; keep only one shard's recovered metadata in memory.
+            for shard in 0..crate::page_lifecycle::SHARDS {
+                let dir = paged.root().join(format!("{shard:02x}"));
+                let mut recovered_shard =
+                    crate::page_access_shard::load(&dir, shard, paged.page_size(), now);
+                if recovered_shard.is_some() {
+                    self.page_lifecycle.checkpoint_recovered(shard);
                 }
-                self.page_gc_metrics.future.add(recovered.future as u64);
-                for page in pages {
-                    let access = recovered.records.get(&page).copied();
-                    if access.is_none() {
-                        self.page_gc_metrics.missing.inc();
+                let (ceiling, _, _) = self.page_lifecycle.checkpoint_start(shard);
+                let mut slot = 0;
+                loop {
+                    let blocks = self
+                        .page_lifecycle
+                        .checkpoint_batch(shard, &mut slot, ceiling);
+                    if blocks.is_empty() {
+                        break;
                     }
-                    state.register(PageIndex(page), access, now, false);
+                    for state in blocks {
+                        let recovered = match &mut recovered_shard {
+                            Some(shard) => shard.records.remove(&state.id).unwrap_or_else(|| {
+                                crate::page_access_store::AccessRecovery {
+                                    corrupt: shard.corrupt,
+                                    ..Default::default()
+                                }
+                            }),
+                            None => PageAccessStore::load(
+                                &paged.dir_for(&state.id),
+                                &state.id,
+                                paged.page_size(),
+                                now,
+                            ),
+                        };
+                        let pages: Vec<_> =
+                            state.inner.lock().unwrap().pages.keys().copied().collect();
+                        if recovered.corrupt {
+                            self.page_gc_metrics.corrupt.add(pages.len() as u64);
+                        }
+                        self.page_gc_metrics.future.add(recovered.future as u64);
+                        for page in pages {
+                            let access = recovered.records.get(&page).copied();
+                            if access.is_none() {
+                                self.page_gc_metrics.missing.inc();
+                            }
+                            state.register(PageIndex(page), access, now, false);
+                        }
+                    }
                 }
             }
         }
@@ -338,112 +369,146 @@ impl WorkerRuntime {
         }
     }
 
-    /// Visit dirty blocks in bounded batches; no per-access queue or global snapshot.
+    /// Explicit flush (including shutdown). Normal background work advances one
+    /// shard per tick, spreading syncs over the configured checkpoint interval.
     pub async fn checkpoint_access_times(&self) -> CheckpointReport {
+        self.checkpoint_shards(true).await
+    }
+
+    pub(crate) async fn checkpoint_next_shard(&self) -> CheckpointReport {
+        self.checkpoint_shards(false).await
+    }
+
+    async fn checkpoint_shards(&self, all: bool) -> CheckpointReport {
         if self.page_gc_config.ttl_ms == 0 {
             return CheckpointReport::default();
         }
-        let Ok(_single) = self.page_checkpoint.try_lock() else {
+        let Ok(mut cursor) = self.page_checkpoint.clone().try_lock_owned() else {
             return CheckpointReport::default();
         };
-        let mut cursor = ScanCursor::default();
-        let mut report = CheckpointReport::default();
-        let mut dirty = 0;
-        let mut oldest = 0;
-        loop {
-            let (blocks, done) = self.page_lifecycle.dirty_batch(&mut cursor, 64);
-            for block in &blocks {
-                let state = block.inner.lock().unwrap();
-                if let Some(since) = state.dirty_since {
-                    dirty += 1;
-                    oldest = oldest.max(self.page_clock.now().saturating_sub(since));
-                }
-            }
-            self.page_gc_metrics.dirty_blocks.set(dirty as f64);
-            self.page_gc_metrics.dirty_age.set(oldest as f64 / 1000.0);
-            let work = futures::stream::iter(blocks.into_iter().map(|block| {
-                let runtime = self.clone();
-                async move {
-                    self.page_mutations
-                        .run(async move {
-                            let _gate = block.gate.lock().await;
-                            let snapshot = {
-                                let state = block.inner.lock().unwrap();
-                                if state.dirty_since.is_none() || state.pages.is_empty() {
-                                    return Ok::<_, anyhow::Error>(0);
-                                }
-                                AccessSnapshot {
-                                    revision: state.revision,
-                                    sampled_at: runtime.page_clock.now(),
-                                    records: state
-                                        .pages
-                                        .iter()
-                                        .filter_map(|(&page, entry)| {
-                                            entry.last_access.map(|access| (page, access))
-                                        })
-                                        .collect(),
-                                }
-                            };
-                            let revision = snapshot.revision;
-                            let sampled_at = snapshot.sampled_at;
-                            let paged = runtime.paged.as_ref().expect("paged TTL").clone();
-                            let id = block.id.clone();
-                            let bytes = tokio::task::spawn_blocking(move || {
-                                PageAccessStore::checkpoint(
-                                    &paged.dir_for(&id),
-                                    &id,
-                                    paged.page_size(),
-                                    &snapshot,
-                                )
-                            })
-                            .await??;
-                            let mut state = block.inner.lock().unwrap();
-                            if state.revision == revision {
-                                state.dirty_since = None;
-                            } else {
-                                // Only post-snapshot accesses remain unsaved. A hot block
-                                // must not report the age of already-persisted accesses.
-                                state.dirty_since = Some(sampled_at);
-                            }
-                            runtime
-                                .page_gc_metrics
-                                .checkpoint_at
-                                .set(runtime.page_clock.now() as f64 / 1000.0);
-                            Ok(bytes)
-                        })
-                        .await
-                }
-            }));
-            let mut work = work.buffer_unordered(2);
-            while let Some(result) = work.next().await {
+        let runtime = self.clone();
+        // Retain serialization and dirty-state ownership even if the caller is cancelled.
+        self.page_mutations.run(async move {
+            let mut report = CheckpointReport::default();
+            for _ in 0..if all { crate::page_lifecycle::SHARDS } else { 1 } {
+                let shard = *cursor;
+                *cursor = (shard + 1) % crate::page_lifecycle::SHARDS;
+                let worker = runtime.clone();
+                let result = tokio::task::spawn_blocking(move || worker.checkpoint_shard(shard)).await
+                    .expect("access checkpoint task panicked");
                 match result {
-                    Ok(bytes) if bytes > 0 => {
-                        report.blocks += 1;
+                    Ok((blocks, bytes)) => {
+                        report.blocks += blocks;
                         report.bytes += bytes as u64;
-                        self.page_gc_metrics.checkpoint_bytes.add(bytes as u64);
+                        if bytes > 0 {
+                            runtime.page_gc_metrics.checkpoint_bytes.add(bytes as u64);
+                            runtime.page_gc_metrics.checkpoint_at.set(runtime.page_clock.now() as f64 / 1000.0);
+                        }
                     }
-                    Ok(_) => {}
                     Err(error) => {
                         report.failures += 1;
-                        self.page_gc_metrics.checkpoint_errors.inc();
-                        tracing::warn!(%error, "page access checkpoint failed; keeping dirty state");
+                        runtime.page_gc_metrics.checkpoint_errors.inc();
+                        tracing::warn!(shard, %error, "page shard checkpoint failed; keeping dirty state");
                     }
                 }
             }
-            if done {
+            if all || *cursor == 0 { runtime.refresh_checkpoint_metrics().await; }
+            report
+        }).await
+    }
+
+    fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
+        let paged = self.paged.as_ref().expect("paged TTL");
+        let gate = self.page_lifecycle.checkpoint_gate(shard);
+        let _guard = gate.lock().unwrap();
+        let (ceiling, membership, mut dirty) = self.page_lifecycle.checkpoint_start(shard);
+        let mut slot = 0;
+        let mut snapshots = Vec::new();
+        let mut size = 24;
+        loop {
+            let blocks = self
+                .page_lifecycle
+                .checkpoint_batch(shard, &mut slot, ceiling);
+            if blocks.is_empty() {
                 break;
             }
-            tokio::task::yield_now().await;
+            for block in blocks {
+                let state = block.inner.lock().unwrap();
+                dirty |= state.dirty_since.is_some();
+                // Bound allocation before collecting a potentially large block.
+                let records = state.pages.len();
+                size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
+                anyhow::ensure!(
+                    size <= crate::page_access_shard::MAX_BYTES,
+                    "access shard exceeds 64 MiB limit"
+                );
+                // Consume markers before sampling timestamps. Concurrent reads
+                // remain dirty for the next checkpoint; failure restores markers.
+                let pages: Vec<_> = state
+                    .pages
+                    .iter()
+                    .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
+                    .collect();
+                dirty |= pages.iter().any(PageCheckpoint::dirty);
+                // Include clean blocks too: this file replaces the full shard.
+                let snapshot = AccessSnapshot {
+                    revision: state.revision,
+                    sampled_at: self.page_clock.now(),
+                    records: pages
+                        .iter()
+                        .filter_map(|page| page.access.map(|age| (page.page, age)))
+                        .collect(),
+                };
+                let resident = !state.pages.is_empty();
+                drop(state);
+                snapshots.push((block, snapshot, resident, pages));
+            }
         }
-        // A touch racing a successful checkpoint leaves the block dirty. Recount
-        // in bounded batches rather than inferring cleanliness from write counts.
+        if !dirty {
+            return Ok((0, 0));
+        }
+        let dir = paged.root().join(format!("{shard:02x}"));
+        // Whole-block-only registry entries have no paged directory to persist.
+        if !dir.exists() && snapshots.iter().all(|(_, _, resident, _)| !resident) {
+            self.page_lifecycle.checkpoint_finished(shard, membership);
+            return Ok((0, 0));
+        }
+        let bytes = crate::page_access_shard::checkpoint(
+            &dir,
+            paged.page_size(),
+            snapshots
+                .iter()
+                .filter(|(_, _, resident, _)| *resident)
+                .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
+        )?;
+        let count = snapshots
+            .iter()
+            .filter(|(_, _, resident, _)| *resident)
+            .count();
+        for (block, snapshot, _, pages) in snapshots {
+            let mut state = block.inner.lock().unwrap();
+            if state.revision == snapshot.revision {
+                state.dirty_since = None;
+            } else if let Some(since) = state.dirty_since.as_mut() {
+                *since = (*since).max(snapshot.sampled_at);
+            }
+            drop(state);
+            for page in pages {
+                page.commit();
+            }
+        }
+        self.page_lifecycle.checkpoint_finished(shard, membership);
+        Ok((count, bytes))
+    }
+
+    async fn refresh_checkpoint_metrics(&self) {
         let mut cursor = ScanCursor::default();
         let mut remaining = 0;
         let mut oldest = 0;
         loop {
             let (blocks, done) = self.page_lifecycle.dirty_batch(&mut cursor, 64);
             for block in blocks {
-                if let Some(since) = block.inner.lock().unwrap().dirty_since {
+                if let Some(since) = block.inner.lock().unwrap().dirty_since() {
                     remaining += 1;
                     oldest = oldest.max(self.page_clock.now().saturating_sub(since));
                 }
@@ -455,6 +520,5 @@ impl WorkerRuntime {
         }
         self.page_gc_metrics.dirty_blocks.set(remaining as f64);
         self.page_gc_metrics.dirty_age.set(oldest as f64 / 1000.0);
-        report
     }
 }
