@@ -166,3 +166,66 @@ groups:
             Worker {{ $labels.instance }} is returning errors for over 5% of
             requests for 5m ({{ printf "%.1f" ($value | humanizePercentage) }}).
           runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#worker-high-error-ratio"
+
+  - name: talon_page_gc.alerts
+    rules:
+      - alert: TalonPageAccessCheckpointLag
+        expr: |
+          (talon_worker_page_access_oldest_dirty_seconds > 3 * talon_worker_page_access_checkpoint_interval_seconds)
+          or (
+            (talon_worker_page_access_dirty_blocks > 0)
+            and (
+              ((time() - talon_worker_page_access_checkpoint_timestamp_seconds > 3 * talon_worker_page_access_checkpoint_interval_seconds) and (talon_worker_page_access_checkpoint_timestamp_seconds > 0))
+              or ((talon_worker_process_uptime_seconds > 3 * talon_worker_page_access_checkpoint_interval_seconds) and (talon_worker_page_access_checkpoint_timestamp_seconds == 0))
+            )
+          )
+        for: 2m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Page access checkpoints lag on {{ $labels.instance }}"
+          description: "Access records remain unsaved beyond three checkpoint periods; restart can cause early eviction and origin traffic. Check disk space, permissions and I/O latency."
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-access-checkpoint-lag"
+      - alert: TalonPageGcScanLag
+        expr: (talon_worker_page_gc_scan_seconds > 0.1 * talon_worker_page_ttl_seconds) and (talon_worker_page_ttl_seconds > 0)
+        for: 2m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Page GC scan is slow on {{ $labels.instance }}"
+          description: "A complete scan exceeds 10% of TTL. Check GC budgets and disk latency; TTL is not a physical space release deadline."
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-gc-scan-lag"
+      - alert: TalonPageGcDeleteFailures
+        expr: rate(talon_worker_page_gc_delete_errors_total[5m]) > 0 or delta(talon_worker_page_gc_pending_retries[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Page GC cannot reclaim files on {{ $labels.instance }}"
+          description: "Unlink failures persist or retries are increasing. Check filesystem errors and permissions; failed unlinks retain resident byte accounting."
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-gc-delete-failures"
+      - alert: TalonPageCleanupFailures
+        expr: rate(talon_worker_page_cleanup_errors_total[5m]) > 0 or talon_worker_page_cleanup_pending > 0
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Page metadata leftovers persist on {{ $labels.instance }}"
+          description: "Disk cleanup repeatedly fails or has unresolved paths. Inspect the logged paths, directory permissions and filesystem errors; retries continue even with page TTL disabled."
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-cleanup-failures"
+      - alert: TalonPageCleanupScanStalled
+        expr: |
+          ((time() - talon_worker_page_cleanup_scan_timestamp_seconds > 900) and (talon_worker_page_cleanup_scan_timestamp_seconds > 0))
+          or ((talon_worker_process_uptime_seconds > 900) and (talon_worker_page_cleanup_scan_timestamp_seconds == 0))
+        for: 5m
+        labels:
+          severity: warning
+          component: worker
+        annotations:
+          summary: "Page metadata cleanup scan is stalled on {{ $labels.instance }}"
+          description: "No disk cleanup scan completed for 15 minutes. Check filesystem latency and scan/delete budgets; large cache roots may need a higher alert threshold."
+          runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-cleanup-scan-stalled"

@@ -1723,6 +1723,17 @@ mod tests {
             // 16-byte pages inside a 64-byte block: a 40-byte read from offset
             // 5 spans pages 0..=2 with partial pages at both ends.
             let (worker, obs) = build_paged(&root, Arc::new(RampBackend), 64, 16);
+            let worker = Arc::new(
+                Arc::try_unwrap(worker)
+                    .unwrap_or_else(|_| panic!("sole owner"))
+                    .with_page_gc(crate::page_gc::PageGcConfig {
+                        ttl_ms: 1,
+                        checkpoint_interval_ms: 1,
+                        ..Default::default()
+                    })
+                    .unwrap(),
+            );
+            let retained = worker.clone();
             let l = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let addr = l.local_addr().unwrap();
             monoio::spawn(async move {
@@ -1740,6 +1751,11 @@ mod tests {
             let mut c = TcpStream::connect(addr).await.unwrap();
 
             for pass in 0..3 {
+                if pass == 2 {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    assert_eq!(retained.gc_once().await.bytes, 48);
+                    assert_eq!(retained.resident_bytes(), 0);
+                }
                 let (r, _) = c.write_all(encode_request(0, &req).unwrap()).await;
                 r.unwrap();
                 let (header, body) = read_response(&mut c).await;

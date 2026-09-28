@@ -124,6 +124,51 @@ pub trait RingHandler: Clone + 'static {
     ) -> impl std::future::Future<Output = anyhow::Result<()>>;
 }
 
+/// Keep our place in the admission queue across stop checks. Unlike accept,
+/// semaphore acquisition is cancellation-safe and can be dropped on shutdown.
+async fn acquire_until_stopped(
+    admission: &ConnectionAdmission,
+    stop: &std::sync::atomic::AtomicBool,
+) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    let mut pending = std::pin::pin!(admission.acquire());
+    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+        if let Ok(permit) =
+            monoio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut()).await
+        {
+            return Some(permit);
+        }
+    }
+    None
+}
+
+/// Keep one accept alive across stop checks. Dropping a pending Monoio accept
+/// loses the accepted FD if completion races its asynchronous cancellation.
+async fn accept_until_stopped(
+    listener: &monoio::net::TcpListener,
+    stop: &std::sync::atomic::AtomicBool,
+) -> std::io::Result<Option<(monoio::net::TcpStream, std::net::SocketAddr)>> {
+    use std::sync::atomic::Ordering;
+    if stop.load(Ordering::Acquire) {
+        return Ok(None);
+    }
+    let cancel = monoio::io::Canceller::new();
+    let pending = listener.cancelable_accept(cancel.handle());
+    let mut pending = std::pin::pin!(pending);
+    loop {
+        match monoio::time::timeout(std::time::Duration::from_millis(100), pending.as_mut()).await {
+            Ok(result) => return result.map(Some),
+            Err(_) if stop.load(Ordering::Acquire) => {
+                cancel.cancel();
+                // Cancellation can lose to a successful accept. Await and drop
+                // that stream too, so every completed FD gets an owner.
+                drop(pending.await);
+                return Ok(None);
+            }
+            Err(_) => {}
+        }
+    }
+}
+
 /// Run the data plane on `rings` io_uring rings bound to `addr`.
 ///
 /// Blocks until every ring thread exits. Each thread:
@@ -166,6 +211,28 @@ pub fn serve<H>(
 where
     H: RingHandler + Send,
 {
+    serve_with_shutdown(
+        addr,
+        rings,
+        admission,
+        handler,
+        tokio_handle,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    )
+}
+
+/// Like [`serve`], with a cooperative accept-loop stop flag for worker shutdown.
+pub fn serve_with_shutdown<H>(
+    addr: String,
+    rings: usize,
+    admission: ConnectionAdmission,
+    handler: H,
+    tokio_handle: tokio::runtime::Handle,
+    stop: Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<()>
+where
+    H: RingHandler + Send,
+{
     let ready = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
     let mut threads = Vec::with_capacity(rings);
 
@@ -188,6 +255,7 @@ where
         let ready = Arc::clone(&ready);
         let tokio_handle = tokio_handle.clone();
         let allowed = Arc::clone(&allowed);
+        let stop = Arc::clone(&stop);
         threads.push(
             std::thread::Builder::new()
                 .name(format!("talon-ring-{ring_id}"))
@@ -253,12 +321,16 @@ where
                         tracing::info!(ring = ring_id, %addr, "data-plane ring listening");
 
                         loop {
-                            // Match the Tokio data plane's overload policy: wait
-                            // for worker-global capacity before accepting, leaving
-                            // excess peers in this ring's kernel backlog.
-                            let permit = admission.acquire().await;
-                            let (stream, peer) = match listener.accept().await {
-                                Ok(v) => v,
+                            // Preserve the worker-global pre-accept budget while
+                            // still allowing shutdown when all permits are held.
+                            let Some(permit) = acquire_until_stopped(&admission, &stop).await
+                            else {
+                                break;
+                            };
+                            let (stream, peer) = match accept_until_stopped(&listener, &stop).await
+                            {
+                                Ok(Some(v)) => v,
+                                Ok(None) => break,
                                 Err(e) => {
                                     tracing::warn!(ring = ring_id, error = %e, "accept failed");
                                     continue;
@@ -300,6 +372,111 @@ mod tests {
 
     fn admission(capacity: usize) -> ConnectionAdmission {
         ConnectionAdmission::new(capacity, crate::WorkerMetrics::new(0))
+    }
+
+    #[test]
+    fn saturated_admission_stops_without_leaking_capacity() {
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let admission = admission(1);
+            let held = admission.acquire().await;
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let mut waiting = Box::pin(acquire_until_stopped(&admission, &stop));
+            assert!(futures::poll!(&mut waiting).is_pending());
+            stop.store(true, Ordering::Release);
+            assert!(
+                monoio::time::timeout(std::time::Duration::from_secs(2), waiting)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            drop(held);
+            let replacement =
+                monoio::time::timeout(std::time::Duration::from_secs(2), admission.acquire())
+                    .await
+                    .unwrap();
+            drop(replacement);
+        });
+    }
+
+    #[test]
+    fn accept_stop_checks_preserve_pending_accept_and_close_racing_fds() {
+        // FD accounting must be isolated from the other socket tests.
+        const CHILD: &str = "TALON_ACCEPT_STOP_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "uring_serve::tests::accept_stop_checks_preserve_pending_accept_and_close_racing_fds",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut rt = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .enable_timer()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            use std::time::Duration;
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            monoio::time::sleep(Duration::from_millis(1)).await;
+            let before = std::fs::read_dir("/proc/self/fd").unwrap().count();
+            for cancel in [false, true] {
+                for _ in 0..4 {
+                    let stop = std::sync::atomic::AtomicBool::new(false);
+                    let mut pending = Box::pin(accept_until_stopped(&listener, &stop));
+                    assert!(futures::poll!(&mut pending).is_pending());
+                    // Submit accept and cross multiple periodic checks with no client.
+                    for _ in 0..2 {
+                        monoio::time::sleep(Duration::from_millis(110)).await;
+                        assert!(futures::poll!(&mut pending).is_pending());
+                    }
+                    if cancel {
+                        monoio::time::sleep(Duration::from_millis(110)).await;
+                        stop.store(true, Ordering::Release);
+                        // Queue cancellation, then make accept complete before
+                        // that cancellation is submitted to the kernel.
+                        assert!(futures::poll!(&mut pending).is_pending());
+                    }
+                    let client = std::net::TcpStream::connect(addr).unwrap();
+                    std::thread::sleep(Duration::from_millis(5));
+                    let accepted = monoio::time::timeout(Duration::from_secs(2), pending)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(accepted.is_none(), cancel);
+                    drop(accepted);
+                    drop(client);
+                    // Let Monoio complete any asynchronous closes.
+                    monoio::time::sleep(Duration::from_millis(5)).await;
+                    assert_eq!(std::fs::read_dir("/proc/self/fd").unwrap().count(), before);
+                }
+            }
+            // Shutdown with no racing connection must also finish promptly.
+            let stop = std::sync::atomic::AtomicBool::new(false);
+            let mut pending = Box::pin(accept_until_stopped(&listener, &stop));
+            assert!(futures::poll!(&mut pending).is_pending());
+            monoio::time::sleep(Duration::from_millis(5)).await;
+            stop.store(true, Ordering::Release);
+            assert!(monoio::time::timeout(Duration::from_secs(2), pending)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_none());
+        });
     }
 
     /// The default configuration must select the io_uring data plane, and it

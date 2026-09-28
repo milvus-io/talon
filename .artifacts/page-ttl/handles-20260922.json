@@ -1,0 +1,756 @@
+{
+  "versions": {
+    "base": "6d18bf2cc82a9146b3958b00289d656cc5d8132d",
+    "candidate_parent": "d0eb9ee00370e588cfb4004e5dcafbe9af9c2aba",
+    "candidate_patch_sha256": "6438208e9d70b31298d6de97e9a3fb3a60fba0684a290504401c762892425278",
+    "candidate_new_module_sha256": "7b6b456104afaf573ddf2550ee3285a3eb2dfaef6252c2b2efa655525bc21a95",
+    "binaries": {
+      "talon-worker-baseline": "303ea9b9c4b87a9a1c19bebbe88f8527bd27336540cffb4342a910b6d9b55208",
+      "talon-worker-candidate": "2b6e97b4515470c8236a77919e158fa31b6cb8411c2e49839efd8d916bf3997d",
+      "talon-coordinator": "6f79621aca670ac0246e7d7e789fa31a7deb731775004afaa166815ca012ce98",
+      "libtalon_c.so": "fb0f816410a2055d5c1a97a1727a707f086821d4390b668959674974bccf8056",
+      "talon-s3-loadgen": "77f490b17b6f0bb9f20ec7cd1eaf5d60f77d17f926626f2be5549bac04ca4f8d"
+    }
+  },
+  "scope": "Same-environment 1 TiB/4 KiB steady-state L2 comparison against main 6d18bf2. c1 two complete rounds, c512 three complete rounds. Not full runbook, production workload, expiration under load, E2E or fault recovery.",
+  "resumed_round": "Round4 reruns all three variants after explicit user resume; partial round3 kept separately. Identical source, binary, SDK and dataset hashes.",
+  "note": "Median of per-run P99, not global pooled P99. Worker CPU/request uses process user+system CPU tick deltas over first/last in-window samples / observed duration / successful QPS; excludes transitions and checks process start identity. Any reproducible decline reported, no 5%/10% tolerance.",
+  "primary_windows": 15,
+  "diagnostic_windows": 5,
+  "aggregates": [
+    {
+      "concurrency": 1,
+      "variant": "baseline",
+      "rounds": [
+        1,
+        2
+      ],
+      "qps": 2168.406,
+      "p99_ms": 0.7635000000000001,
+      "worker_cpu_us_per_request": 60.703241185810995,
+      "qps_range": [
+        2168.256,
+        2168.556
+      ],
+      "p99_range": [
+        0.761,
+        0.766
+      ],
+      "qps_change_pct": 0.0,
+      "p99_ms_change_pct": 0.0,
+      "worker_cpu_us_per_request_change_pct": 0.0
+    },
+    {
+      "concurrency": 1,
+      "variant": "ttl-off",
+      "rounds": [
+        1,
+        2
+      ],
+      "qps": 2252.1165,
+      "p99_ms": 0.725,
+      "worker_cpu_us_per_request": 164.51967859102575,
+      "qps_range": [
+        2203.289,
+        2300.944
+      ],
+      "p99_range": [
+        0.701,
+        0.749
+      ],
+      "qps_change_pct": 3.8604624779676966,
+      "p99_ms_change_pct": -5.0425671250818755,
+      "worker_cpu_us_per_request_change_pct": 171.02289000917662
+    },
+    {
+      "concurrency": 1,
+      "variant": "ttl-on",
+      "rounds": [
+        1,
+        2
+      ],
+      "qps": 2377.083,
+      "p99_ms": 0.6835,
+      "worker_cpu_us_per_request": 167.5643268691192,
+      "qps_range": [
+        2371.844,
+        2382.322
+      ],
+      "p99_range": [
+        0.683,
+        0.684
+      ],
+      "qps_change_pct": 9.623520687546527,
+      "p99_ms_change_pct": -10.478061558611662,
+      "worker_cpu_us_per_request_change_pct": 176.03851721230055
+    },
+    {
+      "concurrency": 512,
+      "variant": "baseline",
+      "rounds": [
+        1,
+        2,
+        4
+      ],
+      "qps": 593636.9,
+      "p99_ms": 2.04,
+      "worker_cpu_us_per_request": 32.38334109945232,
+      "qps_range": [
+        585728.439,
+        597827.9
+      ],
+      "p99_range": [
+        1.941,
+        2.47
+      ],
+      "qps_change_pct": 0.0,
+      "p99_ms_change_pct": 0.0,
+      "worker_cpu_us_per_request_change_pct": 0.0
+    },
+    {
+      "concurrency": 512,
+      "variant": "ttl-off",
+      "rounds": [
+        1,
+        2,
+        4
+      ],
+      "qps": 574338.844,
+      "p99_ms": 2.313,
+      "worker_cpu_us_per_request": 33.52030142886235,
+      "qps_range": [
+        571751.367,
+        587558.25
+      ],
+      "p99_range": [
+        2.103,
+        2.903
+      ],
+      "qps_change_pct": -3.250818134789124,
+      "p99_ms_change_pct": 13.382352941176467,
+      "worker_cpu_us_per_request_change_pct": 3.5109420177439787
+    },
+    {
+      "concurrency": 512,
+      "variant": "ttl-on",
+      "rounds": [
+        1,
+        2,
+        4
+      ],
+      "qps": 575934.661,
+      "p99_ms": 2.287,
+      "worker_cpu_us_per_request": 33.810934399746564,
+      "qps_range": [
+        574177.083,
+        581414.961
+      ],
+      "p99_range": [
+        2.25,
+        2.294
+      ],
+      "qps_change_pct": -2.981997749802967,
+      "p99_ms_change_pct": 12.107843137254903,
+      "worker_cpu_us_per_request_change_pct": 4.408418809875014
+    }
+  ],
+  "paired_comparisons": [
+    {
+      "variant": "ttl-off",
+      "concurrency": 1,
+      "round": 1,
+      "qps_change_pct": 1.601664886680365,
+      "p99_ms_change_pct": -2.219321148825071,
+      "worker_cpu_us_per_request_change_pct": 177.0065818143581
+    },
+    {
+      "variant": "ttl-on",
+      "concurrency": 1,
+      "round": 1,
+      "qps_change_pct": 9.85752731310605,
+      "p99_ms_change_pct": -10.835509138381195,
+      "worker_cpu_us_per_request_change_pct": 177.92948553346335
+    },
+    {
+      "variant": "ttl-on",
+      "concurrency": 1,
+      "round": 2,
+      "qps_change_pct": 9.389481684819522,
+      "p99_ms_change_pct": -10.118265440210239,
+      "worker_cpu_us_per_request_change_pct": 174.17186528231917
+    },
+    {
+      "variant": "ttl-off",
+      "concurrency": 1,
+      "round": 2,
+      "qps_change_pct": 6.11957259659377,
+      "p99_ms_change_pct": -7.884362680683321,
+      "worker_cpu_us_per_request_change_pct": 165.11614385613288
+    },
+    {
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 1,
+      "qps_change_pct": 0.31239920723740155,
+      "p99_ms_change_pct": -14.8582995951417,
+      "worker_cpu_us_per_request_change_pct": 3.253637199854964
+    },
+    {
+      "variant": "ttl-on",
+      "concurrency": 512,
+      "round": 1,
+      "qps_change_pct": -1.9721350767467172,
+      "p99_ms_change_pct": -7.408906882591104,
+      "worker_cpu_us_per_request_change_pct": 4.564069360419243
+    },
+    {
+      "variant": "ttl-on",
+      "concurrency": 512,
+      "round": 2,
+      "qps_change_pct": -2.0588240050441575,
+      "p99_ms_change_pct": 12.450980392156863,
+      "worker_cpu_us_per_request_change_pct": 4.589183837486321
+    },
+    {
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 2,
+      "qps_change_pct": -3.250818134789124,
+      "p99_ms_change_pct": 13.382352941176467,
+      "worker_cpu_us_per_request_change_pct": 3.3021925814630704
+    },
+    {
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 4,
+      "qps_change_pct": -4.361879564336169,
+      "p99_ms_change_pct": 49.56208140133951,
+      "worker_cpu_us_per_request_change_pct": 4.591593337257338
+    },
+    {
+      "variant": "ttl-on",
+      "concurrency": 512,
+      "round": 4,
+      "qps_change_pct": -3.6621306901200246,
+      "p99_ms_change_pct": 15.919629057187024,
+      "worker_cpu_us_per_request_change_pct": 3.7486220476217413
+    }
+  ],
+  "raw_artifacts": "/data/yuruiz/artifacts/talon-ttl-handles-resume-20260922",
+  "client": "10.15.3.101, c6in.8xlarge, 32 x86_64 vCPU",
+  "client_kernel": "6.1.55-75.123.amzn2023.x86_64",
+  "worker_kernel": "6.12.100-125.179.amzn2023.aarch64",
+  "results": [
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c1-r1",
+      "variant": "baseline",
+      "concurrency": 1,
+      "round": 1,
+      "qps": 2168.556,
+      "p99_ms": 0.766,
+      "p999_ms": 1.183,
+      "max_ms": 51.222,
+      "worker_cpu_us_per_request": 60.31041709503125,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 1087.50023891477,
+        "worker-node-1": 1089.9645593785542
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c1-r1",
+      "variant": "ttl-off",
+      "concurrency": 1,
+      "round": 1,
+      "qps": 2203.289,
+      "p99_ms": 0.749,
+      "p999_ms": 1.096,
+      "max_ms": 52.482,
+      "worker_cpu_us_per_request": 167.06382487292836,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 1098.0494327258334,
+        "worker-node-1": 1105.7890966890734
+      }
+    },
+    {
+      "run": "ttl-on-hot-large-checkpoint-4096-c1-r1",
+      "variant": "ttl-on",
+      "concurrency": 1,
+      "round": 1,
+      "qps": 2382.322,
+      "p99_ms": 0.683,
+      "p999_ms": 1.097,
+      "max_ms": 50.574,
+      "worker_cpu_us_per_request": 167.6204319553063,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 240092079.0,
+      "physical_read_iops": {
+        "worker-node-0": 1193.3352490848692,
+        "worker-node-1": 1197.8495227345536
+      }
+    },
+    {
+      "run": "ttl-on-hot-large-checkpoint-4096-c1-r2",
+      "variant": "ttl-on",
+      "concurrency": 1,
+      "round": 2,
+      "qps": 2371.844,
+      "p99_ms": 0.684,
+      "p999_ms": 1.086,
+      "max_ms": 51.16,
+      "worker_cpu_us_per_request": 167.50822178293214,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 239834145.0,
+      "physical_read_iops": {
+        "worker-node-0": 1184.164753555202,
+        "worker-node-1": 1196.9836094729503
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c1-r2",
+      "variant": "ttl-off",
+      "concurrency": 1,
+      "round": 2,
+      "qps": 2300.944,
+      "p99_ms": 0.701,
+      "p999_ms": 0.85,
+      "max_ms": 49.768,
+      "worker_cpu_us_per_request": 161.97553230912317,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 1147.7877654440501,
+        "worker-node-1": 1161.9470058130412
+      }
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c1-r2",
+      "variant": "baseline",
+      "concurrency": 1,
+      "round": 2,
+      "qps": 2168.256,
+      "p99_ms": 0.761,
+      "p999_ms": 1.217,
+      "max_ms": 50.501,
+      "worker_cpu_us_per_request": 61.09606527659074,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 1081.4968708010663,
+        "worker-node-1": 1091.3160571640876
+      }
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c512-r1",
+      "variant": "baseline",
+      "concurrency": 512,
+      "round": 1,
+      "qps": 585728.439,
+      "p99_ms": 2.47,
+      "p999_ms": 10.824,
+      "max_ms": 44.28,
+      "worker_cpu_us_per_request": 32.335136348992414,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 255523.42644257518,
+        "worker-node-1": 256636.4377410736
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c512-r1",
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 1,
+      "qps": 587558.25,
+      "p99_ms": 2.103,
+      "p999_ms": 10.412,
+      "max_ms": 402.019,
+      "worker_cpu_us_per_request": 33.38720437386706,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 250897.22449560766,
+        "worker-node-1": 252798.80385083627
+      }
+    },
+    {
+      "run": "ttl-on-hot-large-checkpoint-4096-c512-r1",
+      "variant": "ttl-on",
+      "concurrency": 512,
+      "round": 1,
+      "qps": 574177.083,
+      "p99_ms": 2.287,
+      "p999_ms": 10.638,
+      "max_ms": 33.218,
+      "worker_cpu_us_per_request": 33.810934399746564,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 487837718.0,
+      "physical_read_iops": {
+        "worker-node-0": 246483.27926430796,
+        "worker-node-1": 247896.61105730938
+      }
+    },
+    {
+      "run": "ttl-on-hot-large-checkpoint-4096-c512-r2",
+      "variant": "ttl-on",
+      "concurrency": 512,
+      "round": 2,
+      "qps": 581414.961,
+      "p99_ms": 2.294,
+      "p999_ms": 10.63,
+      "max_ms": 46.499,
+      "worker_cpu_us_per_request": 33.93791439292591,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 490274100.0,
+      "physical_read_iops": {
+        "worker-node-0": 249040.59917323163,
+        "worker-node-1": 250353.06531486358
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c512-r2",
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 2,
+      "qps": 574338.844,
+      "p99_ms": 2.313,
+      "p999_ms": 10.344,
+      "max_ms": 45.04,
+      "worker_cpu_us_per_request": 33.52030142886235,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 246378.98964222812,
+        "worker-node-1": 247453.30537579933
+      }
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c512-r2",
+      "variant": "baseline",
+      "concurrency": 512,
+      "round": 2,
+      "qps": 593636.9,
+      "p99_ms": 2.04,
+      "p999_ms": 9.744,
+      "max_ms": 52.144,
+      "worker_cpu_us_per_request": 32.448780215800916,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 253908.28087409894,
+        "worker-node-1": 255150.44956654825
+      }
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c1024-r1",
+      "variant": "baseline",
+      "concurrency": 1024,
+      "round": 1,
+      "qps": 604314.433,
+      "p99_ms": 5.46,
+      "p999_ms": 12.596,
+      "max_ms": 30107.302,
+      "worker_cpu_us_per_request": 33.57791739475441,
+      "primary": false,
+      "exclusion_reason": "connection admission saturation",
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 16.0,
+        "talon-test-worker-1": 27.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 257908.08811784672,
+        "worker-node-1": 259258.28160221069
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c1024-r1",
+      "variant": "ttl-off",
+      "concurrency": 1024,
+      "round": 1,
+      "qps": 585674.011,
+      "p99_ms": 5.92,
+      "p999_ms": 13.388,
+      "max_ms": 30008.833,
+      "worker_cpu_us_per_request": 34.722254028289974,
+      "primary": false,
+      "exclusion_reason": "connection admission saturation",
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 35.0,
+        "talon-test-worker-1": 22.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 250546.36061567464,
+        "worker-node-1": 252009.6106468921
+      }
+    },
+    {
+      "run": "ttl-on-hot-large-checkpoint-4096-c1024-r1",
+      "variant": "ttl-on",
+      "concurrency": 1024,
+      "round": 1,
+      "qps": 608915.883,
+      "p99_ms": 5.685,
+      "p999_ms": 13.044,
+      "max_ms": 30006.091,
+      "worker_cpu_us_per_request": 35.08763622513918,
+      "primary": false,
+      "exclusion_reason": "connection admission saturation",
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 26.0,
+        "talon-test-worker-1": 23.0
+      },
+      "checkpoint_bytes": 515770463.0,
+      "physical_read_iops": {
+        "worker-node-0": 259114.20390665857,
+        "worker-node-1": 260492.93654743463
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c512-r3",
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 3,
+      "qps": 575692.217,
+      "p99_ms": 2.249,
+      "p999_ms": 10.759,
+      "max_ms": 37.935,
+      "worker_cpu_us_per_request": 33.436550717122486,
+      "primary": false,
+      "exclusion_reason": "round interrupted by user; retain without merging across resume",
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 246936.58684313152,
+        "worker-node-1": 248145.3559737165
+      }
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c512-r3",
+      "variant": "baseline",
+      "concurrency": 512,
+      "round": 3,
+      "qps": 579494.089,
+      "p99_ms": 2.065,
+      "p999_ms": 9.406,
+      "max_ms": 32.482,
+      "worker_cpu_us_per_request": 32.70864989572485,
+      "primary": false,
+      "exclusion_reason": "round interrupted by user; retain without merging across resume",
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 248274.73567714813,
+        "worker-node-1": 249270.42856608928
+      }
+    },
+    {
+      "run": "ttl-off-hot-large-checkpoint-4096-c512-r4",
+      "variant": "ttl-off",
+      "concurrency": 512,
+      "round": 4,
+      "qps": 571751.367,
+      "p99_ms": 2.903,
+      "p999_ms": 11.287,
+      "max_ms": 42.014,
+      "worker_cpu_us_per_request": 33.87025243175609,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-resume-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0.0,
+      "physical_read_iops": {
+        "worker-node-0": 249587.30573693092,
+        "worker-node-1": 251225.04347711802
+      }
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c512-r4",
+      "variant": "baseline",
+      "concurrency": 512,
+      "round": 4,
+      "qps": 597827.9,
+      "p99_ms": 1.941,
+      "p999_ms": 9.73,
+      "max_ms": 28.738,
+      "worker_cpu_us_per_request": 32.38334109945232,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-resume-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 0,
+      "physical_read_iops": {
+        "worker-node-0": 255637.2740810854,
+        "worker-node-1": 256619.69456933095
+      }
+    },
+    {
+      "run": "ttl-on-hot-large-checkpoint-4096-c512-r4",
+      "variant": "ttl-on",
+      "concurrency": 512,
+      "round": 4,
+      "qps": 575934.661,
+      "p99_ms": 2.25,
+      "p999_ms": 10.335,
+      "max_ms": 32.65,
+      "worker_cpu_us_per_request": 33.59727016366295,
+      "primary": true,
+      "exclusion_reason": null,
+      "artifact_directory": "/data/yuruiz/artifacts/talon-ttl-handles-resume-20260922",
+      "admission_saturation_events": {
+        "talon-test-worker-0": 0.0,
+        "talon-test-worker-1": 0.0
+      },
+      "checkpoint_bytes": 494851426.0,
+      "physical_read_iops": {
+        "worker-node-0": 246591.6741707237,
+        "worker-node-1": 247434.31827939136
+      }
+    }
+  ],
+  "audit": {
+    "measurement_passed": true,
+    "cleanup_passed": true,
+    "passed": true,
+    "total_windows": 20,
+    "primary_windows": 15,
+    "admission_limited_windows": 3,
+    "interrupted_incomplete_pairing_windows": 2,
+    "recovered_resume_windows": 3,
+    "errors": 0,
+    "backend_fetches": 0,
+    "dropped_samples": 0,
+    "ena_allowance_deltas": 0,
+    "payload": [
+      {
+        "directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+        "status": "passed",
+        "talon_reads": 144,
+        "direct_s3_reads": 72,
+        "bytes_checked": 53673984,
+        "label": "before"
+      },
+      {
+        "directory": "/data/yuruiz/artifacts/talon-ttl-handles-bench-20260922",
+        "status": "passed",
+        "talon_reads": 144,
+        "direct_s3_reads": 72,
+        "bytes_checked": 53673984,
+        "label": "after"
+      },
+      {
+        "directory": "/data/yuruiz/artifacts/talon-ttl-handles-resume-20260922",
+        "status": "passed",
+        "talon_reads": 144,
+        "direct_s3_reads": 72,
+        "bytes_checked": 53673984,
+        "label": "before"
+      },
+      {
+        "directory": "/data/yuruiz/artifacts/talon-ttl-handles-resume-20260922",
+        "status": "passed",
+        "talon_reads": 144,
+        "direct_s3_reads": 72,
+        "bytes_checked": 53673984,
+        "label": "after"
+      }
+    ],
+    "checked_at": 1790051050.6724718,
+    "note": "Audit checks measurement integrity and resource cleanup, not absence of performance regression."
+  },
+  "acceptance": "No universal no-regression claim. See paired results and per-request CPU; any reproducible decline counts."
+}

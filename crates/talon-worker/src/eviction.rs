@@ -74,9 +74,17 @@ impl AccessHandle {
     }
 }
 
+/// A policy snapshot invalidated by a later touch, selection, or admission.
+#[derive(Clone, Debug)]
+pub(crate) struct EvictionCandidate {
+    pub unit: CacheUnit,
+    revision: u64,
+}
+
 struct Entry {
     bytes: u64,
     position: u64,
+    revision: u64,
     access: AccessHandle,
     pins: u32,
 }
@@ -86,6 +94,17 @@ struct Entry {
 pub struct Lru {
     inner: Mutex<Inner>,
     eviction: Mutex<()>,
+}
+
+/// A cancellation-safe capacity-policy pin.
+pub struct LruPin {
+    lru: Arc<Lru>,
+    unit: CacheUnit,
+}
+impl Drop for LruPin {
+    fn drop(&mut self) {
+        self.lru.unpin(&self.unit);
+    }
 }
 
 struct Inner {
@@ -99,6 +118,33 @@ struct Inner {
 }
 
 impl Inner {
+    /// Move a resident unit to the back of the second-chance queue.
+    fn rotate(&mut self, unit: &CacheUnit) -> u64 {
+        let entry = self.entries.get_mut(unit).expect("tracked cache unit");
+        let queued = self
+            .queue
+            .remove(&entry.position)
+            .expect("queued cache unit");
+        let position = self.clock;
+        self.clock = self
+            .clock
+            .checked_add(1)
+            .expect("eviction sequence exhausted");
+        entry.position = position;
+        self.queue.insert(position, queued);
+        position
+    }
+
+    fn snapshot(&mut self, unit: CacheUnit) -> EvictionCandidate {
+        self.entries[&unit].access.0.store(false, Ordering::Relaxed);
+        let revision = self.rotate(&unit);
+        self.entries
+            .get_mut(&unit)
+            .expect("tracked cache unit")
+            .revision = revision;
+        EvictionCandidate { unit, revision }
+    }
+
     /// All removal paths must update both maps under the same lock.
     fn remove(&mut self, unit: &CacheUnit) -> Option<u64> {
         let entry = self.entries.remove(unit)?;
@@ -199,6 +245,7 @@ impl Lru {
             Entry {
                 bytes,
                 position,
+                revision: position,
                 access: access.clone(),
                 pins: 0,
             },
@@ -228,6 +275,13 @@ impl Lru {
         }
     }
 
+    pub fn pin_guard(self: &Arc<Self>, unit: CacheUnit) -> Option<LruPin> {
+        self.pin(&unit).then(|| LruPin {
+            lru: self.clone(),
+            unit,
+        })
+    }
+
     /// Release one pin previously taken with [`pin`](Self::pin).
     pub fn unpin(&self, unit: &CacheUnit) {
         let mut g = self.inner.lock().unwrap();
@@ -239,6 +293,130 @@ impl Lru {
     /// Remove a unit outright (e.g. explicit delete), returning its byte cost.
     pub fn remove(&self, unit: &CacheUnit) -> Option<u64> {
         self.inner.lock().unwrap().remove(unit)
+    }
+
+    /// Snapshot candidates without charging freed bytes before unlink succeeds.
+    pub(crate) fn candidates_to_fit(
+        &self,
+        capacity: u64,
+        excluded: &HashSet<CacheUnit>,
+    ) -> Vec<EvictionCandidate> {
+        if self.total_bytes() <= capacity {
+            return Vec::new();
+        }
+        let _eviction = self.eviction.lock().unwrap();
+        let count = self.len();
+        let mut selected = HashSet::new();
+        let mut selected_bytes = 0_u64;
+        let mut out = Vec::new();
+        // Keep the upstream bounded second-chance walk and short lock batches.
+        // Candidates remain resident and charged until unlink succeeds.
+        for second_pass in [false, true] {
+            let mut remaining = count;
+            while remaining > 0 {
+                let mut g = self.inner.lock().unwrap();
+                let batch = remaining.min(64);
+                for _ in 0..batch {
+                    if g.total_bytes.saturating_sub(selected_bytes) <= capacity {
+                        return out;
+                    }
+                    let Some((_, unit)) = g.queue.first_key_value() else {
+                        return out;
+                    };
+                    let unit = unit.clone();
+                    let entry = &g.entries[unit.as_ref()];
+                    // Do not consume recency for an already selected unit:
+                    // a touch after its snapshot must still invalidate it.
+                    let eligible = entry.pins == 0
+                        && !selected.contains(unit.as_ref())
+                        && !excluded.contains(unit.as_ref());
+                    let referenced = eligible && entry.access.0.swap(false, Ordering::Relaxed);
+                    let victim = eligible && (second_pass || !referenced);
+                    let bytes = entry.bytes;
+                    let revision = g.rotate(&unit);
+                    if eligible {
+                        // Consuming recency must invalidate any older snapshot,
+                        // even when this walk grants the unit another chance.
+                        g.entries
+                            .get_mut(unit.as_ref())
+                            .expect("queued entry")
+                            .revision = revision;
+                    }
+                    if victim {
+                        selected_bytes = selected_bytes.saturating_add(bytes);
+                        selected.insert((*unit).clone());
+                        out.push(EvictionCandidate {
+                            unit: (*unit).clone(),
+                            revision,
+                        });
+                    }
+                }
+                remaining -= batch;
+            }
+        }
+        out
+    }
+
+    /// Old-version candidates; removal is committed by the caller after I/O.
+    pub(crate) fn superseded_candidates(&self, keep: &BlockId) -> Vec<EvictionCandidate> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(versions) = g.versions.get(&LogicalBlock::from(keep)) else {
+            return Vec::new();
+        };
+        let units: Vec<_> = versions
+            .iter()
+            .filter(|(version, _)| *version != &keep.version)
+            .flat_map(|(version, units)| {
+                units.iter().map(move |page| {
+                    let block = BlockId::new(
+                        keep.object.clone(),
+                        keep.offset,
+                        keep.block_size,
+                        version.clone(),
+                    );
+                    match page {
+                        None => CacheUnit::Whole(block),
+                        Some(page) => CacheUnit::Page(block, *page),
+                    }
+                })
+            })
+            .filter(|unit| g.entries[unit].pins == 0)
+            .collect();
+        units.into_iter().map(|unit| g.snapshot(unit)).collect()
+    }
+
+    /// Snapshot resident units for an explicit block invalidation.
+    pub(crate) fn block_candidates(&self, block: &BlockId) -> Vec<EvictionCandidate> {
+        let mut g = self.inner.lock().unwrap();
+        let Some(units) = g
+            .versions
+            .get(&LogicalBlock::from(block))
+            .and_then(|versions| versions.get(&block.version))
+        else {
+            return Vec::new();
+        };
+        let units: Vec<_> = units
+            .iter()
+            .map(|page| match page {
+                None => CacheUnit::Whole(block.clone()),
+                Some(page) => CacheUnit::Page(block.clone(), *page),
+            })
+            .collect();
+        units.into_iter().map(|unit| g.snapshot(unit)).collect()
+    }
+
+    /// Recheck with the block mutation gate held. Commits also pin under that gate.
+    pub(crate) fn candidate_is_current(&self, candidate: &EvictionCandidate) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .entries
+            .get(&candidate.unit)
+            .is_some_and(|entry| {
+                entry.pins == 0
+                    && entry.revision == candidate.revision
+                    && !entry.access.0.load(Ordering::Relaxed)
+            })
     }
 
     /// Evict and return every *superseded* unit — whole block or page — for the
@@ -326,10 +504,9 @@ impl Lru {
                         g.queue.remove(&position);
                         let next = g.clock;
                         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
-                        g.entries
-                            .get_mut(unit.as_ref())
-                            .expect("queued entry")
-                            .position = next;
+                        let entry = g.entries.get_mut(unit.as_ref()).expect("queued entry");
+                        entry.position = next;
+                        entry.revision = next;
                         g.queue.insert(next, unit);
                     }
                 }
@@ -362,6 +539,89 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn deferred_candidates_keep_accounting_and_skip_protected_units() {
+        let lru = Lru::new();
+        let hot = lru.insert(whole(1), 10);
+        lru.insert(whole(2), 10);
+        lru.insert(whole(3), 10);
+        lru.insert(whole(4), 10);
+        hot.touch();
+        lru.pin(&whole(3));
+        let candidates = lru.candidates_to_fit(20, &HashSet::from([whole(4)]));
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|c| c.unit.clone())
+                .collect::<Vec<_>>(),
+            vec![whole(2), whole(1)]
+        );
+        assert_eq!(lru.total_bytes(), 40);
+        for candidate in candidates {
+            assert!(lru.candidate_is_current(&candidate));
+            lru.remove(&candidate.unit);
+        }
+        assert_eq!(lru.total_bytes(), 20);
+    }
+
+    #[test]
+    fn deferred_candidates_survive_a_full_walk_past_pinned_units() {
+        let lru = Lru::new();
+        lru.insert(whole(1), 10);
+        lru.insert(whole(2), 10);
+        lru.pin(&whole(2));
+        let candidates = lru.candidates_to_fit(0, &HashSet::new());
+        assert_eq!(candidates.len(), 1);
+        assert!(lru.candidate_is_current(&candidates[0]));
+        assert_eq!(lru.total_bytes(), 20);
+    }
+
+    #[test]
+    fn stable_handle_touch_invalidates_a_deferred_candidate_after_later_walks() {
+        let lru = Lru::new();
+        let handle = lru.insert(whole(1), 10);
+        let candidate = lru.candidates_to_fit(0, &HashSet::new()).pop().unwrap();
+        assert!(lru.candidate_is_current(&candidate));
+        handle.touch();
+        assert!(!lru.candidate_is_current(&candidate));
+        // A second selection clears recency, but must not revive the old snapshot.
+        let replacement = lru.candidates_to_fit(0, &HashSet::new()).pop().unwrap();
+        assert!(!lru.candidate_is_current(&candidate));
+        assert!(lru.candidate_is_current(&replacement));
+        lru.remove(&whole(1));
+        lru.insert(whole(1), 10);
+        assert!(!lru.candidate_is_current(&replacement));
+    }
+
+    #[test]
+    fn version_candidates_use_live_index_without_charging_before_unlink() {
+        let lru = Lru::new();
+        let old = blk(1);
+        let mut keep = old.clone();
+        keep.version = Version::new("v2");
+        let page = CacheUnit::Page(old.clone(), PageIndex(0));
+        let pinned = CacheUnit::Page(old.clone(), PageIndex(1));
+        let current = CacheUnit::Page(keep.clone(), PageIndex(0));
+        let access = lru.insert(page.clone(), 10);
+        lru.insert(pinned.clone(), 10);
+        lru.insert(current, 10);
+        lru.insert(whole(2), 10);
+        lru.pin(&pinned);
+        let candidates = lru.superseded_candidates(&keep);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].unit, page);
+        assert!(lru.candidate_is_current(&candidates[0]));
+        assert_eq!(lru.total_bytes(), 40);
+        access.touch();
+        assert!(!lru.candidate_is_current(&candidates[0]));
+        let refreshed = lru.block_candidates(&old);
+        assert_eq!(refreshed.len(), 2);
+        assert!(!lru.candidate_is_current(&candidates[0]));
+        for candidate in refreshed {
+            assert_eq!(lru.candidate_is_current(&candidate), candidate.unit == page);
+        }
     }
 
     #[test]

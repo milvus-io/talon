@@ -1,0 +1,236 @@
+{
+  "baseline": "6d18bf2cc82a9146b3958b00289d656cc5d8132d",
+  "pre_repair": "d0eb9ee00370e588cfb4004e5dcafbe9af9c2aba",
+  "candidate_sha256": "b7bf1277d855342c313425a25dbfbea963c5cfe3f364a711d036ef945ad52a74",
+  "source_state": "uncommitted repair; Rust hashes match tested snapshot",
+  "performance_acceptance": "not met: repeated main-vs-PR P99 regression",
+  "scope": "4 KiB random reads from the same 1 TiB real-S3 paged L2; L1 disabled; two Workers; TTL 0 versus 24h; checkpoint 60s",
+  "kernel": "6.12.100-125.179.amzn2023.aarch64",
+  "ordering": "forward then reverse; c512 180s, c1 90s, both 10s warmup",
+  "cache_control": "c1 rounds81/82 use scoped POSIX_FADV_DONTNEED before each variant; initial c1 r71 off invalid due zero physical reads and excluded",
+  "raw_artifacts": "/data/yuruiz/artifacts/talon-ttl-fix-20260921",
+  "payload_validation": {
+    "talon_reads": 144,
+    "direct_s3_ranges": 72,
+    "bytes_checked": 53673984,
+    "sha256_matches": 144
+  },
+  "results": [
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c512-r71",
+      "variant": "baseline",
+      "concurrency": 512,
+      "round": 71,
+      "valid": true,
+      "qps": 556200.394,
+      "p99_ms": 3.362,
+      "physical_write_mib_s": 0.08932007187256097,
+      "physical_read_mib_s": [
+        1021.5846990560776,
+        1024.6774525334586
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        null,
+        null
+      ]
+    },
+    {
+      "run": "ttl-off-fused-hot-large-checkpoint-4096-c512-r71",
+      "variant": "ttl-off-fused",
+      "concurrency": 512,
+      "round": 71,
+      "valid": true,
+      "qps": 551810.167,
+      "p99_ms": 3.823,
+      "physical_write_mib_s": 0.09960774386827707,
+      "physical_read_mib_s": [
+        1018.3628103574498,
+        1020.1411405689552
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "run": "ttl-on-fused-hot-large-checkpoint-4096-c512-r71",
+      "variant": "ttl-on-fused",
+      "concurrency": 512,
+      "round": 71,
+      "valid": true,
+      "qps": 554385.75,
+      "p99_ms": 3.852,
+      "physical_write_mib_s": 3.161889913364763,
+      "physical_read_mib_s": [
+        1025.3152560253452,
+        1030.464681755549
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        59.753,
+        59.756
+      ]
+    },
+    {
+      "run": "ttl-on-fused-hot-large-checkpoint-4096-c512-r72",
+      "variant": "ttl-on-fused",
+      "concurrency": 512,
+      "round": 72,
+      "valid": true,
+      "qps": 544264.861,
+      "p99_ms": 3.882,
+      "physical_write_mib_s": 3.3224866704780167,
+      "physical_read_mib_s": [
+        1002.9368658981014,
+        1008.6605803386693
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        59.744,
+        59.765
+      ]
+    },
+    {
+      "run": "ttl-off-fused-hot-large-checkpoint-4096-c512-r72",
+      "variant": "ttl-off-fused",
+      "concurrency": 512,
+      "round": 72,
+      "valid": true,
+      "qps": 551342.083,
+      "p99_ms": 3.992,
+      "physical_write_mib_s": 0.13899700861966127,
+      "physical_read_mib_s": [
+        1019.8784164074825,
+        1018.246511369429
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c512-r72",
+      "variant": "baseline",
+      "concurrency": 512,
+      "round": 72,
+      "valid": true,
+      "qps": 556346.461,
+      "p99_ms": 3.455,
+      "physical_write_mib_s": 0.10837659893230861,
+      "physical_read_mib_s": [
+        1031.7819298842821,
+        1028.23047556474
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        null,
+        null
+      ]
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c1-r81",
+      "variant": "baseline",
+      "concurrency": 1,
+      "round": 81,
+      "valid": true,
+      "qps": 2254.289,
+      "p99_ms": 0.702,
+      "physical_write_mib_s": 0.11919694682121296,
+      "physical_read_mib_s": [
+        4.602131667151843,
+        4.607717390655735
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        null,
+        null
+      ]
+    },
+    {
+      "run": "ttl-off-fused-hot-large-checkpoint-4096-c1-r81",
+      "variant": "ttl-off-fused",
+      "concurrency": 1,
+      "round": 81,
+      "valid": true,
+      "qps": 1873.511,
+      "p99_ms": 0.861,
+      "physical_write_mib_s": 0.23096092161302317,
+      "physical_read_mib_s": [
+        3.804686319330963,
+        3.883391125575222
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "run": "ttl-on-fused-hot-large-checkpoint-4096-c1-r81",
+      "variant": "ttl-on-fused",
+      "concurrency": 1,
+      "round": 81,
+      "valid": true,
+      "qps": 2139.244,
+      "p99_ms": 0.736,
+      "physical_write_mib_s": 2.720826193945972,
+      "physical_read_mib_s": [
+        4.388825870438359,
+        4.393562385744311
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        59.69,
+        59.451
+      ]
+    },
+    {
+      "run": "ttl-on-fused-hot-large-checkpoint-4096-c1-r82",
+      "variant": "ttl-on-fused",
+      "concurrency": 1,
+      "round": 82,
+      "valid": true,
+      "qps": 2006.756,
+      "p99_ms": 0.792,
+      "physical_write_mib_s": 2.7589011402218353,
+      "physical_read_mib_s": [
+        4.0636623645011225,
+        4.126131163456983
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        59.666,
+        59.728
+      ]
+    },
+    {
+      "run": "ttl-off-fused-hot-large-checkpoint-4096-c1-r82",
+      "variant": "ttl-off-fused",
+      "concurrency": 1,
+      "round": 82,
+      "valid": true,
+      "qps": 2043.467,
+      "p99_ms": 0.801,
+      "physical_write_mib_s": 0.11523836465684219,
+      "physical_read_mib_s": [
+        4.12912243915858,
+        4.1902855085893345
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        0.0,
+        0.0
+      ]
+    },
+    {
+      "run": "baseline-hot-large-checkpoint-4096-c1-r82",
+      "variant": "baseline",
+      "concurrency": 1,
+      "round": 82,
+      "valid": true,
+      "qps": 2059.811,
+      "p99_ms": 0.775,
+      "physical_write_mib_s": 0.13448516624172818,
+      "physical_read_mib_s": [
+        4.168837196222725,
+        4.238219312375762
+      ],
+      "maximum_reported_dirty_age_seconds": [
+        null,
+        null
+      ]
+    }
+  ]
+}
