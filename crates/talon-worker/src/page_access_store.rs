@@ -192,7 +192,7 @@ impl PageAccessStore {
     }
 }
 
-/// Held for the entire worker lifetime, even when TTL is disabled.
+/// Held for the entire worker lifetime, even when TTI is disabled.
 pub struct CacheRootLock {
     _file: File,
 }

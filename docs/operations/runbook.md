@@ -313,14 +313,14 @@ can recover older access times and cause early eviction and extra origin reads.
 ### page-gc-scan-lag
 
 **Alert:** `TalonPageGcScanLag` (warning) — the latest complete page GC scan
-takes more than 10% of the configured TTL for >2m.
+takes more than 10% of the configured TTI for >2m.
 
 1. Compare `talon_worker_page_gc_scan_seconds` with page count, batch latency,
    disk latency, and deletion errors.
 2. Review `page_gc_interval_ms`, `page_gc_scan_batch_size`,
    `page_gc_delete_batch_size`, and `page_gc_io_concurrency`. Tune budgets against
    foreground request latency and available I/O capacity.
-3. Confirm subsequent scans complete faster. TTL determines eviction eligibility;
+3. Confirm subsequent scans complete faster. TTI determines eviction eligibility;
    it does not promise physical space release at a fixed deadline.
 
 ### page-gc-delete-failures
@@ -338,7 +338,7 @@ or the observed retry count increases for >5m.
 ### page-cleanup-failures
 
 **Alert:** `TalonPageCleanupFailures` (warning) — disk cleanup errors recur or
-the latest completed scan reports unresolved paths for >5m, even with TTL off.
+the latest completed scan reports unresolved paths for >5m, even with TTI off.
 
 1. Inspect paths in cleanup warnings and check cache-root permissions, mount
    state, and filesystem health.
@@ -361,10 +361,10 @@ and this condition persists for >5m.
    cache root can require many background batches; compare its measured full
    scan time with the alert threshold before increasing that threshold.
 3. Verify `talon_worker_page_cleanup_scan_timestamp_seconds` advances. Cleanup
-   runs even when TTL or paged reads are disabled, so disabling TTL alone does
+   runs even when TTI or paged reads are disabled, so disabling TTI alone does
    not explain a stalled disk scan.
 
-See [page TTL](../explanation/page-ttl.md) for checkpoint recovery, cleanup
+See [page TTI](../explanation/page-tti.md) for checkpoint recovery, cleanup
 ownership and performance limits.
 
 ---

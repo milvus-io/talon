@@ -1727,7 +1727,7 @@ mod tests {
                 Arc::try_unwrap(worker)
                     .unwrap_or_else(|_| panic!("sole owner"))
                     .with_page_gc(crate::page_gc::PageGcConfig {
-                        ttl_ms: 1,
+                        tti_ms: 1,
                         checkpoint_interval_ms: 1,
                         ..Default::default()
                     })

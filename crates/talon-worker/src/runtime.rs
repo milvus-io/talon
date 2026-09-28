@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 mod page_maintenance;
 #[cfg(test)]
-mod page_ttl_tests;
+mod page_tti_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
 
@@ -1010,10 +1010,10 @@ impl WorkerRuntime {
         Ok(out.freeze())
     }
 
-    /// TTL-disabled hits need only read/delete arbitration, not timestamps or
+    /// TTI-disabled hits need only read/delete arbitration, not timestamps or
     /// checkpoint dirtiness. Configuration is immutable while serving.
     fn page_access_time(&self) -> Option<u64> {
-        (self.page_gc_config.ttl_ms > 0).then(|| self.page_clock.now())
+        (self.page_gc_config.tti_ms > 0).then(|| self.page_clock.now())
     }
 
     /// Return a page from L1 or the on-disk page file, promoting L2 hits to L1.

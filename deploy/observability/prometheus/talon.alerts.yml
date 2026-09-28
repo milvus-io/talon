@@ -188,14 +188,14 @@ groups:
           description: "Access records remain unsaved beyond three checkpoint periods; restart can cause early eviction and origin traffic. Check disk space, permissions and I/O latency."
           runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-access-checkpoint-lag"
       - alert: TalonPageGcScanLag
-        expr: (talon_worker_page_gc_scan_seconds > 0.1 * talon_worker_page_ttl_seconds) and (talon_worker_page_ttl_seconds > 0)
+        expr: (talon_worker_page_gc_scan_seconds > 0.1 * talon_worker_page_tti_seconds) and (talon_worker_page_tti_seconds > 0)
         for: 2m
         labels:
           severity: warning
           component: worker
         annotations:
           summary: "Page GC scan is slow on {{ $labels.instance }}"
-          description: "A complete scan exceeds 10% of TTL. Check GC budgets and disk latency; TTL is not a physical space release deadline."
+          description: "A complete scan exceeds 10% of TTI. Check GC budgets and disk latency; TTI is not a physical space release deadline."
           runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-gc-scan-lag"
       - alert: TalonPageGcDeleteFailures
         expr: rate(talon_worker_page_gc_delete_errors_total[5m]) > 0 or delta(talon_worker_page_gc_pending_retries[5m]) > 0
@@ -215,7 +215,7 @@ groups:
           component: worker
         annotations:
           summary: "Page metadata leftovers persist on {{ $labels.instance }}"
-          description: "Disk cleanup repeatedly fails or has unresolved paths. Inspect the logged paths, directory permissions and filesystem errors; retries continue even with page TTL disabled."
+          description: "Disk cleanup repeatedly fails or has unresolved paths. Inspect the logged paths, directory permissions and filesystem errors; retries continue even with page TTI disabled."
           runbook_url: "https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-cleanup-failures"
       - alert: TalonPageCleanupScanStalled
         expr: |

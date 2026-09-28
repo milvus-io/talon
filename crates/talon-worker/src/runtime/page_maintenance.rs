@@ -20,7 +20,7 @@ impl WorkerRuntime {
             "page GC concurrency exceeds semaphore capacity"
         );
         for millis in [
-            config.ttl_ms,
+            config.tti_ms,
             config.interval_ms,
             config.checkpoint_interval_ms,
         ] {
@@ -31,14 +31,14 @@ impl WorkerRuntime {
                 "page GC duration overflows clock"
             );
         }
-        if config.ttl_ms > 0 {
+        if config.tti_ms > 0 {
             let paged = self
                 .paged
                 .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("page TTL requires paged L2"))?;
+                .ok_or_else(|| anyhow::anyhow!("page TTI requires paged L2"))?;
             anyhow::ensure!(
-                config.checkpoint_interval_ms <= config.ttl_ms,
-                "checkpoint interval exceeds TTL"
+                config.checkpoint_interval_ms <= config.tti_ms,
+                "checkpoint interval exceeds TTI"
             );
             let now = self.page_clock.now();
             // Load each shard once; keep only one shard's recovered metadata in memory.
@@ -91,8 +91,8 @@ impl WorkerRuntime {
             }
         }
         self.page_gc_metrics
-            .ttl_seconds
-            .set(config.ttl_ms as f64 / 1000.0);
+            .tti_seconds
+            .set(config.tti_ms as f64 / 1000.0);
         self.page_gc_metrics
             .checkpoint_interval
             .set(config.checkpoint_interval_ms as f64 / 1000.0);
@@ -105,7 +105,7 @@ impl WorkerRuntime {
         self.page_mutations.drain().await;
     }
 
-    /// Run one disk cleanup batch, including when page TTL or paged reads are disabled.
+    /// Run one disk cleanup batch, including when page TTI or paged reads are disabled.
     pub async fn cleanup_page_files_once(&self) -> crate::page_gc::CleanupReport {
         let runtime = self.clone();
         let permit = self
@@ -170,7 +170,7 @@ impl WorkerRuntime {
         }
     }
 
-    /// Run at most one bounded TTL batch; independent of capacity and control-plane health.
+    /// Run at most one bounded TTI batch; independent of capacity and control-plane health.
     pub async fn gc_once(&self) -> GcReport {
         let Ok(mut scan) = self.page_scan.try_lock() else {
             return GcReport::default();
@@ -180,10 +180,10 @@ impl WorkerRuntime {
         let lifecycle = self.page_lifecycle.clone();
         let limit = self.page_gc_config.scan_batch_size;
         let delete_limit = self.page_gc_config.delete_batch_size;
-        let ttl = (self.page_gc_config.ttl_ms > 0).then_some(self.page_gc_config.ttl_ms);
+        let tti = (self.page_gc_config.tti_ms > 0).then_some(self.page_gc_config.tti_ms);
         let now = self.page_clock.now();
         let (cursor, candidates, stats) = tokio::task::spawn_blocking(move || {
-            let (candidates, stats) = lifecycle.scan(&mut cursor, limit, now, ttl, delete_limit);
+            let (candidates, stats) = lifecycle.scan(&mut cursor, limit, now, tti, delete_limit);
             (cursor, candidates, stats)
         })
         .await
@@ -238,8 +238,8 @@ impl WorkerRuntime {
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= runtime.capacity_bytes) { return None; }
-            let ttl = (reason == 0).then_some(runtime.page_gc_config.ttl_ms);
-            if !block.claim(&candidate, runtime.page_clock.now(), ttl) {return None;}
+            let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
+            if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
             let page = candidate.page;
             let id = &block.id;
@@ -298,7 +298,7 @@ impl WorkerRuntime {
             .await;
     }
 
-    /// Capacity and superseded page eviction share the same commit protocol as TTL.
+    /// Capacity and superseded page eviction share the same commit protocol as TTI.
     pub(super) async fn unlink_units(
         &self,
         units: Vec<crate::eviction::EvictionCandidate>,
@@ -380,7 +380,7 @@ impl WorkerRuntime {
     }
 
     async fn checkpoint_shards(&self, all: bool) -> CheckpointReport {
-        if self.page_gc_config.ttl_ms == 0 {
+        if self.page_gc_config.tti_ms == 0 {
             return CheckpointReport::default();
         }
         let Ok(mut cursor) = self.page_checkpoint.clone().try_lock_owned() else {
@@ -418,7 +418,7 @@ impl WorkerRuntime {
     }
 
     fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
-        let paged = self.paged.as_ref().expect("paged TTL");
+        let paged = self.paged.as_ref().expect("paged TTI");
         let gate = self.page_lifecycle.checkpoint_gate(shard);
         let _guard = gate.lock().unwrap();
         let (ceiling, membership, mut dirty) = self.page_lifecycle.checkpoint_start(shard);

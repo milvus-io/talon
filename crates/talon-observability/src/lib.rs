@@ -117,7 +117,7 @@ mod tests {
         "talon_worker_capacity_bytes",
         "talon_worker_resident_bytes",
         "talon_worker_ready",
-        // worker page TTL, checkpoints and disk cleanup (#580)
+        // worker page TTI, checkpoints and disk cleanup (#580)
         "talon_worker_page_access_checkpoint_interval_seconds",
         "talon_worker_page_access_checkpoint_timestamp_seconds",
         "talon_worker_page_access_dirty_blocks",
@@ -128,7 +128,7 @@ mod tests {
         "talon_worker_page_gc_delete_errors_total",
         "talon_worker_page_gc_pending_retries",
         "talon_worker_page_gc_scan_seconds",
-        "talon_worker_page_ttl_seconds",
+        "talon_worker_page_tti_seconds",
         "talon_worker_process_uptime_seconds",
         // coordinator (#77)
         "talon_coordinator_control_requests_total",

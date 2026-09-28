@@ -11,7 +11,7 @@ use tokio::sync::Notify;
 
 #[derive(Clone, Debug)]
 pub struct PageGcConfig {
-    pub ttl_ms: u64,
+    pub tti_ms: u64,
     pub checkpoint_interval_ms: u64,
     pub interval_ms: u64,
     pub scan_batch_size: usize,
@@ -21,7 +21,7 @@ pub struct PageGcConfig {
 impl From<&WorkerConfig> for PageGcConfig {
     fn from(c: &WorkerConfig) -> Self {
         Self {
-            ttl_ms: c.page_ttl_ms,
+            tti_ms: c.page_tti_ms,
             checkpoint_interval_ms: c.page_access_checkpoint_interval_ms,
             interval_ms: c.page_gc_interval_ms,
             scan_batch_size: c.page_gc_scan_batch_size,
@@ -124,7 +124,7 @@ pub(crate) struct PageGcMetrics {
     pub missing: Counter,
     pub corrupt: Counter,
     pub future: Counter,
-    pub ttl_seconds: Gauge,
+    pub tti_seconds: Gauge,
     pub checkpoint_interval: Gauge,
     pub cleanup_scanned: Counter,
     pub cleanup_removed: Counter,
@@ -145,8 +145,8 @@ impl PageGcMetrics {
             cleanup_scan_seconds: g("talon_worker_page_cleanup_scan_seconds", "Latest complete disk cleanup scan duration."),
             cleanup_scan_at: g("talon_worker_page_cleanup_scan_timestamp_seconds", "Last completed disk cleanup scan Unix timestamp."),
             scanned: c("talon_worker_page_gc_scanned_total", "Pages examined by idle GC."),
-            deleted: ["ttl", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_total", "Pages successfully unlinked by reason.", talon_core::metrics::labels(&[("reason", reason)]))),
-            bytes: ["ttl", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_bytes_total", "Logical bytes successfully unlinked by reason; open descriptors may delay physical release.", talon_core::metrics::labels(&[("reason", reason)]))),
+            deleted: ["tti", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_total", "Pages successfully unlinked by reason.", talon_core::metrics::labels(&[("reason", reason)]))),
+            bytes: ["tti", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_bytes_total", "Logical bytes successfully unlinked by reason; open descriptors may delay physical release.", talon_core::metrics::labels(&[("reason", reason)]))),
             delete_errors: c("talon_worker_page_gc_delete_errors_total", "Failed page unlink attempts."),
             retries: g("talon_worker_page_gc_pending_retries", "Retry pages observed in the latest complete scan."),
             batch_duration: r.histogram("talon_worker_page_gc_batch_seconds", "Idle GC batch duration.", Default::default()),
@@ -159,7 +159,7 @@ impl PageGcMetrics {
             missing: c("talon_worker_page_access_recovery_missing_total", "Recovered pages without a valid access record."),
             corrupt: c("talon_worker_page_access_recovery_corrupt_total", "Pages in corrupt access checkpoints."),
             future: c("talon_worker_page_access_recovery_future_total", "Future access records rejected on recovery."),
-            ttl_seconds: g("talon_worker_page_ttl_seconds", "Configured page idle lifetime; zero disables GC."),
+            tti_seconds: g("talon_worker_page_tti_seconds", "Configured page time to idle; zero disables idle expiration."),
             checkpoint_interval: g("talon_worker_page_access_checkpoint_interval_seconds", "Configured access checkpoint period."),
         }
     }
@@ -175,10 +175,10 @@ impl PageGcService {
     pub fn start(worker: Arc<WorkerRuntime>, config: PageGcConfig) -> Self {
         let (stop, _) = tokio::sync::watch::channel(false);
         let mut tasks = Vec::new();
-        // Disk leftovers must be reclaimed even after TTL is disabled. Keep
+        // Disk leftovers must be reclaimed even after TTI is disabled. Keep
         // the loops independent so a long checkpoint cannot starve cleanup.
         for maintenance in 0..3 {
-            if maintenance == 1 && config.ttl_ms == 0 {
+            if maintenance == 1 && config.tti_ms == 0 {
                 continue;
             }
             let worker = worker.clone();
