@@ -1,0 +1,30 @@
+# Adapt the node and disk path, and create one PV per Worker slot. These paths
+# belong to the Kubernetes node, not the machine running kubectl.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: talon-local
+provisioner: kubernetes.io/no-provisioner
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Retain
+---
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: talon-cache-node-a
+spec:
+  capacity:
+    storage: 20Gi
+  volumeMode: Filesystem
+  accessModes: [ReadWriteOnce]
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: talon-local
+  local:
+    path: /mnt/talon-cache/slot-a
+  nodeAffinity:
+    required:
+      nodeSelectorTerms:
+        - matchExpressions:
+            - key: kubernetes.io/hostname
+              operator: In
+              values: [node-a]

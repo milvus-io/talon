@@ -276,3 +276,25 @@ just gen-conformance-vectors
 If that produces a diff, the wire format changed. Bump
 `CONTROL_SCHEMA_VERSION` when the change is not backward compatible, update the
 other clients, and commit the regenerated vectors in the same change.
+
+## Persistent membership and typed failures (schema 6)
+
+The single supported control schema uses `MembershipQuery` (tag 4) and
+`MembershipList` (tag 5) for topology, instance availability and freshness.
+`NodeStatusHeartbeat` (tag 7) reports the process and `NodeStatusAck` (tag 17)
+returns acceptance and serving permission. There is no capability negotiation
+or membership-mode field. Incompatible schemas are rejected explicitly.
+
+A discovered worker contains `WorkerMember` (`worker_id: String`,
+`zone: Option<String>`, `retired: bool`) followed by `InstanceState`: Offline=0,
+Conflict=1, Serving=2. Serving carries `instance_id: String`, then
+`address: String`. The view contains `topology_token`, `state_token`,
+`valid_for_ms` and the workers. Tokens are opaque equality values; address and
+lease changes do not change logical ownership. Client instance freshness is
+bounded by `valid_for_ms` and 500 ms. Failed data reads are not resent; later
+requests may refresh and recover.
+
+`ControlFailure` (tag 18) carries the existing `DataErrorCode` discriminant and
+`message: String`. Coordinators and Workers use it for typed discovery and
+metadata failures. Only availability and timeout permit caller-selected origin
+fallback. Conformance vectors cover membership and metadata failure messages.

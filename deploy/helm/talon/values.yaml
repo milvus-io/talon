@@ -25,6 +25,7 @@ coordinator:
   clusterId: talon
   # -- Coordinator replica count. Forced to 1 for the memory backend (no HA).
   replicas: 3
+  minReadySeconds: 15
   resources:
     requests:
       cpu: 100m
@@ -56,6 +57,10 @@ worker:
   # -- Deploy cache workers alongside the coordinator.
   enabled: true
   replicas: 3
+  minReadySeconds: 15
+  rollingUpdate:
+    # Set replicas-1 for a one-Pod canary, then lower one ordinal at a time.
+    partition: 0
   # -- Scheduler behavior when workers cannot be evenly spread across nodes.
   topologySpreadWhenUnsatisfiable: ScheduleAnyway
   # -- Cache block size in bytes. Capacity must be at least one block.
@@ -72,9 +77,10 @@ worker:
     existingSecret: talon-worker-backend
     azureAccountKey: azure-account
     azureSasKey: azure-sas
-  # -- Cache volume. When persistence is disabled an emptyDir is used.
+  # -- Retained PVC per StatefulSet ordinal. Disabling is for disposable
+  # development only and cannot retain identity/cache during replacement.
   persistence:
-    enabled: false
+    enabled: true
     size: 20Gi
     storageClass: ""
   resources:

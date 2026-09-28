@@ -8,7 +8,7 @@ metadata:
     app.kubernetes.io/component: worker
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: {{ .Release.Name }}-worker
   labels:
@@ -16,15 +16,20 @@ metadata:
     app.kubernetes.io/component: worker
 spec:
   replicas: {{ .Values.worker.replicas }}
+  serviceName: {{ .Release.Name }}-worker
+  podManagementPolicy: OrderedReady
+  minReadySeconds: {{ .Values.worker.minReadySeconds }}
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   revisionHistoryLimit: 5
   selector:
     matchLabels:
       {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 6 }}
-  strategy:
+  updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 1
+      partition: {{ .Values.worker.rollingUpdate.partition }}
   template:
     metadata:
       labels:
@@ -36,7 +41,7 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ .Release.Name }}-worker
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -51,22 +56,11 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 14 }}
+      {{- if not .Values.worker.persistence.enabled }}
       volumes:
         - name: cache
-        {{- if .Values.worker.persistence.enabled }}
-          ephemeral:
-            volumeClaimTemplate:
-              spec:
-                accessModes: ["ReadWriteOnce"]
-                {{- with .Values.worker.persistence.storageClass }}
-                storageClassName: {{ . }}
-                {{- end }}
-                resources:
-                  requests:
-                    storage: {{ .Values.worker.persistence.size }}
-        {{- else }}
           emptyDir: {}
-        {{- end }}
+      {{- end }}
       containers:
         - name: worker
           image: {{ include "talon.workerImage" . }}
@@ -86,10 +80,6 @@ spec:
           env:
             - name: TALON_WORKER_CLUSTER_ID
               value: {{ .Values.coordinator.clusterId | quote }}
-            - name: TALON_WORKER_NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
             - name: TALON_WORKER_ADVERTISE_ADDR
               valueFrom:
                 fieldRef:
@@ -119,7 +109,7 @@ spec:
               mountPath: /var/cache/talon
           startupProbe:
             httpGet: { path: /healthz, port: admin }
-            failureThreshold: 30
+            failureThreshold: 300
             periodSeconds: 2
           livenessProbe:
             httpGet: { path: /healthz, port: admin }
@@ -131,4 +121,35 @@ spec:
             failureThreshold: 2
           resources:
             {{- toYaml .Values.worker.resources | nindent 12 }}
+  {{- if .Values.worker.persistence.enabled }}
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        {{- with .Values.worker.persistence.storageClass }}
+        storageClassName: {{ . | quote }}
+        {{- end }}
+        resources:
+          requests:
+            storage: {{ .Values.worker.persistence.size }}
+  {{- end }}
+---
+# Governing service only; discovered data endpoints remain individual Pod IPs.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-worker
+  labels:
+    {{- include "talon.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 4 }}
+  ports:
+    - name: data
+      port: 7001
+      targetPort: data
 {{- end }}

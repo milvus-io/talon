@@ -3,12 +3,116 @@
   "info": {
     "title": "Talon Coordinator Management API",
     "version": "v1",
-    "description": "Read-only, versioned view of the live Talon cluster served by every coordinator from shared cluster state. Responses are equivalent across coordinators for the same backend revision."
+    "description": "Versioned cluster views and revision-checked membership administration. Worker discovery uses independent topology/state tokens; legacy node views retain their backend revision semantics."
   },
   "servers": [
     { "url": "/", "description": "Coordinator administration server" }
   ],
   "paths": {
+    "/api/v1/worker-membership": {
+      "get": {
+        "summary": "Persistent Worker registry and opaque CAS revision",
+        "responses": {
+          "200": {
+            "description": "registry_revision (nullable string), topology_token and registry (format_version, members with worker_id, nullable zone, retired)."
+          },
+          "503": {
+            "description": "Backend unavailable or invalid registry."
+          }
+        }
+      },
+      "put": {
+        "summary": "Import, retire or explicitly reactivate members",
+        "description": "Requires existing management authentication. Preserve all existing records. Stop/fence retiring instances before use. Review membership and storage requirements; HTTP 409 requires reload/review, never a blind retry.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": [
+                  "expected_registry_revision",
+                  "registry"
+                ],
+                "properties": {
+                  "expected_registry_revision": {
+                    "type": "string",
+                    "nullable": true
+                  },
+                  "registry": {
+                    "type": "object",
+                    "required": [
+                      "format_version",
+                      "members"
+                    ],
+                    "properties": {
+                      "format_version": {
+                        "type": "integer",
+                        "enum": [
+                          1
+                        ]
+                      },
+                      "members": {
+                        "type": "array",
+                        "items": {
+                          "type": "object",
+                          "required": [
+                            "worker_id",
+                            "retired"
+                          ],
+                          "properties": {
+                            "worker_id": {
+                              "type": "string",
+                              "maxLength": 256
+                            },
+                            "zone": {
+                              "type": "string",
+                              "nullable": true,
+                              "maxLength": 256
+                            },
+                            "retired": {
+                              "type": "boolean"
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "204": {
+            "description": "Applied."
+          },
+          "400": {
+            "description": "Malformed membership update request."
+          },
+          "409": {
+            "description": "Registry revision changed; reload before constructing another request."
+          },
+          "503": {
+            "description": "Backend unavailable, invalid membership update, or active instance prevents retirement."
+          }
+        }
+      }
+    },
+    "/api/v1/worker-discovery": {
+      "get": {
+        "summary": "Retained members and sole serving process observations",
+        "description": "Independent observation with topology_token, state_token, valid_for_ms, and workers. Each worker has member (worker_id, zone, retired) and state Offline, Conflict, or Serving {instance_id,address}. Equality tokens are opaque, not watch revisions. Offline members remain owners; retired members are excluded. The legacy /nodes snapshot is not this inventory.",
+        "responses": {
+          "200": {
+            "description": "WorkerDiscovery JSON. Freshness is at most 500ms; responses are not a durable serving lease."
+          },
+          "503": {
+            "description": "Registry or instance state unavailable."
+          }
+        }
+      }
+    },
     "/api/v1/cluster": {
       "get": {
         "summary": "Cluster summary",

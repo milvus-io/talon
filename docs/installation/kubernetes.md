@@ -55,8 +55,12 @@ kubectl create secret generic talon-worker-backend -n talon \
   --from-literal=azure-account="$ACCOUNT" --from-literal=azure-sas="$SAS"
 ```
 
-Scale workers with `--set worker.replicas=N`, and back their cache with a
-node-local PVC instead of an `emptyDir` via `--set worker.persistence.enabled=true`.
+Workers now use retained StatefulSet PVCs by default. Select your persistent
+storage class with `worker.persistence.storageClass`; raw manifests expect
+`talon-local` (see `worker-local-pv.example.yaml`). Scaling down preserves PVCs
+and makes retained members offline; retirement is an explicit operation.
+Follow the [rolling-upgrade runbook](../how-to/rolling-upgrade.md) to migrate an
+existing Deployment, activate retained mode, and advance canary ordinals.
 Disable workers with `--set worker.enabled=false`.
 
 See the [chart README](https://github.com/milvus-io/talon/tree/main/deploy/helm/talon)

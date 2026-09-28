@@ -53,6 +53,7 @@ metadata:
     app.kubernetes.io/component: coordinator
 spec:
   replicas: {{ include "talon.coordinatorReplicas" . }}
+  minReadySeconds: {{ .Values.coordinator.minReadySeconds }}
   revisionHistoryLimit: 5
   selector:
     matchLabels:
@@ -73,7 +74,7 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: {{ .Release.Name }}-coordinator
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -186,7 +187,7 @@ spec:
           {{- end }}
           startupProbe:
             httpGet: { path: /healthz, port: admin }
-            failureThreshold: 30
+            failureThreshold: 150
             periodSeconds: 2
           livenessProbe:
             httpGet: { path: /healthz, port: admin }
