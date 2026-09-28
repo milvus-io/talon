@@ -338,6 +338,172 @@ impl CoordinatorObservability {
         }
     }
 
+    pub async fn worker_discovery(
+        &self,
+    ) -> StateStoreResult<talon_core::worker_membership::WorkerDiscovery> {
+        use talon_core::worker_membership::*;
+        let view = tokio::time::timeout(self.request_timeout, async {
+            let registry = self.store.member_registry(&self.cluster_id).await?.value;
+            if registry.mode == MembershipMode::Retained {
+                let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+                Ok::<_, StateStoreError>(WorkerDiscovery::retained(&registry, &instances.nodes))
+            } else {
+                let snapshot = self.store.snapshot(&self.cluster_id).await?;
+                let nodes: Vec<_> = snapshot
+                    .nodes
+                    .into_iter()
+                    .filter(|n| {
+                        n.node.role == NodeRole::Worker
+                            && n.ready
+                            && n.health == NodeHealth::Healthy
+                    })
+                    .collect();
+                let legacy = MemberRegistry {
+                    members: nodes
+                        .iter()
+                        .map(|n| WorkerMember {
+                            worker_id: n.node.id.0.clone(),
+                            zone: n.labels.get(talon_core::NODE_ZONE_LABEL).cloned(),
+                            retired: false,
+                        })
+                        .collect(),
+                    ..Default::default()
+                };
+                Ok(WorkerDiscovery::retained(&legacy, &nodes))
+            }
+        })
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })??;
+        self.metrics.update_worker_discovery(&view);
+        Ok(view)
+    }
+
+    /// Authoritative targets for control updates, without manufacturing a watch
+    /// cursor across the independently read member and instance resources.
+    pub async fn serving_workers(&self) -> StateStoreResult<Vec<NodeStatus>> {
+        use talon_core::worker_membership::{InstanceState, MembershipMode, WorkerDiscovery};
+        tokio::time::timeout(self.request_timeout, async {
+            let registry = self.store.member_registry(&self.cluster_id).await?.value;
+            if registry.mode == MembershipMode::Legacy {
+                return Ok(self.store.snapshot(&self.cluster_id).await?.nodes);
+            }
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            let view = WorkerDiscovery::retained(&registry, &instances.nodes);
+            let serving: std::collections::HashSet<_> = view
+                .workers
+                .iter()
+                .filter_map(|worker| match &worker.state {
+                    InstanceState::Serving { instance_id, .. } => {
+                        Some((worker.member.worker_id.as_str(), instance_id.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(instances
+                .nodes
+                .into_iter()
+                .filter(|status| {
+                    serving.contains(&(status.node.id.0.as_str(), status.incarnation_id.as_str()))
+                })
+                .collect())
+        })
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })?
+    }
+
+    pub async fn membership_mode(
+        &self,
+    ) -> StateStoreResult<talon_core::worker_membership::MembershipMode> {
+        Ok(tokio::time::timeout(
+            self.request_timeout,
+            self.store.member_registry(&self.cluster_id),
+        )
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })??
+        .value
+        .mode)
+    }
+
+    pub async fn report_instance(
+        &self,
+        mut status: NodeStatus,
+        writable: bool,
+        ttl: Duration,
+    ) -> StateStoreResult<bool> {
+        use crate::state_store::registry::{change, MemberChange};
+        use talon_core::worker_membership::InstanceState;
+        if status.cluster_id != self.cluster_id || status.node.role != NodeRole::Worker {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "invalid worker instance cluster or role",
+            ));
+        }
+        status.validate()?;
+        let worker_id = status.node.id.0.clone();
+        let incarnation = status.incarnation_id.clone();
+        status.ready &= writable;
+        tokio::time::timeout(self.request_timeout, async {
+            change(self.store.as_ref(), &self.cluster_id, MemberChange::Register {
+                worker_id: worker_id.clone(), zone: status.labels.get(talon_core::NODE_ZONE_LABEL).cloned(),
+            }).await?;
+            let result = self.store.upsert_instance(status.clone(), ttl).await?;
+            if !matches!(result.disposition, crate::WriteDisposition::Applied | crate::WriteDisposition::Duplicate) {
+                return Err(crate::state_store::registry::invalid(self.store.backend(), "stale instance heartbeat"));
+            }
+            let registry = self.store.member_registry(&self.cluster_id).await?.value;
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            let view = talon_core::worker_membership::WorkerDiscovery::retained(&registry, &instances.nodes);
+            let serving = view.workers.iter().any(|w| w.member.worker_id == worker_id && matches!(&w.state, InstanceState::Serving { instance_id, .. } if instance_id == &incarnation));
+            // Keep older clients working only before activation.
+            if registry.mode == talon_core::worker_membership::MembershipMode::Legacy {
+                status.ready &= serving;
+                self.store.upsert_node(status, ttl).await?;
+            }
+            Ok(serving)
+        }).await.map_err(|_| StateStoreError::Timeout { backend: self.store.backend() })?
+    }
+
+    pub async fn worker_registry(
+        &self,
+    ) -> StateStoreResult<crate::state_store::registry::RegistrySnapshot> {
+        tokio::time::timeout(
+            self.request_timeout,
+            self.store.member_registry(&self.cluster_id),
+        )
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })?
+    }
+
+    pub async fn update_worker_registry(
+        &self,
+        expected_revision: Option<&str>,
+        mut value: talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<bool> {
+        tokio::time::timeout(self.request_timeout, async {
+            let current = self.store.member_registry(&self.cluster_id).await?;
+            if current.revision.as_ref().map(|r| r.as_str()) != expected_revision { return Ok(false); }
+            if current.value.members.iter().any(|old| !value.members.iter().any(|new| old.worker_id == new.worker_id)) {
+                return Err(crate::state_store::registry::invalid(self.store.backend(), "retain all member records; retire instead of deleting"));
+            }
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            if value.members.iter().any(|m| m.retired && instances.nodes.iter().any(|n| n.node.id.0 == m.worker_id && n.ready)) {
+                return Err(crate::state_store::registry::invalid(self.store.backend(), "stop worker and wait for instance withdrawal/expiration before retirement"));
+            }
+            value.members.sort_by(|a,b| a.worker_id.cmp(&b.worker_id));
+            let applied = self.store.compare_member_registry(&self.cluster_id, current.revision.as_ref(), &value).await?;
+            if applied { tracing::info!(cluster = %self.cluster_id, ?value, "administrative membership update"); }
+            Ok(applied)
+        }).await.map_err(|_| StateStoreError::Timeout { backend: self.store.backend() })?
+    }
+
     /// Reconcile local membership from an authoritative store snapshot.
     ///
     /// This is what makes coordinators active-active: the node set consulted by
@@ -354,6 +520,49 @@ impl CoordinatorObservability {
         &self,
         membership: &crate::Membership,
     ) -> StateStoreResult<()> {
+        // Load the full persistent member resource before admitting requests.
+        // A backend failure preserves the installed last-good view.
+        match self.membership_mode().await {
+            Ok(talon_core::worker_membership::MembershipMode::Retained) => {
+                match self.worker_discovery().await {
+                    Ok(view) => {
+                        let workers = view
+                            .workers
+                            .into_iter()
+                            .map(|w| {
+                                let address = match w.state {
+                                    talon_core::worker_membership::InstanceState::Serving {
+                                        address,
+                                        ..
+                                    } => address,
+                                    _ => String::new(),
+                                };
+                                (
+                                    NodeInfo {
+                                        id: talon_core::NodeId::new(w.member.worker_id),
+                                        address,
+                                        role: NodeRole::Worker,
+                                    },
+                                    w.member.zone,
+                                )
+                            })
+                            .collect();
+                        membership.reconcile_zoned(workers);
+                        self.record_membership_refresh();
+                        return Ok(());
+                    }
+                    Err(error) => {
+                        self.record_state_store_failure();
+                        return Err(error);
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                self.record_state_store_failure();
+                return Err(error);
+            }
+        }
         let started = Instant::now();
         let result =
             match tokio::time::timeout(self.request_timeout, self.store.snapshot(&self.cluster_id))

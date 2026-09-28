@@ -23,6 +23,7 @@ pub(crate) fn encode(value: &MemberRegistry, backend: StateBackend) -> StateStor
     }
     Ok(bytes)
 }
+#[cfg(any(feature = "etcd", feature = "kubernetes"))]
 pub(crate) fn decode(bytes: &[u8], backend: StateBackend) -> StateStoreResult<MemberRegistry> {
     if bytes.len() > MAX_REGISTRY_BYTES {
         return Err(invalid(backend, "member registry exceeds size limit"));
@@ -251,5 +252,68 @@ mod tests {
                 .len(),
             32
         );
+    }
+    #[tokio::test]
+    async fn instances_conflict_and_expire_without_changing_owners() {
+        use super::super::testkit::worker_status;
+        use std::time::Duration;
+        use talon_core::worker_membership::{InstanceState, WorkerDiscovery};
+        let store = MemoryStateStore::new();
+        let registry = change(
+            &store,
+            "contract",
+            MemberChange::Register {
+                worker_id: "w".into(),
+                zone: None,
+            },
+        )
+        .await
+        .unwrap();
+        let token = registry.topology_token();
+        store
+            .upsert_instance(worker_status("w", "inc-1", 0), Duration::from_millis(5))
+            .await
+            .unwrap();
+        let view = WorkerDiscovery::retained(
+            &registry,
+            &store.instance_snapshot("contract").await.unwrap().nodes,
+        );
+        assert!(matches!(
+            view.workers[0].state,
+            InstanceState::Serving { .. }
+        ));
+        let stable_state = view.state_token;
+        store
+            .upsert_instance(worker_status("w", "inc-1", 1), Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            WorkerDiscovery::retained(
+                &registry,
+                &store.instance_snapshot("contract").await.unwrap().nodes
+            )
+            .state_token,
+            stable_state
+        );
+        store
+            .upsert_instance(worker_status("w", "inc-2", 0), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let view = WorkerDiscovery::retained(
+            &registry,
+            &store.instance_snapshot("contract").await.unwrap().nodes,
+        );
+        assert!(matches!(view.workers[0].state, InstanceState::Conflict));
+        assert_eq!(view.topology_token, token);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let view = WorkerDiscovery::retained(
+            &registry,
+            &store.instance_snapshot("contract").await.unwrap().nodes,
+        );
+        assert!(
+            matches!(&view.workers[0].state, InstanceState::Serving { instance_id, .. } if instance_id == "inc-2")
+        );
+        assert_eq!(view.topology_token, token);
+        assert!(store.snapshot("contract").await.unwrap().nodes.is_empty());
     }
 }

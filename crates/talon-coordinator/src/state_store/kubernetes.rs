@@ -49,6 +49,8 @@ pub const DEFAULT_LEASE_LABEL_PREFIX: &str = "talon.io";
 const BACKEND: StateBackend = StateBackend::Kubernetes;
 /// Bounded number of optimistic retries under write contention.
 const MAX_WRITE_RETRIES: usize = 16;
+/// Expired process records must not accumulate across rolling restarts.
+const MAX_INSTANCE_CLEANUP: usize = 16;
 
 fn label_managed_by() -> String {
     format!("{DEFAULT_LEASE_LABEL_PREFIX}/managed-by")
@@ -129,6 +131,7 @@ impl KubernetesConfig {
 
 /// Strongly consistent Kubernetes-backed [`ClusterStateStore`].
 pub struct KubernetesStateStore {
+    instance_records: bool,
     api: Api<Lease>,
     registry_api: Api<k8s_openapi::api::core::v1::ConfigMap>,
     cluster_id: String,
@@ -173,6 +176,7 @@ impl KubernetesStateStore {
         request_timeout: Duration,
     ) -> Self {
         Self {
+            instance_records: false,
             api: Api::namespaced(client.clone(), &config.namespace),
             registry_api: Api::namespaced(client, &config.namespace),
             cluster_id: config.cluster_id.clone(),
@@ -185,7 +189,10 @@ impl KubernetesStateStore {
         lease_name(&self.cluster_id, role, node_id)
     }
 
-    fn role_str(status: &NodeStatus) -> &'static str {
+    fn role_str(&self, status: &NodeStatus) -> &'static str {
+        if self.instance_records {
+            return "worker-instance";
+        }
         match status.node.role {
             talon_core::NodeRole::Coordinator => "coordinator",
             talon_core::NodeRole::Worker => "worker",
@@ -219,7 +226,7 @@ impl KubernetesStateStore {
         let mut labels = BTreeMap::new();
         labels.insert(label_managed_by(), "talon".to_string());
         labels.insert(label_cluster(), sanitize_label(&self.cluster_id));
-        labels.insert(label_role(), Self::role_str(status).to_string());
+        labels.insert(label_role(), self.role_str(status).to_string());
         labels.insert(label_node(), sanitize_label(&status.node.id.0));
         let mut annotations = BTreeMap::new();
         annotations.insert(annotation_status(), status_json);
@@ -247,6 +254,17 @@ impl KubernetesStateStore {
 impl ClusterStateStore for KubernetesStateStore {
     fn backend(&self) -> StateBackend {
         StateBackend::Kubernetes
+    }
+
+    async fn upsert_instance(
+        &self,
+        status: NodeStatus,
+        ttl: Duration,
+    ) -> StateStoreResult<WriteResult> {
+        self.instance_store().upsert_node(status, ttl).await
+    }
+    async fn instance_snapshot(&self, cluster: &str) -> StateStoreResult<ClusterSnapshot> {
+        self.instance_store().snapshot(cluster).await
     }
 
     async fn member_registry(
@@ -350,7 +368,14 @@ impl ClusterStateStore for KubernetesStateStore {
     ) -> StateStoreResult<WriteResult> {
         status.validate()?;
         let ttl_seconds = lease_ttl_to_seconds(lease_ttl)?;
-        let name = self.lease_name(Self::role_str(&status), &status.node.id);
+        let name = self.lease_name(
+            self.role_str(&status),
+            &if self.instance_records {
+                super::instance_key(&status)
+            } else {
+                status.node.id.clone()
+            },
+        );
 
         for _ in 0..MAX_WRITE_RETRIES {
             let existing = self.with_timeout(self.api.get_opt(&name)).await?;
@@ -480,6 +505,23 @@ impl ClusterStateStore for KubernetesStateStore {
                 }
             }
         }
+        // Kubernetes does not expire Lease objects. Only process leases may be
+        // reclaimed; persistent member ConfigMaps and legacy records are intact.
+        // Cleanup is best effort, bounded in both requests and total wall time.
+        if self.instance_records {
+            let _ = timeout(self.request_timeout.min(Duration::from_millis(100)), async {
+                for (name, params) in expired_instance_deletions(&list.items, now) {
+                    match self.api.delete(&name, &params).await {
+                        Ok(_) => {}
+                        Err(kube::Error::Api(error)) if error.code == 404 || error.code == 409 => {}
+                        Err(error) => {
+                            tracing::warn!(error = %map_kube_error(error), "expired instance cleanup failed");
+                            break;
+                        }
+                    }
+                }
+            }).await;
+        }
         nodes.sort_by(|a, b| a.node.id.0.cmp(&b.node.id.0));
         Ok(ClusterSnapshot {
             nodes,
@@ -530,12 +572,24 @@ impl ClusterStateStore for KubernetesStateStore {
 }
 
 impl KubernetesStateStore {
+    fn instance_store(&self) -> Self {
+        Self {
+            api: self.api.clone(),
+            registry_api: self.registry_api.clone(),
+            cluster_id: self.cluster_id.clone(),
+            request_timeout: self.request_timeout,
+            instance_records: true,
+        }
+    }
+
     fn selector(&self) -> String {
         format!(
-            "{}=talon,{}={}",
+            "{}=talon,{}={},{}{}worker-instance",
             label_managed_by(),
             label_cluster(),
-            sanitize_label(&self.cluster_id)
+            sanitize_label(&self.cluster_id),
+            label_role(),
+            if self.instance_records { "=" } else { "!=" }
         )
     }
 
@@ -710,6 +764,39 @@ fn lease_expired(lease: &Lease, now_unix_ms: u64) -> bool {
     now_unix_ms > deadline
 }
 
+/// Delete only the exact expired observation. A concurrent renewal changes
+/// resourceVersion; delete/recreate changes UID, so either race fails the delete.
+fn expired_instance_deletions(leases: &[Lease], now: u64) -> Vec<(String, DeleteParams)> {
+    leases
+        .iter()
+        .filter(|lease| {
+            lease
+                .metadata
+                .labels
+                .as_ref()
+                .and_then(|labels| labels.get(&label_role()))
+                .is_some_and(|role| role == "worker-instance")
+                && lease_expired(lease, now)
+        })
+        .filter_map(|lease| {
+            let name = lease.metadata.name.clone()?;
+            let resource_version = lease.metadata.resource_version.clone()?;
+            let uid = lease.metadata.uid.clone()?;
+            Some((
+                name,
+                DeleteParams {
+                    preconditions: Some(kube::api::Preconditions {
+                        resource_version: Some(resource_version),
+                        uid: Some(uid),
+                    }),
+                    ..Default::default()
+                },
+            ))
+        })
+        .take(MAX_INSTANCE_CLEANUP)
+        .collect()
+}
+
 fn sanitize_label(value: &str) -> String {
     let s: String = value
         .chars()
@@ -858,6 +945,52 @@ mod tests {
         // A lease with no spec or no renewTime is treated as expired.
         assert!(lease_expired(&Lease::default(), 0));
         assert!(lease_expired(&lease_with(0, 0), 1));
+    }
+
+    #[test]
+    fn expired_instance_cleanup_is_bounded_and_fenced() {
+        let expired = Lease {
+            metadata: ObjectMeta {
+                name: Some("expired".into()),
+                uid: Some("uid-old".into()),
+                resource_version: Some("observed-version".into()),
+                labels: Some(BTreeMap::from([(label_role(), "worker-instance".into())])),
+                ..Default::default()
+            },
+            spec: Some(LeaseSpec {
+                renew_time: Some(MicroTime(Utc.timestamp_millis_opt(0).single().unwrap())),
+                lease_duration_seconds: Some(1),
+                ..Default::default()
+            }),
+        };
+        let mut fresh = expired.clone();
+        fresh.spec.as_mut().unwrap().renew_time =
+            Some(MicroTime(Utc.timestamp_millis_opt(2_000).single().unwrap()));
+        let mut legacy = expired.clone();
+        legacy
+            .metadata
+            .labels
+            .as_mut()
+            .unwrap()
+            .insert(label_role(), "worker".into());
+        let mut unfenced = expired.clone();
+        unfenced.metadata.uid = None;
+        assert!(expired_instance_deletions(&[fresh, legacy, unfenced], 2_000).is_empty());
+        let deletions = expired_instance_deletions(&vec![expired; MAX_INSTANCE_CLEANUP + 1], 2_000);
+        assert_eq!(deletions.len(), MAX_INSTANCE_CLEANUP);
+        let (name, params) = &deletions[0];
+        assert_eq!(name, "expired");
+        let preconditions = params.preconditions.as_ref().unwrap();
+        assert_eq!(preconditions.uid.as_deref(), Some("uid-old"));
+        assert_eq!(
+            preconditions.resource_version.as_deref(),
+            Some("observed-version")
+        );
+        // Both tokens go on the wire: renewing or replacing this resource after
+        // the list therefore makes the Kubernetes API reject the deletion.
+        let body = serde_json::to_value(params).unwrap();
+        assert_eq!(body["preconditions"]["resourceVersion"], "observed-version");
+        assert_eq!(body["preconditions"]["uid"], "uid-old");
     }
 
     #[test]
