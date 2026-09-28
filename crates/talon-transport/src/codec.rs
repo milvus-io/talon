@@ -175,6 +175,10 @@ pub enum ControlMessage {
         serving: bool,
         detail: Option<String>,
     },
+    ControlFailure {
+        code: crate::DataErrorCode,
+        message: String,
+    },
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -310,6 +314,12 @@ pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, ControlMessage), Codec
     }
     let (_, business) = crate::envelope::decode(&header, &buf[HEADER_LEN..])?;
     decode_business(header, business, CONTROL_SCHEMA_VERSION)
+}
+
+/// Read the schema after the caller has validated a request with `decode_request`.
+pub fn request_schema(header: &FrameHeader, payload: &[u8]) -> Result<u16, CodecError> {
+    let (_, business) = crate::envelope::decode(header, payload)?;
+    peek_schema(business)
 }
 
 fn decode_with_max_schema(

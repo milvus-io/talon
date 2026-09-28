@@ -30,7 +30,6 @@ use crate::worker_client::WorkerError;
 
 pub(crate) enum DetailedBlockReadError {
     Block(BlockReadError),
-    Worker(WorkerError),
 }
 
 impl From<BlockReadError> for DetailedBlockReadError {
@@ -55,14 +54,26 @@ pub enum BlockReadError {
     /// The worker fetch failed.
     #[error(transparent)]
     Worker(#[from] WorkerError),
+    #[error("worker {worker_id}, instance {instance_id} at {address}: {source}")]
+    Target {
+        worker_id: String,
+        instance_id: String,
+        address: String,
+        #[source]
+        source: WorkerError,
+    },
     /// The cluster returned no owners for the block (empty cluster).
     #[error("no owners for block")]
     NoOwners,
     /// All configured logical candidates failed, without refreshing discovery.
-    #[error("all replicas failed; last worker {worker}: {source}")]
+    #[error("all replicas failed; last worker {worker_id}, instance {instance_id:?} at {worker}: {source}")]
     AllReplicasFailed {
         /// Last candidate's address when known, otherwise its logical worker ID.
         worker: String,
+        /// Last candidate logical identity, including unavailable candidates.
+        worker_id: String,
+        /// Last observed instance identity, absent for offline or conflicting members.
+        instance_id: Option<String>,
         /// Original failure, preserved for diagnostics and classification.
         #[source]
         source: WorkerError,
@@ -199,10 +210,7 @@ impl BlockReader {
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
-                    last = BlockReadError::AllReplicasFailed {
-                        worker: target.into(),
-                        source: error,
-                    };
+                    last = snapshot.replica_error(target, error);
                     continue;
                 }
             };
@@ -228,10 +236,7 @@ impl BlockReader {
             if !replica_retryable(&error) {
                 return Err(error.into());
             }
-            last = BlockReadError::AllReplicasFailed {
-                worker: target.into(),
-                source: error,
-            };
+            last = snapshot.replica_error(target, error);
         }
         Err(cache_block_error(last))
     }
@@ -277,7 +282,6 @@ impl BlockReader {
         {
             Ok(bytes) => Ok(bytes),
             Err(DetailedBlockReadError::Block(error)) => Err(error),
-            Err(DetailedBlockReadError::Worker(error)) => Err(BlockReadError::Worker(error)),
         }
     }
 
@@ -329,10 +333,7 @@ impl BlockReader {
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
-                    last = BlockReadError::AllReplicasFailed {
-                        worker: target.into(),
-                        source: error,
-                    };
+                    last = snapshot.replica_error(target, error);
                     continue;
                 }
             };
@@ -361,12 +362,9 @@ impl BlockReader {
             };
             self.stats.record_worker_failure();
             if !replica_retryable(&error) {
-                return Err(error.into());
+                return Err(snapshot.target_error(target, error));
             }
-            last = BlockReadError::AllReplicasFailed {
-                worker: target.into(),
-                source: error,
-            };
+            last = snapshot.replica_error(target, error);
         }
         Err(last)
     }
@@ -406,10 +404,7 @@ impl BlockReader {
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
-                    last = BlockReadError::AllReplicasFailed {
-                        worker: target.into(),
-                        source: error,
-                    };
+                    last = snapshot.replica_error(target, error);
                     continue;
                 }
             };
@@ -445,12 +440,9 @@ impl BlockReader {
             };
             self.stats.record_worker_failure();
             if !replica_retryable(&error) {
-                return Err(DetailedBlockReadError::Worker(error));
+                return Err(snapshot.target_error(target, error).into());
             }
-            last = BlockReadError::AllReplicasFailed {
-                worker: target.into(),
-                source: error,
-            };
+            last = snapshot.replica_error(target, error);
         }
         Err(last.into())
     }
@@ -602,9 +594,9 @@ impl BlockReader {
 fn cache_block_error(error: BlockReadError) -> CacheReadError {
     match error {
         BlockReadError::Coordinator(error) => error.into(),
-        BlockReadError::Worker(error) | BlockReadError::AllReplicasFailed { source: error, .. } => {
-            error.into()
-        }
+        BlockReadError::Worker(error)
+        | BlockReadError::Target { source: error, .. }
+        | BlockReadError::AllReplicasFailed { source: error, .. } => error.into(),
         other => CacheReadError::Unavailable(other.to_string()),
     }
 }
@@ -1518,8 +1510,8 @@ mod tests {
                     (&secondary, DataErrorCode::Timeout, "last candidate failure")
                 };
                 assert!(matches!(&error, BlockReadError::AllReplicasFailed {
-                    worker, source: WorkerError::Remote(remote),
-                } if worker == expected_worker && remote.code == expected_code && remote.message == expected_message));
+                    worker, worker_id, instance_id, source: WorkerError::Remote(remote),
+                } if worker_id == if k == 1 { "w1" } else { "w2" } && instance_id.is_some() && worker == expected_worker && remote.code == expected_code && remote.message == expected_message));
                 assert!(error
                     .source()
                     .unwrap()
@@ -1568,16 +1560,49 @@ mod tests {
                 if code == DataErrorCode::Timeout {
                     assert!(matches!(error, BlockReadError::AllReplicasFailed {
                         worker: ref last_worker,
-                        source: WorkerError::Remote(ref remote),
+                        source: WorkerError::Remote(ref remote), ..
                     } if last_worker == &worker && remote.code == code));
                 } else {
                     assert!(
-                        matches!(error, BlockReadError::Worker(WorkerError::Remote(ref remote))
+                        matches!(error, BlockReadError::Target { source: WorkerError::Remote(ref remote), .. }
                         if remote.code == code)
                     );
                 }
                 assert_eq!(hits.load(Ordering::SeqCst), 1);
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_replica_failure_reports_the_actual_candidate() {
+        for into in [false, true] {
+            let primary = spawn_worker_error(
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                encode_typed_error(0, DataErrorCode::Unavailable, "primary unavailable"),
+            )
+            .await;
+            let secondary = spawn_worker_error(
+                Arc::new(std::sync::atomic::AtomicU32::new(0)),
+                encode_typed_error(0, DataErrorCode::Origin, "secondary origin failure"),
+            )
+            .await;
+            let coordinator = mock_coordinator_two(primary, secondary.clone()).await;
+            let reader = BlockReader::new(
+                CoordinatorClient::new(coordinator),
+                Arc::new(PlacementCache::new(500)),
+                2,
+            );
+            let error = if into {
+                reader
+                    .read_block_into(&block(), 0, &mut [0; 8])
+                    .await
+                    .unwrap_err()
+            } else {
+                reader.read_block(&block(), 0, 8).await.unwrap_err()
+            };
+            assert!(matches!(error, BlockReadError::Target {
+                worker_id, address, source: WorkerError::Remote(remote), ..
+            } if worker_id == "w2" && address == secondary && remote.code == DataErrorCode::Origin));
         }
     }
 
@@ -2158,7 +2183,7 @@ mod tests {
                     code: DataErrorCode::Unavailable,
                     ..
                 }),
-                worker,
+                worker, ..
             } if worker == last_id
         ));
         let mut dst = [42; 4];
@@ -2168,5 +2193,71 @@ mod tests {
             reader.read_cached_block(&block(), 0, 4).await,
             Err(CacheReadError::Unavailable(_))
         ));
+    }
+    #[tokio::test]
+    async fn stream_preserves_domain_and_protocol_failures() {
+        use futures::StreamExt;
+        use talon_core::worker_membership::*;
+        for code in [
+            Some(DataErrorCode::VersionMismatch),
+            Some(DataErrorCode::RateLimited),
+            Some(DataErrorCode::Origin),
+            None,
+        ] {
+            let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let response = code.map_or_else(
+                || vec![0; HEADER_LEN],
+                |c| encode_typed_error(0, c, "original cause"),
+            );
+            let address = spawn_worker_error(hits.clone(), response).await;
+            let reader = BlockReader::new(
+                CoordinatorClient::new("127.0.0.1:1"),
+                Arc::new(PlacementCache::new(30_000)),
+                1,
+            );
+            reader.membership.replace(
+                WorkerDiscovery {
+                    topology_token: 1,
+                    state_token: 1,
+                    valid_for_ms: 500,
+                    workers: vec![DiscoveredWorker {
+                        member: WorkerMember {
+                            worker_id: "w1".into(),
+                            zone: None,
+                            retired: false,
+                        },
+                        state: InstanceState::Serving {
+                            instance_id: "instance".into(),
+                            address,
+                        },
+                    }],
+                },
+                std::time::Instant::now(),
+                &reader.worker_pool,
+            );
+            let block = block();
+            let file = FileView {
+                object: &block.object,
+                version: &block.version,
+                block_size: block.block_size,
+                size: 16,
+            };
+            let mut stream = reader.stream_range(&file, 0, 4, 4).unwrap();
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(!error.fallback_eligible(), "{error}");
+            match code {
+                Some(DataErrorCode::VersionMismatch) => {
+                    assert!(matches!(error, CacheReadError::VersionMismatch(_)))
+                }
+                Some(DataErrorCode::RateLimited) => {
+                    assert!(matches!(error, CacheReadError::RateLimited(_)))
+                }
+                Some(DataErrorCode::Origin) => assert!(matches!(error, CacheReadError::Origin(_))),
+                None => assert!(matches!(error, CacheReadError::Protocol(_))),
+                _ => unreachable!(),
+            }
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(stream.next().await.is_none());
+        }
     }
 }

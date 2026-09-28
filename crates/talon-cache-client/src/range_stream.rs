@@ -97,6 +97,7 @@ impl From<WorkerError> for CacheReadError {
 impl From<CoordinatorError> for CacheReadError {
     fn from(error: CoordinatorError) -> Self {
         match error {
+            CoordinatorError::Remote(error) => WorkerError::Remote(error).into(),
             CoordinatorError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                 Self::Timeout(error.to_string())
             }
@@ -109,9 +110,9 @@ impl From<CoordinatorError> for CacheReadError {
 impl From<DetailedBlockReadError> for CacheReadError {
     fn from(error: DetailedBlockReadError) -> Self {
         match error {
-            DetailedBlockReadError::Worker(error) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
-            DetailedBlockReadError::Block(BlockReadError::Worker(error))
+            DetailedBlockReadError::Block(BlockReadError::Target { source: error, .. })
+            | DetailedBlockReadError::Block(BlockReadError::Worker(error))
             | DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
                 source: error,
                 ..
@@ -403,6 +404,8 @@ mod tests {
                 let error = if exhausted {
                     BlockReadError::AllReplicasFailed {
                         worker: "worker:9000".into(),
+                        worker_id: "worker".into(),
+                        instance_id: Some("instance".into()),
                         source,
                     }
                 } else {

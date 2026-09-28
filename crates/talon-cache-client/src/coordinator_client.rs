@@ -61,6 +61,8 @@ pub enum CoordinatorError {
     /// A frame could not be encoded/decoded.
     #[error("coordinator codec: {0}")]
     Codec(#[from] talon_transport::CodecError),
+    #[error("coordinator error: {0}")]
+    Remote(talon_transport::DataPlaneError),
     /// The coordinator advertised a control payload above the safety cap.
     #[error("coordinator payload length {length} exceeds cap {cap}")]
     PayloadTooLarge {
@@ -92,7 +94,8 @@ impl CoordinatorError {
             CoordinatorError::Io(_) => true,
             CoordinatorError::Codec(_)
             | CoordinatorError::PayloadTooLarge { .. }
-            | CoordinatorError::Unexpected { .. } => false,
+            | CoordinatorError::Unexpected { .. }
+            | CoordinatorError::Remote(_) => false,
         }
     }
 }
@@ -154,6 +157,12 @@ impl CoordinatorClient {
             .await?
         {
             ControlMessage::MembershipList { view } => Ok(view),
+            ControlMessage::ControlFailure { code, message } => {
+                Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
+                    code,
+                    message,
+                }))
+            }
             other => Err(CoordinatorError::Unexpected {
                 expected: "MembershipQuery",
                 got: Box::new(other),
@@ -207,6 +216,12 @@ impl CoordinatorClient {
             object: object.clone(),
         };
         match self.round_trip(req, "StatObject").await? {
+            ControlMessage::ControlFailure { code, message } => {
+                Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
+                    code,
+                    message,
+                }))
+            }
             ControlMessage::ObjectStat { size, version } => Ok(ObjectStat { size, version }),
             other => Err(CoordinatorError::Unexpected {
                 expected: "StatObject",
@@ -227,6 +242,12 @@ impl CoordinatorClient {
             prefix: prefix.to_string(),
         };
         match self.round_trip(req, "ListObjects").await? {
+            ControlMessage::ControlFailure { code, message } => {
+                Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
+                    code,
+                    message,
+                }))
+            }
             ControlMessage::ObjectList { entries } => Ok(entries),
             other => Err(CoordinatorError::Unexpected {
                 expected: "ListObjects",

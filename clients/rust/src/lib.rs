@@ -27,6 +27,7 @@
 //!         Error::Coordinator(source)
 //!         | Error::Block(BlockReadError::Coordinator(source)) => source.into(),
 //!         Error::Block(BlockReadError::Worker(source))
+//!         | Error::Block(BlockReadError::Target { source, .. })
 //!         | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),
 //!         Error::Block(BlockReadError::NoOwners) =>
 //!             CacheReadError::Unavailable(diagnostic.clone()),
@@ -36,6 +37,8 @@
 //!
 //! let error = Error::from(BlockReadError::AllReplicasFailed {
 //!     worker: "worker-1:9000".into(),
+//!     worker_id: "worker-1".into(),
+//!     instance_id: Some("instance-1".into()),
 //!     source: WorkerError::Remote(DataPlaneError {
 //!         code: DataErrorCode::Timeout,
 //!         message: "request timed out".into(),
@@ -51,7 +54,7 @@ mod client;
 mod error;
 
 pub use client::{parse_uri, Client, ClientBuilder, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS};
-pub use error::{Error, UriError};
+pub use error::{Error, ErrorKind, UriError};
 pub use talon_cache_client::{
     BlockReadError, CacheReadError, CoordinatorError, ObjectStat, WorkerError,
 };
