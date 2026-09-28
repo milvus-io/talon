@@ -57,6 +57,8 @@ struct Inner {
 /// Single-process backend with injected time, bounded watch history, and fault
 /// injection.
 pub struct MemoryStateStore {
+    instances: std::sync::OnceLock<Box<MemoryStateStore>>,
+    instance_records: bool,
     clock: Arc<dyn TimeSource>,
     history_limit: usize,
     available: AtomicBool,
@@ -81,6 +83,8 @@ impl MemoryStateStore {
         let history_limit = history_limit.max(1);
         let (events, _) = broadcast::channel(history_limit);
         Self {
+            instances: Default::default(),
+            instance_records: false,
             clock,
             history_limit,
             available: AtomicBool::new(true),
@@ -155,6 +159,14 @@ impl MemoryStateStore {
         }
     }
 
+    fn instance_store(&self) -> &MemoryStateStore {
+        self.instances.get_or_init(|| {
+            let mut store = Self::with_time_source(self.clock.clone(), self.history_limit);
+            store.instance_records = true;
+            Box::new(store)
+        })
+    }
+
     fn ttl_ms(ttl: Duration) -> StateStoreResult<u64> {
         if ttl.is_zero() {
             return Err(StateStoreError::InvalidLeaseTtl(ttl));
@@ -172,6 +184,19 @@ impl MemoryStateStore {
 impl ClusterStateStore for MemoryStateStore {
     fn backend(&self) -> StateBackend {
         StateBackend::Memory
+    }
+
+    async fn upsert_instance(
+        &self,
+        status: NodeStatus,
+        ttl: Duration,
+    ) -> StateStoreResult<WriteResult> {
+        self.ensure_available()?;
+        self.instance_store().upsert_node(status, ttl).await
+    }
+    async fn instance_snapshot(&self, cluster: &str) -> StateStoreResult<ClusterSnapshot> {
+        self.ensure_available()?;
+        self.instance_store().snapshot(cluster).await
     }
 
     async fn member_registry(
@@ -218,7 +243,11 @@ impl ClusterStateStore for MemoryStateStore {
         let now = self.clock.now_unix_ms();
         let key = RecordKey {
             cluster_id: status.cluster_id.clone(),
-            node_id: status.node.id.clone(),
+            node_id: if self.instance_records {
+                super::instance_key(&status)
+            } else {
+                status.node.id.clone()
+            },
         };
         let mut inner = self.inner.lock().unwrap();
         self.prune_expired_locked(&mut inner, now);

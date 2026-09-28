@@ -867,12 +867,48 @@ fn spawn_control_plane(
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut registered = false;
+        let mut instance_capable = false;
         let mut last_successful_heartbeat = None;
         let failure_grace = heartbeat_interval
             .saturating_mul(CONTROL_FAILURE_GRACE_INTERVALS)
             .min(MAX_CONTROL_FAILURE_GRACE);
         loop {
             ticker.tick().await;
+
+            let proposed = ControlMessage::WorkerInstanceHeartbeat {
+                status: Box::new(observability.status_for_heartbeat()),
+                writable: true,
+            };
+            let report = tokio::time::timeout(
+                CONTROL_OPERATION_TIMEOUT,
+                instance_report(&coordinator, channel.as_ref(), &proposed),
+            )
+            .await;
+            match report {
+                Ok(Ok((accepted, serving))) => {
+                    instance_capable = true;
+                    observability
+                        .readiness()
+                        .set_control_registered(accepted && serving);
+                    if accepted && serving {
+                        last_successful_heartbeat = Some(Instant::now());
+                        observability.metrics().record_heartbeat_success();
+                    } else {
+                        observability.metrics().record_heartbeat_failure();
+                    }
+                    continue;
+                }
+                _ if instance_capable => {
+                    observability.metrics().record_heartbeat_failure();
+                    retain_readiness_after_control_failure(
+                        &observability,
+                        last_successful_heartbeat,
+                        failure_grace,
+                    );
+                    continue;
+                }
+                _ => {} // Initial capability probe against an older coordinator.
+            }
 
             if !registered {
                 match tokio::time::timeout(
@@ -948,6 +984,38 @@ fn spawn_control_plane(
             }
         }
     })
+}
+
+async fn instance_report(
+    addr: &str,
+    channel: Option<&ControlTlsChannel>,
+    msg: &ControlMessage,
+) -> anyhow::Result<(bool, bool)> {
+    async fn exchange<S: AsyncRead + AsyncWrite + Unpin>(
+        mut stream: S,
+        msg: &ControlMessage,
+    ) -> anyhow::Result<(bool, bool)> {
+        stream.write_all(&codec::encode(0, msg)?).await?;
+        stream.flush().await?;
+        match read_control(&mut stream).await? {
+            Some(ControlMessage::WorkerInstanceAck {
+                accepted,
+                serving,
+                detail,
+                ..
+            }) => {
+                if !accepted {
+                    tracing::warn!(?detail, "worker instance rejected");
+                }
+                Ok((accepted, serving))
+            }
+            _ => anyhow::bail!("coordinator did not acknowledge instance capability"),
+        }
+    }
+    match channel {
+        Some(channel) => exchange(channel.connect(addr).await?.stream, msg).await,
+        None => exchange(TcpStream::connect(addr).await?, msg).await,
+    }
 }
 
 /// Connect, send one control message, and require the coordinator's Ack.
@@ -1247,9 +1315,12 @@ mod tests {
         let server = tokio::spawn(async move {
             let mut status_gate = Some((status_sent, wait_for_ack));
             let mut messages = Vec::new();
-            for _ in 0..3 {
+            while messages.len() < 3 {
                 let (mut stream, _) = listener.accept().await.unwrap();
                 let message = read_control(&mut stream).await.unwrap().unwrap();
+                if matches!(message, ControlMessage::WorkerInstanceHeartbeat { .. }) {
+                    continue;
+                }
                 if matches!(message, ControlMessage::NodeStatusHeartbeat { .. }) {
                     let (sent, gate) = status_gate.take().unwrap();
                     sent.send(()).unwrap();

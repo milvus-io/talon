@@ -164,6 +164,7 @@ impl EtcdConfig {
 /// Strongly consistent etcd-backed [`ClusterStateStore`].
 pub struct EtcdStateStore {
     client: Client,
+    instance_records: bool,
     prefix: String,
     request_timeout: Duration,
 }
@@ -202,6 +203,7 @@ impl EtcdStateStore {
 
         Ok(Self {
             client,
+            instance_records: false,
             prefix: config.normalized_prefix(),
             request_timeout,
         })
@@ -215,9 +217,19 @@ impl EtcdStateStore {
     ) -> StateStoreResult<Self> {
         Ok(Self {
             client,
+            instance_records: false,
             prefix: prefix.into().trim_end_matches('/').to_string(),
             request_timeout,
         })
+    }
+
+    fn instance_store(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            prefix: format!("{}/instances", self.prefix),
+            request_timeout: self.request_timeout,
+            instance_records: true,
+        }
     }
 
     fn cluster_prefix(&self, cluster_id: &str) -> String {
@@ -225,7 +237,15 @@ impl EtcdStateStore {
     }
 
     fn node_key(&self, status: &NodeStatus) -> String {
-        self.record_key(&status.cluster_id, status.node.role, &status.node.id)
+        self.record_key(
+            &status.cluster_id,
+            status.node.role,
+            &if self.instance_records {
+                super::instance_key(status)
+            } else {
+                status.node.id.clone()
+            },
+        )
     }
 
     fn record_key(&self, cluster_id: &str, role: NodeRole, node_id: &NodeId) -> String {
@@ -255,6 +275,17 @@ impl EtcdStateStore {
 impl ClusterStateStore for EtcdStateStore {
     fn backend(&self) -> StateBackend {
         StateBackend::Etcd
+    }
+
+    async fn upsert_instance(
+        &self,
+        status: NodeStatus,
+        ttl: Duration,
+    ) -> StateStoreResult<WriteResult> {
+        self.instance_store().upsert_node(status, ttl).await
+    }
+    async fn instance_snapshot(&self, cluster: &str) -> StateStoreResult<ClusterSnapshot> {
+        self.instance_store().snapshot(cluster).await
     }
 
     async fn member_registry(
