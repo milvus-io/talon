@@ -220,6 +220,10 @@ impl PageGcService {
             worker,
         }
     }
+    pub fn begin_shutdown(&self) {
+        let _ = self.stop.send(true);
+    }
+
     pub async fn shutdown(mut self) {
         let _ = self.stop.send(true);
         for task in self.tasks.drain(..) {

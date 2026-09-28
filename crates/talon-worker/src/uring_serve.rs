@@ -117,6 +117,9 @@ pub fn resolve_ring_count(configured: usize) -> usize {
 /// its own ring driving the future. The future is deliberately **not** `Send`:
 /// it never leaves the thread that accepted the connection.
 pub trait RingHandler: Clone + 'static {
+    /// Stop new requests and wake idle connections before joining ring threads.
+    fn begin_shutdown(&self) {}
+    fn listening(&self) {}
     /// Serve one accepted connection to completion.
     fn handle(
         &self,
@@ -248,6 +251,8 @@ where
         );
     }
 
+    let stop_all = stop.clone();
+    let handler_all = handler.clone();
     for ring_id in 0..rings {
         let addr = addr.clone();
         let admission = admission.clone();
@@ -256,104 +261,143 @@ where
         let tokio_handle = tokio_handle.clone();
         let allowed = Arc::clone(&allowed);
         let stop = Arc::clone(&stop);
-        threads.push(
-            std::thread::Builder::new()
-                .name(format!("talon-ring-{ring_id}"))
-                .spawn(move || {
-                    // Required before the ring runs: WorkerRuntime reaches Tokio
-                    // internally. See "Tokio coexistence" on this function.
-                    let _tokio_guard = tokio_handle.enter();
-
-                    // Pin before building the ring so its memory is allocated on
-                    // the node this thread will actually run on. Pin to a CPU
-                    // from the *allowed* set rather than to `ring_id`, so a
-                    // restricted cpuset (Kubernetes CPU manager, taskset, NUMA
-                    // pinning) is respected instead of escaped. A failure here is
-                    // not fatal — pinning is an optimization, not a correctness
-                    // requirement — but it is worth surfacing.
-                    match allowed.get(ring_id % allowed.len().max(1)) {
-                        Some(&cpu) => {
-                            if let Err(e) = monoio::utils::bind_to_cpu_set(vec![cpu]) {
-                                tracing::warn!(
-                                    ring = ring_id,
-                                    cpu,
-                                    error = ?e,
-                                    "could not pin ring to cpu"
-                                );
-                            }
-                        }
-                        // Affinity unreadable: leave the thread unpinned rather
-                        // than guess a CPU that may not be ours.
-                        None => tracing::warn!(
-                            ring = ring_id,
-                            "cpu affinity unavailable; ring left unpinned"
-                        ),
+        let thread = std::thread::Builder::new()
+            .name(format!("talon-ring-{ring_id}"))
+            .spawn(move || {
+                struct StopOnExit<H: RingHandler>(Arc<std::sync::atomic::AtomicBool>, H);
+                impl<H: RingHandler> Drop for StopOnExit<H> {
+                    fn drop(&mut self) {
+                        self.0.store(true, std::sync::atomic::Ordering::Release);
+                        self.1.begin_shutdown();
                     }
+                }
+                let _stop_on_exit = StopOnExit(stop.clone(), handler.clone());
+                // Required before the ring runs: WorkerRuntime reaches Tokio
+                // internally. See "Tokio coexistence" on this function.
+                let _tokio_guard = tokio_handle.enter();
 
-                    // Resident sends submit splice operations to this same
-                    // ring. No user-space send helper threads are created. Bound
-                    // both io-wq classes: regular-file and pipe/socket splice
-                    // may otherwise grow kernel workers with connection count.
-                    let mut rt = match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
-                        .with_iowq_max_workers(8, 8)
-                        .enable_timer()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            ready.lock().unwrap().push(format!("ring {ring_id}: {e}"));
-                            return;
+                // Pin before building the ring so its memory is allocated on
+                // the node this thread will actually run on. Pin to a CPU
+                // from the *allowed* set rather than to `ring_id`, so a
+                // restricted cpuset (Kubernetes CPU manager, taskset, NUMA
+                // pinning) is respected instead of escaped. A failure here is
+                // not fatal — pinning is an optimization, not a correctness
+                // requirement — but it is worth surfacing.
+                match allowed.get(ring_id % allowed.len().max(1)) {
+                    Some(&cpu) => {
+                        if let Err(e) = monoio::utils::bind_to_cpu_set(vec![cpu]) {
+                            tracing::warn!(
+                                ring = ring_id,
+                                cpu,
+                                error = ?e,
+                                "could not pin ring to cpu"
+                            );
                         }
-                    };
+                    }
+                    // Affinity unreadable: leave the thread unpinned rather
+                    // than guess a CPU that may not be ours.
+                    None => tracing::warn!(
+                        ring = ring_id,
+                        "cpu affinity unavailable; ring left unpinned"
+                    ),
+                }
 
-                    rt.block_on(async move {
-                        // SO_REUSEPORT is default-true in ListenerConfig: every ring
-                        // binds the same address and the kernel spreads accepts.
-                        let cfg = monoio::net::ListenerConfig::default();
-                        let listener =
-                            match monoio::net::TcpListener::bind_with_config(addr.as_str(), &cfg) {
-                                Ok(l) => l,
-                                Err(e) => {
-                                    ready.lock().unwrap().push(format!("ring {ring_id}: {e}"));
-                                    return;
-                                }
-                            };
-                        tracing::info!(ring = ring_id, %addr, "data-plane ring listening");
+                // Resident sends submit splice operations to this same
+                // ring. No user-space send helper threads are created. Bound
+                // both io-wq classes: regular-file and pipe/socket splice
+                // may otherwise grow kernel workers with connection count.
+                let mut rt = match monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                    .with_iowq_max_workers(8, 8)
+                    .enable_timer()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        stop.store(true, std::sync::atomic::Ordering::Release);
+                        ready.lock().unwrap().push(format!("ring {ring_id}: {e}"));
+                        return;
+                    }
+                };
 
-                        loop {
-                            // Preserve the worker-global pre-accept budget while
-                            // still allowing shutdown when all permits are held.
-                            let Some(permit) = acquire_until_stopped(&admission, &stop).await
-                            else {
-                                break;
-                            };
-                            let (stream, peer) = match accept_until_stopped(&listener, &stop).await
-                            {
-                                Ok(Some(v)) => v,
-                                Ok(None) => break,
-                                Err(e) => {
-                                    tracing::warn!(ring = ring_id, error = %e, "accept failed");
-                                    continue;
+                rt.block_on(async move {
+                    // SO_REUSEPORT is default-true in ListenerConfig: every ring
+                    // binds the same address and the kernel spreads accepts.
+                    let cfg = monoio::net::ListenerConfig::default();
+                    let listener =
+                        match monoio::net::TcpListener::bind_with_config(addr.as_str(), &cfg) {
+                            Ok(l) => l,
+                            Err(e) => {
+                                stop.store(true, std::sync::atomic::Ordering::Release);
+                                ready.lock().unwrap().push(format!("ring {ring_id}: {e}"));
+                                return;
+                            }
+                        };
+                    handler.listening();
+                    tracing::info!(ring = ring_id, %addr, "data-plane ring listening");
+
+                    let active = std::rc::Rc::new(std::cell::Cell::new(0usize));
+                    loop {
+                        // Preserve the worker-global pre-accept budget while
+                        // still allowing shutdown when all permits are held.
+                        let Some(permit) = acquire_until_stopped(&admission, &stop).await else {
+                            break;
+                        };
+                        let (stream, peer) = match accept_until_stopped(&listener, &stop).await {
+                            Ok(Some(v)) => v,
+                            Ok(None) => break,
+                            Err(e) => {
+                                tracing::warn!(ring = ring_id, error = %e, "accept failed");
+                                continue;
+                            }
+                        };
+                        let _ = stream.set_nodelay(true);
+                        let handler = handler.clone();
+                        active.set(active.get() + 1);
+                        let active = active.clone();
+                        monoio::spawn(async move {
+                            struct Finished(std::rc::Rc<std::cell::Cell<usize>>);
+                            impl Drop for Finished {
+                                fn drop(&mut self) {
+                                    self.0.set(self.0.get() - 1);
                                 }
-                            };
-                            let _ = stream.set_nodelay(true);
-                            let handler = handler.clone();
-                            monoio::spawn(async move {
-                                // The permit covers the accepted FD and task for
-                                // their complete lifetime.
-                                let _permit = permit;
-                                if let Err(e) = handler.handle(stream).await {
-                                    tracing::debug!(?peer, error = %e, "connection ended");
-                                }
-                            });
-                        }
-                    });
-                })?,
-        );
+                            }
+                            let _finished = Finished(active);
+                            // The permit covers the accepted FD and task for
+                            // their complete lifetime.
+                            let _permit = permit;
+                            if let Err(e) = handler.handle(stream).await {
+                                tracing::debug!(?peer, error = %e, "connection ended");
+                            }
+                        });
+                    }
+                    handler.begin_shutdown();
+                    drop(listener);
+                    while active.get() != 0 {
+                        monoio::time::sleep(std::time::Duration::from_millis(5)).await;
+                    }
+                });
+            });
+        match thread {
+            Ok(thread) => threads.push(thread),
+            Err(error) => {
+                // Already started rings must be joined before the caller can
+                // release cache ownership.
+                stop_all.store(true, std::sync::atomic::Ordering::Release);
+                handler_all.begin_shutdown();
+                for thread in threads {
+                    let _ = thread.join();
+                }
+                return Err(error.into());
+            }
+        }
     }
 
+    let mut panicked = false;
     for t in threads {
-        let _ = t.join();
+        panicked |= t.join().is_err();
+    }
+    if panicked {
+        anyhow::bail!("data-plane ring panicked");
     }
     let errors = ready.lock().unwrap();
     if !errors.is_empty() {
