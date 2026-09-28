@@ -151,7 +151,7 @@ async fn run() -> anyhow::Result<()> {
             "zone affinity configuration"
         );
     }
-    let reader = BlockReader::new(coordinator.clone(), cache, 1).with_zone_affinity(
+    let reader = BlockReader::new(coordinator.clone(), cache).with_zone_affinity(
         zone,
         zone_affinity,
         Arc::new(LoggingZoneObserver::default()),

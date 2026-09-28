@@ -157,3 +157,158 @@ async fn control_path_register_lookup_resolve() {
     let resolved = nodes.iter().find(|n| n.id == node.id).unwrap();
     assert_eq!(resolved.address, "127.0.0.1:9999");
 }
+
+/// Run the real CLI against the unified membership discovery protocol.
+async fn retained_cli(
+    view: talon_core::worker_membership::WorkerDiscovery,
+    args: &[&str],
+) -> std::process::Output {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let server = tokio::spawn(async move {
+        {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let frame = FrameHeader::decode(&header).unwrap();
+            let mut payload = vec![0; frame.length as usize];
+            socket.read_exact(&mut payload).await.unwrap();
+            let mut full = header.to_vec();
+            full.extend(payload);
+            let (_, request) = codec::decode(&full).unwrap();
+            assert_eq!(request, ControlMessage::MembershipQuery {});
+            let reply = ControlMessage::MembershipList { view };
+            socket
+                .write_all(&codec::encode(frame.request_id, &reply).unwrap())
+                .await
+                .unwrap();
+        }
+    });
+    let args: Vec<_> = args.iter().map(|s| s.to_string()).collect();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(coordinator_bin().with_file_name(if cfg!(windows) {
+            "talon-client.exe"
+        } else {
+            "talon-client"
+        }))
+        .args(["--coordinator", &address])
+        .args(args)
+        .output()
+        .unwrap()
+    })
+    .await
+    .unwrap();
+    server.await.unwrap();
+    output
+}
+
+#[tokio::test]
+async fn retained_cli_keeps_offline_owner_and_checks_discovery_expiry() {
+    use talon_core::worker_membership::*;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap().to_string();
+    let mut view = WorkerDiscovery {
+        topology_token: 1,
+        state_token: 1,
+        valid_for_ms: 500,
+        workers: ["w1", "w2"]
+            .into_iter()
+            .map(|id| DiscoveredWorker {
+                member: WorkerMember {
+                    worker_id: id.into(),
+                    zone: None,
+                    retired: false,
+                },
+                state: InstanceState::Serving {
+                    instance_id: format!("{id}-process"),
+                    address: address.clone(),
+                },
+            })
+            .collect(),
+    };
+    let block = BlockId::new(
+        ObjectId::new(Backend::Azure, "container", "object"),
+        0,
+        256 << 20,
+        Version::new("e2e-v1"),
+    );
+    let nodes: Vec<_> = view
+        .workers
+        .iter()
+        .map(|w| NodeInfo {
+            id: NodeId::new(&w.member.worker_id),
+            address: address.clone(),
+            role: NodeRole::Worker,
+        })
+        .collect();
+    let table = talon_core::CachePlacementTable::new(&nodes);
+    let owner = table.primary(&block).unwrap().id.0.clone();
+    view.workers
+        .iter_mut()
+        .find(|w| w.member.worker_id == owner)
+        .unwrap()
+        .state = InstanceState::Offline;
+
+    let members = retained_cli(view.clone(), &["--membership-only"]).await;
+    assert!(members.status.success(), "{:?}", members);
+    let stdout = String::from_utf8_lossy(&members.stdout);
+    assert!(
+        stdout.contains(&format!("member {owner} unavailable")),
+        "{stdout}"
+    );
+    assert!(stdout.contains("member w1 ") && stdout.contains("member w2 "));
+
+    let read_args = ["--path", "/az/container/object", "--len", "4"];
+    let offline = retained_cli(view.clone(), &read_args).await;
+    assert!(!offline.status.success());
+    let error = String::from_utf8_lossy(&offline.stderr);
+    assert!(
+        error.contains("Unavailable") && error.contains(&owner),
+        "{error}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err(),
+        "offline owner was replaced by an online member"
+    );
+
+    view.workers
+        .iter_mut()
+        .find(|w| w.member.worker_id == owner)
+        .unwrap()
+        .state = InstanceState::Serving {
+        instance_id: "restarted".into(),
+        address: address.clone(),
+    };
+    view.valid_for_ms = 0;
+    let expired = retained_cli(view.clone(), &read_args).await;
+    assert!(!expired.status.success());
+    assert!(String::from_utf8_lossy(&expired.stderr).contains("expired instance discovery"));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), listener.accept())
+            .await
+            .is_err()
+    );
+
+    view.valid_for_ms = 500;
+    let worker = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut header = [0; HEADER_LEN];
+        socket.read_exact(&mut header).await.unwrap();
+        let frame = FrameHeader::decode(&header).unwrap();
+        let mut payload = vec![0; frame.length as usize];
+        socket.read_exact(&mut payload).await.unwrap();
+        let mut full = header.to_vec();
+        full.extend(payload);
+        let (_, request) = talon_transport::decode_request(&full).unwrap();
+        assert_eq!(request.object, block.object);
+        let mut reply = talon_transport::response_header_ok(frame.request_id, 4).to_vec();
+        reply.extend([1, 2, 3, 4]);
+        socket.write_all(&reply).await.unwrap();
+    });
+    let recovered = retained_cli(view, &read_args).await;
+    assert!(recovered.status.success(), "{:?}", recovered);
+    assert!(String::from_utf8_lossy(&recovered.stdout).contains("first 4 bytes (hex): 01020304"));
+    worker.await.unwrap();
+}

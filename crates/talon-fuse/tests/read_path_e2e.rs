@@ -172,7 +172,7 @@ async fn cold_read_miss_then_warm_hit_same_bytes() {
     let coord = spawn_coordinator(vec![("w1".into(), worker)], Arc::clone(&counters)).await;
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
     let obj = object();
     let ver = Version::new("v1");
     let block_size = 1024u32;
@@ -220,7 +220,7 @@ async fn multi_block_read_stitches_contiguous_bytes() {
     let coord = spawn_coordinator(vec![("w1".into(), worker)], counters).await;
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
     let obj = object();
     let ver = Version::new("v1");
     let block_size = 1024u32;
@@ -287,7 +287,7 @@ async fn falls_back_to_healthy_replica() {
 
     let cache = Arc::new(PlacementCache::new(10_000));
     // Request k=2 so both replicas are cached and available for fallback.
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 2);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
     let obj = object();
     let ver = Version::new("v1");
     let view = FileView {

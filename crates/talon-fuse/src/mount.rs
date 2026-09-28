@@ -1699,7 +1699,6 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new("127.0.0.1:7000"),
             Arc::new(PlacementCache::new(1000)),
-            1,
         );
         let mounted = TalonFuse::new(
             Arc::clone(&fs),
@@ -1736,7 +1735,6 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new("127.0.0.1:9"), // unused; prefetch fetches just fail
             Arc::new(PlacementCache::new(1000)),
-            1,
         );
         TalonFuse::new(
             fs,

@@ -112,9 +112,6 @@ impl From<DetailedBlockReadError> for CacheReadError {
             DetailedBlockReadError::Worker(error) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Worker(error)) => error.into(),
-            DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed { source, .. }) => {
-                source.into()
-            }
             DetailedBlockReadError::Block(error) => Self::Unavailable(error.to_string()),
         }
     }
@@ -330,7 +327,6 @@ mod tests {
         let reader = BlockReader::new(
             crate::CoordinatorClient::new(coordinator),
             Arc::new(crate::PlacementCache::new(60_000)),
-            1,
         );
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
@@ -395,15 +391,14 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_replicas_preserve_stream_error_classification() {
+    fn block_failures_preserve_stream_error_classification() {
         for code in [DataErrorCode::Timeout, DataErrorCode::Internal] {
-            let error = DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
-                worker: "127.0.0.1:1234".into(),
-                source: WorkerError::Remote(DataPlaneError {
+            let error = DetailedBlockReadError::Block(BlockReadError::Worker(WorkerError::Remote(
+                DataPlaneError {
                     code,
                     message: "original worker diagnostic".into(),
-                }),
-            });
+                },
+            )));
             let error = CacheReadError::from(error);
             assert!(error.to_string().contains("original worker diagnostic"));
             match code {
@@ -425,7 +420,6 @@ mod tests {
         let reader = BlockReader::new(
             crate::CoordinatorClient::new("127.0.0.1:1"),
             Arc::new(crate::PlacementCache::new(1)),
-            1,
         );
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
@@ -463,7 +457,6 @@ mod tests {
         let reader = BlockReader::new(
             crate::CoordinatorClient::new(coordinator),
             Arc::new(crate::PlacementCache::new(60_000)),
-            1,
         );
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
@@ -498,7 +491,6 @@ mod tests {
         let reader = BlockReader::new(
             crate::CoordinatorClient::new(coordinator),
             Arc::new(crate::PlacementCache::new(60_000)),
-            1,
         );
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");

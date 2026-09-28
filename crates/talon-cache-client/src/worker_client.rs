@@ -101,6 +101,7 @@ impl WorkerError {
 #[derive(Debug, Clone)]
 pub struct WorkerClient {
     addr: String,
+    retry_reads: bool,
     pool: Arc<ConnectionPool>,
     /// Tenant every fetch from this client is attributed to. `Unattributed`
     /// unless set with [`with_tenant`](Self::with_tenant).
@@ -121,9 +122,16 @@ impl WorkerClient {
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
             addr: addr.into(),
+            retry_reads: true,
             pool,
             tenant: TenantId::Unattributed,
         }
+    }
+
+    /// Instance-bound readers never resend a read after a failed exchange.
+    pub(crate) fn without_read_retry(mut self) -> Self {
+        self.retry_reads = false;
+        self
     }
 
     /// The worker address this client talks to.
@@ -240,7 +248,7 @@ impl WorkerClient {
         // propagates immediately rather than re-asking the same peer.
         match self.exchange(&mut out, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, err)) if err.is_transport_failure() => {
+            Err((true, err)) if self.retry_reads && err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut out, &self.addr)?;
@@ -293,7 +301,7 @@ impl WorkerClient {
         let mut output = self.encode_range_request(request_id.0, request)?;
         match self.exchange_into(&mut output, dst).await {
             Ok(n) => Ok(n),
-            Err((true, err)) if err.is_transport_failure() => {
+            Err((true, err)) if self.retry_reads && err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
@@ -351,7 +359,7 @@ impl WorkerClient {
         let mut output = self.encode_versioned_range_request(request_id.0, request)?;
         match self.exchange(&mut output, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, error)) if error.is_transport_failure() => {
+            Err((true, error)) if self.retry_reads && error.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
@@ -405,7 +413,7 @@ impl WorkerClient {
         let mut output = self.encode_versioned_range_request(request_id.0, request)?;
         match self.exchange_into(&mut output, dst).await {
             Ok(n) => Ok(n),
-            Err((true, error)) if error.is_transport_failure() => {
+            Err((true, error)) if self.retry_reads && error.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
@@ -460,7 +468,7 @@ impl WorkerClient {
         let mut output = self.encode_cached_range_request(request_id.0, request)?;
         match self.exchange(&mut output, len).await {
             Ok(bytes) => Ok(bytes),
-            Err((true, err)) if err.is_transport_failure() => {
+            Err((true, err)) if self.retry_reads && err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
@@ -1493,6 +1501,45 @@ mod tests {
         assert_eq!(b, vec![7u8; 8]);
         // Two connections were accepted (the retry dialed a fresh one).
         assert_eq!(accepts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn instance_bound_read_does_not_redial_a_stale_connection() {
+        use std::sync::atomic::Ordering;
+        let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let accepts_srv = Arc::clone(&accepts);
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(v) => v,
+                    Err(_) => return,
+                };
+                accepts_srv.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut hdr = [0u8; HEADER_LEN];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let header = FrameHeader::decode(&hdr).unwrap();
+                    let mut body = vec![0u8; header.length as usize];
+                    sock.read_exact(&mut body).await.unwrap();
+                    let out = response_header_ok(0, 8).to_vec();
+                    let mut full = out;
+                    full.extend_from_slice(&[7u8; 8]);
+                    sock.write_all(&full).await.unwrap();
+                    sock.flush().await.unwrap();
+                });
+            }
+        });
+        let client = WorkerClient::new(addr).without_read_retry();
+
+        let a = client.fetch_range(&object(), 0, 8).await.unwrap();
+        assert_eq!(a, vec![7u8; 8]);
+        let error = client.fetch_range(&object(), 0, 8).await.unwrap_err();
+        assert!(error.is_transport_failure());
+        assert_eq!(accepts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

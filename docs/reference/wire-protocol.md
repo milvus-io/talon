@@ -199,9 +199,9 @@ reconnect**, not attempt to resynchronise.
 
 A correct client does more than encode messages:
 
-**Client-side placement.** Current clients cache the healthy workers returned by
-`MembershipList` and build a deterministic Maglev table when that membership
-changes. Workers sort by stable ID. The table size is the next power of two at
+**Client-side placement.** Clients cache the persistent logical workers returned
+by `MembershipList` and build a deterministic Maglev table when its topology
+changes. Offline and conflicted workers remain in placement. Workers sort by stable ID. The table size is the next power of two at
 or above `max(4096, 64 * worker_count)`; SHA-256 domains
 `talon-cache-maglev-worker-v1\0` and `talon-cache-maglev-block-v1\0` derive
 worker permutations and block slots from the same canonical length-delimited
@@ -209,17 +209,18 @@ fields in every language. A primary lookup is one block hash and one table
 access, O(1) regardless of worker count. `PlacementLookup` remains a
 compatibility operation for older clients.
 
-**Placement caching.** Cache locally ranked worker addresses rather than node
-IDs. When membership identity or address changes, invalidate affected placement
-entries and resolve them against the rebuilt table.
+**Instance discovery.** Placement selects a logical worker ID. The same discovery
+snapshot resolves that ID to its sole serving instance and address. Instance or
+address changes replace the isolated connection pool without changing logical
+ownership. The observation expires after the smaller of the advertised lifetime,
+the client's configured TTL, and 500 ms; expired instances cannot serve reads.
 
-**Replica fallback.** On a fetch failure, walk the cached replicas in order. If
-all are exhausted, invalidate the entry, refresh membership once, and retry
-before giving up. Concurrent failures share a completed membership refresh; a
-later read can refresh again even if that attempt failed or returned unchanged
-membership. If membership refresh fails, an existing client retains its
-last-good snapshot so a coordinator outage does not interrupt cached data-plane
-placement.
+**Single-attempt reads.** Each block read tries its selected instance once. An
+offline or conflicted owner, expired discovery, or worker error is returned to the
+caller without refreshing and resending that request or switching owners. A
+later request refreshes expired discovery; concurrent refreshes are serialized
+and cached snapshots limit refreshes to one per 100 ms. Last-good snapshots are
+retained for diagnostics, but never permit reads through expired instances.
 
 **Legacy epoch reconciliation.** `PlacementResponse` carries the epoch its
 owners were computed at. Clients still using this compatibility operation must

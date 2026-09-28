@@ -244,7 +244,6 @@ mod tests {
         BlockReader::new(
             CoordinatorClient::new(coord_addr),
             Arc::new(PlacementCache::new(10_000)),
-            1,
         )
     }
 

@@ -40,7 +40,6 @@ struct Settings {
     block_size: u32,
     transfer_chunk_bytes: u32,
     placement_ttl_ms: u64,
-    replicas: u8,
     max_body_bytes: usize,
     request_deadline_ms: u64,
     route: GatewayRoute,
@@ -136,11 +135,6 @@ impl Settings {
             value(&mut get, "TALON_GATEWAY_PLACEMENT_TTL_MS"),
             "5000",
             "TALON_GATEWAY_PLACEMENT_TTL_MS",
-        )?;
-        let replicas = parse_or(
-            value(&mut get, "TALON_GATEWAY_REPLICAS"),
-            "1",
-            "TALON_GATEWAY_REPLICAS",
         )?;
         let max_body_bytes = parse_or(
             value(&mut get, "TALON_GATEWAY_MAX_BODY_BYTES"),
@@ -261,7 +255,6 @@ impl Settings {
             block_size,
             transfer_chunk_bytes,
             placement_ttl_ms,
-            replicas,
             max_body_bytes,
             request_deadline_ms,
             route,
@@ -399,7 +392,6 @@ fn cache_reader(
         BlockReader::new(
             CoordinatorClient::new(&settings.coordinator),
             Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
-            settings.replicas,
         )
         .with_zone_affinity(
             zone,
@@ -1189,7 +1181,6 @@ mod tests {
         Arc::new(BlockReader::new(
             CoordinatorClient::new(&settings.coordinator),
             Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
-            1,
         ))
     }
 

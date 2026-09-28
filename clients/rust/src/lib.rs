@@ -26,24 +26,19 @@
 //!             CacheReadError::InvalidRequest(diagnostic.clone()),
 //!         Error::Coordinator(source)
 //!         | Error::Block(BlockReadError::Coordinator(source)) => source.into(),
-//!         Error::Block(BlockReadError::Worker(source))
-//!         | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),
-//!         Error::Block(BlockReadError::NoOwners | BlockReadError::UnresolvedOwner) =>
+//!         Error::Block(BlockReadError::Worker(source)) => source.into(),
+//!         Error::Block(BlockReadError::NoOwners) =>
 //!             CacheReadError::Unavailable(diagnostic.clone()),
 //!     };
 //!     (class, diagnostic)
 //! }
 //!
-//! let error = Error::from(BlockReadError::AllReplicasFailed {
-//!     worker: "worker-1:9000".into(),
-//!     source: WorkerError::Remote(DataPlaneError {
+//! let error = Error::from(BlockReadError::Worker(WorkerError::Remote(DataPlaneError {
 //!         code: DataErrorCode::VersionMismatch,
 //!         message: "object changed".into(),
-//!     }),
-//! });
+//! })));
 //! let (class, diagnostic) = classify(error);
 //! assert!(matches!(class, CacheReadError::VersionMismatch(_)));
-//! assert!(diagnostic.contains("worker-1:9000"));
 //! assert!(diagnostic.contains("object changed"));
 //! ```
 

@@ -13,7 +13,6 @@ use talon_cache_client::{
 };
 
 const PLACEMENT_TTL_MS: u64 = 30_000;
-const REPLICAS_K: u8 = 1;
 
 // Limit task allocation and let other logical reads make progress.
 const MAX_CONCURRENT_BLOCK_READS_PER_READ: usize = 8;
@@ -116,10 +115,9 @@ impl ClientBuilder {
             )),
         );
         let cache = Arc::new(PlacementCache::new(PLACEMENT_TTL_MS));
-        let reader =
-            BlockReader::new(coordinator.clone(), cache, REPLICAS_K).with_worker_pool(Arc::new(
-                ConnectionPool::with_limits(max_idle_per_addr, DEFAULT_IDLE_TTL),
-            ));
+        let reader = BlockReader::new(coordinator.clone(), cache).with_worker_pool(Arc::new(
+            ConnectionPool::with_limits(max_idle_per_addr, DEFAULT_IDLE_TTL),
+        ));
         Ok(Client {
             coordinator,
             reader,
@@ -708,32 +706,34 @@ mod tests {
                 let started_notify = Arc::clone(&started_notify);
                 let release = Arc::clone(&release);
                 tokio::spawn(async move {
-                    let mut header_bytes = [0_u8; HEADER_LEN];
-                    if socket.read_exact(&mut header_bytes).await.is_err() {
-                        return;
+                    loop {
+                        let mut header_bytes = [0_u8; HEADER_LEN];
+                        if socket.read_exact(&mut header_bytes).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&header_bytes).unwrap();
+                        let mut payload = vec![0_u8; header.length as usize];
+                        socket.read_exact(&mut payload).await.unwrap();
+                        let mut frame = header_bytes.to_vec();
+                        frame.extend_from_slice(&payload);
+                        let (_, request) = decode_versioned_request(&frame).unwrap();
+                        assert_eq!(request.version.0.as_str(), "test-version");
+                        let request = request.request;
+
+                        let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(active_now, Ordering::SeqCst);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        started_notify.notify_waiters();
+                        release.acquire().await.unwrap().forget();
+
+                        let bytes: Vec<u8> = (0..request.len)
+                            .map(|index| ((request.offset + index) % 251) as u8)
+                            .collect();
+                        let mut response = response_header_ok(0, bytes.len() as u32).to_vec();
+                        response.extend_from_slice(&bytes);
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        socket.write_all(&response).await.unwrap();
                     }
-                    let header = FrameHeader::decode(&header_bytes).unwrap();
-                    let mut payload = vec![0_u8; header.length as usize];
-                    socket.read_exact(&mut payload).await.unwrap();
-                    let mut frame = header_bytes.to_vec();
-                    frame.extend_from_slice(&payload);
-                    let (_, request) = decode_versioned_request(&frame).unwrap();
-                    assert_eq!(request.version.0.as_str(), "test-version");
-                    let request = request.request;
-
-                    let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(active_now, Ordering::SeqCst);
-                    started.fetch_add(1, Ordering::SeqCst);
-                    started_notify.notify_waiters();
-                    release.acquire().await.unwrap().forget();
-
-                    let bytes: Vec<u8> = (0..request.len)
-                        .map(|index| ((request.offset + index) % 251) as u8)
-                        .collect();
-                    let mut response = response_header_ok(0, bytes.len() as u32).to_vec();
-                    response.extend_from_slice(&bytes);
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    socket.write_all(&response).await.unwrap();
                 });
             }
         });
