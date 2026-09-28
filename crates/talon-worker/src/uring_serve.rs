@@ -768,11 +768,29 @@ mod tests {
         }
     }
 
-    /// Count established sockets owned by this process whose local port is the
-    /// server port. Correlating `/proc/net/tcp` inodes with `/proc/self/fd`
-    /// excludes client-side sockets in this test and connections still queued in
-    /// the kernel backlog.
-    fn accepted_server_fds(port: u16) -> usize {
+    /// Count accepted sockets for these clients, using their complete reversed
+    /// local/remote tuples. A local port alone can match unrelated connections
+    /// from parallel tests. Inode ownership excludes peers in the kernel backlog.
+    fn accepted_server_fds(clients: &[std::net::TcpStream]) -> usize {
+        fn endpoint(addr: std::net::SocketAddr) -> String {
+            let std::net::SocketAddr::V4(addr) = addr else {
+                panic!("this fixture uses IPv4 and /proc/net/tcp");
+            };
+            format!(
+                "{:08X}:{:04X}",
+                u32::from_ne_bytes(addr.ip().octets()),
+                addr.port()
+            )
+        }
+        let connections: HashSet<_> = clients
+            .iter()
+            .map(|client| {
+                (
+                    endpoint(client.peer_addr().unwrap()),
+                    endpoint(client.local_addr().unwrap()),
+                )
+            })
+            .collect();
         let socket_inodes: HashSet<String> = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(Result::ok)
@@ -785,23 +803,41 @@ mod tests {
                     .map(str::to_owned)
             })
             .collect();
-        let expected_port = format!("{port:04X}");
         std::fs::read_to_string("/proc/net/tcp")
             .unwrap()
             .lines()
             .skip(1)
-            .filter(|line| {
+            .filter_map(|line| {
                 let fields: Vec<_> = line.split_whitespace().collect();
-                fields.get(1).is_some_and(|local| {
-                    local
-                        .rsplit_once(':')
-                        .is_some_and(|(_, local_port)| local_port == expected_port)
-                }) && fields.get(3) == Some(&"01")
-                    && fields
-                        .get(9)
-                        .is_some_and(|inode| socket_inodes.contains(*inode))
+                let inode = *fields.get(9)?;
+                (fields[3] == "01"
+                    && connections.contains(&(fields[1].to_owned(), fields[2].to_owned()))
+                    && socket_inodes.contains(inode))
+                .then(|| inode.to_owned())
             })
-            .count()
+            .collect::<HashSet<_>>()
+            .len()
+    }
+
+    #[test]
+    fn accepted_fd_count_excludes_unrelated_connections() {
+        let target = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let target_addr = target.local_addr().unwrap();
+        let foreign = std::net::TcpListener::bind(("127.0.0.2", target_addr.port())).unwrap();
+        let client = std::net::TcpStream::connect(target_addr).unwrap();
+        let _accepted = target.accept().unwrap();
+        // Same local port, but a different local address.
+        let foreign_client = std::net::TcpStream::connect(foreign.local_addr().unwrap()).unwrap();
+        let _foreign_accepted = foreign.accept().unwrap();
+        // Same server endpoint, but not one of the measured clients.
+        let other_client = std::net::TcpStream::connect(target_addr).unwrap();
+        let _other_accepted = target.accept().unwrap();
+        assert_eq!(accepted_server_fds(std::slice::from_ref(&client)), 1);
+        assert_eq!(
+            accepted_server_fds(std::slice::from_ref(&foreign_client)),
+            1
+        );
+        assert_eq!(accepted_server_fds(&[client, other_client]), 2);
     }
 
     fn await_zero(counter: &AtomicUsize) {
@@ -880,7 +916,7 @@ mod tests {
             resident_bytes.load(Ordering::Relaxed),
             CAPACITY * BYTES_PER_CONNECTION
         );
-        assert_eq!(accepted_server_fds(socket_addr.port()), CAPACITY);
+        assert_eq!(accepted_server_fds(&clients), CAPACITY);
         let saturation = metrics
             .render()
             .lines()

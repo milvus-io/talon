@@ -132,7 +132,7 @@ struct Args {
     /// Logical cluster advertised by worker status.
     #[arg(long)]
     cluster_id: Option<String>,
-    /// Stable node identity; defaults to the RPC listen address.
+    /// Import a stable node identity; thereafter must match worker_identity.
     #[arg(long)]
     node_id: Option<String>,
     /// Heartbeat interval in milliseconds; detected failures retain readiness
@@ -368,7 +368,7 @@ async fn run() -> anyhow::Result<()> {
     };
     let env = WorkerConfigPatch::from_env()?;
     let cli = args.into_patch();
-    let cfg = WorkerConfig::resolve(file, env, cli)?;
+    let mut cfg = WorkerConfig::resolve(file, env, cli)?;
 
     tracing::info!(
         listen = %cfg.listen,
@@ -399,6 +399,13 @@ async fn run() -> anyhow::Result<()> {
     let cache_root_lock = Arc::new(talon_worker::page_access_store::CacheRootLock::acquire(
         &root,
     )?);
+    let identity = cache_root_lock.load_identity(
+        &cfg.cluster_id,
+        cfg.node_id.as_deref(),
+        cfg.block_size,
+        cfg.l2_page_size_bytes,
+    )?;
+    cfg.node_id = Some(identity.worker_id);
     let store = WholeBlockStore::open(&root)?.with_root_lock(cache_root_lock.clone());
     // Paged L2 is opt-in: with `l2_page_size_bytes` set, a miss materializes only
     // the pages a read touches, under `<root>/paged`, instead of whole blocks.
@@ -431,7 +438,8 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "failed to scan on-disk paged cache");
+                return Err(error)
+                    .map_err(|error| anyhow::anyhow!("failed to recover paged cache: {error}"));
             }
         }
     }
@@ -450,7 +458,8 @@ async fn run() -> anyhow::Result<()> {
             }
         }
         Err(error) => {
-            tracing::warn!(%error, "failed to scan on-disk cache; starting with an empty index");
+            return Err(error)
+                .map_err(|error| anyhow::anyhow!("failed to recover block cache: {error}"));
         }
     }
     let inflight = Arc::new(InFlightLoads::new());

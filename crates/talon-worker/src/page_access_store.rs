@@ -195,6 +195,7 @@ impl PageAccessStore {
 /// Held for the entire worker lifetime, even when TTI is disabled.
 pub struct CacheRootLock {
     _file: File,
+    pub(crate) root: std::path::PathBuf,
 }
 impl CacheRootLock {
     pub fn acquire(root: &Path) -> anyhow::Result<Self> {
@@ -212,7 +213,10 @@ impl CacheRootLock {
                 std::io::Error::last_os_error()
             ));
         }
-        Ok(Self { _file: file })
+        Ok(Self {
+            _file: file,
+            root: root.to_owned(),
+        })
     }
 }
 

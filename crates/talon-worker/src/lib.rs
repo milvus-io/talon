@@ -11,6 +11,7 @@ mod data_error;
 pub mod eviction;
 mod fd_cache;
 pub mod flusher;
+pub mod identity;
 pub mod index;
 pub mod loader;
 pub mod mapping_guard;
