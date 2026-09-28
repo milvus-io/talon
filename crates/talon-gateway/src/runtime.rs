@@ -890,14 +890,17 @@ async fn request_lifecycle(
     if let Ok(value) = HeaderValue::from_str(&request_id) {
         response.headers_mut().insert(REQUEST_ID_HEADER, value);
     }
-    tracing::info!(
-        request_id,
-        method = %method,
-        status = response.status().as_u16(),
-        elapsed_ms = started.elapsed().as_millis() as u64,
-        protocol = runtime.adapter.protocol().label(),
-        "gateway request headers completed"
-    );
+    // Successful probes and scrapes are routine; retain failures for diagnosis.
+    if !operational || !response.status().is_success() {
+        tracing::info!(
+            request_id,
+            method = %method,
+            status = response.status().as_u16(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            protocol = runtime.adapter.protocol().label(),
+            "gateway request headers completed"
+        );
+    }
     response
 }
 
