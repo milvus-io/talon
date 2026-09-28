@@ -130,6 +130,7 @@ impl KubernetesConfig {
 /// Strongly consistent Kubernetes-backed [`ClusterStateStore`].
 pub struct KubernetesStateStore {
     api: Api<Lease>,
+    registry_api: Api<k8s_openapi::api::core::v1::ConfigMap>,
     cluster_id: String,
     request_timeout: Duration,
 }
@@ -172,7 +173,8 @@ impl KubernetesStateStore {
         request_timeout: Duration,
     ) -> Self {
         Self {
-            api: Api::namespaced(client, &config.namespace),
+            api: Api::namespaced(client.clone(), &config.namespace),
+            registry_api: Api::namespaced(client, &config.namespace),
             cluster_id: config.cluster_id.clone(),
             request_timeout,
         }
@@ -245,6 +247,100 @@ impl KubernetesStateStore {
 impl ClusterStateStore for KubernetesStateStore {
     fn backend(&self) -> StateBackend {
         StateBackend::Kubernetes
+    }
+
+    async fn member_registry(
+        &self,
+        cluster: &str,
+    ) -> StateStoreResult<super::registry::RegistrySnapshot> {
+        if cluster != self.cluster_id {
+            return Err(super::registry::invalid(
+                BACKEND,
+                "registry cluster mismatch",
+            ));
+        }
+        let name = self.lease_name("members", &NodeId::new("registry"));
+        match self.with_timeout(self.registry_api.get_opt(&name)).await? {
+            Some(record) => {
+                let bytes = record
+                    .data
+                    .as_ref()
+                    .and_then(|d| d.get("registry.json"))
+                    .ok_or_else(|| super::registry::invalid(BACKEND, "missing registry.json"))?;
+                Ok(super::registry::RegistrySnapshot {
+                    value: super::registry::decode(bytes.as_bytes(), BACKEND)?,
+                    revision: Some(revision(
+                        record
+                            .metadata
+                            .resource_version
+                            .as_deref()
+                            .unwrap_or_default(),
+                    )?),
+                })
+            }
+            None => Ok(super::registry::RegistrySnapshot {
+                value: Default::default(),
+                revision: None,
+            }),
+        }
+    }
+    async fn compare_member_registry(
+        &self,
+        cluster: &str,
+        expected: Option<&StoreRevision>,
+        value: &talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<bool> {
+        if cluster != self.cluster_id {
+            return Err(super::registry::invalid(
+                BACKEND,
+                "registry cluster mismatch",
+            ));
+        }
+        let bytes = super::registry::encode(value, BACKEND)?;
+        let name = self.lease_name("members", &NodeId::new("registry"));
+        let resource = k8s_openapi::api::core::v1::ConfigMap {
+            // No Pod owner reference: the record must survive all Pod deletions.
+            metadata: ObjectMeta {
+                name: Some(name.clone()),
+                resource_version: expected
+                    .map(|r| {
+                        r.as_str()
+                            .strip_prefix("k8s:")
+                            .ok_or_else(|| {
+                                super::registry::invalid(
+                                    BACKEND,
+                                    "non-Kubernetes registry revision",
+                                )
+                            })
+                            .map(str::to_owned)
+                    })
+                    .transpose()?,
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([(
+                "registry.json".into(),
+                String::from_utf8(bytes).expect("JSON UTF-8"),
+            )])),
+            ..Default::default()
+        };
+        let result = tokio::time::timeout(self.request_timeout, async {
+            if expected.is_some() {
+                self.registry_api
+                    .replace(&name, &PostParams::default(), &resource)
+                    .await
+            } else {
+                self.registry_api
+                    .create(&PostParams::default(), &resource)
+                    .await
+            }
+        })
+        .await
+        .map_err(|_| StateStoreError::Timeout { backend: BACKEND })?;
+        match result {
+            Ok(_) => Ok(true),
+            Err(kube::Error::Api(e)) if e.code == 409 => Ok(false),
+            Err(e) => Err(map_kube_error(e)),
+        }
     }
 
     async fn upsert_node(

@@ -46,3 +46,9 @@ pub use status::{
 pub use store::{BlockHandle, ObjectStore};
 pub use tenant::{TenantId, TenantIdError, MAX_TENANT_ID_BYTES};
 pub use trace::{init_tracing, RequestId};
+
+pub mod worker_membership;
+
+/// Maximum business payload of a control frame. Persistent membership admission
+/// and transport readers share this bound so every legal registry is discoverable.
+pub const MAX_CONTROL_PAYLOAD_BYTES: usize = 1 << 20;

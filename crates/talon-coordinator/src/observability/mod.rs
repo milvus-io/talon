@@ -26,7 +26,8 @@ fn state_error_kind(error: &StateStoreError) -> &'static str {
         StateStoreError::Unavailable { .. } => "unavailable",
         StateStoreError::Compacted { .. } => "compacted",
         StateStoreError::WatchLagged { .. } => "watch_lagged",
-        StateStoreError::InvalidRecord(_)
+        StateStoreError::InvalidRegistry { .. }
+        | StateStoreError::InvalidRecord(_)
         | StateStoreError::InvalidLeaseTtl(_)
         | StateStoreError::InvalidRevision { .. } => "invalid",
     }

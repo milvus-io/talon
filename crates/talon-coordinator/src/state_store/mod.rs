@@ -11,6 +11,7 @@ mod etcd;
 #[cfg(feature = "kubernetes")]
 mod kubernetes;
 mod memory;
+pub mod registry;
 
 #[cfg(any(test, feature = "state-store-testkit"))]
 #[doc(hidden)]
@@ -181,6 +182,31 @@ pub trait ClusterStateStore: Send + Sync {
         after_revision: Option<&StoreRevision>,
     ) -> StateStoreResult<Box<dyn ClusterStateWatch>>;
 
+    /// Read the persistent cluster registry; absence means legacy/empty.
+    async fn member_registry(
+        &self,
+        _cluster: &str,
+    ) -> StateStoreResult<registry::RegistrySnapshot> {
+        Err(registry::invalid(
+            self.backend(),
+            "member registry unsupported",
+        ))
+    }
+
+    /// Compare and swap the complete resource using an opaque backend revision.
+    /// `None` requires absence. False means another writer won; never overwrite it.
+    async fn compare_member_registry(
+        &self,
+        _cluster: &str,
+        _expected: Option<&StoreRevision>,
+        _value: &talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<bool> {
+        Err(registry::invalid(
+            self.backend(),
+            "member registry unsupported",
+        ))
+    }
+
     /// Verify the backend can serve authoritative requests.
     async fn check_ready(&self) -> StateStoreResult<BackendHealth>;
 }
@@ -191,6 +217,15 @@ pub enum StateStoreError {
     /// A status record violated the shared schema contract.
     #[error("invalid node status: {0}")]
     InvalidRecord(#[from] NodeStatusError),
+    /// Persistent membership bytes or registry semantics violated their contract.
+    /// Retrying a transport operation cannot repair invalid authoritative state.
+    #[error("{backend} member registry invalid: {detail}")]
+    InvalidRegistry {
+        /// Selected backend.
+        backend: StateBackend,
+        /// Diagnostic detail without credentials.
+        detail: String,
+    },
     /// A lease duration was zero or could not be represented.
     #[error("invalid lease TTL: {0:?}")]
     InvalidLeaseTtl(Duration),
