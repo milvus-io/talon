@@ -240,3 +240,37 @@ just gen-conformance-vectors
 If that produces a diff, the wire format changed. Bump
 `CONTROL_SCHEMA_VERSION` when the change is not backward compatible, update the
 other clients, and commit the regenerated vectors in the same change.
+
+## Retained membership (schema 6)
+
+Existing enum tags 0–20 and their minimum schema versions are unchanged. The
+following variants are appended; old implementations reject schema 6 explicitly.
+A client starts with legacy membership discovery and negotiates retained mode
+only on `MembershipCapabilityRequired`, without parsing diagnostic strings.
+
+| Tag | Message | Fields in bincode order |
+|---|---|---|
+| 21 | `WorkerDiscoveryQuery` | none |
+| 22 | `WorkerDiscovery` | `mode: u32`, `topology_token: u64`, `state_token: u64`, `valid_for_ms: u64`, `workers: Vec<DiscoveredWorker>` |
+| 23 | `WorkerInstanceHeartbeat` | existing `NodeStatus`, `writable: bool` |
+| 24 | `WorkerInstanceAck` | `accepted: bool`, `serving: bool`, `mode: u32`, `detail: Option<String>` |
+| 25 | `MembershipCapabilityRequired` | none |
+| 26 | `ControlFailure` | existing `DataErrorCode` discriminant, `message: String` |
+
+`mode` is Legacy=0 or Retained=1. A DiscoveredWorker is a WorkerMember
+(`worker_id: String`, `zone: Option<String>`, `retired: bool`) followed by
+InstanceState: Offline=0, Conflict=1, Serving=2. Serving carries
+`instance_id: String`, then `address: String`. Integers, enum tags and lengths
+use the existing little-endian fixed-int bincode encoding. Both tokens are
+opaque equality values. Neither an address change nor lease expiry changes the
+logical topology token. The monotonic client freshness deadline is bounded by
+`valid_for_ms` (at most 500); expired or conflicting owners return availability
+errors without dialing another member. A failed retained data read is never
+resent; later requests can refresh and recover.
+
+Retained Coordinators forward Stat/List with an explicitly selected schema 6.
+Workers return typed ControlFailure to such peers; older metadata requests
+retain Ack failures. ControlFailure uses the existing availability, timeout,
+version, origin, internal and rate-limit categories; only availability and
+timeout permit caller fallback. The conformance vectors include schema-6
+membership and metadata failure examples.

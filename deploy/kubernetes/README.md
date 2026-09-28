@@ -17,9 +17,9 @@ authorization are implemented in issue #446.
 | `service.yaml` | ClusterIP Service + PodDisruptionBudget (`minAvailable: 2`). Apply for either backend. |
 | `coordinator-kubernetes.yaml` | Coordinator Deployment using the Kubernetes Lease backend (no external creds). |
 | `coordinator-etcd.yaml` | Coordinator Deployment using an external etcd backend (Secret-mounted creds/TLS). |
-| `worker.yaml` | Worker Deployment (cache nodes) + ServiceAccount. Shared by both coordinator backends. |
+| `worker.yaml` | Worker StatefulSet, governing Service and ServiceAccount. Shared by both coordinator backends. |
 | `worker-secret.example.yaml` | Template Secret for the worker's object-store (Azure account/SAS) credentials. |
-| `rbac.yaml` | Least-privilege namespaced Lease RBAC. **Kubernetes backend only.** |
+| `rbac.yaml` | Namespaced Lease and membership ConfigMap RBAC, plus optional node-zone reading. **Kubernetes backend only.** |
 | `etcd-secret.example.yaml` | Template Secret for etcd endpoints/credentials/TLS and the optional management token. **etcd backend only.** |
 | `servicemonitor.yaml` | Prometheus Operator ServiceMonitor (or use the pod scrape annotations). |
 | `gateway-s3-sidecar.yaml` | Loopback-only S3 gateway sidecar template. |
@@ -47,9 +47,9 @@ kubectl create secret generic talon-worker-backend -n talon \
 kubectl apply -n talon -f worker.yaml
 ```
 
-The workers are horizontally scalable (`kubectl scale deployment/talon-worker
---replicas=N`) and independent of the coordinator's HA backend. The cache is an
-`emptyDir`; swap in a PVC for a node-local SSD in production.
+Workers use `kubectl scale statefulset/talon-worker --replicas=N` and retained
+per-ordinal PVCs. Scaling down keeps logical members offline until explicit
+retirement. Provision the `talon-local` class/PVs or adapt the storage class.
 
 ## Quick start — external etcd backend
 
@@ -95,7 +95,15 @@ The `talon-observability` crate embeds these manifests and validates them in the
 standard `cargo test` job (no cluster needed): every document parses, both
 coordinator Deployments run ≥3 replicas with all three probes and a quorum-safe
 rollout, exactly one backend is selected per Deployment, the RBAC is a
-namespaced Lease-only Role (no ClusterRole, no secrets), etcd credentials are
+namespaced Lease/ConfigMap Role (no secrets; node-zone reading uses a separate ClusterRole), etcd credentials are
 `secretKeyRef`s (never inline), and the example Secret contains only
-placeholders. The worker Deployment is validated too: it runs non-root with all
+placeholders. The worker StatefulSet is validated too: it runs non-root with all
 three probes and takes its object-store credentials from a Secret, never inline.
+
+## Persistent Worker upgrade
+
+Workers use a StatefulSet with retained per-ordinal PVCs. Provision the
+`talon-local` class and one PV per slot (adapt `worker-local-pv.example.yaml`),
+or select your existing persistent class. Migrating an old Deployment requires
+explicit volume preservation and rebinding; follow the
+[rolling-upgrade runbook](../../docs/how-to/rolling-upgrade.md).

@@ -39,9 +39,15 @@ kubectl create secret generic talon-worker-backend -n talon \
   --from-literal=azure-account="$ACCOUNT" --from-literal=azure-sas="$SAS"
 ```
 
-Set `worker.persistence.enabled=true` to back the cache with a PVC (node-local
-SSD) instead of an `emptyDir`. Disable workers entirely with
-`worker.enabled=false`.
+Workers use a StatefulSet with retained PVCs by default. Set
+`worker.persistence.storageClass` for your local/persistent storage class.
+Disabling persistence is for disposable development. Disable workers entirely
+with `worker.enabled=false`.
+
+Chart 0.2 changes workload kind and requires explicit migration from the old
+Deployment and ephemeral claims. Follow the [rolling-upgrade runbook](../../../docs/how-to/rolling-upgrade.md)
+before upgrading an existing release or activating retained membership.
+Use `worker.rollingUpdate.partition` to advance one canary ordinal at a time.
 
 ## Key values
 

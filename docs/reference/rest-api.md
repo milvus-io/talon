@@ -2,7 +2,7 @@
 
 > **Generated file — do not edit by hand.** Rendered from `crates/talon-coordinator/src/openapi.json` by `talon-gen-api-docs`; CI fails if it drifts. To change it, edit the OpenAPI spec and regenerate.
 
-Read-only, versioned view of the live Talon cluster served by every coordinator from shared cluster state. Responses are equivalent across coordinators for the same backend revision.
+Versioned cluster views and revision-checked membership administration. Worker discovery uses independent topology/state tokens; legacy node views retain their backend revision semantics.
 
 **API version:** `v1`
 
@@ -88,6 +88,41 @@ This OpenAPI document
 | Status | Body | Description |
 |--------|------|-------------|
 | `200` | — | The OpenAPI 3.0 contract. |
+
+### `GET /api/v1/worker-discovery`
+
+Retained members and sole serving process observations
+
+**Responses:**
+
+| Status | Body | Description |
+|--------|------|-------------|
+| `200` | — | WorkerDiscovery JSON. Freshness is at most 500ms; responses are not a durable serving lease. |
+| `503` | — | Registry or instance state unavailable. |
+
+### `GET /api/v1/worker-membership`
+
+Persistent Worker registry and opaque CAS revision
+
+**Responses:**
+
+| Status | Body | Description |
+|--------|------|-------------|
+| `200` | — | registry_revision (nullable string), topology_token and registry (format_version, mode Legacy/Retained, members with worker_id, nullable zone, retired). |
+| `503` | — | Backend unavailable or invalid registry. |
+
+### `PUT /api/v1/worker-membership`
+
+Activate mode, import, retire or explicitly reactivate members
+
+**Responses:**
+
+| Status | Body | Description |
+|--------|------|-------------|
+| `204` | — | Applied. |
+| `400` | — | Missing preflight confirmation or malformed request. |
+| `409` | — | Registry revision changed; reload before constructing another request. |
+| `503` | — | Backend unavailable, invalid membership update, or active instance prevents retirement. |
 
 ## Schemas
 

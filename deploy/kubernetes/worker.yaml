@@ -1,16 +1,6 @@
-# Talon worker Deployment — cache nodes that register with the coordinator
-# Service and serve object ranges from a local cache backed by an object store.
-#
-# Workers are horizontally scalable and independent of the coordinator's HA
-# backend, so this manifest is shared by BOTH coordinator variants
-# (coordinator-kubernetes.yaml and coordinator-etcd.yaml). Apply it alongside
-# whichever coordinator you chose:
-#   kubectl apply -n talon -f service.yaml -f coordinator-etcd.yaml -f worker.yaml
-#
-# Object-store credentials (Azure account + SAS) come from a Secret
-# (talon-worker-backend, see worker-secret.example.yaml) — never baked into the
-# image or committed. The cache is an emptyDir here; swap in a PVC for a
-# node-local SSD in production.
+# Persistent Worker slots. Each ordinal reopens its retained cache PVC and
+# worker_identity. See docs/how-to/rolling-upgrade.md before migrating a Deployment.
+# Provision matching PVs or change storageClassName to your persistent class.
 apiVersion: v1
 kind: ServiceAccount
 metadata:
@@ -21,7 +11,7 @@ metadata:
     app.kubernetes.io/component: worker
 ---
 apiVersion: apps/v1
-kind: Deployment
+kind: StatefulSet
 metadata:
   name: talon-worker
   namespace: talon
@@ -30,16 +20,21 @@ metadata:
     app.kubernetes.io/component: worker
 spec:
   replicas: 3
+  serviceName: talon-worker
+  podManagementPolicy: OrderedReady
+  minReadySeconds: 15
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
   revisionHistoryLimit: 5
   selector:
     matchLabels:
       app.kubernetes.io/name: talon
       app.kubernetes.io/component: worker
-  strategy:
+  updateStrategy:
     type: RollingUpdate
     rollingUpdate:
-      maxUnavailable: 1
-      maxSurge: 1
+      partition: 0
   template:
     metadata:
       labels:
@@ -51,7 +46,7 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: talon-worker
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -76,11 +71,6 @@ spec:
             matchLabels:
               app.kubernetes.io/name: talon
               app.kubernetes.io/component: worker
-      volumes:
-        # Local cache. Swap this emptyDir for a PVC (node-local SSD) in
-        # production; the worker rebuilds its cache on restart either way.
-        - name: cache
-          emptyDir: {}
       containers:
         - name: worker
           image: ghcr.io/milvus-io/talon-worker:latest
@@ -100,10 +90,6 @@ spec:
           env:
             - name: TALON_WORKER_CLUSTER_ID
               value: "talon"
-            - name: TALON_WORKER_NODE_ID
-              valueFrom:
-                fieldRef:
-                  fieldPath: metadata.name
             # Lets the worker look up its node's zone label for zone-aware
             # cache reads (ADR 0006); requires the talon-node-zone-reader
             # ClusterRole in rbac.yaml. TALON_ZONE overrides the lookup.
@@ -144,7 +130,7 @@ spec:
               mountPath: /var/cache/talon
           startupProbe:
             httpGet: { path: /healthz, port: admin }
-            failureThreshold: 30
+            failureThreshold: 300
             periodSeconds: 2
           livenessProbe:
             httpGet: { path: /healthz, port: admin }
@@ -161,3 +147,28 @@ spec:
             limits:
               cpu: "2"
               memory: "1Gi"
+  volumeClaimTemplates:
+    - metadata:
+        name: cache
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        storageClassName: talon-local
+        resources:
+          requests:
+            storage: 20Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: talon-worker
+  namespace: talon
+spec:
+  clusterIP: None
+  publishNotReadyAddresses: true
+  selector:
+    app.kubernetes.io/name: talon
+    app.kubernetes.io/component: worker
+  ports:
+    - name: data
+      port: 7001
+      targetPort: data

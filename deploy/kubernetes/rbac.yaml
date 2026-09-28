@@ -1,10 +1,9 @@
 # Least-privilege RBAC for the Talon coordinator's Kubernetes ClusterStateStore
 # backend (feature "kubernetes").
 #
-# The backend stores one coordination.k8s.io/v1 Lease per Talon node in a single
-# namespace and needs only to manage those Lease objects — nothing cluster-wide,
-# no other resource types, no secrets. Bind this Role to the ServiceAccount the
-# coordinator pods run as.
+# The backend stores process Leases and the persistent membership ConfigMap in
+# one namespace. The state Role grants no cluster-wide or Secret access. Bind it
+# to the ServiceAccount the coordinator pods run as.
 #
 # Apply into the namespace that holds Talon state (KubernetesConfig.namespace):
 #   kubectl apply -n talon -f rbac.yaml
@@ -26,7 +25,7 @@ metadata:
     app.kubernetes.io/name: talon
     app.kubernetes.io/component: coordinator
 rules:
-  # Manage only Lease objects, only in this namespace. get/list/watch back
+  # Manage Lease objects only in this namespace. get/list/watch back
   # snapshots and event streams; create/update/patch back heartbeat upserts;
   # delete backs graceful node removal. No access to secrets, pods, or any
   # cluster-scoped resource.
@@ -34,6 +33,7 @@ rules:
     resources: ["leases"]
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
+    # Persistent registry CAS; deliberately no delete permission.
     resources: ["configmaps"]
     verbs: ["get", "create", "update"]
 ---
