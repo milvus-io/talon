@@ -752,9 +752,9 @@ async fn handle_control_frame(
     let reply = match message {
         ControlMessage::StatObject { object } => {
             if !observability.is_ready() {
-                ControlMessage::Ack {
-                    ok: false,
-                    detail: Some("worker is not ready".into()),
+                talon_transport::ControlMessage::ControlFailure {
+                    code: talon_transport::DataErrorCode::Unavailable,
+                    message: "worker is not ready".into(),
                 }
             } else {
                 match worker.stat_object(&object).await {
@@ -762,18 +762,18 @@ async fn handle_control_frame(
                         size: stat.len,
                         version: stat.version.as_str().to_string(),
                     },
-                    Err(error) => ControlMessage::Ack {
-                        ok: false,
-                        detail: Some(error.to_string()),
+                    Err(error) => talon_transport::ControlMessage::ControlFailure {
+                        code: crate::data_error::classify(&error),
+                        message: error.to_string(),
                     },
                 }
             }
         }
         ControlMessage::ListObjects { prefix } => {
             if !observability.is_ready() {
-                ControlMessage::Ack {
-                    ok: false,
-                    detail: Some("worker is not ready".into()),
+                talon_transport::ControlMessage::ControlFailure {
+                    code: talon_transport::DataErrorCode::Unavailable,
+                    message: "worker is not ready".into(),
                 }
             } else {
                 match worker.list_objects(&prefix).await {
@@ -783,9 +783,9 @@ async fn handle_control_frame(
                             .map(|(path, size)| talon_transport::ObjectEntry { path, size })
                             .collect(),
                     },
-                    Err(error) => ControlMessage::Ack {
-                        ok: false,
-                        detail: Some(error.to_string()),
+                    Err(error) => talon_transport::ControlMessage::ControlFailure {
+                        code: crate::data_error::classify(&error),
+                        message: error.to_string(),
                     },
                 }
             }
@@ -798,7 +798,14 @@ async fn handle_control_frame(
         },
     };
 
-    let is_error = matches!(reply, ControlMessage::Ack { ok: false, .. });
+    let reply = talon_transport::codec::metadata_reply_for_schema(
+        reply,
+        talon_transport::codec::request_schema(header, payload)?,
+    );
+    let is_error = matches!(
+        reply,
+        ControlMessage::Ack { ok: false, .. } | ControlMessage::ControlFailure { .. }
+    );
     let mut buf = codec::encode(h.request_id, &reply)?;
     buf[2] = response_version;
     stream.write_all(&buf).await?;

@@ -25,7 +25,7 @@ pub(crate) fn encode_runtime_error(request_id: u32, error: &anyhow::Error) -> Ve
     encode_typed_error(request_id, classify(error), error.to_string())
 }
 
-fn classify(error: &anyhow::Error) -> DataErrorCode {
+pub(crate) fn classify(error: &anyhow::Error) -> DataErrorCode {
     if error.downcast_ref::<CacheMiss>().is_some() {
         return DataErrorCode::CacheMiss;
     }

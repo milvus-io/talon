@@ -235,6 +235,26 @@ impl MembershipCache {
 }
 
 impl MembershipSnapshot {
+    pub(crate) fn target_error(
+        &self,
+        block: &talon_core::BlockId,
+        source: crate::WorkerError,
+    ) -> crate::BlockReadError {
+        let owner = self.placement.primary(block).expect("selected owner");
+        let (instance_id, client) = self
+            .instances
+            .as_ref()
+            .unwrap()
+            .get(&owner.id.0)
+            .expect("selected instance");
+        crate::BlockReadError::Target {
+            worker_id: owner.id.0.clone(),
+            instance_id: instance_id.clone(),
+            address: client.addr().to_owned(),
+            source,
+        }
+    }
+
     pub fn retained_owner(
         &self,
         block: &talon_core::BlockId,

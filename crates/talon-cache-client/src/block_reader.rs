@@ -69,6 +69,14 @@ pub enum BlockReadError {
     /// The worker fetch failed.
     #[error(transparent)]
     Worker(#[from] WorkerError),
+    #[error("worker {worker_id}, instance {instance_id} at {address}: {source}")]
+    Target {
+        worker_id: String,
+        instance_id: String,
+        address: String,
+        #[source]
+        source: WorkerError,
+    },
     /// The cluster returned no owners for the block (empty cluster).
     #[error("no owners for block")]
     NoOwners,
@@ -398,14 +406,15 @@ impl BlockReader {
             let offset = block.offset + u64::from(offset_in_block);
             let n = match mode {
                 OriginReadMode::Current => {
-                    worker.fetch_range_into(&block.object, offset, dst).await?
+                    worker.fetch_range_into(&block.object, offset, dst).await
                 }
                 OriginReadMode::ExactVersion => {
                     worker
                         .fetch_versioned_range_into(&block.object, &block.version, offset, dst)
-                        .await?
+                        .await
                 }
-            };
+            }
+            .map_err(|error| snapshot.target_error(block, error))?;
             if n != dst.len() {
                 return Err(WorkerError::RangeLengthMismatch {
                     expected: dst.len() as u64,
@@ -518,7 +527,7 @@ impl BlockReader {
                         .await
                 }
             }
-            .map_err(DetailedBlockReadError::Worker)?;
+            .map_err(|error| DetailedBlockReadError::Block(snapshot.target_error(block, error)))?;
             if bytes.len() != len as usize {
                 return Err(DetailedBlockReadError::Worker(
                     WorkerError::RangeLengthMismatch {
@@ -1051,7 +1060,9 @@ impl BlockReader {
 fn cache_block_error(error: BlockReadError) -> CacheReadError {
     match error {
         BlockReadError::Coordinator(error) => error.into(),
-        BlockReadError::Worker(error) => error.into(),
+        BlockReadError::Worker(error) | BlockReadError::Target { source: error, .. } => {
+            error.into()
+        }
         other => CacheReadError::Unavailable(other.to_string()),
     }
 }
@@ -2367,6 +2378,74 @@ mod tests {
             assert_eq!(reader.read_block(&block(), 0, 4, 0).await.unwrap().len(), 4);
             assert_eq!(new_hits.load(Ordering::SeqCst), 1);
             server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn retained_stream_preserves_domain_and_protocol_failures() {
+        use futures::StreamExt;
+        use talon_core::worker_membership::*;
+        for code in [
+            Some(DataErrorCode::VersionMismatch),
+            Some(DataErrorCode::RateLimited),
+            Some(DataErrorCode::Origin),
+            None,
+        ] {
+            let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let response = code.map_or_else(
+                || vec![0; HEADER_LEN],
+                |c| encode_typed_error(0, c, "original cause"),
+            );
+            let address = spawn_worker_error(hits.clone(), response).await;
+            let reader = BlockReader::new(
+                CoordinatorClient::new("127.0.0.1:1"),
+                Arc::new(PlacementCache::new(30_000)),
+                1,
+            );
+            reader.membership.replace_retained(
+                WorkerDiscovery {
+                    mode: MembershipMode::Retained,
+                    topology_token: 1,
+                    state_token: 1,
+                    valid_for_ms: 500,
+                    workers: vec![DiscoveredWorker {
+                        member: WorkerMember {
+                            worker_id: "w1".into(),
+                            zone: None,
+                            retired: false,
+                        },
+                        state: InstanceState::Serving {
+                            instance_id: "instance".into(),
+                            address,
+                        },
+                    }],
+                },
+                std::time::Instant::now(),
+                &reader.worker_pool,
+            );
+            let block = block();
+            let file = FileView {
+                object: &block.object,
+                version: &block.version,
+                block_size: block.block_size,
+                size: 16,
+            };
+            let mut stream = reader.stream_range(&file, 0, 4, 4, 0).unwrap();
+            let error = stream.next().await.unwrap().unwrap_err();
+            assert!(!error.fallback_eligible(), "{error}");
+            match code {
+                Some(DataErrorCode::VersionMismatch) => {
+                    assert!(matches!(error, CacheReadError::VersionMismatch(_)))
+                }
+                Some(DataErrorCode::RateLimited) => {
+                    assert!(matches!(error, CacheReadError::RateLimited(_)))
+                }
+                Some(DataErrorCode::Origin) => assert!(matches!(error, CacheReadError::Origin(_))),
+                None => assert!(matches!(error, CacheReadError::Protocol(_))),
+                _ => unreachable!(),
+            }
+            assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+            assert!(stream.next().await.is_none());
         }
     }
 }
