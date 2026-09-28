@@ -1,5 +1,9 @@
 # Page TTL validation
 
+This is a historical validation record for #580. Its TTL labels and artifact
+paths retain the names used during those runs; the policy is now called
+[page TTI](../explanation/page-tti.md). Runnable commands below use the current names.
+
 ## Page-handle hot-read optimization (2026-09-21, local validation only)
 
 This follow-up replaces block-locked read guards with stable per-page handles in
@@ -41,7 +45,7 @@ remain unmeasured.
 
 The repair reuses stable lifecycle handles from `BlockIndex` on read hits and
 replaces per-block checkpoint publication with directory-shard snapshots. See
-[page TTL](../explanation/page-ttl.md) for migration, pacing, limits and recovery.
+[page TTI](../explanation/page-tti.md) for migration, pacing, limits and recovery.
 The baseline for the real-disk comparison is `6d18bf2`; the pre-repair PR head is
 `d0eb9ee`. Historical metadata probes below describe the earlier per-block format.
 
@@ -134,8 +138,8 @@ Run each size in a separate process so the RSS baseline does not include a
 previous size's retained allocator arenas:
 
 ```sh
-TALON_TTL_BENCH_PAGES=100000 cargo test -p talon-worker --lib page_ttl_metadata_scale -- --ignored --nocapture
-TALON_TTL_BENCH_PAGES=1000000 cargo test -p talon-worker --lib page_ttl_metadata_scale -- --ignored --nocapture
+TALON_TTI_BENCH_PAGES=100000 cargo test -p talon-worker --lib page_tti_metadata_scale -- --ignored --nocapture
+TALON_TTI_BENCH_PAGES=1000000 cargo test -p talon-worker --lib page_tti_metadata_scale -- --ignored --nocapture
 ```
 
 [Raw JSONL](../../.artifacts/page-ttl/metadata.jsonl) preserves all 12 records.

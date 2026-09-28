@@ -1,4 +1,4 @@
-//! Bounded, repeatable disk discovery of checkpoint leftovers, independent of TTL.
+//! Bounded, repeatable disk discovery of checkpoint leftovers, independent of TTI.
 use crate::page_gc::CleanupReport;
 use crate::page_lifecycle::PageLifecycle;
 use std::fs::{self, ReadDir};

@@ -148,8 +148,8 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
-    /// Idle page lifetime in milliseconds; 0 disables TTL.
-    pub page_ttl_ms: u64,
+    /// Page time to idle in milliseconds; 0 disables idle expiration.
+    pub page_tti_ms: u64,
     /// Dirty page access checkpoint interval in milliseconds.
     pub page_access_checkpoint_interval_ms: u64,
     /// Page GC batch interval in milliseconds.
@@ -293,7 +293,7 @@ impl Default for WorkerConfig {
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
-            page_ttl_ms: 0,
+            page_tti_ms: 0,
             page_access_checkpoint_interval_ms: 60000,
             page_gc_interval_ms: 1000,
             page_gc_scan_batch_size: 65536,
@@ -362,8 +362,8 @@ pub struct WorkerConfigPatch {
     pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
     pub paged_miss_run_concurrency: Option<usize>,
-    /// Override for [`WorkerConfig::page_ttl_ms`].
-    pub page_ttl_ms: Option<u64>,
+    /// Override for [`WorkerConfig::page_tti_ms`].
+    pub page_tti_ms: Option<u64>,
     /// Override for [`WorkerConfig::page_access_checkpoint_interval_ms`].
     pub page_access_checkpoint_interval_ms: Option<u64>,
     /// Override for [`WorkerConfig::page_gc_interval_ms`].
@@ -434,7 +434,7 @@ impl Patch for WorkerConfigPatch {
             paged_miss_run_concurrency: self
                 .paged_miss_run_concurrency
                 .or(base.paged_miss_run_concurrency),
-            page_ttl_ms: self.page_ttl_ms.or(base.page_ttl_ms),
+            page_tti_ms: self.page_tti_ms.or(base.page_tti_ms),
             page_access_checkpoint_interval_ms: self
                 .page_access_checkpoint_interval_ms
                 .or(base.page_access_checkpoint_interval_ms),
@@ -632,7 +632,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_PAGE_TTL_MS", key: "page_ttl_ms", default: Some("0"), cli: false, secret: false, help: "Idle page lifetime in milliseconds; 0 disables TTL." },
+    ConfigVar { env: "TALON_WORKER_PAGE_TTI_MS", key: "page_tti_ms", default: Some("0"), cli: false, secret: false, help: "Page time to idle in milliseconds; 0 disables idle expiration." },
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS", key: "page_access_checkpoint_interval_ms", default: Some("60000"), cli: false, secret: false, help: "Dirty page access checkpoint interval in milliseconds." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MS", key: "page_gc_interval_ms", default: Some("1000"), cli: false, secret: false, help: "Page GC batch interval in milliseconds." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum pages examined per GC batch." },
@@ -837,7 +837,7 @@ pub(crate) mod worker_env {
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
-    pub const PAGE_TTL_MS: &str = "TALON_WORKER_PAGE_TTL_MS";
+    pub const PAGE_TTI_MS: &str = "TALON_WORKER_PAGE_TTI_MS";
     pub const PAGE_ACCESS_CHECKPOINT_INTERVAL_MS: &str =
         "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS";
     pub const PAGE_GC_INTERVAL_MS: &str = "TALON_WORKER_PAGE_GC_INTERVAL_MS";
@@ -951,8 +951,8 @@ impl WorkerConfigPatch {
             paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
                 .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
                 .transpose()?,
-            page_ttl_ms: get(worker_env::PAGE_TTL_MS)
-                .map(|v| parse_u64(v, worker_env::PAGE_TTL_MS))
+            page_tti_ms: get(worker_env::PAGE_TTI_MS)
+                .map(|v| parse_u64(v, worker_env::PAGE_TTI_MS))
                 .transpose()?,
             page_access_checkpoint_interval_ms: get(worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MS)
                 .map(|v| parse_u64(v, worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MS))
@@ -1061,7 +1061,7 @@ impl WorkerConfig {
             paged_miss_run_concurrency: merged
                 .paged_miss_run_concurrency
                 .unwrap_or(d.paged_miss_run_concurrency),
-            page_ttl_ms: merged.page_ttl_ms.unwrap_or(d.page_ttl_ms),
+            page_tti_ms: merged.page_tti_ms.unwrap_or(d.page_tti_ms),
             page_access_checkpoint_interval_ms: merged
                 .page_access_checkpoint_interval_ms
                 .unwrap_or(d.page_access_checkpoint_interval_ms),
@@ -1200,12 +1200,12 @@ impl WorkerConfig {
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
         }
-        if self.page_ttl_ms > 0 && self.l2_page_size_bytes == 0 {
-            return Err(Error::Other("page_ttl_ms requires paged L2".into()));
+        if self.page_tti_ms > 0 && self.l2_page_size_bytes == 0 {
+            return Err(Error::Other("page_tti_ms requires paged L2".into()));
         }
-        if self.page_ttl_ms > 0 && self.page_access_checkpoint_interval_ms > self.page_ttl_ms {
+        if self.page_tti_ms > 0 && self.page_access_checkpoint_interval_ms > self.page_tti_ms {
             return Err(Error::Other(
-                "page_access_checkpoint_interval_ms must not exceed page_ttl_ms".into(),
+                "page_access_checkpoint_interval_ms must not exceed page_tti_ms".into(),
             ));
         }
         if self.page_access_checkpoint_interval_ms == 0 {
@@ -1231,7 +1231,7 @@ impl WorkerConfig {
             return Err(Error::Other("page_gc_io_concurrency must be > 0".into()));
         }
         for millis in [
-            self.page_ttl_ms,
+            self.page_tti_ms,
             self.page_access_checkpoint_interval_ms,
             self.page_gc_interval_ms,
         ] {
@@ -1827,13 +1827,13 @@ mod tests {
     }
 
     #[test]
-    fn page_ttl_config_layers_and_validation() {
+    fn page_tti_config_layers_and_validation() {
         let file = WorkerConfigPatch::from_toml(
-            "l2_page_size_bytes = 1048576\npage_ttl_ms = 120000\npage_gc_scan_batch_size = 10\n",
+            "l2_page_size_bytes = 1048576\npage_tti_ms = 120000\npage_gc_scan_batch_size = 10\n",
         )
         .unwrap();
         let env = WorkerConfigPatch::from_env_with(|key| match key {
-            "TALON_WORKER_PAGE_TTL_MS" => Some("180000".into()),
+            "TALON_WORKER_PAGE_TTI_MS" => Some("180000".into()),
             "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS" => Some("1000".into()),
             "TALON_WORKER_PAGE_GC_INTERVAL_MS" => Some("500".into()),
             "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE" => Some("100".into()),
@@ -1845,7 +1845,7 @@ mod tests {
         let c = WorkerConfig::resolve(file, env, Default::default()).unwrap();
         assert_eq!(
             (
-                c.page_ttl_ms,
+                c.page_tti_ms,
                 c.page_access_checkpoint_interval_ms,
                 c.page_gc_interval_ms
             ),
@@ -1859,15 +1859,15 @@ mod tests {
             ),
             (100, 5, 2)
         );
-        assert_eq!(WorkerConfig::default().page_ttl_ms, 0);
+        assert_eq!(WorkerConfig::default().page_tti_ms, 0);
         for setting in [
-            "page_ttl_ms = 1",
+            "page_tti_ms = 1",
             "page_gc_interval_ms = 0",
             "page_access_checkpoint_interval_ms = 0",
             "page_gc_scan_batch_size = 0",
             "page_gc_delete_batch_size = 0",
             "page_gc_io_concurrency = 0",
-            "l2_page_size_bytes = 1048576\npage_ttl_ms = 1000",
+            "l2_page_size_bytes = 1048576\npage_tti_ms = 1000",
         ] {
             let patch = WorkerConfigPatch::from_toml(setting).unwrap();
             assert!(
@@ -1876,7 +1876,7 @@ mod tests {
             );
         }
         assert!(WorkerConfigPatch::from_env_with(
-            |key| (key == "TALON_WORKER_PAGE_TTL_MS").then(|| "bad".into())
+            |key| (key == "TALON_WORKER_PAGE_TTI_MS").then(|| "bad".into())
         )
         .is_err());
     }

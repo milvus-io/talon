@@ -394,11 +394,11 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
-### `page_ttl_ms`
+### `page_tti_ms`
 
-Idle page lifetime in milliseconds; 0 disables TTL.
+Page time to idle in milliseconds; 0 disables idle expiration.
 
-- **Environment variable:** `TALON_WORKER_PAGE_TTL_MS`
+- **Environment variable:** `TALON_WORKER_PAGE_TTI_MS`
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 

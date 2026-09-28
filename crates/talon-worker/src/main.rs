@@ -172,7 +172,7 @@ impl Args {
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
             paged_miss_run_concurrency: None,
-            page_ttl_ms: None,
+            page_tti_ms: None,
             page_access_checkpoint_interval_ms: None,
             page_gc_interval_ms: None,
             page_gc_scan_batch_size: None,
@@ -1633,7 +1633,7 @@ mod tests {
             )
             .with_paged_store(talon_worker::PagedBlockStore::open(root.join("paged"), 16).unwrap())
             .with_page_gc(talon_worker::page_gc::PageGcConfig {
-                ttl_ms: 1,
+                tti_ms: 1,
                 checkpoint_interval_ms: 1,
                 ..Default::default()
             })

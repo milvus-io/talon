@@ -294,7 +294,7 @@ impl BlockState {
     }
     /// Called under the mutation gate. The CAS is the read/delete arbitration
     /// point; timestamp validation follows successful exclusive ownership.
-    pub fn claim(&self, c: &GcCandidate, now: u64, ttl: Option<u64>) -> bool {
+    pub fn claim(&self, c: &GcCandidate, now: u64, tti: Option<u64>) -> bool {
         let g = self.inner.lock().unwrap();
         let Some(e) = g.pages.get(&c.page.0) else {
             return false;
@@ -311,7 +311,7 @@ impl BlockState {
         {
             return false;
         }
-        if ttl.is_some_and(|ttl| !expired(e.handle.last_access(), now, ttl)) {
+        if tti.is_some_and(|tti| !expired(e.handle.last_access(), now, tti)) {
             e.handle.state.fetch_and(!CLOSED, Ordering::Release);
             return false;
         }
@@ -346,8 +346,8 @@ impl BlockState {
     }
 }
 
-pub(crate) fn expired(last: Option<u64>, now: u64, ttl: u64) -> bool {
-    last.map_or(true, |last| now.saturating_sub(last) > ttl)
+pub(crate) fn expired(last: Option<u64>, now: u64, tti: u64) -> bool {
+    last.map_or(true, |last| now.saturating_sub(last) > tti)
 }
 pub(crate) struct PageReadGuard {
     handle: Arc<PageState>,
@@ -511,7 +511,7 @@ impl PageLifecycle {
         cursor: &mut ScanCursor,
         limit: usize,
         now: u64,
-        ttl: Option<u64>,
+        tti: Option<u64>,
         delete_limit: usize,
     ) -> (Vec<GcCandidate>, ScanReport) {
         let mut out = Vec::new();
@@ -574,14 +574,14 @@ impl PageLifecycle {
                 if retry.is_some() {
                     report.retries += 1;
                 }
-                let ttl_expired =
-                    ttl.is_some_and(|ttl| expired(entry.handle.last_access(), now, ttl));
-                let retryable = retry.is_some_and(|reason| reason != 0 || ttl.is_some());
-                if flags & (CLOSED | READERS) == 0 && (ttl_expired || retryable) {
+                let tti_expired =
+                    tti.is_some_and(|tti| expired(entry.handle.last_access(), now, tti));
+                let retryable = retry.is_some_and(|reason| reason != 0 || tti.is_some());
+                if flags & (CLOSED | READERS) == 0 && (tti_expired || retryable) {
                     if let Some(candidate) = block.select(
                         PageIndex(page),
                         entry,
-                        if ttl_expired { 0 } else { retry.unwrap() },
+                        if tti_expired { 0 } else { retry.unwrap() },
                         flags,
                     ) {
                         out.push(candidate);
@@ -900,7 +900,7 @@ mod tests {
     }
 
     #[test]
-    fn disabled_ttl_keeps_unknown_pages_but_discovers_cleanup_retries() {
+    fn disabled_tti_keeps_unknown_pages_but_discovers_cleanup_retries() {
         let life = PageLifecycle::new();
         let block = life.block(&id());
         block.register(PageIndex(0), None, 1, false);

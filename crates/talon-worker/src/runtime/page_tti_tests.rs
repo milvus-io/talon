@@ -55,7 +55,7 @@ fn request(offset: u64, len: u64) -> RangeRequest {
         len,
     }
 }
-fn runtime(root: &Path, l1: bool, capacity: u64, ttl: u64) -> WorkerRuntime {
+fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
     for meta in paged.scan().unwrap() {
@@ -74,7 +74,7 @@ fn runtime(root: &Path, l1: bool, capacity: u64, ttl: u64) -> WorkerRuntime {
     )
     .with_paged_store(paged)
     .with_page_gc(PageGcConfig {
-        ttl_ms: ttl,
+        tti_ms: tti,
         checkpoint_interval_ms: 10,
         ..Default::default()
     })
@@ -93,7 +93,7 @@ async fn collect_all(r: &WorkerRuntime) -> u64 {
 }
 
 #[tokio::test]
-async fn disabled_ttl_hits_leave_access_and_dirtiness_unchanged() {
+async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
     for l1 in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let r = runtime(root.path(), l1, 0, 0);
@@ -170,7 +170,7 @@ async fn access_only_checkpoint_failure_retries_without_structural_changes() {
 }
 
 #[tokio::test]
-async fn ttl_strict_boundary_and_l1_l2_access_refresh_only_touched_page() {
+async fn tti_strict_boundary_and_l1_l2_access_refresh_only_touched_page() {
     for l1 in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let r = runtime(root.path(), l1, 0, 100);
@@ -250,7 +250,7 @@ async fn restart_and_failback_never_renew_missing_or_old_access() {
 }
 
 #[tokio::test]
-async fn no_checkpoint_corrupt_checkpoint_and_disabled_ttl() {
+async fn no_checkpoint_corrupt_checkpoint_and_disabled_tti() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 0);
     r.serve_range(&request(0, 16)).await.unwrap();
@@ -342,7 +342,7 @@ async fn checkpoint_failure_retries_and_does_not_recreate_empty_directory() {
 }
 
 #[tokio::test]
-async fn read_pin_blocks_ttl_and_capacity_until_resource_is_obtained() {
+async fn read_pin_blocks_tti_and_capacity_until_resource_is_obtained() {
     let root = tempfile::tempdir().unwrap();
     let mut r = runtime(root.path(), false, 0, 100);
     r.page_clock.set(10000);
@@ -467,7 +467,7 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
 /// or claim end-to-end read throughput. Run with --ignored --nocapture.
 #[test]
 #[ignore = "manual 100k/1m page metadata and checkpoint scale probe"]
-fn page_ttl_metadata_scale() {
+fn page_tti_metadata_scale() {
     use crate::page_access_store::{AccessSnapshot, PageAccessStore};
     use std::hint::black_box;
     fn rss_kib() -> usize {
@@ -481,7 +481,7 @@ fn page_ttl_metadata_scale() {
             })
             .unwrap_or(0)
     }
-    let sizes = std::env::var("TALON_TTL_BENCH_PAGES")
+    let sizes = std::env::var("TALON_TTI_BENCH_PAGES")
         .ok()
         .map(|s| vec![s.parse::<usize>().expect("page count")])
         .unwrap_or_else(|| vec![100_000, 1_000_000]);
@@ -787,7 +787,7 @@ async fn capacity_retries_other_victims_after_unlink_failure() {
 }
 
 #[tokio::test]
-async fn orphan_cleanup_retries_with_ttl_disabled_and_preserves_live_snapshots() {
+async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots() {
     let root = tempfile::tempdir().unwrap();
     let mut r = runtime(root.path(), false, 0, 0);
     r.serve_range(&request(0, 16)).await.unwrap();
@@ -933,7 +933,7 @@ fn orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries() {
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "runtime::page_ttl_tests::orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries",
+                "runtime::page_tti_tests::orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries",
                 "--nocapture",
             ])
             .env(ROOT, root.path())
