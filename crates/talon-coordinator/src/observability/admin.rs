@@ -35,7 +35,10 @@ pub async fn serve_admin_secured(
     state: Arc<CoordinatorObservability>,
     security: Arc<crate::security::SecurityConfig>,
 ) -> std::io::Result<()> {
-    axum::serve(listener, secured_admin_router(state, security)).await
+    let drain = state.drain().clone();
+    axum::serve(listener, secured_admin_router(state, security))
+        .with_graceful_shutdown(async move { drain.stopped().await })
+        .await
 }
 
 /// Build the coordinator administration router: metrics/health/readiness, the
@@ -108,6 +111,9 @@ async fn update_worker_membership(
     State(state): State<Arc<CoordinatorObservability>>,
     Json(update): Json<MembershipUpdate>,
 ) -> Response {
+    let Some(_request) = state.drain().admit() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     match state
         .update_worker_registry(
             update.expected_registry_revision.as_deref(),

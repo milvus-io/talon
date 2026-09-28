@@ -712,6 +712,7 @@ pub struct WorkerObservability {
     heartbeat_seq: AtomicU64,
     metrics: WorkerMetrics,
     readiness: WorkerReadiness,
+    drain: Arc<talon_transport::drain::DrainGate>,
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
     /// Deployment zone reported in status labels (ADR 0006).
@@ -760,6 +761,7 @@ impl WorkerObservability {
             heartbeat_seq: AtomicU64::new(0),
             metrics: WorkerMetrics::new_with_backend(capacity_bytes, backend),
             readiness: WorkerReadiness::default(),
+            drain: Arc::default(),
             index,
             inflight,
             zone: None,
@@ -775,6 +777,15 @@ impl WorkerObservability {
     /// Worker metric handles for data and control paths.
     pub fn metrics(&self) -> &WorkerMetrics {
         &self.metrics
+    }
+
+    pub fn drain(&self) -> &Arc<talon_transport::drain::DrainGate> {
+        &self.drain
+    }
+
+    pub fn begin_shutdown(&self) {
+        self.drain.begin();
+        self.readiness.set_shutting_down(true);
     }
 
     /// Worker dependency readiness controls.

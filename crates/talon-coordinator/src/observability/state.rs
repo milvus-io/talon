@@ -45,6 +45,8 @@ pub struct CoordinatorObservability {
     /// a transient state-store failure.
     state_failure_grace: Duration,
     pub(crate) shutting_down: AtomicBool,
+    drain: Arc<talon_transport::drain::DrainGate>,
+    listeners_ready: AtomicBool,
     request_timeout: Duration,
     pub(crate) metrics: CoordinatorMetrics,
     store: Arc<dyn ClusterStateStore>,
@@ -97,6 +99,8 @@ impl CoordinatorObservability {
             last_membership_refresh_elapsed_ms: AtomicU64::new(0),
             state_failure_grace: Duration::ZERO,
             shutting_down: AtomicBool::new(false),
+            drain: Arc::default(),
+            listeners_ready: AtomicBool::new(true),
             request_timeout,
             metrics: CoordinatorMetrics::new(),
             store,
@@ -256,6 +260,10 @@ impl CoordinatorObservability {
     }
 
     /// Whether authoritative shared state is currently ready.
+    pub fn set_listeners_ready(&self, ready: bool) {
+        self.listeners_ready.store(ready, Ordering::Release);
+    }
+
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
             && self
@@ -266,6 +274,7 @@ impl CoordinatorObservability {
                 .map_or(true, |(_, refreshed)| {
                     refreshed.elapsed() < self.discovery_max_age()
                 })
+            && self.listeners_ready.load(Ordering::Acquire)
             && (!self.state_store_degraded.load(Ordering::Acquire)
                 || self.membership_within_failure_grace())
             && !self.shutting_down.load(Ordering::Acquire)
@@ -813,7 +822,12 @@ impl CoordinatorObservability {
 
     /// Begin graceful shutdown: mark this coordinator not-live/not-ready so new
     /// authoritative reads fail closed while in-flight ones drain.
+    pub fn drain(&self) -> &Arc<talon_transport::drain::DrainGate> {
+        &self.drain
+    }
+
     pub fn begin_shutdown(&self) {
+        self.drain.begin();
         self.shutting_down.store(true, Ordering::Release);
         self.ready.store(false, Ordering::Release);
     }
