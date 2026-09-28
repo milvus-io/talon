@@ -46,6 +46,19 @@ public final class ConformanceTest {
         Map<String, byte[]> byName = parseVectors(Files.readString(vectors));
         System.out.println("loaded " + byName.size() + " vectors from " + vectors);
 
+        check("persistent discovery matches Rust", () -> {
+            Messages.Discovery view = Messages.readDiscovery(body(byName.get("control.membership_instances")).body);
+            assertEquals(7L, view.topology(), "topology");
+            assertEquals(2, view.workers().size(), "logical members");
+            assertEquals(0, view.workers().get(0).state(), "offline logical owner");
+            assertEquals("process-2", view.workers().get(1).instance(), "incarnation");
+            Messages.Response failure = body(byName.get("control.unavailable"));
+            assertEquals(Messages.TAG_CONTROL_FAILURE, failure.tag, "control failure tag");
+            TalonException error = TalonException.decode(failure.body);
+            assertEquals(TalonException.Code.UNAVAILABLE, error.code(), "availability code");
+            assertTrue(error.fallbackEligible(), "advisory fallback");
+            assertTrue(!new TalonException(TalonException.Code.VERSION_MISMATCH, "unavailable").fallbackEligible(), "no string classification");
+        });
         check("v2 carrier envelope matches Rust", () -> {
             TraceContext parent = TraceContext.fromW3c("00-11111111111111111111111111111111-2222222222222222-01", "vendor=value");
             assertBytes(byName.get("v2.range.context"), Telemetry.envelope(byName.get("data.range_request"), parent, null));

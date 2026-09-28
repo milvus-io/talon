@@ -44,27 +44,26 @@ import java.util.concurrent.atomic.AtomicInteger;
  */
 public final class TalonClient implements AutoCloseable {
 
-    /** Membership and placement freshness window. Matches the Rust default. */
-    private static final long PLACEMENT_TTL_MS = 30_000;
-    /** Workers retained from the local ranking. RF=1 in v1. */
-    private static final int REPLICAS_K = 1;
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 30_000;
 
     private final String coordinator;
     private final int blockSize;
     private final ConnectionPool coordinatorPool;
-    private final ConnectionPool workerPool;
     private final AtomicInteger requestIds = new AtomicInteger(1);
-    private final Map<BlockId, CachedPlacement> placementCache = new HashMap<>();
     private final Object membershipLock = new Object();
     private CachedMembership membership;
+    private Messages.Discovery discovery;
+    private long discoveryExpires;
+    private long nextDiscoveryAttempt;
+    private final Map<String, ConnectionPool> instancePools = new HashMap<>();
+    private final int maxIdlePerAddr;
 
     private TalonClient(String coordinator, int blockSize, int maxIdlePerAddr) {
+        this.maxIdlePerAddr = maxIdlePerAddr;
         this.coordinator = coordinator;
         this.blockSize = blockSize;
         this.coordinatorPool = new ConnectionPool(maxIdlePerAddr);
-        this.workerPool = new ConnectionPool(maxIdlePerAddr);
     }
 
     /**
@@ -232,11 +231,11 @@ public final class TalonClient implements AutoCloseable {
 
     @Override
     public void close() {
-        coordinatorPool.close();
-        workerPool.close();
-        synchronized (placementCache) {
-            placementCache.clear();
+        synchronized (membershipLock) {
+            for (ConnectionPool pool : instancePools.values()) pool.close();
+            instancePools.clear();
         }
+        coordinatorPool.close();
     }
 
     // --- read planning -----------------------------------------------------
@@ -283,159 +282,72 @@ public final class TalonClient implements AutoCloseable {
 
     // --- placement ---------------------------------------------------------
 
-    private static final class CachedPlacement {
-        final List<String> addresses;
-        final long expiresAtMs;
+    private record CachedMembership(Placement.Table placement) {}
 
-        CachedPlacement(List<String> addresses, long expiresAtMs) {
-            this.addresses = addresses;
-            this.expiresAtMs = expiresAtMs;
-        }
-    }
-
-    private static final class CachedMembership {
-        final Placement.Table placement;
-        final String identity;
-        final long expiresAtMs;
-
-        CachedMembership(List<NodeInfo> nodes, String identity, long expiresAtMs) {
-            this(new Placement.Table(nodes), identity, expiresAtMs);
-        }
-
-        CachedMembership(Placement.Table placement, String identity, long expiresAtMs) {
-            this.placement = placement;
-            this.identity = identity;
-            this.expiresAtMs = expiresAtMs;
-        }
-    }
-
-    /**
-     * Fetch one segment, walking replicas on failure.
-     *
-     * <p>If every cached replica fails the entry is invalidated and refreshed
-     * once before giving up, so a stale placement costs one retry rather than a
-     * permanent error.
-     */
+    /** Fetch one segment from its selected logical owner without resending. */
     private byte[] readBlock(Segment seg) throws IOException {
-        List<String> addresses = resolve(seg.block, false);
-        IOException last = null;
-        for (String address : addresses) {
-            try {
-                return fetchRange(address, seg);
-            } catch (IOException e) {
-                last = e;
-            }
-        }
-        // Every replica failed: the placement may be stale rather than the
-        // workers being down.
-        addresses = resolve(seg.block, true);
-        for (String address : addresses) {
-            try {
-                return fetchRange(address, seg);
-            } catch (IOException e) {
-                last = e;
-            }
-        }
-        throw new IOException(
-                "no replica served block " + seg.block + " after a placement refresh",
-                last);
-    }
-
-    private List<String> resolve(BlockId block, boolean forceRefresh) throws IOException {
-        long now = System.currentTimeMillis();
-        if (!forceRefresh) {
-            synchronized (placementCache) {
-                CachedPlacement cached = placementCache.get(block);
-                if (cached != null && cached.expiresAtMs > now) {
-                    return cached.addresses;
-                }
-            }
-        }
-
-        CachedMembership members = membership(forceRefresh, now);
-        List<NodeInfo> owners;
-        if (REPLICAS_K == 1) {
-            NodeInfo primary = members.placement.primary(block);
-            owners = primary == null
-                    ? java.util.Collections.emptyList()
-                    : java.util.Collections.singletonList(primary);
-        } else {
-            owners = members.placement.rank(block, REPLICAS_K);
-        }
-        List<String> addresses = new ArrayList<>(owners.size());
-        for (NodeInfo owner : owners) {
-            addresses.add(owner.address());
-        }
-        if (addresses.isEmpty()) {
-            throw new IOException("membership contains no worker for " + block);
-        }
-
-        synchronized (placementCache) {
-            placementCache.put(
-                    block,
-                    new CachedPlacement(addresses, now + PLACEMENT_TTL_MS));
-        }
-        return addresses;
-    }
-
-    private CachedMembership membership(boolean forceRefresh, long now) throws IOException {
+        membership();
+        ConnectionPool pool;
+        String address;
         synchronized (membershipLock) {
-            if (!forceRefresh && membership != null && membership.expiresAtMs > now) {
-                return membership;
-            }
+            NodeInfo owner = membership.placement.primary(seg.block);
+            if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
+            if (System.nanoTime() >= discoveryExpires) throw new TalonException(TalonException.Code.UNAVAILABLE, "expired instance discovery");
+            Messages.DiscoveredWorker target = discovery.workers().stream().filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
+            if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "worker " + owner.id() + " offline or conflicting");
+            address = target.address();
+            pool = instancePools.get(instanceKey(target));
+        }
+        try { return fetchRange(address, seg, pool); }
+        catch (IOException failure) { throw TalonException.transport(failure); }
+    }
 
-            List<NodeInfo> nodes;
-            try {
-                int id = requestIds.getAndIncrement();
-                nodes = controlRoundTrip(Messages.membershipQuery(id), resp -> {
-                    if (resp.tag != Messages.TAG_MEMBERSHIP_LIST) {
-                        throw unexpected("MembershipQuery", resp);
-                    }
-                    return Messages.readMembershipList(resp.body);
-                });
-            } catch (IOException refreshFailure) {
-                if (membership != null) {
-                    return membership;
-                }
-                throw refreshFailure;
-            }
-
-            String identity = membershipIdentity(nodes);
-            boolean changed = membership != null && !membership.identity.equals(identity);
-            if (membership != null && !changed) {
-                membership =
-                        new CachedMembership(
-                                membership.placement, identity, now + PLACEMENT_TTL_MS);
-                return membership;
-            }
-            if (changed) {
-                synchronized (placementCache) {
-                    placementCache.clear();
-                }
-            }
-            membership =
-                    new CachedMembership(List.copyOf(nodes), identity, now + PLACEMENT_TTL_MS);
-            return membership;
+    private CachedMembership membership() throws IOException {
+        synchronized (membershipLock) {
+            if (discovery != null && System.nanoTime() < discoveryExpires) return membership;
+            if (System.nanoTime() < nextDiscoveryAttempt) throw new TalonException(TalonException.Code.UNAVAILABLE, "discovery refresh cooling down");
+            return refreshDiscovery();
         }
     }
 
-    private static String membershipIdentity(List<NodeInfo> nodes) {
-        List<String> fields = new ArrayList<>();
-        for (NodeInfo node : nodes) {
-            if (node.isWorker()) {
-                fields.add(node.id().length() + ":" + node.id() + node.address().length() + ":"
-                        + node.address());
+    private static String instanceKey(Messages.DiscoveredWorker worker) {
+        return worker.id().length() + ":" + worker.id() + worker.instance().length() + ":" + worker.instance() + worker.address();
+    }
+    private CachedMembership refreshDiscovery() throws IOException {
+        long started = System.nanoTime();
+        nextDiscoveryAttempt = started + 100_000_000L;
+        Messages.Discovery view;
+        try {
+            view = controlRoundTrip(Messages.membershipQuery(requestIds.getAndIncrement()), response -> {
+                if (response.tag != Messages.TAG_MEMBERSHIP_LIST) throw unexpected("MembershipQuery", response);
+                return Messages.readDiscovery(response.body);
+            });
+        } catch (IOException failure) { throw TalonException.transport(failure); }
+        List<NodeInfo> logical = new ArrayList<>();
+        java.util.Set<String> keys = new java.util.HashSet<>();
+        for (Messages.DiscoveredWorker worker : view.workers()) {
+            logical.add(new NodeInfo(worker.id(), "", true));
+            if (worker.state() == 2) {
+                String key = instanceKey(worker);
+                keys.add(key);
+                instancePools.computeIfAbsent(key, ignored -> new ConnectionPool(maxIdlePerAddr));
             }
         }
-        fields.sort(Comparator.naturalOrder());
-        return String.join("|", fields);
+        instancePools.entrySet().removeIf(entry -> {
+            if (keys.contains(entry.getKey())) return false;
+            entry.getValue().close(); return true;
+        });
+        Placement.Table table = discovery != null && discovery.topology() == view.topology()
+                ? membership.placement : new Placement.Table(logical);
+        discovery = view;
+        discoveryExpires = started + view.validForMs() * 1_000_000L;
+        membership = new CachedMembership(table);
+        return membership;
     }
-
-    // --- transport ---------------------------------------------------------
 
     private <T> T controlRoundTrip(byte[] request, IoFunction<Messages.Response, T> decode)
             throws IOException {
-        return coordinatorPool.exchange(coordinator, socket -> {
+        try { return coordinatorPool.exchange(coordinator, socket -> {
             OutputStream out = socket.getOutputStream();
             out.write(Telemetry.envelope(request, coordinator));
             out.flush();
@@ -446,11 +358,14 @@ public final class TalonClient implements AutoCloseable {
                 throw new IOException(
                         "coordinator returned an error: " + new String(payload, java.nio.charset.StandardCharsets.UTF_8));
             }
-            return decode.apply(Messages.decodeBody(payload));
+            Messages.Response response = Messages.decodeBody(payload);
+            if (response.tag == Messages.TAG_CONTROL_FAILURE) throw TalonException.decode(response.body);
+            return decode.apply(response);
         });
+        } catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
-    private byte[] fetchRange(String workerAddress, Segment seg) throws IOException {
+    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool) throws IOException {
         int id = requestIds.getAndIncrement();
         byte[] request =
                 Messages.versionedRange(
@@ -460,7 +375,7 @@ public final class TalonClient implements AutoCloseable {
                         seg.length,
                         seg.block.version());
 
-        return workerPool.exchange(workerAddress, socket -> {
+        return pool.exchange(workerAddress, false, socket -> {
             OutputStream out = socket.getOutputStream();
             out.write(Telemetry.envelope(request, workerAddress));
             out.flush();
@@ -469,10 +384,12 @@ public final class TalonClient implements AutoCloseable {
             Frame response = readHeader(in);
             byte[] payload = readExactly(in, response.length());
             if (response.isError()) {
-                throw new IOException(
-                        "worker " + workerAddress + " returned: "
-                                + new String(payload, java.nio.charset.StandardCharsets.UTF_8));
+                if (payload.length >= 4 && payload[0] == 'T' && payload[1] == 'L' && payload[2] == 'E' && payload[3] == '1') {
+                    throw TalonException.decode(new Bincode.Reader(java.util.Arrays.copyOfRange(payload, 4, payload.length)));
+                }
+                throw new TalonException(TalonException.Code.UNKNOWN, "worker " + workerAddress + ": " + new String(payload, java.nio.charset.StandardCharsets.UTF_8));
             }
+            if (payload.length != seg.length) throw new ProtocolException("incomplete block response");
             return payload;
         });
     }
@@ -496,6 +413,9 @@ public final class TalonClient implements AutoCloseable {
         }
 
         <T> T exchange(String address, IoFunction<Socket, T> request) throws IOException {
+            return exchange(address, true, request);
+        }
+        <T> T exchange(String address, boolean retry, IoFunction<Socket, T> request) throws IOException {
             Socket socket = takeIdle(address);
             boolean reused = socket != null;
             for (;;) {
@@ -511,7 +431,7 @@ public final class TalonClient implements AutoCloseable {
                     completed = true;
                     return result;
                 } catch (EOFException | SocketException disconnected) {
-                    if (!reused) {
+                    if (!reused || !retry) {
                         throw disconnected;
                     }
                     // The peer may close an idle socket. Retry once, bypassing the pool.
@@ -619,9 +539,9 @@ public final class TalonClient implements AutoCloseable {
         if (resp.tag == Messages.TAG_ACK) {
             String detail = Messages.readAckDetail(resp.body);
             if (detail != null) {
-                return new IOException(request + " rejected: " + detail);
+                return new TalonException(TalonException.Code.UNKNOWN, request + " rejected: " + detail);
             }
         }
-        return new IOException("unexpected reply to " + request + ": variant tag " + resp.tag);
+        throw new ProtocolException("unexpected reply to " + request + ": variant tag " + resp.tag);
     }
 }

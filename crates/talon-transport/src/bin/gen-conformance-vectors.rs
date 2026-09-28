@@ -254,6 +254,49 @@ fn vectors() -> Vec<Vector> {
             2,
         ),
     });
+    use talon_core::worker_membership::*;
+    result.push(control(
+        "control.membership_instances",
+        "offline member and serving incarnation",
+        0,
+        &ControlMessage::MembershipList {
+            view: WorkerDiscovery {
+                topology_token: 7,
+                state_token: 9,
+                valid_for_ms: 500,
+                workers: vec![
+                    DiscoveredWorker {
+                        member: WorkerMember {
+                            worker_id: "offline".into(),
+                            zone: Some("z".into()),
+                            retired: false,
+                        },
+                        state: InstanceState::Offline,
+                    },
+                    DiscoveredWorker {
+                        member: WorkerMember {
+                            worker_id: "online".into(),
+                            zone: None,
+                            retired: false,
+                        },
+                        state: InstanceState::Serving {
+                            instance_id: "process-2".into(),
+                            address: "127.0.0.1:7001".into(),
+                        },
+                    },
+                ],
+            },
+        },
+    ));
+    result.push(control(
+        "control.unavailable",
+        "typed metadata failure",
+        0,
+        &ControlMessage::ControlFailure {
+            code: talon_transport::DataErrorCode::Unavailable,
+            message: "offline".into(),
+        },
+    ));
     result
 }
 

@@ -59,3 +59,7 @@ Requires Java 17 or newer.
 
 See the [wire protocol reference](https://milvus-io.github.io/talon/reference/wire-protocol.html)
 for the format this implements.
+
+## Rolling upgrades
+
+Schema-6 clusters with persistent membership preserve block owners while Workers restart. Reads select one logical owner, resolve its current process, and return `TalonException` with `code()` equal to `UNAVAILABLE` or `TIMEOUT` on availability failures. `fallbackEligible()` is advisory and never accesses origin storage. Version mismatch, rate limits, origin failures and protocol failures remain distinct. Discovery expires after at most 500 ms and refresh failures are coalesced; idle sockets belong to a single process incarnation.
