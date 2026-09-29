@@ -539,7 +539,7 @@ impl WorkerRuntime {
                                 self.metrics.record_l2_hit();
                                 talon_telemetry::cache_tier("l2");
                                 self.metrics.record_cache_hit();
-                                tracing::info!(
+                                tracing::debug!(
                                     block = %block,
                                     first_page = first.0,
                                     pages = handles.len(),
@@ -580,7 +580,7 @@ impl WorkerRuntime {
                     Ok(mut handles) if handles.len() == 1 => {
                         let handle = handles.pop().expect("one handle");
                         self.record_l2_hit();
-                        tracing::info!(block = %block, tier = "l2", "HIT (sendfile)");
+                        tracing::debug!(block = %block, tier = "l2", "HIT (sendfile)");
                         return Ok(ServeOutcome::Sendfile(handle));
                     }
                     Ok(_) | Err(_) => {
@@ -1259,7 +1259,7 @@ impl WorkerRuntime {
                 result
             })
             .await?;
-        tracing::info!(block = %block, page = page.0, "committed page");
+        tracing::trace!(block = %block, page = page.0, "committed page");
         Ok(())
     }
 
