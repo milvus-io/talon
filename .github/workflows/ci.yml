@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Include dependent PRs whose base is another stack branch.
   pull_request:
-    branches: [main]
 
 # Cancel superseded runs on the same ref (e.g. rapid pushes to a PR).
 concurrency:

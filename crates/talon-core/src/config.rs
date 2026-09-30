@@ -531,10 +531,10 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar {
         env: "TALON_WORKER_NODE_ID",
         key: "node_id",
-        default: Some("<listen>"),
+        default: Some("<persisted worker_identity or generated ID>"),
         cli: true,
         secret: false,
-        help: "Stable worker node identity.",
+        help: "Persistent cache-directory identity. An explicit ID must match worker_identity; required when importing a nonempty legacy directory.",
     },
     ConfigVar {
         env: "TALON_WORKER_CONTROL_TLS_CA_CERT_PATH",

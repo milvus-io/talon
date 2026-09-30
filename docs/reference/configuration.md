@@ -292,10 +292,10 @@ Logical cluster advertised in status.
 
 ### `node_id`
 
-Stable worker node identity.
+Persistent cache-directory identity. An explicit ID must match worker_identity; required when importing a nonempty legacy directory.
 
 - **Environment variable:** `TALON_WORKER_NODE_ID`
-- **Default:** `<listen>`
+- **Default:** `<persisted worker_identity or generated ID>`
 - **CLI flag:** `--node-id`
 
 ### `control_tls.ca_cert_path`
