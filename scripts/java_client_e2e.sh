@@ -70,6 +70,10 @@ echo "=== conformance vectors ==="
 "$JAVA" -cp "$CLASSES" io.milvus.talon.ConformanceTest || exit 1
 
 echo
+echo "=== retained membership and failure semantics ==="
+"$JAVA" -cp "$CLASSES" io.milvus.talon.RollingUpgradeTest || exit 1
+
+echo
 echo "=== end-to-end ==="
 "$JAVA" -cp "$CLASSES" io.milvus.talon.E2ETest \
   "127.0.0.1:$COORD_PORT" "$BLOCK_SIZE" "$VERSION" || exit 1

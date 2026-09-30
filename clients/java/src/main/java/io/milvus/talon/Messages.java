@@ -15,20 +15,8 @@ import java.util.List;
  */
 final class Messages {
 
-    /**
-     * Newest control schema this client understands.
-     *
-     * <p>Deliberately behind the Rust {@code CONTROL_SCHEMA_VERSION}, which is
-     * at 3. Schema 3 adds the ADR 0003 §5 mapping-fence messages, which this
-     * client does not implement, so claiming 3 would mean accepting an envelope
-     * it cannot decode.
-     *
-     * <p>This does not break interoperation: the server encodes each message at
-     * its own minimum schema rather than the global maximum, so placement,
-     * membership and object messages still arrive tagged 1 or 2. Raise this only
-     * when the fence messages are implemented here.
-     */
-    static final int CONTROL_SCHEMA_VERSION = 2;
+    /** Highest understood envelope; unsupported variants still fail closed. */
+    static final int CONTROL_SCHEMA_VERSION = 6;
     /** Oldest schema the protocol defines. */
     static final int MIN_CONTROL_SCHEMA_VERSION = 1;
 
@@ -42,6 +30,11 @@ final class Messages {
     static final int TAG_OBJECT_STAT = 11;
     static final int TAG_LIST_OBJECTS = 12;
     static final int TAG_OBJECT_LIST = 13;
+
+    static final int TAG_WORKER_DISCOVERY_QUERY = 21;
+    static final int TAG_WORKER_DISCOVERY = 22;
+    static final int TAG_MEMBERSHIP_REQUIRED = 25;
+    static final int TAG_CONTROL_FAILURE = 26;
 
     // Backend enum tags.
     static final int BACKEND_S3 = 0;
@@ -76,6 +69,11 @@ final class Messages {
      */
     static int minimumSchema(int tag) {
         switch (tag) {
+            case TAG_WORKER_DISCOVERY_QUERY:
+            case TAG_WORKER_DISCOVERY:
+            case TAG_MEMBERSHIP_REQUIRED:
+            case TAG_CONTROL_FAILURE:
+                return 6;
             case TAG_STAT_OBJECT:
             case TAG_OBJECT_STAT:
             case TAG_LIST_OBJECTS:
@@ -84,6 +82,36 @@ final class Messages {
             default:
                 return MIN_CONTROL_SCHEMA_VERSION;
         }
+    }
+
+    static byte[] workerDiscoveryQuery(int requestId) {
+        return framed(requestId, envelope(TAG_WORKER_DISCOVERY_QUERY).toBytes());
+    }
+
+    record DiscoveredWorker(String id, String zone, int state, String instance, String address) {}
+    record Discovery(boolean retained, long topology, long state, long validForMs, List<DiscoveredWorker> workers) {}
+    static Discovery readDiscovery(Bincode.Reader r) {
+        int mode = r.variant();
+        if (mode > 1) throw new ProtocolException("unknown membership mode");
+        long topology = r.u64();
+        long state = r.u64();
+        long validity = r.u64();
+        if (validity < 0) throw new ProtocolException("invalid discovery validity");
+        int count = r.seqLen();
+        List<DiscoveredWorker> workers = new ArrayList<>(count);
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (int i = 0; i < count; i++) {
+            String id = r.string();
+            String zone = r.bool() ? r.string() : null;
+            boolean retired = r.bool();
+            int status = r.variant();
+            if (status > 2 || retired || !ids.add(id)) throw new ProtocolException("invalid discovered member");
+            String instance = status == 2 ? r.string() : null;
+            String address = status == 2 ? r.string() : null;
+            workers.add(new DiscoveredWorker(id, zone, status, instance, address));
+        }
+        if (r.remaining() != 0) throw new ProtocolException("trailing discovery bytes");
+        return new Discovery(mode == 1, topology, state, Math.min(validity, 500), List.copyOf(workers));
     }
 
     /** Wrap a bincode body in a Control frame. */
