@@ -168,6 +168,12 @@ impl Args {
             data_plane_rings: self.data_plane_rings,
             cache_dirs: None,
             capacity_bytes: None,
+            background_task_concurrency: None,
+            background_io_concurrency: None,
+            background_scan_batch_size: None,
+            background_delete_batch_size: None,
+            background_io_max_mb_per_sec: None,
+            background_delete_max_per_sec: None,
             async_eviction_enabled: None,
             async_eviction_high_watermark: None,
             async_eviction_low_watermark: None,
@@ -692,8 +698,7 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
-    let async_eviction = talon_worker::runtime::AsyncEvictionService::start(worker.clone(), &cfg);
-    let page_gc = talon_worker::page_gc::PageGcService::start(worker.clone(), page_gc_config);
+    let background = talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
     tokio::pin!(data);
@@ -705,7 +710,7 @@ async fn run() -> anyhow::Result<()> {
     let drain_started = Instant::now();
     observability.begin_shutdown();
     tracing::info!("worker draining");
-    page_gc.begin_shutdown();
+    background.begin_shutdown();
     stop.store(true, std::sync::atomic::Ordering::Release);
     // Join the producer before publishing not-ready: an older ready heartbeat
     // must never follow the final report from this process.
@@ -727,10 +732,7 @@ async fn run() -> anyhow::Result<()> {
             Some(task) => task.await,
             None => Ok(()),
         };
-        if let Some(service) = async_eviction {
-            service.shutdown().await;
-        }
-        page_gc.shutdown().await;
+        background.shutdown().await;
         control_result?;
         data_result
     };

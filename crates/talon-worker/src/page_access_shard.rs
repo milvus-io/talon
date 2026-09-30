@@ -5,7 +5,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::path::Path;
-use std::time::{Duration, Instant};
 use talon_core::BlockId;
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -14,10 +13,6 @@ pub(crate) const FILE_NAME: &str = "access.shard";
 pub(crate) const TEMP_PREFIX: &str = "access.shard.tmp.";
 // A malformed or exceptionally large shard must not allocate unbounded memory.
 pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
-// Per worker, with one checkpoint writer. Shards are also spread over the
-// configured checkpoint interval by PageGcService. Shutdown retains this cap.
-const BYTES_PER_SECOND: u64 = 8 * 1024 * 1024;
-
 pub(crate) struct ShardRecovery {
     pub records: HashMap<BlockId, AccessRecovery>,
     pub corrupt: bool,
@@ -88,10 +83,20 @@ pub(crate) fn load(dir: &Path, shard: usize, page_size: u32, now: u64) -> Option
 /// Caller holds the shard checkpoint gate through publication and directory sync.
 /// No block gate is held: a snapshot may become stale exactly as an unsaved access
 /// can, but it neither publishes residency nor clears a newer dirty revision.
+#[cfg(test)]
 pub(crate) fn checkpoint<'a>(
     dir: &Path,
     page_size: u32,
     records: impl Iterator<Item = (&'a BlockId, &'a AccessSnapshot)>,
+) -> anyhow::Result<usize> {
+    checkpoint_with_budget(dir, page_size, records, None)
+}
+
+pub(crate) fn checkpoint_with_budget<'a>(
+    dir: &Path,
+    page_size: u32,
+    records: impl Iterator<Item = (&'a BlockId, &'a AccessSnapshot)>,
+    resources: Option<&crate::background::BackgroundBudget>,
 ) -> anyhow::Result<usize> {
     let mut bytes = Vec::from(*MAGIC);
     bytes.extend_from_slice(&page_size.to_le_bytes());
@@ -113,15 +118,18 @@ pub(crate) fn checkpoint<'a>(
     let mut tmp = tempfile::Builder::new()
         .prefix(TEMP_PREFIX)
         .tempfile_in(dir)?;
-    let started = Instant::now();
-    let mut written = 0_u64;
-    for chunk in bytes.chunks(64 * 1024) {
-        tmp.write_all(chunk)?;
-        written += chunk.len() as u64;
-        let due = Duration::from_secs_f64(written as f64 / BYTES_PER_SECOND as f64);
-        if let Some(wait) = due.checked_sub(started.elapsed()) {
-            std::thread::sleep(wait);
+    let defaults;
+    let resources = match resources {
+        Some(resources) => resources,
+        None => {
+            defaults =
+                crate::background::BackgroundBudget::new(&talon_core::WorkerConfig::default());
+            &defaults
         }
+    };
+    for chunk in bytes.chunks(64 * 1024) {
+        resources.bytes_blocking(chunk.len());
+        tmp.write_all(chunk)?;
     }
     #[cfg(test)]
     crate::page_access_store::checkpoint_fault("file_sync")?;

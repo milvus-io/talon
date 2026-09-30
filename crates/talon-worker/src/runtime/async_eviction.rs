@@ -1,17 +1,19 @@
 //! Background capacity reclamation with high/low watermark hysteresis.
 use super::WorkerRuntime;
+#[cfg(test)]
 use std::sync::Arc;
+#[cfg(test)]
 use std::time::Duration;
 use talon_core::WorkerConfig;
 
-struct EvictionCycle {
+pub(super) struct EvictionCycle {
     high: u64,
     low: u64,
     active: bool,
 }
 
 impl EvictionCycle {
-    fn new(capacity: u64, config: &WorkerConfig) -> Self {
+    pub(super) fn new(capacity: u64, config: &WorkerConfig) -> Self {
         Self {
             high: ((capacity as f64 * config.async_eviction_high_watermark).ceil() as u64).max(1),
             low: (capacity as f64 * config.async_eviction_low_watermark).floor() as u64,
@@ -19,7 +21,7 @@ impl EvictionCycle {
         }
     }
 
-    async fn tick(&mut self, worker: &WorkerRuntime) {
+    pub(super) async fn tick(&mut self, worker: &WorkerRuntime) {
         let bytes = worker.lru.total_bytes();
         if bytes <= self.low {
             self.active = false;
@@ -27,66 +29,20 @@ impl EvictionCycle {
             self.active = true;
         }
         if self.active {
-            // One bounded pass. If readers or I/O prevent reaching the target,
+            // One bounded batch. If readers, budgets, or I/O prevent reaching the target,
             // retain the cycle across ticks, including below the high watermark.
-            worker.evict_to_target(self.low).await;
+            let lru = worker.lru.clone();
+            let target = self.low;
+            let scan = worker.page_gc_config.scan_batch_size;
+            let deletes = worker.page_gc_config.delete_batch_size;
+            let units = tokio::task::spawn_blocking(move || {
+                lru.candidates_to_fit_bounded(target, &Default::default(), scan, deletes)
+            })
+            .await
+            .expect("eviction scan panicked");
+            worker.unlink_units_to_target(units, 1, target).await;
             self.active = worker.lru.total_bytes() > self.low;
         }
-    }
-}
-
-/// Periodically reclaim whole blocks and pages without waiting for a cache miss.
-/// Occupancy is tracked cache bytes / configured cache capacity, not filesystem use.
-pub struct AsyncEvictionService {
-    stop: tokio::sync::watch::Sender<bool>,
-    task: Option<tokio::task::JoinHandle<()>>,
-}
-
-impl AsyncEvictionService {
-    /// Start with a validated worker configuration; disabled/unbounded caches spawn no task.
-    pub fn start(worker: Arc<WorkerRuntime>, config: &WorkerConfig) -> Option<Self> {
-        if !config.async_eviction_enabled || worker.capacity_bytes == 0 {
-            return None;
-        }
-        let mut cycle = EvictionCycle::new(worker.capacity_bytes, config);
-        let period = Duration::from_secs(config.async_eviction_check_interval_secs);
-        let (stop, mut stopped) = tokio::sync::watch::channel(false);
-        let task = tokio::spawn(async move {
-            // The first tick also handles occupancy recovered from disk at startup.
-            let mut ticker = tokio::time::interval(period);
-            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                tokio::select! { biased;
-                    _ = stopped.changed() => break,
-                    _ = ticker.tick() => {
-                        tokio::select! { biased;
-                            _ = stopped.changed() => break,
-                            _ = cycle.tick(&worker) => {}
-                        }
-                    }
-                }
-            }
-            // A cancelled pass may have an owned disk/metadata mutation in flight.
-            // PageGcService's shutdown drains those mutations before checkpointing.
-        });
-        Some(Self {
-            stop,
-            task: Some(task),
-        })
-    }
-
-    /// Stop scheduling new work; the worker's mutation drain finishes any pending unlink.
-    pub async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        if let Some(task) = self.task.take() {
-            let _ = task.await;
-        }
-    }
-}
-
-impl Drop for AsyncEvictionService {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
     }
 }
 
@@ -157,6 +113,126 @@ mod tests {
                 .unwrap();
         } else {
             r.commit_cached_block(&block(n), Bytes::from_static(&[1; 16]))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn scan_and_delete_budgets_bound_each_eviction_batch() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut r = runtime(root.path(), paged, 160);
+            r.page_gc_config.scan_batch_size = 1;
+            r.page_gc_config.delete_batch_size = 1;
+            for n in 0..9 {
+                fill(&r, n, paged).await;
+            }
+            for n in 0..9 {
+                r.lru.touch(&unit(n, paged));
+            }
+            let config = WorkerConfig {
+                async_eviction_low_watermark: 0.2,
+                ..Default::default()
+            };
+            let mut cycle = EvictionCycle::new(160, &config);
+            for _ in 0..9 {
+                cycle.tick(&r).await;
+                assert_eq!(
+                    r.resident_bytes(),
+                    144,
+                    "one scan step only clears one reference bit"
+                );
+            }
+            for remaining in (2..9).rev() {
+                cycle.tick(&r).await;
+                assert_eq!(r.resident_bytes(), remaining * 16);
+            }
+            assert!(!cycle.active);
+        }
+    }
+
+    #[tokio::test]
+    async fn both_eviction_forms_obey_shared_io_and_delete_rates() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut r = runtime(root.path(), paged, 48);
+            let config = WorkerConfig {
+                async_eviction_low_watermark: 0.4,
+                background_io_concurrency: 1,
+                background_delete_max_per_sec: 25,
+                ..Default::default()
+            };
+            let budget = crate::background::BackgroundBudget::new(&config);
+            r.background_budget = Some(budget.clone());
+            for n in 0..3 {
+                fill(&r, n, paged).await;
+            }
+            let slot = budget.io().await;
+            let r = Arc::new(r);
+            let worker = r.clone();
+            let started = std::time::Instant::now();
+            let task = tokio::spawn(async move {
+                EvictionCycle::new(48, &config).tick(&worker).await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!task.is_finished());
+            assert_eq!(
+                r.resident_bytes(),
+                48,
+                "no unlink while the shared disk slot is occupied"
+            );
+            drop(slot);
+            tokio::time::timeout(Duration::from_secs(2), task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(r.resident_bytes(), 16);
+            assert!(started.elapsed() >= Duration::from_millis(80));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_caller_keeps_the_disk_slot_until_owned_unlink_finishes() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut r = runtime(root.path(), paged, 32);
+            let config = WorkerConfig {
+                background_io_concurrency: 1,
+                background_delete_max_per_sec: 0,
+                ..Default::default()
+            };
+            let budget = crate::background::BackgroundBudget::new(&config);
+            r.background_budget = Some(budget.clone());
+            fill(&r, 0, paged).await;
+            fill(&r, 1, paged).await;
+            let state = r.page_lifecycle.block(&block(0));
+            let gate = state.gate.lock().await;
+            let r = Arc::new(r);
+            let worker = r.clone();
+            let task = tokio::spawn(async move {
+                EvictionCycle::new(32, &config).tick(&worker).await;
+            });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while budget.available_io() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(20), budget.io())
+                .await
+                .is_err());
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert!(tokio::time::timeout(Duration::from_millis(20), budget.io())
+                .await
+                .is_err());
+            assert_eq!(r.resident_bytes(), 32);
+            drop(gate);
+            r.drain_page_mutations().await;
+            assert_eq!(r.resident_bytes(), 16);
+            let _slot = tokio::time::timeout(Duration::from_secs(1), budget.io())
                 .await
                 .unwrap();
         }
@@ -262,7 +338,7 @@ mod tests {
             ..Default::default()
         };
         let started = tokio::time::Instant::now();
-        let service = AsyncEvictionService::start(r.clone(), &config).unwrap();
+        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
         tokio::time::timeout(Duration::from_secs(2), async {
             while r.resident_bytes() > 128 {
                 tokio::task::yield_now().await;
@@ -288,7 +364,10 @@ mod tests {
         fill(&r, 13, false).await;
         tokio::time::sleep(Duration::from_millis(1100)).await;
         assert_eq!(r.resident_bytes(), 144);
-        assert!(AsyncEvictionService::start(r.clone(), &WorkerConfig::default()).is_none());
+        let disabled = crate::runtime::WorkerBackground::start(r.clone(), &WorkerConfig::default());
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(r.resident_bytes(), 144);
+        disabled.shutdown().await;
         // The foreground fallback still enforces the hard cap.
         fill(&r, 11, false).await;
         fill(&r, 12, false).await;
@@ -296,7 +375,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_cancels_the_pass_but_preserves_owned_unlink() {
+    async fn shutdown_waits_for_owned_unlink() {
         for paged in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let r = Arc::new(runtime(root.path(), paged, 32));
@@ -306,9 +385,10 @@ mod tests {
             let gate = state.gate.lock().await;
             let config = WorkerConfig {
                 async_eviction_enabled: true,
+                background_task_concurrency: 4,
                 ..Default::default()
             };
-            let service = AsyncEvictionService::start(r.clone(), &config).unwrap();
+            let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
             tokio::time::timeout(Duration::from_secs(2), async {
                 while r.page_mutations.active_count() == 0 {
                     tokio::task::yield_now().await;
@@ -316,12 +396,15 @@ mod tests {
             })
             .await
             .unwrap();
-            tokio::time::timeout(Duration::from_secs(2), service.shutdown())
-                .await
-                .unwrap();
+            let shutdown = tokio::spawn(service.shutdown());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            assert!(!shutdown.is_finished(), "shutdown retains owned disk work");
             assert_eq!(r.resident_bytes(), 32, "blocked unlink remains accounted");
             drop(gate);
-            r.drain_page_mutations().await;
+            tokio::time::timeout(Duration::from_secs(2), shutdown)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(r.resident_bytes(), 16);
             assert_eq!(r.lru.total_bytes(), 16);
         }

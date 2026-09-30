@@ -7,7 +7,8 @@ use std::time::{Duration, Instant};
 
 mod load;
 mod async_eviction;
-pub use async_eviction::AsyncEvictionService;
+mod background;
+pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;
@@ -128,6 +129,7 @@ pub struct WorkerRuntime {
     page_gc_metrics: PageGcMetrics,
     page_mutations: Arc<Mutations>,
     page_gc_io: Arc<tokio::sync::Semaphore>,
+    background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<(ScanCursor, Instant, usize)>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
     page_cleanup: Arc<Mutex<crate::page_cleanup::CleanupCursor>>,
@@ -220,6 +222,7 @@ impl WorkerRuntime {
             page_gc_config: PageGcConfig::default(),
             page_mutations: Arc::new(Mutations::default()),
             page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
+            background_budget: None,
             page_scan: Arc::new(tokio::sync::Mutex::new((
                 ScanCursor::default(),
                 Instant::now(),
@@ -1871,7 +1874,7 @@ impl WorkerRuntime {
         self.evict_to_target(self.capacity_bytes).await;
     }
 
-    /// Bounded capacity reclamation shared by admissions and background watermarks.
+    /// Capacity reclamation for foreground admissions, bounded by initial residency.
     async fn evict_to_target(&self, target: u64) {
         // A selected page can become protected or fail to unlink. Refill from
         // other units using actual residency, attempting each unit at most once.

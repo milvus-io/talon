@@ -1,11 +1,8 @@
-//! Worker-local idle collection and checkpoint scheduling, independent of registration.
-use crate::WorkerRuntime;
-use std::hash::{BuildHasher, Hasher};
+//! Page maintenance configuration, reports, metrics, and owned disk mutations.
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
 use talon_core::{Counter, Gauge, Histogram, Metrics, WorkerConfig};
 use tokio::sync::Notify;
 
@@ -162,79 +159,5 @@ impl PageGcMetrics {
             tti_seconds: g("talon_worker_page_tti_seconds", "Configured page time to idle; zero disables idle expiration."),
             checkpoint_interval: g("talon_worker_page_access_checkpoint_interval_seconds", "Configured access checkpoint period."),
         }
-    }
-}
-
-/// Start collector, checkpoint, and disk cleanup loops with orderly shutdown.
-pub struct PageGcService {
-    stop: tokio::sync::watch::Sender<bool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    worker: Arc<WorkerRuntime>,
-}
-impl PageGcService {
-    pub fn start(worker: Arc<WorkerRuntime>, config: PageGcConfig) -> Self {
-        let (stop, _) = tokio::sync::watch::channel(false);
-        let mut tasks = Vec::new();
-        // Disk leftovers must be reclaimed even after TTI is disabled. Keep
-        // the loops independent so a long checkpoint cannot starve cleanup.
-        for maintenance in 0..3 {
-            if maintenance == 1 && config.tti_ms == 0 {
-                continue;
-            }
-            let worker = worker.clone();
-            let mut stopped = stop.subscribe();
-            let config = config.clone();
-            tasks.push(tokio::spawn(async move {
-                let millis = if maintenance == 1 {
-                    (config.checkpoint_interval_ms / crate::page_lifecycle::SHARDS as u64).max(1)
-                } else {
-                    config.interval_ms
-                };
-                let period = Duration::from_millis(millis);
-                let jitter = std::collections::hash_map::RandomState::new()
-                    .build_hasher()
-                    .finish()
-                    % millis;
-                let mut ticker = tokio::time::interval_at(
-                    tokio::time::Instant::now() + Duration::from_millis(jitter),
-                    period,
-                );
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {biased;
-                        _ = stopped.changed() => break,
-                        _ = ticker.tick() => {
-                            match maintenance {
-                                0 => { worker.gc_once().await; }
-                                1 => { worker.checkpoint_next_shard().await; }
-                                _ => { worker.cleanup_page_files_once().await; }
-                            }
-                        }
-                    }
-                }
-            }));
-        }
-        Self {
-            stop,
-            tasks,
-            worker,
-        }
-    }
-    pub fn begin_shutdown(&self) {
-        let _ = self.stop.send(true);
-    }
-
-    pub async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
-        }
-        self.worker.drain_page_mutations().await;
-        self.worker.checkpoint_access_times().await;
-    }
-}
-impl Drop for PageGcService {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
     }
 }
