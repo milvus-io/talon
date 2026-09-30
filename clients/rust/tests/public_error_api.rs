@@ -24,7 +24,8 @@ fn classify(error: Error) -> (CacheReadError, String) {
             source.into()
         }
         Error::Block(BlockReadError::Worker(source))
-        | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),
+        | Error::Block(BlockReadError::AllReplicasFailed { source, .. })
+        | Error::Block(BlockReadError::Target { source, .. }) => source.into(),
         Error::Block(BlockReadError::NoOwners | BlockReadError::UnresolvedOwner) => {
             CacheReadError::Unavailable(diagnostic.clone())
         }

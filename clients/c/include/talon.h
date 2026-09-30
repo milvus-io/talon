@@ -16,7 +16,9 @@ typedef enum talon_status {
     TALON_STATUS_INVALID_ARGUMENT = 1,
     TALON_STATUS_RUNTIME_ERROR = 2,
     TALON_STATUS_SUBMIT_ERROR = 3,
-    TALON_STATUS_OPERATION_ERROR = 4
+    TALON_STATUS_OPERATION_ERROR = 4,
+    TALON_STATUS_UNAVAILABLE = 5,
+    TALON_STATUS_TIMEOUT = 6
 } talon_status;
 
 typedef enum talon_operation {

@@ -35,6 +35,7 @@ pub struct CoordinatorObservability {
     pub(crate) started: Instant,
     sequence: AtomicU64,
     ready: AtomicBool,
+    retained_mode: AtomicBool,
     /// Whether a state-store operation has failed since the last successful
     /// membership reconciliation.
     state_store_degraded: AtomicBool,
@@ -85,6 +86,7 @@ impl CoordinatorObservability {
             started: Instant::now(),
             sequence: AtomicU64::new(0),
             ready: AtomicBool::new(false),
+            retained_mode: AtomicBool::new(false),
             state_store_degraded: AtomicBool::new(false),
             last_membership_refresh_elapsed_ms: AtomicU64::new(0),
             state_failure_grace: Duration::ZERO,
@@ -415,10 +417,16 @@ impl CoordinatorObservability {
         })?
     }
 
+    /// Last authoritative mode, used only to preserve error wire compatibility
+    /// if the backend becomes unavailable. Never used to authorize placement.
+    pub fn retained_mode(&self) -> bool {
+        self.retained_mode.load(Ordering::Acquire)
+    }
+
     pub async fn membership_mode(
         &self,
     ) -> StateStoreResult<talon_core::worker_membership::MembershipMode> {
-        Ok(tokio::time::timeout(
+        let mode = tokio::time::timeout(
             self.request_timeout,
             self.store.member_registry(&self.cluster_id),
         )
@@ -427,7 +435,12 @@ impl CoordinatorObservability {
             backend: self.store.backend(),
         })??
         .value
-        .mode)
+        .mode;
+        self.retained_mode.store(
+            mode == talon_core::worker_membership::MembershipMode::Retained,
+            Ordering::Release,
+        );
+        Ok(mode)
     }
 
     pub async fn report_instance(

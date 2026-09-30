@@ -2014,6 +2014,40 @@ mod tests {
         std::fs::remove_dir_all(root).ok();
     }
 
+    #[tokio::test]
+    async fn metadata_errors_follow_request_capability_during_migration() {
+        let (worker, obs, _, _) = test_worker(); // Deliberately not ready.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, _) = listener.accept().await.unwrap();
+        let task = tokio::spawn(async move { handle_conn(stream, worker, obs).await });
+        let request = ControlMessage::StatObject {
+            object: ObjectId::new(talon_core::Backend::Azure, "c", "o"),
+        };
+        for schema in [2, 6, 2] {
+            client
+                .write_all(&codec::encode_for_schema(1, &request, schema).unwrap())
+                .await
+                .unwrap();
+            let reply = read_control(&mut client).await.unwrap().unwrap();
+            if schema == 6 {
+                assert!(matches!(
+                    reply,
+                    ControlMessage::ControlFailure {
+                        code: talon_transport::DataErrorCode::Unavailable,
+                        ..
+                    }
+                ));
+            } else {
+                assert!(matches!(reply, ControlMessage::Ack { ok: false, .. }));
+            }
+        }
+        drop(client);
+        task.await.unwrap().unwrap();
+    }
+
     fn test_worker() -> (
         Arc<WorkerRuntime>,
         Arc<WorkerObservability>,

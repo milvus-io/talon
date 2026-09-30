@@ -214,6 +214,10 @@ pub enum ControlMessage {
         detail: Option<String>,
     },
     MembershipCapabilityRequired {},
+    ControlFailure {
+        code: crate::DataErrorCode,
+        message: String,
+    },
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -241,7 +245,8 @@ impl ControlMessage {
     /// Oldest control schema that can represent this message.
     pub fn minimum_schema(&self) -> u16 {
         match self {
-            Self::MembershipCapabilityRequired {}
+            Self::ControlFailure { .. }
+            | Self::MembershipCapabilityRequired {}
             | Self::WorkerDiscoveryQuery {}
             | Self::WorkerDiscovery { .. }
             | Self::WorkerInstanceHeartbeat { .. }
@@ -372,6 +377,23 @@ pub fn decode_request(buf: &[u8]) -> Result<(FrameHeader, ControlMessage), Codec
     }
     let (_, business) = crate::envelope::decode(&header, &buf[HEADER_LEN..])?;
     decode_business(header, business, CONTROL_SCHEMA_VERSION)
+}
+
+/// Read the schema after the caller has validated a request with `decode_request`.
+pub fn request_schema(header: &FrameHeader, payload: &[u8]) -> Result<u16, CodecError> {
+    let (_, business) = crate::envelope::decode(header, payload)?;
+    peek_schema(business)
+}
+
+/// Old metadata peers retain the string-only Ack contract during migration.
+pub fn metadata_reply_for_schema(reply: ControlMessage, schema: u16) -> ControlMessage {
+    match reply {
+        ControlMessage::ControlFailure { message, .. } if schema < 6 => ControlMessage::Ack {
+            ok: false,
+            detail: Some(message),
+        },
+        reply => reply,
+    }
 }
 
 fn decode_with_max_schema(
