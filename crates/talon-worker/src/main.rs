@@ -168,6 +168,16 @@ impl Args {
             data_plane_rings: self.data_plane_rings,
             cache_dirs: None,
             capacity_bytes: None,
+            background_task_concurrency: None,
+            background_io_concurrency: None,
+            background_scan_batch_size: None,
+            background_delete_batch_size: None,
+            background_io_max_mb_per_sec: None,
+            background_delete_max_per_sec: None,
+            async_eviction_enabled: None,
+            async_eviction_high_watermark: None,
+            async_eviction_low_watermark: None,
+            async_eviction_check_interval_secs: None,
             l1_capacity_bytes: None,
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
@@ -686,7 +696,7 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
-    let page_gc = talon_worker::page_gc::PageGcService::start(worker.clone(), page_gc_config);
+    let background = talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg, worker, observability, stop.clone());
     tokio::pin!(data);
@@ -699,12 +709,12 @@ async fn run() -> anyhow::Result<()> {
     };
     stop.store(true, std::sync::atomic::Ordering::Release);
     _control_plane.abort();
-    if tokio::time::timeout(Duration::from_secs(10), page_gc.shutdown())
+    if tokio::time::timeout(Duration::from_secs(10), background.shutdown())
         .await
         .is_err()
     {
         tracing::warn!(
-            "page maintenance shutdown timed out; restart will use the last valid checkpoint"
+            "background maintenance shutdown timed out; restart will use the last valid checkpoint"
         );
     }
     result

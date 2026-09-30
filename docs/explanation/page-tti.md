@@ -60,7 +60,8 @@ TTI 是异步回收条件，不是物理空间释放期限。GC 扫描/删除预
 | `page_lifecycle` | 分片 block registry、稳定 page handle、原子读取保护与时间、可恢复扫描游标 |
 | `page_access_store` / `page_access_shard` | 旧 block 元数据恢复、分片快照编解码与原子替换、cache root 独占锁 |
 | `page_cleanup` | 物理目录游标扫描、崩溃临时文件和无 page 目录的限量清理 |
-| `page_gc` | 配置、GC/checkpoint 调度、任务所有权与退出、指标 |
+| `page_gc` | 配置、mutation 所有权、指标 |
+| `background`、`runtime/background` | 统一后台调度、共享资源预算、GC/checkpoint/清理/eviction 注册与退出 |
 | `runtime/page_maintenance` | 配置恢复、`gc_once`、checkpoint 和统一 page 删除协议 |
 | `runtime` | L1/L2/sendfile/cache-only 接入，提交事务及容量/旧版本淘汰 |
 | `eviction` | 非破坏性候选选择、成功 unlink 后记账、RAII 容量 pin |
@@ -136,10 +137,11 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 时间戳只向前推进；同一毫秒或晚完成的较早读取跳过时间戳和 dirty 写入。
 时间戳推进时只更新本 page 的原子 dirty 标记，不修改 block 共享状态。
 这些是路径上的开销减少，不代表已通过性能验收。
-后台按配置周期轮转 256 个分片，每个 tick 处理一个分片；tick 最小为 1 ms。
-同一 Worker 同时只有一个 checkpoint，写入按 64 KiB 分块，限制为 8 MiB/s；
+后台通过[统一调度器](async-eviction.md)轮转 256 个分片，每批处理一个分片；
+批次完成后等待配置周期的 1/256（最小 1 ms）。同一 Worker 同时只有一个 checkpoint，
+写入按 64 KiB 分块，使用共享 `background_io_max_mb_per_sec` 预算，默认 8 MB/s（十进制）；
 实际全轮耗时可能因 I/O、数据规模和调度超过配置周期。显式 flush 和关闭时遍历全部
-分片，不等待后台 tick，但仍遵守字节速率限制。未变脏且成员未变化的分片不写盘。
+分片，不等待后台 tick；关闭时保留共享预算，独立显式 flush 使用默认字节速率限制。未变脏且成员未变化的分片不写盘。
 
 每次只构造一个分片的快照，registry 遍历每批最多 64 个 block。重写分片时包含
 其中未变脏的存量 block，避免覆盖丢失。小范围访问也可能重写整个分片；这是减少
@@ -164,7 +166,8 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 - 启动持有 cache root 独占锁，在接收请求前完成一轮限量分批扫描；不依赖 residency
   索引，因此无 page、缺少或损坏 `block.meta` 的目录仍可被发现。
 - 后台按 `page_gc_interval_ms`（默认 1 秒）推进；每批使用 `page_gc_scan_batch_size`
-  和 `page_gc_delete_batch_size` 的独立预算，并与 page GC 共享 I/O 并发限额。
+  和 `page_gc_delete_batch_size` 与全局后台批量上限中的较小值，并共享后台任务并发、
+  I/O 并发和删除速率预算；同一任务完成后再等待下一周期。
   即使关闭 TTI 或切回 whole-block 读取模式，也继续扫描已有的 `paged/` 目录。
 - 分片目录中的 `access.shard.tmp.*` 使用独立 checkpoint gate 清理；在途写入、未知文件和符号链接保留。正式快照即使为空也保留，避免恢复时重新启用旧 block 文件。
 - 删除已识别的旧 `access.meta.tmp.*`，以及符合现有命名格式的 `block.meta.tmp.<pid>.<seq>`

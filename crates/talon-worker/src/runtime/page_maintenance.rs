@@ -5,6 +5,18 @@ use crate::page_gc::{CheckpointReport, GcReport};
 use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
 
 impl WorkerRuntime {
+    async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.background_budget {
+            Some(budget) => Some(budget.io().await),
+            None => None,
+        }
+    }
+    async fn background_delete(&self) {
+        if let Some(budget) = &self.background_budget {
+            budget.delete().await;
+        }
+    }
+
     /// Configure page idle collection and restore persisted ages before serving traffic.
     pub fn with_page_gc(mut self, config: PageGcConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -117,13 +129,15 @@ impl WorkerRuntime {
         self.page_mutations
             .run(async move {
                 let _permit = permit;
+                let _background_io = runtime.background_io().await;
                 let worker = runtime.clone();
                 let report = tokio::task::spawn_blocking(move || {
                     // The runtime retains the root lease until blocking I/O finishes.
-                    worker.page_cleanup.lock().unwrap().run_batch(
+                    worker.page_cleanup.lock().unwrap().run_batch_with_budget(
                         &worker.page_lifecycle,
                         worker.page_gc_config.scan_batch_size,
                         worker.page_gc_config.delete_batch_size,
+                        worker.background_budget.as_deref(),
                     )
                 })
                 .await
@@ -231,13 +245,25 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
+        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
+            .await
+    }
+
+    async fn evict_page_candidate_to_target(
+        &self,
+        candidate: GcCandidate,
+        reason: usize,
+        target: u64,
+    ) -> Option<u64> {
         let runtime = self.clone();
         let permit = self.page_gc_io.clone().acquire_owned().await.ok()?;
         self.page_mutations.run(async move {
             let _permit = permit;
+            runtime.background_delete().await;
+            let _background_io = runtime.background_io().await;
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
-            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= runtime.capacity_bytes) { return None; }
+            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= target) { return None; }
             let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
@@ -271,6 +297,8 @@ impl WorkerRuntime {
         let runtime = self.clone();
         self.page_mutations
             .run(async move {
+                runtime.background_delete().await;
+                let _background_io = runtime.background_io().await;
                 let _gate = block.gate.lock().await;
                 if !block.inner.lock().unwrap().pages.is_empty() {
                     return;
@@ -304,6 +332,16 @@ impl WorkerRuntime {
         units: Vec<crate::eviction::EvictionCandidate>,
         reason: usize,
     ) {
+        self.unlink_units_to_target(units, reason, self.capacity_bytes)
+            .await;
+    }
+
+    pub(super) async fn unlink_units_to_target(
+        &self,
+        units: Vec<crate::eviction::EvictionCandidate>,
+        reason: usize,
+        target: u64,
+    ) {
         // Capture generations before the first await, not after earlier deletions finish.
         let candidates: Vec<_> = units
             .into_iter()
@@ -323,7 +361,7 @@ impl WorkerRuntime {
                 CacheUnit::Page(_, _) => {
                     if self.lru.candidate_is_current(&unit) {
                         if let Some(c) = candidate {
-                            self.evict_page_candidate(c, reason).await;
+                            self.evict_page_candidate_to_target(c, reason, target).await;
                         }
                     }
                 }
@@ -332,10 +370,12 @@ impl WorkerRuntime {
                     let runtime = self.clone();
                     self.page_mutations
                         .run(async move {
+                            runtime.background_delete().await;
+                            let _background_io = runtime.background_io().await;
                             let _gate = state.gate.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
-                                    || runtime.lru.total_bytes() <= runtime.capacity_bytes)
+                                    || runtime.lru.total_bytes() <= target)
                             {
                                 return;
                             }
@@ -393,6 +433,7 @@ impl WorkerRuntime {
             for _ in 0..if all { crate::page_lifecycle::SHARDS } else { 1 } {
                 let shard = *cursor;
                 *cursor = (shard + 1) % crate::page_lifecycle::SHARDS;
+                let _background_io = runtime.background_io().await;
                 let worker = runtime.clone();
                 let result = tokio::task::spawn_blocking(move || worker.checkpoint_shard(shard)).await
                     .expect("access checkpoint task panicked");
@@ -473,13 +514,14 @@ impl WorkerRuntime {
             self.page_lifecycle.checkpoint_finished(shard, membership);
             return Ok((0, 0));
         }
-        let bytes = crate::page_access_shard::checkpoint(
+        let bytes = crate::page_access_shard::checkpoint_with_budget(
             &dir,
             paged.page_size(),
             snapshots
                 .iter()
                 .filter(|(_, _, resident, _)| *resident)
                 .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
+            self.background_budget.as_deref(),
         )?;
         let count = snapshots
             .iter()

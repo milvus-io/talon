@@ -370,6 +370,86 @@ Worker cache capacity (bytes).
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `background_task_concurrency`
+
+Maximum concurrently running background maintenance tasks.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_TASK_CONCURRENCY`
+- **Default:** `2`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_io_concurrency`
+
+Shared local disk I/O concurrency for background maintenance.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_IO_CONCURRENCY`
+- **Default:** `4`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_scan_batch_size`
+
+Maximum entries scanned per GC, cleanup, or eviction batch.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE`
+- **Default:** `65536`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_delete_batch_size`
+
+Maximum deletion work items per background batch.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_io_max_mb_per_sec`
+
+Shared background disk read/write MB/s (decimal); zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC`
+- **Default:** `8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_delete_max_per_sec`
+
+Shared background deletion work items per second; zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_enabled`
+
+Enable background eviction at cache occupancy watermarks.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_ENABLED`
+- **Default:** `false`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_high_watermark`
+
+Start background eviction at this fraction of capacity_bytes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK`
+- **Default:** `0.9`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_low_watermark`
+
+Stop background eviction at or below this fraction of capacity_bytes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK`
+- **Default:** `0.8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_check_interval_secs`
+
+Background cache occupancy check interval in seconds.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_SECS`
+- **Default:** `60`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `l1_capacity_bytes`
 
 L1 DRAM cache capacity in bytes; 0 disables L1.

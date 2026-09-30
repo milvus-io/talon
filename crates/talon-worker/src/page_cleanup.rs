@@ -46,7 +46,16 @@ impl CleanupCursor {
         tracing::warn!(path = %path.display(), %error, "page metadata cleanup failed; will rescan");
     }
 
-    fn unlink(&self, path: &Path, directory: bool, report: &mut CleanupReport) -> bool {
+    fn unlink(
+        &self,
+        path: &Path,
+        directory: bool,
+        report: &mut CleanupReport,
+        resources: Option<&crate::background::BackgroundBudget>,
+    ) -> bool {
+        if let Some(resources) = resources {
+            resources.delete_blocking();
+        }
         report.attempted += 1;
         #[cfg(test)]
         if self.fail_deletes {
@@ -83,6 +92,7 @@ impl CleanupCursor {
         dir: &DirectoryScan,
         budget: usize,
         report: &mut CleanupReport,
+        resources: Option<&crate::background::BackgroundBudget>,
     ) -> io::Result<bool> {
         let files = match fs::read_dir(&dir.path) {
             Ok(files) => files,
@@ -104,22 +114,33 @@ impl CleanupCursor {
             if report.attempted == budget {
                 return Ok(true);
             }
-            if !self.unlink(&path, false, report) {
+            if !self.unlink(&path, false, report, resources) {
                 return Ok(false);
             }
         }
         if report.attempted == budget {
             return Ok(true);
         }
-        self.unlink(&dir.path, true, report);
+        self.unlink(&dir.path, true, report, resources);
         Ok(false)
     }
 
+    #[cfg(test)]
     pub fn run_batch(
         &mut self,
         lifecycle: &PageLifecycle,
         scan_budget: usize,
         delete_budget: usize,
+    ) -> CleanupReport {
+        self.run_batch_with_budget(lifecycle, scan_budget, delete_budget, None)
+    }
+
+    pub fn run_batch_with_budget(
+        &mut self,
+        lifecycle: &PageLifecycle,
+        scan_budget: usize,
+        delete_budget: usize,
+        resources: Option<&crate::background::BackgroundBudget>,
     ) -> CleanupReport {
         let mut report = CleanupReport::default();
         if self.shards.is_none() {
@@ -194,7 +215,7 @@ impl CleanupCursor {
                                             .to_str()
                                             .is_some_and(is_owned_temp) =>
                                 {
-                                    if !self.unlink(&entry.path(), false, &mut report) {
+                                    if !self.unlink(&entry.path(), false, &mut report, resources) {
                                         dir.failed = true;
                                     }
                                 }
@@ -216,7 +237,7 @@ impl CleanupCursor {
                 }
                 if dir.exhausted {
                     let errors = report.errors;
-                    match self.finish_directory(&dir, delete_budget, &mut report) {
+                    match self.finish_directory(&dir, delete_budget, &mut report, resources) {
                         Ok(true) => {
                             self.current = Some(dir);
                         }
@@ -254,7 +275,7 @@ impl CleanupCursor {
                                 if let Ok(_guard) = gate.try_lock() {
                                     match entry.file_type() {
                                         Ok(kind) if kind.is_file() => {
-                                            if !self.unlink(&path, false, &mut report) {
+                                            if !self.unlink(&path, false, &mut report, resources) {
                                                 self.pending += 1;
                                             }
                                         }
