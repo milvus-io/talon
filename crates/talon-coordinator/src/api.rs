@@ -1,4 +1,4 @@
-//! Read-only versioned cluster management API (`/api/v1`).
+//! Read-only node views within the versioned cluster management API (`/api/v1`).
 //!
 //! A small, bounded JSON surface over the shared [`ClusterSnapshot`] so
 //! operators and the management UI can read the live cluster view from any
@@ -7,7 +7,8 @@
 //! equivalent for the same backend revision (issue #82).
 //!
 //! Design constraints (per the issue):
-//! - **Read-only.** No mutation routes in v1.
+//! - **Read-only node views.** Membership mutations are registered separately
+//!   by `observability::admin` and use a backend CAS revision.
 //! - **Bounded.** List endpoints page with a hard `limit` cap and stable
 //!   ordering; there is no arbitrary-query or PromQL proxy.
 //! - **Self-describing.** Every response carries the generation time, the

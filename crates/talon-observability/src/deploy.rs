@@ -17,7 +17,7 @@ pub const COORDINATOR_KUBERNETES_YAML: &str =
 /// etcd-backend coordinator Deployment.
 pub const COORDINATOR_ETCD_YAML: &str =
     include_str!("../../../deploy/kubernetes/coordinator-etcd.yaml");
-/// Worker Deployment (cache nodes), shared by both coordinator backends.
+/// Worker StatefulSet (cache nodes), shared by both coordinator backends.
 pub const WORKER_YAML: &str = include_str!("../../../deploy/kubernetes/worker.yaml");
 /// Example Secret template for the worker's object-store credentials.
 pub const WORKER_SECRET_EXAMPLE_YAML: &str =
@@ -232,12 +232,26 @@ mod tests {
     }
 
     #[test]
-    fn worker_deployment_is_valid_and_uses_secret_credentials() {
+    fn worker_statefulset_retains_cache_and_uses_secret_credentials() {
         let docs = parse_documents(WORKER_YAML);
         let dep = docs
             .iter()
-            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Deployment"))
-            .expect("a worker Deployment");
+            .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("StatefulSet"))
+            .expect("a worker StatefulSet");
+        assert_eq!(
+            dep["spec"]["podManagementPolicy"].as_str(),
+            Some("OrderedReady")
+        );
+        for action in ["whenDeleted", "whenScaled"] {
+            assert_eq!(
+                dep["spec"]["persistentVolumeClaimRetentionPolicy"][action].as_str(),
+                Some("Retain")
+            );
+        }
+        assert_eq!(
+            dep["spec"]["volumeClaimTemplates"][0]["metadata"]["name"].as_str(),
+            Some("cache")
+        );
         // Horizontally scalable.
         assert!(dep["spec"]["replicas"].as_u64().unwrap() >= 1);
         let spec = &dep["spec"]["template"]["spec"];
@@ -252,6 +266,9 @@ mod tests {
             assert!(!c[probe].is_null(), "worker missing {probe}");
         }
         let envs = c["env"].as_sequence().unwrap();
+        assert!(!envs
+            .iter()
+            .any(|e| e["name"].as_str() == Some("TALON_WORKER_NODE_ID")));
         // Object-store credentials must be secretKeyRefs, never inline.
         for key in ["TALON_WORKER_AZURE_ACCOUNT", "TALON_WORKER_AZURE_SAS"] {
             let e = envs

@@ -19,6 +19,7 @@ metadata:
     app.kubernetes.io/component: coordinator
 spec:
   replicas: 3
+  minReadySeconds: 15
   revisionHistoryLimit: 5
   selector:
     matchLabels:
@@ -43,7 +44,7 @@ spec:
       serviceAccountName: talon-coordinator
       # Give in-flight control requests and lease release time to drain (SIGINT
       # triggers graceful shutdown + lease removal in the coordinator).
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -108,7 +109,7 @@ spec:
           startupProbe:
             # Allow slow cold starts (image pull, first snapshot) before liveness.
             httpGet: { path: /healthz, port: admin }
-            failureThreshold: 30
+            failureThreshold: 150
             periodSeconds: 2
           livenessProbe:
             httpGet: { path: /healthz, port: admin }
