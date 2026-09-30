@@ -4,6 +4,7 @@
 //! provides an in-memory [`ObjectStore`](talon_core::ObjectStore)
 //! implementation, with room to add tiered/persistent backends later.
 
+pub mod background;
 pub mod block_store;
 pub mod capacity;
 pub mod connection_admission;

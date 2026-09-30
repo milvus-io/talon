@@ -135,6 +135,18 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// Maximum concurrently running background maintenance tasks.
+    pub background_task_concurrency: usize,
+    /// Shared local disk I/O concurrency for background maintenance.
+    pub background_io_concurrency: usize,
+    /// Maximum entries scanned per GC, cleanup, or eviction batch.
+    pub background_scan_batch_size: usize,
+    /// Maximum deletion work items per background batch.
+    pub background_delete_batch_size: usize,
+    /// Shared background disk read/write MB/s (decimal); zero disables throttling.
+    pub background_io_max_mb_per_sec: u64,
+    /// Shared background deletion work items per second; zero disables throttling.
+    pub background_delete_max_per_sec: u64,
     /// Enable background eviction at cache occupancy watermarks.
     pub async_eviction_enabled: bool,
     /// Start background eviction at this fraction of capacity_bytes.
@@ -297,6 +309,12 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            background_task_concurrency: 2,
+            background_io_concurrency: 4,
+            background_scan_batch_size: 65536,
+            background_delete_batch_size: 1024,
+            background_io_max_mb_per_sec: 8,
+            background_delete_max_per_sec: 1024,
             async_eviction_enabled: false,
             async_eviction_high_watermark: 0.9,
             async_eviction_low_watermark: 0.8,
@@ -366,6 +384,18 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::background_task_concurrency`].
+    pub background_task_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::background_io_concurrency`].
+    pub background_io_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::background_scan_batch_size`].
+    pub background_scan_batch_size: Option<usize>,
+    /// Override for [`WorkerConfig::background_delete_batch_size`].
+    pub background_delete_batch_size: Option<usize>,
+    /// Override for [`WorkerConfig::background_io_max_mb_per_sec`].
+    pub background_io_max_mb_per_sec: Option<u64>,
+    /// Override for [`WorkerConfig::background_delete_max_per_sec`].
+    pub background_delete_max_per_sec: Option<u64>,
     /// Override for [`WorkerConfig::async_eviction_enabled`].
     pub async_eviction_enabled: Option<bool>,
     /// Override for [`WorkerConfig::async_eviction_high_watermark`].
@@ -448,6 +478,24 @@ impl Patch for WorkerConfigPatch {
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            background_task_concurrency: self
+                .background_task_concurrency
+                .or(base.background_task_concurrency),
+            background_io_concurrency: self
+                .background_io_concurrency
+                .or(base.background_io_concurrency),
+            background_scan_batch_size: self
+                .background_scan_batch_size
+                .or(base.background_scan_batch_size),
+            background_delete_batch_size: self
+                .background_delete_batch_size
+                .or(base.background_delete_batch_size),
+            background_io_max_mb_per_sec: self
+                .background_io_max_mb_per_sec
+                .or(base.background_io_max_mb_per_sec),
+            background_delete_max_per_sec: self
+                .background_delete_max_per_sec
+                .or(base.background_delete_max_per_sec),
             async_eviction_enabled: self.async_eviction_enabled.or(base.async_eviction_enabled),
             async_eviction_high_watermark: self
                 .async_eviction_high_watermark
@@ -638,6 +686,12 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "Worker cache capacity (bytes).",
     },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per GC, cleanup, or eviction batch." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion work items per background batch." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC", key: "background_delete_max_per_sec", default: Some("1024"), cli: false, secret: false, help: "Shared background deletion work items per second; zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("false"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK", key: "async_eviction_high_watermark", default: Some("0.9"), cli: false, secret: false, help: "Start background eviction at this fraction of capacity_bytes." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK", key: "async_eviction_low_watermark", default: Some("0.8"), cli: false, secret: false, help: "Stop background eviction at or below this fraction of capacity_bytes." },
@@ -867,6 +921,12 @@ pub(crate) mod worker_env {
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
+    pub const BACKGROUND_TASK_CONCURRENCY: &str = "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY";
+    pub const BACKGROUND_IO_CONCURRENCY: &str = "TALON_WORKER_BACKGROUND_IO_CONCURRENCY";
+    pub const BACKGROUND_SCAN_BATCH_SIZE: &str = "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE";
+    pub const BACKGROUND_DELETE_BATCH_SIZE: &str = "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE";
+    pub const BACKGROUND_IO_MAX_MB_PER_SEC: &str = "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC";
+    pub const BACKGROUND_DELETE_MAX_PER_SEC: &str = "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC";
     pub const ASYNC_EVICTION_ENABLED: &str = "TALON_WORKER_ASYNC_EVICTION_ENABLED";
     pub const ASYNC_EVICTION_HIGH_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK";
     pub const ASYNC_EVICTION_LOW_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK";
@@ -981,6 +1041,24 @@ impl WorkerConfigPatch {
                 .map(|v| v.split(':').map(PathBuf::from).collect()),
             capacity_bytes: get(worker_env::CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
+                .transpose()?,
+            background_task_concurrency: get(worker_env::BACKGROUND_TASK_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_TASK_CONCURRENCY))
+                .transpose()?,
+            background_io_concurrency: get(worker_env::BACKGROUND_IO_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_IO_CONCURRENCY))
+                .transpose()?,
+            background_scan_batch_size: get(worker_env::BACKGROUND_SCAN_BATCH_SIZE)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_SCAN_BATCH_SIZE))
+                .transpose()?,
+            background_delete_batch_size: get(worker_env::BACKGROUND_DELETE_BATCH_SIZE)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_DELETE_BATCH_SIZE))
+                .transpose()?,
+            background_io_max_mb_per_sec: get(worker_env::BACKGROUND_IO_MAX_MB_PER_SEC)
+                .map(|v| parse_u64(v, worker_env::BACKGROUND_IO_MAX_MB_PER_SEC))
+                .transpose()?,
+            background_delete_max_per_sec: get(worker_env::BACKGROUND_DELETE_MAX_PER_SEC)
+                .map(|v| parse_u64(v, worker_env::BACKGROUND_DELETE_MAX_PER_SEC))
                 .transpose()?,
             async_eviction_enabled: get(worker_env::ASYNC_EVICTION_ENABLED)
                 .map(|v| parse_bool(v, worker_env::ASYNC_EVICTION_ENABLED))
@@ -1110,6 +1188,24 @@ impl WorkerConfig {
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
+            background_task_concurrency: merged
+                .background_task_concurrency
+                .unwrap_or(d.background_task_concurrency),
+            background_io_concurrency: merged
+                .background_io_concurrency
+                .unwrap_or(d.background_io_concurrency),
+            background_scan_batch_size: merged
+                .background_scan_batch_size
+                .unwrap_or(d.background_scan_batch_size),
+            background_delete_batch_size: merged
+                .background_delete_batch_size
+                .unwrap_or(d.background_delete_batch_size),
+            background_io_max_mb_per_sec: merged
+                .background_io_max_mb_per_sec
+                .unwrap_or(d.background_io_max_mb_per_sec),
+            background_delete_max_per_sec: merged
+                .background_delete_max_per_sec
+                .unwrap_or(d.background_delete_max_per_sec),
             async_eviction_enabled: merged
                 .async_eviction_enabled
                 .unwrap_or(d.async_eviction_enabled),
@@ -1266,6 +1362,34 @@ impl WorkerConfig {
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
+        }
+        for (name, value) in [
+            (
+                "background_task_concurrency",
+                self.background_task_concurrency,
+            ),
+            ("background_io_concurrency", self.background_io_concurrency),
+            (
+                "background_scan_batch_size",
+                self.background_scan_batch_size,
+            ),
+            (
+                "background_delete_batch_size",
+                self.background_delete_batch_size,
+            ),
+        ] {
+            if value == 0 || value > (usize::MAX >> 3) {
+                return Err(Error::Other(format!("invalid {name}")));
+            }
+        }
+        if self
+            .background_io_max_mb_per_sec
+            .checked_mul(1_000_000)
+            .is_none()
+        {
+            return Err(Error::Other(
+                "background_io_max_mb_per_sec overflows bytes/s".into(),
+            ));
         }
         let low = self.async_eviction_low_watermark;
         let high = self.async_eviction_high_watermark;
@@ -1909,6 +2033,58 @@ mod tests {
         // An invalid bool for s3_path_style is a hard error too.
         let bad_bool = |k: &str| (k == "TALON_WORKER_S3_PATH_STYLE").then(|| "maybe".to_string());
         assert!(WorkerConfigPatch::from_env_with(bad_bool).is_err());
+    }
+
+    #[test]
+    fn background_config_layers_and_validation() {
+        let patch: WorkerConfigPatch = toml::from_str("background_task_concurrency = 1\nbackground_io_concurrency = 2\nbackground_scan_batch_size = 64\nbackground_delete_batch_size = 4\nbackground_io_max_mb_per_sec = 16\nbackground_delete_max_per_sec = 50").unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC" => Some("3".into()),
+            "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC" => Some("7".into()),
+            _ => None,
+        })
+        .unwrap();
+        let c = WorkerConfig::resolve(patch, env, WorkerConfigPatch::default()).unwrap();
+        assert_eq!(
+            (
+                c.background_task_concurrency,
+                c.background_io_concurrency,
+                c.background_scan_batch_size,
+                c.background_delete_batch_size
+            ),
+            (1, 2, 64, 4)
+        );
+        assert_eq!(
+            (
+                c.background_io_max_mb_per_sec,
+                c.background_delete_max_per_sec
+            ),
+            (3, 7)
+        );
+        for key in [
+            "background_task_concurrency",
+            "background_io_concurrency",
+            "background_scan_batch_size",
+            "background_delete_batch_size",
+        ] {
+            let patch = toml::from_str(&format!("{key} = 0")).unwrap();
+            assert!(WorkerConfig::resolve(
+                patch,
+                WorkerConfigPatch::default(),
+                WorkerConfigPatch::default()
+            )
+            .is_err());
+        }
+        let patch = WorkerConfigPatch {
+            background_io_max_mb_per_sec: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(WorkerConfig::resolve(
+            patch,
+            WorkerConfigPatch::default(),
+            WorkerConfigPatch::default()
+        )
+        .is_err());
     }
 
     #[test]

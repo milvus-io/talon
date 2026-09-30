@@ -370,6 +370,54 @@ Worker cache capacity (bytes).
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `background_task_concurrency`
+
+Maximum concurrently running background maintenance tasks.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_TASK_CONCURRENCY`
+- **Default:** `2`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_io_concurrency`
+
+Shared local disk I/O concurrency for background maintenance.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_IO_CONCURRENCY`
+- **Default:** `4`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_scan_batch_size`
+
+Maximum entries scanned per GC, cleanup, or eviction batch.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE`
+- **Default:** `65536`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_delete_batch_size`
+
+Maximum deletion work items per background batch.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_io_max_mb_per_sec`
+
+Shared background disk read/write MB/s (decimal); zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC`
+- **Default:** `8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_delete_max_per_sec`
+
+Shared background deletion work items per second; zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `async_eviction_enabled`
 
 Enable background eviction at cache occupancy watermarks.

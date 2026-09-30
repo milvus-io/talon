@@ -1,13 +1,76 @@
-# Background cache eviction
+# Background maintenance and cache eviction
 
-The Worker can reclaim cached data in the background before reaching its configured
-capacity. This leaves space for new cache fills and reduces the occasions when a
-miss must wait for capacity eviction. It applies to both whole-block and paged L2
-caches and uses the existing byte-accounted Second-Chance policy described in
-`DESIGN.md`, section 3 (Worker storage). The change adds a background trigger
-while retaining foreground capacity enforcement.
+The Worker uses one scheduler for page GC, access checkpoints, orphan-file cleanup,
+and cache watermark eviction. This extends `DESIGN.md`, section 3 (Worker storage):
+maintenance shares resource budgets while foreground capacity enforcement remains
+available when a cache fill reaches capacity. Network fetches and uploads are
+outside this scheduler.
 
-Enable it in the Worker TOML configuration:
+## Shared scheduling and resource budgets
+
+Configure the Worker with TOML or the matching `TALON_WORKER_` environment variable
+(uppercase field name):
+
+```toml
+background_task_concurrency = 2
+background_io_concurrency = 4
+background_scan_batch_size = 65536
+background_delete_batch_size = 1024
+background_io_max_mb_per_sec = 8
+background_delete_max_per_sec = 1024
+```
+
+These are the defaults. Task and I/O concurrency and batch sizes must be positive.
+A zero rate disables that rate limit. MB means 1,000,000 bytes.
+
+- **Task concurrency** bounds active batches across all registrations. Each task
+  has at most one invocation. Ready tasks are admitted in round-robin order; there
+  is no queue of missed timer events. A task becomes eligible again one configured
+  interval after its previous batch finishes. The first batch is eligible at
+  startup. Resource contention can delay admission.
+- **I/O concurrency** is shared by checkpoint writes, page/whole-block eviction,
+  and orphan cleanup. A slot stays owned until disk and metadata changes finish,
+  including when a caller is cancelled. Existing page-GC concurrency remains an
+  additional limit for page deletion and cleanup.
+- **Batch sizes** cap scanned entries and deletion candidates for GC, cleanup,
+  and eviction. Existing page-GC batch limits also apply; the smaller limit wins.
+  Checkpoints retain their atomic one-shard transaction, bounded by the existing
+  64 MiB format limit, rather than truncating the shard to the scan budget.
+- **Disk throughput** meters application data bytes before each checkpoint write
+  chunk (at most 64 KiB), using one shared rate clock with no idle burst credit.
+  This is local disk read/write budgeting, not network bandwidth or measured
+  physical device traffic. Current maintenance reads directory metadata and writes
+  checkpoints; filesystem metadata, fsync, page-cache writeback, and write
+  amplification cannot be expressed as application-byte traffic.
+- **Deletion rate** meters maintenance work items, independently of byte traffic.
+  One item is a page or whole-block eviction including its associated metadata
+  cleanup, an empty-block cleanup attempt, or one orphan file/directory removal.
+  Failed and stale attempts also consume credit. It is not an exact syscall or
+  device-IOPS limit. Deleting a 1 GiB cache block does not charge 1 GiB to the disk
+  byte budget.
+
+Limits apply to scheduled maintenance and its final checkpoint flush. Startup
+recovery and foreground request/capacity work are outside these shared budgets.
+Fair admission does not preempt a running batch; a slow filesystem operation or
+low rate can delay other tasks, especially with task concurrency set to one.
+
+The scheduler stops admitting work on shutdown, finishes admitted batches, drains
+owned mutations, then flushes dirty access metadata with the same disk budget.
+The process retains its existing 10-second maintenance shutdown deadline; after
+that deadline, restart uses the last valid checkpoint. Dropping the scheduler
+handle also stops admission and lets active batches finish.
+
+Metrics `talon_worker_background_task_active`,
+`talon_worker_background_task_completed_total`,
+`talon_worker_background_task_panics_total`, and
+`talon_worker_background_task_seconds` use a `task` label. Batch duration includes
+resource waits. A panicking registration is logged and retried after its interval;
+other registrations continue. Existing GC/checkpoint error and progress metrics
+remain available.
+
+## Cache watermarks
+
+Enable watermark eviction with:
 
 ```toml
 async_eviction_enabled = true
@@ -16,8 +79,6 @@ async_eviction_low_watermark = 0.75
 async_eviction_check_interval_secs = 30
 ```
 
-The corresponding environment variables are:
-
 ```sh
 TALON_WORKER_ASYNC_EVICTION_ENABLED=true
 TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK=0.85
@@ -25,51 +86,27 @@ TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK=0.75
 TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_SECS=30
 ```
 
-Defaults are disabled, a high watermark of `0.9`, a low watermark of `0.8`, and a
-check interval of `60` seconds. Watermarks must satisfy
-`0 < low < high < 1`; the check interval must be positive. See the generated
-[configuration reference](../reference/configuration.md#async_eviction_enabled).
+Defaults are disabled, high `0.9`, low `0.8`, and `60` seconds between batches.
+Watermarks must satisfy `0 < low < high < 1`; the interval must be positive.
+See the generated [configuration reference](../reference/configuration.md#async_eviction_enabled).
 
-## Watermarks and lifecycle
+Occupancy is tracked resident cache data bytes divided by `capacity_bytes`, for
+both whole-block and paged L2. It excludes metadata, temporary files, other
+applications, and filesystem overhead. A zero capacity disables watermark eviction.
 
-Occupancy means tracked resident cache data bytes divided by `capacity_bytes`.
-It does not measure filesystem utilization, temporary files, metadata, or other
-applications' data. For a 1 TiB cache, the example starts eviction at 85% occupancy
-and attempts to reduce it to 75%. Thresholds round up for starting and down for
-stopping; individual cache units can take occupancy below the low watermark.
+Reaching the high watermark starts a reclamation cycle. Each invocation performs
+one bounded Second-Chance scan/deletion batch. If pins, recent accesses, ongoing
+fills, errors, or batch limits prevent reaching the low watermark, the cycle stays
+active across subsequent invocations, even below the high watermark. Reaching or
+falling below the low watermark ends it. Start thresholds round up and stop
+thresholds round down; deleting one unit can cross below the low watermark.
 
-The Worker checks immediately after starting the service, including data recovered
-from disk, and then at the configured interval. Reaching the high watermark starts
-a cycle. Each check makes a bounded reclamation pass; if reads, pins, concurrent
-fills, or deletion errors prevent reaching the low watermark, the cycle remains
-active for the next check even when usage has fallen below the high watermark.
-Reaching or dropping below the low watermark ends the cycle.
+The first batch handles occupancy recovered from disk, independently of requests,
+page TTI, and coordinator registration. Candidate revalidation and reader
+protection apply before deletion. Failed deletion keeps cache accounting; successful
+L2 eviction also invalidates inclusive L1 copies. Existing capacity-eviction
+metrics include watermark deletions.
 
-The background loop awaits each pass before polling its timer again, so passes
-do not overlap. An overdue tick can run immediately after a long pass; missed
-intervals are delayed rather than replayed in a burst. Foreground eviction and
-page TTI collection can still run concurrently with the background loop.
-
-The collector runs independently of requests, page TTI, and coordinator
-registration. Existing read protection and candidate validation also apply to
-background eviction. Failed deletions remain charged to the cache; successful L2
-eviction invalidates inclusive L1 copies. During shutdown the service stops
-scheduling work, and the Worker drains owned disk/metadata mutations before the
-final access checkpoint.
-
-## Capacity fallback and disk space
-
-Writes continue to enforce `capacity_bytes` after committing data. Below that
-limit they do not wait for background watermark reclamation. If fills outpace the
-collector and exceed the limit, the existing foreground capacity fallback still
-runs. Neither path can guarantee reclamation while every candidate is protected
-or cannot be deleted.
-
-Set cache capacity below available physical storage, leaving room for concurrent
-fills, staging files, and metadata. Files held open by active readers can delay
-physical space release after unlink. Background eviction does not implement
-filesystem-full (`ENOSPC`) recovery or reserve space for in-flight fills.
-
-Existing `talon_worker_evictions_total` counts successful reclamations. Paged
-watermark eviction is included in `talon_worker_page_gc_reclaimed_total` and
-`talon_worker_page_gc_reclaimed_bytes_total` with `reason="capacity"`.
+Background headroom does not reserve space for concurrent fills or handle every
+filesystem `ENOSPC` condition. Foreground capacity enforcement remains the fallback
+when new cache admissions exceed `capacity_bytes`.

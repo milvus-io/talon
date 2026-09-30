@@ -301,6 +301,17 @@ impl Lru {
         capacity: u64,
         excluded: &HashSet<CacheUnit>,
     ) -> Vec<EvictionCandidate> {
+        self.candidates_to_fit_bounded(capacity, excluded, usize::MAX, usize::MAX)
+    }
+
+    /// Limit both policy walk work and retained candidates for background batches.
+    pub(crate) fn candidates_to_fit_bounded(
+        &self,
+        capacity: u64,
+        excluded: &HashSet<CacheUnit>,
+        mut scan_budget: usize,
+        delete_budget: usize,
+    ) -> Vec<EvictionCandidate> {
         if self.total_bytes() <= capacity {
             return Vec::new();
         }
@@ -317,9 +328,13 @@ impl Lru {
                 let mut g = self.inner.lock().unwrap();
                 let batch = remaining.min(64);
                 for _ in 0..batch {
-                    if g.total_bytes.saturating_sub(selected_bytes) <= capacity {
+                    if scan_budget == 0
+                        || out.len() == delete_budget
+                        || g.total_bytes.saturating_sub(selected_bytes) <= capacity
+                    {
                         return out;
                     }
+                    scan_budget -= 1;
                     let Some((_, unit)) = g.queue.first_key_value() else {
                         return out;
                     };
