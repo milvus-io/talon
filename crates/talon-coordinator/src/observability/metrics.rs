@@ -377,6 +377,39 @@ impl CoordinatorMetrics {
         }
     }
 
+    /// Counts from the last successful complete discovery. Backend failures keep
+    /// the last observation; no per-worker or per-incarnation metric labels.
+    pub(crate) fn update_worker_discovery(
+        &self,
+        view: &talon_core::worker_membership::WorkerDiscovery,
+    ) {
+        use talon_core::worker_membership::InstanceState;
+        let mut counts = [0usize; 3];
+        for worker in &view.workers {
+            counts[match worker.state {
+                InstanceState::Serving { .. } => 0,
+                InstanceState::Offline => 1,
+                InstanceState::Conflict => 2,
+            }] += 1;
+        }
+        self.registry
+            .gauge(
+                "talon_coordinator_worker_members",
+                "Active logical members in the latest successful worker discovery.",
+                BTreeMap::new(),
+            )
+            .set(view.workers.len() as f64);
+        for (state, count) in ["serving", "offline", "conflict"].into_iter().zip(counts) {
+            self.registry
+                .gauge(
+                    "talon_coordinator_worker_member_states",
+                    "Logical members by availability in the latest successful worker discovery.",
+                    labels(&[("state", state)]),
+                )
+                .set(count as f64);
+        }
+    }
+
     pub(crate) fn totals(&self) -> (u64, u64) {
         self.operations
             .iter()

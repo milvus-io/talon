@@ -182,6 +182,25 @@ pub trait ClusterStateStore: Send + Sync {
         after_revision: Option<&StoreRevision>,
     ) -> StateStoreResult<Box<dyn ClusterStateWatch>>;
 
+    /// Publish a process record keyed by (worker ID, incarnation), independently
+    /// of the legacy node record and every other process using that logical ID.
+    async fn upsert_instance(
+        &self,
+        _status: NodeStatus,
+        _ttl: Duration,
+    ) -> StateStoreResult<WriteResult> {
+        Err(registry::invalid(
+            self.backend(),
+            "instance storage unsupported",
+        ))
+    }
+    async fn instance_snapshot(&self, _cluster: &str) -> StateStoreResult<ClusterSnapshot> {
+        Err(registry::invalid(
+            self.backend(),
+            "instance storage unsupported",
+        ))
+    }
+
     /// Read the persistent cluster registry; absence means legacy/empty.
     async fn member_registry(
         &self,
@@ -294,4 +313,14 @@ impl StateStoreError {
                 | Self::Unavailable { .. }
         )
     }
+}
+
+/// Unambiguous internal key only; the stored status retains its logical ID.
+fn instance_key(status: &NodeStatus) -> NodeId {
+    NodeId::new(format!(
+        "{}:{}{}",
+        status.node.id.0.len(),
+        status.node.id.0,
+        status.incarnation_id
+    ))
 }

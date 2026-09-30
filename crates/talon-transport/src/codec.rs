@@ -21,7 +21,7 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 /// Bumped when [`ControlMessage`] changes in an incompatible way. Carried in
 /// the envelope so a peer can reject a mismatched schema instead of
 /// misinterpreting bytes.
-pub const CONTROL_SCHEMA_VERSION: u16 = 5;
+pub const CONTROL_SCHEMA_VERSION: u16 = 6;
 
 /// Oldest control schema this build can decode.
 pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
@@ -198,6 +198,22 @@ pub enum ControlMessage {
         /// All nodes the coordinator currently knows about, with zones.
         nodes: Vec<ZonedNodeInfo>,
     },
+    /// Schema 6: persistent logical membership plus separately leased instances.
+    WorkerDiscoveryQuery {},
+    WorkerDiscovery {
+        view: talon_core::worker_membership::WorkerDiscovery,
+    },
+    WorkerInstanceHeartbeat {
+        status: Box<NodeStatus>,
+        writable: bool,
+    },
+    WorkerInstanceAck {
+        accepted: bool,
+        serving: bool,
+        mode: talon_core::worker_membership::MembershipMode,
+        detail: Option<String>,
+    },
+    MembershipCapabilityRequired {},
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -225,6 +241,11 @@ impl ControlMessage {
     /// Oldest control schema that can represent this message.
     pub fn minimum_schema(&self) -> u16 {
         match self {
+            Self::MembershipCapabilityRequired {}
+            | Self::WorkerDiscoveryQuery {}
+            | Self::WorkerDiscovery { .. }
+            | Self::WorkerInstanceHeartbeat { .. }
+            | Self::WorkerInstanceAck { .. } => 6,
             Self::NodeStatusHeartbeat { .. } => 2,
             Self::StatObject { .. } | Self::ObjectStat { .. } => 2,
             Self::ListObjects { .. } | Self::ObjectList { .. } => 2,
@@ -415,7 +436,9 @@ fn validate_message(message: &ControlMessage, schema: u16) -> Result<(), CodecEr
             selected: schema,
         });
     }
-    if let ControlMessage::NodeStatusHeartbeat { status } = message {
+    if let ControlMessage::NodeStatusHeartbeat { status }
+    | ControlMessage::WorkerInstanceHeartbeat { status, .. } = message
+    {
         status.validate()?;
         let got = bincode::serialized_size(status)? as usize;
         if got > MAX_NODE_STATUS_BYTES {
@@ -859,5 +882,79 @@ mod tests {
         let mut buf = FrameHeader::new(MsgType::Control, 0, 3).encode().to_vec();
         buf.extend_from_slice(&[0xFF, 0xFF, 0xFF]);
         assert!(decode(&buf).is_err());
+    }
+    #[test]
+    fn retained_discovery_uses_schema_six_without_changing_legacy_wire() {
+        use talon_core::worker_membership::*;
+        let view = WorkerDiscovery::retained(
+            &MemberRegistry {
+                mode: MembershipMode::Retained,
+                members: vec![WorkerMember {
+                    worker_id: "offline".into(),
+                    zone: None,
+                    retired: false,
+                }],
+                ..Default::default()
+            },
+            &[],
+        );
+        let message = ControlMessage::WorkerDiscovery { view };
+        assert_eq!(message.minimum_schema(), 6);
+        let encoded = encode(7, &message).unwrap();
+        assert_eq!(decode(&encoded).unwrap().1, message);
+        assert_eq!(ControlMessage::MembershipQuery {}.minimum_schema(), 1);
+        assert_eq!(ControlMessage::MembershipQueryV2 {}.minimum_schema(), 5);
+    }
+    #[tokio::test]
+    async fn largest_admitted_discovery_with_maximum_instances_fits_reader_cap() {
+        use talon_core::worker_membership::{
+            MemberRegistry, MembershipMode, WorkerDiscovery, WorkerMember,
+        };
+        let mut registry = MemberRegistry {
+            mode: MembershipMode::Retained,
+            ..Default::default()
+        };
+        loop {
+            registry.members.push(WorkerMember {
+                worker_id: format!("w{:05}", registry.members.len()),
+                zone: Some(String::new()),
+                retired: false,
+            });
+            if registry.validate().is_err() {
+                registry.members.pop();
+                break;
+            }
+        }
+        registry.validate().unwrap();
+        // This population is also below the persistent JSON resource limit;
+        // the discovery budget, rather than JSON capacity, bounds it.
+        assert!(serde_json::to_vec(&registry).unwrap().len() < 512 * 1024);
+        let instances: Vec<_> = registry
+            .members
+            .iter()
+            .map(|member| {
+                let mut status = sample_status(NodeInfo {
+                    id: NodeId::new(member.worker_id.clone()),
+                    address: "a".repeat(talon_core::MAX_STATUS_FIELD_BYTES),
+                    role: NodeRole::Worker,
+                });
+                status.incarnation_id = "i".repeat(talon_core::MAX_STATUS_FIELD_BYTES);
+                status.validate().unwrap();
+                status
+            })
+            .collect();
+        let view = WorkerDiscovery::retained(&registry, &instances);
+        let message = ControlMessage::WorkerDiscovery { view };
+        let encoded = encode(7, &message).unwrap();
+        let payload_bytes = encoded.len() - HEADER_LEN;
+        assert!(payload_bytes <= crate::MAX_CONTROL_PAYLOAD_LEN as usize);
+        assert!(payload_bytes > crate::MAX_CONTROL_PAYLOAD_LEN as usize - 2_000);
+        // Exercise the actual capped stream reader, not merely bincode decode.
+        let (_, payload) =
+            crate::read_frame(&mut encoded.as_slice(), std::time::Duration::from_secs(2))
+                .await
+                .unwrap();
+        assert_eq!(payload.len(), payload_bytes);
+        assert_eq!(decode(&encoded).unwrap().1, message);
     }
 }
