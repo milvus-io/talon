@@ -9,6 +9,7 @@ description = "Native async Rust client for the Talon distributed object-store c
 publish = false
 
 [dependencies]
+tracing.workspace = true
 talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-cache-client.workspace = true

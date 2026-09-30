@@ -49,6 +49,7 @@
 
 mod client;
 mod error;
+mod executor;
 
 pub use client::{parse_uri, Client, ClientBuilder, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS};
 pub use error::{Error, UriError};

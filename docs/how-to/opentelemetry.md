@@ -58,7 +58,9 @@ let parent = TraceContext::from_w3c(traceparent, Some(tracestate));
 let options = RequestOptions {
     parent: parent.as_ref().map(TraceParent::Explicit).unwrap_or(TraceParent::Root),
 };
-client.read_into_with_options(&object, offset, &mut buffer, None, &options).await?;
+let (written, buffer) = client
+    .read_into_with_options(&object, offset, buffer, None, &options)
+    .await?;
 ```
 
 C/C++ hosts call `talon_telemetry_init()` explicitly after setting the
