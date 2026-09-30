@@ -25,6 +25,9 @@ pub struct MembershipSnapshot {
     /// Zone affinity was requested but no same-zone worker exists, so
     /// `placement` covers the full membership instead.
     pub affinity_fallback: bool,
+    /// Present only in retained mode. Missing IDs are offline or conflicted.
+    pub instances: Option<Arc<HashMap<String, (String, crate::WorkerClient)>>>,
+    pub valid_until: Option<std::time::Instant>,
 }
 
 struct Entry {
@@ -68,8 +71,11 @@ impl MembershipCache {
     /// Return the snapshot only while its refresh TTL is current.
     pub fn fresh(&self, now_ms: u64) -> Option<MembershipSnapshot> {
         self.entry.read_recover().as_ref().and_then(|entry| {
-            (now_ms.saturating_sub(entry.refreshed_ms) <= self.ttl_ms)
-                .then(|| entry.snapshot.clone())
+            (entry.snapshot.valid_until.map_or_else(
+                || now_ms.saturating_sub(entry.refreshed_ms) <= self.ttl_ms,
+                |until| std::time::Instant::now() < until,
+            ))
+            .then(|| entry.snapshot.clone())
         })
     }
 
@@ -88,7 +94,10 @@ impl MembershipCache {
         let zones_token = zones_token(&members);
         let mut entry = self.entry.write_recover();
         if let Some(current) = entry.as_mut() {
-            if current.snapshot.epoch == epoch && current.zones_token == zones_token {
+            if current.snapshot.instances.is_none()
+                && current.snapshot.epoch == epoch
+                && current.zones_token == zones_token
+            {
                 current.refreshed_ms = now_ms;
                 return (current.snapshot.clone(), false);
             }
@@ -118,6 +127,8 @@ impl MembershipCache {
             })
             .collect();
         let snapshot = MembershipSnapshot {
+            instances: None,
+            valid_until: None,
             epoch,
             placement: Arc::new(CachePlacementTable::new(&table_nodes)),
             zones_by_address: Arc::new(zones_by_address),
@@ -130,6 +141,136 @@ impl MembershipCache {
             zones_token,
         });
         (snapshot, changed)
+    }
+    pub fn replace_retained(
+        &self,
+        view: talon_core::worker_membership::WorkerDiscovery,
+        observed: std::time::Instant,
+        pool: &crate::ConnectionPool,
+    ) -> MembershipSnapshot {
+        use talon_core::worker_membership::InstanceState;
+        let mut entry = self.entry.write_recover();
+        let old = entry.as_ref().map(|e| &e.snapshot);
+        let local: Vec<_> = view
+            .workers
+            .iter()
+            .filter(|w| {
+                self.zone_affinity
+                    && self
+                        .zone
+                        .as_ref()
+                        .is_some_and(|z| Some(z) == w.member.zone.as_ref())
+            })
+            .collect();
+        let affinity_fallback = self.zone_affinity
+            && self.zone.is_some()
+            && local.is_empty()
+            && !view.workers.is_empty();
+        let selected: Vec<_> = if local.is_empty() {
+            view.workers.iter().collect()
+        } else {
+            local
+        };
+        let nodes: Vec<_> = selected
+            .iter()
+            .map(|w| NodeInfo {
+                id: talon_core::NodeId::new(w.member.worker_id.clone()),
+                address: String::new(),
+                role: talon_core::NodeRole::Worker,
+            })
+            .collect();
+        let placement = match old {
+            Some(old) if old.instances.is_some() && old.epoch == view.topology_token => {
+                old.placement.clone()
+            }
+            _ => Arc::new(CachePlacementTable::new(&nodes)),
+        };
+        let mut instances = HashMap::new();
+        let mut zones = HashMap::new();
+        for worker in &view.workers {
+            if let InstanceState::Serving {
+                instance_id,
+                address,
+            } = &worker.state
+            {
+                let existing = old
+                    .and_then(|s| s.instances.as_ref())
+                    .and_then(|i| i.get(&worker.member.worker_id));
+                let client = match existing {
+                    Some((id, client)) if id == instance_id && client.addr() == address => {
+                        client.clone()
+                    }
+                    _ => crate::WorkerClient::with_pool(address.clone(), Arc::new(pool.isolated()))
+                        .without_read_retry(),
+                };
+                instances.insert(
+                    worker.member.worker_id.clone(),
+                    (instance_id.clone(), client),
+                );
+                if let Some(zone) = &worker.member.zone {
+                    zones.insert(address.clone(), zone.clone());
+                }
+            }
+        }
+        let snapshot = MembershipSnapshot {
+            placement,
+            epoch: view.topology_token,
+            zones_by_address: Arc::new(zones),
+            affinity_fallback,
+            instances: Some(Arc::new(instances)),
+            valid_until: Some(
+                observed
+                    + std::time::Duration::from_millis(
+                        view.valid_for_ms.min(self.ttl_ms.max(1)).min(500),
+                    ),
+            ),
+        };
+        *entry = Some(Entry {
+            snapshot: snapshot.clone(),
+            refreshed_ms: 0,
+            zones_token: 0,
+        });
+        snapshot
+    }
+}
+
+impl MembershipSnapshot {
+    pub fn retained_owner(
+        &self,
+        block: &talon_core::BlockId,
+    ) -> Result<Option<crate::WorkerClient>, crate::BlockReadError> {
+        let Some(instances) = &self.instances else {
+            return Ok(None);
+        };
+        let owner = self
+            .placement
+            .primary(block)
+            .ok_or(crate::BlockReadError::NoOwners)?;
+        if self
+            .valid_until
+            .map_or(true, |until| std::time::Instant::now() >= until)
+        {
+            return Err(crate::BlockReadError::Worker(crate::WorkerError::Remote(
+                talon_transport::DataPlaneError {
+                    code: talon_transport::DataErrorCode::Unavailable,
+                    message: format!("worker {} has expired instance discovery", owner.id),
+                },
+            )));
+        }
+        instances
+            .get(&owner.id.0)
+            .map(|(_, client)| Some(client.clone()))
+            .ok_or_else(|| {
+                crate::BlockReadError::Worker(crate::WorkerError::Remote(
+                    talon_transport::DataPlaneError {
+                        code: talon_transport::DataErrorCode::Unavailable,
+                        message: format!(
+                            "worker {} is offline or has conflicting instances",
+                            owner.id
+                        ),
+                    },
+                ))
+            })
     }
 }
 
@@ -266,5 +407,75 @@ mod tests {
         assert!(changed);
         assert_eq!(second.placement.workers().len(), 1);
         assert_eq!(second.epoch, first.epoch);
+    }
+    #[test]
+    fn retained_topology_survives_offline_address_and_instance_changes() {
+        use talon_core::worker_membership::*;
+        let cache = MembershipCache::new(30_000).with_zone_affinity(Some("a".into()), true);
+        let pool = crate::ConnectionPool::new();
+        let mut view = WorkerDiscovery {
+            mode: MembershipMode::Retained,
+            topology_token: 7,
+            state_token: 1,
+            valid_for_ms: 500,
+            workers: vec![
+                DiscoveredWorker {
+                    member: WorkerMember {
+                        worker_id: "local".into(),
+                        zone: Some("a".into()),
+                        retired: false,
+                    },
+                    state: InstanceState::Serving {
+                        instance_id: "old".into(),
+                        address: "127.0.0.1:1".into(),
+                    },
+                },
+                DiscoveredWorker {
+                    member: WorkerMember {
+                        worker_id: "remote".into(),
+                        zone: Some("b".into()),
+                        retired: false,
+                    },
+                    state: InstanceState::Serving {
+                        instance_id: "remote".into(),
+                        address: "127.0.0.1:2".into(),
+                    },
+                },
+            ],
+        };
+        let first = cache.replace_retained(view.clone(), std::time::Instant::now(), &pool);
+        let block = talon_core::BlockId::new(
+            talon_core::ObjectId::new(talon_core::Backend::S3, "b", "key"),
+            0,
+            64,
+            talon_core::Version::new("v"),
+        );
+        assert_eq!(
+            first.retained_owner(&block).unwrap().unwrap().addr(),
+            "127.0.0.1:1"
+        );
+        view.workers[0].state = InstanceState::Offline;
+        let offline = cache.replace_retained(view.clone(), std::time::Instant::now(), &pool);
+        assert!(Arc::ptr_eq(&first.placement, &offline.placement));
+        assert!(offline.retained_owner(&block).is_err());
+        assert!(!offline.affinity_fallback);
+        view.workers[0].state = InstanceState::Serving {
+            instance_id: "new".into(),
+            address: "127.0.0.1:3".into(),
+        };
+        let changed = cache.replace_retained(view.clone(), std::time::Instant::now(), &pool);
+        assert!(Arc::ptr_eq(&first.placement, &changed.placement));
+        assert_eq!(
+            changed.retained_owner(&block).unwrap().unwrap().addr(),
+            "127.0.0.1:3"
+        );
+        let expired = cache.replace_retained(
+            view,
+            std::time::Instant::now() - std::time::Duration::from_secs(1),
+            &pool,
+        );
+        assert!(expired.retained_owner(&block).is_err());
+        assert!(cache.fresh(0).is_none());
+        assert!(cache.last_good().is_some());
     }
 }

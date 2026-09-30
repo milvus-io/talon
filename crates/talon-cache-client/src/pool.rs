@@ -117,6 +117,12 @@ impl ConnectionPool {
         }
     }
 
+    /// Isolate one process incarnation while preserving the caller's limits.
+    pub(crate) fn isolated(&self) -> Self {
+        Self::with_limits(self.max_idle_per_addr, self.idle_ttl)
+            .with_timeouts(self.connect_timeout, self.request_timeout)
+    }
+
     /// Override the connect and per-exchange deadlines (for tuning/tests).
     pub fn with_timeouts(mut self, connect: Duration, request: Duration) -> Self {
         self.connect_timeout = connect;

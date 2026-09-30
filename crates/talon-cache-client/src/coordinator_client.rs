@@ -150,6 +150,24 @@ impl CoordinatorClient {
         }
     }
 
+    pub async fn worker_discovery(
+        &self,
+    ) -> Result<talon_core::worker_membership::WorkerDiscovery, CoordinatorError> {
+        match self
+            .round_trip(
+                ControlMessage::WorkerDiscoveryQuery {},
+                "WorkerDiscoveryQuery",
+            )
+            .await?
+        {
+            ControlMessage::WorkerDiscovery { view } => Ok(view),
+            other => Err(CoordinatorError::Unexpected {
+                expected: "WorkerDiscoveryQuery",
+                got: Box::new(other),
+            }),
+        }
+    }
+
     /// Fetch the current membership snapshot (node id + address).
     pub async fn membership(&self) -> Result<Vec<NodeInfo>, CoordinatorError> {
         let req = ControlMessage::MembershipQuery {};
