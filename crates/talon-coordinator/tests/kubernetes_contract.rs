@@ -52,12 +52,13 @@ async fn kubernetes_store_contract() {
     let cluster_id = format!("contract-{}", std::process::id());
     let config = KubernetesConfig {
         namespace: std::env::var("TALON_TEST_NAMESPACE").unwrap_or_else(|_| "talon".into()),
-        cluster_id,
+        cluster_id: cluster_id.clone(),
         context: std::env::var("TALON_TEST_KUBE_CONTEXT").ok(),
     };
     let store = KubernetesStateStore::connect(&config, Duration::from_secs(5))
         .await
         .expect("connect to Kubernetes");
+    talon_coordinator::state_store::testkit::assert_registry_contract(&store, &cluster_id).await;
     let harness = KubernetesHarness {
         store: Arc::new(store),
     };

@@ -50,6 +50,7 @@ struct StoredRecord {
 struct Inner {
     revision: u64,
     records: HashMap<RecordKey, StoredRecord>,
+    registries: HashMap<String, (talon_core::worker_membership::MemberRegistry, StoreRevision)>,
     history: VecDeque<NodeEvent>,
 }
 
@@ -171,6 +172,39 @@ impl MemoryStateStore {
 impl ClusterStateStore for MemoryStateStore {
     fn backend(&self) -> StateBackend {
         StateBackend::Memory
+    }
+
+    async fn member_registry(
+        &self,
+        cluster: &str,
+    ) -> StateStoreResult<super::registry::RegistrySnapshot> {
+        self.ensure_available()?;
+        let inner = self.inner.lock().unwrap();
+        let (value, revision) = inner
+            .registries
+            .get(cluster)
+            .map(|(v, r)| (v.clone(), Some(r.clone())))
+            .unwrap_or_default();
+        Ok(super::registry::RegistrySnapshot { value, revision })
+    }
+    async fn compare_member_registry(
+        &self,
+        cluster: &str,
+        expected: Option<&StoreRevision>,
+        value: &talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<bool> {
+        self.ensure_available()?;
+        super::registry::encode(value, self.backend())?;
+        let mut inner = self.inner.lock().unwrap();
+        if inner.registries.get(cluster).map(|(_, r)| r) != expected {
+            return Ok(false);
+        }
+        inner.revision += 1;
+        let revision = Self::revision(inner.revision);
+        inner
+            .registries
+            .insert(cluster.to_owned(), (value.clone(), revision));
+        Ok(true)
     }
 
     async fn upsert_node(

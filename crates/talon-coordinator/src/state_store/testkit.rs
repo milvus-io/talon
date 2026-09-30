@@ -152,3 +152,61 @@ pub async fn assert_store_contract<H: StoreContractHarness>(harness: &H) {
     let empty = StoreRevision::new("");
     assert!(empty.is_err());
 }
+
+/// Shared persistent-membership contract, usable by real backend harnesses.
+pub async fn assert_registry_contract(store: &dyn ClusterStateStore, cluster: &str) {
+    use super::registry::{change, MemberChange};
+    use talon_core::worker_membership::{MemberRegistry, MembershipMode, WorkerMember};
+    let initial = store.member_registry(cluster).await.unwrap();
+    assert!(initial.revision.is_none());
+    change(
+        store,
+        cluster,
+        MemberChange::Register {
+            worker_id: "persistent".into(),
+            zone: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(!store
+        .compare_member_registry(cluster, None, &MemberRegistry::default())
+        .await
+        .unwrap());
+    let old = store.member_registry(cluster).await.unwrap();
+    change(
+        store,
+        cluster,
+        MemberChange::SetMode(MembershipMode::Retained),
+    )
+    .await
+    .unwrap();
+    assert!(!store
+        .compare_member_registry(cluster, old.revision.as_ref(), &MemberRegistry::default())
+        .await
+        .unwrap());
+    change(
+        store,
+        cluster,
+        MemberChange::SetMember(WorkerMember {
+            worker_id: "persistent".into(),
+            zone: None,
+            retired: true,
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(change(
+        store,
+        cluster,
+        MemberChange::Register {
+            worker_id: "persistent".into(),
+            zone: None
+        }
+    )
+    .await
+    .is_err());
+    let result = store.member_registry(cluster).await.unwrap();
+    assert_eq!(result.value.mode, MembershipMode::Retained);
+    assert!(result.value.members[0].retired);
+}

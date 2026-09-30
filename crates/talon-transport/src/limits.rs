@@ -28,7 +28,7 @@ use crate::frame::{FrameHeader, MsgType, HEADER_LEN, MAX_PAYLOAD_LEN};
 /// Maximum payload for a control-plane frame (bincode `ControlMessage`). These
 /// are small membership/placement messages; 1 MiB is generous and keeps a
 /// control listener from ever committing a data-plane-sized buffer.
-pub const MAX_CONTROL_PAYLOAD_LEN: u32 = 1 << 20;
+pub const MAX_CONTROL_PAYLOAD_LEN: u32 = talon_core::MAX_CONTROL_PAYLOAD_BYTES as u32;
 
 /// Maximum payload for a `Ping` frame — it carries no payload at all.
 pub const MAX_PING_PAYLOAD_LEN: u32 = 0;
