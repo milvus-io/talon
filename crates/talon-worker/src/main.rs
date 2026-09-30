@@ -168,6 +168,10 @@ impl Args {
             data_plane_rings: self.data_plane_rings,
             cache_dirs: None,
             capacity_bytes: None,
+            async_eviction_enabled: None,
+            async_eviction_high_watermark: None,
+            async_eviction_low_watermark: None,
+            async_eviction_check_interval_secs: None,
             l1_capacity_bytes: None,
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
@@ -688,6 +692,7 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
+    let async_eviction = talon_worker::runtime::AsyncEvictionService::start(worker.clone(), &cfg);
     let page_gc = talon_worker::page_gc::PageGcService::start(worker.clone(), page_gc_config);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
@@ -722,6 +727,9 @@ async fn run() -> anyhow::Result<()> {
             Some(task) => task.await,
             None => Ok(()),
         };
+        if let Some(service) = async_eviction {
+            service.shutdown().await;
+        }
         page_gc.shutdown().await;
         control_result?;
         data_result

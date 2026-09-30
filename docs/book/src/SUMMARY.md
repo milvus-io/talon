@@ -53,6 +53,7 @@
 - [Design (v1)](./explanation/design.md)
 - [Page TTI](./explanation/page-tti.md)
 - [Retained membership and rolling upgrades](./explanation/worker-rolling-upgrade.md)
+- [Background cache eviction](./explanation/async-eviction.md)
 - [Data-plane runtime: choosing io_uring](./explanation/data-plane-runtime.md)
 - [Eventual global tenant rate limits](./explanation/eventual-global-tenant-rate-limits.md)
 - [Real-time tenant traffic observability](./explanation/tenant-traffic-observability.md)

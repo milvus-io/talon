@@ -231,13 +231,23 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
+        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
+            .await
+    }
+
+    async fn evict_page_candidate_to_target(
+        &self,
+        candidate: GcCandidate,
+        reason: usize,
+        target: u64,
+    ) -> Option<u64> {
         let runtime = self.clone();
         let permit = self.page_gc_io.clone().acquire_owned().await.ok()?;
         self.page_mutations.run(async move {
             let _permit = permit;
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
-            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= runtime.capacity_bytes) { return None; }
+            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= target) { return None; }
             let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
@@ -304,6 +314,16 @@ impl WorkerRuntime {
         units: Vec<crate::eviction::EvictionCandidate>,
         reason: usize,
     ) {
+        self.unlink_units_to_target(units, reason, self.capacity_bytes)
+            .await;
+    }
+
+    pub(super) async fn unlink_units_to_target(
+        &self,
+        units: Vec<crate::eviction::EvictionCandidate>,
+        reason: usize,
+        target: u64,
+    ) {
         // Capture generations before the first await, not after earlier deletions finish.
         let candidates: Vec<_> = units
             .into_iter()
@@ -323,7 +343,7 @@ impl WorkerRuntime {
                 CacheUnit::Page(_, _) => {
                     if self.lru.candidate_is_current(&unit) {
                         if let Some(c) = candidate {
-                            self.evict_page_candidate(c, reason).await;
+                            self.evict_page_candidate_to_target(c, reason, target).await;
                         }
                     }
                 }
@@ -335,7 +355,7 @@ impl WorkerRuntime {
                             let _gate = state.gate.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
-                                    || runtime.lru.total_bytes() <= runtime.capacity_bytes)
+                                    || runtime.lru.total_bytes() <= target)
                             {
                                 return;
                             }
