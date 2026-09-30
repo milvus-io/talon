@@ -370,6 +370,38 @@ Worker cache capacity (bytes).
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `async_eviction_enabled`
+
+Enable background eviction at cache occupancy watermarks.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_ENABLED`
+- **Default:** `false`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_high_watermark`
+
+Start background eviction at this fraction of capacity_bytes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK`
+- **Default:** `0.9`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_low_watermark`
+
+Stop background eviction at or below this fraction of capacity_bytes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK`
+- **Default:** `0.8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_check_interval_secs`
+
+Background cache occupancy check interval in seconds.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_SECS`
+- **Default:** `60`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `l1_capacity_bytes`
 
 L1 DRAM cache capacity in bytes; 0 disables L1.

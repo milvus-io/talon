@@ -5,6 +5,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod async_eviction;
+pub use async_eviction::AsyncEvictionService;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;
@@ -1848,19 +1850,24 @@ impl WorkerRuntime {
         if self.capacity_bytes == 0 {
             return;
         }
+        self.evict_to_target(self.capacity_bytes).await;
+    }
+
+    /// Bounded capacity reclamation shared by admissions and background watermarks.
+    async fn evict_to_target(&self, target: u64) {
         // A selected page can become protected or fail to unlink. Refill from
         // other units using actual residency, attempting each unit at most once.
         // Bound the pass even if concurrent admissions keep adding new units.
         let budget = self.lru.len();
         let mut attempted = HashSet::new();
         while attempted.len() < budget {
-            let mut evicted = self.lru.candidates_to_fit(self.capacity_bytes, &attempted);
+            let mut evicted = self.lru.candidates_to_fit(target, &attempted);
             evicted.truncate(budget - attempted.len());
             if evicted.is_empty() {
                 break;
             }
             attempted.extend(evicted.iter().map(|c| c.unit.clone()));
-            self.unlink_units(evicted, 1).await;
+            self.unlink_units_to_target(evicted, 1, target).await;
         }
     }
 
