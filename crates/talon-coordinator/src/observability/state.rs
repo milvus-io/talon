@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use talon_core::{
@@ -49,6 +49,10 @@ pub struct CoordinatorObservability {
     pub(crate) metrics: CoordinatorMetrics,
     store: Arc<dyn ClusterStateStore>,
     last_discovery: RwLock<Option<(talon_core::worker_membership::WorkerDiscovery, Instant)>>,
+    heartbeats: Mutex<super::heartbeats::Heartbeats>,
+    // Serialize snapshot installation and slow-path admission. The heartbeat
+    // fast path never waits for this lock or performs backend I/O.
+    membership_refresh: tokio::sync::Mutex<()>,
     /// What this cluster advertises, and the store that backs it.
     ///
     /// `advertised` and `revision` are fixed at construction: they describe the
@@ -85,6 +89,8 @@ impl CoordinatorObservability {
             started_at_unix_ms: now_unix_ms(),
             started: Instant::now(),
             last_discovery: RwLock::new(None),
+            heartbeats: Mutex::new(Default::default()),
+            membership_refresh: tokio::sync::Mutex::new(()),
             sequence: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             state_store_degraded: AtomicBool::new(false),
@@ -252,6 +258,14 @@ impl CoordinatorObservability {
     /// Whether authoritative shared state is currently ready.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+            && self
+                .last_discovery
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(true, |(_, refreshed)| {
+                    refreshed.elapsed() < self.discovery_max_age()
+                })
             && (!self.state_store_degraded.load(Ordering::Acquire)
                 || self.membership_within_failure_grace())
             && !self.shutting_down.load(Ordering::Acquire)
@@ -363,7 +377,16 @@ impl CoordinatorObservability {
         Ok(view)
     }
 
-    /// Read discovery, retaining the last installed view only within failure grace.
+    fn discovery_max_age(&self) -> Duration {
+        if self.state_failure_grace.is_zero() {
+            self.request_timeout
+        } else {
+            self.state_failure_grace
+        }
+    }
+
+    /// Serve the last installed observation without a backend round trip.
+    /// Periodic reconciliation alone renews its bounded validity.
     pub async fn membership_for_query(
         &self,
     ) -> StateStoreResult<talon_core::worker_membership::WorkerDiscovery> {
@@ -373,28 +396,198 @@ impl CoordinatorObservability {
                 "coordinator not ready",
             ));
         }
-        match self.worker_discovery().await {
-            Ok(view) => Ok(view),
-            Err(error) => {
-                self.record_state_store_failure();
-                if self.is_ready() {
-                    let cached = self
-                        .last_discovery
-                        .read()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some((view, refreshed)) = cached.as_ref() {
-                        let remaining =
-                            self.state_failure_grace.saturating_sub(refreshed.elapsed());
-                        if !remaining.is_zero() {
-                            let mut view = view.clone();
-                            view.valid_for_ms = view.valid_for_ms.min(remaining.as_millis() as u64);
-                            return Ok(view);
-                        }
-                    }
-                }
-                Err(error)
+        let cached = self
+            .last_discovery
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((view, refreshed)) = cached.as_ref() {
+            let remaining = self.discovery_max_age().saturating_sub(refreshed.elapsed());
+            if remaining.as_millis() > 0 {
+                let mut view = view.clone();
+                view.valid_for_ms = view.valid_for_ms.min(remaining.as_millis() as u64);
+                return Ok(view);
             }
         }
+        Err(crate::state_store::registry::invalid(
+            self.store.backend(),
+            "membership cache requires refresh",
+        ))
+    }
+
+    fn buffer_instance(
+        &self,
+        status: &NodeStatus,
+        ttl: Duration,
+    ) -> Option<StateStoreResult<bool>> {
+        if !self.is_ready() || !self.membership_cache_is_fresh() {
+            return None;
+        }
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .receive(status, ttl)
+            .map(|result| {
+                result.map_err(|()| {
+                    crate::state_store::registry::invalid(
+                        self.store.backend(),
+                        "stale instance heartbeat",
+                    )
+                })
+            })
+    }
+
+    fn membership_cache_is_fresh(&self) -> bool {
+        self.last_discovery
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(_, refreshed)| refreshed.elapsed() < self.discovery_max_age())
+    }
+
+    /// Accept an unchanged admitted instance in memory, or synchronously admit
+    /// a new/changed instance and install its routing observation before Ack.
+    /// The second result says whether proxy membership needs refreshing.
+    pub async fn receive_instance(
+        &self,
+        status: NodeStatus,
+        ttl: Duration,
+        membership: &crate::Membership,
+    ) -> StateStoreResult<(bool, bool)> {
+        let received = Instant::now();
+        status.validate()?;
+        if status.cluster_id != self.cluster_id || status.node.role != NodeRole::Worker {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "invalid worker instance cluster or role",
+            ));
+        }
+        self.check_cached_sequence(&status)?;
+        if let Some(result) = self.buffer_instance(&status, ttl) {
+            return result.map(|serving| (serving, false));
+        }
+        // Queueing is part of the request budget. A disconnected caller's
+        // report must not wait indefinitely and then acquire a fresh lease.
+        let result = tokio::time::timeout(self.request_timeout, async {
+            let _refresh = self.membership_refresh.lock().await;
+            self.check_cached_sequence(&status)?;
+            if let Some(result) = self.buffer_instance(&status, ttl) {
+                return result.map(|serving| (serving, false));
+            }
+            let remaining = ttl.saturating_sub(received.elapsed());
+            if remaining.is_zero() {
+                return Err(StateStoreError::InvalidLeaseTtl(remaining));
+            }
+            let (written, _) = self.publish_instance(status.clone(), remaining).await?;
+            self.reconcile_membership_inner(membership).await?;
+            let cached = self.last_discovery.read().unwrap_or_else(|e| e.into_inner());
+            let serving = cached.as_ref().is_some_and(|(view, _)| view.workers.iter().any(|worker|
+                worker.member.worker_id == status.node.id.0
+                    && matches!(&worker.state, talon_core::worker_membership::InstanceState::Serving { instance_id, .. }
+                        if instance_id == &status.incarnation_id)));
+            if written.disposition == crate::WriteDisposition::Applied {
+                self.heartbeats.lock().unwrap_or_else(|e| e.into_inner())
+                    .admit(status, ttl, received, serving);
+            }
+            Ok((serving, true))
+        }).await.unwrap_or_else(|_| Err(StateStoreError::Timeout { backend: self.store.backend() }));
+        if result.is_err() {
+            self.record_state_store_failure();
+        }
+        result
+    }
+
+    fn check_cached_sequence(&self, status: &NodeStatus) -> StateStoreResult<()> {
+        if self
+            .heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_stale(status)
+        {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "stale instance heartbeat",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish coalesced reports independently of discovery reconciliation.
+    /// Backend latency here must not block snapshot reads or new admissions.
+    pub async fn publish_buffered_instances(&self) -> StateStoreResult<()> {
+        let result = async {
+            let registry = self.worker_registry().await?.value;
+            self.flush_heartbeats(&registry).await
+        }
+        .await;
+        if result.is_err() {
+            self.record_state_store_failure();
+        }
+        result
+    }
+
+    async fn flush_heartbeats(
+        &self,
+        registry: &talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<()> {
+        // One latest report per locally admitted instance, not a task per
+        // heartbeat. Keep backend concurrency bounded independently of N.
+        let pending = self
+            .heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending(registry);
+        let mut pending = pending.into_iter();
+        let mut writes = tokio::task::JoinSet::new();
+        loop {
+            while writes.len() < 16 {
+                let Some(heartbeat) = pending.next() else {
+                    break;
+                };
+                let store = self.store.clone();
+                let request_timeout = self.request_timeout;
+                writes.spawn(async move {
+                    let result = tokio::time::timeout(request_timeout, async {
+                        let remaining = heartbeat.ttl.saturating_sub(heartbeat.received.elapsed());
+                        if remaining.is_zero() {
+                            return Ok(None);
+                        }
+                        let written = store
+                            .upsert_instance(heartbeat.status.clone(), remaining)
+                            .await?;
+                        if written.disposition == crate::WriteDisposition::Stale {
+                            return Ok(None);
+                        }
+                        let remaining = heartbeat.ttl.saturating_sub(heartbeat.received.elapsed());
+                        if !remaining.is_zero() {
+                            let mut status = heartbeat.status.clone();
+                            status.ready &= heartbeat.serving;
+                            store.upsert_node(status, remaining).await?;
+                        }
+                        Ok(Some(()))
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(StateStoreError::Timeout {
+                            backend: store.backend(),
+                        })
+                    });
+                    (heartbeat, result)
+                });
+            }
+            let Some(completed) = writes.join_next().await else {
+                break;
+            };
+            let (heartbeat, result) = completed.map_err(|error| StateStoreError::Unavailable {
+                backend: self.store.backend(),
+                detail: format!("heartbeat publication task failed: {error}"),
+            })?;
+            let mut cache = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
+            match result? {
+                Some(()) => cache.persisted(&heartbeat),
+                None => cache.forget(&heartbeat.status),
+            }
+        }
+        Ok(())
     }
 
     /// Authoritative targets for control updates, without manufacturing a watch
@@ -527,9 +720,36 @@ impl CoordinatorObservability {
         &self,
         membership: &crate::Membership,
     ) -> StateStoreResult<()> {
+        let _refresh = self.membership_refresh.lock().await;
+        self.reconcile_membership_inner(membership).await
+    }
+
+    async fn reconcile_membership_inner(
+        &self,
+        membership: &crate::Membership,
+    ) -> StateStoreResult<()> {
         let result = async {
-            let view = self.worker_discovery().await?;
+            // Refresh discovery independently of pending publication work.
+            let registry = self.worker_registry().await?.value;
+            let observed = Instant::now();
+            let instances = tokio::time::timeout(
+                self.request_timeout,
+                self.store.instance_snapshot(&self.cluster_id),
+            )
+            .await
+            .map_err(|_| StateStoreError::Timeout {
+                backend: self.store.backend(),
+            })??;
+            let view = talon_core::worker_membership::WorkerDiscovery::retained(
+                &registry,
+                &instances.nodes,
+            );
             self.refresh_snapshot().await?;
+            self.metrics.update_worker_discovery(&view);
+            self.heartbeats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(&view, &instances.nodes, observed);
             let cached = view.clone();
             let workers = view
                 .workers
@@ -555,7 +775,7 @@ impl CoordinatorObservability {
             *self
                 .last_discovery
                 .write()
-                .unwrap_or_else(|e| e.into_inner()) = Some((cached, Instant::now()));
+                .unwrap_or_else(|e| e.into_inner()) = Some((cached, observed));
             self.record_membership_refresh();
             Ok(())
         }
@@ -905,6 +1125,222 @@ mod tests {
     use talon_core::NodeId;
 
     use super::*;
+
+    #[tokio::test]
+    async fn warm_heartbeats_and_discovery_do_not_access_the_backend() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        let ttl = Duration::from_secs(30);
+        let mut status = worker_status();
+        assert_eq!(
+            obs.receive_instance(status.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (true, true)
+        );
+        let before = store.instance_snapshot("cluster-a").await.unwrap();
+        // Any attempted backend access now fails. Warm requests must succeed
+        // entirely in memory, without swallowing an I/O error or marking the
+        // coordinator degraded.
+        store.set_available(false);
+        for seq in 1..=100 {
+            status.heartbeat_seq = seq;
+            status.metrics.block_count = seq;
+            assert_eq!(
+                obs.receive_instance(status.clone(), ttl, &membership)
+                    .await
+                    .unwrap(),
+                (true, false)
+            );
+            assert_eq!(obs.membership_for_query().await.unwrap().workers.len(), 1);
+        }
+        assert!(!obs.state_store_degraded.load(Ordering::Acquire));
+        status.heartbeat_seq -= 1;
+        assert!(obs
+            .receive_instance(status.clone(), ttl, &membership)
+            .await
+            .is_err());
+        store.set_available(true);
+        assert_eq!(
+            store.instance_snapshot("cluster-a").await.unwrap().nodes,
+            before.nodes
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_publication_coalesces_reports_and_reaches_other_coordinators() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        let ttl = Duration::from_secs(30);
+        let mut status = worker_status();
+        obs.receive_instance(status.clone(), ttl, &membership)
+            .await
+            .unwrap();
+        // Make the last publication due without sleeping or changing the
+        // backend clock; receipt of new heartbeats remains current.
+        obs.heartbeats.lock().unwrap().admit(
+            status.clone(),
+            ttl,
+            Instant::now() - Duration::from_secs(11),
+            true,
+        );
+        for seq in 1..=100 {
+            status.heartbeat_seq = seq;
+            status.metrics.block_count = seq;
+            assert_eq!(
+                obs.receive_instance(status.clone(), ttl, &membership)
+                    .await
+                    .unwrap(),
+                (true, false)
+            );
+        }
+        assert_eq!(
+            store.instance_snapshot("cluster-a").await.unwrap().nodes[0].heartbeat_seq,
+            0
+        );
+        obs.publish_buffered_instances().await.unwrap();
+        obs.reconcile_membership(&membership).await.unwrap();
+        let published = store.instance_snapshot("cluster-a").await.unwrap();
+        assert_eq!(published.nodes[0].heartbeat_seq, 100);
+        assert_eq!(
+            store.snapshot("cluster-a").await.unwrap().nodes[0]
+                .metrics
+                .block_count,
+            100
+        );
+        obs.publish_buffered_instances().await.unwrap();
+        obs.reconcile_membership(&membership).await.unwrap();
+        assert_eq!(
+            store.instance_snapshot("cluster-a").await.unwrap().revision,
+            published.revision,
+            "a reconcile with no new report must not renew a lease"
+        );
+
+        let peer = CoordinatorObservability::new(
+            "cluster-a".into(),
+            obs.node.clone(),
+            obs.admin_address.clone(),
+            Duration::from_secs(1),
+            store.clone(),
+        )
+        .unwrap();
+        peer.reconcile_membership(&crate::Membership::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.membership_for_query().await.unwrap().workers,
+            obs.membership_for_query().await.unwrap().workers
+        );
+        // A Service can route the next heartbeat to a different replica. Its
+        // shared observation must already warm the instance fast path.
+        store.set_available(false);
+        status.heartbeat_seq += 1;
+        assert_eq!(
+            peer.receive_instance(status, ttl, &crate::Membership::new())
+                .await
+                .unwrap(),
+            (true, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_queue_wait_is_part_of_the_request_deadline() {
+        let (obs, store) = observability();
+        let _blocked = obs.membership_refresh.lock().await;
+        let error = obs
+            .receive_instance(
+                worker_status(),
+                Duration::from_secs(30),
+                &crate::Membership::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StateStoreError::Timeout { .. }));
+        assert!(store
+            .instance_snapshot("cluster-a")
+            .await
+            .unwrap()
+            .nodes
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_queries_do_not_refresh_observation_age() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        obs.receive_instance(worker_status(), Duration::from_secs(30), &membership)
+            .await
+            .unwrap();
+        obs.last_discovery.write().unwrap().as_mut().unwrap().1 -= Duration::from_secs(16);
+        assert!(
+            !obs.is_ready(),
+            "a stalled refresh task must expire even without a reported backend error"
+        );
+        assert!(obs.membership_for_query().await.is_err());
+        obs.check_ready().await.unwrap();
+        assert!(
+            obs.membership_for_query().await.is_err(),
+            "health probes cannot refresh discovery"
+        );
+        store.set_available(false);
+        let mut status = worker_status();
+        status.heartbeat_seq += 1;
+        assert!(obs
+            .receive_instance(status, Duration::from_secs(30), &membership)
+            .await
+            .is_err());
+        store.set_available(true);
+        obs.reconcile_membership(&membership).await.unwrap();
+        assert!(obs.membership_for_query().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn state_changes_require_publication_and_invalidate_cached_grants() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        let ttl = Duration::from_secs(30);
+        let mut first = worker_status();
+        obs.receive_instance(first.clone(), ttl, &membership)
+            .await
+            .unwrap();
+        let mut second = first.clone();
+        second.incarnation_id = "second".into();
+        assert_eq!(
+            obs.receive_instance(second.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (false, true)
+        );
+        first.heartbeat_seq += 1;
+        assert_eq!(
+            obs.receive_instance(first.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (false, false)
+        );
+        second.heartbeat_seq += 1;
+        second.ready = false;
+        assert_eq!(
+            obs.receive_instance(second, ttl, &membership)
+                .await
+                .unwrap(),
+            (false, true)
+        );
+        first.heartbeat_seq += 1;
+        assert_eq!(
+            obs.receive_instance(first.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (true, false)
+        );
+        first.heartbeat_seq += 1;
+        first.node.address = "127.0.0.1:9001".into();
+        store.set_available(false);
+        assert!(
+            obs.receive_instance(first, ttl, &membership).await.is_err(),
+            "a cached grant must never approve an unconfirmed address"
+        );
+    }
 
     #[tokio::test]
     async fn reconcile_retains_unavailable_owners_without_serving_addresses() {

@@ -118,10 +118,19 @@ Variant tags are the enum's declaration order. The read path needs these:
 
 Workers send `NodeStatusHeartbeat { status: NodeStatus }` (tag 7). The coordinator
 replies with `NodeStatusAck { accepted: bool, serving: bool, detail: Option<String> }`
-(tag 17). Acceptance means the report was persisted and membership refreshed;
+(tag 17). New instances and admission-relevant changes are persisted and routing
+is installed before acceptance. Unchanged reports from an admitted instance are
+accepted in memory and coalesced for periodic publication; acceptance does not
+promise that every heartbeat's metrics or sequence survives a Coordinator crash.
 `serving` separately grants service admission. A conflicting or withdrawn instance
 can be accepted without being allowed to serve. `NodeStatus.ready` reports local
 readiness, independent of this grant. There is no separate registration RPC.
+
+`MembershipQuery` reads the Coordinator's last installed discovery without a
+backend RPC. Its validity is bounded by the observation's remaining cache lifetime;
+requests never renew that lifetime. Coordinators refresh independently, so a client
+switching replicas can temporarily observe different views. The equality tokens
+do not provide monotonic revision ordering.
 
 Supporting types:
 

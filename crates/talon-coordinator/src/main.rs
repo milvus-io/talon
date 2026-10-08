@@ -667,17 +667,16 @@ impl Coordinator {
         match message {
             ControlMessage::NodeStatusHeartbeat { status } => {
                 let result: talon_coordinator::StateStoreResult<bool> = async {
-                    let serving = self
+                    let (serving, published) = self
                         .observability
-                        .report_instance(*status, self.lease_ttl)
+                        .receive_instance(*status, self.lease_ttl, self.service.membership())
                         .await?;
                     // The acknowledgement can make the worker ready immediately.
                     // Publish routing and proxy membership before sending it, including
                     // withdrawals and conflicts, without waiting for the periodic tick.
-                    self.observability
-                        .reconcile_membership(self.service.membership())
-                        .await?;
-                    self.refresh_worker_proxy_membership();
+                    if published {
+                        self.refresh_worker_proxy_membership();
+                    }
                     Ok(serving)
                 }
                 .await;
@@ -853,6 +852,10 @@ async fn run() -> anyhow::Result<()> {
     spawn_membership_reconcile(
         Arc::clone(&observability),
         Arc::clone(&state),
+        Duration::from_millis(config.state.heartbeat_interval_ms),
+    );
+    spawn_instance_publication(
+        Arc::clone(&observability),
         Duration::from_millis(config.state.heartbeat_interval_ms),
     );
 
@@ -1034,6 +1037,22 @@ fn spawn_membership_reconcile(
                 tracing::warn!(%error, "membership reconcile from shared state failed");
             } else {
                 state.refresh_worker_proxy_membership();
+            }
+        }
+    })
+}
+
+fn spawn_instance_publication(
+    observability: Arc<CoordinatorObservability>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = observability.publish_buffered_instances().await {
+                tracing::warn!(%error, "buffered worker heartbeat publication failed");
             }
         }
     })

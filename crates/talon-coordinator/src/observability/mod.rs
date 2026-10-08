@@ -7,6 +7,7 @@
 //! them without widening visibility.
 
 mod admin;
+mod heartbeats;
 mod metrics;
 mod state;
 
