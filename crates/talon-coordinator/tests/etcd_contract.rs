@@ -70,8 +70,19 @@ async fn etcd_backend_passes_store_contract() {
     let store = EtcdStateStore::from_client(client, prefix, Duration::from_secs(5))
         .expect("construct etcd store");
 
+    talon_coordinator::state_store::testkit::assert_registry_contract(&store, "contract").await;
     let harness = EtcdHarness {
         store: Arc::new(store),
     };
     assert_store_contract(&harness).await;
+    assert!(
+        harness
+            .store
+            .member_registry("contract")
+            .await
+            .unwrap()
+            .value
+            .members[0]
+            .retired
+    );
 }

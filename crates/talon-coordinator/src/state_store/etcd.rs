@@ -257,6 +257,50 @@ impl ClusterStateStore for EtcdStateStore {
         StateBackend::Etcd
     }
 
+    async fn member_registry(
+        &self,
+        cluster: &str,
+    ) -> StateStoreResult<super::registry::RegistrySnapshot> {
+        let mut client = self.client.clone();
+        let key = format!("{}/member-registry/{}", self.prefix, hex_component(cluster));
+        let response = self.with_timeout(client.get(key, None)).await?;
+        match response.kvs().first() {
+            Some(kv) => Ok(super::registry::RegistrySnapshot {
+                value: super::registry::decode(kv.value(), self.backend())?,
+                revision: Some(revision(kv.mod_revision())?),
+            }),
+            None => Ok(super::registry::RegistrySnapshot {
+                value: Default::default(),
+                revision: None,
+            }),
+        }
+    }
+    async fn compare_member_registry(
+        &self,
+        cluster: &str,
+        expected: Option<&StoreRevision>,
+        value: &talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<bool> {
+        let bytes = super::registry::encode(value, self.backend())?;
+        let key = format!("{}/member-registry/{}", self.prefix, hex_component(cluster));
+        let compare = match expected {
+            Some(rv) => Compare::mod_revision(key.clone(), CompareOp::Equal, parse_revision(rv)?),
+            None => Compare::create_revision(key.clone(), CompareOp::Equal, 0),
+        };
+        let mut client = self.client.clone();
+        // Intentionally no lease: process expiration cannot delete membership.
+        let response = self
+            .with_timeout(
+                client.txn(
+                    Txn::new()
+                        .when(vec![compare])
+                        .and_then(vec![TxnOp::put(key, bytes, None)]),
+                ),
+            )
+            .await?;
+        Ok(response.succeeded())
+    }
+
     async fn upsert_node(
         &self,
         status: NodeStatus,
@@ -739,6 +783,10 @@ fn sanitize_transport_error(error: &etcd_client::Error) -> String {
         E::ElectError(_) => "etcd election error".into(),
         _ => "etcd backend error".into(),
     }
+}
+
+fn hex_component(value: &str) -> String {
+    value.bytes().map(|b| format!("{b:02x}")).collect()
 }
 
 #[cfg(test)]

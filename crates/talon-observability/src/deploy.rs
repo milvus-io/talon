@@ -138,21 +138,38 @@ mod tests {
     }
 
     #[test]
-    fn kubernetes_backend_uses_least_privilege_lease_rbac() {
+    fn kubernetes_backend_uses_least_privilege_state_rbac() {
         let docs = parse_documents(RBAC_YAML);
         let role = docs
             .iter()
             .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Role"))
             .expect("a namespaced Role, not ClusterRole");
         let rules = role["rules"].as_sequence().unwrap();
-        // Only coordination.k8s.io/leases, nothing cluster-wide or secrets.
+        // Process leases and one persistent registry resource type, no secrets.
+        assert_eq!(rules.len(), 2);
         for rule in rules {
-            let groups = rule["apiGroups"].as_sequence().unwrap();
-            assert!(groups
-                .iter()
-                .all(|g| g.as_str() == Some("coordination.k8s.io")));
-            let resources = rule["resources"].as_sequence().unwrap();
-            assert!(resources.iter().all(|r| r.as_str() == Some("leases")));
+            let strings = |key: &str| {
+                rule[key]
+                    .as_sequence()
+                    .unwrap()
+                    .iter()
+                    .map(|value| value.as_str().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            match strings("resources").as_slice() {
+                ["leases"] => {
+                    assert_eq!(strings("apiGroups"), ["coordination.k8s.io"]);
+                    assert_eq!(
+                        strings("verbs"),
+                        ["get", "list", "watch", "create", "update", "patch", "delete"]
+                    );
+                }
+                ["configmaps"] => {
+                    assert_eq!(strings("apiGroups"), [""]);
+                    assert_eq!(strings("verbs"), ["get", "create", "update"]);
+                }
+                resources => panic!("unexpected state resources: {resources:?}"),
+            }
         }
         // Cluster-wide grants are allowed only for the zone lookup (ADR
         // 0006): nodes are cluster-scoped, so reading the node's zone label
