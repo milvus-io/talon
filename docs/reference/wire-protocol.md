@@ -215,10 +215,23 @@ address changes replace the isolated connection pool without changing logical
 ownership. The observation expires after the smaller of the advertised lifetime,
 the client's configured TTL, and 500 ms; expired instances cannot serve reads.
 
-**Single-attempt reads.** Each block read tries its selected instance once. An
-offline or conflicted owner, expired discovery, or worker error is returned to the
-caller without refreshing and resending that request or switching owners. A
-later request refreshes expired discovery; concurrent refreshes are serialized
+**Bounded replica fallback.** Each block read ranks up to `replicas_k` distinct
+logical workers, primary first (default 1). Offline and conflicted candidates
+retain their rank but may be skipped; retryable read failures try the next
+candidate in the same snapshot, checking its discovery deadline before use.
+A reused connection that fails with an I/O error may be redialed once; discovery
+must still be valid before dialing and before resending. Fresh-connection failures
+and Worker error responses do not trigger this transport retry. Failure does not
+refresh discovery or restart the candidate list.
+Invalid requests, missing origin objects, version mismatches, origin failures,
+and tenant rate limits return immediately. Exhaustion returns
+`BlockReadError::AllReplicasFailed { worker, source }`, preserving the last
+candidate address (or logical ID when no address is known) and typed cause.
+`replicas_k` bounds read candidates; it does not proactively populate replicas
+or distribute successful primary reads across backups. Admission still targets
+the primary only.
+
+A later request refreshes expired discovery; concurrent refreshes are serialized
 and cached snapshots limit refreshes to one per 100 ms. Last-good snapshots are
 retained for diagnostics, but never permit reads through expired instances.
 

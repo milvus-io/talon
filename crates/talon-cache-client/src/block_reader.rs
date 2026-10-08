@@ -1,11 +1,13 @@
 //! Block read orchestration over persistent logical membership.
 //!
 //! [`BlockReader`] ranks logical worker IDs with the cached placement table,
-//! then resolves the selected owner's current process from bounded discovery.
-//! Offline, conflicted, and expired instances fail without changing ownership.
-//! A worker read is attempted once; errors are returned without an in-request
-//! refresh, resend, or replica fallback. Instance-specific connection pools
-//! prevent a replacement process from inheriting an old process's sockets.
+//! then resolves up to `replicas_k` candidates from bounded instance discovery.
+//! Offline or conflicted candidates keep their rank but can be skipped. Retryable
+//! read failures try the next ranked candidate without an
+//! in-request discovery refresh. Expired discovery cannot route any candidate.
+//! A stale reused connection may be redialed once while discovery is valid.
+//! Instance-specific connection pools prevent a replacement process from
+//! inheriting an old process's sockets.
 //!
 //! Multi-block splitting is handled by [`crate::read_plan`]; protocol frontends
 //! own their prefetch policy.
@@ -56,6 +58,15 @@ pub enum BlockReadError {
     /// The cluster returned no owners for the block (empty cluster).
     #[error("no owners for block")]
     NoOwners,
+    /// All configured logical candidates failed, without refreshing discovery.
+    #[error("all replicas failed; last worker {worker}: {source}")]
+    AllReplicasFailed {
+        /// Last candidate's address when known, otherwise its logical worker ID.
+        worker: String,
+        /// Original failure, preserved for diagnostics and classification.
+        #[source]
+        source: WorkerError,
+    },
 }
 
 /// The coordinates of an open file needed to plan a read: its object identity,
@@ -80,6 +91,8 @@ pub struct FileView<'a> {
 pub struct BlockReader {
     coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
+    /// Maximum number of ranked logical workers attempted per block read.
+    replicas_k: u8,
     /// Read-path counters (cache hit/miss, worker fetches, bytes served).
     stats: ReadStats,
     /// Settings template for isolated per-instance connection pools.
@@ -97,13 +110,16 @@ pub struct BlockReader {
 impl BlockReader {
     /// Create a reader over the given coordinator client and placement cache.
     ///
+    /// `replicas_k` bounds the ordered candidate list, primary first. It does not
+    /// populate replicas; zero is treated as one.
     /// Metrics are collected into a fresh [`ReadStats`]; use
     /// [`with_stats`](Self::with_stats) to share an existing one.
-    pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>) -> Self {
+    pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
         let membership = Arc::new(MembershipCache::new(cache.ttl_ms()));
         Self {
             coordinator,
             cache,
+            replicas_k: replicas_k.max(1),
             stats: ReadStats::new(),
             worker_pool: Arc::new(ConnectionPool::new()),
             membership,
@@ -173,26 +189,51 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
-        _now_ms: u64,
     ) -> Result<Vec<u8>, CacheReadError> {
         let snapshot = self
             .membership_snapshot()
             .await
             .map_err(cache_block_error)?;
-        let worker = snapshot.owner(block).map_err(cache_block_error)?;
-        let bytes = worker
-            .fetch_cached_range(
-                &block.object,
-                &block.version,
-                block.offset + u64::from(offset_in_block),
-                u64::from(len),
-            )
-            .await?;
-        if bytes.len() != len as usize {
-            return Err(CacheReadError::Protocol("incomplete cached read".into()));
+        let mut last = BlockReadError::NoOwners;
+        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
+            let worker = match candidate {
+                Ok(worker) => worker,
+                Err(error) => {
+                    last = BlockReadError::AllReplicasFailed {
+                        worker: target.into(),
+                        source: error,
+                    };
+                    continue;
+                }
+            };
+            let result = worker
+                .fetch_cached_range(
+                    &block.object,
+                    &block.version,
+                    block.offset + u64::from(offset_in_block),
+                    u64::from(len),
+                )
+                .await;
+            let error = match result {
+                Ok(bytes) if bytes.len() == len as usize => {
+                    self.record_zone_read(worker.addr(), bytes.len() as u64);
+                    return Ok(bytes);
+                }
+                Ok(bytes) => WorkerError::RangeLengthMismatch {
+                    expected: u64::from(len),
+                    actual: bytes.len() as u64,
+                },
+                Err(error) => error,
+            };
+            if !replica_retryable(&error) {
+                return Err(error.into());
+            }
+            last = BlockReadError::AllReplicasFailed {
+                worker: target.into(),
+                source: error,
+            };
         }
-        self.record_zone_read(worker.addr(), bytes.len() as u64);
-        Ok(bytes)
+        Err(cache_block_error(last))
     }
 
     /// Admit one complete versioned block to its current primary owner.
@@ -204,7 +245,6 @@ impl BlockReader {
         block: &BlockId,
         object_len: u64,
         body: &[u8],
-        _now_ms: u64,
     ) -> Result<(), CacheReadError> {
         let snapshot = self
             .membership_snapshot()
@@ -219,9 +259,9 @@ impl BlockReader {
 
     /// Read `len` bytes at `offset_in_block` within `block`.
     ///
-    /// Rank logical membership, resolve the selected owner's unexpired instance,
-    /// and fetch once at `block.offset + offset_in_block`. Failures propagate
-    /// without retrying another instance or owner.
+    /// Rank up to `replicas_k` logical candidates and resolve their unexpired
+    /// instances. Retryable failures try the next candidate without refreshing
+    /// discovery. Stale reused connections may be redialed once before expiry.
     ///
     /// This FUSE entry point follows the current origin generation. Use
     /// [`read_versioned_block_into`](Self::read_versioned_block_into) to pin the source.
@@ -230,16 +270,9 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
-        now_ms: u64,
     ) -> Result<Vec<u8>, BlockReadError> {
         match self
-            .read_block_detailed_with_mode(
-                block,
-                offset_in_block,
-                len,
-                now_ms,
-                OriginReadMode::Current,
-            )
+            .read_block_detailed_with_mode(block, offset_in_block, len, OriginReadMode::Current)
             .await
         {
             Ok(bytes) => Ok(bytes),
@@ -250,7 +283,7 @@ impl BlockReader {
 
     /// Read `dst.len()` bytes at `offset_in_block` within `block` into `dst`.
     ///
-    /// This follows the same logical-owner selection and single-attempt
+    /// This follows the same logical-candidate selection and replica fallback
     /// behavior as [`read_block`](Self::read_block), without allocating an
     /// intermediate result buffer.
     pub async fn read_block_into(
@@ -258,9 +291,8 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         dst: &mut [u8],
-        now_ms: u64,
     ) -> Result<usize, BlockReadError> {
-        self.read_block_into_with_mode(block, offset_in_block, dst, now_ms, OriginReadMode::Current)
+        self.read_block_into_with_mode(block, offset_in_block, dst, OriginReadMode::Current)
             .await
     }
 
@@ -274,16 +306,9 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         dst: &mut [u8],
-        now_ms: u64,
     ) -> Result<usize, BlockReadError> {
-        self.read_block_into_with_mode(
-            block,
-            offset_in_block,
-            dst,
-            now_ms,
-            OriginReadMode::ExactVersion,
-        )
-        .await
+        self.read_block_into_with_mode(block, offset_in_block, dst, OriginReadMode::ExactVersion)
+            .await
     }
 
     async fn read_block_into_with_mode(
@@ -291,37 +316,59 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         dst: &mut [u8],
-        _now_ms: u64,
         mode: OriginReadMode,
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
-        let worker = snapshot.owner(block)?;
         self.stats.record_cache_miss();
-        self.stats.record_worker_fetch();
         if snapshot.affinity_fallback {
             self.zone_observer.affinity_fallback();
         }
         let offset = block.offset + u64::from(offset_in_block);
-        let n = match mode {
-            OriginReadMode::Current => worker.fetch_range_into(&block.object, offset, dst).await,
-            OriginReadMode::ExactVersion => {
-                worker
-                    .fetch_versioned_range_into(&block.object, &block.version, offset, dst)
-                    .await
-            }
-        }
-        .inspect_err(|_| self.stats.record_worker_failure())?;
-        if n != dst.len() {
+        let mut last = BlockReadError::NoOwners;
+        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
+            let worker = match candidate {
+                Ok(worker) => worker,
+                Err(error) => {
+                    last = BlockReadError::AllReplicasFailed {
+                        worker: target.into(),
+                        source: error,
+                    };
+                    continue;
+                }
+            };
+            self.stats.record_worker_fetch();
+            let result = match mode {
+                OriginReadMode::Current => {
+                    worker.fetch_range_into(&block.object, offset, dst).await
+                }
+                OriginReadMode::ExactVersion => {
+                    worker
+                        .fetch_versioned_range_into(&block.object, &block.version, offset, dst)
+                        .await
+                }
+            };
+            let error = match result {
+                Ok(n) if n == dst.len() => {
+                    self.stats.add_bytes_served(n as u64);
+                    self.record_zone_read(worker.addr(), n as u64);
+                    return Ok(n);
+                }
+                Ok(n) => WorkerError::RangeLengthMismatch {
+                    expected: dst.len() as u64,
+                    actual: n as u64,
+                },
+                Err(error) => error,
+            };
             self.stats.record_worker_failure();
-            return Err(WorkerError::RangeLengthMismatch {
-                expected: dst.len() as u64,
-                actual: n as u64,
+            if !replica_retryable(&error) {
+                return Err(error.into());
             }
-            .into());
+            last = BlockReadError::AllReplicasFailed {
+                worker: target.into(),
+                source: error,
+            };
         }
-        self.stats.add_bytes_served(n as u64);
-        self.record_zone_read(worker.addr(), n as u64);
-        Ok(n)
+        Err(last)
     }
 
     /// Read one exact-version block slice while preserving the typed worker failure
@@ -331,13 +378,11 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
-        now_ms: u64,
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
         self.read_block_detailed_with_mode(
             block,
             offset_in_block,
             len,
-            now_ms,
             OriginReadMode::ExactVersion,
         )
         .await
@@ -348,43 +393,66 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
-        _now_ms: u64,
         mode: OriginReadMode,
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
         let snapshot = self.membership_snapshot().await?;
-        let worker = snapshot.owner(block)?;
         self.stats.record_cache_miss();
-        self.stats.record_worker_fetch();
         if snapshot.affinity_fallback {
             self.zone_observer.affinity_fallback();
         }
         let offset = block.offset + u64::from(offset_in_block);
-        let bytes = match mode {
-            OriginReadMode::Current => {
-                worker
-                    .fetch_range(&block.object, offset, u64::from(len))
-                    .await
-            }
-            OriginReadMode::ExactVersion => {
-                worker
-                    .fetch_versioned_range(&block.object, &block.version, offset, u64::from(len))
-                    .await
-            }
-        }
-        .inspect_err(|_| self.stats.record_worker_failure())
-        .map_err(DetailedBlockReadError::Worker)?;
-        if bytes.len() != len as usize {
-            self.stats.record_worker_failure();
-            return Err(DetailedBlockReadError::Worker(
-                WorkerError::RangeLengthMismatch {
+        let mut last = BlockReadError::NoOwners;
+        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
+            let worker = match candidate {
+                Ok(worker) => worker,
+                Err(error) => {
+                    last = BlockReadError::AllReplicasFailed {
+                        worker: target.into(),
+                        source: error,
+                    };
+                    continue;
+                }
+            };
+            self.stats.record_worker_fetch();
+            let result = match mode {
+                OriginReadMode::Current => {
+                    worker
+                        .fetch_range(&block.object, offset, u64::from(len))
+                        .await
+                }
+                OriginReadMode::ExactVersion => {
+                    worker
+                        .fetch_versioned_range(
+                            &block.object,
+                            &block.version,
+                            offset,
+                            u64::from(len),
+                        )
+                        .await
+                }
+            };
+            let error = match result {
+                Ok(bytes) if bytes.len() == len as usize => {
+                    self.stats.add_bytes_served(bytes.len() as u64);
+                    self.record_zone_read(worker.addr(), bytes.len() as u64);
+                    return Ok(bytes);
+                }
+                Ok(bytes) => WorkerError::RangeLengthMismatch {
                     expected: u64::from(len),
                     actual: bytes.len() as u64,
                 },
-            ));
+                Err(error) => error,
+            };
+            self.stats.record_worker_failure();
+            if !replica_retryable(&error) {
+                return Err(DetailedBlockReadError::Worker(error));
+            }
+            last = BlockReadError::AllReplicasFailed {
+                worker: target.into(),
+                source: error,
+            };
         }
-        self.stats.add_bytes_served(bytes.len() as u64);
-        self.record_zone_read(worker.addr(), bytes.len() as u64);
-        Ok(bytes)
+        Err(last.into())
     }
 
     /// Reconcile the cache against an observed placement version.
@@ -410,7 +478,6 @@ impl BlockReader {
         file: &FileView<'_>,
         offset: u64,
         len: u64,
-        now_ms: u64,
     ) -> Result<Vec<u8>, BlockReadError> {
         let plan = plan_read(
             file.object,
@@ -423,7 +490,7 @@ impl BlockReader {
         let mut out = Vec::with_capacity(plan.iter().map(|s| s.len as usize).sum());
         for seg in plan {
             let bytes = self
-                .read_block(&seg.block, seg.offset_in_block, seg.len, now_ms)
+                .read_block(&seg.block, seg.offset_in_block, seg.len)
                 .await?;
             if bytes.len() as u64 != u64::from(seg.len) {
                 return Err(WorkerError::RangeLengthMismatch {
@@ -447,7 +514,6 @@ impl BlockReader {
         file: &FileView<'_>,
         offset: u64,
         dst: &mut [u8],
-        now_ms: u64,
     ) -> Result<usize, BlockReadError> {
         let plan = plan_read(
             file.object,
@@ -462,12 +528,7 @@ impl BlockReader {
             let len = seg.len as usize;
             let end = written + len;
             let n = self
-                .read_block_into(
-                    &seg.block,
-                    seg.offset_in_block,
-                    &mut dst[written..end],
-                    now_ms,
-                )
+                .read_block_into(&seg.block, seg.offset_in_block, &mut dst[written..end])
                 .await?;
             if n != len {
                 return Err(WorkerError::RangeLengthMismatch {
@@ -493,7 +554,6 @@ impl BlockReader {
         object: &ObjectId,
         block_size: u32,
         version: &Version,
-        _now_ms: u64,
     ) -> Result<String, BlockReadError> {
         let block = BlockId::new(object.clone(), 0, block_size, version.clone());
         let snapshot = self.membership_snapshot().await?;
@@ -542,8 +602,25 @@ impl BlockReader {
 fn cache_block_error(error: BlockReadError) -> CacheReadError {
     match error {
         BlockReadError::Coordinator(error) => error.into(),
-        BlockReadError::Worker(error) => error.into(),
+        BlockReadError::Worker(error) | BlockReadError::AllReplicasFailed { source: error, .. } => {
+            error.into()
+        }
         other => CacheReadError::Unavailable(other.to_string()),
+    }
+}
+
+/// Candidate fallback cannot hide authoritative errors or evade tenant limits.
+fn replica_retryable(error: &WorkerError) -> bool {
+    match error {
+        WorkerError::Remote(error) => !matches!(
+            error.code,
+            talon_transport::DataErrorCode::InvalidRequest
+                | talon_transport::DataErrorCode::NotFound
+                | talon_transport::DataErrorCode::VersionMismatch
+                | talon_transport::DataErrorCode::Origin
+                | talon_transport::DataErrorCode::RateLimited
+        ),
+        _ => true,
     }
 }
 
@@ -777,7 +854,25 @@ mod tests {
                         s.read_exact(&mut body).await.unwrap();
                         let mut full = hdr.to_vec();
                         full.extend_from_slice(&body);
-                        let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                        let req: RangeRequest = match h.msg_type {
+                            MsgType::GetRange => decode_request(&full).unwrap().1,
+                            MsgType::GetVersionedRange => {
+                                let request =
+                                    talon_transport::decode_versioned_request(&full).unwrap().1;
+                                assert_eq!(request.version, block().version);
+                                request.request
+                            }
+                            MsgType::GetCachedRange => {
+                                let request = decode_cached_request(&full).unwrap().1;
+                                assert_eq!(request.version, block().version);
+                                RangeRequest {
+                                    object: request.object,
+                                    offset: request.offset,
+                                    len: request.len,
+                                }
+                            }
+                            other => panic!("unexpected read request: {other:?}"),
+                        };
                         hits.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                         // Encode the absolute offset into the bytes so tests can
                         // verify the worker got the right sub-range.
@@ -854,7 +949,25 @@ mod tests {
                     s.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_h, req): (_, RangeRequest) = decode_request(&full).unwrap();
+                    let req: RangeRequest = match h.msg_type {
+                        MsgType::GetRange => decode_request(&full).unwrap().1,
+                        MsgType::GetVersionedRange => {
+                            let request =
+                                talon_transport::decode_versioned_request(&full).unwrap().1;
+                            assert_eq!(request.version, block().version);
+                            request.request
+                        }
+                        MsgType::GetCachedRange => {
+                            let request = decode_cached_request(&full).unwrap().1;
+                            assert_eq!(request.version, block().version);
+                            RangeRequest {
+                                object: request.object,
+                                offset: request.offset,
+                                len: request.len,
+                            }
+                        }
+                        other => panic!("unexpected read request: {other:?}"),
+                    };
                     count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let short_len = req.len.saturating_sub(1) as usize;
                     let payload = vec![0u8; short_len];
@@ -956,6 +1069,7 @@ mod tests {
             let reader = BlockReader::new(
                 CoordinatorClient::new(coordinator),
                 Arc::new(PlacementCache::new(10_000)),
+                1,
             );
             let reader = if stats_first {
                 reader
@@ -967,7 +1081,7 @@ mod tests {
                     .with_stats(stats.clone())
             };
 
-            let bytes = reader.clone().read_block(&block(), 0, 64, 0).await.unwrap();
+            let bytes = reader.clone().read_block(&block(), 0, 64).await.unwrap();
             assert_eq!(bytes.len(), 64);
             assert_eq!(stats.snapshot().bytes_served, 64);
             assert_eq!(stats.snapshot().worker_fetches, 1);
@@ -987,11 +1101,11 @@ mod tests {
         let coord_addr = mock_coordinator(worker_addr).await;
 
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
 
         let blk = block();
         // First read: discover membership, rank the owner, and fetch.
-        let bytes = reader.read_block(&blk, 100, 64, 0).await.unwrap();
+        let bytes = reader.read_block(&blk, 100, 64).await.unwrap();
         assert_eq!(bytes.len(), 64);
         let abs = blk.offset + 100;
         assert_eq!(bytes[0], (abs % 256) as u8);
@@ -1000,7 +1114,7 @@ mod tests {
         let first = reader.membership.last_good().unwrap();
 
         // Second read: reuse logical membership and the instance connection.
-        let _ = reader.read_block(&blk, 0, 16, 1).await.unwrap();
+        let _ = reader.read_block(&blk, 0, 16).await.unwrap();
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
 
         assert!(Arc::ptr_eq(
@@ -1103,7 +1217,7 @@ mod tests {
 
         let observer = Arc::new(CountingZoneObserver::default());
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache)
+        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1)
             .with_zone_affinity(
                 Some("az-a".into()),
                 true,
@@ -1114,7 +1228,7 @@ mod tests {
         for i in 0..4u64 {
             let mut blk = block();
             blk.offset = i * u64::from(blk.block_size);
-            reader.read_block(&blk, 0, 16, 0).await.unwrap();
+            reader.read_block(&blk, 0, 16).await.unwrap();
         }
         use std::sync::atomic::Ordering;
         assert!(hits_a.load(Ordering::SeqCst) >= 4);
@@ -1136,14 +1250,14 @@ mod tests {
 
         let observer = Arc::new(CountingZoneObserver::default());
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache)
+        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1)
             .with_zone_affinity(
                 Some("az-c".into()),
                 true,
                 Arc::clone(&observer) as Arc<dyn crate::metrics::ZoneReadObserver>,
             );
 
-        reader.read_block(&block(), 0, 16, 0).await.unwrap();
+        reader.read_block(&block(), 0, 16).await.unwrap();
         use std::sync::atomic::Ordering;
         assert_eq!(
             hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
@@ -1172,8 +1286,8 @@ mod tests {
             s.flush().await.unwrap();
         });
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(addr), cache);
-        let err = reader.read_block(&block(), 0, 16, 0).await.unwrap_err();
+        let reader = BlockReader::new(CoordinatorClient::new(addr), cache, 1);
+        let err = reader.read_block(&block(), 0, 16).await.unwrap_err();
         assert!(matches!(err, BlockReadError::NoOwners));
     }
 
@@ -1207,12 +1321,12 @@ mod tests {
         });
 
         let cache = Arc::new(PlacementCache::new(500));
-        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache);
-        reader.read_block(&block(), 0, 16, 0).await.unwrap();
+        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1);
+        reader.read_block(&block(), 0, 16).await.unwrap();
         let mut next = block();
         next.offset += u64::from(next.block_size);
         tokio::time::sleep(std::time::Duration::from_millis(510)).await;
-        assert!(reader.read_block(&next, 0, 16, 1).await.is_err());
+        assert!(reader.read_block(&next, 0, 16).await.is_err());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1234,6 +1348,7 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new(coordinator),
             Arc::new(PlacementCache::new(10_000)),
+            1,
         );
 
         let reads = (0..BLOCKS).map(|index| {
@@ -1241,11 +1356,14 @@ mod tests {
             async move {
                 let mut requested = block();
                 requested.offset = u64::from(index) * u64::from(requested.block_size);
-                reader.read_block(&requested, 0, 16, 0).await
+                reader.read_block(&requested, 0, 16).await
             }
         });
         for result in futures::future::join_all(reads).await {
-            assert!(matches!(result, Err(BlockReadError::Worker(_))));
+            assert!(matches!(
+                result,
+                Err(BlockReadError::AllReplicasFailed { .. })
+            ));
         }
 
         assert_eq!(
@@ -1286,13 +1404,14 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new(coordinator),
             Arc::new(PlacementCache::new(100)),
+            1,
         );
         let first = block();
         let mut second = block();
         second.offset += u64::from(second.block_size);
 
         reader.membership_snapshot().await.unwrap();
-        assert!(reader.read_block(&first, 0, 16, 0).await.is_err());
+        assert!(reader.read_block(&first, 0, 16).await.is_err());
         tokio::time::sleep(std::time::Duration::from_millis(110)).await;
         let intermediate = reader.membership_snapshot().await;
         assert_eq!(intermediate.is_err(), fail_intermediate);
@@ -1300,7 +1419,7 @@ mod tests {
         // A later refresh can recover after either an error or an unchanged view.
         tokio::time::sleep(std::time::Duration::from_millis(110)).await;
         reader.membership_snapshot().await.unwrap();
-        let bytes = reader.read_block(&second, 0, 16, 0).await.unwrap();
+        let bytes = reader.read_block(&second, 0, 16).await.unwrap();
         assert_eq!(bytes.len(), 16);
         assert_eq!(membership_calls.load(Ordering::SeqCst), 3);
         assert_eq!(recovered_requests.load(Ordering::SeqCst), 1);
@@ -1324,14 +1443,21 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new(coordinator),
             Arc::new(PlacementCache::new(10_000)),
+            1,
         );
         assert!(matches!(
-            reader.read_block(&block(), 0, 16, 0).await,
-            Err(BlockReadError::Worker(WorkerError::Io(_)))
+            reader.read_block(&block(), 0, 16).await,
+            Err(BlockReadError::AllReplicasFailed {
+                source: WorkerError::Io(_),
+                ..
+            })
         ));
         assert!(matches!(
-            reader.read_block_into(&block(), 0, &mut [0; 16], 0).await,
-            Err(BlockReadError::Worker(WorkerError::Io(_)))
+            reader.read_block_into(&block(), 0, &mut [0; 16]).await,
+            Err(BlockReadError::AllReplicasFailed {
+                source: WorkerError::Io(_),
+                ..
+            })
         ));
         assert_eq!(
             hits.load(Ordering::SeqCst),
@@ -1339,6 +1465,71 @@ mod tests {
             "one attempt per caller read"
         );
         assert_eq!(reader.stats().snapshot().coordinator_refreshes, 0);
+    }
+
+    #[tokio::test]
+    async fn exhausted_reads_preserve_last_candidate_and_source() {
+        use std::error::Error as _;
+        for k in [1, 2, 3] {
+            for api in [
+                ReadApi::Allocated,
+                ReadApi::Into,
+                ReadApi::VersionedInto,
+                ReadApi::Detailed,
+            ] {
+                let first_hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let last_hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let primary = spawn_worker_error(
+                    first_hits.clone(),
+                    encode_typed_error(0, DataErrorCode::Unavailable, "primary failure"),
+                )
+                .await;
+                let secondary = spawn_worker_error(
+                    last_hits.clone(),
+                    encode_typed_error(0, DataErrorCode::Timeout, "last candidate failure"),
+                )
+                .await;
+                let coordinator = mock_coordinator_two(primary.clone(), secondary.clone()).await;
+                let reader = BlockReader::new(
+                    CoordinatorClient::new(coordinator),
+                    Arc::new(PlacementCache::new(500)),
+                    k,
+                );
+                let mut dst = [0; 32];
+                let error = match api {
+                    ReadApi::Allocated => reader.read_block(&block(), 7, 32).await.unwrap_err(),
+                    ReadApi::Into => reader
+                        .read_block_into(&block(), 7, &mut dst)
+                        .await
+                        .unwrap_err(),
+                    ReadApi::VersionedInto => reader
+                        .read_versioned_block_into(&block(), 7, &mut dst)
+                        .await
+                        .unwrap_err(),
+                    ReadApi::Detailed => match reader.read_block_detailed(&block(), 7, 32).await {
+                        Err(DetailedBlockReadError::Block(error)) => error,
+                        _ => panic!("exhausted detailed read must preserve the aggregate error"),
+                    },
+                    ReadApi::Cached => unreachable!(),
+                };
+                let (expected_worker, expected_code, expected_message) = if k == 1 {
+                    (&primary, DataErrorCode::Unavailable, "primary failure")
+                } else {
+                    (&secondary, DataErrorCode::Timeout, "last candidate failure")
+                };
+                assert!(matches!(&error, BlockReadError::AllReplicasFailed {
+                    worker, source: WorkerError::Remote(remote),
+                } if worker == expected_worker && remote.code == expected_code && remote.message == expected_message));
+                assert!(error
+                    .source()
+                    .unwrap()
+                    .downcast_ref::<WorkerError>()
+                    .is_some());
+                assert!(error.to_string().contains(expected_worker));
+                assert_eq!(first_hits.load(Ordering::SeqCst), 1);
+                assert_eq!(last_hits.load(Ordering::SeqCst), u32::from(k > 1));
+            }
+        }
     }
 
     #[tokio::test]
@@ -1357,14 +1548,15 @@ mod tests {
                 let reader = BlockReader::new(
                     CoordinatorClient::new(coord),
                     Arc::new(PlacementCache::new(10_000)),
+                    1,
                 );
                 let error = if into {
                     reader
-                        .read_block_into(&block(), 0, &mut [0; 16], 0)
+                        .read_block_into(&block(), 0, &mut [0; 16])
                         .await
                         .unwrap_err()
                 } else {
-                    reader.read_block(&block(), 0, 16, 0).await.unwrap_err()
+                    reader.read_block(&block(), 0, 16).await.unwrap_err()
                 };
                 let message = error.to_string();
                 assert!(
@@ -1373,17 +1565,24 @@ mod tests {
                 );
                 assert!(message.contains(&format!("{code:?}")), "{message}");
                 assert!(!message.contains("after refresh"), "{message}");
-                assert!(
-                    matches!(error, BlockReadError::Worker(WorkerError::Remote(ref remote))
-                    if remote.code == code)
-                );
+                if code == DataErrorCode::Timeout {
+                    assert!(matches!(error, BlockReadError::AllReplicasFailed {
+                        worker: ref last_worker,
+                        source: WorkerError::Remote(ref remote),
+                    } if last_worker == &worker && remote.code == code));
+                } else {
+                    assert!(
+                        matches!(error, BlockReadError::Worker(WorkerError::Remote(ref remote))
+                        if remote.code == code)
+                    );
+                }
                 assert_eq!(hits.load(Ordering::SeqCst), 1);
             }
         }
     }
 
     #[tokio::test]
-    async fn wrong_owner_does_not_fall_back_to_second_replica() {
+    async fn single_candidate_does_not_fall_back_to_second_replica() {
         // Primary w1 always errors "not present"; secondary w2 serves the bytes.
         // The reader must preserve the primary failure without contacting w2.
         let bad = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1392,10 +1591,10 @@ mod tests {
         let w2 = mock_worker(Arc::clone(&good)).await;
         let coord = mock_coordinator_two(w1, w2).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        // Another serving member cannot replace the selected logical owner.
-        let reader = BlockReader::new(CoordinatorClient::new(coord), Arc::clone(&cache));
+        // k=1 must not reach a candidate outside the configured list.
+        let reader = BlockReader::new(CoordinatorClient::new(coord), Arc::clone(&cache), 1);
 
-        assert!(reader.read_block(&block(), 0, 32, 0).await.is_err());
+        assert!(reader.read_block(&block(), 0, 32).await.is_err());
         assert_eq!(
             bad.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1411,16 +1610,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn short_reply_does_not_fall_back_to_next_replica() {
+    async fn single_candidate_returns_short_reply_error() {
         let short = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let good = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let w1 = spawn_short_reply_worker(Arc::clone(&short)).await;
         let w2 = mock_worker(Arc::clone(&good)).await;
         let coord = mock_coordinator_two(w1, w2).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord), Arc::clone(&cache));
+        let reader = BlockReader::new(CoordinatorClient::new(coord), Arc::clone(&cache), 1);
 
-        assert!(reader.read_block(&block(), 0, 32, 0).await.is_err());
+        assert!(reader.read_block(&block(), 0, 32).await.is_err());
         assert_eq!(
             short.load(std::sync::atomic::Ordering::SeqCst),
             1,
@@ -1439,15 +1638,275 @@ mod tests {
         assert_eq!(stats.bytes_served, 0);
     }
 
+    #[derive(Clone, Copy, Debug)]
+    enum ReadApi {
+        Allocated,
+        Into,
+        VersionedInto,
+        Detailed,
+        Cached,
+    }
+
+    const READ_APIS: [ReadApi; 5] = [
+        ReadApi::Allocated,
+        ReadApi::Into,
+        ReadApi::VersionedInto,
+        ReadApi::Detailed,
+        ReadApi::Cached,
+    ];
+
+    async fn read_via(reader: &BlockReader, api: ReadApi) -> Result<Vec<u8>, CacheReadError> {
+        match api {
+            ReadApi::Allocated => reader
+                .read_block(&block(), 7, 32)
+                .await
+                .map_err(cache_block_error),
+            ReadApi::Into | ReadApi::VersionedInto => {
+                let mut dst = vec![42; 32];
+                let n = if matches!(api, ReadApi::VersionedInto) {
+                    reader
+                        .read_versioned_block_into(&block(), 7, &mut dst)
+                        .await
+                } else {
+                    reader.read_block_into(&block(), 7, &mut dst).await
+                }
+                .map_err(cache_block_error)?;
+                assert_eq!(n, dst.len());
+                Ok(dst)
+            }
+            ReadApi::Detailed => reader
+                .read_block_detailed(&block(), 7, 32)
+                .await
+                .map_err(Into::into),
+            ReadApi::Cached => reader.read_cached_block(&block(), 7, 32).await,
+        }
+    }
+
+    #[tokio::test]
+    async fn ranked_replica_fallback_preserves_range_and_bounds_attempts() {
+        for api in READ_APIS {
+            for response in [
+                Vec::new(), // EOF after the request, with no complete response.
+                encode_typed_error(0, DataErrorCode::Unavailable, "restarting"),
+                encode_typed_error(0, DataErrorCode::CacheMiss, "not resident"),
+                response_header_ok(0, 0).to_vec(), // Incomplete range.
+            ] {
+                for k in [0, 1, 2, 3] {
+                    let bad = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let good = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let primary = spawn_worker_error(bad.clone(), response.clone()).await;
+                    let secondary = mock_worker(good.clone()).await;
+                    let coordinator = mock_coordinator_two(primary, secondary).await;
+                    let reader = BlockReader::new(
+                        CoordinatorClient::new(coordinator),
+                        Arc::new(PlacementCache::new(500)),
+                        k,
+                    );
+                    let result = read_via(&reader, api).await;
+                    if k >= 2 {
+                        assert_eq!(result.unwrap(), (7..39).collect::<Vec<u8>>(), "{api:?}");
+                    } else {
+                        assert!(result.is_err(), "{api:?}, k={k}");
+                    }
+                    assert_eq!(bad.load(Ordering::SeqCst), 1, "one primary attempt");
+                    assert_eq!(good.load(Ordering::SeqCst), u32::from(k >= 2));
+                    assert_eq!(reader.stats().snapshot().coordinator_refreshes, 0);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn replica_fallback_preserves_terminal_errors_and_last_failure() {
+        for api in READ_APIS {
+            for code in [
+                DataErrorCode::InvalidRequest,
+                DataErrorCode::NotFound,
+                DataErrorCode::VersionMismatch,
+                DataErrorCode::Origin,
+                DataErrorCode::RateLimited,
+                DataErrorCode::Unavailable,
+            ] {
+                let first = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let second = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let primary = spawn_worker_error(
+                    first.clone(),
+                    encode_typed_error(0, code, "primary failure"),
+                )
+                .await;
+                let secondary = spawn_worker_error(
+                    second.clone(),
+                    encode_typed_error(0, DataErrorCode::Timeout, "secondary failure"),
+                )
+                .await;
+                let coordinator = mock_coordinator_two(primary, secondary).await;
+                let reader = BlockReader::new(
+                    CoordinatorClient::new(coordinator),
+                    Arc::new(PlacementCache::new(500)),
+                    3,
+                );
+                let error = read_via(&reader, api).await.unwrap_err();
+                let fallback = code == DataErrorCode::Unavailable;
+                match code {
+                    DataErrorCode::InvalidRequest => {
+                        assert!(matches!(error, CacheReadError::InvalidRequest(_)))
+                    }
+                    DataErrorCode::NotFound => {
+                        assert!(matches!(error, CacheReadError::NotFound(_)))
+                    }
+                    DataErrorCode::VersionMismatch => {
+                        assert!(matches!(error, CacheReadError::VersionMismatch(_)))
+                    }
+                    DataErrorCode::Origin => assert!(matches!(error, CacheReadError::Origin(_))),
+                    DataErrorCode::RateLimited => {
+                        assert!(matches!(error, CacheReadError::RateLimited(_)))
+                    }
+                    DataErrorCode::Unavailable => {
+                        assert!(matches!(error, CacheReadError::Timeout(_)))
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(error.to_string().contains(if fallback {
+                    "secondary failure"
+                } else {
+                    "primary failure"
+                }));
+                assert_eq!(first.load(Ordering::SeqCst), 1);
+                assert_eq!(second.load(Ordering::SeqCst), u32::from(fallback));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn offline_and_conflicted_candidates_keep_rank_but_allow_replica_reads() {
+        use talon_core::worker_membership::InstanceState;
+        for api in READ_APIS {
+            for state in [InstanceState::Offline, InstanceState::Conflict] {
+                let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                let secondary = mock_worker(hits.clone()).await;
+                let coordinator = mock_coordinator_two("127.0.0.1:1".into(), secondary).await;
+                let reader = BlockReader::new(
+                    CoordinatorClient::new(coordinator),
+                    Arc::new(PlacementCache::new(500)),
+                    2,
+                );
+                let before = reader.membership_snapshot().await.unwrap();
+                let primary_id = before.placement.primary(&block()).unwrap().id.0.clone();
+                let mut view = reader.coordinator.discovery().await.unwrap();
+                view.workers
+                    .iter_mut()
+                    .find(|w| w.member.worker_id == primary_id)
+                    .unwrap()
+                    .state = state;
+                let after =
+                    reader
+                        .membership
+                        .replace(view, std::time::Instant::now(), &reader.worker_pool);
+                assert!(Arc::ptr_eq(&before.placement, &after.placement));
+                assert_eq!(after.placement.primary(&block()).unwrap().id.0, primary_id);
+                assert_eq!(
+                    read_via(&reader, api).await.unwrap(),
+                    (7..39).collect::<Vec<u8>>()
+                );
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+                // Admission still targets only the primary; it must not silently move data.
+                assert!(reader
+                    .admit_block(&block(), block().offset + 32, &[0; 32])
+                    .await
+                    .is_err());
+                assert_eq!(hits.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn discovery_expiring_during_reused_read_prevents_redial() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for n in 0..2 {
+                let mut header = [0; HEADER_LEN];
+                socket.read_exact(&mut header).await.unwrap();
+                let header = FrameHeader::decode(&header).unwrap();
+                let mut body = vec![0; header.length as usize];
+                socket.read_exact(&mut body).await.unwrap();
+                if n == 0 {
+                    let mut response = response_header_ok(header.request_id, 8).to_vec();
+                    response.extend_from_slice(&[7; 8]);
+                    socket.write_all(&response).await.unwrap();
+                } else {
+                    tokio::time::sleep(std::time::Duration::from_millis(510)).await;
+                }
+            }
+            drop(socket);
+            // Keep listening so a forbidden retry would connect and send bytes.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
+                    .await
+                    .is_err()
+            );
+        });
+        let coordinator = mock_coordinator(address).await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(500)),
+            1,
+        );
+        assert_eq!(reader.read_block(&block(), 0, 8).await.unwrap(), vec![7; 8]);
+        let error = reader.read_block(&block(), 0, 8).await.unwrap_err();
+        assert!(matches!(error, BlockReadError::AllReplicasFailed {
+            source: WorkerError::Remote(ref remote), ..
+        } if remote.code == DataErrorCode::Unavailable && remote.message.contains("expired before read retry")));
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_expiring_during_primary_read_prevents_replica_attempt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let header = FrameHeader::decode(&header).unwrap();
+            let mut body = vec![0; header.length as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(510)).await;
+            socket
+                .write_all(&encode_typed_error(
+                    0,
+                    DataErrorCode::Unavailable,
+                    "draining",
+                ))
+                .await
+                .unwrap();
+        });
+        let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let secondary = mock_worker(hits.clone()).await;
+        let coordinator = mock_coordinator_two(primary, secondary).await;
+        let reader = BlockReader::new(
+            CoordinatorClient::new(coordinator),
+            Arc::new(PlacementCache::new(500)),
+            2,
+        );
+        let error = read_via(&reader, ReadApi::Into).await.unwrap_err();
+        assert!(matches!(error, CacheReadError::Unavailable(_)));
+        assert!(error.to_string().contains("expired instance discovery"));
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+        assert_eq!(reader.stats().snapshot().worker_fetches, 1);
+        server.await.unwrap();
+    }
+
     #[tokio::test]
     async fn observe_epoch_invalidates_stale_entry() {
         let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
         let coord_addr = mock_coordinator(worker_addr).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
 
-        reader.read_block(&block(), 0, 8, 0).await.unwrap();
+        reader.read_block(&block(), 0, 8).await.unwrap();
         let epoch = reader.membership.last_good().unwrap().epoch;
         // The public epoch hook still invalidates externally supplied entries.
         cache.insert(
@@ -1473,7 +1932,7 @@ mod tests {
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
         let coord_addr = mock_coordinator(worker_addr).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
 
         let obj = ObjectId::new(Backend::S3, "b", "o/1");
         let ver = Version::new("v1");
@@ -1488,7 +1947,7 @@ mod tests {
             version: &ver,
             size,
         };
-        let bytes = reader.read(&file, offset, len, 0).await.unwrap();
+        let bytes = reader.read(&file, offset, len).await.unwrap();
         assert_eq!(bytes.len() as u64, len);
         // The mock worker fills each byte with (absolute_offset % 256); the
         // stitched buffer must be contiguous across block boundaries.
@@ -1506,7 +1965,7 @@ mod tests {
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
         let coord_addr = mock_coordinator(worker_addr).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache));
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), Arc::clone(&cache), 1);
 
         let object = ObjectId::new(Backend::S3, "b", "o/1");
         let version = Version::new("v1");
@@ -1519,7 +1978,7 @@ mod tests {
             size: 100_000,
         };
 
-        let n = reader.read_into(&file, offset, &mut dst, 0).await.unwrap();
+        let n = reader.read_into(&file, offset, &mut dst).await.unwrap();
         assert_eq!(n, dst.len());
         for (index, byte) in dst.iter().enumerate() {
             assert_eq!(*byte, ((offset + index as u64) % 256) as u8);
@@ -1534,7 +1993,7 @@ mod tests {
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
         let coord_addr = mock_coordinator(worker_addr).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache);
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
 
         let obj = ObjectId::new(Backend::S3, "b", "o/1");
         let ver = Version::new("v1");
@@ -1544,7 +2003,7 @@ mod tests {
             version: &ver,
             size: 1500,
         };
-        let bytes = reader.read(&file, 5000, 10, 0).await.unwrap();
+        let bytes = reader.read(&file, 5000, 10).await.unwrap();
         assert!(bytes.is_empty());
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
@@ -1555,7 +2014,7 @@ mod tests {
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
         let coord_addr = mock_coordinator(worker_addr).await;
         let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache);
+        let reader = BlockReader::new(CoordinatorClient::new(coord_addr), cache, 1);
         let object = ObjectId::new(Backend::S3, "b", "o/1");
         let version = Version::new("v1");
         let file = FileView {
@@ -1566,7 +2025,7 @@ mod tests {
         };
         let mut dst = vec![7u8; 10];
 
-        let n = reader.read_into(&file, 5000, &mut dst, 0).await.unwrap();
+        let n = reader.read_into(&file, 5000, &mut dst).await.unwrap();
         assert_eq!(n, 0);
         assert_eq!(dst, vec![7u8; 10]);
         assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -1602,12 +2061,10 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new(coordinator),
             Arc::new(PlacementCache::new(10_000)),
+            1,
         );
 
-        let error = reader
-            .read_cached_block(&block(), 7, 11, 0)
-            .await
-            .unwrap_err();
+        let error = reader.read_cached_block(&block(), 7, 11).await.unwrap_err();
         assert!(matches!(error, CacheReadError::CacheMiss(_)));
     }
 
@@ -1642,19 +2099,21 @@ mod tests {
         let reader = BlockReader::new(
             CoordinatorClient::new(coordinator),
             Arc::new(PlacementCache::new(10_000)),
+            1,
         );
 
         reader
-            .admit_block(&expected, expected.offset + 5, b"tail!", 0)
+            .admit_block(&expected, expected.offset + 5, b"tail!")
             .await
             .unwrap();
     }
     #[tokio::test]
-    async fn offline_owner_never_tries_another_replica() {
+    async fn all_offline_candidates_return_unavailable() {
         use talon_core::worker_membership::*;
         let reader = BlockReader::new(
             CoordinatorClient::new("127.0.0.1:1"),
             Arc::new(PlacementCache::new(30_000)),
+            2,
         );
         let view = WorkerDiscovery {
             topology_token: 9,
@@ -1679,25 +2138,34 @@ mod tests {
                 },
             ],
         };
-        reader
-            .membership
-            .replace(view, std::time::Instant::now(), &reader.worker_pool);
-        let error = reader.read_block(&block(), 0, 4, 0).await.unwrap_err();
+        let snapshot =
+            reader
+                .membership
+                .replace(view, std::time::Instant::now(), &reader.worker_pool);
+        let last_id = snapshot
+            .placement
+            .rank(&block(), 2)
+            .last()
+            .unwrap()
+            .id
+            .0
+            .clone();
+        let error = reader.read_block(&block(), 0, 4).await.unwrap_err();
         assert!(matches!(
             error,
-            BlockReadError::Worker(WorkerError::Remote(talon_transport::DataPlaneError {
-                code: DataErrorCode::Unavailable,
-                ..
-            }))
+            BlockReadError::AllReplicasFailed {
+                source: WorkerError::Remote(talon_transport::DataPlaneError {
+                    code: DataErrorCode::Unavailable,
+                    ..
+                }),
+                worker,
+            } if worker == last_id
         ));
         let mut dst = [42; 4];
-        assert!(reader
-            .read_block_into(&block(), 0, &mut dst, 0)
-            .await
-            .is_err());
+        assert!(reader.read_block_into(&block(), 0, &mut dst).await.is_err());
         assert_eq!(dst, [42; 4]);
         assert!(matches!(
-            reader.read_cached_block(&block(), 0, 4, 0).await,
+            reader.read_cached_block(&block(), 0, 4).await,
             Err(CacheReadError::Unavailable(_))
         ));
     }

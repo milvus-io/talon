@@ -159,7 +159,7 @@ async fn mount_read_is_byte_exact_through_the_kernel() {
     fs.insert_object("s3/bucket/obj.bin", file_size);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -376,7 +376,7 @@ async fn mount_write_through_is_visible_in_backend() {
     fs.insert_object("s3/bucket/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -480,7 +480,7 @@ async fn mount_large_sparse_write_streams_without_whole_object_memory() {
     let fs = Arc::new(ReadOnlyFs::new().with_max_object_bytes(1024));
     fs.insert_object("s3/bucket/placeholder", 0);
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -560,7 +560,7 @@ async fn mount_open_flags_preserve_and_replace_blob_contents() {
     fs.insert_object("s3/bucket/existing.bin", 6);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -667,7 +667,7 @@ async fn mount_directory_markers_are_written_through() {
     fs.insert_object("s3/bucket/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -775,7 +775,7 @@ async fn mount_truncate_and_ftruncate_are_written_through() {
     fs.insert_object("s3/bucket/data.bin", 6);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -871,7 +871,7 @@ async fn mount_regular_file_rename_is_written_through() {
     fs.insert_object("s3/bucket/target.bin", 3);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -975,7 +975,7 @@ async fn mount_directory_tree_rename_is_written_through() {
     ]);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1079,7 +1079,7 @@ async fn mount_unlink_preserves_open_descriptors_without_recreating_the_name() {
     fs.insert_object("s3/bucket/live.bin", 5);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1193,7 +1193,7 @@ async fn mount_symbolic_links_are_written_through() {
     fs.insert_object("s3/bucket/target.bin", 7);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1314,7 +1314,7 @@ async fn mount_hard_links_to_objects_are_refused() {
     fs.insert_object("gcs/other/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1477,7 +1477,7 @@ async fn mount_timestamp_updates_follow_utimens_semantics() {
     fs.insert_object("s3/bucket/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1592,7 +1592,7 @@ async fn mount_special_nodes_are_namespace_only() {
     fs.insert_object("s3/bucket/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1722,7 +1722,7 @@ async fn mount_device_nodes_preserve_rdev() {
     let fs = Arc::new(ReadOnlyFs::new());
     fs.insert_object("s3/bucket/placeholder", 0);
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1806,7 +1806,7 @@ async fn mount_metadata_enforces_multiuser_permissions() {
     fs.insert_object("s3/bucket/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -1934,7 +1934,7 @@ async fn mount_pjdfstest_compatibility_suite() {
     fs.insert_object("s3/bucket/placeholder", 0);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,
@@ -2030,7 +2030,7 @@ async fn mount_kernel_io_benchmark() {
     fs.insert_object("s3/bucket/bench-read.bin", read_size);
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    let reader = BlockReader::new(CoordinatorClient::new(coord), cache);
+    let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 1);
     let adapter = TalonFuse::new(
         Arc::clone(&fs),
         reader,

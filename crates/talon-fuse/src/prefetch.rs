@@ -90,21 +90,21 @@ impl Prefetcher {
     /// Returns the block indices for which a prefetch task was actually spawned
     /// (after EOF and in-flight-cap filtering), primarily for tests/metrics.
     /// Never blocks on the prefetch itself.
-    pub fn on_read(&mut self, block_index: u64, now_ms: u64) -> Vec<u64> {
+    pub fn on_read(&mut self, block_index: u64) -> Vec<u64> {
         let planned = self.state.on_read(block_index);
-        self.spawn_planned(planned, now_ms)
+        self.spawn_planned(planned)
     }
 
     /// Record a successful foreground byte-range read and fire off prefetches.
     ///
     /// `read_len` must be the number of bytes actually returned. Empty reads are
     /// no-ops. Returns the block indices for which a task was actually spawned.
-    pub fn on_read_range(&mut self, offset: u64, read_len: u64, now_ms: u64) -> Vec<u64> {
+    pub fn on_read_range(&mut self, offset: u64, read_len: u64) -> Vec<u64> {
         let planned = self.state.on_read_range(offset, read_len, self.block_size);
-        self.spawn_planned(planned, now_ms)
+        self.spawn_planned(planned)
     }
 
-    fn spawn_planned(&self, planned: Vec<u64>, now_ms: u64) -> Vec<u64> {
+    fn spawn_planned(&self, planned: Vec<u64>) -> Vec<u64> {
         let mut spawned = Vec::new();
         let bs = u64::from(self.block_size);
         if bs == 0 {
@@ -134,7 +134,7 @@ impl Prefetcher {
                 // Hold the permit for the duration; a one-byte probe is enough
                 // to drive the worker's load/commit of the block.
                 let _permit = permit;
-                let _ = reader.read_block(&target.block, 0, 1, now_ms).await;
+                let _ = reader.read_block(&target.block, 0, 1).await;
             });
         }
         spawned
@@ -244,6 +244,7 @@ mod tests {
         BlockReader::new(
             CoordinatorClient::new(coord_addr),
             Arc::new(PlacementCache::new(10_000)),
+            1,
         )
     }
 
@@ -269,9 +270,9 @@ mod tests {
         let coord = mock_coordinator(worker).await;
         let mut pf = prefetcher(reader(coord));
         // Jumps, not consecutive → no run, no prefetch.
-        assert!(pf.on_read(0, 0).is_empty());
-        assert!(pf.on_read(5, 0).is_empty());
-        assert!(pf.on_read(2, 0).is_empty());
+        assert!(pf.on_read(0).is_empty());
+        assert!(pf.on_read(5).is_empty());
+        assert!(pf.on_read(2).is_empty());
         assert!(!pf.is_sequential());
         // Give any (erroneously) spawned tasks a chance to run.
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -285,8 +286,8 @@ mod tests {
         let coord = mock_coordinator(worker).await;
         let mut pf = prefetcher(reader(coord));
 
-        assert!(pf.on_read(0, 0).is_empty()); // no run yet
-        let spawned = pf.on_read(1, 0); // run hits trigger → prefetch window
+        assert!(pf.on_read(0).is_empty()); // no run yet
+        let spawned = pf.on_read(1); // run hits trigger → prefetch window
         assert!(pf.is_sequential());
         assert!(!spawned.is_empty(), "sequential read should prefetch");
         // Blocks ahead of the cursor (2,3,4) are what get prefetched.
@@ -304,8 +305,8 @@ mod tests {
         let coord = mock_coordinator(worker).await;
         let mut pf = prefetcher(reader(coord));
 
-        assert!(pf.on_read_range(0, 128, 0).is_empty());
-        let spawned = pf.on_read_range(128, 128, 0);
+        assert!(pf.on_read_range(0, 128).is_empty());
+        let spawned = pf.on_read_range(128, 128);
         assert_eq!(spawned, vec![1, 2, 3]);
         assert!(pf.is_sequential());
 
@@ -320,9 +321,9 @@ mod tests {
         let coord = mock_coordinator(worker).await;
         let mut pf = prefetcher(reader(coord));
 
-        assert!(pf.on_read_range(0, 128, 0).is_empty());
-        assert!(pf.on_read_range(128, 0, 0).is_empty());
-        assert_eq!(pf.on_read_range(128, 128, 0), vec![1, 2, 3]);
+        assert!(pf.on_read_range(0, 128).is_empty());
+        assert!(pf.on_read_range(128, 0).is_empty());
+        assert_eq!(pf.on_read_range(128, 128), vec![1, 2, 3]);
     }
 
     #[tokio::test]
@@ -343,8 +344,8 @@ mod tests {
             Version::new("v1"),
             2000,
         );
-        assert!(pf.on_read(0, 0).is_empty());
-        let spawned = pf.on_read(1, 0);
+        assert!(pf.on_read(0).is_empty());
+        let spawned = pf.on_read(1);
         // Only block index 1 (offset 1024) is < EOF; 2.. are past it. Planner
         // proposes 2,3,4,5,6 but all start >= 2048 >= 2000 → none spawned.
         assert!(
@@ -370,6 +371,6 @@ mod tests {
             u64::MAX,
         );
 
-        assert!(pf.on_read(u64::MAX / 1024, 0).is_empty());
+        assert!(pf.on_read(u64::MAX / 1024).is_empty());
     }
 }

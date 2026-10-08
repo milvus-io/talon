@@ -124,8 +124,7 @@ impl MembershipCache {
                     Some((id, client)) if id == instance_id && client.addr() == address => {
                         client.clone()
                     }
-                    _ => crate::WorkerClient::with_pool(address.clone(), Arc::new(pool.isolated()))
-                        .without_read_retry(),
+                    _ => crate::WorkerClient::with_pool(address.clone(), Arc::new(pool.isolated())),
                 };
                 instances.insert(
                     worker.member.worker_id.clone(),
@@ -153,6 +152,25 @@ impl MembershipCache {
 }
 
 impl MembershipSnapshot {
+    /// Rank logical candidates before resolving availability. Each resolution
+    /// checks expiry when the candidate is attempted, including after an await.
+    pub(crate) fn candidates(
+        &self,
+        block: &talon_core::BlockId,
+        replicas_k: u8,
+    ) -> impl Iterator<Item = (&str, Result<crate::WorkerClient, crate::WorkerError>)> + '_ {
+        self.placement
+            .rank(block, usize::from(replicas_k.max(1)))
+            .into_iter()
+            .map(|owner| {
+                let target = self
+                    .instances
+                    .get(&owner.id.0)
+                    .map_or(owner.id.0.as_str(), |(_, client)| client.addr());
+                (target, self.instance(&owner.id.0))
+            })
+    }
+
     pub fn owner(
         &self,
         block: &talon_core::BlockId,
@@ -161,27 +179,26 @@ impl MembershipSnapshot {
             .placement
             .primary(block)
             .ok_or(crate::BlockReadError::NoOwners)?;
+        self.instance(&owner.id.0).map_err(Into::into)
+    }
+
+    fn instance(&self, worker_id: &str) -> Result<crate::WorkerClient, crate::WorkerError> {
         if std::time::Instant::now() >= self.valid_until {
-            return Err(crate::BlockReadError::Worker(crate::WorkerError::Remote(
+            return Err(crate::WorkerError::Remote(
                 talon_transport::DataPlaneError {
                     code: talon_transport::DataErrorCode::Unavailable,
-                    message: format!("worker {} has expired instance discovery", owner.id),
+                    message: format!("worker {worker_id} has expired instance discovery"),
                 },
-            )));
+            ));
         }
         self.instances
-            .get(&owner.id.0)
-            .map(|(_, client)| client.clone())
+            .get(worker_id)
+            .map(|(_, client)| client.clone().with_read_retry_deadline(self.valid_until))
             .ok_or_else(|| {
-                crate::BlockReadError::Worker(crate::WorkerError::Remote(
-                    talon_transport::DataPlaneError {
-                        code: talon_transport::DataErrorCode::Unavailable,
-                        message: format!(
-                            "worker {} is offline or has conflicting instances",
-                            owner.id
-                        ),
-                    },
-                ))
+                crate::WorkerError::Remote(talon_transport::DataPlaneError {
+                    code: talon_transport::DataErrorCode::Unavailable,
+                    message: format!("worker {worker_id} is offline or has conflicting instances"),
+                })
             })
     }
 }
