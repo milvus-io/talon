@@ -785,6 +785,10 @@ fn sanitize_transport_error(error: &etcd_client::Error) -> String {
     }
 }
 
+fn hex_component(value: &str) -> String {
+    value.bytes().map(|b| format!("{b:02x}")).collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -890,8 +894,4 @@ mod tests {
         assert!(rendered.contains("<redacted>"));
         assert!(!rendered.contains("client.key"));
     }
-}
-
-fn hex_component(value: &str) -> String {
-    value.bytes().map(|b| format!("{b:02x}")).collect()
 }

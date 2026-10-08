@@ -23,6 +23,7 @@ pub(crate) fn encode(value: &MemberRegistry, backend: StateBackend) -> StateStor
     }
     Ok(bytes)
 }
+#[cfg(any(feature = "etcd", feature = "kubernetes"))]
 pub(crate) fn decode(bytes: &[u8], backend: StateBackend) -> StateStoreResult<MemberRegistry> {
     if bytes.len() > MAX_REGISTRY_BYTES {
         return Err(invalid(backend, "member registry exceeds size limit"));
