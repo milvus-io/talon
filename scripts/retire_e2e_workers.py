@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Retire pod-name identities deliberately replaced by an ephemeral E2E stack.
 
-Read the pre-replacement worker pod names from stdin. This is test orchestration,
-not a production policy: missing/offline workers must not be retired implicitly.
+Use --snapshot before replacement to capture every worker pod, including unready
+pods. Read those names from stdin after replacement to retire them explicitly.
+This is test orchestration, not a production policy: missing/offline workers must
+not be retired implicitly.
 """
 
 import argparse
@@ -19,12 +21,22 @@ def kubectl(namespace, *args, body=None):
     ).stdout
 
 
-def retire_once(namespace, release, replaced):
-    pods = json.loads(kubectl(
+def worker_pods(namespace, release):
+    return json.loads(kubectl(
         namespace, "get", "pods", "-l",
         f"app.kubernetes.io/instance={release},app.kubernetes.io/component=worker",
         "-o", "json",
     ))["items"]
+
+
+def snapshot_workers(namespace, release):
+    # Readiness can change after Helm's wait. Every replaced pod may already
+    # have registered a persistent identity, regardless of its current readiness.
+    return {pod["metadata"]["name"] for pod in worker_pods(namespace, release)}
+
+
+def retire_once(namespace, release, replaced):
+    pods = worker_pods(namespace, release)
     # Include unready and terminating pods: loss of readiness is not retirement.
     present = {pod["metadata"]["name"] for pod in pods}
     if replaced & present:
@@ -77,7 +89,13 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--namespace", required=True)
     parser.add_argument("--release", required=True)
+    parser.add_argument("--snapshot", action="store_true",
+                        help="print all current worker pod names before replacement")
     args = parser.parse_args()
+    if args.snapshot:
+        for name in sorted(snapshot_workers(args.namespace, args.release)):
+            print(name)
+        return
     replaced = set(sys.stdin.read().split())
     if not replaced:
         return
