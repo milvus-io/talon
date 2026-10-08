@@ -1,5 +1,11 @@
 # ADR 0006: Zone-Aware Cache Reads
 
+> Protocol update: schema 6 consolidates membership into `MembershipQuery` /
+> `MembershipList { view: WorkerDiscovery }`, with zones on persistent members.
+> The schema-v5 negotiation described below is historical and has been removed;
+> current clients do not probe or fall back to earlier membership protocols.
+
+
 - Status: Accepted
 - Date: 2026-08-11
 - Tracking issue: #531

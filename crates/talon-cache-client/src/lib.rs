@@ -28,3 +28,7 @@ pub use pool::{ConnectionPool, DEFAULT_CONNECT_TIMEOUT, DEFAULT_REQUEST_TIMEOUT}
 pub use range_stream::{CacheReadError, RangeChunkStream, DEFAULT_TRANSFER_CHUNK_BYTES};
 pub use read_plan::{iter_read, plan_read, BlockSegment, ReadPlan};
 pub use worker_client::{WorkerClient, WorkerError, WriteClient};
+
+#[cfg(test)]
+#[path = "../../talon-transport/tests/support/membership.rs"]
+mod membership_fixture;

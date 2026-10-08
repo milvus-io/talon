@@ -1,5 +1,8 @@
 //! Demand-driven, bounded-memory range streaming.
 
+#[cfg(test)]
+use crate::membership_fixture;
+
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -252,24 +255,15 @@ mod tests {
                         let mut frame = header.encode().to_vec();
                         frame.extend_from_slice(&body);
                         let reply = match talon_transport::decode(&frame).unwrap().1 {
-                            ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                                nodes: vec![NodeInfo {
-                                    id: NodeId("w1".into()),
-                                    address: worker_addr.clone(),
-                                    role: NodeRole::Worker,
-                                }],
-                            },
-                            ControlMessage::MembershipQueryV2 {} => {
-                                ControlMessage::MembershipListV2 {
-                                    nodes: vec![talon_transport::ZonedNodeInfo {
-                                        info: NodeInfo {
-                                            id: NodeId("w1".into()),
-                                            address: worker_addr.clone(),
-                                            role: NodeRole::Worker,
-                                        },
-                                        zone: None,
-                                    }],
-                                }
+                            ControlMessage::MembershipQuery {} => {
+                                membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
+                                    info: NodeInfo {
+                                        id: NodeId("w1".into()),
+                                        address: worker_addr.clone(),
+                                        role: NodeRole::Worker,
+                                    },
+                                    zone: None,
+                                }])
                             }
                             other => panic!("unexpected control request: {other:?}"),
                         };

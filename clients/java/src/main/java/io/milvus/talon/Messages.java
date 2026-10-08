@@ -15,33 +15,20 @@ import java.util.List;
  */
 final class Messages {
 
-    /**
-     * Newest control schema this client understands.
-     *
-     * <p>Deliberately behind the Rust {@code CONTROL_SCHEMA_VERSION}, which is
-     * at 3. Schema 3 adds the ADR 0003 §5 mapping-fence messages, which this
-     * client does not implement, so claiming 3 would mean accepting an envelope
-     * it cannot decode.
-     *
-     * <p>This does not break interoperation: the server encodes each message at
-     * its own minimum schema rather than the global maximum, so placement,
-     * membership and object messages still arrive tagged 1 or 2. Raise this only
-     * when the fence messages are implemented here.
-     */
-    static final int CONTROL_SCHEMA_VERSION = 2;
-    /** Oldest schema the protocol defines. */
-    static final int MIN_CONTROL_SCHEMA_VERSION = 1;
+    /** The single control schema supported before the first deployment. */
+    static final int CONTROL_SCHEMA_VERSION = 6;
+    static final int MIN_CONTROL_SCHEMA_VERSION = CONTROL_SCHEMA_VERSION;
 
     // Variant tags, in Rust declaration order.
-    static final int TAG_PLACEMENT_LOOKUP = 2;
-    static final int TAG_PLACEMENT_RESPONSE = 3;
-    static final int TAG_MEMBERSHIP_QUERY = 6;
-    static final int TAG_MEMBERSHIP_LIST = 7;
-    static final int TAG_ACK = 8;
-    static final int TAG_STAT_OBJECT = 10;
-    static final int TAG_OBJECT_STAT = 11;
-    static final int TAG_LIST_OBJECTS = 12;
-    static final int TAG_OBJECT_LIST = 13;
+    static final int TAG_PLACEMENT_LOOKUP = 0;
+    static final int TAG_PLACEMENT_RESPONSE = 1;
+    static final int TAG_MEMBERSHIP_QUERY = 4;
+    static final int TAG_MEMBERSHIP_LIST = 5;
+    static final int TAG_ACK = 6;
+    static final int TAG_STAT_OBJECT = 8;
+    static final int TAG_OBJECT_STAT = 9;
+    static final int TAG_LIST_OBJECTS = 10;
+    static final int TAG_OBJECT_LIST = 11;
 
     // Backend enum tags.
     static final int BACKEND_S3 = 0;
@@ -54,36 +41,8 @@ final class Messages {
 
     private Messages() {}
 
-    /**
-     * Write the {@code Envelope { schema, message }} prefix.
-     *
-     * <p>The schema field is the <b>minimum</b> version that can represent this
-     * message, not the newest the client speaks. Sending the newest would make a
-     * peer running an older schema reject requests it could actually have
-     * served — the field exists so a receiver can decide whether it understands
-     * the message, so it must describe the message rather than the sender.
-     */
     private static Bincode.Writer envelope(int tag) {
-        return new Bincode.Writer().u16(minimumSchema(tag)).variant(tag);
-    }
-
-    /**
-     * The oldest schema that can represent a message.
-     *
-     * <p>{@code StatObject}, {@code ObjectStat}, {@code ListObjects}, and
-     * {@code ObjectList} were added in schema 2; everything else on the read
-     * path predates it.
-     */
-    static int minimumSchema(int tag) {
-        switch (tag) {
-            case TAG_STAT_OBJECT:
-            case TAG_OBJECT_STAT:
-            case TAG_LIST_OBJECTS:
-            case TAG_OBJECT_LIST:
-                return 2;
-            default:
-                return MIN_CONTROL_SCHEMA_VERSION;
-        }
+        return new Bincode.Writer().u16(CONTROL_SCHEMA_VERSION).variant(tag);
     }
 
     /** Wrap a bincode body in a Control frame. */
@@ -201,9 +160,9 @@ final class Messages {
     static Response decodeBody(byte[] payload) {
         Bincode.Reader r = new Bincode.Reader(payload);
         int schema = r.u16();
-        if (schema > CONTROL_SCHEMA_VERSION) {
+        if (schema != CONTROL_SCHEMA_VERSION) {
             throw new ProtocolException(
-                    "server speaks control schema " + schema + "; this client understands at most "
+                    "server speaks control schema " + schema + "; this client requires "
                             + CONTROL_SCHEMA_VERSION + " — upgrade the client");
         }
         return new Response(r.variant(), r);
@@ -220,15 +179,26 @@ final class Messages {
         return new Placement(owners, epoch);
     }
 
-    /** {@code MembershipList { nodes }} */
+    /** Project persistent membership to nodes while retaining unavailable owners. */
     static List<NodeInfo> readMembershipList(Bincode.Reader r) {
+        r.u64(); // topology token
+        r.u64(); // instance-state token
+        r.u64(); // observation validity in milliseconds
         int n = r.seqLen();
         List<NodeInfo> nodes = new ArrayList<>(n);
         for (int i = 0; i < n; i++) {
             String id = r.string();
-            String address = r.string();
-            int role = r.variant();
-            nodes.add(new NodeInfo(id, address, role == ROLE_WORKER));
+            if (r.bool()) r.string(); // optional zone
+            boolean retired = r.bool();
+            int state = r.variant();
+            String address = "";
+            if (state == 2) {
+                r.string(); // instance id
+                address = r.string();
+            } else if (state != 0 && state != 1) {
+                throw new ProtocolException("unknown worker instance state: " + state);
+            }
+            if (!retired) nodes.add(new NodeInfo(id, address, true));
         }
         return nodes;
     }

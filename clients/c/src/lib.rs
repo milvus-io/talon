@@ -6,6 +6,10 @@
 
 #![allow(clippy::missing_safety_doc)]
 
+#[cfg(test)]
+#[path = "../../../crates/talon-transport/tests/support/membership.rs"]
+mod membership_fixture;
+
 use std::cell::RefCell;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -957,23 +961,16 @@ mod tests {
                                 version: "test-version".into(),
                             }
                         }
-                        ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                            nodes: vec![NodeInfo {
-                                id: NodeId::new("worker-a"),
-                                address: worker_addr,
-                                role: NodeRole::Worker,
-                            }],
-                        },
-                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
-                            nodes: vec![talon_transport::ZonedNodeInfo {
+                        ControlMessage::MembershipQuery {} => {
+                            membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
                                 info: NodeInfo {
                                     id: NodeId::new("worker-a"),
                                     address: worker_addr,
                                     role: NodeRole::Worker,
                                 },
                                 zone: None,
-                            }],
-                        },
+                            }])
+                        }
                         _ => ControlMessage::Ack {
                             ok: false,
                             detail: None,

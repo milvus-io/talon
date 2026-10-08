@@ -21,6 +21,9 @@
 //! membership token is seen. Multi-block splitting is handled by
 //! [`crate::read_plan`]; protocol frontends own their prefetch policy.
 
+#[cfg(test)]
+use crate::membership_fixture;
+
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -867,7 +870,7 @@ impl BlockReader {
         } else if let Some(snapshot) = self.membership.fresh(now_ms) {
             return Ok(snapshot);
         }
-        let snapshot = match self.coordinator.membership_zoned(now_ms).await {
+        let snapshot = match self.coordinator.membership_zoned().await {
             Ok(members) => {
                 let (snapshot, changed) = self.membership.replace(members, now_ms);
                 if changed {
@@ -965,16 +968,15 @@ mod tests {
                     socket.read_exact(&mut body).await.unwrap();
                     let call = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                     let worker = if call == 0 { first_worker } else { next_worker };
-                    let response = ControlMessage::MembershipListV2 {
-                        nodes: vec![talon_transport::ZonedNodeInfo {
+                    let response =
+                        membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
                             info: NodeInfo {
                                 id: NodeId::new("w1"),
                                 address: worker,
                                 role: NodeRole::Worker,
                             },
                             zone: None,
-                        }],
-                    };
+                        }]);
                     socket
                         .write_all(&talon_transport::encode(0, &response).unwrap())
                         .await
@@ -1056,16 +1058,14 @@ mod tests {
                         } else {
                             recovered_worker
                         };
-                        ControlMessage::MembershipListV2 {
-                            nodes: vec![talon_transport::ZonedNodeInfo {
-                                info: NodeInfo {
-                                    id: NodeId::new("w1"),
-                                    address: worker,
-                                    role: NodeRole::Worker,
-                                },
-                                zone: None,
-                            }],
-                        }
+                        membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new("w1"),
+                                address: worker,
+                                role: NodeRole::Worker,
+                            },
+                            zone: None,
+                        }])
                     };
                     socket
                         .write_all(&talon_transport::encode(0, &response).unwrap())
@@ -1099,23 +1099,16 @@ mod tests {
                     full.extend_from_slice(&body);
                     let (_h, msg) = talon_transport::decode(&full).unwrap();
                     let reply = match msg {
-                        ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                            nodes: vec![NodeInfo {
-                                id: NodeId::new("w1"),
-                                address: worker_addr.clone(),
-                                role: NodeRole::Worker,
-                            }],
-                        },
-                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
-                            nodes: vec![talon_transport::ZonedNodeInfo {
+                        ControlMessage::MembershipQuery {} => {
+                            membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
                                 info: NodeInfo {
                                     id: NodeId::new("w1"),
                                     address: worker_addr.clone(),
                                     role: NodeRole::Worker,
                                 },
                                 zone: None,
-                            }],
-                        },
+                            }])
+                        }
                         _ => ControlMessage::Ack {
                             ok: false,
                             detail: None,
@@ -1288,22 +1281,8 @@ mod tests {
                     full.extend_from_slice(&body);
                     let (_h, msg) = talon_transport::decode(&full).unwrap();
                     let reply = match msg {
-                        ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                            nodes: vec![
-                                NodeInfo {
-                                    id: NodeId::new("w1"),
-                                    address: w1.clone(),
-                                    role: NodeRole::Worker,
-                                },
-                                NodeInfo {
-                                    id: NodeId::new("w2"),
-                                    address: w2.clone(),
-                                    role: NodeRole::Worker,
-                                },
-                            ],
-                        },
-                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
-                            nodes: [w1.clone(), w2.clone()]
+                        ControlMessage::MembershipQuery {} => membership_fixture::zoned(
+                            [w1.clone(), w2.clone()]
                                 .into_iter()
                                 .enumerate()
                                 .map(|(i, address)| talon_transport::ZonedNodeInfo {
@@ -1315,7 +1294,7 @@ mod tests {
                                     zone: None,
                                 })
                                 .collect(),
-                        },
+                        ),
                         _ => ControlMessage::Ack {
                             ok: false,
                             detail: None,
@@ -1416,26 +1395,24 @@ mod tests {
                         let h = FrameHeader::decode(&hdr).unwrap();
                         let mut body = vec![0u8; h.length as usize];
                         s.read_exact(&mut body).await.unwrap();
-                        let reply = ControlMessage::MembershipListV2 {
-                            nodes: vec![
-                                talon_transport::ZonedNodeInfo {
-                                    info: NodeInfo {
-                                        id: NodeId::new("w1"),
-                                        address: az_a.clone(),
-                                        role: NodeRole::Worker,
-                                    },
-                                    zone: Some("az-a".into()),
+                        let reply = membership_fixture::zoned(vec![
+                            talon_transport::ZonedNodeInfo {
+                                info: NodeInfo {
+                                    id: NodeId::new("w1"),
+                                    address: az_a.clone(),
+                                    role: NodeRole::Worker,
                                 },
-                                talon_transport::ZonedNodeInfo {
-                                    info: NodeInfo {
-                                        id: NodeId::new("w2"),
-                                        address: az_b.clone(),
-                                        role: NodeRole::Worker,
-                                    },
-                                    zone: Some("az-b".into()),
+                                zone: Some("az-a".into()),
+                            },
+                            talon_transport::ZonedNodeInfo {
+                                info: NodeInfo {
+                                    id: NodeId::new("w2"),
+                                    address: az_b.clone(),
+                                    role: NodeRole::Worker,
                                 },
-                            ],
-                        };
+                                zone: Some("az-b".into()),
+                            },
+                        ]);
                         s.write_all(&talon_transport::encode(0, &reply).unwrap())
                             .await
                             .unwrap();
@@ -1546,7 +1523,7 @@ mod tests {
             let h = FrameHeader::decode(&hdr).unwrap();
             let mut body = vec![0u8; h.length as usize];
             s.read_exact(&mut body).await.unwrap();
-            let reply = ControlMessage::MembershipListV2 { nodes: Vec::new() };
+            let reply = membership_fixture::zoned(Vec::new());
             s.write_all(&talon_transport::encode(0, &reply).unwrap())
                 .await
                 .unwrap();
@@ -1571,16 +1548,14 @@ mod tests {
             let header = FrameHeader::decode(&header).unwrap();
             let mut body = vec![0u8; header.length as usize];
             stream.read_exact(&mut body).await.unwrap();
-            let reply = ControlMessage::MembershipListV2 {
-                nodes: vec![talon_transport::ZonedNodeInfo {
-                    info: NodeInfo {
-                        id: NodeId::new("worker-a"),
-                        address: worker_addr,
-                        role: NodeRole::Worker,
-                    },
-                    zone: None,
-                }],
-            };
+            let reply = membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
+                info: NodeInfo {
+                    id: NodeId::new("worker-a"),
+                    address: worker_addr,
+                    role: NodeRole::Worker,
+                },
+                zone: None,
+            }]);
             stream
                 .write_all(&talon_transport::encode(0, &reply).unwrap())
                 .await

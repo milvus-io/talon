@@ -2,13 +2,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum MembershipMode {
-    #[default]
-    Legacy,
-    Retained,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMember {
     pub worker_id: String,
@@ -20,7 +13,6 @@ pub struct WorkerMember {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemberRegistry {
     pub format_version: u32,
-    pub mode: MembershipMode,
     pub members: Vec<WorkerMember>,
 }
 
@@ -28,7 +20,6 @@ impl Default for MemberRegistry {
     fn default() -> Self {
         Self {
             format_version: 1,
-            mode: MembershipMode::Legacy,
             members: Vec::new(),
         }
     }
@@ -95,7 +86,6 @@ pub struct DiscoveredWorker {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerDiscovery {
-    pub mode: MembershipMode,
     pub topology_token: u64,
     pub state_token: u64,
     /// Maximum age of this complete, authoritative observation at the client.
@@ -143,7 +133,6 @@ impl WorkerDiscovery {
                 .unwrap(),
         );
         Self {
-            mode: registry.mode,
             topology_token: registry.topology_token(),
             state_token,
             valid_for_ms: 500,
@@ -204,7 +193,6 @@ mod tests {
             }
         }
         let registry = MemberRegistry {
-            mode: MembershipMode::Retained,
             members: ["conflict", "offline", "retired", "serving"]
                 .into_iter()
                 .map(|id| WorkerMember {

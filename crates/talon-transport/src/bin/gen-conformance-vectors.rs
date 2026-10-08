@@ -15,8 +15,8 @@
 //!     crates/talon-transport/tests/conformance_vectors.json
 //! ```
 
-use talon_core::{Backend, BlockId, NodeId, NodeInfo, NodeRole, ObjectId, Version};
-use talon_transport::codec::{self, ControlMessage, ObjectEntry, ZonedNodeInfo};
+use talon_core::{Backend, BlockId, NodeId, ObjectId, Version};
+use talon_transport::codec::{self, ControlMessage, ObjectEntry};
 use talon_transport::data::{self, RangeRequest, VersionedRangeRequest};
 use talon_transport::frame::{FrameHeader, MsgType};
 
@@ -61,6 +61,24 @@ fn vectors() -> Vec<Vector> {
             note: "A zero-length payload is legal; decoders must not treat it as EOF",
             bytes: FrameHeader::new(MsgType::Ping, 0, 0).encode().to_vec(),
         },
+        control(
+            "control.membership_query", "Schema v6: instance-aware membership request", 2,
+            &ControlMessage::MembershipQuery {},
+        ),
+        control(
+            "control.node_status_ack", "Schema v6: accepted sole serving instance, without a membership mode", 7,
+            &ControlMessage::NodeStatusAck { accepted: true, serving: true, detail: None },
+        ),
+        control(
+            "control.membership_list", "Schema v6: persistent member and serving instance, without a membership mode", 7,
+            &ControlMessage::MembershipList { view: talon_core::worker_membership::WorkerDiscovery {
+                topology_token: 1, state_token: 2, valid_for_ms: 500,
+                workers: vec![talon_core::worker_membership::DiscoveredWorker {
+                    member: talon_core::worker_membership::WorkerMember { worker_id: "worker-a".into(), zone: None, retired: false },
+                    state: talon_core::worker_membership::InstanceState::Serving { instance_id: "instance-a".into(), address: "10.0.0.1:7001".into() },
+                }],
+            }},
+        ),
         // --- Control plane: the read path ----------------------------------
         control(
             "control.placement_lookup",
@@ -94,24 +112,8 @@ fn vectors() -> Vec<Vector> {
                 epoch: 0,
             },
         ),
-        control(
-            "control.membership_query",
-            "A unit-struct variant: the tag with no body",
-            2,
-            &ControlMessage::MembershipQuery {},
-        ),
-        control(
-            "control.membership_list",
-            "Node ids resolved to dialable addresses",
-            2,
-            &ControlMessage::MembershipList {
-                nodes: vec![NodeInfo {
-                    id: NodeId::new("worker-a"),
-                    address: "10.0.0.1:7001".into(),
-                    role: NodeRole::Worker,
-                }],
-            },
-        ),
+
+
         control(
             "control.stat_object",
             "Backs getattr: object size and version",
@@ -178,37 +180,8 @@ fn vectors() -> Vec<Vector> {
                 worker_incarnation: "worker-incarnation-1".into(),
             },
         ),
-        control(
-            "control.membership_query_v2",
-            "Schema v5: zone-aware membership request (ADR 0006)",
-            6,
-            &ControlMessage::MembershipQueryV2 {},
-        ),
-        control(
-            "control.membership_list_v2",
-            "Schema v5: nodes paired with optional zones; None is a zero tag",
-            6,
-            &ControlMessage::MembershipListV2 {
-                nodes: vec![
-                    ZonedNodeInfo {
-                        info: NodeInfo {
-                            id: NodeId::new("worker-a"),
-                            address: "10.0.0.1:7001".into(),
-                            role: NodeRole::Worker,
-                        },
-                        zone: Some("us-west-2a".into()),
-                    },
-                    ZonedNodeInfo {
-                        info: NodeInfo {
-                            id: NodeId::new("worker-b"),
-                            address: "10.0.0.2:7001".into(),
-                            role: NodeRole::Worker,
-                        },
-                        zone: None,
-                    },
-                ],
-            },
-        ),
+
+
         // --- Data plane -----------------------------------------------------
         Vector {
             name: "data.range_request",

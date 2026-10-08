@@ -1,6 +1,6 @@
 # Talon Rolling Upgrade Design: Dynamic Membership and Stable Placement During Restarts
 
-- Status: Implementation in progress; activation remains disabled until all layers pass acceptance.
+- Status: Implementation in progress; deploy only after all required layers pass acceptance.
 - Date: 2026-09-28.
 - Source baseline: `c4796fe0f47afae2bebd48168f87b5a25c0bc428`.
 - Audience: Maintainers of the Talon Coordinator, Worker, client SDKs, and deployments.
@@ -30,7 +30,7 @@ A graceful upgrade here guarantees stable placement and cache identity, recogniz
 - Member registration, explicit removal, instance heartbeats, offline state, and client discovery.
 - Fast failure on the read path and structured error propagation through the Rust, C, Python, and Java SDKs.
 - Coordinator and Worker shutdown draining, plus a reference Kubernetes deployment.
-- Activation order, rollback boundaries, and acceptance tests during protocol migration.
+- A single membership contract and acceptance tests before the first deployment.
 
 ### 2.2 Out of Scope
 
@@ -53,7 +53,7 @@ The following facts describe the source baseline, not an implementation of this 
 | [Shared state contract](../../crates/talon-coordinator/src/state_store/mod.rs) | Stores leased node state; snapshots contain unexpired nodes | Add a member registry independent of lease expiration; separate process and member records |
 | [Coordinator membership synchronization](../../crates/talon-coordinator/src/observability/state.rs) | Includes only healthy, ready Workers in placement membership | Separate all logical members from serving instances |
 | [Maglev](../../crates/talon-core/src/placement.rs) | Builds deterministic placement from Worker IDs; the current membership token also includes addresses | Preserve the placement algorithm; address and liveness updates must not change logical ownership |
-| [Client membership cache](../../crates/talon-cache-client/src/membership_cache.rs), [read path](../../crates/talon-cache-client/src/block_reader.rs) | Caches members and addresses; may try candidate Workers and refresh/retry after failure | In the new mode, return availability errors directly and refresh discovery for subsequent requests |
+| [Client membership cache](../../crates/talon-cache-client/src/membership_cache.rs), [read path](../../crates/talon-cache-client/src/block_reader.rs) | Caches members and addresses; may try candidate Workers and refresh/retry after failure | Return availability errors directly and refresh discovery for subsequent requests |
 | [Error protocol](../../crates/talon-transport/src/data.rs), [read error classification](../../crates/talon-cache-client/src/range_stream.rs) | Already provides `Unavailable`, `Timeout`, and other categories, plus `fallback_eligible()` | Carry the same classification through public read APIs and language bindings without parsing error strings |
 | [Coordinator main loop](../../crates/talon-coordinator/src/main.rs) | The SIGINT path marks shutdown and removes its own lease | Handle SIGTERM and wait for in-flight control requests |
 | [Worker Helm template](../../deploy/helm/talon/templates/worker.yaml) | Deployment, probes, and a 30-second termination grace period; Pod name as ID and Pod IP as address | Use reusable local volumes, derive identity from the directory, and support sequential restarts |
@@ -139,9 +139,9 @@ Separate the topology content token from the instance-state content token. The t
 
 ### 6.1 Return Failures and Leave Fallback to the Caller
 
-In the new mode, each block request selects one logical owner and one serving instance. Return immediately when the owner is known to be offline. After a network failure, perform necessary resource cleanup and return without waiting for restart, trying another logical Worker, or refreshing and resending within the same request.
+Each block request selects one logical owner and one serving instance. Return immediately when the owner is known to be offline. After a network failure, perform necessary resource cleanup and return without waiting for restart, trying another logical Worker, or refreshing and resending within the same request.
 
-The current client's candidate iteration, refresh-and-retry behavior, and redial after a reused connection fails must not hide failures in this mode. Preserve existing behavior in legacy mode for gradual migration. Normal connection reuse and concurrency for requests that have not failed remain unchanged.
+The current client's candidate iteration, refresh-and-retry behavior, and redial after a reused connection fails must not hide failures. There is no separate legacy membership or read policy. Normal connection reuse and concurrency for requests that have not failed remain unchanged.
 
 "Return immediately" means adding no upgrade-specific wait after detecting an error. Unresponsive connections still require the existing connection/request deadlines to detect a timeout. Check caller cancellation and the overall deadline first; do not classify explicit cancellation or local argument errors as Worker unavailability.
 
@@ -226,14 +226,14 @@ For a concrete example, start with two ready instances, `C1` and `C2`, behind a 
 Before starting:
 
 - Use a shared persistent backend; the memory backend does not provide these guarantees.
-- Confirm that old and new versions understand the active membership mode, shared records, and client protocol. Initial activation of the new mode follows Section 10 separately.
+- Confirm that both versions implement the same persistent membership, shared-record, and client protocol contracts described in Section 10.
 - Verify backend health and enough Coordinator capacity to serve traffic while one old instance drains. The reference deployment uses at least two replicas and retains at least one serving instance throughout replacement.
 - Use `maxUnavailable: 0` and `maxSurge: 1`, as in the existing HA Helm strategy, with sufficient capacity to schedule the additional Pod. Set an appropriate readiness stabilization interval and termination grace budget.
 - Record the logical membership, topology token, sampled block owners, and Worker session freshness. Avoid concurrent membership changes so upgrade-induced changes can be distinguished from intentional scaling.
 
 ### 8.2 Step 1: Start the Replacement Without Routing Traffic to It
 
-Start `C3` with the new image, the same cluster ID, shared backend, authentication configuration, and active membership mode. Give it its own Coordinator process identity and lease. Keep readiness false while it initializes control listeners, backend access, and local state.
+Start `C3` with the new image, the same cluster ID, shared backend, authentication configuration, and membership contract. Give it its own Coordinator process identity and lease. Keep readiness false while it initializes control listeners, backend access, and local state.
 
 `C1` and `C2` continue serving during this stage. If `C3` cannot connect to the backend, load the schema, or initialize its listeners, it remains unready and the rollout stops making progress. Do not stop an old instance merely because the replacement process has started.
 
@@ -244,7 +244,7 @@ Before `C3` becomes ready, it must:
 1. Load a complete persistent member list, including offline members and retired markers.
 2. Load current Worker instance state, retaining the distinction between membership and liveness. An unavailable instance must not disappear from logical placement.
 3. Initialize the ongoing synchronization mechanism. Updates that occur during initial loading must be incorporated through a valid watch continuation or a subsequent reconciliation; initialization must not leave a permanent gap.
-4. Build its local membership/placement view using the same active mode and placement configuration as existing Coordinators.
+4. Build its local membership/placement view using the same membership contract and placement configuration as existing Coordinators.
 5. Confirm that its control listeners can serve requests, backend access is healthy, and its own Coordinator registration has succeeded.
 
 Only then set readiness to true. Never expose a partially loaded member list or use an empty topology as a startup placeholder. An actually empty cluster is valid only after a successful complete load establishes that it is empty. Member and instance snapshots need not form a cross-resource transaction: uncertainty about an instance may produce unavailable status, but cannot remove a member from placement.
@@ -296,7 +296,7 @@ After `C1` exits, verify that:
 
 Then replace `C2` with `C4` using the same sequence. The Deployment's readiness/availability checks gate ordinary replacement. Additional gates based on metrics or topology comparison require rollout tooling or operator-controlled batches; `maxSurge` alone does not implement them.
 
-If a replacement fails before readiness, retain the old serving instances and fix or roll back the new image. If it fails after an old instance has exited, stop further replacements, keep healthy instances serving, and restore capacity with a compatible image. If the shared backend becomes unhealthy, pause the rollout; creating more Coordinator processes does not repair shared-state availability. None of these recovery actions should remove Worker members or change placement. Rollback across incompatible membership modes follows Section 10.
+If a replacement fails before readiness, retain the old serving instances and fix or roll back the new image. If it fails after an old instance has exited, stop further replacements, keep healthy instances serving, and restore capacity with a compatible image. If the shared backend becomes unhealthy, pause the rollout; creating more Coordinator processes does not repair shared-state availability. None of these recovery actions should remove Worker members or change placement. Protocol compatibility requirements are described in Section 10.
 
 ## 9. Kubernetes Deployment and Upgrade Procedure
 
@@ -325,25 +325,15 @@ Upgrade procedure:
 5. After the new instance recovers the same directory and ID, verify that it is the sole serving instance, inspect cache hits, and check caller fallback metrics.
 6. Proceed to the next Worker only after acceptance checks pass. Stop the rollout if recovery fails or origin load exceeds its budget.
 
-## 10. Protocol Compatibility, Initial Migration, and Rollback
+## 10. One Membership Contract Before Deployment
 
-This proposal changes membership semantics. Simply changing the nodes returned by the existing `MembershipList` without client awareness is insufficient: old clients may treat every returned node as an online endpoint or select a new owner after failure.
+Talon has not been deployed in production. This work replaces the old lease-only membership semantics directly; it does not introduce a Legacy/Retained mode, a mode configuration field, an activation API, or runtime protocol fallback. All Workers use instance heartbeats, and all Coordinators derive logical ownership from the persistent member registry. Temporary instance loss changes availability, not membership.
 
-Add versioned membership queries/responses and instance registration/state messages carrying persistent members, instance state, and mode information. Follow the existing bincode compatibility rules: do not append fields directly to old positional structures. Retain old messages and introduce new ones, allocating schema/message identifiers during implementation. The new public error-classification API does not change the existing wire value of `Unavailable`.
+The single `MembershipQuery` / `MembershipList` exchange carries that persistent view. `NodeStatusHeartbeat` carries local instance readiness and `NodeStatusAck` separately reports acceptance and service admission. Standalone registration messages, legacy heartbeats, versioned query alternatives and protocol fallback have been removed. The first status heartbeat registers the logical Worker; subsequent reports renew its instance lease. SDK layers must consume the instance-aware discovery directly so an offline owner is distinguished from a serving endpoint. They must not probe a legacy mode, switch read policies, or fall back to lease-only placement. Rust/native and Java wire consumers use this schema directly; subsequent SDK layers still implement the full availability and immediate-failure policy before deployment.
 
-Publish the mode through shared cluster configuration, with the semantics "retain membership during temporary failures." Legacy mode preserves current behavior. Different Coordinators must not independently select different topology semantics through local environment variables.
+The protocol carries persistent members, instance states and freshness, without a membership-mode field or capability-switch response. Keep the transport schema explicit so incompatible messages fail clearly. A future supported rolling upgrade requires both releases to implement the same membership and read-error contract; supporting a downgrade to the superseded lease-only implementation is outside this pre-deployment change.
 
-Initial activation:
-
-1. Deploy Coordinators that support both old and new messages, initially retaining legacy mode.
-2. Have Workers persist their existing logical IDs in their original directories and support the new instance reports. Build the complete member registry, explicitly adding currently offline members that should be retained. An online snapshot alone cannot establish complete membership.
-3. Upgrade all SDKs/proxies using the cluster and caller error handling. Verify that the new mode does not perform hidden rerouting.
-4. Compare membership, zone attributes, and expected block mappings. Switch the shared mode while no concurrent membership changes are underway.
-5. In the new mode, reject old registration/membership queries that lack the required capability. Do not silently return a legacy view containing only online nodes. Old clients with cached legacy views also lack the guarantees, so upgrading clients before activation is mandatory.
-
-Every externally serving Coordinator must support the new mode at activation. Old binaries must not remain behind the Service. Subsequent ordinary rolling upgrades follow this design only when both versions support the same membership and error semantics.
-
-An ordinary image rollback reuses directory identity and member records, but must verify that the older version can read the current identity file, cache format, and protocol. To roll back to a version without the new mode, stop the rollout and perform a controlled switch to legacy mode first. That switch may itself change topology and does not retain this design's stability guarantee. Disabling the mode does not delete identity files, caches, or persistent member records.
+Management APIs continue to use their leased node-status projection for node details, aggregate metrics and a genuine backend snapshot revision. Every accepted instance heartbeat maintains that projection in addition to its authoritative instance lease. Member retirement and zone changes remain explicit revision-checked administrative operations; they are not mode activation.
 
 ## 11. Failure Handling and Observability
 
@@ -373,24 +363,24 @@ The table below is the acceptance contract. Per-layer executed checks and valida
 | Addition, explicit removal, and delayed heartbeats after retirement | Topology follows membership operations; ordinary heartbeats cannot undo retirement |
 | Multiple Coordinators with etcd and Kubernetes backends | Membership survives Coordinator restarts; offline is distinct from removal; identical member snapshots produce identical placement |
 | Cache recovery after normal and abnormal shutdown | Valid whole-block/page data remains a cache hit; backend request counts confirm identity changes did not trigger refetches; count TTI expiration and corruption separately |
-| Offline Worker, connection refusal, EOF, and timeout | Every public SDK exposes stable categories; the new mode performs no hidden retries, cross-Worker attempts, or origin fallback |
+| Offline Worker, connection refusal, EOF, and timeout | Every public SDK exposes stable categories; reads perform no hidden retries, cross-Worker attempts, or origin fallback |
 | Object-version change, origin errors, rate limiting, and malformed frames | Preserve the original error rather than misclassify it as Worker unavailability eligible for fallback |
 | Multi-block reads, streaming, and caller-owned buffers | Failure is not reported as complete success; no buffer access after the callback; delivered prefixes and retry ranges remain well-defined |
 | Tokio and io_uring draining, saturated connections, and background writes | Persistent connections admit no new work; the lock remains held until tasks finish; recovery succeeds after forced termination |
 | Coordinator rolling replacement using SIGTERM | New instances load membership before readiness; old instances drain; Worker members remain present |
 | One-at-a-time Kubernetes updates | Same PVC, machine, and ID; caller fallback during downtime; original cache hits after recovery before the next update |
-| Mixed SDK/Coordinator versions and rollback | Missing capabilities are explicitly rejected; no silent return of a legacy view with different semantics; rollback format checks work |
+| SDK/Coordinator protocol agreement | Matching clients consume instance-aware discovery directly; incompatible messages fail explicitly without a second membership policy |
 
 During fault injection, measure Talon failure latency, caller fallback success, cache hit rate after recovery, and origin traffic. Acceptance does not require zero Talon errors: controlled availability errors are expected. Unrecognized errors, data from the wrong object version, unintended topology changes, and unintended cache loss are failures.
 
 ## 13. Implementation Sequence
 
-Implementation uses a linear PR stack, with implementation, regression tests, and relevant documentation in each layer. Keep the mode disabled until its required layers are complete.
+Implementation uses a linear PR stack, with implementation, regression tests, and relevant documentation in each layer. Deploy the stack only after its server and client layers implement the single membership contract.
 
 | Layer | Independently deliverable scope | Validation focus |
 | --- | --- | --- |
 | 1 | Directory identity initialization, old-ID import, and existing lock contract | Normal/crash restart, concurrent initialization, configuration conflicts |
-| 2 | Persistent member registry, shared mode, CAS and retirement in memory, etcd and Kubernetes | Backend contracts, concurrent updates, tombstones and capacity bounds |
+| 2 | Persistent member registry, CAS and retirement in memory, etcd and Kubernetes | Backend contracts, concurrent updates, tombstones and capacity bounds |
 | 3 | Versioned instance discovery, sole-instance readiness and membership administration | Protocol compatibility, offline/conflicting instances and revision propagation |
 | 4 | Rust client and CLI placement by logical membership, bounded refresh and immediate read failure | Stable ownership, no hidden rerouting or resend, discovery freshness and buffer lifetime |
 | 5 | Rust/C/Python error classification and typed metadata failures | Public error categories, ABI compatibility and preservation of domain/protocol errors |

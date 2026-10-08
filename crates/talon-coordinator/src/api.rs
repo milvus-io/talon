@@ -637,6 +637,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn instance_heartbeats_keep_management_visible_past_initial_lease_expiry() {
+        use crate::ClusterStateStore;
+        use std::sync::atomic::{AtomicU64, Ordering};
+        struct Clock(AtomicU64);
+        impl crate::TimeSource for Clock {
+            fn now_unix_ms(&self) -> u64 {
+                self.0.load(Ordering::Relaxed)
+            }
+        }
+        let clock = Arc::new(Clock(AtomicU64::new(1_000)));
+        let store = Arc::new(MemoryStateStore::with_time_source(clock.clone(), 32));
+        let state = Arc::new(
+            CoordinatorObservability::new(
+                "c".into(),
+                NodeInfo {
+                    id: NodeId::new("coord"),
+                    address: "coord:7000".into(),
+                    role: NodeRole::Coordinator,
+                },
+                "coord:8000".into(),
+                Duration::from_secs(1),
+                store.clone(),
+            )
+            .unwrap(),
+        );
+        let ttl = Duration::from_secs(30);
+        let mut status = worker("w00", 1000, 100, 10);
+        assert!(state.report_instance(status.clone(), ttl).await.unwrap());
+        let first_revision = store.snapshot("c").await.unwrap().revision;
+        clock.0.store(21_000, Ordering::Relaxed);
+        status.heartbeat_seq += 1;
+        status.metrics.resident_bytes = 200;
+        status.metrics.block_count = 20;
+        assert!(state.report_instance(status, ttl).await.unwrap());
+        // The initial lease has expired, but continued instance reports must
+        // keep the existing API/UI endpoints and their metrics current.
+        clock.0.store(36_000, Ordering::Relaxed);
+        let (code, summary) = get(state.clone(), "/api/v1/cluster").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(summary["worker_count"], 1);
+        assert_eq!(summary["total_capacity_bytes"], 1000);
+        assert_eq!(summary["total_resident_bytes"], 200);
+        assert_eq!(summary["total_block_count"], 20);
+        let snapshot = store.snapshot("c").await.unwrap();
+        assert_ne!(snapshot.revision, first_revision);
+        assert_eq!(
+            summary["meta"]["snapshot_revision"],
+            snapshot.revision.as_str()
+        );
+        let (code, nodes) = get(state.clone(), "/api/v1/nodes?role=worker").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(nodes["total"], 1);
+        assert_eq!(nodes["nodes"][0]["node_id"], "w00");
+        let (code, detail) = get(state.clone(), "/api/v1/nodes/w00").await;
+        assert_eq!(code, StatusCode::OK);
+        assert_eq!(detail["ready"], true);
+        assert_eq!(detail["resident_bytes"], 200);
+        assert!(state
+            .metrics()
+            .render()
+            .contains("talon_coordinator_live_nodes{health=\"healthy\",role=\"worker\"} 1"));
+        store.set_available(false);
+        assert_eq!(
+            get(state.clone(), "/api/v1/cluster").await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        store.set_available(true);
+        clock.0.store(52_000, Ordering::Relaxed);
+        assert_eq!(
+            get(state.clone(), "/api/v1/nodes/w00").await.0,
+            StatusCode::NOT_FOUND
+        );
+        let view = state.worker_discovery().await.unwrap();
+        assert_eq!(view.workers.len(), 1);
+        assert!(matches!(
+            view.workers[0].state,
+            talon_core::worker_membership::InstanceState::Offline
+        ));
+    }
+
+    #[tokio::test]
     async fn nodes_list_paginates_with_stable_order() {
         let state = state_with_workers(5).await;
         let (status, body) = get(state.clone(), "/api/v1/nodes?limit=2&offset=0").await;

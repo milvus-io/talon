@@ -114,7 +114,14 @@ async fn control_path_register_lookup_resolve() {
         },
     )
     .await;
-    assert!(matches!(ack, ControlMessage::Ack { ok: true, .. }));
+    assert!(matches!(
+        ack,
+        ControlMessage::NodeStatusAck {
+            accepted: true,
+            serving: true,
+            ..
+        }
+    ));
 
     // Placement lookup should now name our worker as the owner.
     let block = BlockId::new(
@@ -131,7 +138,20 @@ async fn control_path_register_lookup_resolve() {
 
     // Membership query resolves that id back to the worker's address.
     let nodes = match round_trip(addr, &ControlMessage::MembershipQuery {}).await {
-        ControlMessage::MembershipList { nodes } => nodes,
+        ControlMessage::MembershipList { view } => view
+            .workers
+            .into_iter()
+            .map(|worker| talon_core::NodeInfo {
+                id: talon_core::NodeId::new(worker.member.worker_id),
+                address: match worker.state {
+                    talon_core::worker_membership::InstanceState::Serving { address, .. } => {
+                        address
+                    }
+                    _ => String::new(),
+                },
+                role: talon_core::NodeRole::Worker,
+            })
+            .collect::<Vec<_>>(),
         other => panic!("expected MembershipList, got {other:?}"),
     };
     let resolved = nodes.iter().find(|n| n.id == node.id).unwrap();

@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "../../../crates/talon-transport/tests/support/membership.rs"]
+mod membership_fixture;
+
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
@@ -662,23 +666,16 @@ mod tests {
                                 version: "test-version".into(),
                             }
                         }
-                        ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                            nodes: vec![NodeInfo {
-                                id: NodeId::new("worker-a"),
-                                address: worker_addr,
-                                role: NodeRole::Worker,
-                            }],
-                        },
-                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
-                            nodes: vec![talon_transport::ZonedNodeInfo {
+                        ControlMessage::MembershipQuery {} => {
+                            membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
                                 info: NodeInfo {
                                     id: NodeId::new("worker-a"),
                                     address: worker_addr,
                                     role: NodeRole::Worker,
                                 },
                                 zone: None,
-                            }],
-                        },
+                            }])
+                        }
                         other => panic!("unexpected request: {other:?}"),
                     };
                     socket

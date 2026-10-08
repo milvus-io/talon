@@ -19,6 +19,10 @@
 //! real backend, and counts requests so cache-hit / fallback behavior is
 //! observable.
 
+#[cfg(test)]
+#[path = "../../talon-transport/tests/support/membership.rs"]
+mod membership_fixture;
+
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -128,21 +132,8 @@ async fn spawn_coordinator(
                     }
                     ControlMessage::MembershipQuery {} => {
                         counters.membership_queries.fetch_add(1, Ordering::SeqCst);
-                        ControlMessage::MembershipList {
-                            nodes: owners
-                                .iter()
-                                .map(|(id, a)| NodeInfo {
-                                    id: NodeId::new(id),
-                                    address: a.clone(),
-                                    role: NodeRole::Worker,
-                                })
-                                .collect(),
-                        }
-                    }
-                    ControlMessage::MembershipQueryV2 {} => {
-                        counters.membership_queries.fetch_add(1, Ordering::SeqCst);
-                        ControlMessage::MembershipListV2 {
-                            nodes: owners
+                        membership_fixture::zoned(
+                            owners
                                 .iter()
                                 .map(|(id, a)| talon_transport::ZonedNodeInfo {
                                     info: NodeInfo {
@@ -153,7 +144,7 @@ async fn spawn_coordinator(
                                     zone: None,
                                 })
                                 .collect(),
-                        }
+                        )
                     }
                     _ => ControlMessage::Ack {
                         ok: false,

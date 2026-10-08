@@ -24,28 +24,15 @@ use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 pub const CONTROL_SCHEMA_VERSION: u16 = 6;
 
 /// Oldest control schema this build can decode.
-pub const MIN_CONTROL_SCHEMA_VERSION: u16 = 1;
+pub const MIN_CONTROL_SCHEMA_VERSION: u16 = CONTROL_SCHEMA_VERSION;
 
 /// A single control-plane message.
 ///
-/// Deliberately minimal for v1; extend per consumer (membership, placement,
-/// load). `#[non_exhaustive]` so adding a variant is not a breaking change for
-/// matchers that already have a wildcard arm.
+/// Membership, placement and load use one versioned contract.
+/// `#[non_exhaustive]` allows consumers to reject unhandled message variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub enum ControlMessage {
-    /// Worker → coordinator: announce presence and address.
-    Register {
-        /// Identity of the registering node.
-        node: NodeInfo,
-    },
-    /// Worker → coordinator: periodic liveness + block-count summary.
-    Heartbeat {
-        /// The reporting worker.
-        node: NodeId,
-        /// Number of blocks currently resident.
-        block_count: u64,
-    },
     /// Client → coordinator: where does this block live?
     PlacementLookup {
         /// The block being located.
@@ -74,15 +61,11 @@ pub enum ControlMessage {
         /// The new epoch value.
         epoch: u64,
     },
-    /// Client → coordinator: list the currently-known live nodes.
-    ///
-    /// A placement lookup returns owner [`NodeId`]s; the client resolves those
-    /// ids to worker addresses with this query.
+    /// Client → coordinator: persistent logical members and their live instances.
     MembershipQuery {},
-    /// Coordinator → client: the current membership snapshot (id + address).
+    /// Coordinator → client: topology, availability, zones and discovery freshness.
     MembershipList {
-        /// All nodes the coordinator currently knows about.
-        nodes: Vec<NodeInfo>,
+        view: talon_core::worker_membership::WorkerDiscovery,
     },
     /// Generic acknowledgement / error reply.
     Ack {
@@ -93,8 +76,7 @@ pub enum ControlMessage {
     },
     /// Node → coordinator: complete runtime status and metric snapshot.
     ///
-    /// This is the first schema-v2 message. The legacy [`Heartbeat`](Self::Heartbeat)
-    /// remains available during rolling upgrades.
+    /// `ready` reports local readiness, before coordinator service admission.
     NodeStatusHeartbeat {
         /// Bounded, versioned status snapshot.
         status: Box<NodeStatus>,
@@ -102,7 +84,7 @@ pub enum ControlMessage {
     /// Client → coordinator: what is this object's size and version?
     ///
     /// Backs FUSE `getattr`: the client needs the object length to report file
-    /// size and the version/etag to address blocks. Schema v2. The coordinator
+    /// size and the version/etag to address blocks. The coordinator
     /// answers from the backend `HEAD` (or its index).
     StatObject {
         /// The object to stat.
@@ -119,7 +101,7 @@ pub enum ControlMessage {
     ///
     /// Backs FUSE `readdir`: the client asks for the objects beneath a
     /// directory prefix (e.g. `s3/bucket/dir`) and synthesizes the namespace
-    /// tree from the returned paths. Schema v2.
+    /// tree from the returned paths.
     ListObjects {
         /// Mount-relative prefix to list under (may be empty for the root).
         prefix: String,
@@ -187,33 +169,12 @@ pub enum ControlMessage {
         /// Current worker process incarnation.
         worker_incarnation: String,
     },
-    /// Client → coordinator: list live nodes with their zones. Schema v5.
-    ///
-    /// Zone-affine readers (ADR 0006) send this first and fall back to
-    /// [`MembershipQuery`](Self::MembershipQuery) when the coordinator
-    /// predates schema v5.
-    MembershipQueryV2 {},
-    /// Coordinator → client: membership with each node's optional zone.
-    MembershipListV2 {
-        /// All nodes the coordinator currently knows about, with zones.
-        nodes: Vec<ZonedNodeInfo>,
-    },
-    /// Schema 6: persistent logical membership plus separately leased instances.
-    WorkerDiscoveryQuery {},
-    WorkerDiscovery {
-        view: talon_core::worker_membership::WorkerDiscovery,
-    },
-    WorkerInstanceHeartbeat {
-        status: Box<NodeStatus>,
-        writable: bool,
-    },
-    WorkerInstanceAck {
+    /// Coordinator → worker: status acceptance and permission to serve.
+    NodeStatusAck {
         accepted: bool,
         serving: bool,
-        mode: talon_core::worker_membership::MembershipMode,
         detail: Option<String>,
     },
-    MembershipCapabilityRequired {},
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -227,8 +188,7 @@ pub struct ObjectEntry {
 
 /// A membership entry paired with its deployment zone.
 ///
-/// [`NodeInfo`] itself cannot grow fields (bincode encodes positionally), so
-/// the zone travels alongside it in the schema-v5 membership messages.
+/// Used by placement consumers projecting the instance-aware discovery view.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZonedNodeInfo {
     /// The unchanged v1 node identity.
@@ -238,30 +198,9 @@ pub struct ZonedNodeInfo {
 }
 
 impl ControlMessage {
-    /// Oldest control schema that can represent this message.
+    /// Schema for the single supported control contract.
     pub fn minimum_schema(&self) -> u16 {
-        match self {
-            Self::MembershipCapabilityRequired {}
-            | Self::WorkerDiscoveryQuery {}
-            | Self::WorkerDiscovery { .. }
-            | Self::WorkerInstanceHeartbeat { .. }
-            | Self::WorkerInstanceAck { .. } => 6,
-            Self::NodeStatusHeartbeat { .. } => 2,
-            Self::StatObject { .. } | Self::ObjectStat { .. } => 2,
-            Self::ListObjects { .. } | Self::ObjectList { .. } => 2,
-            // Schema 3: the ADR 0003 §5 mapping fence. A v2 peer cannot decode
-            // these, and must not silently treat a fenced operation as
-            // unfenced -- so they are rejected at the envelope rather than
-            // degraded.
-            Self::MappingRevisionQuery { .. }
-            | Self::MappingRevisionValue { .. }
-            | Self::StaleMapping { .. } => 3,
-            Self::MappingRevisionUpdate { .. } | Self::MappingRevisionAck { .. } => 4,
-            // Schema 5: zone-aware membership (ADR 0006). Older peers reject
-            // these at the envelope; the client falls back to MembershipQuery.
-            Self::MembershipQueryV2 {} | Self::MembershipListV2 { .. } => 5,
-            _ => MIN_CONTROL_SCHEMA_VERSION,
-        }
+        CONTROL_SCHEMA_VERSION
     }
 }
 
@@ -331,8 +270,7 @@ pub fn encode(request_id: u32, message: &ControlMessage) -> Result<Vec<u8>, Code
 
 /// Encode with an explicitly selected supported schema.
 ///
-/// Existing v1 messages can be forced to v1 or v2. A v2-only message returns
-/// [`CodecError::MessageRequiresSchema`] when v1 is selected.
+/// Incompatible schemas are rejected before serializing any message.
 pub fn encode_for_schema(
     request_id: u32,
     message: &ControlMessage,
@@ -436,9 +374,7 @@ fn validate_message(message: &ControlMessage, schema: u16) -> Result<(), CodecEr
             selected: schema,
         });
     }
-    if let ControlMessage::NodeStatusHeartbeat { status }
-    | ControlMessage::WorkerInstanceHeartbeat { status, .. } = message
-    {
+    if let ControlMessage::NodeStatusHeartbeat { status } = message {
         status.validate()?;
         let got = bincode::serialized_size(status)? as usize;
         if got > MAX_NODE_STATUS_BYTES {
@@ -495,11 +431,6 @@ mod tests {
             Version::new("etag-xyz"),
         );
         vec![
-            ControlMessage::Register { node: node.clone() },
-            ControlMessage::Heartbeat {
-                node: node.id.clone(),
-                block_count: 42,
-            },
             ControlMessage::PlacementLookup {
                 block: block.clone(),
                 k: 1,
@@ -516,7 +447,10 @@ mod tests {
             ControlMessage::EpochBump { epoch: 8 },
             ControlMessage::MembershipQuery {},
             ControlMessage::MembershipList {
-                nodes: vec![node.clone()],
+                view: talon_core::worker_membership::WorkerDiscovery::retained(
+                    &Default::default(),
+                    &[],
+                ),
             },
             ControlMessage::Ack {
                 ok: false,
@@ -524,6 +458,22 @@ mod tests {
             },
             ControlMessage::NodeStatusHeartbeat {
                 status: Box::new(sample_status(node)),
+            },
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: false,
+                detail: None,
+            },
+            ControlMessage::MappingRevisionQuery {
+                namespace: "ns".into(),
+            },
+            ControlMessage::MappingRevisionValue {
+                namespace: "ns".into(),
+                revision: 1,
+            },
+            ControlMessage::StaleMapping {
+                namespace: "ns".into(),
+                current: 1,
             },
             ControlMessage::StatObject {
                 object: block.object.clone(),
@@ -565,6 +515,31 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_schemas_are_rejected_before_message_decoding() {
+        for message in sample_messages() {
+            let frame = encode(1, &message).unwrap();
+            assert_eq!(
+                peek_schema(&frame[HEADER_LEN..]).unwrap(),
+                CONTROL_SCHEMA_VERSION
+            );
+            assert!(decode_with_max_schema(&frame, 5).is_err());
+            for schema in [0, 1, 2, 3, 4, 5, 7] {
+                assert!(matches!(
+                    encode_for_schema(1, &message, schema),
+                    Err(CodecError::UnsupportedSchema { .. })
+                ));
+                let mut incompatible = frame.clone();
+                incompatible[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&schema.to_le_bytes());
+                // Even invalid enum bytes must not be interpreted under an old schema.
+                incompatible[HEADER_LEN + 2..HEADER_LEN + 6].fill(255);
+                assert!(
+                    matches!(decode(&incompatible), Err(CodecError::UnsupportedSchema { got, .. }) if got == schema)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn every_variant_round_trips() {
         for (i, msg) in sample_messages().into_iter().enumerate() {
             let buf = encode(i as u32, &msg).unwrap();
@@ -573,107 +548,6 @@ mod tests {
             assert_eq!(header.request_id, i as u32);
             assert_eq!(header.length as usize, buf.len() - HEADER_LEN);
             assert_eq!(back, msg);
-        }
-    }
-
-    #[test]
-    fn existing_messages_default_to_v1_during_rolling_upgrade() {
-        let msg = ControlMessage::Heartbeat {
-            node: NodeId::new("worker-1"),
-            block_count: 42,
-        };
-        let buf = encode(1, &msg).unwrap();
-        assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 1);
-        assert_eq!(decode_with_max_schema(&buf, 1).unwrap().1, msg);
-    }
-
-    #[test]
-    fn new_status_heartbeat_uses_v2_and_old_peer_rejects_cleanly() {
-        let node = NodeInfo {
-            id: NodeId::new("worker-1"),
-            address: "10.0.0.1:7001".into(),
-            role: NodeRole::Worker,
-        };
-        let msg = ControlMessage::NodeStatusHeartbeat {
-            status: Box::new(sample_status(node)),
-        };
-        let buf = encode(1, &msg).unwrap();
-        assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 2);
-        assert!(matches!(
-            decode_with_max_schema(&buf, 1),
-            Err(CodecError::UnsupportedSchema { got: 2, ours: 1 })
-        ));
-        assert_eq!(decode(&buf).unwrap().1, msg);
-    }
-
-    #[test]
-    fn v2_message_cannot_be_mislabeled_as_v1() {
-        let node = NodeInfo {
-            id: NodeId::new("worker-1"),
-            address: "10.0.0.1:7001".into(),
-            role: NodeRole::Worker,
-        };
-        let msg = ControlMessage::NodeStatusHeartbeat {
-            status: Box::new(sample_status(node)),
-        };
-        assert!(matches!(
-            encode_for_schema(1, &msg, 1),
-            Err(CodecError::MessageRequiresSchema {
-                required: 2,
-                selected: 1
-            })
-        ));
-    }
-
-    #[test]
-    fn list_objects_and_object_list_are_v2() {
-        let req = ControlMessage::ListObjects {
-            prefix: "s3/bkt/dir".into(),
-        };
-        let resp = ControlMessage::ObjectList {
-            entries: vec![ObjectEntry {
-                path: "s3/bkt/dir/a.bin".into(),
-                size: 10,
-            }],
-        };
-        for msg in [req, resp] {
-            let buf = encode(1, &msg).unwrap();
-            assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 2);
-            assert_eq!(decode(&buf).unwrap().1, msg);
-            assert!(matches!(
-                decode_with_max_schema(&buf, 1),
-                Err(CodecError::UnsupportedSchema { got: 2, ours: 1 })
-            ));
-        }
-    }
-
-    #[test]
-    fn stat_object_and_object_stat_are_v2() {
-        let stat_req = ControlMessage::StatObject {
-            object: ObjectId::new(Backend::S3, "bkt", "path/obj.bin"),
-        };
-        let stat_resp = ControlMessage::ObjectStat {
-            size: 2_500_000_000,
-            version: "etag-xyz".into(),
-        };
-        for msg in [stat_req, stat_resp] {
-            let buf = encode(1, &msg).unwrap();
-            // Encoded at schema v2 and round-trips.
-            assert_eq!(peek_schema(&buf[HEADER_LEN..]).unwrap(), 2);
-            assert_eq!(decode(&buf).unwrap().1, msg);
-            // An old v1-only peer rejects it cleanly rather than misreading it.
-            assert!(matches!(
-                decode_with_max_schema(&buf, 1),
-                Err(CodecError::UnsupportedSchema { got: 2, ours: 1 })
-            ));
-            // Forcing v1 on encode is refused.
-            assert!(matches!(
-                encode_for_schema(1, &msg, 1),
-                Err(CodecError::MessageRequiresSchema {
-                    required: 2,
-                    selected: 1
-                })
-            ));
         }
     }
 
@@ -697,7 +571,7 @@ mod tests {
         ));
 
         let body = bincode::serialize(&Envelope {
-            schema: 2,
+            schema: CONTROL_SCHEMA_VERSION,
             message: msg,
         })
         .unwrap();
@@ -776,84 +650,6 @@ mod tests {
     }
 
     #[test]
-    fn a_schema_bump_does_not_change_how_older_messages_encode() {
-        // The property that keeps existing clients working. `encode` selects
-        // each message's own minimum_schema rather than the global maximum, so
-        // adding schema-3 variants must leave a PlacementResponse encoded
-        // exactly as a schema-1 message. A client that understands only v2 keeps
-        // interoperating; the Java client hard-codes its own maximum and would
-        // otherwise refuse every response after this bump.
-        let message = ControlMessage::PlacementResponse {
-            owners: vec![NodeId::new("w0")],
-            epoch: 7,
-        };
-        assert_eq!(message.minimum_schema(), MIN_CONTROL_SCHEMA_VERSION);
-
-        let encoded = encode(1, &message).expect("encode");
-        let (_, decoded) = decode(&encoded).expect("decode");
-        assert_eq!(decoded, message);
-
-        // And the envelope really does carry the old schema, not the new one.
-        let body = &encoded[HEADER_LEN..];
-        let schema = u16::from_le_bytes([body[0], body[1]]);
-        assert_eq!(
-            schema, MIN_CONTROL_SCHEMA_VERSION,
-            "an old message must not be tagged with a newer schema"
-        );
-    }
-
-    #[test]
-    fn the_mapping_fence_messages_require_schema_three() {
-        // They cannot be represented to a v2 peer. Silently degrading a fenced
-        // operation to an unfenced one is exactly the failure ADR 0003 §5's
-        // fence exists to prevent, so encoding must refuse rather than downgrade.
-        let stale = ControlMessage::StaleMapping {
-            namespace: "ns".into(),
-            current: 4,
-        };
-        assert_eq!(stale.minimum_schema(), 3);
-        assert!(matches!(
-            encode_for_schema(1, &stale, 2),
-            Err(CodecError::MessageRequiresSchema { .. })
-        ));
-    }
-
-    #[test]
-    fn revision_propagation_messages_require_schema_four() {
-        let update = ControlMessage::MappingRevisionUpdate {
-            cluster_id: "cluster-a".into(),
-            namespace: "s3/bucket/models".into(),
-            revision: 4,
-            coordinator_id: "coordinator-1".into(),
-            coordinator_incarnation: "coordinator-incarnation-1".into(),
-        };
-        let ack = ControlMessage::MappingRevisionAck {
-            cluster_id: "cluster-a".into(),
-            namespace: "s3/bucket/models".into(),
-            revision: 4,
-            worker_id: "worker-1".into(),
-            worker_incarnation: "worker-incarnation-1".into(),
-        };
-
-        for message in [update, ack] {
-            assert_eq!(message.minimum_schema(), 4);
-            let encoded = encode(1, &message).unwrap();
-            assert_eq!(peek_schema(&encoded[HEADER_LEN..]).unwrap(), 4);
-            assert!(matches!(
-                decode_with_max_schema(&encoded, 3),
-                Err(CodecError::UnsupportedSchema { got: 4, ours: 3 })
-            ));
-            assert!(matches!(
-                encode_for_schema(1, &message, 3),
-                Err(CodecError::MessageRequiresSchema {
-                    required: 4,
-                    selected: 3
-                })
-            ));
-        }
-    }
-
-    #[test]
     fn unknown_schema_rejected_not_panicked() {
         // Encode with a bumped schema and confirm decode reports it cleanly.
         let env = Envelope {
@@ -884,11 +680,10 @@ mod tests {
         assert!(decode(&buf).is_err());
     }
     #[test]
-    fn retained_discovery_uses_schema_six_without_changing_legacy_wire() {
+    fn membership_discovery_uses_the_current_schema() {
         use talon_core::worker_membership::*;
         let view = WorkerDiscovery::retained(
             &MemberRegistry {
-                mode: MembershipMode::Retained,
                 members: vec![WorkerMember {
                     worker_id: "offline".into(),
                     zone: None,
@@ -898,20 +693,16 @@ mod tests {
             },
             &[],
         );
-        let message = ControlMessage::WorkerDiscovery { view };
+        let message = ControlMessage::MembershipList { view };
         assert_eq!(message.minimum_schema(), 6);
         let encoded = encode(7, &message).unwrap();
         assert_eq!(decode(&encoded).unwrap().1, message);
-        assert_eq!(ControlMessage::MembershipQuery {}.minimum_schema(), 1);
-        assert_eq!(ControlMessage::MembershipQueryV2 {}.minimum_schema(), 5);
+        assert_eq!(ControlMessage::MembershipQuery {}.minimum_schema(), 6);
     }
     #[tokio::test]
     async fn largest_admitted_discovery_with_maximum_instances_fits_reader_cap() {
-        use talon_core::worker_membership::{
-            MemberRegistry, MembershipMode, WorkerDiscovery, WorkerMember,
-        };
+        use talon_core::worker_membership::{MemberRegistry, WorkerDiscovery, WorkerMember};
         let mut registry = MemberRegistry {
-            mode: MembershipMode::Retained,
             ..Default::default()
         };
         loop {
@@ -944,7 +735,7 @@ mod tests {
             })
             .collect();
         let view = WorkerDiscovery::retained(&registry, &instances);
-        let message = ControlMessage::WorkerDiscovery { view };
+        let message = ControlMessage::MembershipList { view };
         let encoded = encode(7, &message).unwrap();
         let payload_bytes = encoded.len() - HEADER_LEN;
         assert!(payload_bytes <= crate::MAX_CONTROL_PAYLOAD_LEN as usize);

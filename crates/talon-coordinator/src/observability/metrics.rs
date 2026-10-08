@@ -17,10 +17,6 @@ use crate::{ClusterSnapshot, StateStoreResult};
 #[derive(Debug, Clone, Copy)]
 #[repr(usize)]
 pub enum ControlOperation {
-    /// Worker registration.
-    Register,
-    /// Legacy worker heartbeat.
-    Heartbeat,
     /// Versioned node status heartbeat.
     StatusHeartbeat,
     /// Placement lookup.
@@ -35,8 +31,6 @@ impl ControlOperation {
     /// Classify a control message before dispatch.
     pub fn from_message(message: &ControlMessage) -> Self {
         match message {
-            ControlMessage::Register { .. } => Self::Register,
-            ControlMessage::Heartbeat { .. } => Self::Heartbeat,
             ControlMessage::NodeStatusHeartbeat { .. } => Self::StatusHeartbeat,
             ControlMessage::PlacementLookup { .. } => Self::Placement,
             ControlMessage::MembershipQuery {} => Self::Membership,
@@ -46,8 +40,6 @@ impl ControlOperation {
 
     fn label(self) -> &'static str {
         match self {
-            Self::Register => "register",
-            Self::Heartbeat => "heartbeat",
             Self::StatusHeartbeat => "status_heartbeat",
             Self::Placement => "placement_lookup",
             Self::Membership => "membership_query",
@@ -69,10 +61,6 @@ pub struct CoordinatorMetrics {
     registry: Metrics,
     operations: Arc<Vec<OperationMetric>>,
     protocol_errors: Counter,
-    registration_accepted: Counter,
-    registration_rejected: Counter,
-    heartbeat_legacy_accepted: Counter,
-    heartbeat_legacy_rejected: Counter,
     heartbeat_status_accepted: Counter,
     heartbeat_status_rejected: Counter,
     placement_duration: Histogram,
@@ -114,8 +102,6 @@ impl CoordinatorMetrics {
             )
             .set(1.0);
         let operations = [
-            ControlOperation::Register,
-            ControlOperation::Heartbeat,
             ControlOperation::StatusHeartbeat,
             ControlOperation::Placement,
             ControlOperation::Membership,
@@ -143,8 +129,6 @@ impl CoordinatorMetrics {
             }
         })
         .collect();
-        let result_counter =
-            |name: &str, help: &str, pairs| registry.counter(name, help, labels(pairs));
         let active_connections = registry.gauge(
             "talon_coordinator_active_connections",
             "Control-plane connections currently open.",
@@ -170,26 +154,6 @@ impl CoordinatorMetrics {
                 "talon_coordinator_protocol_errors_total",
                 "Control frames rejected before dispatch.",
                 BTreeMap::new(),
-            ),
-            registration_accepted: result_counter(
-                "talon_coordinator_registration_total",
-                "Worker registrations by outcome.",
-                &[("result", "accepted")],
-            ),
-            registration_rejected: result_counter(
-                "talon_coordinator_registration_total",
-                "Worker registrations by outcome.",
-                &[("result", "rejected")],
-            ),
-            heartbeat_legacy_accepted: registry.counter(
-                "talon_coordinator_heartbeat_total",
-                "Node heartbeats by kind and outcome.",
-                labels(&[("kind", "legacy"), ("result", "accepted")]),
-            ),
-            heartbeat_legacy_rejected: registry.counter(
-                "talon_coordinator_heartbeat_total",
-                "Node heartbeats by kind and outcome.",
-                labels(&[("kind", "legacy"), ("result", "rejected")]),
             ),
             heartbeat_status_accepted: registry.counter(
                 "talon_coordinator_heartbeat_total",
@@ -271,22 +235,12 @@ impl CoordinatorMetrics {
         self.protocol_errors.inc();
     }
 
-    /// Record a registration outcome.
-    pub fn record_registration(&self, accepted: bool) {
+    /// Record a status heartbeat outcome.
+    pub fn record_heartbeat(&self, accepted: bool) {
         if accepted {
-            self.registration_accepted.inc();
+            self.heartbeat_status_accepted.inc();
         } else {
-            self.registration_rejected.inc();
-        }
-    }
-
-    /// Record a legacy or status heartbeat outcome.
-    pub fn record_heartbeat(&self, status: bool, accepted: bool) {
-        match (status, accepted) {
-            (false, true) => self.heartbeat_legacy_accepted.inc(),
-            (false, false) => self.heartbeat_legacy_rejected.inc(),
-            (true, true) => self.heartbeat_status_accepted.inc(),
-            (true, false) => self.heartbeat_status_rejected.inc(),
+            self.heartbeat_status_rejected.inc();
         }
     }
 

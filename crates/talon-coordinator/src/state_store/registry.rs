@@ -1,6 +1,6 @@
 //! Atomic persistent registry operations shared by every backend.
 use super::{ClusterStateStore, StateBackend, StateStoreError, StateStoreResult, StoreRevision};
-use talon_core::worker_membership::{MemberRegistry, MembershipMode, WorkerMember};
+use talon_core::worker_membership::{MemberRegistry, WorkerMember};
 
 pub const MAX_REGISTRY_BYTES: usize = 512 * 1024;
 #[derive(Debug, Clone)]
@@ -42,7 +42,6 @@ pub enum MemberChange {
         zone: Option<String>,
     },
     SetMember(WorkerMember),
-    SetMode(MembershipMode),
 }
 
 pub async fn change(
@@ -87,7 +86,6 @@ pub async fn change(
                     value.members.push(member.clone());
                 }
             }
-            MemberChange::SetMode(mode) => value.mode = *mode,
         }
         value.members.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
         encode(&value, store.backend())?;
@@ -163,12 +161,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_cas_retirement_and_mode_are_persistent() {
+    async fn registry_cas_and_retirement_are_persistent() {
         let store = MemoryStateStore::new();
         let initial = store.member_registry("c").await.unwrap();
         assert!(initial.revision.is_none());
-        assert_eq!(initial.value.mode, MembershipMode::Legacy);
-        let first = change(
+        change(
             &store,
             "c",
             MemberChange::Register {
@@ -182,14 +179,6 @@ mod tests {
             .compare_member_registry("c", None, &MemberRegistry::default())
             .await
             .unwrap());
-        let token = first.topology_token();
-        assert_eq!(
-            change(&store, "c", MemberChange::SetMode(MembershipMode::Retained))
-                .await
-                .unwrap()
-                .topology_token(),
-            token
-        );
         change(
             &store,
             "c",

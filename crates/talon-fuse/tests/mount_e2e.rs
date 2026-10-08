@@ -22,6 +22,10 @@
 //! without exercising the kernel path.
 #![cfg(feature = "mount")]
 
+#[cfg(test)]
+#[path = "../../talon-transport/tests/support/membership.rs"]
+mod membership_fixture;
+
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::os::fd::AsRawFd;
@@ -112,23 +116,16 @@ async fn spawn_coordinator(worker_addr: String) -> String {
                         owners: vec![NodeId::new("w1")],
                         epoch: 1,
                     },
-                    ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                        nodes: vec![NodeInfo {
-                            id: NodeId::new("w1"),
-                            address: worker_addr.clone(),
-                            role: NodeRole::Worker,
-                        }],
-                    },
-                    ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
-                        nodes: vec![talon_transport::ZonedNodeInfo {
+                    ControlMessage::MembershipQuery {} => {
+                        membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
                             info: NodeInfo {
                                 id: NodeId::new("w1"),
                                 address: worker_addr.clone(),
                                 role: NodeRole::Worker,
                             },
                             zone: None,
-                        }],
-                    },
+                        }])
+                    }
                     _ => ControlMessage::Ack {
                         ok: false,
                         detail: None,

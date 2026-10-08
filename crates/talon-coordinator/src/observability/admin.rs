@@ -103,20 +103,11 @@ struct MembershipUpdate {
     expected_registry_revision: Option<String>,
     /// Full desired registry, including retained retirement markers.
     registry: talon_core::worker_membership::MemberRegistry,
-    /// Operator confirms stopped retired workers and capability preflight.
-    confirm_preflight: bool,
 }
 async fn update_worker_membership(
     State(state): State<Arc<CoordinatorObservability>>,
     Json(update): Json<MembershipUpdate>,
 ) -> Response {
-    if !update.confirm_preflight {
-        return (
-            StatusCode::BAD_REQUEST,
-            "membership preflight confirmation required",
-        )
-            .into_response();
-    }
     match state
         .update_worker_registry(
             update.expected_registry_revision.as_deref(),
@@ -196,15 +187,8 @@ mod tests {
         use crate::state_store::registry::{change, MemberChange};
         use crate::ClusterStateStore;
         use std::time::Duration;
-        use talon_core::worker_membership::{MembershipMode, WorkerMember};
+        use talon_core::worker_membership::WorkerMember;
         let (observability, store) = observability();
-        change(
-            store.as_ref(),
-            "cluster-a",
-            MemberChange::SetMode(MembershipMode::Retained),
-        )
-        .await
-        .unwrap();
         for id in ["serving", "offline", "conflict", "retired"] {
             change(
                 store.as_ref(),
@@ -239,7 +223,7 @@ mod tests {
         assert!(reply.starts_with("HTTP/1.1 200 OK"));
         let body: serde_json::Value =
             serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
-        assert_eq!(body["mode"], "Retained");
+        assert!(body.get("mode").is_none());
         assert!(body["topology_token"].is_u64());
         assert!(body["state_token"].is_u64());
         assert!(body["valid_for_ms"].as_u64().unwrap() > 0);
