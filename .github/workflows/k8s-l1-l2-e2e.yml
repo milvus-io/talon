@@ -13,6 +13,8 @@ on:
       - "deploy/docker/**"
       - "deploy/helm/talon/**"
       - "scripts/k8s_l1_l2_e2e.sh"
+      - "scripts/retire_e2e_workers.py"
+      - "scripts/test_retire_e2e_workers.py"
 
 permissions:
   contents: read
@@ -24,6 +26,8 @@ jobs:
     timeout-minutes: 50
     steps:
       - uses: actions/checkout@v4
+      - name: Check E2E membership lifecycle
+        run: python3 scripts/test_retire_e2e_workers.py
       - name: Prepare patched Monoio
         run: python3 scripts/prepare_monoio.py
 

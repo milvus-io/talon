@@ -74,6 +74,26 @@ public final class ConformanceTest {
             assertBytes(frame, Telemetry.envelope(frame, "worker"));
             Telemetry.configure(java.util.Set.of(), null);
         });
+        check("incompatible control schemas fail before decoding tags", () -> {
+            for (int schema : new int[] {0, 1, 2, 3, 4, 5, 7}) {
+                boolean rejected = false;
+                try {
+                    Messages.decodeBody(new Bincode.Writer().u16(schema).variant(0).toBytes());
+                } catch (ProtocolException expected) { rejected = true; }
+                assertTrue(rejected, "schema " + schema + " must be rejected");
+            }
+        });
+        check("membership preserves offline and conflicting logical owners", () -> {
+            Bincode.Writer w = new Bincode.Writer().u64(1).u64(2).u64(500).u64(2);
+            w.string("offline").u8(1).string("zone-a").u8(0).variant(0);
+            w.string("conflict").u8(0).u8(0).variant(1);
+            List<NodeInfo> nodes = Messages.readMembershipList(new Bincode.Reader(w.toBytes()));
+            assertEquals(2, nodes.size(), "logical member count");
+            assertEquals("offline", nodes.get(0).id(), "offline id");
+            assertEquals("conflict", nodes.get(1).id(), "conflict id");
+            assertEquals("", nodes.get(0).address(), "offline address");
+            assertEquals("", nodes.get(1).address(), "conflict address");
+        });
         frameHeaderDecodes(byName);
         frameHeaderEncodesIdentically(byName);
         zeroLengthPayloadIsNotEof(byName);
@@ -412,11 +432,12 @@ public final class ConformanceTest {
                         }
                         response = new byte[] {42};
                     } else if (Messages.decodeBody(body).tag == Messages.TAG_MEMBERSHIP_QUERY) {
-                        response = new Bincode.Writer().u16(1).variant(Messages.TAG_MEMBERSHIP_LIST)
-                                .u64(1).string("worker").string(address()).variant(Messages.ROLE_WORKER)
+                        response = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
+                                .u64(1).u64(1).u64(500).u64(1).string("worker").u8(0).u8(0)
+                                .variant(2).string("test-instance").string(address())
                                 .toBytes();
                     } else {
-                        Bincode.Writer w = new Bincode.Writer().u16(2).variant(Messages.TAG_OBJECT_STAT);
+                        Bincode.Writer w = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_OBJECT_STAT);
                         if (!malformedStat) {
                             w.u64(1).string("v1");
                         }

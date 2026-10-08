@@ -46,6 +46,11 @@ pub fn admin_router(state: Arc<CoordinatorObservability>) -> Router {
         .route("/metrics", get(metrics_handler))
         .route("/healthz", get(health_handler))
         .route("/readyz", get(readiness_handler))
+        .route(
+            "/api/v1/worker-membership",
+            get(worker_membership).put(update_worker_membership),
+        )
+        .route("/api/v1/worker-discovery", get(worker_discovery))
         .with_state(Arc::clone(&state))
         // Read-only versioned management API under /api/v1 (issue #82).
         .merge(crate::api::router(state))
@@ -74,6 +79,46 @@ pub fn secured_admin_router(
         .layer(axum::extract::DefaultBodyLimit::max(
             crate::security::MAX_REQUEST_BODY_BYTES,
         ))
+}
+
+/// Instance observation uses its own topology/state equality tokens, never a
+/// fabricated store revision for independently read registry and lease records.
+async fn worker_discovery(State(state): State<Arc<CoordinatorObservability>>) -> Response {
+    match state.worker_discovery().await {
+        Ok(view) => Json(view).into_response(),
+        Err(error) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()).into_response(),
+    }
+}
+
+async fn worker_membership(State(state): State<Arc<CoordinatorObservability>>) -> Response {
+    match state.worker_registry().await {
+        Ok(value) => Json(serde_json::json!({"topology_token": value.value.topology_token(), "registry_revision": value.revision.as_ref().map(|r| r.as_str()), "registry": value.value})).into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MembershipUpdate {
+    expected_registry_revision: Option<String>,
+    /// Full desired registry, including retained retirement markers.
+    registry: talon_core::worker_membership::MemberRegistry,
+}
+async fn update_worker_membership(
+    State(state): State<Arc<CoordinatorObservability>>,
+    Json(update): Json<MembershipUpdate>,
+) -> Response {
+    match state
+        .update_worker_registry(
+            update.expected_registry_revision.as_deref(),
+            update.registry,
+        )
+        .await
+    {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => (StatusCode::CONFLICT, "membership changed; reload registry").into_response(),
+        Err(e) => (StatusCode::SERVICE_UNAVAILABLE, e.to_string()).into_response(),
+    }
 }
 
 async fn metrics_handler(State(state): State<Arc<CoordinatorObservability>>) -> impl IntoResponse {
@@ -136,6 +181,75 @@ mod tests {
 
     use super::*;
     use crate::observability::state::{observability, observability_with_state_failure_grace};
+
+    #[tokio::test]
+    async fn discovery_api_exposes_retained_states_and_bounded_metrics() {
+        use crate::state_store::registry::{change, MemberChange};
+        use crate::ClusterStateStore;
+        use std::time::Duration;
+        use talon_core::worker_membership::WorkerMember;
+        let (observability, store) = observability();
+        for id in ["serving", "offline", "conflict", "retired"] {
+            change(
+                store.as_ref(),
+                "cluster-a",
+                MemberChange::SetMember(WorkerMember {
+                    worker_id: id.into(),
+                    zone: None,
+                    retired: id == "retired",
+                }),
+            )
+            .await
+            .unwrap();
+        }
+        for (id, incarnation) in [
+            ("serving", "sole"),
+            ("conflict", "first"),
+            ("conflict", "second"),
+            ("retired", "stale"),
+        ] {
+            let mut status = crate::observability::state::worker_status();
+            status.node.id = talon_core::NodeId::new(id);
+            status.incarnation_id = incarnation.into();
+            store
+                .upsert_instance(status, Duration::from_secs(30))
+                .await
+                .unwrap();
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(serve_admin(listener, observability.clone()));
+        let reply = request(address, "/api/v1/worker-discovery").await;
+        assert!(reply.starts_with("HTTP/1.1 200 OK"));
+        let body: serde_json::Value =
+            serde_json::from_str(reply.split_once("\r\n\r\n").unwrap().1).unwrap();
+        assert!(body.get("mode").is_none());
+        assert!(body["topology_token"].is_u64());
+        assert!(body["state_token"].is_u64());
+        assert!(body["valid_for_ms"].as_u64().unwrap() > 0);
+        assert_eq!(body["workers"].as_array().unwrap().len(), 3);
+        assert_eq!(body["workers"][0]["state"], "Conflict");
+        assert_eq!(body["workers"][1]["state"], "Offline");
+        assert_eq!(
+            body["workers"][2]["state"]["Serving"]["instance_id"],
+            "sole"
+        );
+        let metrics = request(address, "/metrics").await;
+        assert!(metrics.contains("talon_coordinator_worker_members 3"));
+        for state in ["serving", "offline", "conflict"] {
+            assert!(metrics.contains(&format!(
+                "talon_coordinator_worker_member_states{{state=\"{state}\"}} 1"
+            )));
+        }
+        store.set_available(false);
+        assert!(request(address, "/api/v1/worker-discovery")
+            .await
+            .starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert!(request(address, "/metrics")
+            .await
+            .contains("talon_coordinator_worker_members 3"));
+        server.abort();
+    }
 
     #[tokio::test]
     async fn admin_endpoints_report_health_readiness_metrics_and_failure() {

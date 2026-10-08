@@ -168,7 +168,20 @@ async fn run() -> anyhow::Result<()> {
 /// Return the coordinator's current membership snapshot.
 async fn membership_lookup(coordinator: &str) -> anyhow::Result<Vec<talon_core::NodeInfo>> {
     match request_control(coordinator, &ControlMessage::MembershipQuery {}).await? {
-        ControlMessage::MembershipList { nodes } => Ok(nodes),
+        ControlMessage::MembershipList { view } => Ok(view
+            .workers
+            .into_iter()
+            .map(|worker| talon_core::NodeInfo {
+                id: talon_core::NodeId::new(worker.member.worker_id),
+                address: match worker.state {
+                    talon_core::worker_membership::InstanceState::Serving { address, .. } => {
+                        address
+                    }
+                    _ => String::new(),
+                },
+                role: talon_core::NodeRole::Worker,
+            })
+            .collect()),
         other => anyhow::bail!("unexpected membership reply: {other:?}"),
     }
 }

@@ -146,8 +146,8 @@ async fn worker_registration_is_visible_through_every_coordinator() {
     b.obs.check_ready().await.unwrap();
 
     // A worker registers through coordinator A only.
-    store
-        .upsert_node(worker(CLUSTER, "w1", "inc-1", 0, 1_000), TTL)
+    a.obs
+        .upsert_status(worker(CLUSTER, "w1", "inc-1", 0, 1_000), TTL)
         .await
         .unwrap();
 
@@ -182,8 +182,8 @@ async fn service_survives_coordinator_shutdown() {
     // Both coordinators register their own leases.
     a.obs.upsert_status(a.obs.status(), TTL).await.unwrap();
     b.obs.upsert_status(b.obs.status(), TTL).await.unwrap();
-    store
-        .upsert_node(worker(CLUSTER, "w1", "inc-1", 0, 1_000), TTL)
+    a.obs
+        .upsert_status(worker(CLUSTER, "w1", "inc-1", 0, 1_000), TTL)
         .await
         .unwrap();
     a.reconcile().await;
@@ -221,8 +221,8 @@ async fn reads_fail_closed_during_backend_outage_and_recover() {
     let (store, mem, _clock) = memory_store();
     let a = Coordinator::new("coord-a", CLUSTER, Arc::clone(&store));
     a.obs.check_ready().await.unwrap();
-    store
-        .upsert_node(worker(CLUSTER, "w1", "inc-1", 0, 1_000), TTL)
+    a.obs
+        .upsert_status(worker(CLUSTER, "w1", "inc-1", 0, 1_000), TTL)
         .await
         .unwrap();
     assert!(a.reconcile().await);
@@ -248,13 +248,13 @@ async fn reads_fail_closed_during_backend_outage_and_recover() {
 }
 
 #[tokio::test]
-async fn crashed_worker_is_removed_after_lease_ttl() {
+async fn crashed_worker_keeps_ownership_but_loses_its_serving_address() {
     let (store, _mem, clock) = memory_store();
     let a = Coordinator::new("coord-a", CLUSTER, Arc::clone(&store));
     a.obs.check_ready().await.unwrap();
     let ttl = Duration::from_secs(30);
-    store
-        .upsert_node(worker(CLUSTER, "w1", "inc-1", 0, 1_000), ttl)
+    a.obs
+        .upsert_status(worker(CLUSTER, "w1", "inc-1", 0, 1_000), ttl)
         .await
         .unwrap();
     assert!(a.reconcile().await);
@@ -264,9 +264,13 @@ async fn crashed_worker_is_removed_after_lease_ttl() {
     // (the derived removal deadline) expires its record.
     clock.advance(ttl + Duration::from_millis(1));
     assert!(a.reconcile().await);
-    assert!(
-        a.service.membership().snapshot().is_empty(),
-        "worker must be removed within lease_ttl of its last heartbeat"
+    let members = a.service.membership().snapshot();
+    assert_eq!(members.len(), 1);
+    assert_eq!(members[0].id, NodeId::new("w1"));
+    assert!(members[0].address.is_empty());
+    assert_eq!(
+        a.service.lookup(&block(1), 1).owners,
+        vec!["w1".to_string()]
     );
 }
 
@@ -304,13 +308,14 @@ async fn rolling_restart_reproduces_identical_placement_version() {
     // placement across the restart are not forced to refresh (rolling-upgrade
     // compatibility).
     let (store, _mem, _clock) = memory_store();
+    let before = Coordinator::new("coord-a", CLUSTER, Arc::clone(&store));
     for id in ["w1", "w2", "w3"] {
-        store
-            .upsert_node(worker(CLUSTER, id, "inc-1", 0, 1_000), TTL)
+        before
+            .obs
+            .upsert_status(worker(CLUSTER, id, "inc-1", 0, 1_000), TTL)
             .await
             .unwrap();
     }
-    let before = Coordinator::new("coord-a", CLUSTER, Arc::clone(&store));
     before.obs.check_ready().await.unwrap();
     before.reconcile().await;
     let version_before = before.service.membership().epoch();
@@ -348,12 +353,12 @@ async fn backend_agnostic_scenario(store: Arc<dyn ClusterStateStore>, cluster: &
     b.obs.upsert_status(b.obs.status(), TTL).await.unwrap();
 
     let now = 1_000;
-    store
-        .upsert_node(worker(cluster, "w1", "inc-1", 0, now), TTL)
+    a.obs
+        .upsert_status(worker(cluster, "w1", "inc-1", 0, now), TTL)
         .await
         .unwrap();
-    store
-        .upsert_node(worker(cluster, "w2", "inc-1", 0, now), TTL)
+    a.obs
+        .upsert_status(worker(cluster, "w2", "inc-1", 0, now), TTL)
         .await
         .unwrap();
 

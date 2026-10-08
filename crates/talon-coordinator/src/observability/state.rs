@@ -7,7 +7,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use talon_core::{
@@ -48,6 +48,11 @@ pub struct CoordinatorObservability {
     request_timeout: Duration,
     pub(crate) metrics: CoordinatorMetrics,
     store: Arc<dyn ClusterStateStore>,
+    last_discovery: RwLock<Option<(talon_core::worker_membership::WorkerDiscovery, Instant)>>,
+    heartbeats: Mutex<super::heartbeats::Heartbeats>,
+    // Serialize snapshot installation and slow-path admission. The heartbeat
+    // fast path never waits for this lock or performs backend I/O.
+    membership_refresh: tokio::sync::Mutex<()>,
     /// What this cluster advertises, and the store that backs it.
     ///
     /// `advertised` and `revision` are fixed at construction: they describe the
@@ -83,6 +88,9 @@ impl CoordinatorObservability {
             incarnation_id: generate_incarnation_id()?,
             started_at_unix_ms: now_unix_ms(),
             started: Instant::now(),
+            last_discovery: RwLock::new(None),
+            heartbeats: Mutex::new(Default::default()),
+            membership_refresh: tokio::sync::Mutex::new(()),
             sequence: AtomicU64::new(0),
             ready: AtomicBool::new(false),
             state_store_degraded: AtomicBool::new(false),
@@ -250,6 +258,14 @@ impl CoordinatorObservability {
     /// Whether authoritative shared state is currently ready.
     pub fn is_ready(&self) -> bool {
         self.ready.load(Ordering::Acquire)
+            && self
+                .last_discovery
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .map_or(true, |(_, refreshed)| {
+                    refreshed.elapsed() < self.discovery_max_age()
+                })
             && (!self.state_store_degraded.load(Ordering::Acquire)
                 || self.membership_within_failure_grace())
             && !self.shutting_down.load(Ordering::Acquire)
@@ -292,6 +308,12 @@ impl CoordinatorObservability {
         status: NodeStatus,
         lease_ttl: Duration,
     ) -> StateStoreResult<WriteResult> {
+        if status.node.role == NodeRole::Worker {
+            return self
+                .publish_instance(status, lease_ttl)
+                .await
+                .map(|(result, _)| result);
+        }
         let started = Instant::now();
         let result = match tokio::time::timeout(
             self.request_timeout,
@@ -338,6 +360,350 @@ impl CoordinatorObservability {
         }
     }
 
+    pub async fn worker_discovery(
+        &self,
+    ) -> StateStoreResult<talon_core::worker_membership::WorkerDiscovery> {
+        use talon_core::worker_membership::*;
+        let view = tokio::time::timeout(self.request_timeout, async {
+            let registry = self.store.member_registry(&self.cluster_id).await?.value;
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            Ok::<_, StateStoreError>(WorkerDiscovery::retained(&registry, &instances.nodes))
+        })
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })??;
+        self.metrics.update_worker_discovery(&view);
+        Ok(view)
+    }
+
+    fn discovery_max_age(&self) -> Duration {
+        if self.state_failure_grace.is_zero() {
+            self.request_timeout
+        } else {
+            self.state_failure_grace
+        }
+    }
+
+    /// Serve the last installed observation without a backend round trip.
+    /// Periodic reconciliation alone renews its bounded validity.
+    pub async fn membership_for_query(
+        &self,
+    ) -> StateStoreResult<talon_core::worker_membership::WorkerDiscovery> {
+        if !self.is_ready() {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "coordinator not ready",
+            ));
+        }
+        let cached = self
+            .last_discovery
+            .read()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some((view, refreshed)) = cached.as_ref() {
+            let remaining = self.discovery_max_age().saturating_sub(refreshed.elapsed());
+            if remaining.as_millis() > 0 {
+                let mut view = view.clone();
+                view.valid_for_ms = view.valid_for_ms.min(remaining.as_millis() as u64);
+                return Ok(view);
+            }
+        }
+        Err(crate::state_store::registry::invalid(
+            self.store.backend(),
+            "membership cache requires refresh",
+        ))
+    }
+
+    fn buffer_instance(
+        &self,
+        status: &NodeStatus,
+        ttl: Duration,
+    ) -> Option<StateStoreResult<bool>> {
+        if !self.is_ready() || !self.membership_cache_is_fresh() {
+            return None;
+        }
+        self.heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .receive(status, ttl)
+            .map(|result| {
+                result.map_err(|()| {
+                    crate::state_store::registry::invalid(
+                        self.store.backend(),
+                        "stale instance heartbeat",
+                    )
+                })
+            })
+    }
+
+    fn membership_cache_is_fresh(&self) -> bool {
+        self.last_discovery
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .is_some_and(|(_, refreshed)| refreshed.elapsed() < self.discovery_max_age())
+    }
+
+    /// Accept an unchanged admitted instance in memory, or synchronously admit
+    /// a new/changed instance and install its routing observation before Ack.
+    /// The second result says whether proxy membership needs refreshing.
+    pub async fn receive_instance(
+        &self,
+        status: NodeStatus,
+        ttl: Duration,
+        membership: &crate::Membership,
+    ) -> StateStoreResult<(bool, bool)> {
+        let received = Instant::now();
+        status.validate()?;
+        if status.cluster_id != self.cluster_id || status.node.role != NodeRole::Worker {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "invalid worker instance cluster or role",
+            ));
+        }
+        self.check_cached_sequence(&status)?;
+        if let Some(result) = self.buffer_instance(&status, ttl) {
+            return result.map(|serving| (serving, false));
+        }
+        // Queueing is part of the request budget. A disconnected caller's
+        // report must not wait indefinitely and then acquire a fresh lease.
+        let result = tokio::time::timeout(self.request_timeout, async {
+            let _refresh = self.membership_refresh.lock().await;
+            self.check_cached_sequence(&status)?;
+            if let Some(result) = self.buffer_instance(&status, ttl) {
+                return result.map(|serving| (serving, false));
+            }
+            let remaining = ttl.saturating_sub(received.elapsed());
+            if remaining.is_zero() {
+                return Err(StateStoreError::InvalidLeaseTtl(remaining));
+            }
+            let (written, _) = self.publish_instance(status.clone(), remaining).await?;
+            self.reconcile_membership_inner(membership).await?;
+            let cached = self.last_discovery.read().unwrap_or_else(|e| e.into_inner());
+            let serving = cached.as_ref().is_some_and(|(view, _)| view.workers.iter().any(|worker|
+                worker.member.worker_id == status.node.id.0
+                    && matches!(&worker.state, talon_core::worker_membership::InstanceState::Serving { instance_id, .. }
+                        if instance_id == &status.incarnation_id)));
+            if written.disposition == crate::WriteDisposition::Applied {
+                self.heartbeats.lock().unwrap_or_else(|e| e.into_inner())
+                    .admit(status, ttl, received, serving);
+            }
+            Ok((serving, true))
+        }).await.unwrap_or_else(|_| Err(StateStoreError::Timeout { backend: self.store.backend() }));
+        if result.is_err() {
+            self.record_state_store_failure();
+        }
+        result
+    }
+
+    fn check_cached_sequence(&self, status: &NodeStatus) -> StateStoreResult<()> {
+        if self
+            .heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_stale(status)
+        {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "stale instance heartbeat",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Publish coalesced reports independently of discovery reconciliation.
+    /// Backend latency here must not block snapshot reads or new admissions.
+    pub async fn publish_buffered_instances(&self) -> StateStoreResult<()> {
+        let result = async {
+            let registry = self.worker_registry().await?.value;
+            self.flush_heartbeats(&registry).await
+        }
+        .await;
+        if result.is_err() {
+            self.record_state_store_failure();
+        }
+        result
+    }
+
+    async fn flush_heartbeats(
+        &self,
+        registry: &talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<()> {
+        // One latest report per locally admitted instance, not a task per
+        // heartbeat. Keep backend concurrency bounded independently of N.
+        let pending = self
+            .heartbeats
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pending(registry);
+        let mut pending = pending.into_iter();
+        let mut writes = tokio::task::JoinSet::new();
+        loop {
+            while writes.len() < 16 {
+                let Some(heartbeat) = pending.next() else {
+                    break;
+                };
+                let store = self.store.clone();
+                let request_timeout = self.request_timeout;
+                writes.spawn(async move {
+                    let result = tokio::time::timeout(request_timeout, async {
+                        let remaining = heartbeat.ttl.saturating_sub(heartbeat.received.elapsed());
+                        if remaining.is_zero() {
+                            return Ok(None);
+                        }
+                        let written = store
+                            .upsert_instance(heartbeat.status.clone(), remaining)
+                            .await?;
+                        if written.disposition == crate::WriteDisposition::Stale {
+                            return Ok(None);
+                        }
+                        let remaining = heartbeat.ttl.saturating_sub(heartbeat.received.elapsed());
+                        if !remaining.is_zero() {
+                            let mut status = heartbeat.status.clone();
+                            status.ready &= heartbeat.serving;
+                            store.upsert_node(status, remaining).await?;
+                        }
+                        Ok(Some(()))
+                    })
+                    .await
+                    .unwrap_or_else(|_| {
+                        Err(StateStoreError::Timeout {
+                            backend: store.backend(),
+                        })
+                    });
+                    (heartbeat, result)
+                });
+            }
+            let Some(completed) = writes.join_next().await else {
+                break;
+            };
+            let (heartbeat, result) = completed.map_err(|error| StateStoreError::Unavailable {
+                backend: self.store.backend(),
+                detail: format!("heartbeat publication task failed: {error}"),
+            })?;
+            let mut cache = self.heartbeats.lock().unwrap_or_else(|e| e.into_inner());
+            match result? {
+                Some(()) => cache.persisted(&heartbeat),
+                None => cache.forget(&heartbeat.status),
+            }
+        }
+        Ok(())
+    }
+
+    /// Authoritative targets for control updates, without manufacturing a watch
+    /// cursor across the independently read member and instance resources.
+    pub async fn serving_workers(&self) -> StateStoreResult<Vec<NodeStatus>> {
+        use talon_core::worker_membership::{InstanceState, WorkerDiscovery};
+        tokio::time::timeout(self.request_timeout, async {
+            let registry = self.store.member_registry(&self.cluster_id).await?.value;
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            let view = WorkerDiscovery::retained(&registry, &instances.nodes);
+            let serving: std::collections::HashSet<_> = view
+                .workers
+                .iter()
+                .filter_map(|worker| match &worker.state {
+                    InstanceState::Serving { instance_id, .. } => {
+                        Some((worker.member.worker_id.as_str(), instance_id.as_str()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(instances
+                .nodes
+                .into_iter()
+                .filter(|status| {
+                    serving.contains(&(status.node.id.0.as_str(), status.incarnation_id.as_str()))
+                })
+                .collect())
+        })
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })?
+    }
+
+    pub async fn report_instance(
+        &self,
+        status: NodeStatus,
+        ttl: Duration,
+    ) -> StateStoreResult<bool> {
+        self.publish_instance(status, ttl)
+            .await
+            .map(|(_, serving)| serving)
+    }
+
+    async fn publish_instance(
+        &self,
+        mut status: NodeStatus,
+        ttl: Duration,
+    ) -> StateStoreResult<(WriteResult, bool)> {
+        use crate::state_store::registry::{change, MemberChange};
+        use talon_core::worker_membership::InstanceState;
+        if status.cluster_id != self.cluster_id || status.node.role != NodeRole::Worker {
+            return Err(crate::state_store::registry::invalid(
+                self.store.backend(),
+                "invalid worker instance cluster or role",
+            ));
+        }
+        status.validate()?;
+        let worker_id = status.node.id.0.clone();
+        let incarnation = status.incarnation_id.clone();
+        tokio::time::timeout(self.request_timeout, async {
+            change(self.store.as_ref(), &self.cluster_id, MemberChange::Register {
+                worker_id: worker_id.clone(), zone: status.labels.get(talon_core::NODE_ZONE_LABEL).cloned(),
+            }).await?;
+            let result = self.store.upsert_instance(status.clone(), ttl).await?;
+            if !matches!(result.disposition, crate::WriteDisposition::Applied | crate::WriteDisposition::Duplicate) {
+                return Err(crate::state_store::registry::invalid(self.store.backend(), "stale instance heartbeat"));
+            }
+            let registry = self.store.member_registry(&self.cluster_id).await?.value;
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            let view = talon_core::worker_membership::WorkerDiscovery::retained(&registry, &instances.nodes);
+            let serving = view.workers.iter().any(|w| w.member.worker_id == worker_id && matches!(&w.state, InstanceState::Serving { instance_id, .. } if instance_id == &incarnation));
+            // Keep the single-node management projection current too. Routing
+            // uses the persistent registry and instance leases; management APIs
+            // retain their consistent node snapshot and backend revision.
+            status.ready &= serving;
+            self.store.upsert_node(status, ttl).await?;
+            Ok((result, serving))
+        }).await.map_err(|_| StateStoreError::Timeout { backend: self.store.backend() })?
+    }
+
+    pub async fn worker_registry(
+        &self,
+    ) -> StateStoreResult<crate::state_store::registry::RegistrySnapshot> {
+        tokio::time::timeout(
+            self.request_timeout,
+            self.store.member_registry(&self.cluster_id),
+        )
+        .await
+        .map_err(|_| StateStoreError::Timeout {
+            backend: self.store.backend(),
+        })?
+    }
+
+    pub async fn update_worker_registry(
+        &self,
+        expected_revision: Option<&str>,
+        mut value: talon_core::worker_membership::MemberRegistry,
+    ) -> StateStoreResult<bool> {
+        tokio::time::timeout(self.request_timeout, async {
+            let current = self.store.member_registry(&self.cluster_id).await?;
+            if current.revision.as_ref().map(|r| r.as_str()) != expected_revision { return Ok(false); }
+            if current.value.members.iter().any(|old| !value.members.iter().any(|new| old.worker_id == new.worker_id)) {
+                return Err(crate::state_store::registry::invalid(self.store.backend(), "retain all member records; retire instead of deleting"));
+            }
+            let instances = self.store.instance_snapshot(&self.cluster_id).await?;
+            if value.members.iter().any(|m| m.retired && instances.nodes.iter().any(|n| n.node.id.0 == m.worker_id && n.ready)) {
+                return Err(crate::state_store::registry::invalid(self.store.backend(), "stop worker and wait for instance withdrawal/expiration before retirement"));
+            }
+            value.members.sort_by(|a,b| a.worker_id.cmp(&b.worker_id));
+            let applied = self.store.compare_member_registry(&self.cluster_id, current.revision.as_ref(), &value).await?;
+            if applied { tracing::info!(cluster = %self.cluster_id, ?value, "administrative membership update"); }
+            Ok(applied)
+        }).await.map_err(|_| StateStoreError::Timeout { backend: self.store.backend() })?
+    }
+
     /// Reconcile local membership from an authoritative store snapshot.
     ///
     /// This is what makes coordinators active-active: the node set consulted by
@@ -345,58 +711,79 @@ impl CoordinatorObservability {
     /// happened to land on this process. A worker registered through any
     /// coordinator becomes visible through every coordinator once it reconciles.
     ///
-    /// Only non-expired **worker** records populate placement membership;
-    /// coordinator records are tracked in the store for the management view but
-    /// are not placement targets. On a store error the local membership is left
+    /// Every non-retired worker remains a logical placement member. Only a sole
+    /// healthy, ready instance contributes a serving address; coordinator records
+    /// remain management-only. On a store error the local membership is left
     /// untouched (last-good). A transient store error keeps that snapshot usable
     /// only for the configured grace; after it expires readiness fails closed.
     pub async fn reconcile_membership(
         &self,
         membership: &crate::Membership,
     ) -> StateStoreResult<()> {
-        let started = Instant::now();
-        let result =
-            match tokio::time::timeout(self.request_timeout, self.store.snapshot(&self.cluster_id))
-                .await
-            {
-                Ok(result) => result,
-                Err(_) => Err(StateStoreError::Timeout {
-                    backend: self.store.backend(),
-                }),
-            };
-        self.metrics
-            .record_state("snapshot", &result, started.elapsed());
-        match result {
-            Ok(snapshot) => {
-                self.metrics.update_snapshot(&snapshot);
-                // Only healthy, ready workers are placement targets. Expired
-                // leases are already absent from the snapshot; this additionally
-                // excludes present-but-unhealthy/not-ready workers so a degraded
-                // node is not handed to clients as an owner (issue #118).
-                let workers: Vec<(NodeInfo, Option<String>)> = snapshot
-                    .nodes
-                    .iter()
-                    .filter(|status| {
-                        status.node.role == NodeRole::Worker
-                            && status.health == NodeHealth::Healthy
-                            && status.ready
-                    })
-                    .map(|status| {
-                        (
-                            status.node.clone(),
-                            status.labels.get(talon_core::NODE_ZONE_LABEL).cloned(),
-                        )
-                    })
-                    .collect();
-                membership.reconcile_zoned(workers);
-                self.record_membership_refresh();
-                Ok(())
-            }
-            Err(error) => {
-                self.record_state_store_failure();
-                Err(error)
-            }
+        let _refresh = self.membership_refresh.lock().await;
+        self.reconcile_membership_inner(membership).await
+    }
+
+    async fn reconcile_membership_inner(
+        &self,
+        membership: &crate::Membership,
+    ) -> StateStoreResult<()> {
+        let result = async {
+            // Refresh discovery independently of pending publication work.
+            let registry = self.worker_registry().await?.value;
+            let observed = Instant::now();
+            let instances = tokio::time::timeout(
+                self.request_timeout,
+                self.store.instance_snapshot(&self.cluster_id),
+            )
+            .await
+            .map_err(|_| StateStoreError::Timeout {
+                backend: self.store.backend(),
+            })??;
+            let view = talon_core::worker_membership::WorkerDiscovery::retained(
+                &registry,
+                &instances.nodes,
+            );
+            self.refresh_snapshot().await?;
+            self.metrics.update_worker_discovery(&view);
+            self.heartbeats
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .install(&view, &instances.nodes, observed);
+            let cached = view.clone();
+            let workers = view
+                .workers
+                .into_iter()
+                .map(|w| {
+                    let address = match w.state {
+                        talon_core::worker_membership::InstanceState::Serving {
+                            address, ..
+                        } => address,
+                        _ => String::new(),
+                    };
+                    (
+                        NodeInfo {
+                            id: talon_core::NodeId::new(w.member.worker_id),
+                            address,
+                            role: NodeRole::Worker,
+                        },
+                        w.member.zone,
+                    )
+                })
+                .collect();
+            membership.reconcile_zoned(workers);
+            *self
+                .last_discovery
+                .write()
+                .unwrap_or_else(|e| e.into_inner()) = Some((cached, observed));
+            self.record_membership_refresh();
+            Ok(())
         }
+        .await;
+        if result.is_err() {
+            self.record_state_store_failure();
+        }
+        result
     }
 
     /// Fetch a linearizable snapshot for the management API, updating freshness
@@ -740,7 +1127,223 @@ mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn reconcile_excludes_unhealthy_and_not_ready_workers() {
+    async fn warm_heartbeats_and_discovery_do_not_access_the_backend() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        let ttl = Duration::from_secs(30);
+        let mut status = worker_status();
+        assert_eq!(
+            obs.receive_instance(status.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (true, true)
+        );
+        let before = store.instance_snapshot("cluster-a").await.unwrap();
+        // Any attempted backend access now fails. Warm requests must succeed
+        // entirely in memory, without swallowing an I/O error or marking the
+        // coordinator degraded.
+        store.set_available(false);
+        for seq in 1..=100 {
+            status.heartbeat_seq = seq;
+            status.metrics.block_count = seq;
+            assert_eq!(
+                obs.receive_instance(status.clone(), ttl, &membership)
+                    .await
+                    .unwrap(),
+                (true, false)
+            );
+            assert_eq!(obs.membership_for_query().await.unwrap().workers.len(), 1);
+        }
+        assert!(!obs.state_store_degraded.load(Ordering::Acquire));
+        status.heartbeat_seq -= 1;
+        assert!(obs
+            .receive_instance(status.clone(), ttl, &membership)
+            .await
+            .is_err());
+        store.set_available(true);
+        assert_eq!(
+            store.instance_snapshot("cluster-a").await.unwrap().nodes,
+            before.nodes
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_publication_coalesces_reports_and_reaches_other_coordinators() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        let ttl = Duration::from_secs(30);
+        let mut status = worker_status();
+        obs.receive_instance(status.clone(), ttl, &membership)
+            .await
+            .unwrap();
+        // Make the last publication due without sleeping or changing the
+        // backend clock; receipt of new heartbeats remains current.
+        obs.heartbeats.lock().unwrap().admit(
+            status.clone(),
+            ttl,
+            Instant::now() - Duration::from_secs(11),
+            true,
+        );
+        for seq in 1..=100 {
+            status.heartbeat_seq = seq;
+            status.metrics.block_count = seq;
+            assert_eq!(
+                obs.receive_instance(status.clone(), ttl, &membership)
+                    .await
+                    .unwrap(),
+                (true, false)
+            );
+        }
+        assert_eq!(
+            store.instance_snapshot("cluster-a").await.unwrap().nodes[0].heartbeat_seq,
+            0
+        );
+        obs.publish_buffered_instances().await.unwrap();
+        obs.reconcile_membership(&membership).await.unwrap();
+        let published = store.instance_snapshot("cluster-a").await.unwrap();
+        assert_eq!(published.nodes[0].heartbeat_seq, 100);
+        assert_eq!(
+            store.snapshot("cluster-a").await.unwrap().nodes[0]
+                .metrics
+                .block_count,
+            100
+        );
+        obs.publish_buffered_instances().await.unwrap();
+        obs.reconcile_membership(&membership).await.unwrap();
+        assert_eq!(
+            store.instance_snapshot("cluster-a").await.unwrap().revision,
+            published.revision,
+            "a reconcile with no new report must not renew a lease"
+        );
+
+        let peer = CoordinatorObservability::new(
+            "cluster-a".into(),
+            obs.node.clone(),
+            obs.admin_address.clone(),
+            Duration::from_secs(1),
+            store.clone(),
+        )
+        .unwrap();
+        peer.reconcile_membership(&crate::Membership::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            peer.membership_for_query().await.unwrap().workers,
+            obs.membership_for_query().await.unwrap().workers
+        );
+        // A Service can route the next heartbeat to a different replica. Its
+        // shared observation must already warm the instance fast path.
+        store.set_available(false);
+        status.heartbeat_seq += 1;
+        assert_eq!(
+            peer.receive_instance(status, ttl, &crate::Membership::new())
+                .await
+                .unwrap(),
+            (true, false)
+        );
+    }
+
+    #[tokio::test]
+    async fn admission_queue_wait_is_part_of_the_request_deadline() {
+        let (obs, store) = observability();
+        let _blocked = obs.membership_refresh.lock().await;
+        let error = obs
+            .receive_instance(
+                worker_status(),
+                Duration::from_secs(30),
+                &crate::Membership::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, StateStoreError::Timeout { .. }));
+        assert!(store
+            .instance_snapshot("cluster-a")
+            .await
+            .unwrap()
+            .nodes
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn cached_queries_do_not_refresh_observation_age() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        obs.receive_instance(worker_status(), Duration::from_secs(30), &membership)
+            .await
+            .unwrap();
+        obs.last_discovery.write().unwrap().as_mut().unwrap().1 -= Duration::from_secs(16);
+        assert!(
+            !obs.is_ready(),
+            "a stalled refresh task must expire even without a reported backend error"
+        );
+        assert!(obs.membership_for_query().await.is_err());
+        obs.check_ready().await.unwrap();
+        assert!(
+            obs.membership_for_query().await.is_err(),
+            "health probes cannot refresh discovery"
+        );
+        store.set_available(false);
+        let mut status = worker_status();
+        status.heartbeat_seq += 1;
+        assert!(obs
+            .receive_instance(status, Duration::from_secs(30), &membership)
+            .await
+            .is_err());
+        store.set_available(true);
+        obs.reconcile_membership(&membership).await.unwrap();
+        assert!(obs.membership_for_query().await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn state_changes_require_publication_and_invalidate_cached_grants() {
+        let (obs, store) = observability_with_state_failure_grace(Duration::from_secs(15));
+        let membership = crate::Membership::new();
+        let ttl = Duration::from_secs(30);
+        let mut first = worker_status();
+        obs.receive_instance(first.clone(), ttl, &membership)
+            .await
+            .unwrap();
+        let mut second = first.clone();
+        second.incarnation_id = "second".into();
+        assert_eq!(
+            obs.receive_instance(second.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (false, true)
+        );
+        first.heartbeat_seq += 1;
+        assert_eq!(
+            obs.receive_instance(first.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (false, false)
+        );
+        second.heartbeat_seq += 1;
+        second.ready = false;
+        assert_eq!(
+            obs.receive_instance(second, ttl, &membership)
+                .await
+                .unwrap(),
+            (false, true)
+        );
+        first.heartbeat_seq += 1;
+        assert_eq!(
+            obs.receive_instance(first.clone(), ttl, &membership)
+                .await
+                .unwrap(),
+            (true, false)
+        );
+        first.heartbeat_seq += 1;
+        first.node.address = "127.0.0.1:9001".into();
+        store.set_available(false);
+        assert!(
+            obs.receive_instance(first, ttl, &membership).await.is_err(),
+            "a cached grant must never approve an unconfirmed address"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_retains_unavailable_owners_without_serving_addresses() {
         use crate::Membership;
         let (observability, _store) = observability();
         observability.check_ready().await.unwrap();
@@ -769,9 +1372,13 @@ mod tests {
             .await
             .unwrap();
 
-        // Only the healthy, ready worker is a placement target.
-        let ids: Vec<String> = membership.snapshot().into_iter().map(|n| n.id.0).collect();
-        assert_eq!(ids, vec!["worker-1".to_string()]);
+        // All logical owners remain; only the healthy, ready instance is dialable.
+        let mut nodes = membership.snapshot();
+        nodes.sort_by(|a, b| a.id.0.cmp(&b.id.0));
+        assert_eq!(nodes.len(), 3);
+        assert_eq!(nodes[0].id.0, "worker-1");
+        assert!(!nodes[0].address.is_empty());
+        assert!(nodes[1..].iter().all(|node| node.address.is_empty()));
     }
 
     #[tokio::test]

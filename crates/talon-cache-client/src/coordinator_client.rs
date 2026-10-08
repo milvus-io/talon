@@ -18,8 +18,12 @@
 //! ([`talon_transport::encode`]/[`decode`](talon_transport::decode)), so this
 //! module only owns the connect + read-a-frame glue and the response matching.
 
+#[cfg(test)]
+use crate::membership_fixture;
+
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
@@ -29,11 +33,6 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 
 use crate::pool::ConnectionPool;
-
-/// How long to keep answering zoned membership from the v1 query after the
-/// schema-v5 query failed (an older coordinator drops the connection), so an
-/// un-upgraded coordinator is not re-probed on every refresh.
-const MEMBERSHIP_V2_RETRY_COOLDOWN_MS: u64 = 60_000;
 
 /// Placement answer for a block: ordered owners + the epoch they hold at.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -106,9 +105,6 @@ impl CoordinatorError {
 pub struct CoordinatorClient {
     addr: String,
     pool: Arc<ConnectionPool>,
-    /// Unix ms of the last failed schema-v5 membership query (`0` = none);
-    /// shared across clones so the fallback cooldown is per coordinator.
-    membership_v2_failed_at_ms: Arc<AtomicU64>,
 }
 
 impl CoordinatorClient {
@@ -122,7 +118,6 @@ impl CoordinatorClient {
         Self {
             addr: addr.into(),
             pool,
-            membership_v2_failed_at_ms: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -150,11 +145,15 @@ impl CoordinatorClient {
         }
     }
 
-    /// Fetch the current membership snapshot (node id + address).
-    pub async fn membership(&self) -> Result<Vec<NodeInfo>, CoordinatorError> {
-        let req = ControlMessage::MembershipQuery {};
-        match self.round_trip(req, "MembershipQuery").await? {
-            ControlMessage::MembershipList { nodes } => Ok(nodes),
+    /// Fetch persistent membership and explicit instance availability.
+    pub async fn discovery(
+        &self,
+    ) -> Result<talon_core::worker_membership::WorkerDiscovery, CoordinatorError> {
+        match self
+            .round_trip(ControlMessage::MembershipQuery {}, "MembershipQuery")
+            .await?
+        {
+            ControlMessage::MembershipList { view } => Ok(view),
             other => Err(CoordinatorError::Unexpected {
                 expected: "MembershipQuery",
                 got: Box::new(other),
@@ -162,49 +161,36 @@ impl CoordinatorClient {
         }
     }
 
-    /// Fetch membership with per-node zones (ADR 0006).
-    ///
-    /// Sends the schema-v5 query first. A coordinator that predates schema v5
-    /// drops the connection at the envelope, so any round-trip failure falls
-    /// back to the v1 query (zones unknown) and starts a cooldown before v5
-    /// is retried. A v5 coordinator's structured refusals (for example "not
-    /// ready") surface as errors without a pointless v1 retry.
-    ///
-    /// `now_ms` drives the cooldown clock and is caller-supplied like every
-    /// other timestamp in this crate, so tests control time.
-    pub async fn membership_zoned(
-        &self,
-        now_ms: u64,
-    ) -> Result<Vec<ZonedNodeInfo>, CoordinatorError> {
-        let failed_at = self.membership_v2_failed_at_ms.load(Ordering::Relaxed);
-        if failed_at == 0 || now_ms.saturating_sub(failed_at) > MEMBERSHIP_V2_RETRY_COOLDOWN_MS {
-            let req = ControlMessage::MembershipQueryV2 {};
-            match self.round_trip(req, "MembershipQueryV2").await {
-                Ok(ControlMessage::MembershipListV2 { nodes }) => {
-                    self.membership_v2_failed_at_ms.store(0, Ordering::Relaxed);
-                    return Ok(nodes);
-                }
-                Ok(other) => {
-                    return Err(CoordinatorError::Unexpected {
-                        expected: "MembershipQueryV2",
-                        got: Box::new(other),
-                    })
-                }
-                Err(error) => {
-                    self.membership_v2_failed_at_ms
-                        .store(now_ms.max(1), Ordering::Relaxed);
-                    tracing::debug!(
-                        %error,
-                        "zoned membership query failed; falling back to the v1 query"
-                    );
-                }
-            }
-        }
+    /// Project logical members to placement nodes, retaining unavailable owners.
+    pub async fn membership(&self) -> Result<Vec<NodeInfo>, CoordinatorError> {
         Ok(self
-            .membership()
+            .membership_zoned()
             .await?
             .into_iter()
-            .map(|info| ZonedNodeInfo { info, zone: None })
+            .map(|node| node.info)
+            .collect())
+    }
+
+    /// Project the same discovery into zoned placement nodes.
+    pub async fn membership_zoned(&self) -> Result<Vec<ZonedNodeInfo>, CoordinatorError> {
+        Ok(self
+            .discovery()
+            .await?
+            .workers
+            .into_iter()
+            .map(|worker| ZonedNodeInfo {
+                info: NodeInfo {
+                    id: NodeId::new(worker.member.worker_id),
+                    address: match worker.state {
+                        talon_core::worker_membership::InstanceState::Serving {
+                            address, ..
+                        } => address,
+                        _ => String::new(),
+                    },
+                    role: talon_core::NodeRole::Worker,
+                },
+                zone: worker.member.zone,
+            })
             .collect())
     }
 
@@ -483,10 +469,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unified_membership_preserves_unavailable_owners_and_zones() {
+        use talon_core::worker_membership::*;
+        let members = vec![
+            DiscoveredWorker {
+                member: WorkerMember {
+                    worker_id: "offline".into(),
+                    zone: Some("zone-a".into()),
+                    retired: false,
+                },
+                state: InstanceState::Offline,
+            },
+            DiscoveredWorker {
+                member: WorkerMember {
+                    worker_id: "conflict".into(),
+                    zone: None,
+                    retired: false,
+                },
+                state: InstanceState::Conflict,
+            },
+        ];
+        let view = WorkerDiscovery {
+            topology_token: 11,
+            state_token: 22,
+            valid_for_ms: 300,
+            workers: members,
+        };
+        let addr = mock_coordinator(ControlMessage::MembershipList { view: view.clone() }).await;
+        assert_eq!(
+            CoordinatorClient::new(addr).discovery().await.unwrap(),
+            view
+        );
+        let addr = mock_coordinator(ControlMessage::MembershipList { view }).await;
+        let projected = CoordinatorClient::new(addr)
+            .membership_zoned()
+            .await
+            .unwrap();
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected[0].info.id.0, "offline");
+        assert_eq!(projected[0].zone.as_deref(), Some("zone-a"));
+        assert_eq!(projected[1].info.id.0, "conflict");
+        assert!(projected.iter().all(|node| node.info.address.is_empty()));
+    }
+
+    #[tokio::test]
     async fn membership_parses_nodes() {
-        let addr = mock_coordinator(ControlMessage::MembershipList {
-            nodes: vec![worker("w1", "10.0.0.1:7001"), worker("w2", "10.0.0.2:7001")],
-        })
+        let addr = mock_coordinator(membership_fixture::plain(vec![
+            worker("w1", "10.0.0.1:7001"),
+            worker("w2", "10.0.0.2:7001"),
+        ]))
         .await;
         let client = CoordinatorClient::new(addr);
         let nodes = client.membership().await.unwrap();
@@ -618,9 +649,10 @@ mod tests {
             let h = FrameHeader::decode(&hdr).unwrap();
             let mut b = vec![0u8; h.length as usize];
             s2.read_exact(&mut b).await.unwrap();
-            let reply = ControlMessage::MembershipList {
-                nodes: vec![worker("w1", "10.0.0.1:7001"), worker("w2", "10.0.0.2:7001")],
-            };
+            let reply = membership_fixture::plain(vec![
+                worker("w1", "10.0.0.1:7001"),
+                worker("w2", "10.0.0.2:7001"),
+            ]);
             s2.write_all(&talon_transport::encode(0, &reply).unwrap())
                 .await
                 .unwrap();
@@ -668,9 +700,8 @@ mod tests {
                         sock.read_exact(&mut body).await.unwrap();
                         let n = requests.fetch_add(1, Ordering::SeqCst);
                         if n == 0 {
-                            let reply = ControlMessage::MembershipList {
-                                nodes: vec![worker("w1", "10.0.0.1:7001")],
-                            };
+                            let reply =
+                                membership_fixture::plain(vec![worker("w1", "10.0.0.1:7001")]);
                             sock.write_all(
                                 &talon_transport::encode(header.request_id, &reply).unwrap(),
                             )
@@ -753,7 +784,6 @@ mod tests {
 #[cfg(test)]
 mod zoned_membership_tests {
     use super::*;
-    use std::sync::atomic::AtomicU32;
     use talon_core::NodeRole;
     use tokio::io::AsyncReadExt;
     use tokio::net::TcpListener;
@@ -766,7 +796,7 @@ mod zoned_membership_tests {
         }
     }
 
-    /// A schema-v5 coordinator answers the zoned query directly.
+    /// The unified membership query carries deployment zones.
     #[tokio::test]
     async fn zoned_membership_parses_zones() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -778,160 +808,46 @@ mod zoned_membership_tests {
             let header = FrameHeader::decode(&hdr).unwrap();
             let mut body = vec![0u8; header.length as usize];
             sock.read_exact(&mut body).await.unwrap();
-            let reply = ControlMessage::MembershipListV2 {
-                nodes: vec![ZonedNodeInfo {
-                    info: worker("w1", "10.0.0.1:7001"),
-                    zone: Some("az-a".into()),
-                }],
-            };
+            let reply = membership_fixture::zoned(vec![ZonedNodeInfo {
+                info: worker("w1", "10.0.0.1:7001"),
+                zone: Some("az-a".into()),
+            }]);
             sock.write_all(&talon_transport::encode(header.request_id, &reply).unwrap())
                 .await
                 .unwrap();
             sock.flush().await.unwrap();
         });
         let client = CoordinatorClient::new(addr);
-        let members = client.membership_zoned(1_000).await.unwrap();
+        let members = client.membership_zoned().await.unwrap();
         assert_eq!(members.len(), 1);
         assert_eq!(members[0].zone.as_deref(), Some("az-a"));
     }
 
-    /// A pre-v5 coordinator cannot decode the zoned query and drops the
-    /// connection; the client must fall back to the v1 query (zones unknown)
-    /// and hold a cooldown so the next refresh goes straight to v1.
     #[tokio::test]
-    async fn old_coordinator_triggers_v1_fallback_with_cooldown() {
-        let v2_queries = Arc::new(AtomicU32::new(0));
-        let seen = Arc::clone(&v2_queries);
+    async fn membership_failure_does_not_issue_a_fallback_query() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let seen = Arc::clone(&seen);
-                tokio::spawn(async move {
-                    loop {
-                        let mut hdr = [0u8; HEADER_LEN];
-                        if sock.read_exact(&mut hdr).await.is_err() {
-                            return;
-                        }
-                        let header = FrameHeader::decode(&hdr).unwrap();
-                        let mut body = vec![0u8; header.length as usize];
-                        sock.read_exact(&mut body).await.unwrap();
-                        let mut full = hdr.to_vec();
-                        full.extend_from_slice(&body);
-                        // An old build rejects the unknown schema at decode and
-                        // drops the connection; emulate by matching the message.
-                        match talon_transport::decode(&full).unwrap().1 {
-                            ControlMessage::MembershipQueryV2 {} => {
-                                seen.fetch_add(1, Ordering::SeqCst);
-                                return; // connection dropped, no reply
-                            }
-                            ControlMessage::MembershipQuery {} => {
-                                let reply = ControlMessage::MembershipList {
-                                    nodes: vec![worker("w1", "10.0.0.1:7001")],
-                                };
-                                sock.write_all(
-                                    &talon_transport::encode(header.request_id, &reply).unwrap(),
-                                )
-                                .await
-                                .unwrap();
-                                sock.flush().await.unwrap();
-                            }
-                            other => panic!("unexpected request: {other:?}"),
-                        }
-                    }
-                });
-            }
+        let client = CoordinatorClient::new(listener.local_addr().unwrap().to_string());
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let decoded = FrameHeader::decode(&header).unwrap();
+            let mut body = vec![0; decoded.length as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            let mut frame = header.to_vec();
+            frame.extend(body);
+            assert!(matches!(
+                talon_transport::decode(&frame).unwrap().1,
+                ControlMessage::MembershipQuery {}
+            ));
+            drop(socket);
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), listener.accept())
+                    .await
+                    .is_err()
+            );
         });
-
-        let client = CoordinatorClient::new(addr);
-        let members = client.membership_zoned(1_000).await.unwrap();
-        assert_eq!(members.len(), 1);
-        assert!(members[0].zone.is_none());
-        assert_eq!(v2_queries.load(Ordering::SeqCst), 1);
-
-        // Within the cooldown the client goes straight to v1: no new v2 probe.
-        let again = client.membership_zoned(30_000).await.unwrap();
-        assert_eq!(again.len(), 1);
-        assert_eq!(v2_queries.load(Ordering::SeqCst), 1);
-    }
-
-    /// Once the cooldown elapses the client probes v5 again, so a coordinator
-    /// upgrade is picked up without restarting readers.
-    #[tokio::test]
-    async fn cooldown_expiry_reprobes_v2_and_recovers_zones() {
-        let v2_queries = Arc::new(AtomicU32::new(0));
-        let seen = Arc::clone(&v2_queries);
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        tokio::spawn(async move {
-            loop {
-                let Ok((mut sock, _)) = listener.accept().await else {
-                    return;
-                };
-                let seen = Arc::clone(&seen);
-                tokio::spawn(async move {
-                    loop {
-                        let mut hdr = [0u8; HEADER_LEN];
-                        if sock.read_exact(&mut hdr).await.is_err() {
-                            return;
-                        }
-                        let header = FrameHeader::decode(&hdr).unwrap();
-                        let mut body = vec![0u8; header.length as usize];
-                        sock.read_exact(&mut body).await.unwrap();
-                        let mut full = hdr.to_vec();
-                        full.extend_from_slice(&body);
-                        match talon_transport::decode(&full).unwrap().1 {
-                            // First probe: the coordinator still predates v5
-                            // and drops the connection. After the upgrade
-                            // (every later probe) it answers with zones.
-                            ControlMessage::MembershipQueryV2 {} => {
-                                if seen.fetch_add(1, Ordering::SeqCst) == 0 {
-                                    return;
-                                }
-                                let reply = ControlMessage::MembershipListV2 {
-                                    nodes: vec![ZonedNodeInfo {
-                                        info: worker("w1", "10.0.0.1:7001"),
-                                        zone: Some("az-a".into()),
-                                    }],
-                                };
-                                sock.write_all(
-                                    &talon_transport::encode(header.request_id, &reply).unwrap(),
-                                )
-                                .await
-                                .unwrap();
-                                sock.flush().await.unwrap();
-                            }
-                            ControlMessage::MembershipQuery {} => {
-                                let reply = ControlMessage::MembershipList {
-                                    nodes: vec![worker("w1", "10.0.0.1:7001")],
-                                };
-                                sock.write_all(
-                                    &talon_transport::encode(header.request_id, &reply).unwrap(),
-                                )
-                                .await
-                                .unwrap();
-                                sock.flush().await.unwrap();
-                            }
-                            other => panic!("unexpected request: {other:?}"),
-                        }
-                    }
-                });
-            }
-        });
-
-        let client = CoordinatorClient::new(addr);
-        // Probe fails at t=1s: fallback to v1, cooldown starts.
-        let members = client.membership_zoned(1_000).await.unwrap();
-        assert!(members[0].zone.is_none());
-        assert_eq!(v2_queries.load(Ordering::SeqCst), 1);
-
-        // Cooldown elapsed: the next refresh probes v5 again and gets zones.
-        let after = 1_000 + MEMBERSHIP_V2_RETRY_COOLDOWN_MS + 1;
-        let members = client.membership_zoned(after).await.unwrap();
-        assert_eq!(members[0].zone.as_deref(), Some("az-a"));
-        assert_eq!(v2_queries.load(Ordering::SeqCst), 2);
+        assert!(client.membership_zoned().await.is_err());
+        server.await.unwrap();
     }
 }

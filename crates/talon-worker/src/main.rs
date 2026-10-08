@@ -680,8 +680,6 @@ async fn run() -> anyhow::Result<()> {
     let _control_plane = spawn_control_plane(
         cfg.coordinator.clone(),
         control_tls,
-        node,
-        Arc::clone(&worker),
         Arc::clone(&observability),
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
@@ -795,49 +793,10 @@ async fn serve_data_plane(
     }
 }
 
-/// Open a control connection to the coordinator and send `Register`.
-async fn register_with_coordinator(
-    coordinator: &str,
-    channel: Option<&ControlTlsChannel>,
-    node: &NodeInfo,
-) -> anyhow::Result<()> {
-    if let Some(channel) = channel {
-        let authenticated = channel.connect(coordinator).await?;
-        tracing::debug!(identity = %authenticated.identity, "connected to coordinator mTLS control plane");
-        return register_on_stream(authenticated.stream, coordinator, node).await;
-    }
-    register_on_stream(TcpStream::connect(coordinator).await?, coordinator, node).await
-}
-
-async fn register_on_stream<S>(
-    mut stream: S,
-    coordinator: &str,
-    node: &NodeInfo,
-) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let buf = codec::encode(0, &ControlMessage::Register { node: node.clone() })?;
-    stream.write_all(&buf).await?;
-    stream.flush().await?;
-    match read_control(&mut stream).await? {
-        Some(ControlMessage::Ack {
-            ok: true,
-            detail: _,
-        }) => {}
-        Some(ControlMessage::Ack { ok: false, detail }) => {
-            anyhow::bail!("coordinator rejected registration: {detail:?}")
-        }
-        Some(other) => anyhow::bail!("unexpected coordinator registration reply: {other:?}"),
-        None => anyhow::bail!("coordinator closed registration connection without an Ack"),
-    }
-    tracing::info!(%coordinator, "registered with coordinator");
-    Ok(())
-}
-
 const CONTROL_FAILURE_GRACE_INTERVALS: u32 = 3;
 const MAX_CONTROL_FAILURE_GRACE: Duration = Duration::from_secs(15);
 
+/// Preserve readiness only within the last accepted heartbeat grace.
 fn retain_readiness_after_control_failure(
     observability: &WorkerObservability,
     last_successful_heartbeat: Option<Instant>,
@@ -854,19 +813,16 @@ fn retain_readiness_after_control_failure(
     }
 }
 
-/// Maintain registration and send legacy plus versioned status heartbeats.
+/// Publish instance status and serve only after sole-instance acceptance.
 fn spawn_control_plane(
     coordinator: String,
     channel: Option<ControlTlsChannel>,
-    node: NodeInfo,
-    worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
     heartbeat_interval: Duration,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(heartbeat_interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut registered = false;
         let mut last_successful_heartbeat = None;
         let failure_grace = heartbeat_interval
             .saturating_mul(CONTROL_FAILURE_GRACE_INTERVALS)
@@ -874,111 +830,69 @@ fn spawn_control_plane(
         loop {
             ticker.tick().await;
 
-            if !registered {
-                match tokio::time::timeout(
-                    CONTROL_OPERATION_TIMEOUT,
-                    register_with_coordinator(&coordinator, channel.as_ref(), &node),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {
-                        registered = true;
-                    }
-                    Ok(Err(error)) => {
-                        observability.metrics().record_heartbeat_failure();
-                        retain_readiness_after_control_failure(
-                            &observability,
-                            last_successful_heartbeat,
-                            failure_grace,
-                        );
-                        tracing::warn!(%error, "worker registration failed; retrying");
-                        continue;
-                    }
-                    Err(_) => {
-                        observability.metrics().record_heartbeat_failure();
-                        retain_readiness_after_control_failure(
-                            &observability,
-                            last_successful_heartbeat,
-                            failure_grace,
-                        );
-                        tracing::warn!("worker registration timed out; retrying");
-                        continue;
-                    }
-                }
-            }
-
-            let legacy = ControlMessage::Heartbeat {
-                node: node.id.clone(),
-                block_count: worker.block_count(),
-            };
-            let status = ControlMessage::NodeStatusHeartbeat {
+            let proposed = ControlMessage::NodeStatusHeartbeat {
                 status: Box::new(observability.status_for_heartbeat()),
             };
-            let heartbeat = tokio::time::timeout(CONTROL_OPERATION_TIMEOUT, async {
-                send_oneshot(&coordinator, channel.as_ref(), &legacy).await?;
-                send_oneshot(&coordinator, channel.as_ref(), &status).await
-            })
+            let report = tokio::time::timeout(
+                CONTROL_OPERATION_TIMEOUT,
+                instance_report(&coordinator, channel.as_ref(), &proposed),
+            )
             .await;
-            match heartbeat {
-                Ok(Ok(())) => {
-                    last_successful_heartbeat = Some(Instant::now());
-                    observability.readiness().set_control_registered(true);
-                    observability.metrics().record_heartbeat_success();
+            match report {
+                Ok(Ok((accepted, serving))) => {
+                    observability
+                        .readiness()
+                        .set_control_registered(accepted && serving);
+                    if accepted && serving {
+                        last_successful_heartbeat = Some(Instant::now());
+                        observability.metrics().record_heartbeat_success();
+                    } else {
+                        observability.metrics().record_heartbeat_failure();
+                    }
                 }
-                Ok(Err(error)) => {
-                    registered = false;
+                result => {
                     observability.metrics().record_heartbeat_failure();
                     retain_readiness_after_control_failure(
                         &observability,
                         last_successful_heartbeat,
                         failure_grace,
                     );
-                    tracing::warn!(%error, "control heartbeat failed; registration will retry");
-                }
-                Err(_) => {
-                    registered = false;
-                    observability.metrics().record_heartbeat_failure();
-                    retain_readiness_after_control_failure(
-                        &observability,
-                        last_successful_heartbeat,
-                        failure_grace,
-                    );
-                    tracing::warn!("control heartbeat timed out; registration will retry");
+                    tracing::warn!(?result, "worker instance heartbeat failed; retrying");
                 }
             }
         }
     })
 }
 
-/// Connect, send one control message, and require the coordinator's Ack.
-async fn send_oneshot(
+async fn instance_report(
     addr: &str,
     channel: Option<&ControlTlsChannel>,
     msg: &ControlMessage,
-) -> anyhow::Result<()> {
-    if let Some(channel) = channel {
-        return send_on_stream(channel.connect(addr).await?.stream, msg).await;
+) -> anyhow::Result<(bool, bool)> {
+    match channel {
+        Some(channel) => instance_report_on_stream(channel.connect(addr).await?.stream, msg).await,
+        None => instance_report_on_stream(TcpStream::connect(addr).await?, msg).await,
     }
-    send_on_stream(TcpStream::connect(addr).await?, msg).await
 }
 
-async fn send_on_stream<S>(mut stream: S, msg: &ControlMessage) -> anyhow::Result<()>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let buf = codec::encode(0, msg)?;
-    stream.write_all(&buf).await?;
+async fn instance_report_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+    msg: &ControlMessage,
+) -> anyhow::Result<(bool, bool)> {
+    stream.write_all(&codec::encode(0, msg)?).await?;
     stream.flush().await?;
     match read_control(&mut stream).await? {
-        Some(ControlMessage::Ack {
-            ok: true,
-            detail: _,
-        }) => Ok(()),
-        Some(ControlMessage::Ack { ok: false, detail }) => {
-            anyhow::bail!("coordinator rejected heartbeat: {detail:?}")
+        Some(ControlMessage::NodeStatusAck {
+            accepted,
+            serving,
+            detail,
+        }) => {
+            if !accepted {
+                tracing::warn!(?detail, "worker instance rejected");
+            }
+            Ok((accepted, serving))
         }
-        Some(other) => anyhow::bail!("unexpected coordinator heartbeat reply: {other:?}"),
-        None => anyhow::bail!("coordinator closed heartbeat connection without an Ack"),
+        other => anyhow::bail!("expected worker instance acknowledgement, got {other:?}"),
     }
 }
 
@@ -1238,130 +1152,119 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn control_plane_sends_legacy_and_versioned_heartbeats() {
+    async fn control_plane_waits_for_instance_acceptance() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let coordinator = listener.local_addr().unwrap();
-        let (messages_tx, messages_rx) = oneshot::channel();
         let (status_sent, status_received) = oneshot::channel();
         let (allow_ack, wait_for_ack) = oneshot::channel();
         let server = tokio::spawn(async move {
-            let mut status_gate = Some((status_sent, wait_for_ack));
-            let mut messages = Vec::new();
-            for _ in 0..3 {
-                let (mut stream, _) = listener.accept().await.unwrap();
-                let message = read_control(&mut stream).await.unwrap().unwrap();
-                if matches!(message, ControlMessage::NodeStatusHeartbeat { .. }) {
-                    let (sent, gate) = status_gate.take().unwrap();
-                    sent.send(()).unwrap();
-                    gate.await.unwrap();
-                }
-                let ack = codec::encode(
-                    0,
-                    &ControlMessage::Ack {
-                        ok: true,
-                        detail: None,
-                    },
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let message = read_control(&mut stream).await.unwrap().unwrap();
+            status_sent.send(message).unwrap();
+            wait_for_ack.await.unwrap();
+            stream
+                .write_all(
+                    &codec::encode(
+                        0,
+                        &ControlMessage::NodeStatusAck {
+                            accepted: true,
+                            serving: true,
+                            detail: None,
+                        },
+                    )
+                    .unwrap(),
                 )
+                .await
                 .unwrap();
-                stream.write_all(&ack).await.unwrap();
-                stream.flush().await.unwrap();
-                messages.push(message);
-            }
-            messages_tx.send(messages).unwrap();
         });
-
-        let (worker, observability, node, root) = test_worker();
+        let (_worker, observability, node, root) = test_worker();
         observability.readiness().set_backend_ready(true);
         observability.readiness().set_store_ready(true);
         let control = spawn_control_plane(
             coordinator.to_string(),
             None,
-            node.clone(),
-            worker,
-            Arc::clone(&observability),
+            observability.clone(),
             Duration::from_secs(60),
         );
-
-        tokio::time::timeout(Duration::from_secs(2), status_received)
+        let message = tokio::time::timeout(Duration::from_secs(2), status_received)
             .await
             .unwrap()
             .unwrap();
-        assert!(
-            !observability.is_ready(),
-            "unaccepted status must not enable data-plane reads"
-        );
-        allow_ack.send(()).unwrap();
-        let messages = tokio::time::timeout(Duration::from_secs(2), messages_rx)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(matches!(
-            &messages[0],
-            ControlMessage::Register { node: registered } if registered == &node
-        ));
-        assert!(matches!(
-            &messages[1],
-            ControlMessage::Heartbeat {
-                node: heartbeat_node,
-                block_count: 0
-            } if heartbeat_node == &node.id
-        ));
-        match &messages[2] {
+        match message {
             ControlMessage::NodeStatusHeartbeat { status } => {
                 status.validate().unwrap();
                 assert_eq!(status.node, node);
                 assert!(status.ready);
             }
-            other => panic!("unexpected status heartbeat: {other:?}"),
+            other => panic!("unexpected heartbeat: {other:?}"),
         }
-
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        assert!(observability.is_ready());
-        assert!(observability
-            .metrics()
-            .render()
-            .contains("talon_worker_control_heartbeat_total{result=\"success\"} 1"));
-
+        assert!(
+            !observability.is_ready(),
+            "unaccepted status must not enable reads"
+        );
+        allow_ack.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !observability.is_ready() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         control.abort();
         server.await.unwrap();
         std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
-    async fn heartbeat_requires_a_positive_coordinator_ack() {
-        let (client, mut server) = tokio::io::duplex(4096);
-        let responder = tokio::spawn(async move {
-            let message = read_control(&mut server).await.unwrap().unwrap();
-            assert!(matches!(message, ControlMessage::Heartbeat { .. }));
-            let reply = codec::encode(
-                0,
-                &ControlMessage::Ack {
-                    ok: false,
-                    detail: Some("state store unavailable".into()),
-                },
-            )
-            .unwrap();
-            server.write_all(&reply).await.unwrap();
-        });
-
-        let error = send_on_stream(
-            client,
-            &ControlMessage::Heartbeat {
-                node: NodeId::new("worker-a"),
-                block_count: 0,
-            },
-        )
-        .await
-        .unwrap_err();
-        assert!(error.to_string().contains("state store unavailable"));
-        responder.await.unwrap();
+    async fn instance_ack_distinguishes_acceptance_from_serving() {
+        let (_worker, observability, _node, root) = test_worker();
+        let message = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(observability.status_for_heartbeat()),
+        };
+        for (accepted, serving) in [(false, false), (true, false), (true, true)] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let responder = tokio::spawn(async move {
+                let message = read_control(&mut server).await.unwrap().unwrap();
+                assert!(matches!(
+                    message,
+                    ControlMessage::NodeStatusHeartbeat { .. }
+                ));
+                server
+                    .write_all(
+                        &codec::encode(
+                            0,
+                            &ControlMessage::NodeStatusAck {
+                                accepted,
+                                serving,
+                                detail: None,
+                            },
+                        )
+                        .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            });
+            assert_eq!(
+                instance_report_on_stream(client, &message).await.unwrap(),
+                (accepted, serving)
+            );
+            responder.await.unwrap();
+        }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
-    async fn heartbeat_rejects_missing_or_unexpected_ack() {
+    async fn instance_heartbeat_rejects_missing_or_old_ack() {
+        let (_worker, observability, _node, root) = test_worker();
+        let message = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(observability.status_for_heartbeat()),
+        };
         for reply in [
             None,
-            Some(ControlMessage::MembershipList { nodes: Vec::new() }),
+            Some(ControlMessage::Ack {
+                ok: true,
+                detail: None,
+            }),
         ] {
             let (client, mut server) = tokio::io::duplex(4096);
             let responder = tokio::spawn(async move {
@@ -1373,17 +1276,10 @@ mod tests {
                         .unwrap();
                 }
             });
-            assert!(send_on_stream(
-                client,
-                &ControlMessage::Heartbeat {
-                    node: NodeId::new("worker-a"),
-                    block_count: 0,
-                }
-            )
-            .await
-            .is_err());
+            assert!(instance_report_on_stream(client, &message).await.is_err());
             responder.await.unwrap();
         }
+        std::fs::remove_dir_all(root).ok();
     }
 
     #[test]
@@ -1424,14 +1320,12 @@ mod tests {
         let coordinator = unused.local_addr().unwrap();
         drop(unused);
 
-        let (worker, observability, node, root) = test_worker();
+        let (_worker, observability, _node, root) = test_worker();
         observability.readiness().set_backend_ready(true);
         observability.readiness().set_store_ready(true);
         let control = spawn_control_plane(
             coordinator.to_string(),
             None,
-            node,
-            worker,
             Arc::clone(&observability),
             Duration::from_secs(60),
         );

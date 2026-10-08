@@ -72,7 +72,9 @@ struct Envelope {
 A receiver rejects a schema it cannot decode rather than misinterpreting the
 body. The current version and the oldest decodable version are both published
 in the conformance vector file, so a client can check compatibility without
-hardcoding them.
+hardcoding them. Schema 6 is the only supported control schema; pre-deployment legacy
+registration, heartbeats and membership queries have been consolidated. Receivers
+reject earlier schemas before reading positional enum tags.
 
 ### Bincode encoding rules
 
@@ -105,21 +107,41 @@ Variant tags are the enum's declaration order. The read path needs these:
 
 | Tag | Message | Direction | Fields |
 |---|---|---|---|
-| 2 | `PlacementLookup` | client → coordinator | `block: BlockId`, `k: u8` |
-| 3 | `PlacementResponse` | coordinator → client | `owners: Vec<NodeId>`, `epoch: u64` |
-| 6 | `MembershipQuery` | client → coordinator | *(none)* |
-| 7 | `MembershipList` | coordinator → client | `nodes: Vec<NodeInfo>` |
-| 10 | `StatObject` | client → coordinator | `object: ObjectId` |
-| 11 | `ObjectStat` | coordinator → client | `size: u64`, `version: String` |
-| 12 | `ListObjects` | client → coordinator | `prefix: String` |
-| 13 | `ObjectList` | coordinator → client | `entries: Vec<ObjectEntry>` |
+| 0 | `PlacementLookup` | client → coordinator | `block: BlockId`, `k: u8` |
+| 1 | `PlacementResponse` | coordinator → client | `owners: Vec<NodeId>`, `epoch: u64` |
+| 4 | `MembershipQuery` | client → coordinator | *(none)* |
+| 5 | `MembershipList` | coordinator → client | `view: WorkerDiscovery` |
+| 8 | `StatObject` | client → coordinator | `object: ObjectId` |
+| 9 | `ObjectStat` | coordinator → client | `size: u64`, `version: String` |
+| 10 | `ListObjects` | client → coordinator | `prefix: String` |
+| 11 | `ObjectList` | coordinator → client | `entries: Vec<ObjectEntry>` |
+
+Workers send `NodeStatusHeartbeat { status: NodeStatus }` (tag 7). The coordinator
+replies with `NodeStatusAck { accepted: bool, serving: bool, detail: Option<String> }`
+(tag 17). New instances and admission-relevant changes are persisted and routing
+is installed before acceptance. Unchanged reports from an admitted instance are
+accepted in memory and coalesced for periodic publication; acceptance does not
+promise that every heartbeat's metrics or sequence survives a Coordinator crash.
+`serving` separately grants service admission. A conflicting or withdrawn instance
+can be accepted without being allowed to serve. `NodeStatus.ready` reports local
+readiness, independent of this grant. There is no separate registration RPC.
+
+`MembershipQuery` reads the Coordinator's last installed discovery without a
+backend RPC. Its validity is bounded by the observation's remaining cache lifetime;
+requests never renew that lifetime. Coordinators refresh independently, so a client
+switching replicas can temporarily observe different views. The equality tokens
+do not provide monotonic revision ordering.
 
 Supporting types:
 
 ```
 struct ObjectId  { backend: Backend, bucket: String, object_path: String }
 struct BlockId   { object: ObjectId, offset: u64, block_size: u32, version: Version }
-struct NodeInfo  { id: NodeId, address: String, role: NodeRole }
+struct WorkerDiscovery { topology_token: u64, state_token: u64, valid_for_ms: u64,
+                         workers: Vec<DiscoveredWorker> }
+struct DiscoveredWorker { member: WorkerMember, state: InstanceState }
+struct WorkerMember { worker_id: String, zone: Option<String>, retired: bool }
+enum InstanceState { Offline, Conflict, Serving { instance_id: String, address: String } }
 struct ObjectEntry { path: String, size: u64 }
 
 enum Backend  { S3 = 0, Gcs = 1, Azure = 2 }   // u32 tag
@@ -128,7 +150,7 @@ enum NodeRole { Coordinator = 0, Worker = 1 }  // u32 tag
 // NodeId and Version are newtypes over String: encoded exactly as a String.
 ```
 
-For legacy placement lookup, `PlacementResponse` returns node **ids** that the
+For server-side placement lookup, `PlacementResponse` returns node **ids** that the
 caller resolves to dialable addresses through `MembershipList`. Current clients
 use `MembershipList` directly and compute placement locally.
 
@@ -216,8 +238,8 @@ payload, and a `u64` value above 2^32.
 
 ```json
 {
-  "control_schema_version": 2,
-  "min_control_schema_version": 1,
+  "control_schema_version": 6,
+  "min_control_schema_version": 6,
   "vectors": [
     { "name": "control.object_stat.large_size",
       "note": "A size above 2^32 — decoders that read u32 will silently truncate here",

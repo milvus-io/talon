@@ -9,7 +9,6 @@ use clap::Parser;
 use talon_coordinator::{
     ClusterStateStore, CoordinatorConfig, CoordinatorConfigPatch, CoordinatorObservability,
     Membership, MemoryStateStore, PlacementService, RendezvousPlacement, StateBackend,
-    WriteDisposition,
 };
 use talon_core::{
     NamespacePolicy, NodeHealth, NodeInfo, NodeRole, ObjectNamespace, WorkloadIdentity,
@@ -433,7 +432,7 @@ impl Coordinator {
             .membership()
             .snapshot()
             .into_iter()
-            .filter(|node| node.role == NodeRole::Worker)
+            .filter(|node| node.role == NodeRole::Worker && !node.address.is_empty())
             .map(|node| node.address)
             .collect();
         self.worker_proxy_pool.retain_workers(&addresses);
@@ -457,7 +456,7 @@ impl Coordinator {
             .membership()
             .snapshot()
             .into_iter()
-            .filter(|node| node.role == NodeRole::Worker)
+            .filter(|node| node.role == NodeRole::Worker && !node.address.is_empty())
             .collect();
         if workers.is_empty() {
             return ControlMessage::Ack {
@@ -651,7 +650,14 @@ impl Coordinator {
         full.extend_from_slice(&header.encode());
         full.extend_from_slice(&payload);
         let (_, reply) = codec::decode(&full)?;
-        if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
+        if matches!(
+            &reply,
+            ControlMessage::Ack { ok: false, .. }
+                | ControlMessage::NodeStatusAck {
+                    accepted: false,
+                    ..
+                }
+        ) {
             talon_telemetry::outcome("error");
         }
         Ok((stream, reply))
@@ -659,97 +665,35 @@ impl Coordinator {
 
     async fn dispatch(&self, message: ControlMessage) -> ControlMessage {
         match message {
-            ControlMessage::Register { node } => {
-                // Legacy control-plane path. It used to call
-                // `membership().register(node)` directly, which writes only this
-                // coordinator's in-memory set — no ClusterStateStore write, no
-                // is_ready()/health gate. In active-active that makes the node
-                // visible on just the receiving coordinator, and the very next
-                // reconcile_membership tick (which replaces the whole set from the
-                // store snapshot) deletes it. That local-only, self-erasing insert
-                // is misleading, so make Register a no-op for membership: workers
-                // use NodeStatusHeartbeat, which persists through the store (#167).
-                tracing::info!(
-                    id = %node.id,
-                    address = %node.address,
-                    "legacy Register received; membership is store-authoritative, \
-                     use NodeStatusHeartbeat"
-                );
-                self.observability.metrics().record_registration(true);
-                ControlMessage::Ack {
-                    ok: true,
-                    detail: None,
-                }
-            }
-            ControlMessage::Heartbeat { node, block_count } => {
-                tracing::debug!(%node, block_count, "legacy heartbeat");
-                self.observability.metrics().record_heartbeat(false, true);
-                ControlMessage::Ack {
-                    ok: true,
-                    detail: None,
-                }
-            }
             ControlMessage::NodeStatusHeartbeat { status } => {
-                if status.cluster_id != self.observability.cluster_id() {
-                    self.observability.metrics().record_heartbeat(true, false);
-                    return ControlMessage::Ack {
-                        ok: false,
-                        detail: Some("node status belongs to another cluster".into()),
-                    };
+                let result: talon_coordinator::StateStoreResult<bool> = async {
+                    let (serving, published) = self
+                        .observability
+                        .receive_instance(*status, self.lease_ttl, self.service.membership())
+                        .await?;
+                    // The acknowledgement can make the worker ready immediately.
+                    // Publish routing and proxy membership before sending it, including
+                    // withdrawals and conflicts, without waiting for the periodic tick.
+                    if published {
+                        self.refresh_worker_proxy_membership();
+                    }
+                    Ok(serving)
                 }
-                let node = status.node.clone();
-                let zone = status.labels.get(talon_core::NODE_ZONE_LABEL).cloned();
-                let healthy_ready =
-                    status.health == talon_core::NodeHealth::Healthy && status.ready;
-                match self
-                    .observability
-                    .upsert_status(*status, self.lease_ttl)
-                    .await
-                {
-                    Ok(result) => {
-                        // Fast-path local visibility before the next reconcile
-                        // tick, but only for a healthy, ready worker — an
-                        // unhealthy/not-ready node must not be injected into
-                        // placement (issue #118); the store reconcile remains the
-                        // authoritative source and will drop it otherwise.
-                        if result.disposition == WriteDisposition::Applied
-                            && node.role == NodeRole::Worker
-                            && healthy_ready
-                        {
-                            self.service.membership().register_zoned(node, zone);
-                            self.refresh_worker_proxy_membership();
-                        }
-                        let accepted = matches!(
-                            result.disposition,
-                            WriteDisposition::Applied | WriteDisposition::Duplicate
-                        );
-                        self.observability
-                            .metrics()
-                            .record_heartbeat(true, accepted);
-                        match result.disposition {
-                            WriteDisposition::Stale => ControlMessage::Ack {
-                                ok: false,
-                                detail: Some("stale node status was not accepted".into()),
-                            },
-                            WriteDisposition::Applied | WriteDisposition::Duplicate => {
-                                ControlMessage::Ack {
-                                    ok: true,
-                                    detail: None,
-                                }
-                            }
-                            WriteDisposition::NotFound => ControlMessage::Ack {
-                                ok: false,
-                                detail: Some("node status upsert did not find its record".into()),
-                            },
-                        }
-                    }
-                    Err(error) => {
-                        self.observability.metrics().record_heartbeat(true, false);
-                        ControlMessage::Ack {
-                            ok: false,
-                            detail: Some(error.to_string()),
-                        }
-                    }
+                .await;
+                self.observability
+                    .metrics()
+                    .record_heartbeat(result.is_ok());
+                match result {
+                    Ok(serving) => ControlMessage::NodeStatusAck {
+                        accepted: true,
+                        serving,
+                        detail: None,
+                    },
+                    Err(e) => ControlMessage::NodeStatusAck {
+                        accepted: false,
+                        serving: false,
+                        detail: Some(e.to_string()),
+                    },
                 }
             }
             lookup @ ControlMessage::PlacementLookup { .. } => {
@@ -764,31 +708,12 @@ impl Coordinator {
                 self.service.handle(lookup)
             }
             ControlMessage::MembershipQuery {} => {
-                if !self.observability.is_ready() {
-                    return ControlMessage::Ack {
+                match self.observability.membership_for_query().await {
+                    Ok(view) => ControlMessage::MembershipList { view },
+                    Err(error) => ControlMessage::Ack {
                         ok: false,
-                        detail: Some("coordinator not ready: shared state unavailable".into()),
-                    };
-                }
-                ControlMessage::MembershipList {
-                    nodes: self.service.membership().snapshot(),
-                }
-            }
-            ControlMessage::MembershipQueryV2 {} => {
-                if !self.observability.is_ready() {
-                    return ControlMessage::Ack {
-                        ok: false,
-                        detail: Some("coordinator not ready: shared state unavailable".into()),
-                    };
-                }
-                ControlMessage::MembershipListV2 {
-                    nodes: self
-                        .service
-                        .membership()
-                        .snapshot_zoned()
-                        .into_iter()
-                        .map(|(info, zone)| talon_transport::ZonedNodeInfo { info, zone })
-                        .collect(),
+                        detail: Some(error.to_string()),
+                    },
                 }
             }
             listing @ ControlMessage::ListObjects { .. } => {
@@ -927,6 +852,10 @@ async fn run() -> anyhow::Result<()> {
     spawn_membership_reconcile(
         Arc::clone(&observability),
         Arc::clone(&state),
+        Duration::from_millis(config.state.heartbeat_interval_ms),
+    );
+    spawn_instance_publication(
+        Arc::clone(&observability),
         Duration::from_millis(config.state.heartbeat_interval_ms),
     );
 
@@ -1113,6 +1042,22 @@ fn spawn_membership_reconcile(
     })
 }
 
+fn spawn_instance_publication(
+    observability: Arc<CoordinatorObservability>,
+    interval: Duration,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            if let Err(error) = observability.publish_buffered_instances().await {
+                tracing::warn!(%error, "buffered worker heartbeat publication failed");
+            }
+        }
+    })
+}
+
 fn spawn_self_heartbeat(
     observability: Arc<CoordinatorObservability>,
     interval: Duration,
@@ -1161,11 +1106,11 @@ async fn propagate_mapping_revisions(
     channel: &ControlTlsChannel,
     policy: &NamespacePolicy,
 ) -> anyhow::Result<()> {
-    let snapshot = observability.snapshot_for_api().await?;
+    let workers = observability.serving_workers().await?;
     let mut revisions = HashMap::<ObjectNamespace, MappingRevision>::new();
     let mut unavailable = HashSet::<ObjectNamespace>::new();
 
-    for target in revision_targets(&snapshot, policy) {
+    for target in revision_targets(&workers, policy) {
         let status = &target.worker;
         let worker_id = status.node.id.0.as_str();
         let address = target.address.as_str();
@@ -1235,11 +1180,10 @@ struct RevisionTarget {
 }
 
 fn revision_targets(
-    snapshot: &talon_coordinator::ClusterSnapshot,
+    workers: &[talon_core::NodeStatus],
     policy: &NamespacePolicy,
 ) -> Vec<RevisionTarget> {
-    snapshot
-        .nodes
+    workers
         .iter()
         .filter(|status| {
             status.node.role == NodeRole::Worker
@@ -1377,12 +1321,6 @@ impl ControlAccess {
             return Ok(());
         };
         match message {
-            ControlMessage::Register { node } => {
-                validate_worker_node(identity, &node.id, node.role, "registration")
-            }
-            ControlMessage::Heartbeat { node, .. } => {
-                validate_worker_node_id(identity, node, "legacy heartbeat")
-            }
             ControlMessage::NodeStatusHeartbeat { status } => {
                 if status.cluster_id != identity.cluster_id() {
                     return Err("status cluster does not match authenticated worker".into());
@@ -1486,12 +1424,7 @@ where
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
         let result: anyhow::Result<()> = operation
             .scope(async {
-                let worker_service = matches!(
-                    message,
-                    ControlMessage::Register { .. }
-                        | ControlMessage::Heartbeat { .. }
-                        | ControlMessage::NodeStatusHeartbeat { .. }
-                );
+                let worker_service = matches!(message, ControlMessage::NodeStatusHeartbeat { .. });
                 let allowed = access.allows(worker_service);
                 let operation = talon_coordinator::ControlOperation::from_message(&message);
                 let started = Instant::now();
@@ -1513,7 +1446,14 @@ where
                 } else {
                     state.dispatch(message).await
                 };
-                let error = matches!(&reply, ControlMessage::Ack { ok: false, .. });
+                let error = matches!(
+                    &reply,
+                    ControlMessage::Ack { ok: false, .. }
+                        | ControlMessage::NodeStatusAck {
+                            accepted: false,
+                            ..
+                        }
+                );
                 if error {
                     talon_telemetry::outcome("error");
                 }
@@ -1745,7 +1685,7 @@ mod tests {
             observed_at_unix_ms: 1,
         };
 
-        let targets = revision_targets(&snapshot, &revision_policy());
+        let targets = revision_targets(&snapshot.nodes, &revision_policy());
         assert_eq!(targets.len(), 1);
         assert_eq!(targets[0].worker.incarnation_id, "healthy-incarnation");
         assert_eq!(targets[0].address, "worker-1:7002");
@@ -1766,40 +1706,6 @@ mod tests {
     #[test]
     fn authenticated_worker_fields_must_match_the_certificate_identity() {
         let access = ControlAccess::WorkerService(worker_identity("worker-1"));
-        let matching = NodeInfo {
-            id: NodeId::new("worker-1"),
-            address: "127.0.0.1:7001".into(),
-            role: NodeRole::Worker,
-        };
-        assert!(access
-            .authorize(&ControlMessage::Register {
-                node: matching.clone(),
-            })
-            .is_ok());
-        assert!(access
-            .authorize(&ControlMessage::Heartbeat {
-                node: matching.id.clone(),
-                block_count: 1,
-            })
-            .is_ok());
-
-        let mut wrong_node = matching.clone();
-        wrong_node.id = NodeId::new("worker-2");
-        assert!(access
-            .authorize(&ControlMessage::Register { node: wrong_node })
-            .is_err());
-        let mut wrong_role = matching;
-        wrong_role.role = NodeRole::Coordinator;
-        assert!(access
-            .authorize(&ControlMessage::Register { node: wrong_role })
-            .is_err());
-        assert!(access
-            .authorize(&ControlMessage::Heartbeat {
-                node: NodeId::new("worker-2"),
-                block_count: 1,
-            })
-            .is_err());
-
         let mut status = worker_status("cluster-a", "worker-1", "inc-1", "127.0.0.1:7001");
         assert!(access
             .authorize(&ControlMessage::NodeStatusHeartbeat {
@@ -1866,7 +1772,14 @@ mod tests {
             .await
             .unwrap();
         let (_, reply, _) = read_control(&mut client).await.unwrap().unwrap();
-        assert!(matches!(reply, ControlMessage::Ack { ok: true, .. }));
+        assert!(matches!(
+            reply,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
         let snapshot = store.snapshot("cluster-a").await.unwrap();
         assert_eq!(snapshot.nodes.len(), 1);
         assert_eq!(snapshot.nodes[0].node.id, NodeId::new("worker-1"));
@@ -1924,7 +1837,14 @@ mod tests {
                 status: Box::new(status),
             })
             .await;
-        assert!(matches!(reply, ControlMessage::Ack { ok: true, .. }));
+        assert!(matches!(
+            reply,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
         assert_eq!(coordinator.service.membership().snapshot().len(), 1);
         assert_eq!(
             observability
@@ -1983,7 +1903,14 @@ mod tests {
                 status: Box::new(newer),
             })
             .await;
-        assert!(matches!(accepted, ControlMessage::Ack { ok: true, .. }));
+        assert!(matches!(
+            accepted,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
 
         let mut stale = worker_status(
             "cluster-a",
@@ -1999,8 +1926,9 @@ mod tests {
             .await;
         assert!(matches!(
             rejected,
-            ControlMessage::Ack {
-                ok: false,
+            ControlMessage::NodeStatusAck {
+                accepted: false,
+                serving: false,
                 detail: Some(_)
             }
         ));
@@ -2009,6 +1937,14 @@ mod tests {
     fn observability_over(
         store: Arc<dyn ClusterStateStore>,
         node_id: &str,
+    ) -> Arc<CoordinatorObservability> {
+        observability_over_with_grace(store, node_id, Duration::ZERO)
+    }
+
+    fn observability_over_with_grace(
+        store: Arc<dyn ClusterStateStore>,
+        node_id: &str,
+        grace: Duration,
     ) -> Arc<CoordinatorObservability> {
         Arc::new(
             CoordinatorObservability::new(
@@ -2022,7 +1958,8 @@ mod tests {
                 Duration::from_secs(1),
                 store,
             )
-            .unwrap(),
+            .unwrap()
+            .with_state_failure_grace(grace),
         )
     }
 
@@ -2590,7 +2527,14 @@ mod tests {
                 )),
             })
             .await;
-        assert!(matches!(reply, ControlMessage::Ack { ok: true, .. }));
+        assert!(matches!(
+            reply,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
 
         // B has not seen the worker locally yet.
         assert_eq!(coord_b.service.membership().snapshot().len(), 0);
@@ -2610,6 +2554,70 @@ mod tests {
             coord_a.service.membership().epoch(),
             coord_b.service.membership().epoch()
         );
+    }
+
+    #[tokio::test]
+    async fn membership_queries_use_last_good_view_only_within_failure_grace() {
+        let store = Arc::new(MemoryStateStore::new());
+        let grace = Duration::from_millis(300);
+        let obs = observability_over_with_grace(store.clone(), "coord-a", grace);
+        let coordinator = Coordinator::new(obs.clone(), Duration::from_secs(30));
+        let status = worker_status("cluster-a", "w", "first", "127.0.0.1:7");
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(status),
+                })
+                .await,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
+        store.set_available(false);
+        assert!(obs
+            .reconcile_membership(coordinator.service.membership())
+            .await
+            .is_err());
+        assert!(obs.is_ready());
+        assert!(
+            matches!(coordinator.dispatch(ControlMessage::MembershipQuery {}).await,
+            ControlMessage::MembershipList { view } if view.workers.len() == 1)
+        );
+        assert!(
+            matches!(coordinator.dispatch(ControlMessage::PlacementLookup { block: sample_block(), k: 1 }).await,
+            ControlMessage::PlacementResponse { owners, .. } if owners == vec![NodeId::new("w")])
+        );
+        tokio::time::sleep(grace + Duration::from_millis(50)).await;
+        assert!(!obs.is_ready());
+        for request in [
+            ControlMessage::MembershipQuery {},
+            ControlMessage::PlacementLookup {
+                block: sample_block(),
+                k: 1,
+            },
+        ] {
+            assert!(matches!(
+                coordinator.dispatch(request).await,
+                ControlMessage::Ack { ok: false, .. }
+            ));
+        }
+        store.set_available(true);
+        obs.reconcile_membership(coordinator.service.membership())
+            .await
+            .unwrap();
+        assert!(
+            matches!(coordinator.dispatch(ControlMessage::MembershipQuery {}).await,
+            ControlMessage::MembershipList { view } if view.workers.len() == 1)
+        );
+        obs.begin_shutdown();
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::MembershipQuery {})
+                .await,
+            ControlMessage::Ack { ok: false, .. }
+        ));
     }
 
     #[tokio::test]
@@ -2679,7 +2687,10 @@ mod tests {
         obs.begin_shutdown();
         assert!(!obs.is_ready(), "shutting-down coordinator is not ready");
         let removed = obs.remove_self().await.unwrap();
-        assert_eq!(removed.disposition, WriteDisposition::Applied);
+        assert_eq!(
+            removed.disposition,
+            talon_coordinator::WriteDisposition::Applied
+        );
         assert_eq!(store.snapshot("cluster-a").await.unwrap().nodes.len(), 0);
     }
 
@@ -2690,5 +2701,159 @@ mod tests {
             256 << 20,
             talon_core::Version::new("v1"),
         )
+    }
+    #[tokio::test]
+    async fn instance_ack_publishes_local_membership_without_a_reconcile_tick() {
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(store, "coordinator-1");
+        obs.check_ready().await.unwrap();
+        let coordinator = Coordinator::new(obs, Duration::from_secs(30));
+        let mut status = worker_status("cluster-a", "w", "first", "127.0.0.1:7");
+        status
+            .labels
+            .insert(talon_core::NODE_ZONE_LABEL.into(), "zone-a".into());
+
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(status.clone()),
+                })
+                .await,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
+        // No background reconciliation runs in this test. A successful
+        // readiness acknowledgement must already make the worker routable.
+        assert_eq!(
+            coordinator.service.membership().snapshot_zoned(),
+            vec![(status.node.clone(), Some("zone-a".into()))],
+            "heartbeat acknowledged before publishing membership"
+        );
+        assert!(matches!(
+            coordinator.dispatch(ControlMessage::MembershipQuery {}).await,
+            ControlMessage::MembershipList { view } if view.workers.len() == 1
+        ));
+
+        status.heartbeat_seq += 1;
+        status.ready = false;
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(status),
+                })
+                .await,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: false,
+                ..
+            }
+        ));
+        let members = coordinator.service.membership().snapshot();
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].id, NodeId::new("w"));
+        assert!(members[0].address.is_empty());
+    }
+
+    #[tokio::test]
+    async fn discovery_reports_conflicting_instances_without_changing_owners() {
+        use talon_core::worker_membership::InstanceState;
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(store.clone(), "coordinator-1");
+        let coordinator = Coordinator::new(obs.clone(), Duration::from_secs(30));
+        let first = worker_status("cluster-a", "w", "first", "127.0.0.1:7");
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(first),
+                })
+                .await,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
+        let initial = obs.worker_discovery().await.unwrap();
+        let second = worker_status("cluster-a", "w", "second", "127.0.0.1:8");
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(second),
+                })
+                .await,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: false,
+                ..
+            }
+        ));
+        let conflict = obs.worker_discovery().await.unwrap();
+        assert_eq!(initial.topology_token, conflict.topology_token);
+        assert!(matches!(conflict.workers[0].state, InstanceState::Conflict));
+        assert!(matches!(
+            coordinator
+                .dispatch(ControlMessage::MembershipQuery {})
+                .await,
+            ControlMessage::MembershipList { view } if view.workers.len() == 1 && matches!(view.workers[0].state, talon_core::worker_membership::InstanceState::Conflict)
+        ));
+    }
+    #[tokio::test]
+    async fn revision_targets_ignore_management_projection_conflicts_and_retirement() {
+        use talon_coordinator::state_store::registry::{change, MemberChange};
+        use talon_core::worker_membership::WorkerMember;
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(store.clone(), "coordinator-1");
+        let first = worker_status("cluster-a", "worker-1", "first", "127.0.0.1:7");
+        assert!(obs
+            .report_instance(first.clone(), Duration::from_secs(30))
+            .await
+            .unwrap());
+        // Removing the management projection must not affect authoritative
+        // instance targets used for revision propagation.
+        store
+            .remove_node("cluster-a", &first.node.id, &first.incarnation_id)
+            .await
+            .unwrap();
+        assert!(store.snapshot("cluster-a").await.unwrap().nodes.is_empty());
+        let targets = revision_targets(&obs.serving_workers().await.unwrap(), &revision_policy());
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].worker.incarnation_id, "first");
+        let mut second = worker_status("cluster-a", "worker-1", "second", "127.0.0.1:8");
+        assert!(!obs
+            .report_instance(second.clone(), Duration::from_secs(30))
+            .await
+            .unwrap());
+        assert!(
+            revision_targets(&obs.serving_workers().await.unwrap(), &revision_policy()).is_empty()
+        );
+        // Withdrawing the second incarnation restores the sole serving target.
+        second.heartbeat_seq += 1;
+        second.ready = false;
+        assert!(!obs
+            .report_instance(second, Duration::from_secs(30))
+            .await
+            .unwrap());
+        assert_eq!(
+            revision_targets(&obs.serving_workers().await.unwrap(), &revision_policy()).len(),
+            1
+        );
+        // A stale live record must not revive a retired member for privileged updates.
+        change(
+            store.as_ref(),
+            "cluster-a",
+            MemberChange::SetMember(WorkerMember {
+                worker_id: "worker-1".into(),
+                zone: None,
+                retired: true,
+            }),
+        )
+        .await
+        .unwrap();
+        assert!(
+            revision_targets(&obs.serving_workers().await.unwrap(), &revision_policy()).is_empty()
+        );
     }
 }

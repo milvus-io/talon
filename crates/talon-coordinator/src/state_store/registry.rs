@@ -1,6 +1,6 @@
 //! Atomic persistent registry operations shared by every backend.
 use super::{ClusterStateStore, StateBackend, StateStoreError, StateStoreResult, StoreRevision};
-use talon_core::worker_membership::{MemberRegistry, MembershipMode, WorkerMember};
+use talon_core::worker_membership::{MemberRegistry, WorkerMember};
 
 pub const MAX_REGISTRY_BYTES: usize = 512 * 1024;
 #[derive(Debug, Clone)]
@@ -42,7 +42,6 @@ pub enum MemberChange {
         zone: Option<String>,
     },
     SetMember(WorkerMember),
-    SetMode(MembershipMode),
 }
 
 pub async fn change(
@@ -87,7 +86,6 @@ pub async fn change(
                     value.members.push(member.clone());
                 }
             }
-            MemberChange::SetMode(mode) => value.mode = *mode,
         }
         value.members.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
         encode(&value, store.backend())?;
@@ -163,12 +161,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_cas_retirement_and_mode_are_persistent() {
+    async fn registry_cas_and_retirement_are_persistent() {
         let store = MemoryStateStore::new();
         let initial = store.member_registry("c").await.unwrap();
         assert!(initial.revision.is_none());
-        assert_eq!(initial.value.mode, MembershipMode::Legacy);
-        let first = change(
+        change(
             &store,
             "c",
             MemberChange::Register {
@@ -182,14 +179,6 @@ mod tests {
             .compare_member_registry("c", None, &MemberRegistry::default())
             .await
             .unwrap());
-        let token = first.topology_token();
-        assert_eq!(
-            change(&store, "c", MemberChange::SetMode(MembershipMode::Retained))
-                .await
-                .unwrap()
-                .topology_token(),
-            token
-        );
         change(
             &store,
             "c",
@@ -252,5 +241,68 @@ mod tests {
                 .len(),
             32
         );
+    }
+    #[tokio::test]
+    async fn instances_conflict_and_expire_without_changing_owners() {
+        use super::super::testkit::worker_status;
+        use std::time::Duration;
+        use talon_core::worker_membership::{InstanceState, WorkerDiscovery};
+        let store = MemoryStateStore::new();
+        let registry = change(
+            &store,
+            "contract",
+            MemberChange::Register {
+                worker_id: "w".into(),
+                zone: None,
+            },
+        )
+        .await
+        .unwrap();
+        let token = registry.topology_token();
+        store
+            .upsert_instance(worker_status("w", "inc-1", 0), Duration::from_millis(5))
+            .await
+            .unwrap();
+        let view = WorkerDiscovery::retained(
+            &registry,
+            &store.instance_snapshot("contract").await.unwrap().nodes,
+        );
+        assert!(matches!(
+            view.workers[0].state,
+            InstanceState::Serving { .. }
+        ));
+        let stable_state = view.state_token;
+        store
+            .upsert_instance(worker_status("w", "inc-1", 1), Duration::from_millis(5))
+            .await
+            .unwrap();
+        assert_eq!(
+            WorkerDiscovery::retained(
+                &registry,
+                &store.instance_snapshot("contract").await.unwrap().nodes
+            )
+            .state_token,
+            stable_state
+        );
+        store
+            .upsert_instance(worker_status("w", "inc-2", 0), Duration::from_secs(10))
+            .await
+            .unwrap();
+        let view = WorkerDiscovery::retained(
+            &registry,
+            &store.instance_snapshot("contract").await.unwrap().nodes,
+        );
+        assert!(matches!(view.workers[0].state, InstanceState::Conflict));
+        assert_eq!(view.topology_token, token);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        let view = WorkerDiscovery::retained(
+            &registry,
+            &store.instance_snapshot("contract").await.unwrap().nodes,
+        );
+        assert!(
+            matches!(&view.workers[0].state, InstanceState::Serving { instance_id, .. } if instance_id == "inc-2")
+        );
+        assert_eq!(view.topology_token, token);
+        assert!(store.snapshot("contract").await.unwrap().nodes.is_empty());
     }
 }

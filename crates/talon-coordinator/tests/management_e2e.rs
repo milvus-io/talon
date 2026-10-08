@@ -174,7 +174,14 @@ async fn management_api_and_ui_serve_registered_cluster() {
     )
     .await;
     assert!(
-        matches!(ack, ControlMessage::Ack { ok: true, .. }),
+        matches!(
+            ack,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ),
         "{ack:?}"
     );
 

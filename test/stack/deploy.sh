@@ -136,6 +136,12 @@ wait_membership_converged() {
     fi
     sleep 1
   done
+  {
+    echo "expected:"
+    echo "$expected"
+    echo "last coordinator response:"
+    echo "${output:-<none>}"
+  } >"$ARTIFACT_DIR/membership-failure.txt"
   fail "coordinator membership did not converge to $KIND_WORKERS ready workers"
 }
 
@@ -274,6 +280,8 @@ deploy_talon() {
   # (seccomp/sysctl), so this e2e intentionally exercises the Tokio data-plane
   # fallback; the io_uring path is covered by benches/dataplane_benches.rs and
   # scripts/dataplane_loadtest.sh (which require a bare-metal io_uring host).
+  local replaced_workers
+  replaced_workers="$(worker_pods)"
   kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
     TALON_WORKER_BACKEND=s3 \
     TALON_WORKER_S3_REGION=us-east-1 \
@@ -286,6 +294,8 @@ deploy_talon() {
   # The old pods can still be ready immediately after set env. Wait for the
   # new backend configuration to finish rolling out before counting workers.
   kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE-worker" --timeout=5m
+  printf '%s\n' "$replaced_workers" | python3 scripts/retire_e2e_workers.py \
+    --namespace "$NAMESPACE" --release "$RELEASE"
 
   log "waiting for $KIND_WORKERS ready workers"
   local ready=0

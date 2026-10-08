@@ -30,6 +30,10 @@
 //!   drive the worker's load/commit without moving a whole 256 MiB block to the
 //!   client.
 
+#[cfg(test)]
+#[path = "../../talon-transport/tests/support/membership.rs"]
+mod membership_fixture;
+
 use std::sync::Arc;
 
 use talon_core::{ObjectId, Version};
@@ -177,23 +181,16 @@ mod tests {
                                 epoch: 1,
                             }
                         }
-                        ControlMessage::MembershipQuery {} => ControlMessage::MembershipList {
-                            nodes: vec![NodeInfo {
-                                id: NodeId::new("w1"),
-                                address: worker_addr.clone(),
-                                role: NodeRole::Worker,
-                            }],
-                        },
-                        ControlMessage::MembershipQueryV2 {} => ControlMessage::MembershipListV2 {
-                            nodes: vec![talon_transport::ZonedNodeInfo {
+                        ControlMessage::MembershipQuery {} => {
+                            membership_fixture::zoned(vec![talon_transport::ZonedNodeInfo {
                                 info: NodeInfo {
                                     id: NodeId::new("w1"),
                                     address: worker_addr.clone(),
                                     role: NodeRole::Worker,
                                 },
                                 zone: None,
-                            }],
-                        },
+                            }])
+                        }
                         _ => ControlMessage::Ack {
                             ok: false,
                             detail: None,
