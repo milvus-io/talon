@@ -193,7 +193,7 @@ assert_workers_spread() {
 }
 
 rollout_workers() {
-  kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE-worker" --timeout=180s
+  kubectl -n "$NAMESPACE" rollout status "statefulset/$RELEASE-worker" --timeout=300s
   assert_workers_spread
 }
 
@@ -223,20 +223,22 @@ restart_worker_container() {
 set_cache_limits() {
   local l1="$1"
   local l2="$2"
-  local replaced_workers
-  replaced_workers="$(python3 scripts/retire_e2e_workers.py \
+  local previous_workers
+  previous_workers="$(python3 scripts/check_e2e_workers.py \
     --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
-  kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
+  kubectl -n "$NAMESPACE" set env "statefulset/$RELEASE-worker" \
     "TALON_WORKER_L1_CAPACITY_BYTES=$l1" \
     "TALON_WORKER_L1_PAGE_SIZE_BYTES=$PAGE_SIZE" \
     "TALON_WORKER_CAPACITY_BYTES=$l2" >/dev/null
   rollout_workers
-  retire_replaced_workers "$replaced_workers"
+  check_replaced_workers "$previous_workers"
 }
 
-retire_replaced_workers() {
-  printf '%s\n' "$1" | python3 scripts/retire_e2e_workers.py \
-    --namespace "$NAMESPACE" --release "$RELEASE"
+check_replaced_workers() {
+  local previous="$1"
+  shift
+  printf '%s\n' "$previous" | python3 scripts/check_e2e_workers.py \
+    --namespace "$NAMESPACE" --release "$RELEASE" "$@"
 }
 
 metric_value() {
@@ -418,9 +420,9 @@ helm upgrade --install "$RELEASE" deploy/helm/talon -n "$NAMESPACE" \
   --set worker.resources.limits.memory=512Mi \
   --wait --timeout 5m
 
-replaced_workers="$(python3 scripts/retire_e2e_workers.py \
+previous_workers="$(python3 scripts/check_e2e_workers.py \
   --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
-kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
+kubectl -n "$NAMESPACE" set env "statefulset/$RELEASE-worker" \
   TALON_WORKER_BACKEND=s3 \
   TALON_WORKER_S3_REGION=us-east-1 \
   TALON_WORKER_S3_ENDPOINT=http://minio:9000 \
@@ -430,7 +432,7 @@ kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
   TALON_WORKER_BACKEND_DELAY_MS=50 \
   TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 >/dev/null
 rollout_workers
-retire_replaced_workers "$replaced_workers"
+check_replaced_workers "$previous_workers"
 
 kubectl -n "$NAMESPACE" get pods -o wide | tee "$ARTIFACT_DIR/pods-initial.txt"
 start_coordinator_forward
@@ -618,9 +620,11 @@ start_worker_forward "$(first_worker)"
 placed_read hot.bin 4096 "$ARTIFACT_DIR/after-coordinator-restart.out" >/dev/null
 
 worker_victim="$(first_worker)"
+previous_workers="$(python3 scripts/check_e2e_workers.py \
+  --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
 kubectl -n "$NAMESPACE" delete pod "$worker_victim" --wait=false
 rollout_workers
-retire_replaced_workers "$worker_victim"
+check_replaced_workers "$previous_workers" --replaced "$worker_victim"
 stop_port_forwards
 start_coordinator_forward
 recovered=0

@@ -1,11 +1,19 @@
 # Rolling upgrade with retained Worker membership
 
-Persistent membership retains logical ownership while a Worker is offline. Reads to that
-owner return `Unavailable` or `Timeout`; the application decides whether to use
-origin fallback. Version conflicts, rate limits, protocol errors and origin
-errors are not availability failures. Failed retained reads are not resent by
-the SDK. All binaries and clients must implement the same schema-6 contract;
-there is no membership-mode switch or compatibility fallback.
+Persistent membership retains logical ownership while a Worker is offline.
+Each block read ranks up to `replicas_k` logical candidates (default one) from
+one discovery snapshot. Offline/conflicted candidates are skipped and retryable
+failures advance to the next candidate. A reused connection that fails with an
+I/O error may be redialed and resent once per candidate, only while discovery
+remains valid. The SDK does not refresh discovery or restart the candidate list
+within that read; subsequent requests may refresh and recover. After candidate
+exhaustion, an availability failure reaches the caller as `Unavailable` or
+`Timeout`, and the application decides whether to use origin fallback. Invalid
+requests, missing origin objects, version conflicts, rate limits and origin
+errors terminate the read without candidate fallback. A protocol error returned
+to the caller is not an availability failure. All binaries and clients must
+implement the same schema-6 contract; there is no membership-mode switch or
+compatibility fallback.
 
 ## Prepare storage and migrate existing deployments
 
@@ -37,10 +45,12 @@ A nonempty legacy directory requires its **exact old Worker ID** on the first
 new startup (`--node-id` or `TALON_WORKER_NODE_ID`). Supply this per directory;
 if old IDs differed, migrate each ordinal with its own configuration. The
 process imports that ID into the synced `worker_identity` file while holding
-`.worker.lock`. For an empty directory it generates a new ID. Later explicit
-IDs must match; cluster ID, block size and page size must also match. Never
-regenerate/delete the identity file to bypass a mismatch. Certificates on the
-mTLS control channel must name this persisted Worker ID.
+`.worker.lock`. For an empty directory it generates a new ID; a filesystem-owned
+`lost+found` directory is ignored for this check, so a fresh ext4 volume can
+initialize without an explicit ID. Other existing contents still require import.
+Later explicit IDs must match; cluster ID, block size and page size must also
+match. Never regenerate/delete the identity file to bypass a mismatch.
+Certificates on the mTLS control channel must name this persisted Worker ID.
 
 Keep PVCs on StatefulSet deletion and scale-down. Losing a disk is a separate
 member replacement: stop/fence its process and explicitly retire the member;

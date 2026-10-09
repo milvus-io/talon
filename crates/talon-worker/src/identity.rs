@@ -54,12 +54,18 @@ impl CacheRootLock {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let has_cache =
                     std::fs::read_dir(&self.root)?.try_fold(false, |found, entry| {
-                        let name = entry?.file_name();
+                        let entry = entry?;
+                        let name = entry.file_name();
                         let name = name.to_string_lossy();
+                        // Fresh ext4 volume roots contain this filesystem-owned
+                        // directory. Do not follow symlinks or ignore other data.
+                        let filesystem_metadata =
+                            name == "lost+found" && entry.file_type()?.is_dir();
                         Ok::<_, std::io::Error>(
                             found
                                 || (name != ".worker.lock"
-                                    && !name.starts_with(".worker_identity.tmp.")),
+                                    && !name.starts_with(".worker_identity.tmp.")
+                                    && !filesystem_metadata),
                         )
                     })?;
                 ensure!(
@@ -139,8 +145,44 @@ mod tests {
     }
 
     #[test]
+    fn filesystem_lost_found_allows_new_identity_and_restart() {
+        let root = tempfile::tempdir().unwrap();
+        let lost_found = root.path().join("lost+found");
+        std::fs::create_dir(&lost_found).unwrap();
+        let lock = CacheRootLock::acquire(root.path()).unwrap();
+        let first = lock.load_identity("c", None, 64, 0).unwrap();
+        assert!(!first.worker_id.is_empty());
+        assert!(lost_found.is_dir());
+        drop(lock);
+
+        let lock = CacheRootLock::acquire(root.path()).unwrap();
+        assert_eq!(first, lock.load_identity("c", None, 64, 0).unwrap());
+    }
+
+    #[test]
+    fn lost_found_file_still_requires_explicit_import() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("lost+found"), b"legacy data").unwrap();
+        let lock = CacheRootLock::acquire(root.path()).unwrap();
+        assert!(lock.load_identity("c", None, 64, 0).is_err());
+        assert!(!root.path().join(IDENTITY_FILE).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn lost_found_symlink_still_requires_explicit_import() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target.path(), root.path().join("lost+found")).unwrap();
+        let lock = CacheRootLock::acquire(root.path()).unwrap();
+        assert!(lock.load_identity("c", None, 64, 0).is_err());
+        assert!(!root.path().join(IDENTITY_FILE).exists());
+    }
+
+    #[test]
     fn legacy_cache_requires_explicit_import() {
         let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("lost+found")).unwrap();
         std::fs::create_dir(root.path().join("blocks")).unwrap();
         let lock = CacheRootLock::acquire(root.path()).unwrap();
         assert!(lock.load_identity("c", None, 64, 0).is_err());

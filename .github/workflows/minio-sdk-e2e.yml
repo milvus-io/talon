@@ -14,8 +14,8 @@ on:
     paths:
       - "patches/**"
       - "scripts/prepare_monoio.py"
-      - "scripts/retire_e2e_workers.py"
-      - "scripts/test_retire_e2e_workers.py"
+      - "scripts/check_e2e_workers.py"
+      - "scripts/test_check_e2e_workers.py"
       - ".github/workflows/minio-sdk-e2e.yml"
       - "test/**"
       - "deploy/docker/**"
@@ -51,7 +51,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Check E2E membership lifecycle
-        run: python3 scripts/test_retire_e2e_workers.py
+        run: python3 scripts/test_check_e2e_workers.py
       - name: Prepare patched Monoio
         run: python3 scripts/prepare_monoio.py
 

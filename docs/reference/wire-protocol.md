@@ -291,8 +291,17 @@ Conflict=1, Serving=2. Serving carries `instance_id: String`, then
 `address: String`. The view contains `topology_token`, `state_token`,
 `valid_for_ms` and the workers. Tokens are opaque equality values; address and
 lease changes do not change logical ownership. Client instance freshness is
-bounded by `valid_for_ms` and 500 ms. Failed data reads are not resent; later
-requests may refresh and recover.
+bounded by `valid_for_ms` and 500 ms. Each block read uses one discovery snapshot
+and ranks up to `replicas_k` logical candidates (default one), skipping offline
+or conflicted candidates and advancing after retryable failures. A reused
+connection that fails with an I/O error may be redialed and resent once per
+candidate; discovery expiration is checked before dialing and before resending.
+Fresh-connection failures and Worker error responses do not trigger that
+same-candidate retry. The SDK does not refresh discovery or restart the candidate
+list within the read; later requests may refresh and recover. Invalid requests,
+missing origin objects, version conflicts, rate limits and origin errors terminate
+the read without trying another candidate. A protocol error returned to the caller
+does not permit origin fallback.
 
 `ControlFailure` (tag 18) carries the existing `DataErrorCode` discriminant and
 `message: String`. Coordinators and Workers use it for typed discovery and
