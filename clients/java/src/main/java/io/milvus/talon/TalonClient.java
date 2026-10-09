@@ -58,6 +58,7 @@ public final class TalonClient implements AutoCloseable {
     private long nextDiscoveryAttempt;
     private final Map<String, ConnectionPool> instancePools = new HashMap<>();
     private final int maxIdlePerAddr;
+    private final java.util.concurrent.Semaphore loadSlots = new java.util.concurrent.Semaphore(8);
 
     private TalonClient(String coordinator, int blockSize, int maxIdlePerAddr) {
         this.maxIdlePerAddr = maxIdlePerAddr;
@@ -169,6 +170,155 @@ public final class TalonClient implements AutoCloseable {
             out.write(readBlock(seg));
         }
         return out.toByteArray();
+    }
+
+    /** Prewarm an exact source version without HEAD; completed fills survive failure. */
+    public LoadResult load(String uri, String version, long size) throws IOException {
+        return load(new LoadRequest(uri, version, size), RequestOptions.INHERIT);
+    }
+
+    /** Prewarm with a parsed request and inherited tracing. */
+    public LoadResult load(LoadRequest request) throws IOException {
+        return load(request, RequestOptions.INHERIT);
+    }
+
+    /** Prewarm a parsed object with explicit request tracing. */
+    public LoadResult load(LoadRequest request, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options,
+                () -> loadFiles(List.of(request), false).get(0));
+    }
+
+    /** Batch by worker and frame size, with up to 1024 block instructions per RPC.
+     * Results follow input order, including empty files and duplicates.
+     * The operation is not atomic: failure may leave completed fills cached. */
+    public List<LoadResult> batchLoad(List<LoadRequest> requests) throws IOException {
+        return batchLoad(requests, RequestOptions.INHERIT);
+    }
+
+    /** Batch prewarm with explicit request tracing. */
+    public List<LoadResult> batchLoad(List<LoadRequest> requests, RequestOptions options) throws IOException {
+        List<LoadRequest> copy = List.copyOf(requests);
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> loadFiles(copy, true));
+    }
+
+    private List<LoadResult> loadFiles(List<LoadRequest> files, boolean batch) throws IOException {
+        List<LoadResult> results = new ArrayList<>(files.size());
+        boolean nonempty = false;
+        for (LoadRequest file : files) {
+            long blocks = file.size() == 0 ? 0 : (file.size() - 1) / blockSize + 1;
+            if (blocks > Long.MAX_VALUE / blockSize) throw new IllegalArgumentException("load extent overflows block addressing");
+            if (blocks > 0 && Messages.BATCH_LOAD_OVERHEAD + Messages.loadBlockSize(
+                    new Messages.LoadBlock(new BlockId(file.object(), 0, blockSize, file.version()), 1)) > Messages.MAX_LOAD_BODY_BYTES) {
+                throw new IllegalArgumentException("load identity exceeds frame limit");
+            }
+            results.add(new LoadResult(file.size(), blocks));
+            nonempty |= blocks > 0;
+        }
+        if (!nonempty) return List.copyOf(results);
+        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MINUTES.toNanos(30);
+        Placement.Table topology = membership().placement;
+        // Bound pending planning across all workers independently of file sizes.
+        Map<String, List<Messages.LoadBlock>> groups = new java.util.LinkedHashMap<>();
+        Map<String, Long> sizes = new HashMap<>();
+        int pending = 0;
+        long pendingBytes = 0;
+        for (LoadRequest file : files) {
+            for (long offset = 0; offset < file.size();) {
+                int length = (int) Math.min(blockSize, file.size() - offset);
+                Messages.LoadBlock request = new Messages.LoadBlock(
+                        new BlockId(file.object(), offset, blockSize, file.version()), length);
+                if (!batch) {
+                    sendLoad(topology, List.of(request), false, deadline);
+                } else {
+                    NodeInfo owner = topology.primary(request.block());
+                    if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
+                    String key = owner.id();
+                    List<Messages.LoadBlock> group = groups.computeIfAbsent(key, ignored -> new ArrayList<>());
+                    long bytes = sizes.getOrDefault(key, (long) Messages.BATCH_LOAD_OVERHEAD);
+                    long size = Messages.loadBlockSize(request);
+                    if (group.size() == Messages.MAX_BATCH_LOAD_BLOCKS || bytes + size > Messages.MAX_LOAD_BODY_BYTES) {
+                        sendLoad(topology, group, true, deadline);
+                        pending -= group.size();
+                        pendingBytes -= bytes - Messages.BATCH_LOAD_OVERHEAD;
+                        group.clear();
+                        bytes = Messages.BATCH_LOAD_OVERHEAD;
+                    }
+                    group.add(request);
+                    sizes.put(key, bytes + size);
+                    pending++;
+                    pendingBytes += size;
+                    if (pending >= 8192 || pendingBytes >= 8L * Messages.MAX_LOAD_BODY_BYTES) {
+                        for (List<Messages.LoadBlock> window : groups.values()) sendLoad(topology, window, true, deadline);
+                        groups.clear(); sizes.clear(); pending = 0; pendingBytes = 0;
+                    }
+                }
+                offset += length;
+            }
+        }
+        for (List<Messages.LoadBlock> group : groups.values()) sendLoad(topology, group, true, deadline);
+        synchronized (membershipLock) {
+            if (membership.placement != topology) throw new TalonException(TalonException.Code.UNAVAILABLE, "membership changed during load");
+        }
+        return List.copyOf(results);
+    }
+
+    private void sendLoad(Placement.Table topology, List<Messages.LoadBlock> blocks,
+            boolean batch, long deadline) throws IOException {
+        long remaining = deadline - System.nanoTime();
+        try {
+            if (remaining <= 0 || !loadSlots.tryAcquire(remaining, java.util.concurrent.TimeUnit.NANOSECONDS)) {
+                throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IOException("load interrupted", interrupted);
+        }
+        try {
+            membership();
+            ConnectionPool pool;
+            String address;
+            long instanceDeadline;
+            synchronized (membershipLock) {
+                if (membership.placement != topology) throw new TalonException(TalonException.Code.UNAVAILABLE, "membership changed during load");
+                NodeInfo owner = topology.primary(blocks.get(0).block());
+                if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
+                Messages.DiscoveredWorker target = discovery.workers().stream()
+                        .filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
+                if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "load owner offline or conflicting");
+                address = target.address(); pool = instancePools.get(instanceKey(target)); instanceDeadline = discoveryExpires;
+            }
+            int id = requestIds.getAndIncrement();
+            byte[] request = batch ? Messages.batchLoad(id, blocks) : Messages.loadBlock(id, blocks.get(0));
+            long rpcDeadline = Math.min(deadline, System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(batch ? 1800 : 120));
+            ConnectionPool.checkRetryDeadline(instanceDeadline);
+            pool.exchange(address, instanceDeadline, socket -> {
+                ConnectionPool.checkRetryDeadline(instanceDeadline);
+                long left = rpcDeadline - System.nanoTime();
+                if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
+                socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
+                try {
+                    socket.getOutputStream().write(Telemetry.envelope(request, address));
+                    socket.getOutputStream().flush();
+                    Frame header = readHeader(socket.getInputStream());
+                    if (header.isError() || header.type() != Frame.MsgType.CONTROL || header.requestId() != id || header.length() > (1 << 20)) {
+                        throw new ProtocolException("invalid LOAD reply frame");
+                    }
+                    // Recompute the remaining read budget after receiving the header.
+                    left = rpcDeadline - System.nanoTime();
+                    if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
+                    socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
+                    Messages.Response response = Messages.decodeBody(readExactly(socket.getInputStream(), header.length()));
+                    if (response.tag != Messages.TAG_ACK) throw unexpected("LOAD", response);
+                    boolean ok = response.body.bool();
+                    String detail = response.body.bool() ? response.body.string() : null;
+                    if (response.body.remaining() != 0) throw new ProtocolException("trailing LOAD acknowledgement bytes");
+                    if (!ok) throw new TalonException(TalonException.Code.UNKNOWN, "load rejected: " + detail);
+                    return null;
+                } finally { socket.setSoTimeout(READ_TIMEOUT_MS); }
+            });
+        } catch (IOException failure) {
+            throw TalonException.transport(failure);
+        } finally { loadSlots.release(); }
     }
 
     /** Return an object's size and version. */

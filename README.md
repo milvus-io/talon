@@ -75,6 +75,11 @@ The Rust SDK exposes the same operation as
 `client.load(&object, &version, size).await`. The caller must provide the
 correct file size for that version.
 
+Prewarming is also exposed as Python `Client.load` / `Client.batch_load`, Java
+`TalonClient.load` / `TalonClient.batchLoad`, and C `talon_load_async` /
+`talon_batch_load_async`. See the [client guides](docs/clients/overview.md) for
+request types, completion results, and ownership rules.
+
 For multiple files, use `client.batch_load(&[LoadRequest { object, version,
 size }, ...]).await` or a JSON manifest:
 

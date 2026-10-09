@@ -47,3 +47,23 @@ client; `put`/`delete` are tracked separately.
 See the [documentation](https://milvus-io.github.io/talon/) for cluster setup
 and the [use cases](https://milvus-io.github.io/talon/use-cases/overview.html)
 this is built for.
+
+## Prewarm
+
+```python
+result = client.load("s3://bucket/file", version="etag-1", size=4096)
+print(result.size, result.blocks)
+results = client.batch_load([
+    talon.LoadRequest("s3://bucket/a", "etag-a", 4096),
+    talon.LoadRequest("s3://bucket/b", "etag-b", 8192),
+])
+```
+
+Both methods release the GIL while waiting. The supplied version and size are
+required, and no HEAD is issued. `batch_load` sends up to 1024 block instructions
+per protocol frame and returns `LoadResult` objects in input order. Empty input
+succeeds without network I/O. Errors may leave completed fills cached; neither
+method pins cache residency. Transient S3 failures are retried by the worker.
+Both methods accept the optional `trace_context` keyword used by `read`.
+Invalid coordinates raise `ValueError`; availability and deadline failures use
+`UnavailableError` and `TimeoutError`. Worker refusals raise `OSError`.

@@ -123,6 +123,7 @@ public final class ConformanceTest {
         versionedRangeEncodesIdentically(byName);
         errorResponseIsFlaggedAndCarriesAMessage(byName);
         connectionPooling();
+        loadBindings(byName);
 
         System.out.println();
         if (failures.isEmpty()) {
@@ -135,6 +136,75 @@ public final class ConformanceTest {
     }
 
     // --- the checks --------------------------------------------------------
+
+    private static void loadBindings(Map<String, byte[]> vectors) {
+        check("LOAD encodings match Rust vectors", () -> {
+            assertBytes(vectors.get("control.load_block"), Messages.loadBlock(7,
+                    new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "path/to/object"), 16, 8, "v1"), 1)));
+            assertBytes(vectors.get("control.batch_load"), Messages.batchLoad(8, List.of(
+                    new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "a"), 0, 8, "v1"), 8),
+                    new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "b"), 8, 8, "v2"), 3))));
+        });
+        check("LOAD and batch LOAD preserve sizes, versions and protocol batching", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                assertEquals(new LoadResult(9, 2), client.load("s3://bucket/file", "v1", 9), "single result");
+                List<LoadRequest> requests = new ArrayList<>();
+                for (int i = 0; i < 1025; i++) requests.add(new LoadRequest("s3://bucket/file-" + i, "v2", 3));
+                requests.add(new LoadRequest("s3://bucket/empty", "v3", 0));
+                List<LoadResult> results = client.batchLoad(requests);
+                assertEquals(1026, results.size(), "result count");
+                assertEquals(new LoadResult(0, 0), results.get(1025), "empty file result");
+                assertTrue(results.subList(0, 1025).stream().allMatch(r -> r.equals(new LoadResult(3, 1))), "ordered results");
+                assertEquals(List.of(0, 0, 1024, 1), peer.loadCounts, "two single frames then two batch frames");
+                assertEquals(List.of(8L, 1L), peer.loaded.subList(0, 2).stream().map(Messages.LoadBlock::length).toList(), "short tail");
+                assertTrue(peer.loaded.subList(2, 1027).stream().allMatch(b -> b.block().version().equals("v2") && b.length() == 3), "version and size preserved");
+                assertEquals(0, peer.statCalls.get(), "no HEAD/stat");
+            }
+        });
+        check("batch LOAD splits by encoded bytes", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                client.batchLoad(List.of(new LoadRequest("s3://bucket/" + "x".repeat(600_000), "v1", 16)));
+                assertEquals(List.of(1, 1), peer.loadCounts, "frame byte limit");
+            }
+        });
+        check("empty LOAD is local and invalid input is rejected", () -> {
+            try (TalonClient client = TalonClient.connect("127.0.0.1:1", 8)) {
+                assertEquals(List.of(), client.batchLoad(List.of()), "empty batch");
+                assertEquals(new LoadResult(0, 0), client.load("s3://bucket/empty", "v1", 0), "empty object");
+                boolean rejected = false;
+                try { client.load("s3://bucket/file", "v1", Long.MAX_VALUE); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                assertTrue(rejected, "overflow before network I/O");
+            }
+        });
+        check("LOAD refusals and malformed acknowledgements are not retried", () -> {
+            for (boolean malformed : List.of(false, true)) {
+                try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    client.load("s3://bucket/file", "v1", 1); // Prime a reused socket.
+                    peer.rejectLoad = !malformed;
+                    peer.wrongLoadRequestId = malformed;
+                    boolean failed = false;
+                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
+                    catch (TalonException error) { assertEquals(TalonException.Code.UNKNOWN, error.code(), "refusal"); failed = true; }
+                    catch (ProtocolException error) { assertTrue(malformed, "only malformed reply is protocol failure"); failed = true; }
+                    assertTrue(failed, "failure propagated");
+                    assertEquals(List.of(0, 1), peer.loadCounts, "no refusal replay");
+                }
+            }
+        });
+        check("LOAD refuses offline and conflicting owners", () -> {
+            for (int state : List.of(0, 1)) {
+                try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    peer.workerState = state;
+                    boolean failed = false;
+                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
+                    catch (TalonException error) { assertEquals(TalonException.Code.UNAVAILABLE, error.code(), "availability"); failed = true; }
+                    assertTrue(failed, "unavailable owner rejected");
+                    assertTrue(peer.loadCounts.isEmpty(), "no LOAD dispatch");
+                }
+            }
+        });
+    }
 
     private static void localPlacementMatchesRust() {
         check("client-side Maglev ranking matches Rust", () -> {
@@ -408,6 +478,12 @@ public final class ConformanceTest {
         volatile CountDownLatch arrived = new CountDownLatch(0);
         volatile CountDownLatch release = new CountDownLatch(0);
         volatile boolean malformedStat;
+        volatile boolean rejectLoad;
+        volatile boolean wrongLoadRequestId;
+        volatile int workerState = 2;
+        final AtomicInteger statCalls = new AtomicInteger();
+        final List<Integer> loadCounts = java.util.Collections.synchronizedList(new ArrayList<>());
+        final List<Messages.LoadBlock> loaded = java.util.Collections.synchronizedList(new ArrayList<>());
 
         PoolPeer() throws IOException {
             threads.submit(() -> {
@@ -445,11 +521,26 @@ public final class ConformanceTest {
                         }
                         response = new byte[] {42};
                     } else if (Messages.decodeBody(body).tag == Messages.TAG_MEMBERSHIP_QUERY) {
-                        response = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
+                        Bincode.Writer discovery = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
                                 .u64(1).u64(1).u64(500).u64(1).string("worker").u8(0).u8(0)
-                                .variant(2).string("test-instance").string(address())
-                                .toBytes();
+                                .variant(workerState);
+                        if (workerState == 2) discovery.string("test-instance").string(address());
+                        response = discovery.toBytes();
+                    } else if (Messages.decodeBody(body).tag == Messages.TAG_LOAD_BLOCK
+                            || Messages.decodeBody(body).tag == Messages.TAG_BATCH_LOAD) {
+                        Messages.Response message = Messages.decodeBody(body);
+                        int count = message.tag == Messages.TAG_BATCH_LOAD ? message.body.seqLen() : 1;
+                        loadCounts.add(message.tag == Messages.TAG_BATCH_LOAD ? count : 0);
+                        for (int i = 0; i < count; i++) {
+                            ObjectId object = new ObjectId(Messages.backendFrom(message.body.variant()), message.body.string(), message.body.string());
+                            BlockId block = new BlockId(object, message.body.u64(), (int) message.body.u32(), message.body.string());
+                            loaded.add(new Messages.LoadBlock(block, message.body.u64()));
+                        }
+                        Bincode.Writer ack = new Bincode.Writer().u16(6).variant(Messages.TAG_ACK).u8(rejectLoad ? 0 : 1).u8(rejectLoad ? 1 : 0);
+                        if (rejectLoad) ack.string("origin unavailable");
+                        response = ack.toBytes();
                     } else {
+                        statCalls.incrementAndGet();
                         Bincode.Writer w = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_OBJECT_STAT);
                         if (!malformedStat) {
                             w.u64(1).string("v1");
@@ -457,7 +548,7 @@ public final class ConformanceTest {
                         response = w.toBytes();
                     }
                     socket.getOutputStream().write(new Frame(request.type(), 0,
-                            request.requestId(), response.length).encode());
+                            request.requestId() + (wrongLoadRequestId ? 1 : 0), response.length).encode());
                     socket.getOutputStream().write(response);
                     socket.getOutputStream().flush();
                 }

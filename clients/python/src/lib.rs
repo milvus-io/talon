@@ -109,9 +109,12 @@ mod exception_types {
 use exception_types::UnavailableError;
 
 fn client_err(error: RustError) -> PyErr {
+    classified_err(error.kind(), error.to_string())
+}
+
+fn classified_err(kind: talon_rust_client::ErrorKind, message: String) -> PyErr {
     use talon_rust_client::ErrorKind;
-    let message = error.to_string();
-    match error.kind() {
+    match kind {
         ErrorKind::Unavailable => UnavailableError::new_err(message),
         ErrorKind::Timeout => pyo3::exceptions::PyTimeoutError::new_err(message),
         ErrorKind::InvalidArgument => PyValueError::new_err(message),
@@ -177,8 +180,136 @@ pub struct Client {
     client: Arc<RustClient>,
 }
 
+/// One file to prewarm, with caller-supplied source version and size.
+#[pyclass(module = "talon", frozen)]
+#[derive(Clone)]
+pub struct LoadRequest {
+    #[pyo3(get)]
+    pub uri: String,
+    #[pyo3(get)]
+    pub version: String,
+    #[pyo3(get)]
+    pub size: u64,
+}
+
+#[pymethods]
+impl LoadRequest {
+    #[new]
+    fn new(uri: String, version: String, size: u64) -> PyResult<Self> {
+        parse_uri(&uri).map_err(client_err)?;
+        if version.trim().is_empty() {
+            return Err(PyValueError::new_err("load requires a non-empty version"));
+        }
+        Ok(Self { uri, version, size })
+    }
+}
+
+/// Successful file prewarm. Cache entries remain subject to eviction.
+#[pyclass(module = "talon", frozen)]
+pub struct LoadResult {
+    #[pyo3(get)]
+    pub size: u64,
+    #[pyo3(get)]
+    pub blocks: u64,
+}
+
+impl Client {
+    fn run_loads(
+        &self,
+        py: Python<'_>,
+        requests: Vec<LoadRequest>,
+        batch: bool,
+        trace_context: Option<std::collections::HashMap<String, String>>,
+    ) -> PyResult<Vec<LoadResult>> {
+        let parent = capture_trace(py, trace_context);
+        let requests = requests
+            .into_iter()
+            .map(|r| {
+                Ok(talon_rust_client::LoadRequest {
+                    object: parse_uri(&r.uri).map_err(client_err)?,
+                    version: talon_rust_client::Version::new(r.version),
+                    size: r.size,
+                })
+            })
+            .collect::<PyResult<Vec<_>>>()?;
+        let client = Arc::clone(&self.client);
+        let runtime = Arc::clone(&self.runtime);
+        let results = py
+            .allow_threads(move || {
+                with_telemetry(|| {
+                    runtime.block_on(async move {
+                        let operation = talon_telemetry::Operation::new(
+                            "talon.python.load",
+                            "internal",
+                            parent
+                                .as_ref()
+                                .map(talon_telemetry::TraceParent::Explicit)
+                                .unwrap_or(talon_telemetry::TraceParent::Root),
+                        );
+                        let result = operation
+                            .scope(async {
+                                if batch {
+                                    client.batch_load(&requests).await
+                                } else {
+                                    let r = &requests[0];
+                                    client
+                                        .load(&r.object, &r.version, r.size)
+                                        .await
+                                        .map(|r| vec![r])
+                                }
+                            })
+                            .await;
+                        operation.outcome(if result.is_ok() { "success" } else { "error" });
+                        result
+                    })
+                })
+            })
+            .map_err(|error| {
+                classified_err(
+                    talon_rust_client::ErrorKind::from(&error),
+                    error.to_string(),
+                )
+            })?;
+        Ok(results
+            .into_iter()
+            .map(|r| LoadResult {
+                size: r.size,
+                blocks: r.blocks,
+            })
+            .collect())
+    }
+}
+
 #[pymethods]
 impl Client {
+    /// Prewarm a file without HEAD. Wait for every assigned block to complete.
+    #[pyo3(signature = (uri, *, version, size, trace_context = None))]
+    fn load(
+        &self,
+        py: Python<'_>,
+        uri: String,
+        version: String,
+        size: u64,
+        trace_context: Option<std::collections::HashMap<String, String>>,
+    ) -> PyResult<LoadResult> {
+        let request = LoadRequest::new(uri, version, size)?;
+        Ok(self
+            .run_loads(py, vec![request], false, trace_context)?
+            .remove(0))
+    }
+
+    /// Prewarm files through protocol batches. Results follow input order.
+    /// An error may leave completed fills cached; no partial results are returned.
+    #[pyo3(signature = (requests, *, trace_context = None))]
+    fn batch_load(
+        &self,
+        py: Python<'_>,
+        requests: Vec<LoadRequest>,
+        trace_context: Option<std::collections::HashMap<String, String>>,
+    ) -> PyResult<Vec<LoadResult>> {
+        self.run_loads(py, requests, true, trace_context)
+    }
+
     /// Connect to a coordinator.
     ///
     /// `block_size` must match the workers' configured block size; placement is
@@ -367,6 +498,8 @@ fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Client>()?;
     m.add_class::<ObjectStat>()?;
     m.add_class::<ObjectEntry>()?;
+    m.add_class::<LoadRequest>()?;
+    m.add_class::<LoadResult>()?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }
@@ -374,6 +507,35 @@ fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn load_python_api_over_real_tcp() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let module = PyModule::new_bound(py, "talon").unwrap();
+            talon(&module).unwrap();
+            py.import_bound("sys")
+                .unwrap()
+                .getattr("modules")
+                .unwrap()
+                .set_item("talon", module)
+                .unwrap();
+            let tests = PyModule::from_code_bound(
+                py,
+                include_str!("../tests/test_load.py"),
+                "test_load.py",
+                "test_load",
+            )
+            .unwrap();
+            assert!(tests
+                .getattr("run_tests")
+                .unwrap()
+                .call0()
+                .unwrap()
+                .extract::<bool>()
+                .unwrap());
+        });
+    }
 
     #[test]
     fn constructor_accepts_pool_limit_keyword_and_rejects_zero() {

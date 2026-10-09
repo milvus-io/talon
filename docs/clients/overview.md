@@ -57,6 +57,16 @@ have served, invisibly from both ends.
 
 ## Current scope
 
+All native SDKs support single-file and protocol-level batch prewarming:
+Rust `load` / `batch_load`, Python `load` / `batch_load`, Java `load` / `batchLoad`,
+and C `talon_load_async` / `talon_batch_load_async`. Supply the source version
+and its size; no HEAD is issued. Clients dispatch directly to primary workers,
+using the coordinator only for membership discovery. A frame carries up to
+1024 block instructions within the control-frame byte limit. Workers load
+concurrently and automatically retry transient origin failures, including S3
+throttling. Completion results report bytes and blocks for each file in input
+order; failure may leave completed fills cached. Cache residency is not pinned.
+
 All native clients are **read-only** in this release.
 
 `list` is implemented in both but not yet usable, because listing needs a

@@ -102,3 +102,25 @@ this implements.
 `list` is implemented but returns an error until the backends gain a listing
 capability ([#332](https://github.com/milvus-io/talon/issues/332)). Writes go
 through the FUSE mount or the Rust client.
+
+## Prewarm
+
+```java
+LoadResult result = client.load("s3://bucket/file", "etag-1", 4096);
+List<LoadResult> results = client.batchLoad(List.of(
+    new LoadRequest("s3://bucket/a", "etag-a", 4096),
+    new LoadRequest("s3://bucket/b", "etag-b", 8192)));
+```
+
+`LoadRequest` accepts either a URI or `ObjectId`. Supply the exact source version
+and its size; no HEAD is issued. Batch LOAD groups blocks by worker and sends up
+to 1024 instructions per frame, splitting earlier for the control-frame byte
+limit. Results follow input order, including empty files. Calls block until
+completion; concurrent calls on a client share eight LOAD RPC permits. Workers
+load blocks concurrently and retry transient origin failures. A failure may
+leave completed cache fills; successful completion does not pin residency.
+
+`load(LoadRequest, RequestOptions)` and `batchLoad(List<LoadRequest>, RequestOptions)`
+accept explicit tracing options. Expired instance discovery must refresh before
+dispatch; offline or conflicting owners produce `TalonException(UNAVAILABLE)`.
+Worker rejections and malformed acknowledgements are not retried.
