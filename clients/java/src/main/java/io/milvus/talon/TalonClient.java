@@ -284,11 +284,12 @@ public final class TalonClient implements AutoCloseable {
 
     private record CachedMembership(Placement.Table placement) {}
 
-    /** Fetch one segment from its selected logical owner without resending. */
+    /** Fetch from one logical owner, allowing one bounded stale-connection retry. */
     private byte[] readBlock(Segment seg) throws IOException {
         membership();
         ConnectionPool pool;
         String address;
+        long retryDeadline;
         synchronized (membershipLock) {
             NodeInfo owner = membership.placement.primary(seg.block);
             if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
@@ -297,8 +298,9 @@ public final class TalonClient implements AutoCloseable {
             if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "worker " + owner.id() + " offline or conflicting");
             address = target.address();
             pool = instancePools.get(instanceKey(target));
+            retryDeadline = discoveryExpires;
         }
-        try { return fetchRange(address, seg, pool); }
+        try { return fetchRange(address, seg, pool, retryDeadline); }
         catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
@@ -365,7 +367,7 @@ public final class TalonClient implements AutoCloseable {
         } catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
-    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool) throws IOException {
+    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool, long retryDeadline) throws IOException {
         int id = requestIds.getAndIncrement();
         byte[] request =
                 Messages.versionedRange(
@@ -375,7 +377,7 @@ public final class TalonClient implements AutoCloseable {
                         seg.length,
                         seg.block.version());
 
-        return pool.exchange(workerAddress, false, socket -> {
+        return pool.exchange(workerAddress, retryDeadline, socket -> {
             OutputStream out = socket.getOutputStream();
             out.write(Telemetry.envelope(request, workerAddress));
             out.flush();
@@ -413,35 +415,51 @@ public final class TalonClient implements AutoCloseable {
         }
 
         <T> T exchange(String address, IoFunction<Socket, T> request) throws IOException {
-            return exchange(address, true, request);
+            return exchange(address, null, request);
         }
-        <T> T exchange(String address, boolean retry, IoFunction<Socket, T> request) throws IOException {
+        <T> T exchange(String address, Long retryDeadline, IoFunction<Socket, T> request) throws IOException {
             Socket socket = takeIdle(address);
             boolean reused = socket != null;
+            boolean retrying = false;
             for (;;) {
                 if (socket == null) {
+                    if (retrying) checkRetryDeadline(retryDeadline);
                     ensureOpen();
                     // Dial and all request I/O run outside the pool lock.
                     socket = dial(address);
                 }
                 boolean completed = false;
                 try {
+                    // Dialing can consume the remaining discovery lifetime.
+                    if (retrying) checkRetryDeadline(retryDeadline);
                     T result = request.apply(socket);
                     release(address, socket);
                     completed = true;
                     return result;
-                } catch (EOFException | SocketException disconnected) {
-                    if (!reused || !retry) {
-                        throw disconnected;
+                } catch (IOException failure) {
+                    // Data reads retry transport I/O only, never a typed Worker refusal.
+                    // Preserve the narrower disconnect-only policy for control requests.
+                    if (!reused || failure instanceof TalonException
+                            || (retryDeadline == null
+                                && !(failure instanceof EOFException || failure instanceof SocketException))) {
+                        throw failure;
                     }
                     // The peer may close an idle socket. Retry once, bypassing the pool.
                     reused = false;
+                    retrying = true;
                 } finally {
                     if (!completed) {
                         closeSocket(socket);
                     }
                 }
                 socket = null;
+            }
+        }
+
+        private static void checkRetryDeadline(Long deadline) throws TalonException {
+            if (deadline != null && System.nanoTime() >= deadline) {
+                throw new TalonException(TalonException.Code.UNAVAILABLE,
+                        "instance discovery expired before read retry");
             }
         }
 
