@@ -98,9 +98,8 @@ pub async fn handle_conn(
     worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
-    let Some(_connection) = observability.drain().admit() else {
-        return Ok(());
-    };
+    let stopped = observability.shutdown().stopped();
+    tokio::pin!(stopped);
     let _active_connection = observability.metrics().track_connection();
     loop {
         let request_started = Instant::now();
@@ -108,7 +107,8 @@ pub async fn handle_conn(
         // a read timeout, so a peer cannot pin a 320 MiB buffer by advertising a
         // huge length and stalling (issue #111).
         let (header, payload) = match tokio::select! {
-            _ = observability.drain().stopped() => return Ok(()),
+            biased;
+            _ = &mut stopped => return Ok(()),
             frame = talon_transport::read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT) => frame,
         } {
             Ok(frame) => frame,
@@ -120,9 +120,11 @@ pub async fn handle_conn(
             Err(e) => return Err(anyhow::anyhow!(e)),
         };
 
-        let Some(_request) = observability.drain().admit() else {
+        // The connection owns this request until its response finishes. A stop
+        // racing after this load is safe: shutdown joins the connection.
+        if observability.shutdown().is_stopped() {
             return Ok(());
-        };
+        }
         let (metadata, _) = talon_transport::envelope::decode(&header, &payload)?;
         let operation =
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);

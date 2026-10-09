@@ -13,10 +13,10 @@
 pub mod codec;
 pub mod control_tls;
 pub mod data;
-pub mod drain;
 pub mod frame;
 pub mod limits;
 pub mod pool;
+pub mod shutdown;
 pub mod uring;
 
 pub use codec::{

@@ -45,7 +45,7 @@ pub struct CoordinatorObservability {
     /// a transient state-store failure.
     state_failure_grace: Duration,
     pub(crate) shutting_down: AtomicBool,
-    drain: Arc<talon_transport::drain::DrainGate>,
+    shutdown: Arc<talon_transport::shutdown::Shutdown>,
     listeners_ready: AtomicBool,
     request_timeout: Duration,
     pub(crate) metrics: CoordinatorMetrics,
@@ -99,7 +99,7 @@ impl CoordinatorObservability {
             last_membership_refresh_elapsed_ms: AtomicU64::new(0),
             state_failure_grace: Duration::ZERO,
             shutting_down: AtomicBool::new(false),
-            drain: Arc::default(),
+            shutdown: Arc::default(),
             listeners_ready: AtomicBool::new(true),
             request_timeout,
             metrics: CoordinatorMetrics::new(),
@@ -820,14 +820,15 @@ impl CoordinatorObservability {
         result
     }
 
-    /// Begin graceful shutdown: mark this coordinator not-live/not-ready so new
-    /// authoritative reads fail closed while in-flight ones drain.
-    pub fn drain(&self) -> &Arc<talon_transport::drain::DrainGate> {
-        &self.drain
+    /// Shared stop signal; listener owners join their accepted work.
+    pub fn shutdown(&self) -> &Arc<talon_transport::shutdown::Shutdown> {
+        &self.shutdown
     }
 
+    /// Begin graceful shutdown: mark this coordinator not-live/not-ready so new
+    /// authoritative reads fail closed while in-flight ones drain.
     pub fn begin_shutdown(&self) {
-        self.drain.begin();
+        self.shutdown.begin();
         self.shutting_down.store(true, Ordering::Release);
         self.ready.store(false, Ordering::Release);
     }

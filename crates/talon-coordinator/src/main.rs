@@ -748,12 +748,12 @@ impl Coordinator {
     }
 
     async fn dispatch(&self, message: ControlMessage) -> ControlMessage {
-        let Some(_request) = self.observability.drain().admit() else {
+        if self.observability.shutdown().is_stopped() {
             return ControlMessage::ControlFailure {
                 code: talon_transport::DataErrorCode::Unavailable,
                 message: "coordinator draining".into(),
             };
-        };
+        }
         match message {
             ControlMessage::NodeStatusHeartbeat { status } => {
                 let result: talon_coordinator::StateStoreResult<bool> = async {
@@ -906,7 +906,7 @@ async fn run() -> anyhow::Result<()> {
     let admin_listener = TcpListener::bind(&config.admin_listen).await?;
     let admin_state = Arc::clone(&observability);
     let admin_security = Arc::clone(&security);
-    tokio::spawn(async move {
+    let admin_server = tokio::spawn(async move {
         if let Err(error) = talon_coordinator::observability::serve_admin_secured(
             admin_listener,
             admin_state,
@@ -935,6 +935,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     let mut revision_propagation = None;
+    let mut control_server = None;
     let secure_control_enabled = config.control_tls.is_some();
     if let (Some(control_listen), Some(control_tls)) = (&config.control_listen, &config.control_tls)
     {
@@ -964,11 +965,11 @@ async fn run() -> anyhow::Result<()> {
             ));
         }
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        control_server = Some(tokio::spawn(async move {
             if let Err(error) = serve_worker_control(listener, channel, state).await {
                 tracing::error!(%error, "coordinator worker mTLS control plane stopped");
             }
-        });
+        }));
     }
 
     let listener = TcpListener::bind(&config.listen).await?;
@@ -978,15 +979,26 @@ async fn run() -> anyhow::Result<()> {
     // exhaust memory/FDs (issue #111).
     let conn_limit = talon_transport::ConnectionLimit::new(MAX_CONTROL_CONNECTIONS);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+    let mut connections = tokio::task::JoinSet::new();
+    let stopped = observability.shutdown().stopped();
+    tokio::pin!(stopped);
     let result = loop {
         tokio::select! {
+            biased;
+            _ = &mut stopped => break Ok(()),
+            signal = tokio::signal::ctrl_c() => break signal.map_err(Into::into),
+            _ = term.recv() => break Ok(()),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "control connection task failed"); }
+                continue;
+            }
             accepted = async {
                 let permit = conn_limit.acquire().await;
                 listener.accept().await.map(|v| (permit, v))
             } => {
                 let (permit, (stream, peer)) = match accepted { Ok(v) => v, Err(e) => break Err(e.into()) };
                 let state = Arc::clone(&state);
-                tokio::spawn(async move {
+                connections.spawn(async move {
                     let _permit = permit;
                     let access = if secure_control_enabled { ControlAccess::PublicOnly } else { ControlAccess::Legacy };
                     if let Err(error) = handle_conn(stream, state, access).await {
@@ -994,8 +1006,6 @@ async fn run() -> anyhow::Result<()> {
                     }
                 });
             }
-            signal = tokio::signal::ctrl_c() => break signal.map_err(Into::into),
-            _ = term.recv() => break Ok(()),
         }
     };
     observability.begin_shutdown();
@@ -1003,7 +1013,15 @@ async fn run() -> anyhow::Result<()> {
     let drain = async {
         self_heartbeat.abort();
         let _ = self_heartbeat.await;
-        observability.drain().drained().await;
+        while let Some(result) = connections.join_next().await {
+            if let Err(error) = result {
+                tracing::warn!(%error, "control connection task failed during shutdown");
+            }
+        }
+        if let Some(task) = control_server {
+            let _ = task.await;
+        }
+        let _ = admin_server.await;
         membership_reconcile.abort();
         let _ = membership_reconcile.await;
         instance_publication.abort();
@@ -1497,26 +1515,37 @@ async fn serve_worker_control(
     state: Arc<Coordinator>,
 ) -> anyhow::Result<()> {
     let conn_limit = talon_transport::ConnectionLimit::new(MAX_CONTROL_CONNECTIONS);
-    loop {
+    let mut connections = tokio::task::JoinSet::new();
+    let stopped = state.observability.shutdown().stopped();
+    tokio::pin!(stopped);
+    let result = loop {
         let accepted = tokio::select! {
-            _ = state.observability.drain().stopped() => return Ok(()),
+            biased;
+            _ = &mut stopped => break Ok(()),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "worker control connection task failed"); }
+                continue;
+            }
             accepted = async {
                 let permit = conn_limit.acquire().await;
                 listener.accept().await.map(|v| (permit, v))
-            } => accepted?,
+            } => accepted,
         };
-        let (permit, (stream, peer)) = accepted;
-        let Some(connection) = state.observability.drain().admit() else {
-            return Ok(());
+        let (permit, (stream, peer)) = match accepted {
+            Ok(value) => value,
+            Err(error) => {
+                state.observability.begin_shutdown();
+                break Err(error.into());
+            }
         };
         let channel = channel.clone();
         let state = Arc::clone(&state);
-        tokio::spawn(async move {
+        connections.spawn(async move {
             let _permit = permit;
-            let _connection = connection;
             let result: anyhow::Result<()> = async {
                 let authenticated = tokio::select! {
-                    _ = state.observability.drain().stopped() => return Ok(()),
+                    biased;
+                    _ = state.observability.shutdown().stopped() => return Ok(()),
                     result = channel.accept(stream) => result?,
                 };
                 handle_conn(
@@ -1531,7 +1560,14 @@ async fn serve_worker_control(
                 tracing::debug!(%peer, %error, "worker mTLS connection ended");
             }
         });
+    };
+    drop(listener);
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "worker control connection task failed during shutdown");
+        }
     }
+    result
 }
 
 async fn handle_conn<S>(
@@ -1542,13 +1578,13 @@ async fn handle_conn<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
-    let Some(_admission) = state.observability.drain().admit() else {
-        return Ok(());
-    };
+    let stopped = state.observability.shutdown().stopped();
+    tokio::pin!(stopped);
     let _connection = state.observability.metrics().track_connection();
     loop {
         let (header, message, metadata) = match tokio::select! {
-            _ = state.observability.drain().stopped() => return Ok(()),
+            biased;
+            _ = &mut stopped => return Ok(()),
             frame = read_control(&mut stream) => frame,
         } {
             Ok(Some(frame)) => frame,
@@ -2905,6 +2941,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shutdown_waits_for_an_accepted_control_response() {
+        use tokio::io::AsyncReadExt;
+        let state = proxy_test_coordinator();
+        state.observability.check_ready().await.unwrap();
+        state
+            .observability
+            .reconcile_membership(state.service.membership())
+            .await
+            .unwrap();
+        // Force the response to remain in flight until the client reads it.
+        let (mut client, stream) = tokio::io::duplex(1);
+        let serving = state.clone();
+        let mut task =
+            tokio::spawn(async move { handle_conn(stream, serving, ControlAccess::Legacy).await });
+        client
+            .write_all(&codec::encode(1, &ControlMessage::MembershipQuery {}).unwrap())
+            .await
+            .unwrap();
+        let mut prefix = [0];
+        client.read_exact(&mut prefix).await.unwrap();
+        state.observability.begin_shutdown();
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut task)
+            .await
+            .is_err());
+        let mut response = prefix.as_slice().chain(client);
+        let (_, message, _) =
+            tokio::time::timeout(Duration::from_secs(1), read_control(&mut response))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        assert!(matches!(message, ControlMessage::MembershipList { .. }));
+        tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.read(&mut [0]).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
     async fn draining_closes_idle_control_connection_and_rejects_mutation() {
         let state = proxy_test_coordinator();
         state.observability.check_ready().await.unwrap();
@@ -2927,7 +3004,6 @@ mod tests {
             .unwrap()
             .unwrap()
             .unwrap();
-        state.observability.drain().drained().await;
         let status = worker_status("cluster-a", "late-worker", "late-instance", "127.0.0.1:7");
         assert!(matches!(
             state

@@ -71,9 +71,8 @@ pub async fn handle_conn(
     worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
-    let Some(_connection) = observability.drain().admit() else {
-        return Ok(());
-    };
+    let stopped = observability.shutdown().stopped();
+    tokio::pin!(stopped);
     let _active_connection = observability.metrics().track_connection();
     // One buffered reader per connection. A client that pipelines costs a single
     // `recv` for the whole batch instead of two ring operations per request; a
@@ -83,7 +82,8 @@ pub async fn handle_conn(
     loop {
         let request_started = Instant::now();
         let (header, payload) = match tokio::select! {
-            _ = observability.drain().stopped() => return Ok(()),
+            biased;
+            _ = &mut stopped => return Ok(()),
             frame = reader.next_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT) => frame,
         } {
             Ok(frame) => frame,
@@ -95,9 +95,11 @@ pub async fn handle_conn(
             Err(e) => return Err(anyhow::anyhow!(e)),
         };
 
-        let Some(_request) = observability.drain().admit() else {
+        // The connection owns this request until its response finishes. A stop
+        // racing after this load is safe: shutdown joins the connection.
+        if observability.shutdown().is_stopped() {
             return Ok(());
-        };
+        }
         let (metadata, _) = talon_transport::envelope::decode(&header, &payload)?;
         let operation =
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
