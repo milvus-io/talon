@@ -25,9 +25,7 @@ fn classify(error: Error) -> (CacheReadError, String) {
         }
         Error::Block(BlockReadError::Worker(source))
         | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),
-        Error::Block(BlockReadError::NoOwners | BlockReadError::UnresolvedOwner) => {
-            CacheReadError::Unavailable(diagnostic.clone())
-        }
+        Error::Block(BlockReadError::NoOwners) => CacheReadError::Unavailable(diagnostic.clone()),
     };
     (class, diagnostic)
 }
@@ -51,7 +49,7 @@ fn worker_error(source: WorkerError, exhausted: bool) -> Error {
         }
         assert_eq!(
             error.to_string(),
-            format!("all replicas failed after refresh; last worker {WORKER}: {diagnostic}")
+            format!("all replicas failed; last worker {WORKER}: {diagnostic}")
         );
         error
     } else {
@@ -68,7 +66,7 @@ fn assert_class(error: Error, expected: &CacheReadError, exhausted: bool) {
     assert_eq!(diagnostic, original);
     if exhausted {
         assert!(diagnostic.contains(WORKER));
-        assert!(diagnostic.contains("all replicas failed after refresh"));
+        assert!(diagnostic.contains("all replicas failed"));
     }
 }
 
@@ -209,13 +207,11 @@ fn protocol_length_errors_stay_protocol_errors() {
 
 #[test]
 fn placement_failures_are_unavailable_to_the_consumer() {
-    for source in [BlockReadError::NoOwners, BlockReadError::UnresolvedOwner] {
-        assert_class(
-            source.into(),
-            &CacheReadError::Unavailable(String::new()),
-            false,
-        );
-    }
+    assert_class(
+        BlockReadError::NoOwners.into(),
+        &CacheReadError::Unavailable(String::new()),
+        false,
+    );
 }
 
 #[test]

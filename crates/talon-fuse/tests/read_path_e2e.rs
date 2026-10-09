@@ -6,9 +6,9 @@
 //! and no cloud backend. It asserts the behaviors the unit tests cover in
 //! isolation actually compose end to end:
 //!
-//! 1. A cold read is a cache **miss** -> membership fetch -> local placement ->
-//!    worker fetch -> bytes; the second read of the same block is a cache
-//!    **hit** (no second coordinator round-trip) and returns identical bytes.
+//! 1. A cold read fetches discovery, ranks logical members, then fetches bytes.
+//!    A repeated read reuses valid discovery and the instance connection,
+//!    without a second coordinator round-trip, and returns identical bytes.
 //! 2. A multi-block read splits across block boundaries and **stitches** the
 //!    per-block results into one contiguous buffer.
 //! 3. When the primary replica reports the block missing, the reader **falls
@@ -44,6 +44,7 @@ fn content_byte(abs_offset: u64) -> u8 {
 #[derive(Default)]
 struct WorkerCounters {
     fetches: AtomicU32,
+    connections: AtomicU32,
 }
 
 #[derive(Default)]
@@ -63,33 +64,37 @@ async fn spawn_worker(counters: Arc<WorkerCounters>, fail_all: bool) -> String {
                 Ok(v) => v,
                 Err(_) => return,
             };
+            counters.connections.fetch_add(1, Ordering::SeqCst);
             let counters = Arc::clone(&counters);
             tokio::spawn(async move {
-                let mut hdr = [0u8; HEADER_LEN];
-                if sock.read_exact(&mut hdr).await.is_err() {
-                    return;
-                }
-                let h = FrameHeader::decode(&hdr).unwrap();
-                let mut body = vec![0u8; h.length as usize];
-                sock.read_exact(&mut body).await.unwrap();
-                let mut full = hdr.to_vec();
-                full.extend_from_slice(&body);
-                assert_eq!(h.msg_type, MsgType::GetRange);
-                let (_h, req) = decode_request(&full).unwrap();
-                counters.fetches.fetch_add(1, Ordering::SeqCst);
+                loop {
+                    let mut hdr = [0u8; HEADER_LEN];
+                    if sock.read_exact(&mut hdr).await.is_err() {
+                        return;
+                    }
+                    let h = FrameHeader::decode(&hdr).unwrap();
+                    let mut body = vec![0u8; h.length as usize];
+                    sock.read_exact(&mut body).await.unwrap();
+                    let mut full = hdr.to_vec();
+                    full.extend_from_slice(&body);
+                    assert_eq!(h.msg_type, MsgType::GetRange);
+                    let (_h, req) = decode_request(&full).unwrap();
+                    counters.fetches.fetch_add(1, Ordering::SeqCst);
 
-                if fail_all {
-                    sock.write_all(&encode_error(0, "block not present"))
-                        .await
-                        .unwrap();
+                    if fail_all {
+                        sock.write_all(&encode_error(0, "block not present"))
+                            .await
+                            .unwrap();
+                        sock.flush().await.unwrap();
+                        return;
+                    }
+                    let payload: Vec<u8> =
+                        (0..req.len).map(|i| content_byte(req.offset + i)).collect();
+                    let mut out = response_header_ok(0, payload.len() as u32).to_vec();
+                    out.extend_from_slice(&payload);
+                    sock.write_all(&out).await.unwrap();
                     sock.flush().await.unwrap();
-                    return;
                 }
-                let payload: Vec<u8> = (0..req.len).map(|i| content_byte(req.offset + i)).collect();
-                let mut out = response_header_ok(0, payload.len() as u32).to_vec();
-                out.extend_from_slice(&payload);
-                sock.write_all(&out).await.unwrap();
-                sock.flush().await.unwrap();
             });
         }
     });
@@ -165,7 +170,7 @@ fn object() -> ObjectId {
 }
 
 #[tokio::test]
-async fn cold_read_miss_then_warm_hit_same_bytes() {
+async fn repeated_read_reuses_discovery_and_instance_connection() {
     let wc = Arc::new(WorkerCounters::default());
     let worker = spawn_worker(Arc::clone(&wc), false).await;
     let counters = Arc::new(CoordinatorCounters::default());
@@ -185,7 +190,7 @@ async fn cold_read_miss_then_warm_hit_same_bytes() {
 
     // Cold read: membership fetch, local placement, then worker fetch. This stays
     // within one block (block 3 spans 3072..4096).
-    let first = reader.read(&view, 3100, 256, 0).await.unwrap();
+    let first = reader.read(&view, 3100, 256).await.unwrap();
     assert_eq!(first.len(), 256);
     for (i, b) in first.iter().enumerate() {
         assert_eq!(*b, content_byte(3100 + i as u64));
@@ -197,8 +202,8 @@ async fn cold_read_miss_then_warm_hit_same_bytes() {
     );
     assert_eq!(counters.placement_lookups.load(Ordering::SeqCst), 0);
 
-    // Warm read of the same block: cache hit, no new coordinator lookup.
-    let second = reader.read(&view, 3100, 256, 1).await.unwrap();
+    // Repeated read of the same block: no new discovery or TCP connection.
+    let second = reader.read(&view, 3100, 256).await.unwrap();
     assert_eq!(second, first, "warm read returns identical bytes");
     assert_eq!(
         counters.membership_queries.load(Ordering::SeqCst),
@@ -208,8 +213,9 @@ async fn cold_read_miss_then_warm_hit_same_bytes() {
     assert_eq!(counters.placement_lookups.load(Ordering::SeqCst), 0);
 
     let snap = reader.stats().snapshot();
-    assert_eq!(snap.cache_misses, 1);
-    assert_eq!(snap.cache_hits, 1);
+    assert_eq!(snap.worker_fetches, 2);
+    assert_eq!(snap.bytes_served, 512);
+    assert_eq!(wc.connections.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
@@ -234,7 +240,7 @@ async fn multi_block_read_stitches_contiguous_bytes() {
     // 900..900+2300 spans 4 blocks (tail, full, full, head).
     let offset = 900u64;
     let len = 2300u64;
-    let bytes = reader.read(&view, offset, len, 0).await.unwrap();
+    let bytes = reader.read(&view, offset, len).await.unwrap();
     assert_eq!(bytes.len() as u64, len);
     for (i, b) in bytes.iter().enumerate() {
         assert_eq!(
@@ -286,7 +292,7 @@ async fn falls_back_to_healthy_replica() {
     .await;
 
     let cache = Arc::new(PlacementCache::new(10_000));
-    // Request k=2 so both replicas are cached and available for fallback.
+    // Request k=2 so both logical candidates are available for fallback.
     let reader = BlockReader::new(CoordinatorClient::new(coord), cache, 2);
     let obj = object();
     let ver = Version::new("v1");
@@ -297,7 +303,7 @@ async fn falls_back_to_healthy_replica() {
         size: 1_000_000,
     };
 
-    let bytes = reader.read(&view, 0, 128, 0).await.unwrap();
+    let bytes = reader.read(&view, 0, 128).await.unwrap();
     assert_eq!(bytes.len(), 128);
     for (i, b) in bytes.iter().enumerate() {
         assert_eq!(*b, content_byte(i as u64));

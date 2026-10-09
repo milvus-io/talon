@@ -9,7 +9,7 @@
 //!
 //! Save the outer diagnostic before consuming an error to classify its cause.
 //! In particular, an exhausted replica read includes the last worker address
-//! and refresh context that would be lost by keeping only `source.to_string()`.
+//! that would be lost by keeping only `source.to_string()`.
 //! This example needs only `talon-rust-client` as a direct Talon dependency:
 //!
 //! ```
@@ -28,7 +28,7 @@
 //!         | Error::Block(BlockReadError::Coordinator(source)) => source.into(),
 //!         Error::Block(BlockReadError::Worker(source))
 //!         | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),
-//!         Error::Block(BlockReadError::NoOwners | BlockReadError::UnresolvedOwner) =>
+//!         Error::Block(BlockReadError::NoOwners) =>
 //!             CacheReadError::Unavailable(diagnostic.clone()),
 //!     };
 //!     (class, diagnostic)
@@ -37,14 +37,14 @@
 //! let error = Error::from(BlockReadError::AllReplicasFailed {
 //!     worker: "worker-1:9000".into(),
 //!     source: WorkerError::Remote(DataPlaneError {
-//!         code: DataErrorCode::VersionMismatch,
-//!         message: "object changed".into(),
+//!         code: DataErrorCode::Timeout,
+//!         message: "request timed out".into(),
 //!     }),
 //! });
 //! let (class, diagnostic) = classify(error);
-//! assert!(matches!(class, CacheReadError::VersionMismatch(_)));
+//! assert!(matches!(class, CacheReadError::Timeout(_)));
 //! assert!(diagnostic.contains("worker-1:9000"));
-//! assert!(diagnostic.contains("object changed"));
+//! assert!(diagnostic.contains("request timed out"));
 //! ```
 
 mod client;

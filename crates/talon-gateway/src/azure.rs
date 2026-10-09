@@ -45,8 +45,6 @@ pub struct AzureCacheRequest<'a> {
     pub block_size: u32,
     /// Maximum emitted stream chunk size.
     pub chunk_size: u32,
-    /// Request time used for cache freshness decisions.
-    pub now_ms: u64,
 }
 
 /// Azure request addressing and cache behavior.
@@ -128,14 +126,8 @@ impl AzureCache for BlockReader {
             version: request.version,
             size: request.object_size,
         };
-        self.stream_range(
-            &file,
-            request.offset,
-            request.len,
-            request.chunk_size,
-            request.now_ms,
-        )
-        .map(|stream| Box::pin(stream) as CacheStream)
+        self.stream_range(&file, request.offset, request.len, request.chunk_size)
+            .map(|stream| Box::pin(stream) as CacheStream)
     }
 
     fn invalidate_object(&self, object: &ObjectId) -> usize {
@@ -1630,15 +1622,6 @@ fn xml_escape(value: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
-}
-
-fn unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
 }
 
 #[cfg(test)]
@@ -3319,7 +3302,6 @@ impl AzureBlobAdapter {
                 .await;
         }
 
-        let now_ms = unix_millis();
         let mut cache = match self.cache.stream(AzureCacheRequest {
             object: &object,
             version: &version,
@@ -3328,7 +3310,6 @@ impl AzureBlobAdapter {
             len,
             block_size: self.config.block_size,
             chunk_size: self.config.transfer_chunk_bytes,
-            now_ms,
         }) {
             Ok(cache) => cache,
             Err(error) if error.fallback_eligible() && route == GatewayRoute::Cache => {

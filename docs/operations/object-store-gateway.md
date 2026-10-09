@@ -90,7 +90,7 @@ Common variables:
 | `TALON_GATEWAY_REQUEST_DEADLINE_MS` | `30000` | Total request deadline, covering the streamed response body. Raise for large objects on slow links. |
 | `TALON_GATEWAY_TRANSFER_CHUNK_BYTES` | `1048576` | Maximum cache body frame. |
 | `TALON_GATEWAY_PLACEMENT_TTL_MS` | `5000` | Client-side placement freshness. |
-| `TALON_GATEWAY_REPLICAS` | `1` | Ordered worker replicas attempted by the cache client. |
+| `TALON_GATEWAY_REPLICAS` | `1` | Maximum ranked logical candidates per block read; does not populate replicas. |
 | `TALON_GATEWAY_TLS_CERT_PATH` | unset | PEM server certificate chain; must be paired with the key. |
 | `TALON_GATEWAY_TLS_KEY_PATH` | unset | PEM private key; its path and contents are redacted. |
 | `TALON_GATEWAY_TLS_RELOAD_MS` | `5000` | Last-good certificate/key reload interval. |

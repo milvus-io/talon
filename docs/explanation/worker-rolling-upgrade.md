@@ -7,7 +7,7 @@
 
 ## 1. Goals and Core Decisions
 
-Talon allows an individual Worker to become temporarily unavailable during an upgrade while retaining its logical identity, block ownership, and local disk cache. The replacement process opens the same directory on the same machine, recovers the cache, and resumes service. When a request encounters an unavailable Worker, Talon returns a recognizable error, leaving the caller to decide whether to access origin storage or use another fallback.
+Talon allows an individual Worker to become temporarily unavailable during an upgrade while retaining its logical identity, block ownership, and local disk cache. The replacement process opens the same directory on the same machine, recovers the cache, and resumes service. A read may try up to `replicas_k` ranked logical candidates, with at most one stale-connection recovery per candidate. When candidates are exhausted, Talon returns a recognizable error, leaving the caller to decide whether to access origin storage or use another fallback.
 
 Membership supports dynamic scaling: adding a member or explicitly removing one changes placement. Temporary outages, process restarts, and address changes affect only instance state, preserving logical block ownership. This design decouples membership from liveness; it avoids the term "static topology," which could imply that scaling is prohibited.
 
@@ -15,8 +15,8 @@ Core decisions:
 
 1. Persist `worker_id` in the data directory. An exclusive directory lock determines which process may use and modify the cache.
 2. The Coordinator maintains persistent member records separately from expiring process state. Heartbeat expiration does not remove a member.
-3. Clients first compute the block owner from logical membership, then resolve that member to a serving instance.
-4. Return `Unavailable` when a Worker is unavailable. Do not hide downtime by waiting for recovery, choosing another logical Worker, or automatically accessing origin storage in the SDK.
+3. Clients first rank block candidates from logical membership, then resolve each attempted member to a serving instance. The primary and candidate order remain stable during restarts.
+4. Bound replica fallback by `replicas_k` (default 1). Do not wait for recovery, refresh and resend a failed read, or automatically access origin storage in the SDK. Return the last failure when the candidate list is exhausted.
 5. The first version restarts Workers sequentially. It requires neither overlapping old and new processes nor an interprocess handoff RPC.
 6. Coordinators continue to use rolling replacement across multiple instances. Member records must survive Coordinator restarts.
 
@@ -53,7 +53,7 @@ The following facts describe the source baseline, not an implementation of this 
 | [Shared state contract](../../crates/talon-coordinator/src/state_store/mod.rs) | Stores leased node state; snapshots contain unexpired nodes | Add a member registry independent of lease expiration; separate process and member records |
 | [Coordinator membership synchronization](../../crates/talon-coordinator/src/observability/state.rs) | Includes only healthy, ready Workers in placement membership | Separate all logical members from serving instances |
 | [Maglev](../../crates/talon-core/src/placement.rs) | Builds deterministic placement from Worker IDs; the current membership token also includes addresses | Preserve the placement algorithm; address and liveness updates must not change logical ownership |
-| [Client membership cache](../../crates/talon-cache-client/src/membership_cache.rs), [read path](../../crates/talon-cache-client/src/block_reader.rs) | Caches members and addresses; may try candidate Workers and refresh/retry after failure | Return availability errors directly and refresh discovery for subsequent requests |
+| [Client membership cache](../../crates/talon-cache-client/src/membership_cache.rs), [read path](../../crates/talon-cache-client/src/block_reader.rs) | Caches members and addresses; may try candidate Workers and refresh/retry after failure | Preserve bounded candidate fallback; refresh discovery for subsequent requests with bounded stale-connection recovery |
 | [Error protocol](../../crates/talon-transport/src/data.rs), [read error classification](../../crates/talon-cache-client/src/range_stream.rs) | Already provides `Unavailable`, `Timeout`, and other categories, plus `fallback_eligible()` | Carry the same classification through public read APIs and language bindings without parsing error strings |
 | [Coordinator main loop](../../crates/talon-coordinator/src/main.rs) | The SIGINT path marks shutdown and removes its own lease | Handle SIGTERM and wait for in-flight control requests |
 | [Worker Helm template](../../deploy/helm/talon/templates/worker.yaml) | Deployment, probes, and a 30-second termination grace period; Pod name as ID and Pod IP as address | Use reusable local volumes, derive identity from the directory, and support sequential restarts |
@@ -137,26 +137,28 @@ Separate the topology content token from the instance-state content token. The t
 
 ## 6. Client Discovery and Error Contract
 
-### 6.1 Return Failures and Leave Fallback to the Caller
+### 6.1 Bounded Candidate Fallback
 
-Each block request selects one logical owner and one serving instance. Return immediately when the owner is known to be offline. After a network failure, perform necessary resource cleanup and return without waiting for restart, trying another logical Worker, or refreshing and resending within the same request.
+Each block request ranks up to `replicas_k` distinct logical Workers, primary first, from one discovery snapshot. The default is one and zero is treated as one. Offline and conflicted members retain their rank; the reader may skip them and try the next candidate. Retryable failures similarly advance to the next candidate, without changing logical ownership or refreshing the snapshot within that read.
 
-The current client's candidate iteration, refresh-and-retry behavior, and redial after a reused connection fails must not hide failures. There is no separate legacy membership or read policy. Normal connection reuse and concurrency for requests that have not failed remain unchanged.
+Resolve each candidate's serving instance immediately before attempting it and check discovery expiration again after any preceding network wait. Each candidate is visited once. If a reused connection fails with an I/O error, the client may redial and resend once, checking discovery expiration before dialing and again before sending. A failure on a fresh connection or a Worker error response does not trigger this transport retry. This bounds each candidate to at most two exchanges; after failed recovery, advance to the next candidate. After exhaustion, return `BlockReadError::AllReplicasFailed { worker, source }`, retaining the last candidate address (or logical ID if no address is known) and original typed cause. SDK and stream classification follow `source`; an empty candidate list still returns `NoOwners`. Invalid requests, missing origin objects, version mismatches, origin failures, and tenant rate limits terminate the read immediately.
 
-"Return immediately" means adding no upgrade-specific wait after detecting an error. Unresponsive connections still require the existing connection/request deadlines to detect a timeout. Check caller cancellation and the overall deadline first; do not classify explicit cancellation or local argument errors as Worker unavailability.
+`replicas_k` preserves the read-candidate mechanism for future replication and hot-block serving. It does not proactively populate backups or balance successful primary reads across them. Cache admission continues to target only the primary. Candidates remain within the logical zone-affinity subset, even when all local candidates are offline.
+
+There is no separate legacy membership or read policy. Normal connection reuse and concurrency for requests that have not failed remain unchanged. Add no upgrade-specific wait; use existing network deadlines to detect an unresponsive candidate. Caller cancellation and the overall deadline still terminate the operation.
 
 ### 6.2 Reuse Existing Error Categories
 
 Worker unavailability maps to the existing `DataErrorCode::Unavailable` / `CacheReadError::Unavailable`. Do not introduce a synonymous `WorkerUnavailable` wire enum. Public SDKs must expose stable classification without string parsing. Diagnostic context includes the target Worker ID, instance ID, endpoint, and original cause when known; do not invent target information when it is unavailable.
 
-| Scenario | Returned category | Reroute this request within Talon? |
+| Scenario | Returned category if no candidate succeeds | Try the next ranked candidate? |
 | --- | --- | --- |
-| Known member with no serving instance, recovery or draining in progress, or conflicting instance identities | `Unavailable` | No |
-| Connection refused, connection reset, or unexpected EOF before a complete response | `Unavailable` | No |
-| Connection/read exceeds the configured network deadline | `Timeout` | No |
+| Known member with no serving instance, recovery or draining in progress, or conflicting instance identities | `Unavailable` | Yes, within the configured candidate list and discovery lifetime |
+| Connection refused, connection reset, or unexpected EOF before a complete response | `Unavailable` | Yes, within the configured candidate list and discovery lifetime |
+| Connection/read exceeds the configured network deadline | `Timeout` | Yes, within the configured candidate list and discovery lifetime |
 | Origin object missing, version mismatch, or permission/argument error | Preserve the existing domain error category | No; do not disguise it as unavailability |
-| Corrupt frame, inconsistent length, or incompatible protocol | `Protocol` / existing protocol category | No |
-| Origin storage error or tenant rate limiting during normal Worker service | `Origin` / `RateLimited` | Unchanged by this design |
+| Corrupt frame, inconsistent length, or incompatible protocol | `Protocol` / existing protocol category | Existing replica retry policy; never return partial bytes as success |
+| Origin storage error or tenant rate limiting during normal Worker service | `Origin` / `RateLimited` | No |
 
 An exited process cannot send an error frame, so the SDK synthesizes the appropriate category. A running process that has stopped admitting requests may return the existing typed `Unavailable` response.
 
@@ -278,7 +280,7 @@ The whole sequence has a bounded shutdown deadline within the Pod termination gr
 
 Workers whose control connections close reconnect through the stable Service. Their next heartbeat carries the same Worker ID, Worker incarnation, and normal heartbeat sequence; reconnecting to another Coordinator does not create a new Worker instance. Heartbeat retries retain the existing idempotency and ordering rules.
 
-Clients discard failed Coordinator connections and use the stable Service for subsequent discovery. Any retry of a control operation follows that operation's existing idempotency and deadline rules. This does not authorize resending a failed block read: Section 6's immediate-failure policy still applies to the Worker data path.
+Clients discard failed Coordinator connections and use the stable Service for subsequent discovery. Any retry of a control operation follows that operation's existing idempotency and deadline rules. This does not authorize restarting a block read's candidate list; Section 6's bounded candidate policy still applies to the Worker data path.
 
 Clients with an unexpired Worker instance view can continue direct Worker requests while Coordinator connections change. If a request requires fresh discovery and no Coordinator can provide it, return a recognizable error instead of waiting for the rollout or publishing an empty topology. Keep the logical member snapshot even when instance freshness expires.
 
@@ -329,7 +331,7 @@ Upgrade procedure:
 
 Talon has not been deployed in production. This work replaces the old lease-only membership semantics directly; it does not introduce a Legacy/Retained mode, a mode configuration field, an activation API, or runtime protocol fallback. All Workers use instance heartbeats, and all Coordinators derive logical ownership from the persistent member registry. Temporary instance loss changes availability, not membership.
 
-The single `MembershipQuery` / `MembershipList` exchange carries that persistent view. `NodeStatusHeartbeat` carries local instance readiness and `NodeStatusAck` separately reports acceptance and service admission. Standalone registration messages, legacy heartbeats, versioned query alternatives and protocol fallback have been removed. The first status heartbeat registers the logical Worker; subsequent reports renew its instance lease. SDK layers must consume the instance-aware discovery directly so an offline owner is distinguished from a serving endpoint. They must not probe a legacy mode, switch read policies, or fall back to lease-only placement. Rust/native and Java wire consumers use this schema directly; subsequent SDK layers still implement the full availability and immediate-failure policy before deployment.
+The single `MembershipQuery` / `MembershipList` exchange carries that persistent view. `NodeStatusHeartbeat` carries local instance readiness and `NodeStatusAck` separately reports acceptance and service admission. Standalone registration messages, legacy heartbeats, versioned query alternatives and protocol fallback have been removed. The first status heartbeat registers the logical Worker; subsequent reports renew its instance lease. SDK layers must consume the instance-aware discovery directly so an offline owner is distinguished from a serving endpoint. They must not probe a legacy mode, switch read policies, or fall back to lease-only placement. Rust/native and Java wire consumers use this schema directly; subsequent SDK layers still implement the full availability and bounded candidate policy before deployment.
 
 The protocol carries persistent members, instance states and freshness, without a membership-mode field or capability-switch response. Keep the transport schema explicit so incompatible messages fail clearly. A future supported rolling upgrade requires both releases to implement the same membership and read-error contract; supporting a downgrade to the superseded lease-only implementation is outside this pre-deployment change.
 
@@ -369,8 +371,9 @@ The table below is the acceptance contract. Per-layer executed checks and valida
 | Addition, explicit removal, and delayed heartbeats after retirement | Topology follows membership operations; ordinary heartbeats cannot undo retirement |
 | Multiple Coordinators with etcd and Kubernetes backends | Membership survives Coordinator restarts; offline is distinct from removal; identical member snapshots produce identical placement |
 | Cache recovery after normal and abnormal shutdown | Valid whole-block/page data remains a cache hit; backend request counts confirm identity changes did not trigger refetches; count TTI expiration and corruption separately |
-| Offline Worker, connection refusal, EOF, and timeout | Every public SDK exposes stable categories; reads perform no hidden retries, cross-Worker attempts, or origin fallback |
-| Object-version change, origin errors, rate limiting, and malformed frames | Preserve the original error rather than misclassify it as Worker unavailability eligible for fallback |
+| Offline Worker, connection refusal, EOF, and timeout | Every public SDK exposes stable categories; attempts stay within the configured logical candidates, stale-connection recovery is limited to one redial per candidate, and expired discovery cannot route reads |
+| Object-version change, origin errors, and rate limiting | Return the original error immediately without trying another candidate |
+| Malformed frames and incomplete replies | Bounded candidate fallback may recover; if exhausted, preserve the last error category and never report partial bytes as success |
 | Multi-block reads, streaming, and caller-owned buffers | Failure is not reported as complete success; no buffer access after the callback; delivered prefixes and retry ranges remain well-defined |
 | Tokio and io_uring draining, saturated connections, and background writes | Persistent connections admit no new work; the lock remains held until tasks finish; recovery succeeds after forced termination |
 | Coordinator rolling replacement using SIGTERM | New instances load membership before readiness; old instances drain; Worker members remain present |
@@ -388,7 +391,7 @@ Implementation uses a linear PR stack, with implementation, regression tests, an
 | 1 | Directory identity initialization, old-ID import, and existing lock contract | Normal/crash restart, concurrent initialization, configuration conflicts |
 | 2 | Persistent member registry, CAS and retirement in memory, etcd and Kubernetes | Backend contracts, concurrent updates, tombstones and capacity bounds |
 | 3 | Versioned instance discovery, sole-instance readiness and membership administration | Protocol compatibility, offline/conflicting instances and revision propagation |
-| 4 | Rust client and CLI placement by logical membership, bounded refresh and immediate read failure | Stable ownership, no hidden rerouting or resend, discovery freshness and buffer lifetime |
+| 4 | Rust client candidate fallback and CLI placement by logical membership, with bounded discovery | Stable primary and candidate order, replica and stale-connection retry limits, discovery freshness and buffer lifetime |
 | 5 | Rust/C/Python error classification and typed metadata failures | Public error categories, ABI compatibility and preservation of domain/protocol errors |
 | 6 | Java retained discovery and typed read failures | Wire conformance, no resend, offline ownership and incarnation recovery |
 | 7 | Bounded Coordinator/Worker draining and complete task lifetimes | Both data runtimes, SIGTERM, stale state and directory lock lifetime |

@@ -111,10 +111,11 @@ impl From<DetailedBlockReadError> for CacheReadError {
         match error {
             DetailedBlockReadError::Worker(error) => error.into(),
             DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
-            DetailedBlockReadError::Block(BlockReadError::Worker(error)) => error.into(),
-            DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed { source, .. }) => {
-                source.into()
-            }
+            DetailedBlockReadError::Block(BlockReadError::Worker(error))
+            | DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
+                source: error,
+                ..
+            }) => error.into(),
             DetailedBlockReadError::Block(error) => Self::Unavailable(error.to_string()),
         }
     }
@@ -128,7 +129,6 @@ struct StreamState {
     position: u64,
     end: u64,
     chunk_size: u32,
-    now_ms: u64,
 }
 
 /// A cache range body that starts at most one bounded worker request per poll.
@@ -158,7 +158,6 @@ impl BlockReader {
         offset: u64,
         len: u64,
         chunk_size: u32,
-        now_ms: u64,
     ) -> Result<RangeChunkStream, CacheReadError> {
         if file.block_size == 0 {
             return Err(CacheReadError::InvalidRequest(
@@ -181,7 +180,6 @@ impl BlockReader {
             position: offset.min(file.size),
             end: requested_end.min(file.size),
             chunk_size,
-            now_ms,
         };
         let stream = futures::stream::try_unfold(state, |mut state| async move {
             if state.position >= state.end {
@@ -203,7 +201,7 @@ impl BlockReader {
             );
             let bytes = state
                 .reader
-                .read_block_detailed(&block, offset_in_block, take, state.now_ms)
+                .read_block_detailed(&block, offset_in_block, take)
                 .await
                 .map_err(CacheReadError::from)?;
             if bytes.len() != take as usize {
@@ -335,7 +333,7 @@ mod tests {
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
         let mut stream = reader
-            .stream_range(&file(&object, &version), 0, 10, 3, 0)
+            .stream_range(&file(&object, &version), 0, 10, 3)
             .unwrap();
 
         assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -395,27 +393,34 @@ mod tests {
     }
 
     #[test]
-    fn exhausted_replicas_preserve_stream_error_classification() {
+    fn block_failures_preserve_stream_error_classification() {
         for code in [DataErrorCode::Timeout, DataErrorCode::Internal] {
-            let error = DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {
-                worker: "127.0.0.1:1234".into(),
-                source: WorkerError::Remote(DataPlaneError {
+            for exhausted in [false, true] {
+                let source = WorkerError::Remote(DataPlaneError {
                     code,
                     message: "original worker diagnostic".into(),
-                }),
-            });
-            let error = CacheReadError::from(error);
-            assert!(error.to_string().contains("original worker diagnostic"));
-            match code {
-                DataErrorCode::Timeout => {
-                    assert!(error.fallback_eligible());
-                    assert!(matches!(error, CacheReadError::Timeout(_)));
+                });
+                let error = if exhausted {
+                    BlockReadError::AllReplicasFailed {
+                        worker: "worker:9000".into(),
+                        source,
+                    }
+                } else {
+                    BlockReadError::Worker(source)
+                };
+                let error = CacheReadError::from(DetailedBlockReadError::Block(error));
+                assert!(error.to_string().contains("original worker diagnostic"));
+                match code {
+                    DataErrorCode::Timeout => {
+                        assert!(error.fallback_eligible());
+                        assert!(matches!(error, CacheReadError::Timeout(_)));
+                    }
+                    DataErrorCode::Internal => {
+                        assert!(!error.fallback_eligible());
+                        assert!(matches!(error, CacheReadError::Internal(_)));
+                    }
+                    _ => unreachable!(),
                 }
-                DataErrorCode::Internal => {
-                    assert!(!error.fallback_eligible());
-                    assert!(matches!(error, CacheReadError::Internal(_)));
-                }
-                _ => unreachable!(),
             }
         }
     }
@@ -430,11 +435,11 @@ mod tests {
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
         assert!(matches!(
-            reader.stream_range(&file(&object, &version), 0, 1, 0, 0),
+            reader.stream_range(&file(&object, &version), 0, 1, 0),
             Err(CacheReadError::InvalidRequest(_))
         ));
         assert!(matches!(
-            reader.stream_range(&file(&object, &version), u64::MAX, 2, 1, 0),
+            reader.stream_range(&file(&object, &version), u64::MAX, 2, 1),
             Err(CacheReadError::InvalidRequest(_))
         ));
     }
@@ -468,7 +473,7 @@ mod tests {
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
         let mut stream = reader
-            .stream_range(&file(&object, &version), 0, 1, 1, 0)
+            .stream_range(&file(&object, &version), 0, 1, 1)
             .unwrap();
         assert!(matches!(
             stream.next().await.unwrap(),
@@ -503,7 +508,7 @@ mod tests {
         let object = ObjectId::new(Backend::S3, "bucket", "object");
         let version = Version::new("v1");
         let mut stream = reader
-            .stream_range(&file(&object, &version), 0, 1, 1, 0)
+            .stream_range(&file(&object, &version), 0, 1, 1)
             .unwrap();
 
         {

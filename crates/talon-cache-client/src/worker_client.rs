@@ -101,6 +101,7 @@ impl WorkerError {
 #[derive(Debug, Clone)]
 pub struct WorkerClient {
     addr: String,
+    read_retry_deadline: Option<std::time::Instant>,
     pool: Arc<ConnectionPool>,
     /// Tenant every fetch from this client is attributed to. `Unattributed`
     /// unless set with [`with_tenant`](Self::with_tenant).
@@ -121,9 +122,38 @@ impl WorkerClient {
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
             addr: addr.into(),
+            read_retry_deadline: None,
             pool,
             tenant: TenantId::Unattributed,
         }
+    }
+
+    /// Bound stale-connection recovery to the discovery snapshot that selected us.
+    pub(crate) fn with_read_retry_deadline(mut self, deadline: std::time::Instant) -> Self {
+        self.read_retry_deadline = Some(deadline);
+        self
+    }
+
+    fn check_read_retry_deadline(&self) -> Result<(), WorkerError> {
+        if self
+            .read_retry_deadline
+            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+        {
+            return Err(WorkerError::Remote(DataPlaneError {
+                code: talon_transport::DataErrorCode::Unavailable,
+                message: "instance discovery expired before read retry".into(),
+            }));
+        }
+        Ok(())
+    }
+
+    async fn fresh_read_retry_connection(&self) -> Result<TcpStream, WorkerError> {
+        self.check_read_retry_deadline()?;
+        let stream = self.pool.fresh(&self.addr).await?;
+        // Connecting may consume the remaining discovery lifetime. Do not send
+        // another request using an observation that expired while dialing.
+        self.check_read_retry_deadline()?;
+        Ok(stream)
     }
 
     /// The worker address this client talks to.
@@ -245,7 +275,7 @@ impl WorkerClient {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut out, &self.addr)?;
 
-                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let mut stream = self.fresh_read_retry_connection().await?;
                     let bytes = self
                         .pool
                         .with_request_deadline("worker fetch_range retry", async {
@@ -298,7 +328,7 @@ impl WorkerClient {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
 
-                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let mut stream = self.fresh_read_retry_connection().await?;
                     let n = self
                         .pool
                         .with_request_deadline("worker fetch_range retry", async {
@@ -355,7 +385,7 @@ impl WorkerClient {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
-                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let mut stream = self.fresh_read_retry_connection().await?;
                     let bytes = self
                         .pool
                         .with_request_deadline("worker fetch_versioned_range retry", async {
@@ -409,7 +439,7 @@ impl WorkerClient {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
-                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let mut stream = self.fresh_read_retry_connection().await?;
                     let n = self
                         .pool
                         .with_request_deadline("worker fetch_versioned_range retry", async {
@@ -465,7 +495,7 @@ impl WorkerClient {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
 
-                    let mut stream = self.pool.fresh(&self.addr).await?;
+                    let mut stream = self.fresh_read_retry_connection().await?;
                     let bytes = self
                         .pool
                         .with_request_deadline("worker fetch_cached_range retry", async {
@@ -1449,50 +1479,164 @@ mod tests {
         );
     }
 
+    async fn retry_test_read(client: &WorkerClient, api: usize) -> Result<Vec<u8>, WorkerError> {
+        let mut dst = vec![0; 8];
+        match api {
+            0 => client.fetch_range(&object(), 0, 8).await,
+            1 => {
+                client.fetch_range_into(&object(), 0, &mut dst).await?;
+                Ok(dst)
+            }
+            2 => {
+                client
+                    .fetch_versioned_range(&object(), &Version::new("v1"), 0, 8)
+                    .await
+            }
+            3 => {
+                client
+                    .fetch_versioned_range_into(&object(), &Version::new("v1"), 0, &mut dst)
+                    .await?;
+                Ok(dst)
+            }
+            4 => {
+                client
+                    .fetch_cached_range(&object(), &Version::new("v1"), 0, 8)
+                    .await
+            }
+            _ => unreachable!(),
+        }
+    }
+
     #[tokio::test]
     async fn retries_on_a_stale_pooled_connection() {
         use std::sync::atomic::Ordering;
-        // A worker that serves exactly one request per connection then closes.
-        // After the first fetch pools the (now server-closed) connection, the
-        // second fetch's reuse fails and must transparently retry on a fresh
-        // dial — so both fetches succeed despite the server closing each conn.
-        let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap().to_string();
-        let accepts_srv = Arc::clone(&accepts);
-        tokio::spawn(async move {
-            loop {
-                let (mut sock, _) = match listener.accept().await {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-                accepts_srv.fetch_add(1, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    let mut hdr = [0u8; HEADER_LEN];
-                    if sock.read_exact(&mut hdr).await.is_err() {
-                        return;
-                    }
-                    let header = FrameHeader::decode(&hdr).unwrap();
-                    let mut body = vec![0u8; header.length as usize];
-                    sock.read_exact(&mut body).await.unwrap();
-                    let out = response_header_ok(0, 8).to_vec();
-                    let mut full = out;
-                    full.extend_from_slice(&[7u8; 8]);
-                    sock.write_all(&full).await.unwrap();
-                    sock.flush().await.unwrap();
-                    // Connection closes here (task ends), so a pooled reuse fails.
-                });
-            }
-        });
-        let client = WorkerClient::new(addr);
+        for api in 0..5 {
+            // A worker that serves exactly one request per connection then closes.
+            // After the first fetch pools the (now server-closed) connection, the
+            // second fetch's reuse fails and must transparently retry on a fresh
+            // dial — so both fetches succeed despite the server closing each conn.
+            let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let accepts_srv = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    accepts_srv.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut hdr = [0u8; HEADER_LEN];
+                        if sock.read_exact(&mut hdr).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&hdr).unwrap();
+                        let mut body = vec![0u8; header.length as usize];
+                        sock.read_exact(&mut body).await.unwrap();
+                        let out = response_header_ok(0, 8).to_vec();
+                        let mut full = out;
+                        full.extend_from_slice(&[7u8; 8]);
+                        sock.write_all(&full).await.unwrap();
+                        sock.flush().await.unwrap();
+                        // Connection closes here (task ends), so a pooled reuse fails.
+                    });
+                }
+            });
+            let client = WorkerClient::new(addr).with_read_retry_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
 
-        let a = client.fetch_range(&object(), 0, 8).await.unwrap();
-        assert_eq!(a, vec![7u8; 8]);
-        // Second fetch: the pooled connection is stale → retry on a fresh dial.
-        let b = client.fetch_range(&object(), 0, 8).await.unwrap();
-        assert_eq!(b, vec![7u8; 8]);
-        // Two connections were accepted (the retry dialed a fresh one).
-        assert_eq!(accepts.load(Ordering::SeqCst), 2);
+            let a = retry_test_read(&client, api).await.unwrap();
+            assert_eq!(a, vec![7u8; 8]);
+            // Second fetch: the pooled connection is stale → retry on a fresh dial.
+            let b = retry_test_read(&client, api).await.unwrap();
+            assert_eq!(b, vec![7u8; 8]);
+            // Two connections were accepted (the retry dialed a fresh one).
+            assert_eq!(accepts.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_discovery_does_not_redial_a_stale_connection() {
+        use std::sync::atomic::Ordering;
+        for api in 0..5 {
+            let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let accepts_srv = Arc::clone(&accepts);
+            tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = match listener.accept().await {
+                        Ok(v) => v,
+                        Err(_) => return,
+                    };
+                    accepts_srv.fetch_add(1, Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut hdr = [0u8; HEADER_LEN];
+                        if sock.read_exact(&mut hdr).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&hdr).unwrap();
+                        let mut body = vec![0u8; header.length as usize];
+                        sock.read_exact(&mut body).await.unwrap();
+                        let out = response_header_ok(0, 8).to_vec();
+                        let mut full = out;
+                        full.extend_from_slice(&[7u8; 8]);
+                        sock.write_all(&full).await.unwrap();
+                        sock.flush().await.unwrap();
+                    });
+                }
+            });
+            let client =
+                WorkerClient::new(addr).with_read_retry_deadline(std::time::Instant::now());
+
+            let a = retry_test_read(&client, api).await.unwrap();
+            assert_eq!(a, vec![7u8; 8]);
+            let error = retry_test_read(&client, api).await.unwrap_err();
+            assert!(
+                matches!(error, WorkerError::Remote(ref e) if e.code == talon_transport::DataErrorCode::Unavailable)
+            );
+            assert_eq!(accepts.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_connection_recovery_stops_after_one_fresh_attempt() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        for api in 0..5 {
+            let accepts = Arc::new(AtomicU32::new(0));
+            let server_accepts = Arc::clone(&accepts);
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                loop {
+                    let (mut sock, _) = listener.accept().await.unwrap();
+                    let n = server_accepts.fetch_add(1, Ordering::SeqCst);
+                    let mut hdr = [0; HEADER_LEN];
+                    sock.read_exact(&mut hdr).await.unwrap();
+                    let header = FrameHeader::decode(&hdr).unwrap();
+                    let mut body = vec![0; header.length as usize];
+                    sock.read_exact(&mut body).await.unwrap();
+                    if n == 0 {
+                        let mut response = response_header_ok(header.request_id, 8).to_vec();
+                        response.extend_from_slice(&[7; 8]);
+                        sock.write_all(&response).await.unwrap();
+                    }
+                    // Close both the warmed socket and the failed fresh retry.
+                }
+            });
+            let client = WorkerClient::new(addr).with_read_retry_deadline(
+                std::time::Instant::now() + std::time::Duration::from_secs(5),
+            );
+            assert_eq!(retry_test_read(&client, api).await.unwrap(), vec![7; 8]);
+            assert!(retry_test_read(&client, api)
+                .await
+                .unwrap_err()
+                .is_transport_failure());
+            assert_eq!(accepts.load(Ordering::SeqCst), 2);
+            server.abort();
+        }
     }
 
     #[tokio::test]

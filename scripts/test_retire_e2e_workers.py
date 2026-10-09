@@ -5,7 +5,7 @@ import json
 import unittest
 from unittest.mock import patch
 
-from retire_e2e_workers import retire_once
+from retire_e2e_workers import retire_once, snapshot_workers
 
 
 def pod(name, ready=True, deleting=False):
@@ -28,6 +28,19 @@ def snapshot(revision="r1", extra=()):
 
 
 class RetirementTests(unittest.TestCase):
+    @patch("retire_e2e_workers.kubectl")
+    def test_snapshot_includes_unready_and_terminating_workers(self, kubectl):
+        kubectl.return_value = json.dumps({"items": [
+            pod("ready"), pod("unready", ready=False), pod("terminating", deleting=True),
+        ]})
+        self.assertEqual(snapshot_workers("ns", "talon"),
+                         {"ready", "unready", "terminating"})
+        kubectl.assert_called_once_with(
+            "ns", "get", "pods", "-l",
+            "app.kubernetes.io/instance=talon,app.kubernetes.io/component=worker",
+            "-o", "json",
+        )
+
     @patch("retire_e2e_workers.kubectl")
     def test_retire_only_explicitly_replaced_ids_and_preserve_full_registry(self, kubectl):
         before = snapshot()

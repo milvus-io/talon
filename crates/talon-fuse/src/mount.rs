@@ -111,14 +111,6 @@ fn request_groups(req: &fuser::Request<'_>) -> Vec<u32> {
     groups
 }
 
-/// A monotonic-ish millisecond timestamp for the placement cache TTL.
-fn now_ms() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as u64)
-        .unwrap_or(0)
-}
-
 /// Convert a synthesized [`Attr`] into a `fuser::FileAttr`.
 ///
 /// Ownership is left to the mounting user via `uid`/`gid`. `blocks` is a
@@ -314,7 +306,6 @@ impl TalonFuse {
         read_len: u64,
         file_size: u64,
         object: Option<ObjectId>,
-        now_ms: u64,
     ) -> Vec<u64> {
         if self.readahead.window == 0 || read_len == 0 {
             return Vec::new();
@@ -338,7 +329,7 @@ impl TalonFuse {
         // The prefetcher spawns fetches on the runtime; enter it so the spawns
         // have a reactor even though we may be on a sync FUSE thread.
         let _guard = self.runtime.enter();
-        prefetcher.on_read_range(offset, read_len, now_ms)
+        prefetcher.on_read_range(offset, read_len)
     }
 
     /// Write `bytes` back to the object at mount-relative `path` through its
@@ -370,11 +361,8 @@ impl TalonFuse {
         let pool = Arc::clone(&self.write_pool);
         let block_size = self.block_size;
         let version = self.version.clone();
-        let now_ms = now_ms();
         self.runtime.block_on(async move {
-            let addr = reader
-                .resolve_owner(&object, block_size, &version, now_ms)
-                .await?;
+            let addr = reader.resolve_owner(&object, block_size, &version).await?;
             let client = crate::worker_client::WriteClient::with_pool(addr, pool);
             match source {
                 WritebackSource::Memory(bytes) => {
@@ -423,11 +411,8 @@ impl TalonFuse {
         let pool = Arc::clone(&self.write_pool);
         let block_size = self.block_size;
         let version = self.version.clone();
-        let now_ms = now_ms();
         self.runtime.block_on(async move {
-            let addr = reader
-                .resolve_owner(&object, block_size, &version, now_ms)
-                .await?;
+            let addr = reader.resolve_owner(&object, block_size, &version).await?;
             let client = crate::worker_client::WriteClient::with_pool(addr, pool);
             client.delete_object(&object).await?;
             Ok::<(), anyhow::Error>(())
@@ -581,7 +566,7 @@ impl TalonFuse {
                     version: &version,
                     size,
                 };
-                reader.read(&view, 0, size, now_ms()).await
+                reader.read(&view, 0, size).await
             })
             .map_err(|_| libc::EIO)
     }
@@ -811,11 +796,6 @@ impl fuser::Filesystem for TalonFuse {
         } else {
             None
         };
-        // A monotonic-ish millisecond stamp for the placement cache TTL.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
 
         let result = self.runtime.block_on(async move {
             let view = FileView {
@@ -824,7 +804,7 @@ impl fuser::Filesystem for TalonFuse {
                 version: &version,
                 size: file_size,
             };
-            reader.read(&view, offset, size as u64, now_ms).await
+            reader.read(&view, offset, size as u64).await
         });
 
         match result {
@@ -840,7 +820,6 @@ impl fuser::Filesystem for TalonFuse {
                     bytes.len() as u64,
                     file_size,
                     object_for_prefetch,
-                    now_ms,
                 );
                 reply.data(&bytes);
             }
@@ -1761,10 +1740,10 @@ mod tests {
         let size = 64 * 8; // 64 blocks of 8 bytes
         let o = Some(obj());
         // Reads at block 0,1 (offsets 0,8): run building, no prefetch yet.
-        assert!(fuse.drive_readahead(1, 0, 8, size, o.clone(), 0).is_empty());
-        assert!(fuse.drive_readahead(1, 8, 8, size, o.clone(), 0).is_empty());
+        assert!(fuse.drive_readahead(1, 0, 8, size, o.clone()).is_empty());
+        assert!(fuse.drive_readahead(1, 8, 8, size, o.clone()).is_empty());
         // Block 2: run reaches trigger_run=3 → prefetch the next blocks.
-        let spawned = fuse.drive_readahead(1, 16, 8, size, o.clone(), 0);
+        let spawned = fuse.drive_readahead(1, 16, 8, size, o.clone());
         assert!(!spawned.is_empty(), "sequential run must prefetch");
         assert_eq!(spawned, vec![3, 4, 5, 6], "window of 4 ahead of block 2");
     }
@@ -1777,8 +1756,7 @@ mod tests {
         // Jumping around (0, 5, 2, 9) is never a sequential run → no prefetch.
         for off in [0u64, 40, 16, 72] {
             assert!(
-                fuse.drive_readahead(1, off, 8, size, o.clone(), 0)
-                    .is_empty(),
+                fuse.drive_readahead(1, off, 8, size, o.clone()).is_empty(),
                 "random access must not prefetch (offset {off})"
             );
         }
@@ -1793,7 +1771,7 @@ mod tests {
         let o = Some(obj());
         for i in 0..6u64 {
             assert!(
-                fuse.drive_readahead(1, i * 8, 8, size, o.clone(), 0)
+                fuse.drive_readahead(1, i * 8, 8, size, o.clone())
                     .is_empty(),
                 "window 0 must never prefetch"
             );
@@ -1807,7 +1785,7 @@ mod tests {
         let fuse = adapter_with_readahead(4);
         let size = 64 * 8;
         let o = Some(obj());
-        let _ = fuse.drive_readahead(7, 0, 8, size, o.clone(), 0);
+        let _ = fuse.drive_readahead(7, 0, 8, size, o.clone());
         assert!(fuse.prefetchers.lock().unwrap().contains_key(&7));
         // Simulate the release callback's cleanup.
         fuse.prefetchers.lock().unwrap().remove(&7);
@@ -1823,13 +1801,13 @@ mod tests {
         let o = Some(obj());
 
         assert!(fuse
-            .drive_readahead(1, 0, READ_LEN, size, o.clone(), 0)
+            .drive_readahead(1, 0, READ_LEN, size, o.clone())
             .is_empty());
         assert!(fuse
-            .drive_readahead(1, READ_LEN, READ_LEN, size, o.clone(), 0)
+            .drive_readahead(1, READ_LEN, READ_LEN, size, o.clone())
             .is_empty());
         assert_eq!(
-            fuse.drive_readahead(1, 2 * READ_LEN, READ_LEN, size, o, 0),
+            fuse.drive_readahead(1, 2 * READ_LEN, READ_LEN, size, o),
             vec![1, 2, 3, 4]
         );
     }
@@ -1840,18 +1818,16 @@ mod tests {
         let size = 64 * 8;
         let o = Some(obj());
 
-        assert!(fuse.drive_readahead(1, 0, 3, size, o.clone(), 0).is_empty());
-        assert!(fuse.drive_readahead(1, 3, 5, size, o.clone(), 0).is_empty());
-        assert_eq!(fuse.drive_readahead(1, 8, 8, size, o, 0), vec![2, 3, 4, 5]);
+        assert!(fuse.drive_readahead(1, 0, 3, size, o.clone()).is_empty());
+        assert!(fuse.drive_readahead(1, 3, 5, size, o.clone()).is_empty());
+        assert_eq!(fuse.drive_readahead(1, 8, 8, size, o), vec![2, 3, 4, 5]);
     }
 
     #[tokio::test]
     async fn readahead_empty_read_does_not_create_state() {
         let fuse = adapter_with_readahead(4);
 
-        assert!(fuse
-            .drive_readahead(11, 0, 0, 64, Some(obj()), 0)
-            .is_empty());
+        assert!(fuse.drive_readahead(11, 0, 0, 64, Some(obj())).is_empty());
         assert!(!fuse.prefetchers.lock().unwrap().contains_key(&11));
     }
 

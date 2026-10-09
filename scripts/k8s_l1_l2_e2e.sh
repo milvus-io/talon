@@ -224,7 +224,8 @@ set_cache_limits() {
   local l1="$1"
   local l2="$2"
   local replaced_workers
-  replaced_workers="$(worker_pods)"
+  replaced_workers="$(python3 scripts/retire_e2e_workers.py \
+    --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
   kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
     "TALON_WORKER_L1_CAPACITY_BYTES=$l1" \
     "TALON_WORKER_L1_PAGE_SIZE_BYTES=$PAGE_SIZE" \
@@ -417,7 +418,8 @@ helm upgrade --install "$RELEASE" deploy/helm/talon -n "$NAMESPACE" \
   --set worker.resources.limits.memory=512Mi \
   --wait --timeout 5m
 
-replaced_workers="$(worker_pods)"
+replaced_workers="$(python3 scripts/retire_e2e_workers.py \
+  --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
 kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
   TALON_WORKER_BACKEND=s3 \
   TALON_WORKER_S3_REGION=us-east-1 \

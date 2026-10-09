@@ -335,10 +335,6 @@ impl Client {
         if planned_len == 0 {
             return Ok(0);
         }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as u64)
-            .unwrap_or(0);
         let mut pending = FuturesUnordered::new();
         let mut rest = &mut dst[..planned_len];
         for segment in plan.by_ref().take(MAX_CONCURRENT_BLOCK_READS_PER_READ) {
@@ -349,7 +345,6 @@ impl Client {
                 &self.block_read_permits,
                 segment,
                 chunk,
-                now_ms,
             ));
         }
 
@@ -364,7 +359,6 @@ impl Client {
                     &self.block_read_permits,
                     segment,
                     chunk,
-                    now_ms,
                 ));
             }
         }
@@ -377,14 +371,13 @@ async fn read_segment_into(
     permits: &Semaphore,
     segment: BlockSegment,
     dst: &mut [u8],
-    now_ms: u64,
 ) -> Result<usize, Error> {
     let _permit = permits
         .acquire()
         .await
         .expect("client never closes its read budget");
     reader
-        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, now_ms)
+        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst)
         .await
         .map_err(Error::from)
 }
@@ -708,32 +701,34 @@ mod tests {
                 let started_notify = Arc::clone(&started_notify);
                 let release = Arc::clone(&release);
                 tokio::spawn(async move {
-                    let mut header_bytes = [0_u8; HEADER_LEN];
-                    if socket.read_exact(&mut header_bytes).await.is_err() {
-                        return;
+                    loop {
+                        let mut header_bytes = [0_u8; HEADER_LEN];
+                        if socket.read_exact(&mut header_bytes).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&header_bytes).unwrap();
+                        let mut payload = vec![0_u8; header.length as usize];
+                        socket.read_exact(&mut payload).await.unwrap();
+                        let mut frame = header_bytes.to_vec();
+                        frame.extend_from_slice(&payload);
+                        let (_, request) = decode_versioned_request(&frame).unwrap();
+                        assert_eq!(request.version.0.as_str(), "test-version");
+                        let request = request.request;
+
+                        let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        peak.fetch_max(active_now, Ordering::SeqCst);
+                        started.fetch_add(1, Ordering::SeqCst);
+                        started_notify.notify_waiters();
+                        release.acquire().await.unwrap().forget();
+
+                        let bytes: Vec<u8> = (0..request.len)
+                            .map(|index| ((request.offset + index) % 251) as u8)
+                            .collect();
+                        let mut response = response_header_ok(0, bytes.len() as u32).to_vec();
+                        response.extend_from_slice(&bytes);
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        socket.write_all(&response).await.unwrap();
                     }
-                    let header = FrameHeader::decode(&header_bytes).unwrap();
-                    let mut payload = vec![0_u8; header.length as usize];
-                    socket.read_exact(&mut payload).await.unwrap();
-                    let mut frame = header_bytes.to_vec();
-                    frame.extend_from_slice(&payload);
-                    let (_, request) = decode_versioned_request(&frame).unwrap();
-                    assert_eq!(request.version.0.as_str(), "test-version");
-                    let request = request.request;
-
-                    let active_now = active.fetch_add(1, Ordering::SeqCst) + 1;
-                    peak.fetch_max(active_now, Ordering::SeqCst);
-                    started.fetch_add(1, Ordering::SeqCst);
-                    started_notify.notify_waiters();
-                    release.acquire().await.unwrap().forget();
-
-                    let bytes: Vec<u8> = (0..request.len)
-                        .map(|index| ((request.offset + index) % 251) as u8)
-                        .collect();
-                    let mut response = response_header_ok(0, bytes.len() as u32).to_vec();
-                    response.extend_from_slice(&bytes);
-                    active.fetch_sub(1, Ordering::SeqCst);
-                    socket.write_all(&response).await.unwrap();
                 });
             }
         });

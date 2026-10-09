@@ -59,8 +59,6 @@ pub struct S3CacheRequest<'a> {
     pub block_size: u32,
     /// Maximum emitted stream chunk size.
     pub chunk_size: u32,
-    /// Request time used for cache freshness decisions.
-    pub now_ms: u64,
 }
 
 /// Incoming S3 addressing and cache behavior.
@@ -146,14 +144,8 @@ impl S3Cache for BlockReader {
             version: request.version,
             size: request.object_size,
         };
-        self.stream_range(
-            &file,
-            request.offset,
-            request.len,
-            request.chunk_size,
-            request.now_ms,
-        )
-        .map(|stream| Box::pin(stream) as CacheStream)
+        self.stream_range(&file, request.offset, request.len, request.chunk_size)
+            .map(|stream| Box::pin(stream) as CacheStream)
     }
 
     fn invalidate_object(&self, object: &ObjectId) -> usize {
@@ -1813,15 +1805,6 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn unix_millis() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis()
-        .try_into()
-        .unwrap_or(u64::MAX)
-}
-
 /// A write body prepared for one origin request.
 enum WriteBody {
     /// Streamed to the origin as `UNSIGNED-PAYLOAD` (a plain unsigned body, or
@@ -3042,7 +3025,6 @@ impl S3Adapter {
             len,
             block_size: self.config.block_size,
             chunk_size: self.config.transfer_chunk_bytes,
-            now_ms: unix_millis(),
         }) {
             Ok(cache) => cache,
             Err(error) if error.fallback_eligible() && route == GatewayRoute::Cache => {
