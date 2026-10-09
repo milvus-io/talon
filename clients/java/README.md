@@ -17,8 +17,11 @@ try (TalonClient client = TalonClient.connect("coordinator-host:7000", 8 << 20, 
 connections retained per address, independently in the coordinator and worker
 pools; concurrent requests may open more connections. Idle connections expire
 after 30 seconds and are discarded on checkout. Failed exchanges close their
-connections; a reused connection that disconnects is retried once on a fresh
-connection. `close()` closes idle connections and prevents in-flight connections
+connections. Data reads retry a transport failure on a reused connection once,
+using a fresh connection to the same discovered instance, only while the original
+discovery remains valid before and after dialing. Worker refusals, protocol errors,
+and failures on fresh connections are not retried. Coordinator requests retry a
+reused connection that disconnects once. `close()` closes idle connections and prevents in-flight connections
 from returning to the pools.
 
 The existing `TalonClient.connect(coordinator, blockSize)` and
@@ -59,3 +62,7 @@ Requires Java 17 or newer.
 
 See the [wire protocol reference](https://milvus-io.github.io/talon/reference/wire-protocol.html)
 for the format this implements.
+
+## Rolling upgrades
+
+Schema-6 clusters with persistent membership preserve block owners while Workers restart. Reads select one logical owner and resolve its current process. A stale pooled connection can be retried once within the original discovery lifetime; this does not refresh discovery or switch owners. Availability failures return `TalonException` with `code()` equal to `UNAVAILABLE` or `TIMEOUT`. `fallbackEligible()` is advisory and never accesses origin storage. Version mismatch, rate limits, origin failures and protocol failures remain distinct. Discovery expires after at most 500 ms and refresh failures are coalesced; idle sockets belong to a single process incarnation.

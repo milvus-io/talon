@@ -281,7 +281,9 @@ deploy_talon() {
   # fallback; the io_uring path is covered by benches/dataplane_benches.rs and
   # scripts/dataplane_loadtest.sh (which require a bare-metal io_uring host).
   local replaced_workers
-  replaced_workers="$(worker_pods)"
+  # Unready pods can already own persistent membership; capture them too.
+  replaced_workers="$(python3 scripts/retire_e2e_workers.py \
+    --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
   kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
     TALON_WORKER_BACKEND=s3 \
     TALON_WORKER_S3_REGION=us-east-1 \

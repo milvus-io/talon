@@ -30,6 +30,8 @@ final class Messages {
     static final int TAG_LIST_OBJECTS = 10;
     static final int TAG_OBJECT_LIST = 11;
 
+    static final int TAG_CONTROL_FAILURE = 18;
+
     // Backend enum tags.
     static final int BACKEND_S3 = 0;
     static final int BACKEND_GCS = 1;
@@ -43,6 +45,30 @@ final class Messages {
 
     private static Bincode.Writer envelope(int tag) {
         return new Bincode.Writer().u16(CONTROL_SCHEMA_VERSION).variant(tag);
+    }
+
+    record DiscoveredWorker(String id, String zone, int state, String instance, String address) {}
+    record Discovery(long topology, long state, long validForMs, List<DiscoveredWorker> workers) {}
+    static Discovery readDiscovery(Bincode.Reader r) {
+        long topology = r.u64();
+        long state = r.u64();
+        long validity = r.u64();
+        if (validity < 0) throw new ProtocolException("invalid discovery validity");
+        int count = r.seqLen();
+        List<DiscoveredWorker> workers = new ArrayList<>(count);
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (int i = 0; i < count; i++) {
+            String id = r.string();
+            String zone = r.bool() ? r.string() : null;
+            boolean retired = r.bool();
+            int status = r.variant();
+            if (status > 2 || retired || !ids.add(id)) throw new ProtocolException("invalid discovered member");
+            String instance = status == 2 ? r.string() : null;
+            String address = status == 2 ? r.string() : null;
+            workers.add(new DiscoveredWorker(id, zone, status, instance, address));
+        }
+        if (r.remaining() != 0) throw new ProtocolException("trailing discovery bytes");
+        return new Discovery(topology, state, Math.min(validity, 500), List.copyOf(workers));
     }
 
     /** Wrap a bincode body in a Control frame. */
