@@ -715,10 +715,9 @@ async fn handle_cached_range(
 
 /// Handle a `Control` frame on the data plane.
 ///
-/// Only `StatObject` is served here (#318): a client must know an object's
-/// version before it can address any block, and only a worker holds the backend
-/// credentials needed to resolve it. Anything else gets an `Ack` naming what
-/// was rejected, so a client sees the reason rather than a closed connection.
+/// Serves metadata requests and version-pinned block prewarm. Only workers
+/// hold backend credentials; load acknowledgements follow cache completion.
+/// Unsupported messages receive an explicit rejection.
 async fn handle_control_frame(
     stream: &mut TcpStream,
     header: &FrameHeader,
@@ -758,6 +757,38 @@ async fn handle_control_frame(
     };
 
     let reply = match message {
+        ControlMessage::LoadBlock { block, len } => {
+            if !observability.is_ready() {
+                ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.load_block(&block, len).await {
+                    Ok(()) => ControlMessage::Ack { ok: true, detail: None },
+                    Err(error) => ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
+        ControlMessage::BatchLoad { blocks } => {
+            if !observability.is_ready() {
+                ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.batch_load(&blocks).await {
+                    Ok(()) => ControlMessage::Ack { ok: true, detail: None },
+                    Err(error) => ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
         ControlMessage::StatObject { object } => {
             if !observability.is_ready() {
                 talon_transport::ControlMessage::ControlFailure {
@@ -801,7 +832,7 @@ async fn handle_control_frame(
         other => ControlMessage::Ack {
             ok: false,
             detail: Some(format!(
-                "worker serves only StatObject/ListObjects on the data plane, got {other:?}"
+                "worker serves only StatObject/ListObjects/LoadBlock/BatchLoad on the data plane, got {other:?}"
             )),
         },
     };

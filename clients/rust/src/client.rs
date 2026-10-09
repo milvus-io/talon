@@ -17,6 +17,16 @@ const REPLICAS_K: u8 = 1;
 
 // Limit task allocation and let other logical reads make progress.
 const MAX_CONCURRENT_BLOCK_READS_PER_READ: usize = 8;
+/// One file in a batch prewarm request. Size belongs to the supplied version.
+#[derive(Debug, Clone)]
+pub struct LoadRequest {
+    /// Object to warm.
+    pub object: ObjectId,
+    /// Exact source version used for cache identity and conditional reads.
+    pub version: Version,
+    /// File size supplied by the caller; no HEAD is issued.
+    pub size: u64,
+}
 /// Default active block-read budget shared by a client and all its clones.
 pub const DEFAULT_MAX_IN_FLIGHT_BLOCK_READS: usize = 1024;
 
@@ -138,6 +148,56 @@ impl Client {
     /// Logical block size used for range planning.
     pub fn block_size(&self) -> u32 {
         self.block_size
+    }
+
+    /// Prewarm a file's specified version on its Maglev primary workers.
+    /// The caller supplies the size of this version; LOAD issues no HEAD.
+    /// Waits for all blocks, returning an error on any failure.
+    /// Completed data remains cached on failure and is subject to eviction.
+    pub async fn load(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        size: u64,
+    ) -> Result<crate::LoadResult, crate::LoadError> {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.reader
+            .load(
+                &talon_cache_client::FileView {
+                    object,
+                    version,
+                    size,
+                    block_size: self.block_size,
+                },
+                now_ms,
+            )
+            .await
+    }
+
+    /// Prewarm files with one protocol batch per worker/chunk, without HEAD.
+    /// Results follow input order. Any failed batch fails the call; completed
+    /// fills remain cached. Uses the same placement and shared RPC budget as LOAD.
+    pub async fn batch_load(
+        &self,
+        requests: &[LoadRequest],
+    ) -> Result<Vec<crate::LoadResult>, crate::LoadError> {
+        let files = requests
+            .iter()
+            .map(|request| talon_cache_client::FileView {
+                object: &request.object,
+                version: &request.version,
+                size: request.size,
+                block_size: self.block_size,
+            })
+            .collect::<Vec<_>>();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        self.reader.batch_load(&files, now_ms).await
     }
 
     /// Return an object's current size and source version.
@@ -986,6 +1046,75 @@ mod tests {
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "s3/bucket/data/a.parquet");
         assert_eq!(entries[0].size, 17);
+    }
+
+    #[tokio::test]
+    async fn batch_load_uses_one_worker_frame_for_multiple_files_without_stat() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let parsed = FrameHeader::decode(&header).unwrap();
+            let mut frame = header.to_vec();
+            frame.resize(HEADER_LEN + parsed.length as usize, 0);
+            socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
+            let (_, request) = talon_transport::codec::decode_request(&frame).unwrap();
+            let ControlMessage::BatchLoad { blocks } = request else {
+                panic!("expected one BatchLoad frame");
+            };
+            assert_eq!(blocks.len(), 3);
+            assert_eq!(blocks[0].len, 8);
+            assert_eq!(blocks[1].len, 1);
+            assert_eq!(blocks[2].len, 3);
+            assert_eq!(blocks[0].block.version, Version::new("v1"));
+            assert_eq!(blocks[2].block.version, Version::new("v2"));
+            socket
+                .write_all(
+                    &talon_transport::encode(
+                        parsed.request_id,
+                        &ControlMessage::Ack {
+                            ok: true,
+                            detail: None,
+                        },
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+        });
+        let stat_calls = Arc::new(AtomicUsize::new(0));
+        let coordinator = mock_read_coordinator(address, 0, stat_calls.clone()).await;
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(8)
+            .build()
+            .unwrap();
+        let results = client
+            .batch_load(&[
+                LoadRequest {
+                    object: parse_uri("s3://bucket/a").unwrap(),
+                    version: Version::new("v1"),
+                    size: 9,
+                },
+                LoadRequest {
+                    object: parse_uri("s3://bucket/b").unwrap(),
+                    version: Version::new("v2"),
+                    size: 3,
+                },
+            ])
+            .await
+            .unwrap();
+        assert_eq!(
+            results,
+            [
+                crate::LoadResult { size: 9, blocks: 2 },
+                crate::LoadResult { size: 3, blocks: 1 }
+            ]
+        );
+        assert_eq!(stat_calls.load(Ordering::SeqCst), 0);
+        server.await.unwrap();
     }
 
     #[tokio::test]

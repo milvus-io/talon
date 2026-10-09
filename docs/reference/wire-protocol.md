@@ -132,6 +132,55 @@ requests never renew that lifetime. Coordinators refresh independently, so a cli
 switching replicas can temporarily observe different views. The equality tokens
 do not provide monotonic revision ordering.
 
+### File prewarm (control schema 6)
+
+These variants are appended after `ControlFailure` in the schema-6 contract.
+Existing variants retain their tags and encoding.
+
+| Tag | Message | Direction | Fields |
+|---|---|---|---|
+| 19 | `LoadBlock` | client → worker | `block: BlockId`, `len: u64` |
+| 20 | `BatchLoad` | client → worker | `blocks: Vec<LoadBlockRequest>` |
+
+`LoadBlockRequest` contains `block: BlockId` followed by `len: u64`. A batch
+contains 1–1024 assignments, which may refer to different files and versions.
+The encoded schema and message body must fit within `MAX_CONTROL_PAYLOAD_LEN`
+minus the maximum tracing-envelope overhead (currently 1 MiB minus 1026 bytes).
+Both encoders and decoders enforce these limits. The client groups assignments
+by worker and splits on either limit; it never falls back to individual LOAD
+RPCs for batch input. An empty SDK batch sends no frames.
+
+Each batch gets one correlated `Ack(true)` after all assignments complete.
+Each batch occupies one LOAD RPC admission permit and runs a window of at most
+eight block loads. Single and batch LOADs share a worker-wide limit of eight
+active block loads. On the first observed failure, the worker stops adding
+assignments and drains the existing window before returning `Ack(false)` with
+the failing block. Completed fills remain cached. Batch execution is not atomic,
+and separately dispatched batches can finish after the caller observes failure.
+Batch RPCs and the complete SDK batch operation have a 30-minute deadline.
+
+LOAD uses the worker's configured origin HTTP retry policy. Transient failures
+(including S3 `429` and `503 SlowDown`) are retried within the block's concurrency
+permit, including backoff. Defaults are three retries, exponential backoff with
+full jitter (100 ms base, 5 s cap), and capped `Retry-After` hints in seconds.
+`403`, `404`, and `412` are not retried. A retry does not resend the batch or
+replay completed blocks; exhaustion is a block failure as described above.
+
+The SDK assigns blocks to the same persistent Maglev primaries used by reads,
+using one logical topology. Before dispatch, it resolves each primary through
+valid instance discovery and its isolated connection pool. Expired discovery
+must be refreshed; offline or conflicting owners fail without remapping.
+Topology changes fail the operation. The coordinator only serves existing membership
+discovery; it does not receive or orchestrate LOAD. The caller must provide
+the correct size for the requested version. Workers use that extent without
+issuing HEAD. Workers use their existing
+version-pinned fill path and configured cache form, and reply with `Ack(true)`
+after warming the block. `len` is the logical block length, including a short
+final block. Errors return `Ack(false)` with a diagnostic. The SDK reports byte
+and block counts locally after every assignment succeeds. Previously completed
+cache fills are retained on failure and remain subject to normal eviction.
+The unversioned `Load` variant (tag 2) remains reserved and unsupported.
+
 Supporting types:
 
 ```

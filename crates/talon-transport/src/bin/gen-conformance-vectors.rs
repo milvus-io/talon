@@ -182,6 +182,24 @@ fn vectors() -> Vec<Vector> {
         ),
 
 
+        control(
+            "control.load_block",
+            "Schema v6: prewarm the short final block on its primary owner",
+            7,
+            &ControlMessage::LoadBlock {
+                block: BlockId::new(object("container", "path/to/object"), 16, 8, Version::new("v1")),
+                len: 1,
+            },
+        ),
+        control(
+            "control.batch_load",
+            "Schema v6: two versioned load assignments in one request, followed by one Ack",
+            8,
+            &ControlMessage::BatchLoad { blocks: vec![
+                talon_transport::LoadBlockRequest { block: BlockId::new(object("container", "a"), 0, 8, Version::new("v1")), len: 8 },
+                talon_transport::LoadBlockRequest { block: BlockId::new(object("container", "b"), 8, 8, Version::new("v2")), len: 3 },
+            ] },
+        ),
         // --- Data plane -----------------------------------------------------
         Vector {
             name: "data.range_request",

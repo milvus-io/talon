@@ -5,9 +5,11 @@
 //! 1. **Splits** the range into fixed-size 256MB blocks ([`split_into_blocks`]).
 //! 2. **Assigns** each block a primary worker via the [`Placement`] strategy
 //!    over the current membership.
-//! 3. Emits a [`LoadAssignment`] per block carrying the whole-vs-paged
-//!    [`LoadHint`], which the coordinator sends to workers as `LoadBlobs`;
-//!    workers then pull the bytes from the backend themselves.
+//! 3. Emits a [`LoadAssignment`] per block carrying a whole-vs-paged hint.
+//!
+//! This generic planner is retained for callers that supply their own placement
+//! strategy. The client SDK executes LOAD with a bounded, lazy Maglev plan
+//! matching the read path, and sends `LoadBlock` directly to workers.
 //!
 //! Blob *listing* (enumerating objects/sizes from a backend) is expected to run
 //! on a background thread so a large listing never blocks the control ring —
@@ -92,7 +94,7 @@ impl LoadProgress {
 ///
 /// Splits the range, assigns each block's primary via `placement` over `nodes`,
 /// and attaches `hint`. The returned plan is what the coordinator turns into
-/// `LoadBlobs` messages; pair it with a [`LoadProgress`] initialized to
+/// worker assignments; pair it with a [`LoadProgress`] initialized to
 /// `total = plan.len()`.
 #[allow(clippy::too_many_arguments)]
 pub fn plan_load<P: Placement>(

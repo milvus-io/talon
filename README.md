@@ -63,6 +63,80 @@ with talon.Client("coordinator-host:7000", block_size=8 << 20) as client:
                         offset=0, length=1 << 20)
 ```
 
+Prewarm a file's blocks across the workers responsible for them:
+
+```sh
+talon-client load --coordinator coordinator-host:7000 \
+  --path /s3/training-data/shard-0.parquet --version '<ETag>' --size 1073741824
+# Add --block-size <bytes> if workers/readers use a non-default block size.
+```
+
+The Rust SDK exposes the same operation as
+`client.load(&object, &version, size).await`. The caller must provide the
+correct file size for that version.
+
+For multiple files, use `client.batch_load(&[LoadRequest { object, version,
+size }, ...]).await` or a JSON manifest:
+
+```json
+[
+  {"path": "/s3/training-data/shard-0.parquet", "version": "etag-0", "size": 1073741824},
+  {"path": "/s3/training-data/shard-1.parquet", "version": "etag-1", "size": 536870912}
+]
+```
+
+```sh
+talon-client batch-load --coordinator coordinator-host:7000 --manifest files.json
+```
+
+Batch load groups assignments by worker and sends up to **1024 block load
+instructions in one protocol request**, followed by one acknowledgement.
+Requests also fit the 1 MiB control-frame limit, including tracing metadata;
+long identities can cause earlier splitting. Workers process each batch with up
+to eight concurrent block loads. All batches and single LOADs on a worker share
+that block limit. On the first observed failure, the worker stops adding work
+and drains its existing window, retaining completed cache fills. The SDK
+returns per-file counts in input order on success, or an error on any failed
+batch. Empty input succeeds without network I/O. Single and batch loads share
+the same client and worker RPC admission limits; a batch counts as one active RPC.
+
+The caller's version is the exact source version used by normal version-pinned
+reads. Load uses the same Maglev primary placement, and each worker fills only
+its assigned blocks using its configured whole-block or paged cache. A small
+file may have no blocks assigned to some workers. Repeated loads reuse resident
+data. The client sends LOAD directly to workers using its cached membership;
+the coordinator only provides ordinary membership discovery. Cached instance
+discovery remains usable during a coordinator outage until its advertised
+validity expires. Dispatch then requires fresh discovery, just like reads;
+offline or conflicting logical owners are not replaced by other workers. LOAD issues no
+HEAD: block and page extents come from the supplied size. Normal conditional origin reads still
+apply; LOAD does not replace the caller's version with the current version.
+
+Workers automatically retry transient origin failures, including S3 `429` and
+`503 SlowDown`, through the same HTTP retry policy used by reads. The default is
+three retries after the first attempt, with exponential backoff and full jitter
+(100 ms base, 5 s cap); `Retry-After` in seconds is honored up to that cap.
+`backend_max_retries`, `backend_retry_base_ms`, and `backend_retry_max_delay_ms`
+configure this policy. Backoff retains the block's concurrency permit. Only the
+failed origin request is retried; completed blocks are not replayed. Permission
+denied, missing objects, and version mismatches (`403`, `404`, `412`) are not
+retried. Exhausted retries fail the block and follow the batch failure behavior
+above.
+
+The command waits until all assigned blocks finish and returns loaded byte and
+block counts. A worker error, timeout, or observed membership change fails the
+request; successfully warmed data remains cached and the request can be retried.
+Load is best-effort cache warming: entries remain subject to ordinary eviction,
+and neither pinned residency nor automatic rebalancing after completion is
+promised. Dropping the client operation stops further dispatch; workers may
+finish requests they have already accepted. A client and its clones share a
+limit of eight active requests, with a two-minute single-block RPC timeout and
+a 30-minute batch RPC and overall operation timeout. Each worker also admits at most eight concurrent
+LOAD requests and rejects excess requests for the caller to retry later. Load
+requires workers implementing `LoadBlock` and `BatchLoad` in control schema 6;
+no additional coordinator upgrade is needed.
+Existing operations retain their original wire schemas.
+
 **POSIX behaviour is measured, not asserted.** Against a real kernel mount,
 Talon passes **99.2% of pjdfstest** (8,731 of 8,798 assertions across 238 test
 files). Reproduce it in one command:

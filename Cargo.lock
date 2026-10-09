@@ -2731,6 +2731,9 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "serde",
+ "serde_json",
+ "talon-cache-client",
  "talon-core",
  "talon-telemetry",
  "talon-transport",
