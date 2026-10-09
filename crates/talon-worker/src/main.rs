@@ -499,7 +499,8 @@ async fn run() -> anyhow::Result<()> {
         .with_zone(resolved_zone.zone),
     );
     observability.readiness().set_backend_ready(true);
-    observability.readiness().set_store_ready(true);
+    // Listener readiness is published only after binding the data plane.
+    observability.readiness().set_store_ready(false);
     observability
         .metrics()
         .set_l1_capacity(cfg.l1_capacity_bytes);
@@ -649,6 +650,7 @@ async fn run() -> anyhow::Result<()> {
         }
     });
 
+    let mut control_server = None;
     if let (Some(control_listen), Some(channel)) = (&cfg.control_listen, &control_tls) {
         let listener = TcpListener::bind(control_listen).await?;
         tracing::info!(listen = %control_listen, "worker serving coordinator mTLS control plane");
@@ -660,7 +662,8 @@ async fn run() -> anyhow::Result<()> {
         let guard = Arc::new(MappingGuard::new(Duration::from_millis(
             cfg.heartbeat_interval_ms.saturating_mul(3),
         )));
-        tokio::spawn(async move {
+        let shutdown = observability.shutdown().clone();
+        control_server = Some(tokio::spawn(async move {
             if let Err(error) = serve_control(
                 listener,
                 channel,
@@ -669,42 +672,73 @@ async fn run() -> anyhow::Result<()> {
                 worker_incarnation,
                 policy,
                 guard,
+                shutdown,
             )
             .await
             {
                 tracing::error!(%error, "worker coordinator mTLS control plane stopped");
             }
-        });
+        }));
     }
 
     let _control_plane = spawn_control_plane(
         cfg.coordinator.clone(),
-        control_tls,
+        control_tls.clone(),
         Arc::clone(&observability),
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
     let page_gc = talon_worker::page_gc::PageGcService::start(worker.clone(), page_gc_config);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let data = serve_data_plane(cfg, worker, observability, stop.clone());
+    let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
     tokio::pin!(data);
-    let result = tokio::select! {
-        result = &mut data => result,
-        result = shutdown_signal() => {
-            stop.store(true, std::sync::atomic::Ordering::Release);
-            result
-        }
+    let (result, data_done) = tokio::select! {
+        result = &mut data => (result, true),
+        result = shutdown_signal() => (result, false),
+        _ = observability.shutdown().stopped() => (Ok(()), false),
     };
+    let drain_started = Instant::now();
+    observability.begin_shutdown();
+    tracing::info!("worker draining");
+    page_gc.begin_shutdown();
     stop.store(true, std::sync::atomic::Ordering::Release);
+    // Join the producer before publishing not-ready: an older ready heartbeat
+    // must never follow the final report from this process.
     _control_plane.abort();
-    if tokio::time::timeout(Duration::from_secs(10), page_gc.shutdown())
-        .await
-        .is_err()
-    {
-        tracing::warn!(
-            "page maintenance shutdown timed out; restart will use the last valid checkpoint"
-        );
+    let _ = _control_plane.await;
+    let drain = async {
+        let report = ControlMessage::NodeStatusHeartbeat {
+            status: Box::new(observability.status_for_heartbeat()),
+        };
+        let _ = tokio::time::timeout(
+            CONTROL_OPERATION_TIMEOUT,
+            instance_report(&cfg.coordinator, control_tls.as_ref(), &report),
+        )
+        .await;
+        let data_result = if !data_done { data.await } else { Ok(()) };
+        // Even a failed accept/ring must drain disk mutations and checkpoint
+        // within the same deadline before returning the original error.
+        let control_result = match control_server {
+            Some(task) => task.await,
+            None => Ok(()),
+        };
+        page_gc.shutdown().await;
+        control_result?;
+        data_result
+    };
+    match tokio::time::timeout(Duration::from_secs(20), drain).await {
+        Ok(drained) => drained?,
+        Err(_) => {
+            // Dropping a spawn_blocking future does not stop disk writes. Exit
+            // the entire process before the cache-directory flock can escape.
+            tracing::error!("worker drain deadline exceeded; terminating with cache lock held");
+            std::process::exit(1);
+        }
     }
+    tracing::info!(
+        elapsed_ms = drain_started.elapsed().as_millis() as u64,
+        "worker drain complete"
+    );
     result
 }
 
@@ -776,20 +810,59 @@ async fn serve_data_plane(
 
     let listener = TcpListener::bind(&cfg.listen).await?;
     tracing::info!(listen = %cfg.listen, "worker serving data plane");
+    serve_tokio_data_plane(listener, worker, observability, connection_admission).await
+}
+
+async fn serve_tokio_data_plane(
+    listener: TcpListener,
+    worker: Arc<WorkerRuntime>,
+    observability: Arc<WorkerObservability>,
+    connection_admission: ConnectionAdmission,
+) -> anyhow::Result<()> {
+    observability.readiness().set_store_ready(true);
+    let mut connections = tokio::task::JoinSet::new();
+    let mut failure = None;
+    let stopped = observability.shutdown().stopped();
+    tokio::pin!(stopped);
     loop {
-        // Wait before accept just like each io_uring listener; overload remains
-        // in the kernel backlog and cannot allocate an accepted FD or task.
-        let permit = connection_admission.acquire().await;
-        let (stream, peer) = listener.accept().await?;
+        let accepted = tokio::select! {
+            biased;
+            _ = &mut stopped => break,
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "connection task failed"); }
+                continue;
+            }
+            accepted = async {
+                let permit = connection_admission.acquire().await;
+                listener.accept().await.map(|accepted| (permit, accepted))
+            } => accepted,
+        };
+        let (permit, (stream, peer)) = match accepted {
+            Ok(v) => v,
+            Err(error) => {
+                failure = Some(error);
+                observability.begin_shutdown();
+                break;
+            }
+        };
         let worker = Arc::clone(&worker);
         let observability = Arc::clone(&observability);
-        tokio::spawn(async move {
-            // Hold the permit for the connection's lifetime.
+        connections.spawn(async move {
             let _permit = permit;
             if let Err(e) = handle_conn(stream, worker, observability).await {
                 tracing::debug!(%peer, error = %e, "worker: connection ended");
             }
         });
+    }
+    drop(listener);
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "connection task failed during drain");
+        }
+    }
+    match failure {
+        Some(error) => Err(error.into()),
+        None => Ok(()),
     }
 }
 
@@ -896,6 +969,7 @@ async fn instance_report_on_stream<S: AsyncRead + AsyncWrite + Unpin>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn serve_control(
     listener: TcpListener,
     channel: ControlTlsChannel,
@@ -904,20 +978,52 @@ async fn serve_control(
     worker_incarnation: String,
     policy: Option<NamespacePolicy>,
     guard: Arc<MappingGuard>,
+    shutdown: Arc<talon_transport::shutdown::Shutdown>,
 ) -> anyhow::Result<()> {
-    loop {
-        let (stream, peer) = listener.accept().await?;
+    let mut connections = tokio::task::JoinSet::new();
+    let stopped = shutdown.stopped();
+    tokio::pin!(stopped);
+    let result = loop {
+        let accepted = tokio::select! {
+            biased;
+            _ = &mut stopped => break Ok(()),
+            completed = connections.join_next(), if !connections.is_empty() => {
+                if let Some(Err(error)) = completed { tracing::warn!(%error, "control connection task failed"); }
+                continue;
+            }
+            accepted = listener.accept() => accepted,
+        };
+        let (stream, peer) = match accepted {
+            Ok(value) => value,
+            Err(error) => {
+                shutdown.begin();
+                break Err(error.into());
+            }
+        };
+        let shutdown = shutdown.clone();
         let channel = channel.clone();
         let cluster_id = cluster_id.clone();
         let worker_id = worker_id.clone();
         let worker_incarnation = worker_incarnation.clone();
         let policy = policy.clone();
         let guard = Arc::clone(&guard);
-        tokio::spawn(async move {
+        connections.spawn(async move {
+            let stopped = shutdown.stopped();
+            tokio::pin!(stopped);
             let result = async {
-                let mut authenticated = channel.accept(stream).await?;
+                let mut authenticated = tokio::select! {
+                    biased;
+                    _ = &mut stopped => return anyhow::Ok(()),
+                    accepted = channel.accept(stream) => accepted?,
+                };
                 tracing::debug!(identity = %authenticated.identity, %peer, "accepted coordinator mTLS connection");
-                if let Some(message) = read_control(&mut authenticated.stream).await? {
+                let message = tokio::select! {
+                    biased;
+                    _ = &mut stopped => return anyhow::Ok(()),
+                    message = read_control(&mut authenticated.stream) => message?,
+                };
+                if let Some(message) = message {
+                    if shutdown.is_stopped() { return anyhow::Ok(()); }
                     let reply = handle_revision_update(
                         message,
                         &authenticated.identity,
@@ -944,7 +1050,14 @@ async fn serve_control(
                 tracing::debug!(%peer, %error, "worker coordinator mTLS connection ended");
             }
         });
+    };
+    drop(listener);
+    while let Some(result) = connections.join_next().await {
+        if let Err(error) = result {
+            tracing::warn!(%error, "control connection task failed during shutdown");
+        }
     }
+    result
 }
 
 fn handle_revision_update(
@@ -1387,6 +1500,134 @@ mod tests {
                 len: u64::MAX,
                 version: Version::new("v1"),
             })
+        }
+    }
+
+    #[tokio::test]
+    async fn draining_finishes_admitted_read_and_holds_directory_lock() {
+        struct PausedOrigin {
+            entered: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+        #[async_trait]
+        impl BackendStore for PausedOrigin {
+            async fn fetch_range(&self, object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+                self.entered.notify_one();
+                self.release.notified().await;
+                RampBackend.fetch_range(object, offset, len).await
+            }
+            async fn fetch_range_if_match(
+                &self,
+                object: &ObjectId,
+                offset: u64,
+                len: u64,
+                _: Option<&Version>,
+            ) -> Result<Bytes> {
+                self.fetch_range(object, offset, len).await
+            }
+            async fn head(&self, object: &ObjectId) -> Result<ObjectStat> {
+                RampBackend.head(object).await
+            }
+        }
+        use talon_worker::page_access_store::CacheRootLock;
+        let root = tmp_root();
+        std::fs::create_dir_all(&root).unwrap();
+        let lock = Arc::new(CacheRootLock::acquire(&root).unwrap());
+        let index = Arc::new(BlockIndex::new());
+        let inflight = Arc::new(InFlightLoads::new());
+        let obs = Arc::new(
+            WorkerObservability::new(
+                "c".into(),
+                NodeInfo {
+                    id: NodeId::new("w"),
+                    address: "127.0.0.1:7".into(),
+                    role: NodeRole::Worker,
+                },
+                "127.0.0.1:8".into(),
+                1024,
+                index.clone(),
+                inflight.clone(),
+            )
+            .unwrap(),
+        );
+        obs.readiness().set_backend_ready(true);
+        obs.readiness().set_store_ready(true);
+        obs.readiness().set_control_registered(true);
+        let origin = Arc::new(PausedOrigin {
+            entered: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        let worker = Arc::new(WorkerRuntime::new(
+            WholeBlockStore::open(&root)
+                .unwrap()
+                .with_root_lock(lock.clone()),
+            index,
+            inflight,
+            origin.clone(),
+            16,
+            0,
+            obs.metrics().clone(),
+        ));
+        drop(lock);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let mut idle = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        // A partial frame must not hold up shutdown while another request runs.
+        idle.write_all(&[0]).await.unwrap();
+        let serving = obs.clone();
+        let admission = ConnectionAdmission::new(2, obs.metrics().clone());
+        let mut task = tokio::spawn(async move {
+            serve_tokio_data_plane(listener, worker, serving, admission).await
+        });
+        let request = talon_transport::encode_request(
+            1,
+            &talon_transport::RangeRequest {
+                object: ObjectId::new(talon_core::Backend::Azure, "c", "obj"),
+                offset: 0,
+                len: 8,
+            },
+        )
+        .unwrap();
+        client.write_all(&request).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), origin.entered.notified())
+            .await
+            .unwrap();
+        // Queue a second frame before shutdown, while the first request is held.
+        // It must never start even though the socket is readable on the next loop.
+        client.write_all(&request).await.unwrap();
+        obs.begin_shutdown();
+        assert!(!obs.is_ready());
+        assert!(CacheRootLock::acquire(&root).is_err());
+        assert!(tokio::time::timeout(Duration::from_millis(10), &mut task)
+            .await
+            .is_err());
+        origin.release.notify_one();
+        let (_, body) = talon_transport::read_frame(&mut client, Duration::from_secs(2))
+            .await
+            .unwrap();
+        assert_eq!(body.as_slice(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let _lock = CacheRootLock::acquire(&root).unwrap();
+        // A persistent socket is closed after its admitted response; it cannot
+        // trigger a second origin operation during shutdown.
+        let mut byte = [0];
+        for socket in [&mut client, &mut idle] {
+            match tokio::time::timeout(Duration::from_secs(1), socket.read(&mut byte))
+                .await
+                .unwrap()
+            {
+                Ok(0) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                other => panic!("connection must close without another response: {other:?}"),
+            }
         }
     }
 

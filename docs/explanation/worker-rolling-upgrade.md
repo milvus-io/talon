@@ -204,6 +204,8 @@ If the data directory is unreadable or its format is incompatible, fail startup 
 
 Both the Tokio and Monoio/io_uring data paths must track in-flight tasks and provide the same semantics. Returning from the main accept future must not destroy a runtime that is still processing requests.
 
+Shutdown uses a one-way atomic flag and a notification future retained by each connection. Request boundaries only read the flag; they do not update a process-wide request counter. A request that observes the running state is owned by its connection even if shutdown races with that check. Tokio listeners join their connection tasks, and each io_uring ring waits for its local connections before its thread exits. Connections must await all work they start, including any future concurrent request tasks. Control listeners follow the same ownership rule, and the Coordinator also awaits graceful HTTP admin shutdown before releasing its lease.
+
 Draining has an overall timeout. Once it expires, remaining reads may fail and the process may terminate, but the lock must not be released while background threads can still modify the cache. Abnormal termination relies on existing crash recovery. Any unacknowledged business writes retain their original write contract and must not be replayed automatically under the read-unavailability policy.
 
 ### 7.3 State Transitions

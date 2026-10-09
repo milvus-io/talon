@@ -98,25 +98,33 @@ pub async fn handle_conn(
     worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
+    let stopped = observability.shutdown().stopped();
+    tokio::pin!(stopped);
     let _active_connection = observability.metrics().track_connection();
     loop {
         let request_started = Instant::now();
         // Read one frame with a per-type size cap enforced BEFORE allocation and
         // a read timeout, so a peer cannot pin a 320 MiB buffer by advertising a
         // huge length and stalling (issue #111).
-        let (header, payload) =
-            match talon_transport::read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT)
-                .await
-            {
-                Ok(frame) => frame,
-                Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
-                Err(talon_transport::ReadFrameError::Timeout) => {
-                    tracing::debug!("worker: connection read timed out");
-                    return Ok(());
-                }
-                Err(e) => return Err(anyhow::anyhow!(e)),
-            };
+        let (header, payload) = match tokio::select! {
+            biased;
+            _ = &mut stopped => return Ok(()),
+            frame = talon_transport::read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT) => frame,
+        } {
+            Ok(frame) => frame,
+            Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
+            Err(talon_transport::ReadFrameError::Timeout) => {
+                tracing::debug!("worker: connection read timed out");
+                return Ok(());
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        };
 
+        // The connection owns this request until its response finishes. A stop
+        // racing after this load is safe: shutdown joins the connection.
+        if observability.shutdown().is_stopped() {
+            return Ok(());
+        }
         let (metadata, _) = talon_transport::envelope::decode(&header, &payload)?;
         let operation =
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);

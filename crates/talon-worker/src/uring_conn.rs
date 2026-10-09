@@ -71,6 +71,8 @@ pub async fn handle_conn(
     worker: Arc<WorkerRuntime>,
     observability: Arc<WorkerObservability>,
 ) -> anyhow::Result<()> {
+    let stopped = observability.shutdown().stopped();
+    tokio::pin!(stopped);
     let _active_connection = observability.metrics().track_connection();
     // One buffered reader per connection. A client that pipelines costs a single
     // `recv` for the whole batch instead of two ring operations per request; a
@@ -79,10 +81,11 @@ pub async fn handle_conn(
     let mut send_pipe = None;
     loop {
         let request_started = Instant::now();
-        let (header, payload) = match reader
-            .next_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT)
-            .await
-        {
+        let (header, payload) = match tokio::select! {
+            biased;
+            _ = &mut stopped => return Ok(()),
+            frame = reader.next_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT) => frame,
+        } {
             Ok(frame) => frame,
             Err(talon_transport::ReadFrameError::Eof) => return Ok(()),
             Err(talon_transport::ReadFrameError::Timeout) => {
@@ -92,6 +95,11 @@ pub async fn handle_conn(
             Err(e) => return Err(anyhow::anyhow!(e)),
         };
 
+        // The connection owns this request until its response finishes. A stop
+        // racing after this load is safe: shutdown joins the connection.
+        if observability.shutdown().is_stopped() {
+            return Ok(());
+        }
         let (metadata, _) = talon_transport::envelope::decode(&header, &payload)?;
         let operation =
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
@@ -1099,6 +1107,13 @@ impl RingConnHandler {
 }
 
 impl crate::uring_serve::RingHandler for RingConnHandler {
+    fn begin_shutdown(&self) {
+        self.observability.begin_shutdown();
+    }
+    fn listening(&self) {
+        self.observability.readiness().set_store_ready(true);
+    }
+
     async fn handle(&self, stream: TcpStream) -> anyhow::Result<()> {
         handle_conn(
             stream,
