@@ -280,11 +280,10 @@ deploy_talon() {
   # (seccomp/sysctl), so this e2e intentionally exercises the Tokio data-plane
   # fallback; the io_uring path is covered by benches/dataplane_benches.rs and
   # scripts/dataplane_loadtest.sh (which require a bare-metal io_uring host).
-  local replaced_workers
-  # Unready pods can already own persistent membership; capture them too.
-  replaced_workers="$(python3 scripts/retire_e2e_workers.py \
+  local previous_workers
+  previous_workers="$(python3 scripts/check_e2e_workers.py \
     --namespace "$NAMESPACE" --release "$RELEASE" --snapshot)"
-  kubectl -n "$NAMESPACE" set env "deployment/$RELEASE-worker" \
+  kubectl -n "$NAMESPACE" set env "statefulset/$RELEASE-worker" \
     TALON_WORKER_BACKEND=s3 \
     TALON_WORKER_S3_REGION=us-east-1 \
     TALON_WORKER_S3_ENDPOINT=http://minio:9000 \
@@ -295,8 +294,9 @@ deploy_talon() {
 
   # The old pods can still be ready immediately after set env. Wait for the
   # new backend configuration to finish rolling out before counting workers.
-  kubectl -n "$NAMESPACE" rollout status "deployment/$RELEASE-worker" --timeout=5m
-  printf '%s\n' "$replaced_workers" | python3 scripts/retire_e2e_workers.py \
+  kubectl -n "$NAMESPACE" rollout status "statefulset/$RELEASE-worker" --timeout=5m
+  # Replacement keeps each ordinal's volume and member; never retire it.
+  printf '%s\n' "$previous_workers" | python3 scripts/check_e2e_workers.py \
     --namespace "$NAMESPACE" --release "$RELEASE"
 
   log "waiting for $KIND_WORKERS ready workers"

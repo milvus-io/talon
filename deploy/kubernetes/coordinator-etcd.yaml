@@ -28,6 +28,7 @@ metadata:
     app.kubernetes.io/component: coordinator
 spec:
   replicas: 3
+  minReadySeconds: 15
   revisionHistoryLimit: 5
   selector:
     matchLabels:
@@ -49,7 +50,7 @@ spec:
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: talon-coordinator-etcd
-      terminationGracePeriodSeconds: 30
+      terminationGracePeriodSeconds: 45
       securityContext:
         runAsNonRoot: true
         runAsUser: 65532
@@ -147,7 +148,7 @@ spec:
               readOnly: true
           startupProbe:
             httpGet: { path: /healthz, port: admin }
-            failureThreshold: 30
+            failureThreshold: 150
             periodSeconds: 2
           livenessProbe:
             httpGet: { path: /healthz, port: admin }

@@ -1,6 +1,6 @@
 # Talon Rolling Upgrade Design: Dynamic Membership and Stable Placement During Restarts
 
-- Status: Implementation in progress; deploy only after all required layers pass acceptance.
+- Status: Implemented in the rolling-upgrade stack; deployment acceptance remains required. See [the runbook](../how-to/rolling-upgrade.md).
 - Date: 2026-09-28.
 - Source baseline: `c4796fe0f47afae2bebd48168f87b5a25c0bc428`.
 - Audience: Maintainers of the Talon Coordinator, Worker, client SDKs, and deployments.

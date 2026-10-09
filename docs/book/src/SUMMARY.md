@@ -25,6 +25,7 @@
 # How-to guides
 
 - [Operator runbook](./operations/runbook.md)
+- [Rolling upgrades](./operations/rolling-upgrade.md)
 - [Cloud backends (S3/GCS/Azure)](./operations/cloud-backends.md)
 - [Zone-aware cache reads](./operations/zone-affinity.md)
 - [Security hardening](./operations/security.md)
@@ -51,6 +52,7 @@
 
 - [Design (v1)](./explanation/design.md)
 - [Page TTI](./explanation/page-tti.md)
+- [Retained membership and rolling upgrades](./explanation/worker-rolling-upgrade.md)
 - [Data-plane runtime: choosing io_uring](./explanation/data-plane-runtime.md)
 - [Eventual global tenant rate limits](./explanation/eventual-global-tenant-rate-limits.md)
 - [Real-time tenant traffic observability](./explanation/tenant-traffic-observability.md)

@@ -364,8 +364,14 @@ jobs:
             echo "::group::template $be"
             helm template t deploy/helm/talon \
               --set coordinator.backend="$be" --set coordinator.replicas="$rp" \
-              | python3 -c "import sys,yaml; list(yaml.safe_load_all(sys.stdin))"
+              | python3 scripts/validate_rolling_upgrade_deploy.py
             echo "::endgroup::"
+          done
+      - name: Validate raw rollout manifests
+        run: |
+          for be in kubernetes etcd; do
+            python3 scripts/validate_rolling_upgrade_deploy.py \
+              "deploy/kubernetes/coordinator-$be.yaml" deploy/kubernetes/worker.yaml
           done
       - name: Reject invalid configurations
         run: |
@@ -643,3 +649,40 @@ jobs:
       - uses: taiki-e/install-action@cargo-deny
       - name: Check advisories, bans, and sources
         run: cargo deny check advisories bans sources
+
+  rolling-upgrade:
+    name: retained membership process acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test acceptance observation handling
+        run: python3 scripts/test_rolling_upgrade_e2e.py
+      - name: Prepare patched Monoio
+        run: python3 scripts/prepare_monoio.py
+      - name: Install protoc and isolated etcd
+        run: |
+          sudo apt-get update && sudo apt-get install -y protobuf-compiler
+          curl -fL --retry 3 -o "$RUNNER_TEMP/etcd.tar.gz" \
+            https://github.com/etcd-io/etcd/releases/download/v3.5.15/etcd-v3.5.15-linux-amd64.tar.gz
+          echo "3f6b48d8c2844699f2b19c1880508ecf63e1489769ed37ebb97495d5cd848a89  $RUNNER_TEMP/etcd.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/etcd.tar.gz" -C "$RUNNER_TEMP"
+      - uses: Swatinem/rust-cache@v2
+      - name: Build services and persistent SDK probe
+        run: |
+          cargo build --locked -p talon-worker --bin talon-worker \
+            -p talon-coordinator --bin talon-coordinator --features talon-coordinator/etcd
+          cargo build --locked -p talon-rust-client --example rolling_upgrade_probe
+      - name: Restart and failure acceptance (Tokio, paged and whole block)
+        run: |
+          python3 scripts/rolling_upgrade_e2e.py \
+            --etcd "$RUNNER_TEMP/etcd-v3.5.15-linux-amd64/etcd" \
+            --work-dir "$RUNNER_TEMP/rolling-upgrade-paged" --page-size 4096 --backend-contract
+          python3 scripts/rolling_upgrade_e2e.py \
+            --etcd "$RUNNER_TEMP/etcd-v3.5.15-linux-amd64/etcd" \
+            --work-dir "$RUNNER_TEMP/rolling-upgrade-whole" --page-size 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: rolling-upgrade-acceptance
+          path: ${{ runner.temp }}/rolling-upgrade-*
