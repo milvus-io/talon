@@ -21,7 +21,7 @@ pub use block_reader::{BlockReadError, BlockReader, FileView};
 pub use coordinator_client::{
     CoordinatorClient, CoordinatorError, ObjectStat, Placement, ResolvedPlacement,
 };
-pub use load::{LoadError, LoadResult};
+pub use load::{LoadError, LoadFailure, LoadResult};
 pub use metrics::{
     NoopZoneReadObserver, ReadStats, ReadStatsSnapshot, ZoneMatch, ZoneReadObserver,
 };

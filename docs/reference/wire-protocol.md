@@ -141,6 +141,7 @@ Existing variants retain their tags and encoding.
 |---|---|---|---|
 | 19 | `LoadBlock` | client → worker | `block: BlockId`, `len: u64` |
 | 20 | `BatchLoad` | client → worker | `blocks: Vec<LoadBlockRequest>` |
+| 21 | `BatchLoadResult` | worker → client | `failures: Vec<LoadBlockFailure>` |
 
 `LoadBlockRequest` contains `block: BlockId` followed by `len: u64`. A batch
 contains 1–1024 assignments, which may refer to different files and versions.
@@ -150,14 +151,39 @@ Both encoders and decoders enforce these limits. The client groups assignments
 by worker and splits on either limit; it never falls back to individual LOAD
 RPCs for batch input. An empty SDK batch sends no frames.
 
-Each batch gets one correlated `Ack(true)` after all assignments complete.
+Each accepted batch gets one correlated `BatchLoadResult` after every assignment
+has been attempted. A failure entry contains `index: u32` (zero-based position
+in that request) and `error: String` (at most 256 UTF-8 bytes). Entries are unique
+and sorted by index; omitted assignments succeeded. Encoders/decoders enforce
+the 1024-entry cap, ordered indices, and diagnostic size. Clients also reject
+indices outside the corresponding request. An all-success reply has no entries.
+The worst-case reply fits within the control-frame limit without repeating paths.
+
 Each batch occupies one LOAD RPC admission permit and runs a window of at most
 eight block loads. Single and batch LOADs share a worker-wide limit of eight
-active block loads. On the first observed failure, the worker stops adding
-assignments and drains the existing window before returning `Ack(false)` with
-the failing block. Completed fills remain cached. Batch execution is not atomic,
-and separately dispatched batches can finish after the caller observes failure.
-Batch RPCs and the complete SDK batch operation have a 30-minute deadline.
+active block loads. A failed assignment does not stop subsequent assignments.
+Completed fills remain cached. Batch execution is not atomic. Batch RPCs and
+the complete SDK batch operation have a 30-minute deadline.
+
+Clients aggregate assignment failures by original input file index, including
+across workers and frames. Every affected input appears once in input order;
+duplicate requests remain distinct. A confirmed block failure makes that file
+failed. Lost/invalid replies, dispatch failures, or expiration of the overall
+deadline mark affected or unfinished files as unconfirmed (`uncertain = true`).
+A confirmed failure takes precedence over uncertainty for the same file.
+Topology replacement invalidates completion for every nonempty input. Empty
+files remain successful. Unrelated files continue after assignment or frame
+failures, within the overall deadline. On a submitted batch error, input indices
+omitted from the failure list completed successfully. Validation errors before
+dispatch have no failure list.
+
+Workers can still return `Ack(false)` for whole-request rejection (readiness or
+admission). Clients conservatively treat this as unconfirmed for all files in
+that frame, since older LOAD workers used the same reply for partial execution.
+For compatibility with those workers, `Ack(true)` means all assignments succeeded.
+Older clients that only understand Ack reject the new result rather than treating
+it as success; upgrade LOAD clients and workers together for detailed results.
+Existing non-LOAD messages retain their schema-6 encodings.
 
 LOAD uses the worker's configured origin HTTP retry policy. Transient failures
 (including S3 `429` and `503 SlowDown`) are retried within the block's concurrency

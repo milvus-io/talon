@@ -191,6 +191,11 @@ pub enum ControlMessage {
         /// Ordered assignments; acknowledged together after all complete.
         blocks: Vec<LoadBlockRequest>,
     },
+    /// Worker → client: all assignments were attempted; omitted indices succeeded.
+    BatchLoadResult {
+        /// Failures ordered by the zero-based assignment index in the request.
+        failures: Vec<LoadBlockFailure>,
+    },
 }
 
 /// Maximum assignments in one batch LOAD frame.
@@ -200,6 +205,30 @@ pub const MAX_BATCH_LOAD_BYTES: u64 =
     (crate::MAX_CONTROL_PAYLOAD_LEN - crate::envelope::ENVELOPE_OVERHEAD) as u64;
 /// Bincode schema (u16), enum tag (u32), and vector length (u64).
 pub const BATCH_LOAD_BODY_OVERHEAD: u64 = 14;
+
+/// Maximum UTF-8 bytes in one batch failure diagnostic.
+pub const MAX_LOAD_ERROR_BYTES: usize = 256;
+
+/// A failed assignment in a batch reply. File identities remain in the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadBlockFailure {
+    /// Zero-based assignment index, not a file index.
+    pub index: u32,
+    /// Bounded diagnostic; clients must not classify errors by its text.
+    pub error: String,
+}
+
+impl LoadBlockFailure {
+    /// Build a bounded diagnostic without splitting a UTF-8 code point.
+    pub fn new(index: u32, mut error: String) -> Self {
+        let mut end = error.len().min(MAX_LOAD_ERROR_BYTES);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        Self { index, error }
+    }
+}
 
 /// One version-pinned block assignment within a batch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -435,6 +464,20 @@ fn validate_message(message: &ControlMessage, schema: u16) -> Result<(), CodecEr
             ));
         }
     }
+    if let ControlMessage::BatchLoadResult { failures } = message {
+        if failures.len() > MAX_BATCH_LOAD_BLOCKS
+            || failures.iter().any(|f| {
+                f.index as usize >= MAX_BATCH_LOAD_BLOCKS || f.error.len() > MAX_LOAD_ERROR_BYTES
+            })
+            || failures
+                .windows(2)
+                .any(|pair| pair[0].index >= pair[1].index)
+        {
+            return Err(CodecError::InvalidBatchLoad(
+                "invalid batch failure list".into(),
+            ));
+        }
+    }
     if let ControlMessage::NodeStatusHeartbeat { status } = message {
         status.validate()?;
         let got = bincode::serialized_size(status)? as usize;
@@ -597,6 +640,40 @@ mod tests {
                     matches!(decode(&incompatible), Err(CodecError::UnsupportedSchema { got, .. }) if got == schema)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn batch_failure_reply_is_bounded_ordered_and_preserves_utf8() {
+        let failure = LoadBlockFailure::new(0, "错".repeat(200));
+        assert!(failure.error.len() <= MAX_LOAD_ERROR_BYTES);
+        let failures = (0..MAX_BATCH_LOAD_BLOCKS)
+            .map(|index| LoadBlockFailure::new(index as u32, "x".repeat(256)))
+            .collect();
+        let reply = ControlMessage::BatchLoadResult { failures };
+        let frame = encode(1, &reply).unwrap();
+        assert!(frame.len() < MAX_BATCH_LOAD_BYTES as usize);
+        assert_eq!(decode(&frame).unwrap().1, reply);
+        for failures in [
+            vec![failure.clone(), failure],
+            vec![LoadBlockFailure::new(1024, "bad index".into())],
+            vec![LoadBlockFailure {
+                index: 0,
+                error: "x".repeat(257),
+            }],
+        ] {
+            let message = ControlMessage::BatchLoadResult { failures };
+            assert!(encode(1, &message).is_err());
+            let body = bincode::serialize(&Envelope {
+                schema: CONTROL_SCHEMA_VERSION,
+                message,
+            })
+            .unwrap();
+            let mut raw = FrameHeader::new(MsgType::Control, 1, body.len() as u32)
+                .encode()
+                .to_vec();
+            raw.extend(body);
+            assert!(decode(&raw).is_err());
         }
     }
 

@@ -177,7 +177,25 @@ async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
         .unwrap_or_default()
         .as_millis() as u64;
     if batch {
-        let results = reader.batch_load(&files, now_ms).await?;
+        let results = match reader.batch_load(&files, now_ms).await {
+            Ok(results) => results,
+            Err(error) => {
+                for failure in error.failed_files() {
+                    eprintln!(
+                        "{} input[{}] {}: {}",
+                        if failure.uncertain {
+                            "unconfirmed"
+                        } else {
+                            "failed"
+                        },
+                        failure.index,
+                        entries[failure.index].path,
+                        failure.error
+                    );
+                }
+                return Err(error.into());
+            }
+        };
         for (entry, result) in entries.iter().zip(results) {
             println!(
                 "loaded {} bytes in {} blocks: {}",

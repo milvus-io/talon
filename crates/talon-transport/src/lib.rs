@@ -20,8 +20,9 @@ pub mod shutdown;
 pub mod uring;
 
 pub use codec::{
-    decode, encode, encode_for_schema, CodecError, ControlMessage, LoadBlockRequest, ObjectEntry,
-    ZonedNodeInfo, CONTROL_SCHEMA_VERSION, MIN_CONTROL_SCHEMA_VERSION,
+    decode, encode, encode_for_schema, CodecError, ControlMessage, LoadBlockFailure,
+    LoadBlockRequest, ObjectEntry, ZonedNodeInfo, CONTROL_SCHEMA_VERSION,
+    MIN_CONTROL_SCHEMA_VERSION,
 };
 pub use data::{
     decode_cached_block_put_header, decode_cached_request, decode_cached_tenant_request,

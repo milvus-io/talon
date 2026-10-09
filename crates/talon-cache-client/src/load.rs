@@ -20,9 +20,48 @@ pub struct LoadResult {
     pub blocks: u64,
 }
 
+/// One input file that did not complete successfully. Entries use input order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadFailure {
+    /// Zero-based input file index; duplicates remain separate entries.
+    pub index: usize,
+    /// True when completion could not be confirmed (e.g. connection loss).
+    pub uncertain: bool,
+    /// Diagnostic for a failed or unconfirmed assignment.
+    pub error: String,
+}
+
+fn record_failure(
+    failures: &mut [Option<LoadFailure>],
+    index: usize,
+    uncertain: bool,
+    error: String,
+) {
+    // A confirmed failed block proves file failure even if other blocks are unknown.
+    if failures[index]
+        .as_ref()
+        .map_or(true, |old| old.uncertain && !uncertain)
+    {
+        failures[index] = Some(LoadFailure {
+            index,
+            uncertain,
+            error,
+        });
+    }
+}
+
 /// Failures from client-side prewarm. Completed fills remain cached on error.
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
+    /// At least one file failed or could not be confirmed. Other files completed.
+    #[error("batch load incomplete for {} file(s): {source}", failed_files.len())]
+    Batch {
+        /// Unique input indices in ascending order, including uncertain files.
+        failed_files: Vec<LoadFailure>,
+        /// First observed cause; per-file diagnostics are in `failed_files`.
+        #[source]
+        source: Box<LoadError>,
+    },
     /// The supplied file coordinates cannot describe a valid load.
     #[error("invalid load request: {0}")]
     InvalidArgument(String),
@@ -40,7 +79,7 @@ pub enum LoadError {
         #[source]
         source: WorkerLoadError,
     },
-    /// A worker failed a batch; its diagnostic identifies the failing block.
+    /// A worker could not complete a batch assignment or exchange.
     #[error("worker {worker} failed batch load: {source}")]
     WorkerBatch {
         /// Selected primary address.
@@ -55,6 +94,16 @@ pub enum LoadError {
     /// Concurrent discovery changed this client's view while it was loading.
     #[error("worker membership changed during load; retry against current placement")]
     MembershipChanged,
+}
+
+impl LoadError {
+    /// Failed/unconfirmed files for a submitted batch; empty on validation errors.
+    pub fn failed_files(&self) -> &[LoadFailure] {
+        match self {
+            Self::Batch { failed_files, .. } => failed_files,
+            _ => &[],
+        }
+    }
 }
 
 fn validate_file(file: &FileView<'_>) -> Result<LoadResult, LoadError> {
@@ -147,12 +196,12 @@ impl BlockReader {
 
     /// Prewarm multiple files using protocol-level batches grouped by primary.
     /// One frame carries up to 1024 assignments within the control-frame byte
-    /// limit (including tracing overhead), with one Ack.
+    /// limit (including tracing overhead), with indexed failures in the reply.
     /// Results follow input order, including empty files and duplicates. One
     /// logical topology and 30-minute deadline cover the entire call. Instance
     /// discovery is refreshed before dispatch when its validity has expired.
-    /// Single and batch loads share eight active RPCs. Failure cancels pending
-    /// dispatch; already accepted worker batches may finish. This is not atomic.
+    /// Single and batch loads share eight active RPCs. Individual failures do not
+    /// cancel other files. Errors report failed/unconfirmed file indices. This is not atomic.
     pub async fn batch_load(
         &self,
         files: &[FileView<'_>],
@@ -185,12 +234,17 @@ impl BlockReader {
         if results.iter().all(|result| result.blocks == 0) {
             return Ok(results);
         }
-        tokio::time::timeout(Duration::from_secs(30 * 60), async {
+        let mut remaining = results.iter().map(|r| r.blocks).collect::<Vec<_>>();
+        let mut failures = vec![None; files.len()];
+        let mut first_error = None;
+        let mut topology = None;
+        let mut completion = tokio::time::timeout(Duration::from_secs(30 * 60), async {
             let snapshot = self.membership_snapshot().await?;
+            topology = Some(snapshot.placement.clone());
             if snapshot.placement.worker_count() == 0 {
                 return Err(LoadError::Placement(BlockReadError::NoOwners));
             }
-            let mut plan = files.iter().flat_map(|file| {
+            let mut plan = files.iter().enumerate().flat_map(|(index, file)| {
                 iter_read(
                     file.object,
                     0,
@@ -199,12 +253,12 @@ impl BlockReader {
                     file.version,
                     file.size,
                 )
+                .map(move |segment| (index, segment))
             });
             loop {
-                // Bound planning independently of total file/block count.
-                let mut groups: HashMap<String, Vec<LoadBlockRequest>> = HashMap::new();
+                let mut groups: HashMap<String, Vec<(usize, LoadBlockRequest)>> = HashMap::new();
                 let mut planned_bytes = 0;
-                for segment in plan.by_ref().take(MAX_BATCH_LOAD_BLOCKS * 8) {
+                for (index, segment) in plan.by_ref().take(MAX_BATCH_LOAD_BLOCKS * 8) {
                     let owner = snapshot
                         .placement
                         .primary(&segment.block)
@@ -216,7 +270,10 @@ impl BlockReader {
                     planned_bytes += request
                         .encoded_len()
                         .map_err(|e| LoadError::InvalidArgument(e.to_string()))?;
-                    groups.entry(owner.id.0.clone()).or_default().push(request);
+                    groups
+                        .entry(owner.id.0.clone())
+                        .or_default()
+                        .push((index, request));
                     if planned_bytes >= MAX_BATCH_LOAD_BYTES * 8 {
                         break;
                     }
@@ -225,61 +282,113 @@ impl BlockReader {
                     break;
                 }
                 let mut batches = Vec::new();
-                for (worker, requests) in groups {
+                for requests in groups.into_values() {
                     let mut batch = Vec::new();
                     let mut bytes = BATCH_LOAD_BODY_OVERHEAD;
-                    for request in requests {
+                    for (index, request) in requests {
                         let size = request
                             .encoded_len()
                             .map_err(|e| LoadError::InvalidArgument(e.to_string()))?;
                         if batch.len() == MAX_BATCH_LOAD_BLOCKS
                             || bytes + size > MAX_BATCH_LOAD_BYTES
                         {
-                            batches.push((worker.clone(), std::mem::take(&mut batch)));
+                            batches.push(std::mem::take(&mut batch));
                             bytes = BATCH_LOAD_BODY_OVERHEAD;
                         }
                         bytes += size;
-                        batch.push(request);
+                        batch.push((index, request));
                     }
                     if !batch.is_empty() {
-                        batches.push((worker, batch));
+                        batches.push(batch);
                     }
                 }
-                stream::iter(batches)
-                    .map(|(_worker_id, blocks)| {
+                let mut pending = stream::iter(batches)
+                    .map(|batch| {
                         let topology = &snapshot.placement;
                         async move {
-                            let _permit = self
-                                .load_slots
-                                .acquire()
-                                .await
-                                .expect("load semaphore is never closed");
-                            let current = self.membership_snapshot().await?;
-                            if !std::sync::Arc::ptr_eq(&current.placement, topology) {
-                                return Err(LoadError::MembershipChanged);
-                            }
-                            let client = current.owner(&blocks[0].block)?;
-                            client.batch_load(&blocks).await.map_err(|source| {
-                                LoadError::WorkerBatch {
-                                    worker: client.addr().into(),
-                                    source,
+                            let (indices, blocks): (Vec<_>, Vec<_>) = batch.into_iter().unzip();
+                            let result = async {
+                                let _permit = self
+                                    .load_slots
+                                    .acquire()
+                                    .await
+                                    .expect("load semaphore is never closed");
+                                let current = self.membership_snapshot().await?;
+                                if !std::sync::Arc::ptr_eq(&current.placement, topology) {
+                                    return Err(LoadError::MembershipChanged);
                                 }
-                            })
+                                let client = current.owner(&blocks[0].block)?;
+                                client
+                                    .batch_load(&blocks)
+                                    .await
+                                    .map(|failures| (client.addr().to_owned(), failures))
+                                    .map_err(|source| LoadError::WorkerBatch {
+                                        worker: client.addr().into(),
+                                        source,
+                                    })
+                            }
+                            .await;
+                            (indices, result)
                         }
                     })
-                    .buffer_unordered(8)
-                    .try_for_each(|()| async { Ok(()) })
-                    .await?;
+                    .buffer_unordered(8);
+                while let Some((indices, result)) = pending.next().await {
+                    for &index in &indices {
+                        remaining[index] -= 1;
+                    }
+                    match result {
+                        Ok((worker, block_failures)) => {
+                            for failure in block_failures {
+                                let index = indices[failure.index as usize];
+                                first_error.get_or_insert_with(|| LoadError::WorkerBatch {
+                                    worker: worker.clone(),
+                                    source: WorkerLoadError::Rejected(failure.error.clone()),
+                                });
+                                record_failure(&mut failures, index, false, failure.error);
+                            }
+                        }
+                        Err(error) => {
+                            let diagnostic = error.to_string();
+                            for index in indices {
+                                record_failure(&mut failures, index, true, diagnostic.clone());
+                            }
+                            first_error.get_or_insert(error);
+                        }
+                    }
+                }
             }
-            if self.membership.last_good().is_some_and(|current| {
-                !std::sync::Arc::ptr_eq(&current.placement, &snapshot.placement)
-            }) {
-                return Err(LoadError::MembershipChanged);
-            }
-            Ok(results)
+            Ok::<_, LoadError>(())
         })
         .await
-        .map_err(|_| LoadError::Timeout)?
+        .unwrap_or(Err(LoadError::Timeout));
+        // Also check topology replacement when the deadline interrupted dispatch.
+        if topology.as_ref().is_some_and(|topology| {
+            self.membership
+                .last_good()
+                .is_some_and(|current| !std::sync::Arc::ptr_eq(&current.placement, topology))
+        }) {
+            for (index, result) in results.iter().enumerate() {
+                remaining[index] = result.blocks;
+            }
+            completion = Err(LoadError::MembershipChanged);
+        }
+        if let Err(error) = completion {
+            for (index, _) in remaining
+                .iter()
+                .enumerate()
+                .filter(|(_, count)| **count != 0)
+            {
+                record_failure(&mut failures, index, true, error.to_string());
+            }
+            first_error.get_or_insert(error);
+        }
+        if let Some(source) = first_error {
+            return Err(LoadError::Batch {
+                failed_files: failures.into_iter().flatten().collect(),
+                source: Box::new(source),
+            });
+        }
+        Ok(results)
     }
 }
 
@@ -318,6 +427,15 @@ mod tests {
     }
 
     async fn worker(id: &str, delay: Duration, ok: bool) -> Worker {
+        worker_with_failure_mode(id, delay, ok, false).await
+    }
+
+    async fn worker_with_failure_mode(
+        id: &str,
+        delay: Duration,
+        ok: bool,
+        detailed: bool,
+    ) -> Worker {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let node = NodeInfo {
             id: NodeId::new(id),
@@ -341,6 +459,10 @@ mod tests {
                         let batches = recorded_batches.clone();
                         connections.spawn(async move {
                             while let Some((id, request)) = receive(&mut stream).await {
+                                let batch_count = match &request {
+                                    ControlMessage::BatchLoad { blocks } => Some(blocks.len()),
+                                    _ => None,
+                                };
                                 match request {
                                     ControlMessage::LoadBlock { block, len } => requests.lock().unwrap().push((block, len)),
                                     ControlMessage::BatchLoad { blocks } => {
@@ -352,7 +474,12 @@ mod tests {
                                 peak.fetch_max(active.fetch_add(1, Ordering::SeqCst) + 1, Ordering::SeqCst);
                                 tokio::time::sleep(delay).await;
                                 active.fetch_sub(1, Ordering::SeqCst);
-                                let response = ControlMessage::Ack { ok, detail: (!ok).then(|| "origin unavailable".into()) };
+                                let response = if let (true, Some(count)) = (detailed, batch_count) {
+                                    ControlMessage::BatchLoadResult { failures: (0..count).filter(|_| !ok)
+                                        .map(|index| talon_transport::LoadBlockFailure::new(index as u32, "origin failure".into())).collect() }
+                                } else {
+                                    ControlMessage::Ack { ok, detail: (!ok).then(|| "origin unavailable".into()) }
+                                };
                                 if stream.write_all(&codec::encode(id, &response).unwrap()).await.is_err() { break; }
                             }
                         });
@@ -431,6 +558,18 @@ mod tests {
                     .await
                     .unwrap_err(),
             ] {
+                let error = match error {
+                    LoadError::Batch {
+                        failed_files,
+                        source,
+                    } => {
+                        assert_eq!(failed_files.len(), 1);
+                        assert_eq!(failed_files[0].index, 0);
+                        assert!(failed_files[0].uncertain);
+                        *source
+                    }
+                    other => other,
+                };
                 assert!(
                     matches!(error, LoadError::Placement(BlockReadError::Worker(crate::WorkerError::Remote(ref error))) if error.code == talon_transport::DataErrorCode::Unavailable)
                 );
@@ -449,6 +588,229 @@ mod tests {
             matches!(expired.batch_load(&[request]).await, Err(WorkerLoadError::Instance(crate::WorkerError::Remote(error))) if error.code == talon_transport::DataErrorCode::Unavailable)
         );
         assert!(a.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn batch_partial_failures_span_frames_and_deduplicate_input_indices() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = NodeInfo {
+            id: NodeId::new("partial"),
+            address: listener.local_addr().unwrap().to_string(),
+            role: NodeRole::Worker,
+        };
+        let calls = Arc::new(AtomicUsize::new(0));
+        let observed = calls.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let calls = observed.clone();
+                tokio::spawn(async move {
+                    while let Some((id, ControlMessage::BatchLoad { blocks })) =
+                        receive(&mut stream).await
+                    {
+                        calls.fetch_add(blocks.len(), Ordering::SeqCst);
+                        let failures = blocks
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, b)| b.block.object.object_path == "bad")
+                            .map(|(index, _)| {
+                                talon_transport::LoadBlockFailure::new(
+                                    index as u32,
+                                    "origin failure".into(),
+                                )
+                            })
+                            .collect();
+                        let response = ControlMessage::BatchLoadResult { failures };
+                        stream
+                            .write_all(&codec::encode(id, &response).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let reader = reader("127.0.0.1:0".into(), &[node]);
+        let good = object();
+        let bad = ObjectId::new(Backend::S3, "bucket", "bad");
+        let version = Version::new("v1");
+        let files = [
+            FileView {
+                object: &good,
+                version: &version,
+                size: 8,
+                block_size: 8,
+            },
+            FileView {
+                object: &bad,
+                version: &version,
+                size: 1025 * 8,
+                block_size: 8,
+            },
+            FileView {
+                object: &good,
+                version: &version,
+                size: 0,
+                block_size: 8,
+            },
+            FileView {
+                object: &bad,
+                version: &version,
+                size: 8,
+                block_size: 8,
+            },
+            FileView {
+                object: &good,
+                version: &version,
+                size: 8,
+                block_size: 8,
+            },
+        ];
+        let error = reader.batch_load(&files, 0).await.unwrap_err();
+        assert_eq!(
+            error
+                .failed_files()
+                .iter()
+                .map(|f| (f.index, f.uncertain))
+                .collect::<Vec<_>>(),
+            [(1, false), (3, false)]
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1028);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn batch_aggregates_file_failures_across_workers_without_losing_successes() {
+        let a = worker_with_failure_mode("a", Duration::ZERO, true, true).await;
+        let b = worker_with_failure_mode("b", Duration::ZERO, false, true).await;
+        let reader = reader("127.0.0.1:0".into(), &[a.node.clone(), b.node.clone()]);
+        let version = Version::new("v1");
+        let snapshot = reader.membership.last_good().unwrap();
+        let good = (0..1000)
+            .map(|i| ObjectId::new(Backend::S3, "bucket", format!("good-{i}")))
+            .find(|object| {
+                snapshot
+                    .placement
+                    .primary(&BlockId::new(object.clone(), 0, 8, version.clone()))
+                    .unwrap()
+                    .id
+                    == a.node.id
+            })
+            .unwrap();
+        let mixed = object();
+        let files = [
+            FileView {
+                object: &good,
+                version: &version,
+                size: 8,
+                block_size: 8,
+            },
+            FileView {
+                object: &mixed,
+                version: &version,
+                size: 64 * 8,
+                block_size: 8,
+            },
+            FileView {
+                object: &mixed,
+                version: &version,
+                size: 0,
+                block_size: 8,
+            },
+            FileView {
+                object: &mixed,
+                version: &version,
+                size: 64 * 8,
+                block_size: 8,
+            },
+        ];
+        let error = reader.batch_load(&files, 0).await.unwrap_err();
+        assert_eq!(
+            error
+                .failed_files()
+                .iter()
+                .map(|f| (f.index, f.uncertain))
+                .collect::<Vec<_>>(),
+            [(1, false), (3, false)]
+        );
+        let successful = a.requests.lock().unwrap().len();
+        let failed = b.requests.lock().unwrap().len();
+        assert!(successful > 1 && failed > 1);
+        assert_eq!(successful + failed, 129);
+    }
+
+    #[tokio::test]
+    async fn malformed_batch_failure_index_is_unconfirmed_not_success() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let node = NodeInfo {
+            id: NodeId::new("invalid"),
+            address: listener.local_addr().unwrap().to_string(),
+            role: NodeRole::Worker,
+        };
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (id, _) = receive(&mut stream).await.unwrap();
+            let reply = ControlMessage::BatchLoadResult {
+                failures: vec![talon_transport::LoadBlockFailure::new(
+                    1,
+                    "outside request".into(),
+                )],
+            };
+            stream
+                .write_all(&codec::encode(id, &reply).unwrap())
+                .await
+                .unwrap();
+        });
+        let reader = reader("127.0.0.1:0".into(), &[node]);
+        let object = object();
+        let version = Version::new("v1");
+        let file = FileView {
+            object: &object,
+            version: &version,
+            size: 8,
+            block_size: 8,
+        };
+        let error = reader.batch_load(&[file], 0).await.unwrap_err();
+        assert_eq!(
+            error
+                .failed_files()
+                .iter()
+                .map(|f| (f.index, f.uncertain))
+                .collect::<Vec<_>>(),
+            [(0, true)]
+        );
+        assert!(error.failed_files()[0].error.contains("index exceeds"));
+        server.await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_timeout_reports_unconfirmed_files_but_excludes_empty_files() {
+        let a = worker("slow", Duration::from_secs(3600), true).await;
+        let reader = reader("127.0.0.1:0".into(), std::slice::from_ref(&a.node));
+        let object = object();
+        let version = Version::new("v1");
+        let files = [
+            FileView {
+                object: &object,
+                version: &version,
+                size: 8,
+                block_size: 8,
+            },
+            FileView {
+                object: &object,
+                version: &version,
+                size: 0,
+                block_size: 8,
+            },
+        ];
+        let error = reader.batch_load(&files, 0).await.unwrap_err();
+        assert_eq!(
+            error
+                .failed_files()
+                .iter()
+                .map(|f| (f.index, f.uncertain))
+                .collect::<Vec<_>>(),
+            [(0, true)]
+        );
     }
 
     #[tokio::test]
@@ -601,10 +963,7 @@ mod tests {
             reader
                 .batch_load(&[FileView { size: 8, ..file }], 100)
                 .await,
-            Err(LoadError::WorkerBatch {
-                source: WorkerLoadError::Rejected(_),
-                ..
-            })
+            Err(LoadError::Batch { failed_files, .. }) if failed_files.len() == 1 && failed_files[0].uncertain
         ));
         assert_eq!(rejected.batch_sizes.lock().unwrap().len(), 1);
         assert_eq!(reader.load_slots.available_permits(), 8);

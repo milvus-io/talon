@@ -32,11 +32,18 @@ use tokio::net::TcpStream;
 
 use crate::pool::ConnectionPool;
 
-async fn read_load_reply(stream: &mut TcpStream, request_id: u32) -> Result<(), WorkerLoadError> {
+async fn read_load_reply(
+    stream: &mut TcpStream,
+    request_id: u32,
+    batch_count: Option<usize>,
+) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
     let mut header = [0; HEADER_LEN];
     stream.read_exact(&mut header).await?;
     let parsed = FrameHeader::decode(&header).map_err(talon_transport::CodecError::from)?;
-    if parsed.msg_type != MsgType::Control || parsed.request_id != request_id {
+    if parsed.msg_type != MsgType::Control
+        || parsed.request_id != request_id
+        || parsed.flags.contains(Flags::ERROR)
+    {
         return Err(WorkerLoadError::Protocol(
             "expected a matching control reply".into(),
         ));
@@ -50,7 +57,19 @@ async fn read_load_reply(stream: &mut TcpStream, request_id: u32) -> Result<(), 
     frame.resize(HEADER_LEN + parsed.length as usize, 0);
     stream.read_exact(&mut frame[HEADER_LEN..]).await?;
     match talon_transport::codec::decode(&frame)?.1 {
-        talon_transport::ControlMessage::Ack { ok: true, .. } => Ok(()),
+        talon_transport::ControlMessage::BatchLoadResult { failures } if batch_count.is_some() => {
+            if failures
+                .iter()
+                .any(|failure| failure.index as usize >= batch_count.unwrap())
+            {
+                return Err(WorkerLoadError::Protocol(
+                    "batch failure index exceeds request length".into(),
+                ));
+            }
+            Ok(failures)
+        }
+        // Accept all-success acknowledgements from workers predating detailed results.
+        talon_transport::ControlMessage::Ack { ok: true, .. } => Ok(Vec::new()),
         talon_transport::ControlMessage::Ack { ok: false, detail } => Err(
             WorkerLoadError::Rejected(detail.unwrap_or_else(|| "no detail provided".into())),
         ),
@@ -295,6 +314,7 @@ impl WorkerClient {
             Duration::from_secs(120),
         )
         .await
+        .map(|_| ())
     }
 
     /// Send up to 1024 assignments in one frame and wait for one acknowledgement.
@@ -302,7 +322,7 @@ impl WorkerClient {
     pub async fn batch_load(
         &self,
         blocks: &[talon_transport::LoadBlockRequest],
-    ) -> Result<(), WorkerLoadError> {
+    ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
         self.load_control(
             &talon_transport::ControlMessage::BatchLoad {
                 blocks: blocks.to_vec(),
@@ -316,7 +336,11 @@ impl WorkerClient {
         &self,
         message: &talon_transport::ControlMessage,
         deadline: Duration,
-    ) -> Result<(), WorkerLoadError> {
+    ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
+        let batch_count = match message {
+            talon_transport::ControlMessage::BatchLoad { blocks } => Some(blocks.len()),
+            _ => None,
+        };
         let request_id = RequestId::next().0;
         let mut output = talon_transport::codec::encode(request_id, message)?;
         talon_transport::envelope::outbound(&mut output, &self.addr)
@@ -329,22 +353,23 @@ impl WorkerClient {
                 let result = async {
                     stream.write_all(&output).await?;
                     stream.flush().await?;
-                    read_load_reply(&mut stream, request_id).await
+                    read_load_reply(&mut stream, request_id, batch_count).await
                 }
                 .await;
                 match result {
-                    Ok(()) => {
+                    Ok(failures) => {
                         self.pool.release(&self.addr, stream);
-                        Ok(())
+                        Ok(failures)
                     }
                     Err(WorkerLoadError::Io(_)) if reused => {
                         drop(stream);
                         let mut stream = self.fresh_read_retry_connection().await?;
                         stream.write_all(&output).await?;
                         stream.flush().await?;
-                        read_load_reply(&mut stream, request_id).await?;
+                        let failures =
+                            read_load_reply(&mut stream, request_id, batch_count).await?;
                         self.pool.release(&self.addr, stream);
-                        Ok(())
+                        Ok(failures)
                     }
                     Err(error) => Err(error),
                 }

@@ -271,12 +271,14 @@ configured whole-block or paged cache using the supplied version. The existing
 origin HTTP retry policy handles transient failures, including S3 throttling,
 while retaining the block's concurrency permit during backoff.
 
-One acknowledgement follows completion of all assignments. On a final failure,
-the worker stops scheduling new assignments and drains its current window
-before replying with an error. Completed fills remain cached subject to normal
-eviction; LOAD is not atomic and does not guarantee pinned residency. Workers
-pull from the backend themselves; no payload returns to the client. See the
-[wire contract](docs/reference/wire-protocol.md) for limits and failure semantics.
+One `BatchLoadResult` follows completion of all assignments. Workers continue
+after individual failures and return their request indices with bounded error
+diagnostics. Clients aggregate these into a unique list of failed input files;
+missing replies or unfinished dispatch are marked as unconfirmed. Successful
+files are omitted from this list, including empty inputs. Completed fills remain
+cached subject to normal eviction; LOAD is not atomic and does not pin residency.
+Workers pull from the backend themselves; no payload returns to the client. See
+the [wire contract](docs/reference/wire-protocol.md) for limits and failure semantics.
 
 ### Why not one mechanism for all data movement
 

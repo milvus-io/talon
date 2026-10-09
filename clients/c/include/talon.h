@@ -174,7 +174,8 @@ int talon_stat_async(
  * callback executor; synchronous errors schedule none. Keep user_data valid
  * until the callback, and free its result with talon_result_free.
  * Batch results follow input order, including empty files. A failed operation
- * exposes no per-file results; completed cache fills may remain resident.
+ * exposes its failed/unconfirmed input file indices through load_failure_*;
+ * completed cache fills remain resident subject to eviction.
  * Batches use up to 1024 block instructions per protocol frame, not one RPC
  * per file. Worker origin retries apply to both operations. */
 int talon_load_async(talon_client *client, const char *uri, const char *version,
@@ -191,6 +192,18 @@ int talon_batch_load_async_with_options(talon_client *client,
 size_t talon_result_load_count(const talon_result *result);
 /* Borrowed until result is freed; NULL for invalid result/index. */
 const talon_load_result *talon_result_load(const talon_result *result, size_t index);
+
+/* Submitted batches report each failed/unconfirmed input once, in input order.
+ * Omitted files completed successfully. Invalid arguments rejected before dispatch
+ * have no failure list. Unknown completion is retryable but is not proof of failure.
+ * Successful-file load results remain available only on overall success. */
+size_t talon_result_load_failure_count(const talon_result *result);
+/* Returns SIZE_MAX for invalid result/index. */
+size_t talon_result_load_failure_index(const talon_result *result, size_t index);
+/* 1 = unconfirmed, 0 = confirmed failure, -1 = invalid index. */
+int talon_result_load_failure_uncertain(const talon_result *result, size_t index);
+/* Borrowed until result is freed; NULL for invalid result/index. */
+const char *talon_result_load_failure_error(const talon_result *result, size_t index);
 
 int talon_result_status(const talon_result *result);
 int talon_result_operation(const talon_result *result);

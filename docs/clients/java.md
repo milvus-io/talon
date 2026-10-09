@@ -122,5 +122,23 @@ leave completed cache fills; successful completion does not pin residency.
 
 `load(LoadRequest, RequestOptions)` and `batchLoad(List<LoadRequest>, RequestOptions)`
 accept explicit tracing options. Expired instance discovery must refresh before
-dispatch; offline or conflicting owners produce `TalonException(UNAVAILABLE)`.
+dispatch; offline or conflicting owners produce `TalonException(UNAVAILABLE)` for single
+loads, or an unconfirmed file entry with that cause for batches.
 Worker rejections and malformed acknowledgements are not retried.
+
+A submitted batch failure throws `BatchLoadException`. Its `failedFiles()` list
+contains `LoadFailure(index, uncertain, error)` entries in original input order.
+Indices are zero-based and unique; omitted inputs completed successfully.
+Confirmed block failures have `uncertain=false`; missing outcomes have
+`uncertain=true`. Empty files succeed and duplicate inputs keep separate indices.
+Other files continue after individual failures. Invalid arguments rejected before
+dispatch still throw `IllegalArgumentException`.
+
+```java
+try {
+    client.batchLoad(requests);
+} catch (BatchLoadException error) {
+    List<LoadRequest> retryRequests = error.failedFiles().stream()
+        .map(f -> requests.get(f.index())).toList();
+}
+```

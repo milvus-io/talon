@@ -105,8 +105,9 @@ fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
 #[allow(unexpected_cfgs)]
 mod exception_types {
     pyo3::create_exception!(talon, UnavailableError, pyo3::exceptions::PyIOError);
+    pyo3::create_exception!(talon, BatchLoadError, pyo3::exceptions::PyIOError);
 }
-use exception_types::UnavailableError;
+use exception_types::{BatchLoadError, UnavailableError};
 
 fn client_err(error: RustError) -> PyErr {
     classified_err(error.kind(), error.to_string())
@@ -178,6 +179,48 @@ impl ObjectEntry {
 pub struct Client {
     runtime: Arc<tokio::runtime::Runtime>,
     client: Arc<RustClient>,
+}
+
+/// One failed or unconfirmed input file, identified by its zero-based index.
+#[pyclass(module = "talon", frozen)]
+pub struct LoadFailure {
+    #[pyo3(get)]
+    pub index: usize,
+    #[pyo3(get)]
+    pub uncertain: bool,
+    #[pyo3(get)]
+    pub error: String,
+}
+
+fn load_err(py: Python<'_>, error: talon_rust_client::LoadError) -> PyErr {
+    if matches!(error, talon_rust_client::LoadError::Batch { .. }) {
+        let exception = BatchLoadError::new_err(error.to_string());
+        let failures = error
+            .failed_files()
+            .iter()
+            .map(|f| {
+                Py::new(
+                    py,
+                    LoadFailure {
+                        index: f.index,
+                        uncertain: f.uncertain,
+                        error: f.error.clone(),
+                    },
+                )
+            })
+            .collect::<PyResult<Vec<_>>>();
+        let result = failures
+            .and_then(|failures| exception.value_bound(py).setattr("failed_files", failures));
+        if let Err(error) = result {
+            return error;
+        }
+        exception
+    } else {
+        classified_err(
+            talon_rust_client::ErrorKind::from(&error),
+            error.to_string(),
+        )
+    }
 }
 
 /// One file to prewarm, with caller-supplied source version and size.
@@ -264,12 +307,7 @@ impl Client {
                     })
                 })
             })
-            .map_err(|error| {
-                classified_err(
-                    talon_rust_client::ErrorKind::from(&error),
-                    error.to_string(),
-                )
-            })?;
+            .map_err(|error| load_err(py, error))?;
         Ok(results
             .into_iter()
             .map(|r| LoadResult {
@@ -299,7 +337,7 @@ impl Client {
     }
 
     /// Prewarm files through protocol batches. Results follow input order.
-    /// An error may leave completed fills cached; no partial results are returned.
+    /// BatchLoadError.failed_files identifies failed/unconfirmed input indices.
     #[pyo3(signature = (requests, *, trace_context = None))]
     fn batch_load(
         &self,
@@ -500,6 +538,8 @@ fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<ObjectEntry>()?;
     m.add_class::<LoadRequest>()?;
     m.add_class::<LoadResult>()?;
+    m.add_class::<LoadFailure>()?;
+    m.add("BatchLoadError", m.py().get_type_bound::<BatchLoadError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

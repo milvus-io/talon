@@ -129,3 +129,18 @@ method pins cache residency. Transient S3 failures are retried by the worker.
 Both methods accept the optional `trace_context` keyword used by `read`.
 Invalid coordinates raise `ValueError`; availability and deadline failures use
 `UnavailableError` and `TimeoutError`. Worker refusals raise `OSError`.
+
+On a submitted batch failure, catch `talon.BatchLoadError` and inspect
+`error.failed_files`: each `LoadFailure` has `index` (zero-based input index),
+`uncertain`, and `error` (diagnostic). Entries are unique and ordered; omitted
+inputs completed successfully. A confirmed failed block sets `uncertain=False`;
+a missing outcome sets it to `True`. Empty files are successful and duplicate
+inputs retain separate indices. Other files continue after individual failures.
+Invalid arguments rejected before dispatch still raise `ValueError`.
+
+```python
+try:
+    client.batch_load(requests)
+except talon.BatchLoadError as error:
+    retry_requests = [requests[f.index] for f in error.failed_files]
+```

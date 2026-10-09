@@ -65,7 +65,9 @@ using the coordinator only for membership discovery. A frame carries up to
 1024 block instructions within the control-frame byte limit. Workers load
 concurrently and automatically retry transient origin failures, including S3
 throttling. Completion results report bytes and blocks for each file in input
-order; failure may leave completed fills cached. Cache residency is not pinned.
+order. Batch failures expose unique input file indices and diagnostics, with
+unconfirmed outcomes distinguished from confirmed failures. Omitted inputs
+succeeded; completed fills remain cached subject to eviction.
 
 All native clients are **read-only** in this release.
 

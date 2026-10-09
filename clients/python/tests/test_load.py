@@ -22,6 +22,7 @@ class Peer(socketserver.ThreadingTCPServer):
         self.frames = []
         self.errors = []
         self.reject = False
+        self.drop_reply = False
         self.thread = threading.Thread(target=self.serve_forever, daemon=True)
         self.thread.start()
 
@@ -68,8 +69,16 @@ class Handler(socketserver.StreamRequestHandler):
                         entries.append((backend, bucket, key, offset, block_size, source_version, size))
                     assert not body.read()
                     self.server.frames.append((tag, entries))
-                    reply = struct.pack("<HI", 6, 6)
-                    reply += b"\0\1" + string("origin unavailable") if self.server.reject else b"\1\0"
+                    if self.server.drop_reply:
+                        return
+                    if tag == 20 and not self.server.reject:
+                        failures = [(i, e) for i, e in enumerate(entries) if e[2] == "bad"]
+                        reply = struct.pack("<HIQ", 6, 21, len(failures))
+                        for i, _ in failures:
+                            reply += struct.pack("<I", i) + string("origin failure")
+                    else:
+                        reply = struct.pack("<HI", 6, 6)
+                        reply += b"\0\1" + string("origin unavailable") if self.server.reject else b"\1\0"
                 self.wfile.write(struct.pack(">HBBHHII", 0x544C, 1, 0, 0, 0, request_id, len(reply)) + reply)
                 self.wfile.flush()
         except Exception as error:
@@ -91,6 +100,28 @@ class LoadTests(unittest.TestCase):
             self.assertEqual(sorted(len(entries) for tag, entries in peer.frames if tag == 20), [1, 1024])
             self.assertTrue(all(e[5:] == ("v2", 3) for tag, entries in peer.frames if tag == 20 for e in entries))
             self.assertFalse(peer.errors)
+            del client
+
+    def test_partial_failure_list_and_lost_reply(self):
+        with Peer() as peer:
+            client = talon.Client(peer.address, block_size=8)
+            with self.assertRaises(talon.BatchLoadError) as caught:
+                client.batch_load([
+                    talon.LoadRequest("s3://bucket/good", "v1", 8),
+                    talon.LoadRequest("s3://bucket/bad", "v1", 1025 * 8),
+                    talon.LoadRequest("s3://bucket/bad", "v1", 0),
+                    talon.LoadRequest("s3://bucket/bad", "v1", 8),
+                ])
+            self.assertEqual([(f.index, f.uncertain, f.error) for f in caught.exception.failed_files],
+                             [(1, False, "origin failure"), (3, False, "origin failure")])
+            self.assertEqual(sum(len(entries) for _, entries in peer.frames), 1027)
+            del client
+        with Peer() as peer:
+            peer.drop_reply = True
+            client = talon.Client(peer.address, block_size=8)
+            with self.assertRaises(talon.BatchLoadError) as caught:
+                client.batch_load([talon.LoadRequest("s3://bucket/file", "v1", 8)])
+            self.assertEqual([(f.index, f.uncertain) for f in caught.exception.failed_files], [(0, True)])
             del client
 
     def test_rejection_and_invalid_inputs(self):

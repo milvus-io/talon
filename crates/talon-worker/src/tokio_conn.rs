@@ -781,7 +781,7 @@ async fn handle_control_frame(
                 }
             } else {
                 match worker.batch_load(&blocks).await {
-                    Ok(()) => ControlMessage::Ack { ok: true, detail: None },
+                    Ok(failures) => ControlMessage::BatchLoadResult { failures },
                     Err(error) => ControlMessage::Ack {
                         ok: false,
                         detail: Some(error.to_string()),
@@ -840,7 +840,7 @@ async fn handle_control_frame(
     let is_error = matches!(
         reply,
         ControlMessage::Ack { ok: false, .. } | ControlMessage::ControlFailure { .. }
-    );
+    ) || matches!(&reply, ControlMessage::BatchLoadResult { failures } if !failures.is_empty());
     let mut buf = codec::encode(h.request_id, &reply)?;
     buf[2] = response_version;
     stream.write_all(&buf).await?;

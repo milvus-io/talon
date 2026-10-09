@@ -895,7 +895,7 @@ async fn handle_control_frame(
                 }
             } else {
                 match worker.batch_load(&blocks).await {
-                    Ok(()) => talon_transport::ControlMessage::Ack { ok: true, detail: None },
+                    Ok(failures) => talon_transport::ControlMessage::BatchLoadResult { failures },
                     Err(error) => talon_transport::ControlMessage::Ack {
                         ok: false,
                         detail: Some(error.to_string()),
@@ -955,7 +955,7 @@ async fn handle_control_frame(
         reply,
         talon_transport::ControlMessage::Ack { ok: false, .. }
             | talon_transport::ControlMessage::ControlFailure { .. }
-    );
+    ) || matches!(&reply, talon_transport::ControlMessage::BatchLoadResult { failures } if !failures.is_empty());
     let buf = talon_transport::envelope::response_version(
         talon_transport::codec::encode(h.request_id, &reply)?,
         response_version,

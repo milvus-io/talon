@@ -145,6 +145,38 @@ public final class ConformanceTest {
                     new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "a"), 0, 8, "v1"), 8),
                     new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "b"), 8, 8, "v2"), 3))));
         });
+        check("batch failures decode Rust vector and reject malformed indices", () -> {
+            byte[] vector = vectors.get("control.batch_load_result");
+            Messages.Response reply = Messages.decodeBody(java.util.Arrays.copyOfRange(vector, Frame.HEADER_LEN, vector.length));
+            assertEquals(List.of(new Messages.LoadBlockFailure(1, "origin unavailable")), Messages.loadFailures(reply, 2), "Rust failure vector");
+            for (int[] indices : List.of(new int[]{2}, new int[]{0, 0}, new int[]{1, 0})) {
+                Bincode.Writer body = new Bincode.Writer().u16(6).variant(Messages.TAG_BATCH_LOAD_RESULT).u64(indices.length);
+                for (int index : indices) body.u32(index).string("error");
+                boolean rejected = false;
+                try { Messages.loadFailures(Messages.decodeBody(body.toBytes()), 2); }
+                catch (ProtocolException expected) { rejected = true; }
+                assertTrue(rejected, "invalid failure indices rejected");
+            }
+        });
+        check("partial batch failure list deduplicates files across frames", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                List<LoadRequest> requests = List.of(
+                    new LoadRequest("s3://bucket/good", "v1", 8),
+                    new LoadRequest("s3://bucket/bad", "v1", 1025 * 8),
+                    new LoadRequest("s3://bucket/bad", "v2", 0),
+                    new LoadRequest("s3://bucket/bad", "v2", 8),
+                    new LoadRequest("s3://bucket/good", "v1", 8));
+                boolean failed = false;
+                try { client.batchLoad(requests); }
+                catch (BatchLoadException error) {
+                    assertEquals(List.of(new LoadFailure(1, false, "origin failure"), new LoadFailure(3, false, "origin failure")), error.failedFiles(), "failed input files");
+                    failed = true;
+                }
+                assertTrue(failed, "batch reported partial failure");
+                assertEquals(1028, peer.loaded.size(), "continues after failed frame");
+                assertEquals(List.of(1024, 4), peer.loadCounts, "still protocol batching");
+            }
+        });
         check("LOAD and batch LOAD preserve sizes, versions and protocol batching", () -> {
             try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
                 assertEquals(new LoadResult(9, 2), client.load("s3://bucket/file", "v1", 9), "single result");
@@ -185,8 +217,12 @@ public final class ConformanceTest {
                     peer.wrongLoadRequestId = malformed;
                     boolean failed = false;
                     try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
-                    catch (TalonException error) { assertEquals(TalonException.Code.UNKNOWN, error.code(), "refusal"); failed = true; }
-                    catch (ProtocolException error) { assertTrue(malformed, "only malformed reply is protocol failure"); failed = true; }
+                    catch (BatchLoadException error) {
+                        assertEquals(1, error.failedFiles().size(), "one unknown file");
+                        assertTrue(error.failedFiles().get(0).uncertain(), "legacy refusal or malformed reply is unconfirmed");
+                        assertEquals(malformed, error.getCause() instanceof ProtocolException, "cause preserved");
+                        failed = true;
+                    }
                     assertTrue(failed, "failure propagated");
                     assertEquals(List.of(0, 1), peer.loadCounts, "no refusal replay");
                 }
@@ -198,7 +234,12 @@ public final class ConformanceTest {
                     peer.workerState = state;
                     boolean failed = false;
                     try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
-                    catch (TalonException error) { assertEquals(TalonException.Code.UNAVAILABLE, error.code(), "availability"); failed = true; }
+                    catch (BatchLoadException error) {
+                        assertEquals(TalonException.Code.UNAVAILABLE, ((TalonException) error.getCause()).code(), "availability");
+                        assertEquals(0, error.failedFiles().get(0).index(), "unknown input");
+                        assertTrue(error.failedFiles().get(0).uncertain(), "offline completion unknown");
+                        failed = true;
+                    }
                     assertTrue(failed, "unavailable owner rejected");
                     assertTrue(peer.loadCounts.isEmpty(), "no LOAD dispatch");
                 }
@@ -531,13 +572,19 @@ public final class ConformanceTest {
                         Messages.Response message = Messages.decodeBody(body);
                         int count = message.tag == Messages.TAG_BATCH_LOAD ? message.body.seqLen() : 1;
                         loadCounts.add(message.tag == Messages.TAG_BATCH_LOAD ? count : 0);
+                        List<Integer> failures = new ArrayList<>();
                         for (int i = 0; i < count; i++) {
                             ObjectId object = new ObjectId(Messages.backendFrom(message.body.variant()), message.body.string(), message.body.string());
                             BlockId block = new BlockId(object, message.body.u64(), (int) message.body.u32(), message.body.string());
                             loaded.add(new Messages.LoadBlock(block, message.body.u64()));
+                            if (object.key().equals("bad")) failures.add(i);
                         }
                         Bincode.Writer ack = new Bincode.Writer().u16(6).variant(Messages.TAG_ACK).u8(rejectLoad ? 0 : 1).u8(rejectLoad ? 1 : 0);
                         if (rejectLoad) ack.string("origin unavailable");
+                        if (message.tag == Messages.TAG_BATCH_LOAD && !rejectLoad) {
+                            ack = new Bincode.Writer().u16(6).variant(Messages.TAG_BATCH_LOAD_RESULT).u64(failures.size());
+                            for (int index : failures) ack.u32(index).string("origin failure");
+                        }
                         response = ack.toBytes();
                     } else {
                         statCalls.incrementAndGet();

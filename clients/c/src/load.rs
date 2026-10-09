@@ -207,6 +207,7 @@ unsafe fn submit(
                     object_size: 0,
                     version: None,
                     error: None,
+                    load_failures: Vec::new(),
                     loads: loads
                         .into_iter()
                         .map(|r| TalonLoadResult {
@@ -215,12 +216,20 @@ unsafe fn submit(
                         })
                         .collect(),
                 },
-                Err(error) => TalonResult::classified_error(
-                    kind,
-                    request_id,
-                    talon_rust_client::ErrorKind::from(&error),
-                    error.to_string(),
-                ),
+                Err(error) => {
+                    let mut result = TalonResult::classified_error(
+                        kind,
+                        request_id,
+                        talon_rust_client::ErrorKind::from(&error),
+                        error.to_string(),
+                    );
+                    result.load_failures = error
+                        .failed_files()
+                        .iter()
+                        .map(|f| (f.clone(), cstring_lossy(f.error.clone())))
+                        .collect();
+                    result
+                }
             };
             dispatch_result(dispatcher, callback, user_data, result);
         };
@@ -252,4 +261,46 @@ pub unsafe extern "C" fn talon_result_load(
         .as_ref()
         .and_then(|r| r.loads.get(index))
         .map_or(ptr::null(), |r| r)
+}
+
+/// Number of failed or unconfirmed input files in a submitted batch.
+#[no_mangle]
+pub unsafe extern "C" fn talon_result_load_failure_count(result: *const TalonResult) -> usize {
+    result.as_ref().map_or(0, |r| r.load_failures.len())
+}
+
+/// Zero-based input index; SIZE_MAX for an invalid result/failure index.
+#[no_mangle]
+pub unsafe extern "C" fn talon_result_load_failure_index(
+    result: *const TalonResult,
+    index: usize,
+) -> usize {
+    result
+        .as_ref()
+        .and_then(|r| r.load_failures.get(index))
+        .map_or(usize::MAX, |f| f.0.index)
+}
+
+/// 1 for unconfirmed completion, 0 for confirmed failure, -1 for invalid index.
+#[no_mangle]
+pub unsafe extern "C" fn talon_result_load_failure_uncertain(
+    result: *const TalonResult,
+    index: usize,
+) -> c_int {
+    result
+        .as_ref()
+        .and_then(|r| r.load_failures.get(index))
+        .map_or(-1, |f| c_int::from(f.0.uncertain))
+}
+
+/// Borrow the per-file diagnostic until talon_result_free; NULL for invalid index.
+#[no_mangle]
+pub unsafe extern "C" fn talon_result_load_failure_error(
+    result: *const TalonResult,
+    index: usize,
+) -> *const c_char {
+    result
+        .as_ref()
+        .and_then(|r| r.load_failures.get(index))
+        .map_or(ptr::null(), |f| f.1.as_ptr())
 }

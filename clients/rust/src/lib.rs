@@ -58,8 +58,8 @@ pub use client::{
 };
 pub use error::{Error, ErrorKind, UriError};
 pub use talon_cache_client::{
-    BlockReadError, CacheReadError, CoordinatorError, LoadError, LoadResult, ObjectStat,
-    WorkerError, WorkerLoadError,
+    BlockReadError, CacheReadError, CoordinatorError, LoadError, LoadFailure, LoadResult,
+    ObjectStat, WorkerError, WorkerLoadError,
 };
 pub use talon_core::{ObjectId, Version};
 pub use talon_transport::{DataErrorCode, DataPlaneError, ObjectEntry};

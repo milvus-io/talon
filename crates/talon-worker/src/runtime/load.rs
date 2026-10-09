@@ -16,50 +16,48 @@ impl WorkerRuntime {
         self.load_block_with_budget(block, len).await
     }
 
-    /// Execute a batch with a bounded window sharing the worker's block budget.
-    /// Stop adding work on the first observed failure, then drain the existing
-    /// window before replying so cache writes keep their lifecycle guards.
+    /// Attempt every assignment with a bounded, shared concurrency budget.
+    /// Failures do not cancel unrelated assignments. Reply only after all fills finish.
     pub async fn batch_load(
         &self,
         blocks: &[talon_transport::LoadBlockRequest],
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<Vec<talon_transport::LoadBlockFailure>> {
         anyhow::ensure!(
             !blocks.is_empty() && blocks.len() <= talon_transport::codec::MAX_BATCH_LOAD_BLOCKS,
             "invalid batch load count"
         );
-        for request in blocks {
-            self.validate_load_block(&request.block, request.len)
-                .map_err(|error| {
-                    anyhow::anyhow!("invalid batch assignment {}: {error}", request.block)
-                })?;
-        }
         let _permit = self
             .load_slots
             .try_acquire()
             .map_err(|_| anyhow::anyhow!("worker load capacity exhausted; retry later"))?;
-        let mut requests = blocks.iter();
+        let mut requests = blocks.iter().enumerate();
         let mut pending = FuturesUnordered::new();
-        let mut first_error = None;
+        let mut failures = Vec::new();
         loop {
-            while first_error.is_none() && pending.len() < MAX_CONCURRENT_LOAD_BLOCKS {
-                let Some(request) = requests.next() else {
+            while pending.len() < MAX_CONCURRENT_LOAD_BLOCKS {
+                let Some((index, request)) = requests.next() else {
                     break;
                 };
                 pending.push(async move {
-                    self.load_block_with_budget(&request.block, request.len)
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("batch load failed for {}: {error}", request.block)
-                        })
+                    let result = async {
+                        self.validate_load_block(&request.block, request.len)?;
+                        self.load_block_with_budget(&request.block, request.len)
+                            .await
+                    }
+                    .await;
+                    result.err().map(|error| {
+                        talon_transport::LoadBlockFailure::new(index as u32, error.to_string())
+                    })
                 });
             }
             match pending.next().await {
-                Some(Err(error)) if first_error.is_none() => first_error = Some(error),
-                Some(_) => {}
+                Some(Some(failure)) => failures.push(failure),
+                Some(None) => {}
                 None => break,
             }
         }
-        first_error.map_or(Ok(()), Err)
+        failures.sort_unstable_by_key(|failure| failure.index);
+        Ok(failures)
     }
 
     async fn load_block_with_budget(&self, block: &BlockId, len: u64) -> anyhow::Result<()> {
@@ -432,8 +430,9 @@ mod tests {
             for (status, calls) in [(429, 4), (503, 4), (403, 1), (404, 1), (412, 1)] {
                 let origin = Origin::new(status, usize::MAX, 100);
                 let (_root, runtime) = setup_backend(paged, origin.backend());
-                let error = runtime.batch_load(&assignments(0, 3)).await.unwrap_err();
-                assert!(error.to_string().contains(&block(0).to_string()));
+                let failures = runtime.batch_load(&assignments(0, 3)).await.unwrap();
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].index, 0);
                 assert_eq!(
                     *origin.attempts.lock().unwrap(),
                     [(0, calls), (8, 1), (16, 1)].into()
@@ -446,14 +445,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn failed_batch_stops_scheduling_beyond_its_window() {
+    async fn invalid_assignments_are_reported_without_skipping_other_files() {
+        for paged in [false, true] {
+            let (_root, backend, runtime) = setup(paged);
+            let mut requests = assignments(0, 3);
+            requests[1].len = 0;
+            requests[2].len = 5;
+            let failures = runtime.batch_load(&requests).await.unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 1);
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_batch_continues_scheduling_beyond_its_window() {
         for paged in [false, true] {
             let origin = Origin::new(404, usize::MAX, 100);
             let (_root, runtime) = setup_backend(paged, origin.backend());
-            assert!(runtime.batch_load(&assignments(0, 16)).await.is_err());
+            let failures = runtime.batch_load(&assignments(0, 16)).await.unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 0);
             assert_eq!(
                 *origin.attempts.lock().unwrap(),
-                (0..8).map(|index| (index * 8, 1)).collect()
+                (0..16).map(|index| (index * 8, 1)).collect()
             );
             assert_eq!(runtime.load_block_slots.available_permits(), 8);
             assert_eq!(runtime.inflight_loads(), 0);
@@ -513,7 +528,7 @@ mod tests {
                     .unwrap();
             });
             let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
-            for ready in [false, true] {
+            for (ready, reject_one) in [(false, false), (true, false), (true, true)] {
                 obs.readiness().set_control_registered(ready);
                 let request = if batch {
                     ControlMessage::BatchLoad {
@@ -523,7 +538,13 @@ mod tests {
                                 len: 8,
                             },
                             talon_transport::LoadBlockRequest {
-                                block: block(8),
+                                block: {
+                                    let mut block = block(8);
+                                    if reject_one {
+                                        block.version = Version::new("wrong-version");
+                                    }
+                                    block
+                                },
                                 len: 8,
                             },
                             talon_transport::LoadBlockRequest {
@@ -550,9 +571,16 @@ mod tests {
                     .read_exact(&mut message[header.len()..])
                     .await
                     .unwrap();
-                assert!(
-                    matches!(codec::decode(&message).unwrap().1, ControlMessage::Ack { ok, .. } if ok == ready)
-                );
+                match codec::decode(&message).unwrap().1 {
+                    ControlMessage::BatchLoadResult { failures } if batch && ready => {
+                        assert_eq!(failures.len(), usize::from(reject_one));
+                        if reject_one {
+                            assert_eq!(failures[0].index, 1);
+                        }
+                    }
+                    ControlMessage::Ack { ok, .. } => assert_eq!(ok, ready),
+                    other => panic!("unexpected reply {other:?}"),
+                }
                 assert_eq!(
                     backend.fetches.load(Ordering::SeqCst),
                     usize::from(ready) * if batch { 3 } else { 1 }
@@ -636,7 +664,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batch_drains_on_failure_retains_completed_blocks_and_shares_admission() {
+    async fn batch_reports_failures_retains_completed_blocks_and_shares_admission() {
         for paged in [false, true] {
             let (_root, backend, runtime) = setup(paged);
             let mut wrong = block(8);
@@ -664,8 +692,9 @@ mod tests {
                 .contains("capacity exhausted"));
             assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
             drop(permits);
-            let error = runtime.batch_load(&requests).await.unwrap_err();
-            assert!(error.to_string().contains(&requests[1].block.to_string()));
+            let failures = runtime.batch_load(&requests).await.unwrap();
+            assert_eq!(failures.len(), 1);
+            assert_eq!(failures[0].index, 1);
             assert_eq!(backend.fetches.load(Ordering::SeqCst), 2);
             assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
             assert_eq!(runtime.load_slots.available_permits(), 8);

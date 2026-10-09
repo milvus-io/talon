@@ -12,7 +12,11 @@ static void capture_empty_load(talon_result *result, void *user_data) {
              talon_result_operation(result) == (int)(uintptr_t)user_data &&
              talon_result_load_count(result) == 1 && entry != NULL &&
              entry->size == 0 && entry->blocks == 0 &&
-             talon_result_load(result, 1) == NULL;
+             talon_result_load(result, 1) == NULL &&
+             talon_result_load_failure_count(result) == 0 &&
+             talon_result_load_failure_index(result, 0) == SIZE_MAX &&
+             talon_result_load_failure_uncertain(result, 0) == -1 &&
+             talon_result_load_failure_error(result, 0) == NULL;
     talon_result_free(result);
     atomic_store_explicit(&callback_ok, ok, memory_order_release);
     atomic_store_explicit(&callback_done, 1, memory_order_release);

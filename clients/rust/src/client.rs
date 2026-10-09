@@ -178,8 +178,10 @@ impl Client {
     }
 
     /// Prewarm files with one protocol batch per worker/chunk, without HEAD.
-    /// Results follow input order. Any failed batch fails the call; completed
-    /// fills remain cached. Uses the same placement and shared RPC budget as LOAD.
+    /// Results follow input order. On partial failure, `LoadError::failed_files`
+    /// lists failed/unconfirmed input indices; omitted files succeeded. Other files
+    /// continue after individual failures. Completed fills remain cached.
+    /// Uses the same placement and shared RPC budget as LOAD.
     pub async fn batch_load(
         &self,
         requests: &[LoadRequest],

@@ -150,6 +150,7 @@ pub struct TalonResult {
     version: Option<CString>,
     error: Option<CString>,
     loads: Vec<TalonLoadResult>,
+    load_failures: Vec<(talon_rust_client::LoadFailure, CString)>,
 }
 
 struct ReadBuffer {
@@ -654,6 +655,7 @@ impl TalonResult {
                 version: None,
                 error: None,
                 loads: Vec::new(),
+                load_failures: Vec::new(),
             },
             Err(error) => Self::operation_error(OPERATION_READ, request_id, error),
         }
@@ -670,6 +672,7 @@ impl TalonResult {
                 version: Some(cstring_lossy(stat.version)),
                 error: None,
                 loads: Vec::new(),
+                load_failures: Vec::new(),
             },
             Err(error) => Self::operation_error(OPERATION_STAT, request_id, error),
         }
@@ -698,6 +701,7 @@ impl TalonResult {
             version: None,
             error: Some(cstring_lossy(message)),
             loads: Vec::new(),
+            load_failures: Vec::new(),
         }
     }
 }
@@ -824,6 +828,7 @@ mod tests {
         version: Option<String>,
         error: Option<String>,
         loads: Vec<(u64, u64)>,
+        load_failures: Vec<(usize, c_int, String)>,
     }
 
     impl CallbackState {
@@ -877,6 +882,17 @@ mod tests {
             )
         };
         let snapshot = CallbackSnapshot {
+            load_failures: (0..unsafe { talon_result_load_failure_count(result) })
+                .map(|index| unsafe {
+                    (
+                        talon_result_load_failure_index(result, index),
+                        talon_result_load_failure_uncertain(result, index),
+                        CStr::from_ptr(talon_result_load_failure_error(result, index))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
             loads: (0..unsafe { talon_result_load_count(result) })
                 .map(|index| {
                     let entry = unsafe { &*talon_result_load(result, index) };
@@ -973,6 +989,7 @@ mod tests {
                         frame.resize(HEADER_LEN + parsed.length as usize, 0);
                         socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
                         let (_, message) = talon_transport::decode(&frame).unwrap();
+                        let batch = matches!(message, ControlMessage::BatchLoad { .. });
                         let requests = match message {
                             ControlMessage::LoadBlock { block, len } => {
                                 observed.lock().unwrap().push(0);
@@ -985,9 +1002,25 @@ mod tests {
                             other => panic!("unexpected request {other:?}"),
                         };
                         assert!(requests.iter().all(|r| r.block.version.as_str() == "v1"));
-                        let reply = ControlMessage::Ack {
-                            ok: true,
-                            detail: None,
+                        let reply = if batch {
+                            ControlMessage::BatchLoadResult {
+                                failures: requests
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, r)| r.block.object.object_path == "bad")
+                                    .map(|(index, _)| {
+                                        talon_transport::LoadBlockFailure::new(
+                                            index as u32,
+                                            "origin failure".into(),
+                                        )
+                                    })
+                                    .collect(),
+                            }
+                        } else {
+                            ControlMessage::Ack {
+                                ok: true,
+                                detail: None,
+                            }
                         };
                         socket
                             .write_all(&talon_transport::encode(parsed.request_id, &reply).unwrap())
@@ -1101,6 +1134,62 @@ mod tests {
                 )
             },
             STATUS_INVALID_ARGUMENT
+        );
+        let good = cstring("s3://bucket/good");
+        let bad = cstring("s3://bucket/bad");
+        let version = cstring("v1");
+        let files = [
+            TalonLoadRequest {
+                uri: good.as_ptr(),
+                version: version.as_ptr(),
+                size: 8,
+            },
+            TalonLoadRequest {
+                uri: bad.as_ptr(),
+                version: version.as_ptr(),
+                size: 1025 * 8,
+            },
+            TalonLoadRequest {
+                uri: bad.as_ptr(),
+                version: version.as_ptr(),
+                size: 0,
+            },
+            TalonLoadRequest {
+                uri: bad.as_ptr(),
+                version: version.as_ptr(),
+                size: 8,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                talon_batch_load_async(
+                    client,
+                    files.as_ptr(),
+                    files.len(),
+                    Some(capture_callback),
+                    state.user_data(),
+                    &mut id,
+                )
+            },
+            STATUS_OK
+        );
+        let result = state.wait();
+        assert_eq!(result.status, STATUS_OPERATION_ERROR);
+        assert!(result.loads.is_empty());
+        assert_eq!(
+            result.load_failures,
+            [
+                (1, 0, "origin failure".into()),
+                (3, 0, "origin failure".into())
+            ]
+        );
+        assert_eq!(
+            unsafe { talon_result_load_failure_index(ptr::null(), 0) },
+            usize::MAX
+        );
+        assert_eq!(
+            unsafe { talon_result_load_failure_uncertain(ptr::null(), 0) },
+            -1
         );
         unsafe {
             talon_client_free(client);

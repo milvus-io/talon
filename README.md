@@ -99,8 +99,8 @@ instructions in one protocol request**, followed by one acknowledgement.
 Requests also fit the 1 MiB control-frame limit, including tracing metadata;
 long identities can cause earlier splitting. Workers process each batch with up
 to eight concurrent block loads. All batches and single LOADs on a worker share
-that block limit. On the first observed failure, the worker stops adding work
-and drains its existing window, retaining completed cache fills. The SDK
+that block limit. Workers continue after individual failures and return failed
+assignment indices after all fills complete, retaining completed cache fills. The SDK
 returns per-file counts in input order on success, or an error on any failed
 batch. Empty input succeeds without network I/O. Single and batch loads share
 the same client and worker RPC admission limits; a batch counts as one active RPC.
@@ -131,6 +131,10 @@ above.
 The command waits until all assigned blocks finish and returns loaded byte and
 block counts. A worker error, timeout, or observed membership change fails the
 request; successfully warmed data remains cached and the request can be retried.
+Batch errors identify each failed/unconfirmed input file once, in input order;
+other files continue after individual failures. Missing replies are marked as
+unconfirmed, never reported as successful. See the client guides for accessing
+the failure list in Rust, C, Python, and Java.
 Load is best-effort cache warming: entries remain subject to ordinary eviction,
 and neither pinned residency nor automatic rebalancing after completion is
 promised. Dropping the client operation stops further dispatch; workers may
@@ -138,7 +142,8 @@ finish requests they have already accepted. A client and its clones share a
 limit of eight active requests, with a two-minute single-block RPC timeout and
 a 30-minute batch RPC and overall operation timeout. Each worker also admits at most eight concurrent
 LOAD requests and rejects excess requests for the caller to retry later. Load
-requires workers implementing `LoadBlock` and `BatchLoad` in control schema 6;
+requires workers implementing `LoadBlock`, `BatchLoad`, and `BatchLoadResult`
+in control schema 6 for detailed failure results;
 no additional coordinator upgrade is needed.
 Existing operations retain their original wire schemas.
 

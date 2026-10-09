@@ -33,11 +33,32 @@ final class Messages {
     static final int TAG_CONTROL_FAILURE = 18;
     static final int TAG_LOAD_BLOCK = 19;
     static final int TAG_BATCH_LOAD = 20;
+    static final int TAG_BATCH_LOAD_RESULT = 21;
     static final int MAX_BATCH_LOAD_BLOCKS = 1024;
     static final int MAX_LOAD_BODY_BYTES = (1 << 20) - 1026;
     static final int BATCH_LOAD_OVERHEAD = 14;
 
     record LoadBlock(BlockId block, long length) {}
+
+    record LoadBlockFailure(int index, String error) {}
+
+    static List<LoadBlockFailure> loadFailures(Response response, int count) {
+        int length = response.body.seqLen();
+        if (length > count) throw new ProtocolException("too many batch failures");
+        List<LoadBlockFailure> failures = new ArrayList<>(length);
+        long previous = -1;
+        for (int i = 0; i < length; i++) {
+            long index = response.body.u32();
+            String error = response.body.string();
+            if (index <= previous || index >= count || error.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 256) {
+                throw new ProtocolException("invalid batch failure entry");
+            }
+            failures.add(new LoadBlockFailure((int) index, error));
+            previous = index;
+        }
+        if (response.body.remaining() != 0) throw new ProtocolException("trailing batch failure bytes");
+        return failures;
+    }
 
     static long loadBlockSize(LoadBlock request) {
         BlockId b = request.block();

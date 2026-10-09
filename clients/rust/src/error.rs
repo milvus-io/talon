@@ -87,6 +87,7 @@ impl From<&talon_cache_client::LoadError> for ErrorKind {
     fn from(error: &talon_cache_client::LoadError) -> Self {
         use talon_cache_client::{LoadError, WorkerLoadError};
         match error {
+            LoadError::Batch { source, .. } => Self::from(source.as_ref()),
             LoadError::InvalidArgument(_) => ErrorKind::InvalidArgument,
             LoadError::Timeout => ErrorKind::Timeout,
             LoadError::MembershipChanged => ErrorKind::Unavailable,
