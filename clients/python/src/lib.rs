@@ -101,12 +101,21 @@ fn io_err<E: std::fmt::Display>(e: E) -> PyErr {
     PyIOError::new_err(e.to_string())
 }
 
-/// Preserve the SDK's input-versus-I/O error distinction at the Python boundary.
+// pyo3 0.22 expands a deprecated optional feature check in this macro.
+#[allow(unexpected_cfgs)]
+mod exception_types {
+    pyo3::create_exception!(talon, UnavailableError, pyo3::exceptions::PyIOError);
+}
+use exception_types::UnavailableError;
+
 fn client_err(error: RustError) -> PyErr {
+    use talon_rust_client::ErrorKind;
     let message = error.to_string();
-    match error {
-        RustError::InvalidUri(_) | RustError::InvalidArgument(_) => PyValueError::new_err(message),
-        RustError::Coordinator(_) | RustError::Block(_) => PyIOError::new_err(message),
+    match error.kind() {
+        ErrorKind::Unavailable => UnavailableError::new_err(message),
+        ErrorKind::Timeout => pyo3::exceptions::PyTimeoutError::new_err(message),
+        ErrorKind::InvalidArgument => PyValueError::new_err(message),
+        _ => PyIOError::new_err(message),
     }
 }
 
@@ -351,6 +360,10 @@ impl Client {
 fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(configure_telemetry, m)?)?;
     m.add_function(wrap_pyfunction!(shutdown_telemetry, m)?)?;
+    m.add(
+        "UnavailableError",
+        m.py().get_type_bound::<UnavailableError>(),
+    )?;
     m.add_class::<Client>()?;
     m.add_class::<ObjectStat>()?;
     m.add_class::<ObjectEntry>()?;
@@ -432,6 +445,22 @@ mod tests {
             };
 
             assert!(error.is_instance_of::<PyIOError>(py));
+        });
+    }
+    #[test]
+    fn unavailable_and_timeout_have_distinct_python_types() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let unavailable = client_err(RustError::Coordinator(
+                talon_rust_client::CoordinatorError::Io(
+                    std::io::ErrorKind::ConnectionRefused.into(),
+                ),
+            ));
+            assert!(unavailable.is_instance_of::<UnavailableError>(py));
+            let timeout = client_err(RustError::Coordinator(
+                talon_rust_client::CoordinatorError::Io(std::io::ErrorKind::TimedOut.into()),
+            ));
+            assert!(timeout.is_instance_of::<pyo3::exceptions::PyTimeoutError>(py));
         });
     }
 }

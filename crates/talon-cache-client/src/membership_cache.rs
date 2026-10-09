@@ -162,13 +162,37 @@ impl MembershipSnapshot {
         self.placement
             .rank(block, usize::from(replicas_k.max(1)))
             .into_iter()
-            .map(|owner| {
-                let target = self
-                    .instances
-                    .get(&owner.id.0)
-                    .map_or(owner.id.0.as_str(), |(_, client)| client.addr());
-                (target, self.instance(&owner.id.0))
-            })
+            .map(|owner| (owner.id.0.as_str(), self.instance(&owner.id.0)))
+    }
+
+    pub(crate) fn target_error(
+        &self,
+        worker_id: &str,
+        source: crate::WorkerError,
+    ) -> crate::BlockReadError {
+        let (instance_id, client) = self.instances.get(worker_id).expect("selected instance");
+        crate::BlockReadError::Target {
+            worker_id: worker_id.into(),
+            instance_id: instance_id.clone(),
+            address: client.addr().into(),
+            source,
+        }
+    }
+
+    pub(crate) fn replica_error(
+        &self,
+        worker_id: &str,
+        source: crate::WorkerError,
+    ) -> crate::BlockReadError {
+        let instance = self.instances.get(worker_id);
+        crate::BlockReadError::AllReplicasFailed {
+            worker: instance
+                .map_or(worker_id, |(_, client)| client.addr())
+                .into(),
+            worker_id: worker_id.into(),
+            instance_id: instance.map(|(id, _)| id.clone()),
+            source,
+        }
     }
 
     pub fn owner(

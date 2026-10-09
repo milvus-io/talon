@@ -24,6 +24,7 @@ fn classify(error: Error) -> (CacheReadError, String) {
             source.into()
         }
         Error::Block(BlockReadError::Worker(source))
+        | Error::Block(BlockReadError::Target { source, .. })
         | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),
         Error::Block(BlockReadError::NoOwners) => CacheReadError::Unavailable(diagnostic.clone()),
     };
@@ -35,6 +36,8 @@ fn worker_error(source: WorkerError, exhausted: bool) -> Error {
     if exhausted {
         let block = BlockReadError::AllReplicasFailed {
             worker: WORKER.into(),
+            worker_id: "last-worker".into(),
+            instance_id: Some("last-instance".into()),
             source,
         };
         let error: Error = block.into();
@@ -49,7 +52,7 @@ fn worker_error(source: WorkerError, exhausted: bool) -> Error {
         }
         assert_eq!(
             error.to_string(),
-            format!("all replicas failed; last worker {WORKER}: {diagnostic}")
+            format!("all replicas failed; last worker last-worker, instance Some(\"last-instance\") at {WORKER}: {diagnostic}")
         );
         error
     } else {
@@ -123,6 +126,14 @@ fn remote_codes_classify_identically_for_direct_and_exhausted_reads() {
                 }),
                 exhausted,
             );
+            let direct = Error::from(BlockReadError::Worker(WorkerError::Remote(
+                DataPlaneError {
+                    code,
+                    message: MESSAGE.into(),
+                },
+            )));
+            assert_eq!(error.kind(), direct.kind());
+            assert_eq!(error.fallback_eligible(), direct.fallback_eligible());
             if exhausted {
                 let source = error
                     .source()
@@ -224,5 +235,35 @@ fn invalid_inputs_are_invalid_requests_to_the_consumer() {
         .into(),
     ] {
         assert_class(error, &CacheReadError::InvalidRequest(String::new()), false);
+    }
+}
+
+#[test]
+fn selected_instance_failure_preserves_identity_and_typed_cause() {
+    let error = Error::from(BlockReadError::Target {
+        worker_id: "logical-worker".into(),
+        instance_id: "process-instance".into(),
+        address: "worker.example:7001".into(),
+        source: WorkerError::Remote(DataPlaneError {
+            code: DataErrorCode::VersionMismatch,
+            message: MESSAGE.into(),
+        }),
+    });
+    let source = error
+        .source()
+        .unwrap()
+        .downcast_ref::<WorkerError>()
+        .unwrap();
+    assert!(matches!(source, WorkerError::Remote(remote)
+        if remote.code == DataErrorCode::VersionMismatch && remote.message == MESSAGE));
+    let (class, diagnostic) = classify(error);
+    assert!(matches!(class, CacheReadError::VersionMismatch(_)));
+    for detail in [
+        "logical-worker",
+        "process-instance",
+        "worker.example:7001",
+        MESSAGE,
+    ] {
+        assert!(diagnostic.contains(detail));
     }
 }

@@ -450,21 +450,39 @@ impl Coordinator {
     ///
     /// Workers are tried in membership order until one answers, so a single
     /// unreachable worker does not fail the request.
-    async fn proxy_to_worker(&self, message: ControlMessage) -> ControlMessage {
-        let workers: Vec<_> = self
-            .service
-            .membership()
-            .snapshot()
-            .into_iter()
-            .filter(|node| node.role == NodeRole::Worker && !node.address.is_empty())
-            .collect();
-        if workers.is_empty() {
-            return ControlMessage::Ack {
-                ok: false,
-                detail: Some("no worker available to serve the request".into()),
-            };
-        }
+    fn metadata_failure(
+        &self,
+        code: talon_transport::DataErrorCode,
+        message: String,
+    ) -> ControlMessage {
+        ControlMessage::ControlFailure { code, message }
+    }
 
+    async fn proxy_to_worker(&self, message: ControlMessage) -> ControlMessage {
+        use talon_core::worker_membership::InstanceState;
+        let workers: Vec<_> = match self.observability.membership_for_query().await {
+            Ok(view) => view
+                .workers
+                .into_iter()
+                .filter_map(|worker| match worker.state {
+                    InstanceState::Serving { address, .. } => Some(NodeInfo {
+                        id: talon_core::NodeId::new(worker.member.worker_id),
+                        address,
+                        role: NodeRole::Worker,
+                    }),
+                    _ => None,
+                })
+                .collect(),
+            Err(error) => {
+                return self.metadata_failure(state_error_code(&error), error.to_string())
+            }
+        };
+        if !self.observability.is_ready() || workers.is_empty() {
+            return self.metadata_failure(
+                talon_transport::DataErrorCode::Unavailable,
+                "no worker available to serve the request".into(),
+            );
+        }
         self.proxy_to_workers(&workers, message).await
     }
 
@@ -496,6 +514,7 @@ impl Coordinator {
         let deadline = tokio::time::Instant::now() + budget;
         let mut attempt_errors = String::new();
         let mut tried = 0;
+        let mut unclassified_rejection = false;
         for (index, worker) in workers.iter().enumerate() {
             let now = tokio::time::Instant::now();
             let remaining = deadline.saturating_duration_since(now);
@@ -520,6 +539,7 @@ impl Coordinator {
                     ),
                 ),
                 Ok(Ok(ControlMessage::Ack { ok: false, detail })) => {
+                    unclassified_rejection = true;
                     append_proxy_attempt_error(
                         &mut attempt_errors,
                         &format!(
@@ -530,14 +550,37 @@ impl Coordinator {
                     );
                 }
                 Ok(Ok(reply)) => return reply,
-                Ok(Err(e)) => append_proxy_attempt_error(
-                    &mut attempt_errors,
-                    &format!("{}: {e}", worker.address),
-                ),
+                Ok(Err(e)) => {
+                    let code = metadata_transport_code(&e);
+                    if !matches!(
+                        code,
+                        talon_transport::DataErrorCode::Unavailable
+                            | talon_transport::DataErrorCode::Timeout
+                    ) {
+                        return ControlMessage::ControlFailure {
+                            code,
+                            message: e.to_string(),
+                        };
+                    }
+                    append_proxy_attempt_error(
+                        &mut attempt_errors,
+                        &format!("{}: {e}", worker.address),
+                    );
+                }
             }
             if tokio::time::Instant::now() >= deadline {
                 break;
             }
+        }
+        if !unclassified_rejection {
+            return ControlMessage::ControlFailure {
+                code: if tokio::time::Instant::now() >= deadline {
+                    talon_transport::DataErrorCode::Timeout
+                } else {
+                    talon_transport::DataErrorCode::Unavailable
+                },
+                message: format!("no serving worker completed metadata request: {attempt_errors}"),
+            };
         }
         ControlMessage::Ack {
             ok: false,
@@ -561,10 +604,21 @@ impl Coordinator {
         attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<ControlMessage> {
         talon_telemetry::observe("talon.rpc", "client", async {
-            let _permit = tokio::time::timeout_at(attempt_deadline, self.worker_proxy_slots.acquire())
-                .await
-                .map_err(|_| anyhow::anyhow!("worker proxy concurrency wait exhausted attempt budget"))?
-                .map_err(|_| anyhow::anyhow!("worker proxy concurrency limiter closed"))?;
+            let _permit =
+                tokio::time::timeout_at(attempt_deadline, self.worker_proxy_slots.acquire())
+                    .await
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "worker proxy concurrency wait exhausted attempt budget",
+                        )
+                    })?
+                    .map_err(|_| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::NotConnected,
+                            "worker proxy concurrency limiter closed",
+                        )
+                    })?;
 
             if let Some(stream) = self.worker_proxy_pool.checkout(address) {
                 match Self::exchange_with_worker(stream, address, message, attempt_deadline).await {
@@ -573,25 +627,30 @@ impl Coordinator {
                         return Ok(reply);
                     }
                     Err(reused_error) => {
+                        if !matches!(
+                            metadata_transport_code(&reused_error),
+                            talon_transport::DataErrorCode::Unavailable
+                                | talon_transport::DataErrorCode::Timeout
+                        ) {
+                            return Err(reused_error);
+                        }
                         // The peer may have closed an otherwise healthy socket
                         // while it sat idle. Retry only this transport exchange on
                         // a fresh connection and keep the same attempt deadline.
-                        let stream = Self::connect_worker(address, attempt_deadline)
-                            .await
-                            .map_err(|fresh_error| {
-                                anyhow::anyhow!(
-                                    "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
-                                )
-                            })?;
-                        return match Self::exchange_with_worker(stream, address, message, attempt_deadline).await
+                        let stream = Self::connect_worker(address, attempt_deadline).await?;
+                        return match Self::exchange_with_worker(
+                            stream,
+                            address,
+                            message,
+                            attempt_deadline,
+                        )
+                        .await
                         {
                             Ok((stream, reply)) => {
                                 self.worker_proxy_pool.release(address, stream);
                                 Ok(reply)
                             }
-                            Err(fresh_error) => Err(anyhow::anyhow!(
-                                "reused connection failed ({reused_error}); fresh retry failed: {fresh_error}"
-                            )),
+                            Err(fresh_error) => Err(fresh_error),
                         };
                     }
                 }
@@ -615,12 +674,21 @@ impl Coordinator {
     ) -> anyhow::Result<TcpStream> {
         let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            anyhow::bail!("worker attempt budget exhausted before connecting");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker attempt budget exhausted before connecting",
+            )
+            .into());
         }
         let connect_timeout = PROXY_CONNECT_TIMEOUT.min(remaining);
         tokio::time::timeout(connect_timeout, TcpStream::connect(address))
             .await
-            .map_err(|_| anyhow::anyhow!("connect timed out after {connect_timeout:?}"))?
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("connect timed out after {connect_timeout:?}"),
+                )
+            })?
             .map_err(Into::into)
     }
 
@@ -637,27 +705,43 @@ impl Coordinator {
 
         let remaining = attempt_deadline.saturating_duration_since(tokio::time::Instant::now());
         if remaining.is_zero() {
-            anyhow::bail!("worker attempt budget exhausted before reading response");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker attempt budget exhausted before reading response",
+            )
+            .into());
         }
         let (header, payload) = tokio::time::timeout(
             remaining,
             talon_transport::read_frame(&mut stream, remaining),
         )
         .await
-        .map_err(|_| anyhow::anyhow!("worker response did not arrive within its attempt budget"))?
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+        .map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "worker response did not arrive within its attempt budget",
+            )
+        })??;
         let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
         full.extend_from_slice(&header.encode());
         full.extend_from_slice(&payload);
         let (_, reply) = codec::decode(&full)?;
-        if matches!(
-            &reply,
-            ControlMessage::Ack { ok: false, .. }
-                | ControlMessage::NodeStatusAck {
-                    accepted: false,
-                    ..
-                }
+        if !matches!(
+            (message, &reply),
+            (
+                ControlMessage::StatObject { .. },
+                ControlMessage::ObjectStat { .. }
+            ) | (
+                ControlMessage::ListObjects { .. },
+                ControlMessage::ObjectList { .. }
+            ) | (
+                _,
+                ControlMessage::Ack { ok: false, .. } | ControlMessage::ControlFailure { .. }
+            )
         ) {
+            anyhow::bail!("unexpected metadata worker response: {reply:?}");
+        }
+        if matches!(&reply, ControlMessage::Ack { ok: false, .. }) {
             talon_telemetry::outcome("error");
         }
         Ok((stream, reply))
@@ -710,30 +794,14 @@ impl Coordinator {
             ControlMessage::MembershipQuery {} => {
                 match self.observability.membership_for_query().await {
                     Ok(view) => ControlMessage::MembershipList { view },
-                    Err(error) => ControlMessage::Ack {
-                        ok: false,
-                        detail: Some(error.to_string()),
+                    Err(error) => ControlMessage::ControlFailure {
+                        code: state_error_code(&error),
+                        message: error.to_string(),
                     },
                 }
             }
-            listing @ ControlMessage::ListObjects { .. } => {
-                if !self.observability.is_ready() {
-                    return ControlMessage::Ack {
-                        ok: false,
-                        detail: Some("coordinator not ready: shared state unavailable".into()),
-                    };
-                }
-                self.proxy_to_worker(listing).await
-            }
-            stat @ ControlMessage::StatObject { .. } => {
-                if !self.observability.is_ready() {
-                    return ControlMessage::Ack {
-                        ok: false,
-                        detail: Some("coordinator not ready: shared state unavailable".into()),
-                    };
-                }
-                self.proxy_to_worker(stat).await
-            }
+            listing @ ControlMessage::ListObjects { .. } => self.proxy_to_worker(listing).await,
+            stat @ ControlMessage::StatObject { .. } => self.proxy_to_worker(stat).await,
             other => ControlMessage::Ack {
                 ok: false,
                 detail: Some(format!("unexpected control message: {other:?}")),
@@ -935,6 +1003,37 @@ async fn run() -> anyhow::Result<()> {
             }
         }
     }
+}
+
+fn state_error_code(error: &talon_coordinator::StateStoreError) -> talon_transport::DataErrorCode {
+    use talon_coordinator::StateStoreError as E;
+    use talon_transport::DataErrorCode as C;
+    match error {
+        E::Timeout { .. } => C::Timeout,
+        E::Unavailable { .. } | E::Compacted { .. } | E::WatchLagged { .. } => C::Unavailable,
+        _ => C::Internal,
+    }
+}
+
+fn metadata_transport_code(error: &anyhow::Error) -> talon_transport::DataErrorCode {
+    use talon_transport::{DataErrorCode as C, ReadFrameError as F};
+    if let Some(frame) = error.downcast_ref::<F>() {
+        return match frame {
+            F::Eof => C::Unavailable,
+            F::Timeout => C::Timeout,
+            F::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => C::Timeout,
+            F::Io(_) => C::Unavailable,
+            _ => C::Internal,
+        };
+    }
+    if let Some(io) = error.downcast_ref::<std::io::Error>() {
+        return match io.kind() {
+            std::io::ErrorKind::TimedOut => C::Timeout,
+            std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => C::Internal,
+            _ => C::Unavailable,
+        };
+    }
+    C::Internal
 }
 
 /// Construct the shared cluster-state store selected by configuration.
@@ -2031,7 +2130,13 @@ mod tests {
         let result = coordinator
             .proxy_to_workers_with_budget(&workers, stat_request(), Duration::from_millis(20))
             .await;
-        assert!(matches!(result, ControlMessage::Ack { ok: false, .. }));
+        assert!(matches!(
+            result,
+            ControlMessage::ControlFailure {
+                code: talon_transport::DataErrorCode::Timeout,
+                ..
+            }
+        ));
         assert!(
             tokio::time::timeout(Duration::from_millis(20), listener.accept())
                 .await
@@ -2490,13 +2595,12 @@ mod tests {
             started.elapsed()
         );
         let detail = match reply {
-            ControlMessage::Ack {
-                ok: false,
-                detail: Some(detail),
-            } => detail,
-            other => panic!("expected aggregate proxy failure, got {other:?}"),
+            ControlMessage::ControlFailure {
+                code: talon_transport::DataErrorCode::Timeout,
+                message,
+            } => message,
+            other => panic!("expected aggregate proxy timeout, got {other:?}"),
         };
-        assert!(detail.contains("2/2 tried within 6s"), "{detail}");
         assert!(detail.contains(&first_address), "{detail}");
         assert!(detail.contains(&second_address), "{detail}");
 
@@ -2601,6 +2705,10 @@ mod tests {
             assert!(matches!(
                 coordinator.dispatch(request).await,
                 ControlMessage::Ack { ok: false, .. }
+                    | ControlMessage::ControlFailure {
+                        code: talon_transport::DataErrorCode::Unavailable,
+                        ..
+                    }
             ));
         }
         store.set_available(true);
@@ -2617,6 +2725,10 @@ mod tests {
                 .dispatch(ControlMessage::MembershipQuery {})
                 .await,
             ControlMessage::Ack { ok: false, .. }
+                | ControlMessage::ControlFailure {
+                    code: talon_transport::DataErrorCode::Unavailable,
+                    ..
+                }
         ));
     }
 
@@ -2653,7 +2765,7 @@ mod tests {
             .await;
         assert!(matches!(placement, ControlMessage::Ack { ok: false, .. }));
         let membership = coord.dispatch(ControlMessage::MembershipQuery {}).await;
-        assert!(matches!(membership, ControlMessage::Ack { ok: false, .. }));
+        assert!(matches!(membership, ControlMessage::ControlFailure { .. }));
 
         // Recovery restores service.
         store.set_available(true);
@@ -2692,6 +2804,65 @@ mod tests {
             talon_coordinator::WriteDisposition::Applied
         );
         assert_eq!(store.snapshot("cluster-a").await.unwrap().nodes.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn retained_metadata_preserves_corrupt_protocol_and_discovery_outage() {
+        let store = Arc::new(MemoryStateStore::new());
+        let obs = observability_over(store.clone(), "coord-a");
+        obs.check_ready().await.unwrap();
+        let coord = Coordinator::new(obs.clone(), Duration::from_secs(30));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let fake = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (header, payload) =
+                talon_transport::read_frame(&mut stream, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            assert_eq!(codec::request_schema(&header, &payload).unwrap(), 6);
+            stream.write_all(&[0u8; HEADER_LEN]).await.unwrap();
+        });
+        let reply = coord
+            .proxy_to_workers(&[proxy_worker(address)], stat_request())
+            .await;
+        assert!(matches!(
+            reply,
+            ControlMessage::ControlFailure {
+                code: talon_transport::DataErrorCode::Internal,
+                ..
+            }
+        ));
+        fake.await.unwrap();
+        store.set_available(false);
+        for request in [
+            ControlMessage::MembershipQuery {},
+            stat_request(),
+            ControlMessage::ListObjects {
+                prefix: "s3/b/p".into(),
+            },
+        ] {
+            assert!(matches!(
+                coord.dispatch(request).await,
+                ControlMessage::ControlFailure {
+                    code: talon_transport::DataErrorCode::Unavailable,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn empty_metadata_returns_unavailable() {
+        let coord = proxy_test_coordinator();
+        coord.observability.check_ready().await.unwrap();
+        assert!(matches!(
+            coord.dispatch(stat_request()).await,
+            ControlMessage::ControlFailure {
+                code: talon_transport::DataErrorCode::Unavailable,
+                ..
+            }
+        ));
     }
 
     fn sample_block() -> talon_core::BlockId {

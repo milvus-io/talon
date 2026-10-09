@@ -391,10 +391,10 @@ impl CoordinatorObservability {
         &self,
     ) -> StateStoreResult<talon_core::worker_membership::WorkerDiscovery> {
         if !self.is_ready() {
-            return Err(crate::state_store::registry::invalid(
-                self.store.backend(),
-                "coordinator not ready",
-            ));
+            return Err(StateStoreError::Unavailable {
+                backend: self.store.backend(),
+                detail: "coordinator not ready".into(),
+            });
         }
         let cached = self
             .last_discovery
@@ -408,10 +408,10 @@ impl CoordinatorObservability {
                 return Ok(view);
             }
         }
-        Err(crate::state_store::registry::invalid(
-            self.store.backend(),
-            "membership cache requires refresh",
-        ))
+        Err(StateStoreError::Unavailable {
+            backend: self.store.backend(),
+            detail: "membership cache requires refresh".into(),
+        })
     }
 
     fn buffer_instance(

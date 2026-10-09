@@ -82,6 +82,8 @@ const STATUS_OK: c_int = 0;
 const STATUS_INVALID_ARGUMENT: c_int = 1;
 const STATUS_RUNTIME_ERROR: c_int = 2;
 const STATUS_OPERATION_ERROR: c_int = 4;
+const STATUS_UNAVAILABLE: c_int = 5;
+const STATUS_TIMEOUT: c_int = 6;
 
 const OPERATION_READ: c_int = 1;
 const OPERATION_STAT: c_int = 2;
@@ -455,7 +457,6 @@ pub unsafe extern "C" fn talon_read_async_with_options(
                 client
                     .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
                     .await
-                    .map_err(|error| error.to_string())
             }
             .await;
             dispatch_result(
@@ -537,10 +538,7 @@ pub unsafe extern "C" fn talon_stat_async_with_options(
                     .map(talon_rust_client::TraceParent::Explicit)
                     .unwrap_or(talon_rust_client::TraceParent::Root),
             };
-            let result = client
-                .stat_with_options(&object, &options)
-                .await
-                .map_err(|error| error.to_string());
+            let result = client.stat_with_options(&object, &options).await;
             dispatch_result(
                 dispatcher,
                 callback,
@@ -639,7 +637,7 @@ pub unsafe extern "C" fn talon_last_error() -> *const c_char {
 }
 
 impl TalonResult {
-    fn read(request_id: u64, result: Result<usize, String>) -> Self {
+    fn read(request_id: u64, result: Result<usize, RustError>) -> Self {
         match result {
             Ok(bytes_written) => Self {
                 operation: OPERATION_READ,
@@ -654,7 +652,7 @@ impl TalonResult {
         }
     }
 
-    fn stat(request_id: u64, result: Result<RustObjectStat, String>) -> Self {
+    fn stat(request_id: u64, result: Result<RustObjectStat, RustError>) -> Self {
         match result {
             Ok(stat) => Self {
                 operation: OPERATION_STAT,
@@ -669,15 +667,19 @@ impl TalonResult {
         }
     }
 
-    fn operation_error(operation: c_int, request_id: u64, error: String) -> Self {
+    fn operation_error(operation: c_int, request_id: u64, error: RustError) -> Self {
         Self {
             operation,
-            status: STATUS_OPERATION_ERROR,
+            status: match error.kind() {
+                talon_rust_client::ErrorKind::Unavailable => STATUS_UNAVAILABLE,
+                talon_rust_client::ErrorKind::Timeout => STATUS_TIMEOUT,
+                _ => STATUS_OPERATION_ERROR,
+            },
             request_id,
             bytes_written: 0,
             object_size: 0,
             version: None,
-            error: Some(cstring_lossy(error)),
+            error: Some(cstring_lossy(error.to_string())),
         }
     }
 }
@@ -1490,5 +1492,22 @@ mod tests {
     fn c_header_and_abi_smoke_test() {
         let status = unsafe { talon_c_api_smoke_test() };
         assert_eq!(status, 0, "C API smoke test failed at check {status}");
+    }
+    #[test]
+    fn callback_results_preserve_availability_and_timeout_codes() {
+        use talon_rust_client::CoordinatorError;
+        for (kind, status) in [
+            (std::io::ErrorKind::ConnectionReset, STATUS_UNAVAILABLE),
+            (std::io::ErrorKind::TimedOut, STATUS_TIMEOUT),
+        ] {
+            let result = TalonResult::read(
+                7,
+                Err(RustError::Coordinator(CoordinatorError::Io(kind.into()))),
+            );
+            assert_eq!(result.status, status);
+            assert_eq!(result.bytes_written, 0);
+            assert!(result.error.is_some());
+        }
+        assert_eq!(STATUS_OPERATION_ERROR, 4);
     }
 }
