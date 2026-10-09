@@ -15,6 +15,7 @@ import socket
 import subprocess
 import threading
 import time
+import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -37,14 +38,38 @@ def http(port, path, body=None):
 
 def until(predicate, seconds=15):
     deadline = time.monotonic() + seconds
+    last_error = None
     while time.monotonic() < deadline:
         try:
-            if predicate():
-                return
-        except (OSError, ValueError):
-            pass
+            result = predicate()
+            if result:
+                return result
+        except urllib.error.HTTPError as error:
+            # Shared-runner etcd latency can exceed the deliberately short
+            # backend timeout. Retry observations, never mutations or SDK calls.
+            if error.code != 503:
+                raise
+            last_error = RuntimeError(f"{error}: {error.read().decode(errors='replace')}")
+            error.close()
+        except OSError as error:
+            last_error = error
         time.sleep(0.05)
-    raise AssertionError("condition did not converge within deadline")
+    raise AssertionError("condition did not converge within deadline") from last_error
+
+
+def observe_discovery(read, state=None, token=None):
+    """Return the same snapshot whose state and topology were checked."""
+    def ready():
+        view = read()
+        if token is not None:
+            assert view["topology_token"] == token, "logical topology changed"
+        if state is not None and not (
+            len(view["workers"]) == 1 and state in view["workers"][0]["state"]
+        ):
+            return None
+        return view
+
+    return until(ready)
 
 
 class Origin(BaseHTTPRequestHandler):
@@ -157,15 +182,12 @@ def main():
             env["TALON_WORKER_NODE_ID"] = identity
         return start("worker", bins / "talon-worker", env=env)
 
-    def discovery(number=1):
-        return http(ports[f"a{number}"], "/api/v1/worker-discovery")
-
-    def state_is(state, number=1):
-        view = discovery(number)
-        return len(view["workers"]) == 1 and (state in view["workers"][0]["state"])
+    def discovery(number=1, state=None, token=None):
+        return observe_discovery(
+            lambda: http(ports[f"a{number}"], "/api/v1/worker-discovery"), state, token)
 
     def update(retired):
-        current = http(ports["a1"], "/api/v1/worker-membership")
+        current = until(lambda: http(ports["a1"], "/api/v1/worker-membership"))
         registry = current["registry"]
         registry["members"][0]["retired"] = retired
         http(ports["a1"], "/api/v1/worker-membership", {"expected_registry_revision": current["registry_revision"],
@@ -195,39 +217,36 @@ def main():
         duplicate_lock.wait(timeout=5)
         assert duplicate_lock.returncode != 0
         check("same directory excludes a second process")
-        until(lambda: state_is("Serving") and state_is("Serving", 2))
-        token = discovery()["topology_token"]
-        assert discovery(2)["topology_token"] == token
+        token = discovery(state="Serving")["topology_token"]
+        discovery(2, state="Serving", token=token)
         command(p1, "read", "OK 8192")
         command(p2, "read", "OK 8192")
         origin_gets = Origin.gets
         assert origin_gets > 0
         check("persistent membership, two-coordinator agreement and exact cache fill")
         for sig, endpoint in [(signal.SIGTERM, "w2"), (signal.SIGKILL, "w2")]:
-            before = discovery()["workers"][0]["state"]["Serving"]["instance_id"]
+            before = discovery(state="Serving", token=token)["workers"][0]["state"]["Serving"]["instance_id"]
             stop(w, sig)
-            until(lambda: state_is("Offline") and state_is("Offline", 2))
-            assert discovery()["topology_token"] == token
+            for number in [1, 2]:
+                discovery(number, state="Offline", token=token)
             time.sleep(0.6)
             command(p1, "read", "ERR Unavailable")
             command(p1, "stat", "ERR Unavailable")
             w = worker(endpoint)
-            until(lambda: http(ports["wa"], "/readyz") and state_is("Serving"))
+            until(lambda: http(ports["wa"], "/readyz"))
             assert (root / "cache/worker_identity").read_bytes() == identity
-            view = discovery()
-            assert view["topology_token"] == token
+            view = discovery(state="Serving", token=token)
             assert view["workers"][0]["state"]["Serving"]["instance_id"] != before
             time.sleep(0.6)
             command(p1, "read", "OK 8192")
             assert Origin.gets == origin_gets, "restart refetched resident data"
             check(f"{sig.name}: stable identity/owner, unavailable gap, recovered cache hit")
         duplicate = worker("dup", cache="duplicate", identity=worker_id, admin="dupa")
-        until(lambda: state_is("Conflict"))
-        assert discovery()["topology_token"] == token
+        discovery(state="Conflict", token=token)
         time.sleep(0.6)
         command(p1, "read", "ERR Unavailable")
         stop(duplicate)
-        until(lambda: state_is("Serving"))
+        discovery(state="Serving", token=token)
         check("duplicate identity conflicts without changing topology")
         stop(c1)
         time.sleep(0.6)
@@ -241,13 +260,14 @@ def main():
         time.sleep(0.7)
         assert command(p1, "read") in ["ERR Unavailable", "ERR Timeout"]
         etcd = start_etcd()
-        until(lambda: state_is("Serving") and state_is("Serving", 2))
+        for number in [1, 2]:
+            discovery(number, state="Serving", token=token)
         time.sleep(0.6)
         command(p1, "read", "OK 8192")
         assert discovery()["topology_token"] == token
         check("backend outage fails closed and durable registry recovers")
         stop(w)
-        until(lambda: state_is("Offline"))
+        discovery(state="Offline", token=token)
         update(retired=True)
         assert discovery()["topology_token"] != token
         rejected = worker("w2")
@@ -256,8 +276,8 @@ def main():
         stop(rejected)
         update(retired=False)
         w = worker("w2")
-        until(lambda: http(ports["wa"], "/readyz") and state_is("Serving"))
-        assert discovery()["topology_token"] == token
+        until(lambda: http(ports["wa"], "/readyz"))
+        discovery(state="Serving", token=token)
         check("retirement persists until explicit administrative reactivation")
         report = {"runtime": args.runtime, "page_size": args.page_size, "checks": checks,
                   "origin_gets": Origin.gets, "worker_id": worker_id, "topology_token": token}

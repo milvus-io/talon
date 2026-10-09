@@ -656,6 +656,8 @@ jobs:
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
+      - name: Test acceptance observation handling
+        run: python3 scripts/test_rolling_upgrade_e2e.py
       - name: Prepare patched Monoio
         run: python3 scripts/prepare_monoio.py
       - name: Install protoc and isolated etcd
