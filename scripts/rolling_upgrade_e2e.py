@@ -6,6 +6,7 @@ its development container with an explicit data-backed --work-dir. Logs and
 report.json are retained. No Kubernetes resources or external services are used.
 """
 import argparse
+from contextlib import ExitStack
 import json
 import os
 from pathlib import Path
@@ -20,10 +21,32 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 
-def free_port():
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
+# A registry update performs several sequential etcd operations. Shared CI
+# runners can spend hundreds of milliseconds on each durable operation; the
+# entire update must not be constrained to the old 300 ms budget. Keep lease,
+# failure grace, client timeout, and acceptance waits consistent with that budget.
+HEARTBEAT_MS = 100
+STATE_REQUEST_TIMEOUT_MS = 3000
+STATE_FAILURE_GRACE_MS = 5000
+STATE_LEASE_TTL_MS = 10000
+HTTP_TIMEOUT_SECONDS = STATE_REQUEST_TIMEOUT_MS / 1000 + 2
+OBSERVATION_TIMEOUT_SECONDS = 30
+# Allow a reconciliation already in flight, the next heartbeat, and the SDK's
+# 500 ms discovery validity to expire before asserting a changed serving state.
+SETTLE_SECONDS = (STATE_REQUEST_TIMEOUT_MS + HEARTBEAT_MS) / 1000 + 0.6
+OUTAGE_SECONDS = STATE_FAILURE_GRACE_MS / 1000 + SETTLE_SECONDS
+
+
+def free_ports(names):
+    # Keep every reservation open until allocation finishes; closing each socket
+    # immediately lets the OS hand the same ephemeral port to another service.
+    with ExitStack() as reservations:
+        ports = {}
+        for name in names:
+            sock = reservations.enter_context(socket.socket())
+            sock.bind(("127.0.0.1", 0))
+            ports[name] = sock.getsockname()[1]
+        return ports
 
 
 def http(port, path, body=None):
@@ -31,12 +54,12 @@ def http(port, path, body=None):
     request = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=data,
                                      method="GET" if body is None else "PUT",
                                      headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(request, timeout=3) as response:
+    with urllib.request.urlopen(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
         payload = response.read()
         return json.loads(payload) if payload else None
 
 
-def until(predicate, seconds=15):
+def until(predicate, seconds=OBSERVATION_TIMEOUT_SECONDS):
     deadline = time.monotonic() + seconds
     last_error = None
     while time.monotonic() < deadline:
@@ -45,8 +68,7 @@ def until(predicate, seconds=15):
             if result:
                 return result
         except urllib.error.HTTPError as error:
-            # Shared-runner etcd latency can exceed the deliberately short
-            # backend timeout. Retry observations, never mutations or SDK calls.
+            # Retry transient observations, never mutations or SDK calls.
             if error.code != 503:
                 raise
             last_error = RuntimeError(f"{error}: {error.read().decode(errors='replace')}")
@@ -116,9 +138,8 @@ def main():
     root = args.work_dir.resolve()
     bins = args.bin_dir.resolve()
     processes, logs, checks = [], [], []
-    ports = {name: free_port() for name in ["etcd", "peer", "c1", "a1", "c2", "a2", "w", "wa", "w2", "dup", "dupa"]}
-    assert len(set(ports.values())) == len(ports), "ephemeral port collision; rerun"
-    origin = ThreadingHTTPServer(("127.0.0.1", 0), Origin)
+    ports = free_ports(["etcd", "peer", "c1", "a1", "c2", "a2", "w", "wa", "w2", "dup", "dupa", "origin"])
+    origin = ThreadingHTTPServer(("127.0.0.1", ports["origin"]), Origin)
     threading.Thread(target=origin.serve_forever, daemon=True).start()
 
     def start(name, binary, argv=(), env=None, probe=False):
@@ -165,8 +186,10 @@ def main():
             "TALON_COORDINATOR_ADMIN_LISTEN": f"127.0.0.1:{ports[f'a{number}']}",
             "TALON_COORDINATOR_NODE_ID": f"coordinator-{number}", "TALON_COORDINATOR_CLUSTER_ID": "rolling-test",
             "TALON_COORDINATOR_STATE_BACKEND": "etcd", "TALON_COORDINATOR_ETCD_ENDPOINTS": f"http://127.0.0.1:{ports['etcd']}",
-            "TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS": "100", "TALON_COORDINATOR_LEASE_TTL_MS": "1000",
-            "TALON_COORDINATOR_REQUEST_TIMEOUT_MS": "300", "TALON_COORDINATOR_UNHEALTHY_AFTER_MS": "500"})
+            "TALON_COORDINATOR_HEARTBEAT_INTERVAL_MS": str(HEARTBEAT_MS),
+            "TALON_COORDINATOR_LEASE_TTL_MS": str(STATE_LEASE_TTL_MS),
+            "TALON_COORDINATOR_REQUEST_TIMEOUT_MS": str(STATE_REQUEST_TIMEOUT_MS),
+            "TALON_COORDINATOR_UNHEALTHY_AFTER_MS": str(STATE_FAILURE_GRACE_MS)})
 
     def worker(port="w", cache="cache", identity=None, admin="wa"):
         env = {"TALON_WORKER_LISTEN": f"127.0.0.1:{ports[port]}",
@@ -174,7 +197,7 @@ def main():
                "TALON_WORKER_COORDINATOR": f"127.0.0.1:{ports['c2']}",
                "TALON_WORKER_CLUSTER_ID": "rolling-test", "TALON_WORKER_CACHE_DIRS": str(root / cache),
                "TALON_WORKER_BLOCK_SIZE": "65536", "TALON_WORKER_CAPACITY_BYTES": str(8 << 20),
-               "TALON_WORKER_L2_PAGE_SIZE_BYTES": str(args.page_size), "TALON_WORKER_HEARTBEAT_INTERVAL_MS": "100",
+               "TALON_WORKER_L2_PAGE_SIZE_BYTES": str(args.page_size), "TALON_WORKER_HEARTBEAT_INTERVAL_MS": str(HEARTBEAT_MS),
                "TALON_WORKER_AZURE_ACCOUNT": "test", "TALON_WORKER_AZURE_SAS": "test",
                "TALON_WORKER_AZURE_ENDPOINT": f"http://127.0.0.1:{origin.server_port}",
                "TALON_WORKER_FORCE_TOKIO_DATA_PLANE": "1" if args.runtime == "tokio" else "0"}
@@ -219,6 +242,7 @@ def main():
         check("same directory excludes a second process")
         token = discovery(state="Serving")["topology_token"]
         discovery(2, state="Serving", token=token)
+        time.sleep(SETTLE_SECONDS)
         command(p1, "read", "OK 8192")
         command(p2, "read", "OK 8192")
         origin_gets = Origin.gets
@@ -229,7 +253,7 @@ def main():
             stop(w, sig)
             for number in [1, 2]:
                 discovery(number, state="Offline", token=token)
-            time.sleep(0.6)
+            time.sleep(SETTLE_SECONDS)
             command(p1, "read", "ERR Unavailable")
             command(p1, "stat", "ERR Unavailable")
             w = worker(endpoint)
@@ -237,32 +261,33 @@ def main():
             assert (root / "cache/worker_identity").read_bytes() == identity
             view = discovery(state="Serving", token=token)
             assert view["workers"][0]["state"]["Serving"]["instance_id"] != before
-            time.sleep(0.6)
+            time.sleep(SETTLE_SECONDS)
             command(p1, "read", "OK 8192")
             assert Origin.gets == origin_gets, "restart refetched resident data"
             check(f"{sig.name}: stable identity/owner, unavailable gap, recovered cache hit")
         duplicate = worker("dup", cache="duplicate", identity=worker_id, admin="dupa")
         discovery(state="Conflict", token=token)
-        time.sleep(0.6)
+        time.sleep(SETTLE_SECONDS)
         command(p1, "read", "ERR Unavailable")
         stop(duplicate)
         discovery(state="Serving", token=token)
         check("duplicate identity conflicts without changing topology")
         stop(c1)
-        time.sleep(0.6)
+        time.sleep(SETTLE_SECONDS)
         command(p2, "read", "OK 8192")
         c1 = coordinator(1)
         until(lambda: http(ports["a1"], "/readyz"))
         assert discovery()["topology_token"] == token
+        time.sleep(SETTLE_SECONDS)
         command(p1, "read", "OK 8192")
         check("SIGTERM coordinator replacement preserves members and peer service")
         stop(etcd, clean=False)
-        time.sleep(0.7)
+        time.sleep(OUTAGE_SECONDS)
         assert command(p1, "read") in ["ERR Unavailable", "ERR Timeout"]
         etcd = start_etcd()
         for number in [1, 2]:
             discovery(number, state="Serving", token=token)
-        time.sleep(0.6)
+        time.sleep(SETTLE_SECONDS)
         command(p1, "read", "OK 8192")
         assert discovery()["topology_token"] == token
         check("backend outage fails closed and durable registry recovers")
@@ -271,7 +296,7 @@ def main():
         update(retired=True)
         assert discovery()["topology_token"] != token
         rejected = worker("w2")
-        time.sleep(1)
+        time.sleep(SETTLE_SECONDS)
         assert not discovery()["workers"], "heartbeat resurrected a retired member"
         stop(rejected)
         update(retired=False)

@@ -6,7 +6,7 @@ import unittest
 from unittest.mock import Mock, patch
 from urllib.error import HTTPError
 
-from rolling_upgrade_e2e import observe_discovery, until
+from rolling_upgrade_e2e import OBSERVATION_TIMEOUT_SECONDS, observe_discovery, until
 
 
 def unavailable():
@@ -52,7 +52,7 @@ class ObservationTests(unittest.TestCase):
         read.assert_called_once()
 
     @patch("rolling_upgrade_e2e.time.sleep")
-    @patch("rolling_upgrade_e2e.time.monotonic", side_effect=[0, 0, 16])
+    @patch("rolling_upgrade_e2e.time.monotonic", side_effect=[0, 0, OBSERVATION_TIMEOUT_SECONDS + 1])
     def test_persistent_503_fails_with_backend_diagnostic(self, _clock, _sleep):
         read = Mock(side_effect=unavailable())
         with self.assertRaisesRegex(AssertionError, "deadline") as failure:
