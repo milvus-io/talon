@@ -132,7 +132,7 @@ pub struct WorkerRuntime {
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<(ScanCursor, Instant, usize)>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
-    page_cleanup: Arc<Mutex<crate::page_cleanup::CleanupCursor>>,
+    page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
 impl WorkerRuntime {
@@ -195,9 +195,9 @@ impl WorkerRuntime {
         metrics.update_l1_residency(0, 0);
         Self {
             l1,
-            page_cleanup: Arc::new(Mutex::new(crate::page_cleanup::CleanupCursor::new(
-                store.root().join("paged"),
-            ))),
+            page_cleanup: Arc::new(tokio::sync::Mutex::new(
+                crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
+            )),
             store: Arc::new(store),
             paged: None,
             index,
@@ -240,9 +240,9 @@ impl WorkerRuntime {
     /// of local disk rather than the whole block. Eviction reclaims individual
     /// pages, leaving the block's other pages intact.
     pub fn with_paged_store(mut self, paged: PagedBlockStore) -> Self {
-        self.page_cleanup = Arc::new(Mutex::new(crate::page_cleanup::CleanupCursor::new(
-            paged.root().to_owned(),
-        )));
+        self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
+            crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
+        ));
         for (id, page, _) in self.index.snapshot_units() {
             if let Some(page) = page {
                 let state = self.page_lifecycle.block(&id);

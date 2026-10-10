@@ -231,13 +231,6 @@ impl Rate {
             tokio::time::sleep_until(at.into()).await;
         }
     }
-    fn charge_blocking(&self, units: u64) {
-        if let Some(at) = self.reserve(units) {
-            if let Some(wait) = at.checked_duration_since(std::time::Instant::now()) {
-                std::thread::sleep(wait);
-            }
-        }
-    }
 }
 
 /// Shared background disk resources. Foreground requests do not use these budgets.
@@ -270,12 +263,9 @@ impl BackgroundBudget {
     pub async fn delete(&self) {
         self.deletes.charge(1).await;
     }
-    pub fn delete_blocking(&self) {
-        self.deletes.charge_blocking(1);
-    }
-    /// Called from blocking disk jobs before each bounded read/write chunk.
-    pub fn bytes_blocking(&self, bytes: usize) {
-        self.bytes.charge_blocking(bytes as u64);
+    /// Await before each bounded read/write chunk.
+    pub async fn bytes(&self, bytes: usize) {
+        self.bytes.charge(bytes as u64).await;
     }
 }
 
@@ -381,7 +371,7 @@ mod tests {
         drop(waiting.await.unwrap());
         let start = std::time::Instant::now();
         let other = budget.clone();
-        let write = tokio::task::spawn_blocking(move || other.bytes_blocking(50_000));
+        let write = tokio::spawn(async move { other.bytes(50_000).await });
         budget.delete().await;
         budget.delete().await;
         write.await.unwrap();

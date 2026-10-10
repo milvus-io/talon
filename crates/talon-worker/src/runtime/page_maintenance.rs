@@ -130,18 +130,17 @@ impl WorkerRuntime {
             .run(async move {
                 let _permit = permit;
                 let _background_io = runtime.background_io().await;
-                let worker = runtime.clone();
-                let report = tokio::task::spawn_blocking(move || {
-                    // The runtime retains the root lease until blocking I/O finishes.
-                    worker.page_cleanup.lock().unwrap().run_batch_with_budget(
-                        &worker.page_lifecycle,
-                        worker.page_gc_config.scan_batch_size,
-                        worker.page_gc_config.delete_batch_size,
-                        worker.background_budget.as_deref(),
+                let report = runtime
+                    .page_cleanup
+                    .lock()
+                    .await
+                    .run_batch_with_budget(
+                        &runtime.page_lifecycle,
+                        runtime.page_gc_config.scan_batch_size,
+                        runtime.page_gc_config.delete_batch_size,
+                        runtime.background_budget.as_deref(),
                     )
-                })
-                .await
-                .expect("page cleanup task panicked");
+                    .await;
                 runtime
                     .page_gc_metrics
                     .cleanup_scanned
@@ -434,9 +433,7 @@ impl WorkerRuntime {
                 let shard = *cursor;
                 *cursor = (shard + 1) % crate::page_lifecycle::SHARDS;
                 let _background_io = runtime.background_io().await;
-                let worker = runtime.clone();
-                let result = tokio::task::spawn_blocking(move || worker.checkpoint_shard(shard)).await
-                    .expect("access checkpoint task panicked");
+                let result = runtime.checkpoint_shard(shard).await;
                 match result {
                     Ok((blocks, bytes)) => {
                         report.blocks += blocks;
@@ -458,89 +455,106 @@ impl WorkerRuntime {
         }).await
     }
 
-    fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
+    async fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
         let paged = self.paged.as_ref().expect("paged TTI");
         let gate = self.page_lifecycle.checkpoint_gate(shard);
-        let _guard = gate.lock().unwrap();
-        let (ceiling, membership, mut dirty) = self.page_lifecycle.checkpoint_start(shard);
-        let mut slot = 0;
-        let mut snapshots = Vec::new();
-        let mut size = 24;
-        loop {
-            let blocks = self
-                .page_lifecycle
-                .checkpoint_batch(shard, &mut slot, ceiling);
-            if blocks.is_empty() {
-                break;
-            }
-            for block in blocks {
-                let state = block.inner.lock().unwrap();
-                dirty |= state.dirty_since.is_some();
-                // Bound allocation before collecting a potentially large block.
-                let records = state.pages.len();
-                size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
-                anyhow::ensure!(
-                    size <= crate::page_access_shard::MAX_BYTES,
-                    "access shard exceeds 64 MiB limit"
-                );
-                // Consume markers before sampling timestamps. Concurrent reads
-                // remain dirty for the next checkpoint; failure restores markers.
-                let pages: Vec<_> = state
-                    .pages
-                    .iter()
-                    .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
-                    .collect();
-                dirty |= pages.iter().any(PageCheckpoint::dirty);
-                // Include clean blocks too: this file replaces the full shard.
-                let snapshot = AccessSnapshot {
-                    revision: state.revision,
-                    sampled_at: self.page_clock.now(),
-                    records: pages
+        let _guard = gate.lock().await;
+        let worker = self.clone();
+        let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let (ceiling, membership, mut dirty) = worker.page_lifecycle.checkpoint_start(shard);
+            let mut slot = 0;
+            let mut snapshots = Vec::new();
+            let mut size = 24;
+            loop {
+                let blocks = worker
+                    .page_lifecycle
+                    .checkpoint_batch(shard, &mut slot, ceiling);
+                if blocks.is_empty() {
+                    break;
+                }
+                for block in blocks {
+                    let state = block.inner.lock().unwrap();
+                    dirty |= state.dirty_since.is_some();
+                    // Bound allocation before collecting a potentially large block.
+                    let records = state.pages.len();
+                    size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
+                    anyhow::ensure!(
+                        size <= crate::page_access_shard::MAX_BYTES,
+                        "access shard exceeds 64 MiB limit"
+                    );
+                    // Consume markers before sampling timestamps. Concurrent reads
+                    // remain dirty for the next checkpoint; failure restores markers.
+                    let pages: Vec<_> = state
+                        .pages
                         .iter()
-                        .filter_map(|page| page.access.map(|age| (page.page, age)))
-                        .collect(),
-                };
-                let resident = !state.pages.is_empty();
-                drop(state);
-                snapshots.push((block, snapshot, resident, pages));
+                        .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
+                        .collect();
+                    dirty |= pages.iter().any(PageCheckpoint::dirty);
+                    // Include clean blocks too: this file replaces the full shard.
+                    let snapshot = AccessSnapshot {
+                        revision: state.revision,
+                        sampled_at: worker.page_clock.now(),
+                        records: pages
+                            .iter()
+                            .filter_map(|page| page.access.map(|age| (page.page, age)))
+                            .collect(),
+                    };
+                    let resident = !state.pages.is_empty();
+                    drop(state);
+                    snapshots.push((block, snapshot, resident, pages));
+                }
             }
-        }
-        if !dirty {
+            if !dirty {
+                return Ok(None);
+            }
+            let paged = worker.paged.as_ref().expect("paged TTI");
+            let dir = paged.root().join(format!("{shard:02x}"));
+            // Whole-block-only registry entries have no paged directory to persist.
+            if !dir.exists() && snapshots.iter().all(|(_, _, resident, _)| !resident) {
+                worker.page_lifecycle.checkpoint_finished(shard, membership);
+                return Ok(None);
+            }
+            let bytes = crate::page_access_shard::encode(
+                paged.page_size(),
+                snapshots
+                    .iter()
+                    .filter(|(_, _, resident, _)| *resident)
+                    .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
+            )?;
+            Ok(Some((membership, snapshots, bytes)))
+        })
+        .await
+        .expect("access checkpoint preparation panicked")?;
+        let Some((membership, snapshots, bytes)) = prepared else {
             return Ok((0, 0));
-        }
+        };
         let dir = paged.root().join(format!("{shard:02x}"));
-        // Whole-block-only registry entries have no paged directory to persist.
-        if !dir.exists() && snapshots.iter().all(|(_, _, resident, _)| !resident) {
-            self.page_lifecycle.checkpoint_finished(shard, membership);
-            return Ok((0, 0));
-        }
-        let bytes = crate::page_access_shard::checkpoint_with_budget(
-            &dir,
-            paged.page_size(),
-            snapshots
+        let bytes =
+            crate::page_access_shard::publish(&dir, bytes, self.background_budget.as_deref())
+                .await?;
+        let worker = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let count = snapshots
                 .iter()
                 .filter(|(_, _, resident, _)| *resident)
-                .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
-            self.background_budget.as_deref(),
-        )?;
-        let count = snapshots
-            .iter()
-            .filter(|(_, _, resident, _)| *resident)
-            .count();
-        for (block, snapshot, _, pages) in snapshots {
-            let mut state = block.inner.lock().unwrap();
-            if state.revision == snapshot.revision {
-                state.dirty_since = None;
-            } else if let Some(since) = state.dirty_since.as_mut() {
-                *since = (*since).max(snapshot.sampled_at);
+                .count();
+            for (block, snapshot, _, pages) in snapshots {
+                let mut state = block.inner.lock().unwrap();
+                if state.revision == snapshot.revision {
+                    state.dirty_since = None;
+                } else if let Some(since) = state.dirty_since.as_mut() {
+                    *since = (*since).max(snapshot.sampled_at);
+                }
+                drop(state);
+                for page in pages {
+                    page.commit();
+                }
             }
-            drop(state);
-            for page in pages {
-                page.commit();
-            }
-        }
-        self.page_lifecycle.checkpoint_finished(shard, membership);
-        Ok((count, bytes))
+            worker.page_lifecycle.checkpoint_finished(shard, membership);
+            Ok((count, bytes))
+        })
+        .await
+        .expect("access checkpoint completion panicked")
     }
 
     async fn refresh_checkpoint_metrics(&self) {

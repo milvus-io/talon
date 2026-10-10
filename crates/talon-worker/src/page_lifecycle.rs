@@ -445,7 +445,7 @@ pub(crate) struct ScanReport {
 pub(crate) struct PageLifecycle {
     shards: Vec<Mutex<Registry>>,
     directories: Vec<Arc<tokio::sync::RwLock<()>>>,
-    checkpoints: Vec<Arc<Mutex<()>>>,
+    checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
 }
 impl PageLifecycle {
     pub fn new() -> Self {
@@ -453,7 +453,9 @@ impl PageLifecycle {
             shards: (0..SHARDS)
                 .map(|_| Mutex::new(Registry::default()))
                 .collect(),
-            checkpoints: (0..SHARDS).map(|_| Arc::new(Mutex::new(()))).collect(),
+            checkpoints: (0..SHARDS)
+                .map(|_| Arc::new(tokio::sync::Mutex::new(())))
+                .collect(),
             directories: (0..DIRECTORY_SHARDS)
                 .map(|_| Arc::new(tokio::sync::RwLock::new(())))
                 .collect(),
@@ -604,7 +606,7 @@ impl PageLifecycle {
     }
     /// Only checkpoint publication and cleanup of shard-level temporary files
     /// take this gate. Foreground page I/O never waits for a shard checkpoint.
-    pub fn checkpoint_gate(&self, shard: usize) -> Arc<Mutex<()>> {
+    pub fn checkpoint_gate(&self, shard: usize) -> Arc<tokio::sync::Mutex<()>> {
         self.checkpoints[shard].clone()
     }
     pub fn checkpoint_start(&self, shard: usize) -> (u64, u64, bool) {

@@ -3,9 +3,10 @@ use crate::page_access_store::{AccessRecovery, AccessSnapshot, PageAccessStore};
 use crate::page_lifecycle::disk_shard;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Write};
+use std::io::Read;
 use std::path::Path;
 use talon_core::BlockId;
+use tokio::io::AsyncWriteExt;
 use xxhash_rust::xxh3::xxh3_64;
 
 const MAGIC: &[u8; 8] = b"TLNSHR01";
@@ -84,20 +85,19 @@ pub(crate) fn load(dir: &Path, shard: usize, page_size: u32, now: u64) -> Option
 /// No block gate is held: a snapshot may become stale exactly as an unsaved access
 /// can, but it neither publishes residency nor clears a newer dirty revision.
 #[cfg(test)]
-pub(crate) fn checkpoint<'a>(
+pub(crate) async fn checkpoint<'a>(
     dir: &Path,
     page_size: u32,
     records: impl Iterator<Item = (&'a BlockId, &'a AccessSnapshot)>,
 ) -> anyhow::Result<usize> {
-    checkpoint_with_budget(dir, page_size, records, None)
+    let bytes = encode(page_size, records)?;
+    publish(dir, bytes, None).await
 }
 
-pub(crate) fn checkpoint_with_budget<'a>(
-    dir: &Path,
+pub(crate) fn encode<'a>(
     page_size: u32,
     records: impl Iterator<Item = (&'a BlockId, &'a AccessSnapshot)>,
-    resources: Option<&crate::background::BackgroundBudget>,
-) -> anyhow::Result<usize> {
+) -> anyhow::Result<Vec<u8>> {
     let mut bytes = Vec::from(*MAGIC);
     bytes.extend_from_slice(&page_size.to_le_bytes());
     bytes.extend_from_slice(&0_u32.to_le_bytes());
@@ -114,10 +114,25 @@ pub(crate) fn checkpoint_with_budget<'a>(
     }
     bytes[12..16].copy_from_slice(&count.to_le_bytes());
     bytes.extend_from_slice(&xxh3_64(&bytes).to_le_bytes());
+    Ok(bytes)
+}
+
+/// The caller retains the shard gate and mutation ownership across every await.
+pub(crate) async fn publish(
+    dir: &Path,
+    bytes: Vec<u8>,
+    resources: Option<&crate::background::BackgroundBudget>,
+) -> anyhow::Result<usize> {
     // Shard directories are retained by cleanup. Never recreate a missing one.
-    let mut tmp = tempfile::Builder::new()
-        .prefix(TEMP_PREFIX)
-        .tempfile_in(dir)?;
+    let directory = dir.to_owned();
+    let (file, temp_path) = tokio::task::spawn_blocking(move || {
+        tempfile::Builder::new()
+            .prefix(TEMP_PREFIX)
+            .tempfile_in(directory)
+            .map(|temp| temp.into_parts())
+    })
+    .await??;
+    let mut file = tokio::fs::File::from_std(file);
     let defaults;
     let resources = match resources {
         Some(resources) => resources,
@@ -128,18 +143,20 @@ pub(crate) fn checkpoint_with_budget<'a>(
         }
     };
     for chunk in bytes.chunks(64 * 1024) {
-        resources.bytes_blocking(chunk.len());
-        tmp.write_all(chunk)?;
+        resources.bytes(chunk.len()).await;
+        file.write_all(chunk).await?;
     }
     #[cfg(test)]
     crate::page_access_store::checkpoint_fault("file_sync")?;
-    tmp.as_file().sync_all()?;
+    file.flush().await?;
+    file.sync_all().await?;
     #[cfg(test)]
     crate::page_access_store::checkpoint_fault("rename")?;
-    tmp.persist(dir.join(FILE_NAME))?;
+    let target = dir.join(FILE_NAME);
+    tokio::task::spawn_blocking(move || temp_path.persist(target)).await??;
     #[cfg(test)]
     crate::page_access_store::checkpoint_fault("directory_sync")?;
-    File::open(dir)?.sync_all()?;
+    tokio::fs::File::open(dir).await?.sync_all().await?;
     Ok(bytes.len())
 }
 
@@ -149,8 +166,8 @@ mod tests {
     use crate::page_access_store::FAIL_CHECKPOINT;
     use talon_core::{Backend, ObjectId, Version};
 
-    #[test]
-    fn failures_retain_atomic_snapshot_and_decoder_rejects_invalid_shards() {
+    #[tokio::test]
+    async fn failures_retain_atomic_snapshot_and_decoder_rejects_invalid_shards() {
         let dir = tempfile::tempdir().unwrap();
         let id = BlockId::new(
             ObjectId::new(Backend::S3, "bucket", "key"),
@@ -170,9 +187,11 @@ mod tests {
             records: vec![(0, 20)],
         };
         for stage in ["file_sync", "rename", "directory_sync"] {
-            checkpoint(dir.path(), 16, std::iter::once((&id, &old))).unwrap();
+            checkpoint(dir.path(), 16, std::iter::once((&id, &old)))
+                .await
+                .unwrap();
             FAIL_CHECKPOINT.with(|f| f.set(Some(stage)));
-            let result = checkpoint(dir.path(), 16, std::iter::once((&id, &new)));
+            let result = checkpoint(dir.path(), 16, std::iter::once((&id, &new))).await;
             FAIL_CHECKPOINT.with(|f| f.set(None));
             assert!(result.is_err());
             let r = load(dir.path(), shard, 16, 30).unwrap();
@@ -185,7 +204,9 @@ mod tests {
         }
         assert!(load(dir.path(), (shard + 1) % 256, 16, 30).unwrap().corrupt);
         assert!(load(dir.path(), shard, 32, 30).unwrap().corrupt);
-        checkpoint(dir.path(), 16, [(&id, &old), (&id, &new)].into_iter()).unwrap();
+        checkpoint(dir.path(), 16, [(&id, &old), (&id, &new)].into_iter())
+            .await
+            .unwrap();
         assert!(load(dir.path(), shard, 16, 30).unwrap().corrupt);
         let file = File::create(dir.path().join(FILE_NAME)).unwrap();
         file.set_len(MAX_BYTES as u64 + 1).unwrap();

@@ -32,6 +32,12 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
   and orphan cleanup. A slot stays owned until disk and metadata changes finish,
   including when a caller is cancelled. Existing page-GC concurrency remains an
   additional limit for page deletion and cleanup.
+  All rate waits use asynchronous timers, including directory cleanup and each
+  checkpoint write chunk; pacing never occupies a blocking-pool thread. Cleanup
+  and checkpoint filesystem operations use asynchronous APIs, while snapshot
+  encoding and synchronous temporary-file operations run in short blocking jobs.
+  The admitted mutation retains its I/O slot and required directory/shard gates
+  across waits to preserve serialization and cancellation safety.
 - **Batch sizes** cap scanned entries and deletion candidates for GC, cleanup,
   and eviction. Existing page-GC batch limits also apply; the smaller limit wins.
   Checkpoints retain their atomic one-shard transaction, bounded by the existing
