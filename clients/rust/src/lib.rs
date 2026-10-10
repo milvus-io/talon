@@ -61,7 +61,7 @@ pub use talon_cache_client::{
     BlockReadError, CacheReadError, CoordinatorError, LoadError, LoadFailure, LoadResult,
     ObjectStat, WorkerError, WorkerLoadError,
 };
-pub use talon_core::{ObjectId, Version};
+pub use talon_core::{ObjectId, Version, UNCHECKED_VERSION};
 pub use talon_transport::{DataErrorCode, DataPlaneError, ObjectEntry};
 
 pub use talon_telemetry::{RequestOptions, TraceContext, TraceParent};

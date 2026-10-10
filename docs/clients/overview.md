@@ -55,6 +55,25 @@ Rust sends the minimum version that can represent the message. Nothing would
 have crashed — an older coordinator would simply have rejected requests it could
 have served, invisibly from both ends.
 
+## Reading without ETag matching
+
+For objects your application guarantees are immutable, pass the exported
+constant as the existing read API's version argument:
+
+| Client | Constant |
+| --- | --- |
+| Rust | `talon_rust_client::UNCHECKED_VERSION` |
+| Python | `talon.UNCHECKED_VERSION` |
+| C / C++ | `TALON_UNCHECKED_VERSION` from `talon.h` |
+| Java | `TalonClient.UNCHECKED_VERSION` |
+
+For Rust, set `ObjectStat.version = UNCHECKED_VERSION.to_owned()` and pass the
+stat to `read` / `read_into`. Continue supplying file size wherever required by
+the existing API. The token skips ETag matching only: metadata lookup, range
+validation, and caching retain their usual behavior. It does not mean "latest";
+overwriting a cached object can return stale or mixed data. Workers must support
+the token before clients use it.
+
 ## Current scope
 
 All native SDKs support single-file and protocol-level batch prewarming:

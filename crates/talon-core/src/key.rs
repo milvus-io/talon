@@ -11,6 +11,11 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+/// Reserved read version that skips origin ETag matching.
+/// Callers must keep the object immutable while cached. Metadata lookups,
+/// required size arguments, and cache behavior are unchanged.
+pub const UNCHECKED_VERSION: &str = "__talon_unchecked__";
+
 /// A supported blob-storage backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Backend {
