@@ -80,6 +80,11 @@ impl WorkerBackground {
             worker,
         }
     }
+    /// Stop scheduling maintenance as soon as the worker starts draining requests.
+    pub fn begin_shutdown(&self) {
+        self.scheduler.begin_shutdown();
+    }
+
     /// Stop admission, finish active maintenance and owned mutations, then flush access metadata
     /// using the same disk budget. External process shutdown deadlines still apply.
     pub async fn shutdown(self) {

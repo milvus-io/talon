@@ -275,6 +275,41 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
+    async fn begin_shutdown_stops_admission_before_join_and_drains_active_work() {
+        let gate = Arc::new(Semaphore::new(0));
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut scheduler = BackgroundScheduler::new(1);
+        for name in ["active", "queued"] {
+            let gate = gate.clone();
+            let sent = sent.clone();
+            scheduler.register(name, Duration::from_millis(1), move || {
+                let gate = gate.clone();
+                let sent = sent.clone();
+                async move {
+                    sent.send(name).unwrap();
+                    gate.acquire().await.unwrap().forget();
+                }
+            });
+        }
+        let mut handle = scheduler.start();
+        assert_eq!(received.recv().await.unwrap(), "active");
+        handle.begin_shutdown();
+        assert!(!handle.task.as_ref().unwrap().is_finished());
+        gate.add_permits(1);
+        // The scheduler must finish without waiting for the later shutdown join:
+        // admitting the queued registration would block on the empty gate.
+        tokio::time::timeout(Duration::from_secs(1), handle.task.take().unwrap())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            received.try_recv().is_err(),
+            "no admission after begin_shutdown"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn bounded_fair_non_reentrant_and_shutdown_drains() {
         let gate = Arc::new(Semaphore::new(0));
         let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();

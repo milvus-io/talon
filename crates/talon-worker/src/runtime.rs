@@ -5,9 +5,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-mod load;
 mod async_eviction;
 mod background;
+mod load;
 pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]

@@ -78,9 +78,11 @@ low rate can delay other tasks, especially with task concurrency set to one.
 
 The scheduler stops admitting work on shutdown, finishes admitted invocations, drains
 owned mutations, then flushes dirty access metadata with the same disk budget.
-The process retains its existing 10-second maintenance shutdown deadline; after
-that deadline, restart uses the last valid checkpoint. Dropping the scheduler
-handle also stops admission and lets active batches finish.
+Admission stops as soon as the worker starts draining requests. Maintenance and
+the final checkpoint share the process's 20-second drain deadline with request
+and control handling. If the deadline expires, the process exits while retaining
+the cache-directory lock until termination; restart uses the last valid checkpoint.
+Dropping the scheduler handle also stops admission and lets active batches finish.
 
 Metrics `talon_worker_background_task_active`,
 `talon_worker_background_task_completed_total`,
