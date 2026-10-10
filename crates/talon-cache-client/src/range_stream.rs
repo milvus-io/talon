@@ -127,6 +127,7 @@ struct StreamState {
     object: ObjectId,
     version: Version,
     block_size: u32,
+    object_len: u64,
     position: u64,
     end: u64,
     chunk_size: u32,
@@ -178,6 +179,7 @@ impl BlockReader {
             object: file.object.clone(),
             version: file.version.clone(),
             block_size: file.block_size,
+            object_len: file.size,
             position: offset.min(file.size),
             end: requested_end.min(file.size),
             chunk_size,
@@ -202,7 +204,7 @@ impl BlockReader {
             );
             let bytes = state
                 .reader
-                .read_block_detailed(&block, offset_in_block, take)
+                .read_block_detailed(&block, offset_in_block, take, state.object_len)
                 .await
                 .map_err(CacheReadError::from)?;
             if bytes.len() != take as usize {
@@ -295,7 +297,9 @@ mod tests {
                         socket.read_exact(&mut body).await.unwrap();
                         let mut frame = header.encode().to_vec();
                         frame.extend_from_slice(&body);
-                        let request = decode_versioned_request(&frame).unwrap().1.request;
+                        let versioned = decode_versioned_request(&frame).unwrap().1;
+                        assert_eq!(versioned.object_len, 10);
+                        let request = versioned.request;
                         requests.fetch_add(1, Ordering::SeqCst);
                         let bytes: Vec<u8> = (request.offset..request.offset + request.len)
                             .map(|value| value as u8)

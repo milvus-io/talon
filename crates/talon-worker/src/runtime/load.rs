@@ -110,7 +110,7 @@ impl WorkerRuntime {
                         .await?,
                 )
             } else {
-                self.serve_versioned(&request, &block.version).await?
+                self.serve_at(&request, &block.version, None).await?
             };
             let actual = match outcome {
                 ServeOutcome::Bytes(bytes) => bytes.len() as u64,
@@ -600,9 +600,144 @@ mod tests {
                     .len(),
                 8
             );
+            for tenant in [false, true] {
+                let request = talon_transport::VersionedRangeRequest {
+                    request: RangeRequest {
+                        object: ObjectId::new(
+                            talon_core::Backend::S3,
+                            "bucket",
+                            format!("cold-{tenant}"),
+                        ),
+                        offset: 1,
+                        len: 20,
+                    },
+                    version: Version::new("v1"),
+                    object_len: 21,
+                };
+                let frame = if tenant {
+                    talon_transport::data::encode_versioned_tenant_request(
+                        8,
+                        &talon_transport::TenantScopedVersionedRange {
+                            tenant: talon_core::TenantId::named("tenant"),
+                            request,
+                        },
+                    )
+                    .unwrap()
+                } else {
+                    talon_transport::data::encode_versioned_request(8, &request).unwrap()
+                };
+                socket.write_all(&frame).await.unwrap();
+                let mut header = [0; talon_transport::HEADER_LEN];
+                socket.read_exact(&mut header).await.unwrap();
+                let header = talon_transport::FrameHeader::decode(&header).unwrap();
+                assert!(!header.flags.contains(talon_transport::Flags::ERROR));
+                let mut bytes = vec![0; header.length as usize];
+                socket.read_exact(&mut bytes).await.unwrap();
+                assert_eq!(bytes, (1..21).collect::<Vec<u8>>());
+                assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+            }
             drop(socket);
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn sized_reads_fill_short_tail_without_head_or_current_version_update() {
+        for paged in [false, true] {
+            let (_root, backend, runtime) = setup(paged);
+            let object = block(0).object;
+            // A pinned historical read must not replace known current metadata.
+            runtime.store_version(&object, &Version::new("v2"), 33);
+            let request = RangeRequest {
+                object: object.clone(),
+                offset: 1,
+                len: 20,
+            };
+            let outcome = runtime
+                .serve_versioned(&request, &Version::new("v1"), 21)
+                .await
+                .unwrap();
+            let ServeOutcome::Bytes(bytes) = outcome else {
+                panic!("cross-block byte response")
+            };
+            assert_eq!(bytes.as_ref(), (1..21).collect::<Vec<u8>>());
+            assert_eq!(
+                runtime.cached_object_len(&object, &Version::new("v2")),
+                Some(33)
+            );
+            assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+            let calls = backend.fetches.load(Ordering::SeqCst);
+            backend.changed.store(true, Ordering::SeqCst);
+            // The final one-byte page remains readable from the pinned cache.
+            runtime
+                .serve_versioned(
+                    &RangeRequest {
+                        object: object.clone(),
+                        offset: 20,
+                        len: 1,
+                    },
+                    &Version::new("v1"),
+                    21,
+                )
+                .await
+                .unwrap();
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), calls);
+            // A different cold object still uses If-Match and rejects v2.
+            let cold = RangeRequest {
+                object: ObjectId::new(talon_core::Backend::S3, "bucket", "cold"),
+                offset: 0,
+                len: 1,
+            };
+            let error = runtime
+                .serve_versioned(&cold, &Version::new("v1"), 21)
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(
+                error.downcast_ref::<Error>(),
+                Some(Error::VersionMismatch { .. })
+            ));
+            assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn sized_reads_reject_bad_extents_and_short_origin_without_head() {
+        let (_root, backend, runtime) = setup(true);
+        for (offset, len, size) in [(0, 1, 0), (20, 2, 21), (u64::MAX, 1, u64::MAX)] {
+            let request = RangeRequest {
+                object: block(0).object,
+                offset,
+                len,
+            };
+            assert!(runtime
+                .serve_versioned(&request, &Version::new("v1"), size)
+                .await
+                .is_err());
+        }
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+        let request = RangeRequest {
+            object: block(0).object,
+            offset: 20,
+            len: 4,
+        };
+        assert!(runtime
+            .serve_versioned(&request, &Version::new("v1"), 24)
+            .await
+            .is_err());
+        assert!(
+            runtime
+                .serve_cached(&CachedRangeRequest {
+                    object: request.object,
+                    version: Version::new("v1"),
+                    offset: 20,
+                    len: 1,
+                })
+                .await
+                .is_err(),
+            "a short origin response must not publish the page"
+        );
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

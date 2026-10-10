@@ -42,14 +42,14 @@ URIs use the same namespaces as the FUSE mount — `s3://`, `gcs://`, `az://`.
 
 ## Reading many ranges of one object
 
-`read(uri, offset, length)` resolves the version with a `stat` first. When
+`read(uri, offset, length)` resolves the version and size with a `stat` first. When
 reading many ranges of the same object, resolve it once and use the overload
 that takes it:
 
 ```java
 ObjectStat info = client.stat(uri);
 for (long offset = 0; offset < info.size(); offset += chunkSize) {
-    byte[] part = client.read(uri, info.version(), offset, chunkSize);
+    byte[] part = client.read(uri, info.version(), info.size(), offset, chunkSize);
 }
 ```
 
@@ -67,7 +67,7 @@ synchronised.
 ```java
 try (ExecutorService pool = Executors.newFixedThreadPool(8)) {
     for (long offset : offsets) {
-        pool.submit(() -> client.read(uri, info.version(), offset, chunkSize));
+        pool.submit(() -> client.read(uri, info.version(), info.size(), offset, chunkSize));
     }
 }
 ```

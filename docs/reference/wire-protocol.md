@@ -241,18 +241,24 @@ A client that already resolved an object's source version sends a distinct
 `GetVersionedRange` request (message type 10):
 
 ```
-struct VersionedRangeRequest { request: RangeRequest, version: Version }
+struct VersionedRangeRequest { request: RangeRequest, version: Version, object_len: u64 }
 ```
 
 The worker must serve the exact versioned cache identity or fill it from the
 backend with `version` as a conditional request. It returns `VersionMismatch`
 if that generation is no longer available; it must not re-resolve and serve a
 newer generation. `GetVersionedRangeTenant` (message type 11) wraps the request
-with a `TenantId`. A paged miss may issue HEAD to obtain the block length;
-that metadata must match the requested version too. These distinct request types are fail-closed during rolling
-upgrades: an older worker rejects them instead of silently ignoring `version`.
-Deployments must therefore upgrade workers before enabling a client that emits
-these messages; old clients continue using `GetRange` against new workers.
+with a `TenantId`.
+
+`object_len` is the required total byte length of that exact version, not the
+requested range length. Workers use it to size pages, including the final short
+page, without HEAD. The length is request-local and does not update the
+current-version cache. Requests extending past the supplied size are rejected;
+SDKs clamp reads at EOF. Missing or truncated size fields are rejected.
+
+`LoadBlock` and `BatchLoad` carry exact block lengths and also avoid metadata
+HEAD, including for short tail blocks.
+
 Custom `BackendStore` implementations must explicitly implement conditional
 range reads; the trait default rejects a supplied version rather than silently
 ignoring it.

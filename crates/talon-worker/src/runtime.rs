@@ -351,12 +351,12 @@ impl WorkerRuntime {
         // was overwritten within the version-cache window) drop the stale entry
         // and retry once against a force-resolved version.
         let version = self.resolve_version(&request.object, false).await?;
-        match self.serve_range_at(request, &version).await {
+        match self.serve_range_at(request, &version, None).await {
             Ok(bytes) => Ok(bytes),
             Err(error) if is_version_mismatch(&error) => {
                 self.invalidate_version(&request.object);
                 let version = self.resolve_version(&request.object, true).await?;
-                self.serve_range_at(request, &version).await
+                self.serve_range_at(request, &version, None).await
             }
             Err(error) => Err(error),
         }
@@ -381,12 +381,12 @@ impl WorkerRuntime {
             return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
         }
         let version = self.resolve_version(&request.object, false).await?;
-        match self.serve_at(request, &version).await {
+        match self.serve_at(request, &version, None).await {
             Ok(outcome) => Ok(outcome),
             Err(error) if is_version_mismatch(&error) => {
                 self.invalidate_version(&request.object);
                 let version = self.resolve_version(&request.object, true).await?;
-                self.serve_at(request, &version).await
+                self.serve_at(request, &version, None).await
             }
             Err(error) => Err(error),
         }
@@ -396,22 +396,30 @@ impl WorkerRuntime {
     ///
     /// Unlike [`serve`](Self::serve), this path never switches to the current
     /// source version. A matching resident block remains readable; an origin
-    /// miss is fetched with `version` as an `If-Match` precondition. A paged miss
-    /// may HEAD for its length, but must reject metadata for another version.
-    /// A changed source propagates `VersionMismatch` to the caller.
+    /// miss is fetched with `version` as an `If-Match` precondition. The supplied
+    /// total object length sizes pages without HEAD and never refreshes the
+    /// current-version cache. A changed source propagates `VersionMismatch`.
     pub async fn serve_versioned(
         &self,
         request: &RangeRequest,
         version: &Version,
+        object_len: u64,
     ) -> anyhow::Result<ServeOutcome> {
         self.ensure_configured_backend(request.object.backend)?;
         if version.0.trim().is_empty() {
             anyhow::bail!("version-pinned range request has an empty source version");
         }
+        let end = request
+            .offset
+            .checked_add(request.len)
+            .ok_or_else(|| anyhow::anyhow!("range offset+len overflows u64"))?;
+        if end > object_len {
+            anyhow::bail!("version-pinned range exceeds supplied object length");
+        }
         if request.len == 0 {
             return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
         }
-        self.serve_at(request, version).await
+        self.serve_at(request, version, Some(object_len)).await
     }
 
     /// Serve a versioned range only from resident cache state.
@@ -491,6 +499,7 @@ impl WorkerRuntime {
         &self,
         request: &RangeRequest,
         version: &Version,
+        object_len: Option<u64>,
     ) -> anyhow::Result<ServeOutcome> {
         let block_size = self.block_size as u64;
         let end = request
@@ -572,8 +581,14 @@ impl WorkerRuntime {
             }
             if self.l1.is_enabled() {
                 return Ok(ServeOutcome::Bytes(
-                    self.block_range_bytes(request, &block, offset_in_block, request.len)
-                        .await?,
+                    self.block_range_bytes(
+                        request,
+                        &block,
+                        offset_in_block,
+                        request.len,
+                        object_len,
+                    )
+                    .await?,
                 ));
             }
             if self.index.is_whole_and_touch(&block) {
@@ -602,13 +617,13 @@ impl WorkerRuntime {
             }
 
             return Ok(ServeOutcome::Bytes(
-                self.block_range_bytes(request, &block, offset_in_block, request.len)
+                self.block_range_bytes(request, &block, offset_in_block, request.len, object_len)
                     .await?,
             ));
         }
 
         // Fallback: miss or boundary-spanning read → in-memory bytes.
-        let bytes = self.serve_range_at(request, version).await?;
+        let bytes = self.serve_range_at(request, version, object_len).await?;
         Ok(ServeOutcome::Bytes(bytes))
     }
 
@@ -623,6 +638,7 @@ impl WorkerRuntime {
         &self,
         request: &RangeRequest,
         version: &Version,
+        object_len: Option<u64>,
     ) -> anyhow::Result<bytes::Bytes> {
         let block_size = self.block_size as u64;
         let end = request
@@ -637,7 +653,7 @@ impl WorkerRuntime {
             let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
             return self
-                .block_range_bytes(request, &block, offset_in_block, request.len)
+                .block_range_bytes(request, &block, offset_in_block, request.len, object_len)
                 .await;
         }
 
@@ -650,7 +666,7 @@ impl WorkerRuntime {
             let block_end = block.offset + block_size;
             let take = block_end.min(end) - cursor;
             let piece = self
-                .block_range_bytes(request, &block, offset_in_block, take)
+                .block_range_bytes(request, &block, offset_in_block, take, object_len)
                 .await?;
             // A block that returned fewer bytes than its share means the object
             // ends inside it; stop rather than silently returning a short read.
@@ -854,10 +870,20 @@ impl WorkerRuntime {
         block: &BlockId,
         offset: u64,
         len: u64,
+        object_len: Option<u64>,
     ) -> anyhow::Result<bytes::Bytes> {
         if self.paged.is_some() {
             return self
-                .paged_block_range(request, block, offset, len, None)
+                .paged_block_range(
+                    request,
+                    block,
+                    offset,
+                    len,
+                    object_len.map(|size| {
+                        size.saturating_sub(block.offset)
+                            .min(u64::from(self.block_size))
+                    }),
+                )
                 .await;
         }
         if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
@@ -895,8 +921,8 @@ impl WorkerRuntime {
             }
         }
 
-        // LOAD carries the exact block extent from its caller. Keep that hint
-        // request-local: publishing it as the object's current version would
+        // Sized reads and LOAD carry the exact block extent from their caller.
+        // Keep that hint request-local: publishing it as the object's current version would
         // incorrectly affect unversioned reads and other blocks.
         let block_len = match known_block_len {
             Some(len) => len,
@@ -3787,20 +3813,20 @@ mod tests {
         let version_v1 = Version::new("v1");
 
         let first = runtime
-            .serve_versioned(&request(0), &version_v1)
+            .serve_versioned(&request(0), &version_v1, 16)
             .await
             .unwrap();
         assert!(matches!(
             first,
             ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"old-")
         ));
-        assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged));
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
 
         *backend.version.lock().unwrap() = "v2".into();
         *backend.body.lock().unwrap() = Bytes::from_static(b"new-new-new-new-");
 
         let cached = runtime
-            .serve_versioned(&request(0), &version_v1)
+            .serve_versioned(&request(0), &version_v1, 16)
             .await
             .unwrap();
         let handles = match cached {
@@ -3820,7 +3846,7 @@ mod tests {
         assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
 
         let error = runtime
-            .serve_versioned(&request(missing_offset), &version_v1)
+            .serve_versioned(&request(missing_offset), &version_v1, 16)
             .await
             .err()
             .expect("a pinned read must not refresh to v2");
@@ -3831,7 +3857,7 @@ mod tests {
         ));
         assert_eq!(
             backend.heads.load(Ordering::SeqCst),
-            usize::from(paged),
+            0,
             "cached metadata must not be refreshed to another generation"
         );
 
@@ -3840,7 +3866,7 @@ mod tests {
             current,
             ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"new-")
         ));
-        assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged) + 1);
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 1);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3855,7 +3881,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn version_pinned_paged_miss_rejects_length_from_another_generation() {
+    async fn version_pinned_paged_miss_rejects_a_shorter_replacement_without_head() {
         let root = tmp_root();
         let backend = Arc::new(CondBackend {
             version: std::sync::Mutex::new("v2".into()),
@@ -3874,16 +3900,25 @@ mod tests {
             len: 4,
         };
         let error = runtime
-            .serve_versioned(&request, &Version::new("v1"))
+            .serve_versioned(&request, &Version::new("v1"), 16)
             .await
             .err()
-            .expect("a stale HEAD must fail the pinned read");
+            .expect("a changed origin must fail the pinned read");
         assert!(
             matches!(error.downcast_ref::<Error>(), Some(Error::VersionMismatch { expected, found })
             if expected == "v1" && found == "v2")
         );
         assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
-        assert_eq!(runtime.block_count(), 0);
+        assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+        assert!(runtime
+            .serve_cached(&CachedRangeRequest {
+                object: request.object,
+                version: Version::new("v1"),
+                offset: 8,
+                len: 4,
+            })
+            .await
+            .is_err());
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -3915,7 +3950,7 @@ mod tests {
         let runtime = runtime_with(Arc::clone(&backend), WorkerMetrics::new(1024), &root, 8);
 
         let error = runtime
-            .serve_versioned(&request("obj"), &Version::new("v1"))
+            .serve_versioned(&request("obj"), &Version::new("v1"), 8)
             .await
             .err()
             .expect("an unguarded backend must not return newer bytes");

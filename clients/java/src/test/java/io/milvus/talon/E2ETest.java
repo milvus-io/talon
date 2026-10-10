@@ -25,6 +25,7 @@ public final class E2ETest {
         int blockSize = args.length > 1 ? Integer.parseInt(args[1]) : (8 << 20);
         String version = args.length > 2 ? args[2] : "0x8LOADTEST";
         String uri = "az://container/bench";
+        long objectSize = 64L << 20; // scripts/loadtest_origin.py synthetic object
 
         try (TalonClient client = TalonClient.connect(coordinator, blockSize)) {
             check("stat returns size and version", () -> {
@@ -42,12 +43,12 @@ public final class E2ETest {
             });
 
             check("reads exact bytes at offset 0", () -> {
-                byte[] got = client.read(uri, version, 0, 4096);
+                byte[] got = client.read(uri, version, objectSize, 0, 4096);
                 assertBytes(ramp(0, 4096), got);
             });
 
             check("reads exact bytes at a non-zero offset", () -> {
-                byte[] got = client.read(uri, version, 1000, 8192);
+                byte[] got = client.read(uri, version, objectSize, 1000, 8192);
                 assertBytes(ramp(1000, 8192), got);
             });
 
@@ -55,31 +56,31 @@ public final class E2ETest {
             // the wrong bytes in the middle, so assert content and not length.
             check("reassembles a range spanning block boundaries", () -> {
                 int length = blockSize + (4 << 20);
-                byte[] got = client.read(uri, version, 0, length);
+                byte[] got = client.read(uri, version, objectSize, 0, length);
                 assertBytes(ramp(0, length), got);
             });
 
             check("reads across exactly one block edge", () -> {
                 long offset = blockSize - 2048;
-                byte[] got = client.read(uri, version, offset, 4096);
+                byte[] got = client.read(uri, version, objectSize, offset, 4096);
                 assertBytes(ramp(offset, 4096), got);
             });
 
             check("zero-length read returns empty", () -> {
-                byte[] got = client.read(uri, version, 0, 0);
+                byte[] got = client.read(uri, version, objectSize, 0, 0);
                 assertEquals(0, got.length, "length");
             });
 
             check("placement cache serves a repeated read", () -> {
-                byte[] first = client.read(uri, version, 0, 4096);
-                byte[] second = client.read(uri, version, 0, 4096);
+                byte[] first = client.read(uri, version, objectSize, 0, 4096);
+                byte[] second = client.read(uri, version, objectSize, 0, 4096);
                 assertBytes(first, second);
             });
 
             check("stale supplied version fails closed", () -> {
                 String uncached = "az://container/version-mismatch-never-cached";
                 try {
-                    client.read(uncached, "definitely-not-the-current-etag", 0, 4096);
+                    client.read(uncached, "definitely-not-the-current-etag", objectSize, 0, 4096);
                     throw new AssertionError("stale version unexpectedly returned current bytes");
                 } catch (java.io.IOException expected) {
                     // The exact error wording is backend-specific; the
@@ -96,7 +97,7 @@ public final class E2ETest {
                     final int idx = i;
                     Thread t = new Thread(() -> {
                         try {
-                            results[idx] = client.read(uri, version, idx * 65536L, 65536);
+                            results[idx] = client.read(uri, version, objectSize, idx * 65536L, 65536);
                         } catch (Throwable e) {
                             errors[idx] = e;
                         }
@@ -119,7 +120,7 @@ public final class E2ETest {
                 for (String bad : Arrays.asList(
                         "no-scheme", "ftp://bucket/key", "az://bucket", "az:///key", "az://bucket/")) {
                     try {
-                        client.read(bad, version, 0, 1);
+                        client.read(bad, version, objectSize, 0, 1);
                         throw new AssertionError("should have rejected " + bad);
                     } catch (IllegalArgumentException expected) {
                         // The message must name the problem, not just fail.

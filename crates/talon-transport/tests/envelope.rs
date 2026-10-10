@@ -100,6 +100,7 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             &data::VersionedRangeRequest {
                 request: req.clone(),
                 version: cached.version.clone(),
+                object_len: 100_000,
             },
         )
         .unwrap(),
@@ -110,6 +111,7 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
                 request: data::VersionedRangeRequest {
                     request: req.clone(),
                     version: cached.version.clone(),
+                    object_len: 100_000,
                 },
             },
         )
@@ -151,11 +153,13 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
                 let decoded = data::decode_versioned_request(&frame).unwrap().1;
                 assert_eq!(decoded.request, req);
                 assert_eq!(decoded.version, cached.version);
+                assert_eq!(decoded.object_len, 100_000);
             }
             MsgType::GetVersionedRangeTenant => {
                 let decoded = data::decode_versioned_tenant_request(&frame).unwrap().1;
                 assert_eq!(decoded.tenant, TenantId::named("acme"));
                 assert_eq!(decoded.request.request, req);
+                assert_eq!(decoded.request.object_len, 100_000);
                 assert_eq!(decoded.request.version, cached.version);
             }
             MsgType::GetCachedRange => {

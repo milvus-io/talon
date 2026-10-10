@@ -205,14 +205,15 @@ final class Messages {
         return framed(requestId, w.toBytes());
     }
 
-    /** {@code VersionedRangeRequest { request: RangeRequest, version }}. */
+    /** {@code VersionedRangeRequest { request, version, object_len }}. */
     static byte[] versionedRange(
-            int requestId, ObjectId object, long offset, long length, String version) {
+            int requestId, ObjectId object, long offset, long length, String version, long objectSize) {
         Bincode.Writer w = new Bincode.Writer();
         writeObjectId(w, object);
         w.u64(offset);
         w.u64(length);
         w.string(version);
+        w.u64(objectSize);
         byte[] body = w.toBytes();
         byte[] header =
                 new Frame(

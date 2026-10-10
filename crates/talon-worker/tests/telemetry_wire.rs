@@ -128,6 +128,7 @@ async fn v2_stat_cold_hit_cache_only_and_v1_on_same_connection() {
         let versioned = data::VersionedRangeRequest {
             request: range.clone(),
             version: Version::new("v1"),
+            object_len: 64,
         };
         let mut request = match index {
             0 => data::encode_versioned_request(2, &versioned).unwrap(),
@@ -161,6 +162,7 @@ async fn v2_stat_cold_hit_cache_only_and_v1_on_same_connection() {
                     len: 4,
                 },
                 version: Version::new(source_version),
+                object_len: 64,
             },
         )
         .unwrap();

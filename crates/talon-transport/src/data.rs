@@ -11,6 +11,7 @@
 //! path can be served straight from a file (`sendfile`) in production; this
 //! module only handles the request encode/decode and the response header shape.
 
+use bincode::Options;
 use serde::{Deserialize, Serialize};
 use talon_core::{BlockId, ObjectId, TenantId, Version};
 
@@ -93,16 +94,16 @@ pub struct TenantScopedRange {
 
 /// An origin-backed range request pinned to one exact source version.
 ///
-/// This uses a distinct message type from [`RangeRequest`] so an older worker
-/// rejects it instead of silently ignoring the version and serving newer
-/// bytes. A cache miss may access the backend, but only with `version` as the
-/// conditional source identity.
+/// A cache miss uses `version` as the conditional source identity and the
+/// supplied object length to fill pages without resolving origin metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VersionedRangeRequest {
     /// The ordinary object and byte-range coordinates.
     pub request: RangeRequest,
     /// Exact source version that every returned byte must belong to.
     pub version: Version,
+    /// Total byte length of this exact object version.
+    pub object_len: u64,
 }
 
 /// A [`VersionedRangeRequest`] annotated with the tenant it is attributed to.
@@ -279,8 +280,7 @@ pub fn decode_tenant_request(buf: &[u8]) -> Result<(FrameHeader, TenantScopedRan
 
 /// Encode a version-pinned, origin-backed range request.
 ///
-/// The reply is an ordinary [`MsgType::GetRange`] frame. The distinct request
-/// type makes rolling upgrades fail closed when the selected worker is old.
+/// The reply is an ordinary [`MsgType::GetRange`] frame.
 pub fn encode_versioned_request(
     request_id: u32,
     req: &VersionedRangeRequest,
@@ -310,7 +310,10 @@ pub fn decode_versioned_request(
         });
     }
     let (_, body) = crate::envelope::decode(&header, body)?;
-    let req = bincode::deserialize(body)?;
+    let req = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(body.len() as u64)
+        .deserialize(body)?;
     Ok((header, req))
 }
 
@@ -348,7 +351,10 @@ pub fn decode_versioned_tenant_request(
         });
     }
     let (_, body) = crate::envelope::decode(&header, body)?;
-    let scoped = bincode::deserialize(body)?;
+    let scoped = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .with_limit(body.len() as u64)
+        .deserialize(body)?;
     Ok((header, scoped))
 }
 
@@ -634,6 +640,7 @@ mod tests {
         let request = VersionedRangeRequest {
             request: req(),
             version: Version::new("etag-v2"),
+            object_len: 100_000,
         };
         let encoded = encode_versioned_request(13, &request).unwrap();
         let (header, decoded) = decode_versioned_request(&encoded).unwrap();
@@ -647,12 +654,82 @@ mod tests {
     }
 
     #[test]
+    fn versioned_requests_require_a_complete_size() {
+        for tenant in [false, true] {
+            for object_len in [0, 100_000, u64::MAX] {
+                let request = VersionedRangeRequest {
+                    request: req(),
+                    version: Version::new("v1"),
+                    object_len,
+                };
+                let scoped = TenantScopedVersionedRange {
+                    tenant: TenantId::named("acme"),
+                    request: request.clone(),
+                };
+                let encoded = if tenant {
+                    encode_versioned_tenant_request(1, &scoped).unwrap()
+                } else {
+                    encode_versioned_request(1, &request).unwrap()
+                };
+                if tenant {
+                    assert_eq!(decode_versioned_tenant_request(&encoded).unwrap().1, scoped);
+                } else {
+                    assert_eq!(decode_versioned_request(&encoded).unwrap().1, request);
+                }
+                for size_bytes in (0..=9).filter(|n| *n != 8) {
+                    let prefix = encoded.len() - 8;
+                    let mut malformed = encoded[..prefix].to_vec();
+                    malformed.resize(prefix + size_bytes, 0);
+                    let mut header = FrameHeader::decode(&encoded).unwrap();
+                    header.length = (malformed.len() - HEADER_LEN) as u32;
+                    malformed[..HEADER_LEN].copy_from_slice(&header.encode());
+                    let rejected = if tenant {
+                        decode_versioned_tenant_request(&malformed).is_err()
+                    } else {
+                        decode_versioned_request(&malformed).is_err()
+                    };
+                    assert!(rejected, "missing, truncated or oversized size field");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn versioned_decoder_rejects_impossible_string_lengths() {
+        for tenant in [false, true] {
+            let mut body = if tenant {
+                bincode::serialize(&TenantId::named("acme")).unwrap()
+            } else {
+                Vec::new()
+            };
+            // An object backend followed by an impossible bucket string length.
+            body.extend(bincode::serialize(&(talon_core::Backend::S3, u64::MAX)).unwrap());
+            let kind = if tenant {
+                MsgType::GetVersionedRangeTenant
+            } else {
+                MsgType::GetVersionedRange
+            };
+            let mut frame = FrameHeader::new(kind, 1, body.len() as u32)
+                .encode()
+                .to_vec();
+            frame.extend(body);
+            let error = if tenant {
+                decode_versioned_tenant_request(&frame).unwrap_err()
+            } else {
+                decode_versioned_request(&frame).unwrap_err()
+            };
+            assert!(matches!(error, DataError::Bincode(_)));
+        }
+    }
+
+    #[test]
     fn versioned_tenant_request_round_trips() {
         let scoped = TenantScopedVersionedRange {
             tenant: TenantId::named("acme"),
             request: VersionedRangeRequest {
                 request: req(),
                 version: Version::new("etag-v3"),
+                object_len: 100_000,
             },
         };
         let encoded = encode_versioned_tenant_request(14, &scoped).unwrap();

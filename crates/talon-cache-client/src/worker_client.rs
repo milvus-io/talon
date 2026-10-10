@@ -510,6 +510,7 @@ impl WorkerClient {
         version: &Version,
         offset: u64,
         len: u64,
+        object_len: u64,
     ) -> Result<Vec<u8>, WorkerError> {
         let request = VersionedRangeRequest {
             request: RangeRequest {
@@ -518,6 +519,7 @@ impl WorkerClient {
                 len,
             },
             version: version.clone(),
+            object_len,
         };
         let request_id = RequestId::next();
         let mut output = self.encode_versioned_range_request(request_id.0, request)?;
@@ -564,6 +566,7 @@ impl WorkerClient {
         version: &Version,
         offset: u64,
         dst: &mut [u8],
+        object_len: u64,
     ) -> Result<usize, WorkerError> {
         let request = VersionedRangeRequest {
             request: RangeRequest {
@@ -572,6 +575,7 @@ impl WorkerClient {
                 len: dst.len() as u64,
             },
             version: version.clone(),
+            object_len,
         };
         let request_id = RequestId::next();
         let mut output = self.encode_versioned_range_request(request_id.0, request)?;
@@ -1266,6 +1270,7 @@ mod tests {
             assert_eq!(request.request.object, object());
             assert_eq!((request.request.offset, request.request.len), (17, 4));
             assert_eq!(request.version, Version::new("etag-v7"));
+            assert_eq!(request.object_len, 32);
 
             socket
                 .write_all(&response_header_ok(header.request_id, 4))
@@ -1275,7 +1280,7 @@ mod tests {
         });
 
         let bytes = WorkerClient::new(addr)
-            .fetch_versioned_range(&object(), &Version::new("etag-v7"), 17, 4)
+            .fetch_versioned_range(&object(), &Version::new("etag-v7"), 17, 4, 32)
             .await
             .unwrap();
         assert_eq!(bytes, b"data");
@@ -1631,12 +1636,12 @@ mod tests {
             }
             2 => {
                 client
-                    .fetch_versioned_range(&object(), &Version::new("v1"), 0, 8)
+                    .fetch_versioned_range(&object(), &Version::new("v1"), 0, 8, 8)
                     .await
             }
             3 => {
                 client
-                    .fetch_versioned_range_into(&object(), &Version::new("v1"), 0, &mut dst)
+                    .fetch_versioned_range_into(&object(), &Version::new("v1"), 0, &mut dst, 8)
                     .await?;
                 Ok(dst)
             }

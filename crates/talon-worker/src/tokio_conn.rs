@@ -33,12 +33,22 @@ use tokio::net::TcpStream;
 use crate::data_error::encode_runtime_error;
 use crate::{send_file_range, ServeOutcome, WorkerObservability, WorkerRuntime, DEFAULT_CHUNK};
 
+// Source version and its caller-supplied total length.
+type PinnedVersion = (Version, u64);
+
 /// Decode origin-backed coordinates, the optional exact version, and tenant.
 fn decode_range_with_tenant(
     header: &FrameHeader,
     payload: &[u8],
-) -> Result<(FrameHeader, data::RangeRequest, Option<Version>, TenantId), talon_transport::DataError>
-{
+) -> Result<
+    (
+        FrameHeader,
+        data::RangeRequest,
+        Option<PinnedVersion>,
+        TenantId,
+    ),
+    talon_transport::DataError,
+> {
     let mut full = Vec::with_capacity(HEADER_LEN + payload.len());
     full.extend_from_slice(&header.encode());
     full.extend_from_slice(payload);
@@ -56,7 +66,7 @@ fn decode_range_with_tenant(
             Ok((
                 frame,
                 versioned.request,
-                Some(versioned.version),
+                Some((versioned.version, versioned.object_len)),
                 TenantId::Unattributed,
             ))
         }
@@ -65,7 +75,7 @@ fn decode_range_with_tenant(
             Ok((
                 frame,
                 scoped.request.request,
-                Some(scoped.request.version),
+                Some((scoped.request.version, scoped.request.object_len)),
                 scoped.tenant,
             ))
         }
@@ -317,11 +327,17 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    if req.offset.checked_add(req.len).is_none() {
+    let end = req.offset.checked_add(req.len);
+    if end.is_none()
+        || expected_version
+            .as_ref()
+            .map(|(_, size)| *size)
+            .is_some_and(|size| end.is_some_and(|end| end > size))
+    {
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::InvalidRequest,
-            "range offset+len overflows u64",
+            "range overflows u64 or exceeds supplied object length",
         );
         err[2] = response_version;
         talon_telemetry::outcome("error");
@@ -335,7 +351,7 @@ async fn handle_request(
 
     if expected_version
         .as_ref()
-        .is_some_and(|version| version.0.trim().is_empty())
+        .is_some_and(|(version, _)| version.0.trim().is_empty())
     {
         let mut err = data::encode_typed_error(
             h.request_id,
@@ -373,7 +389,7 @@ async fn handle_request(
     }
 
     let outcome = match expected_version.as_ref() {
-        Some(version) => worker.serve_versioned(&req, version).await,
+        Some((version, size)) => worker.serve_versioned(&req, version, *size).await,
         None => worker.serve(&req).await,
     };
     match outcome {
