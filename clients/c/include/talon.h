@@ -1,6 +1,10 @@
 #ifndef TALON_H
 #define TALON_H
 
+/* Skip origin ETag matching for immutable objects. Keep supplying object_size;
+ * metadata lookup and cache behavior are unchanged. */
+#define TALON_UNCHECKED_VERSION "__talon_unchecked__"
+
 #include <stddef.h>
 #include <stdint.h>
 

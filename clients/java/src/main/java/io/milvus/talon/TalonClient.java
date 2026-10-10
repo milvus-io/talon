@@ -49,6 +49,9 @@ import java.util.concurrent.locks.ReentrantLock;
  */
 public final class TalonClient implements AutoCloseable {
 
+    /** Skip origin ETag matching for immutable objects; metadata and caching are unchanged. */
+    public static final String UNCHECKED_VERSION = "__talon_unchecked__";
+
     private static final int CONNECT_TIMEOUT_MS = 10_000;
     private static final int READ_TIMEOUT_MS = 30_000;
 
