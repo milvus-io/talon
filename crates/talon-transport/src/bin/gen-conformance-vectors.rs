@@ -224,7 +224,7 @@ fn vectors() -> Vec<Vector> {
         },
         Vector {
             name: "data.versioned_range_request",
-            note: "Distinct fail-closed request carrying the exact source version",
+            note: "Versioned request carrying the exact source version and total object length",
             bytes: data::encode_versioned_request(
                 10,
                 &VersionedRangeRequest {
@@ -234,6 +234,7 @@ fn vectors() -> Vec<Vector> {
                         len: 4096,
                     },
                     version: Version::new("etag-v1"),
+                    object_len: 100_000,
                 },
             )
             .expect("encode versioned range request"),

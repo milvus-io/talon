@@ -43,7 +43,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * <pre>{@code
  * try (TalonClient client = TalonClient.connect("coordinator:7000", 8 << 20)) {
  *     byte[] data = client.read("az://container/dataset.parquet",
- *                               "0x8DABCDEF", 0, 1 << 20);
+ *                               "0x8DABCDEF", 64L << 20, 0, 1 << 20);
  * }
  * }</pre>
  */
@@ -119,7 +119,7 @@ public final class TalonClient implements AutoCloseable {
      * cache.
      *
      * <p>Resolves the object's version with a {@code stat} first. Use
-     * {@link #read(String, String, long, long)} to supply a known version and
+     * {@link #read(String, String, long, long, long)} to supply a known version and size and
      * skip that round trip.
      */
     public byte[] read(String uri, long offset, long length) throws IOException { return read(uri, offset, length, RequestOptions.INHERIT); }
@@ -132,47 +132,44 @@ public final class TalonClient implements AutoCloseable {
     private byte[] readInternal(String uri, long offset, long length) throws IOException {
         ObjectId object = ObjectId.parse(uri);
         ObjectStat stat = stat(object);
-        return read(object, stat.version(), offset, Math.min(length, Math.max(0, stat.size() - offset)));
+        return readInternal(object, stat.version(), stat.size(), offset, length);
     }
 
-    /**
-     * Read with a known version, skipping the {@code stat} round trip.
-     *
-     * <p>Worth using when reading many ranges of one object: the version is
-     * stable for an object generation, so re-resolving it per read is wasted
-     * work.
-     */
-    public byte[] read(String uri, String version, long offset, long length) throws IOException { return read(uri, version, offset, length, RequestOptions.INHERIT); }
-
-    /** Explicit carrier; captured once on the caller thread before any network I/O. */
-    public byte[] read(String uri, String version, long offset, long length, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, version, offset, length));
+    /** Read with a known source version and total size, without metadata HEAD. */
+    public byte[] read(String uri, String version, long size, long offset, long length) throws IOException {
+        return read(uri, version, size, offset, length, RequestOptions.INHERIT);
     }
 
-    private byte[] readInternal(String uri, String version, long offset, long length) throws IOException {
-        return read(ObjectId.parse(uri), version, offset, length);
+    /** Explicit carrier for a read with known size and version. */
+    public byte[] read(String uri, String version, long size, long offset, long length, RequestOptions options) throws IOException {
+        return read(ObjectId.parse(uri), version, size, offset, length, options);
     }
 
-    /** As {@link #read(String, String, long, long)}, with a parsed object id. */
-    public byte[] read(ObjectId object, String version, long offset, long length) throws IOException { return read(object, version, offset, length, RequestOptions.INHERIT); }
-
-    /** Explicit carrier; captured once on the caller thread before any network I/O. */
-    public byte[] read(ObjectId object, String version, long offset, long length, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(object, version, offset, length));
+    /** As {@link #read(String, String, long, long, long)}, with a parsed object id. */
+    public byte[] read(ObjectId object, String version, long size, long offset, long length) throws IOException {
+        return read(object, version, size, offset, length, RequestOptions.INHERIT);
     }
 
-    private byte[] readInternal(ObjectId object, String version, long offset, long length) throws IOException {
+    /** Explicit carrier for a read with known size and version. */
+    public byte[] read(ObjectId object, String version, long size, long offset, long length, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options,
+                () -> readInternal(object, version, size, offset, length));
+    }
+
+    private byte[] readInternal(ObjectId object, String version, long objectSize, long offset, long length) throws IOException {
         if (offset < 0 || length < 0) {
             throw new IllegalArgumentException(
                     "offset and length must be non-negative, got offset=" + offset
                             + " length=" + length);
         }
+        if (objectSize < 0) throw new IllegalArgumentException("object size must be non-negative");
+        length = Math.min(length, Math.max(0, objectSize - offset));
         if (length == 0) {
             return new byte[0];
         }
         ByteArrayOutputStream out = new ByteArrayOutputStream((int) Math.min(length, 1 << 20));
         for (Segment seg : planRead(object, version, offset, length)) {
-            out.write(readBlock(seg));
+            out.write(readBlock(seg, objectSize));
         }
         return out.toByteArray();
     }
@@ -496,7 +493,7 @@ public final class TalonClient implements AutoCloseable {
     private record CachedMembership(Placement.Table placement) {}
 
     /** Fetch from one logical owner, allowing one bounded stale-connection retry. */
-    private byte[] readBlock(Segment seg) throws IOException {
+    private byte[] readBlock(Segment seg, long objectSize) throws IOException {
         membership();
         ConnectionPool pool;
         String address;
@@ -512,7 +509,7 @@ public final class TalonClient implements AutoCloseable {
             pool = instancePools.get(instanceKey(target));
             retryDeadline = discoveryExpires;
         } finally { membershipLock.unlock(); }
-        try { return fetchRange(address, seg, pool, retryDeadline); }
+        try { return fetchRange(address, seg, pool, retryDeadline, objectSize); }
         catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
@@ -605,7 +602,7 @@ public final class TalonClient implements AutoCloseable {
         } catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
-    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool, long retryDeadline) throws IOException {
+    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool, long retryDeadline, long objectSize) throws IOException {
         int id = requestIds.getAndIncrement();
         byte[] request =
                 Messages.versionedRange(
@@ -613,7 +610,8 @@ public final class TalonClient implements AutoCloseable {
                         seg.block.object(),
                         seg.block.offset() + seg.offsetInBlock,
                         seg.length,
-                        seg.block.version());
+                        seg.block.version(),
+                        objectSize);
 
         return pool.exchange(workerAddress, retryDeadline, socket -> {
             OutputStream out = socket.getOutputStream();

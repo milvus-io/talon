@@ -66,15 +66,15 @@ public final class RollingUpgradeTest {
                 } catch (IOException ignored) { }
             });
             try (TalonClient client = TalonClient.connect("127.0.0.1:" + coordinator.getLocalPort(), 64)) {
-                if (client.read("s3://bucket/key", "v", 0, 8).length != 8) throw new AssertionError("initial read");
-                if (client.read("s3://bucket/key", "v", 0, 8).length != 8) throw new AssertionError("stale socket recovery");
+                if (client.read("s3://bucket/key", "v", 8, 0, 8).length != 8) throw new AssertionError("initial read");
+                if (client.read("s3://bucket/key", "v", 8, 0, 8).length != 8) throw new AssertionError("stale socket recovery");
                 if (accepts.get() != 2) throw new AssertionError("stale socket was not redialed once");
                 incarnation.set("new");
                 Thread.sleep(550);
-                if (client.read("s3://bucket/key", "v", 0, 8).length != 8) throw new AssertionError("recovery");
+                if (client.read("s3://bucket/key", "v", 8, 0, 8).length != 8) throw new AssertionError("recovery");
                 offline.set(true);
                 Thread.sleep(550);
-                try { client.read("s3://bucket/key", "v", 0, 8); throw new AssertionError("offline read succeeded"); }
+                try { client.read("s3://bucket/key", "v", 8, 0, 8); throw new AssertionError("offline read succeeded"); }
                 catch (TalonException expected) { if (expected.code() != TalonException.Code.UNAVAILABLE) throw expected; }
                 if (accepts.get() != 3) throw new AssertionError("offline owner was dialed");
             } finally {
@@ -150,9 +150,9 @@ public final class RollingUpgradeTest {
                 } catch (Exception e) { throw new RuntimeException(e); }
             });
             try (TalonClient client = TalonClient.connect("127.0.0.1:" + coordinator.getLocalPort(), 64)) {
-                client.read("s3://bucket/key", "v", 0, 8);
+                client.read("s3://bucket/key", "v", 8, 0, 8);
                 try {
-                    client.read("s3://bucket/key", "v", 0, 8);
+                    client.read("s3://bucket/key", "v", 8, 0, 8);
                     throw new AssertionError("failure hidden: " + mode);
                 } catch (TalonException expected) {
                     TalonException.Code code = switch (mode) {
@@ -230,13 +230,13 @@ public final class RollingUpgradeTest {
                 } catch (IOException ignored) { }
             });
             try (TalonClient client = TalonClient.connect("127.0.0.1:" + coordinator.getLocalPort(), 64)) {
-                try { client.read("s3://bucket/key", "v", 0, 8); throw new AssertionError("failure hidden after instance replacement"); }
+                try { client.read("s3://bucket/key", "v", 8, 0, 8); throw new AssertionError("failure hidden after instance replacement"); }
                 catch (TalonException expected) {
                     if (expected.code() != TalonException.Code.UNAVAILABLE || !(expected.getCause() instanceof EOFException)) throw expected;
                 }
                 if (oldCalls.get() != 1 || newCalls.get() != 0) throw new AssertionError("failed request was resent");
                 Thread.sleep(550);
-                if (client.read("s3://bucket/key", "v", 0, 8).length != 8 || newCalls.get() != 1) throw new AssertionError("next request failed to recover");
+                if (client.read("s3://bucket/key", "v", 8, 0, 8).length != 8 || newCalls.get() != 1) throw new AssertionError("next request failed to recover");
             } finally {
                 coordinator.close(); oldWorker.close(); newWorker.close(); tasks.shutdownNow();
             }

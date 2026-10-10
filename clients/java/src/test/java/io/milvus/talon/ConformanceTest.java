@@ -87,6 +87,17 @@ public final class ConformanceTest {
             assertBytes(frame, Telemetry.envelope(frame, "worker"));
             Telemetry.configure(java.util.Set.of(), null);
         });
+        check("known and resolved object sizes reach versioned reads", () -> {
+            try (PoolPeer peer = new PoolPeer();
+                    TalonClient client = TalonClient.connect(peer.address(), 1024)) {
+                assertBytes(new byte[] {42}, client.read("s3://bucket/key", "v1", 21, 20, 9));
+                assertEquals(0, peer.statCalls.get(), "known stat avoids coordinator stat");
+                assertBytes(new byte[] {42}, client.read("s3://bucket/key", 0, 1));
+                assertEquals(List.of(21L, 1L), peer.readSizes, "total size forwarded in both paths");
+                assertBytes(new byte[0], client.read("s3://bucket/key", "v1", 21, 21, 1));
+                assertEquals(2, peer.readSizes.size(), "EOF completes without worker request");
+            }
+        });
         check("incompatible control schemas fail before decoding tags", () -> {
             for (int schema : new int[] {0, 1, 2, 3, 4, 5, 7}) {
                 boolean rejected = false;
@@ -565,7 +576,7 @@ public final class ConformanceTest {
                     new ObjectId(ObjectId.Backend.AZURE, "container", "path/to/object");
             assertBytes(
                     v.get("data.versioned_range_request"),
-                    Messages.versionedRange(10, object, 65536, 4096, "etag-v1"));
+                    Messages.versionedRange(10, object, 65536, 4096, "etag-v1", 100_000L));
         });
     }
 
@@ -651,7 +662,7 @@ public final class ConformanceTest {
         try {
             List<Future<byte[]>> results = new ArrayList<>();
             for (int i = 0; i < count; i++) {
-                results.add(readers.submit(() -> client.read("s3://bucket/key", "v1", 0, 1)));
+                results.add(readers.submit(() -> client.read("s3://bucket/key", "v1", 1, 0, 1)));
             }
             assertTrue(peer.arrived.await(5, TimeUnit.SECONDS), "idle limit must not limit concurrency");
             if (close) {
@@ -685,6 +696,7 @@ public final class ConformanceTest {
         volatile CountDownLatch discoveryRelease = new CountDownLatch(0);
         volatile int workerState = 2;
         final AtomicInteger statCalls = new AtomicInteger();
+        final List<Long> readSizes = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<Integer> loadCounts = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<Messages.LoadBlock> loaded = java.util.Collections.synchronizedList(new ArrayList<>());
 
@@ -731,6 +743,10 @@ public final class ConformanceTest {
                     byte[] response;
                     int byteDelay = 0;
                     if (request.type() == Frame.MsgType.GET_VERSIONED_RANGE) {
+                        Bincode.Reader range = new Bincode.Reader(body);
+                        range.variant(); range.string(); range.string();
+                        range.u64(); range.u64(); range.string();
+                        readSizes.add(range.u64());
                         arrived.countDown();
                         if (!release.await(5, TimeUnit.SECONDS)) {
                             throw new IOException("test response gate timed out");

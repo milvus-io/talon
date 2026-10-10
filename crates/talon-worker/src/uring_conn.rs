@@ -287,11 +287,17 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    if req.offset.checked_add(req.len).is_none() {
+    let end = req.offset.checked_add(req.len);
+    if end.is_none()
+        || expected_version
+            .as_ref()
+            .map(|(_, size)| *size)
+            .is_some_and(|size| end.is_some_and(|end| end > size))
+    {
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::InvalidRequest,
-            "range offset+len overflows u64",
+            "range overflows u64 or exceeds supplied object length",
         );
         err[2] = response_version;
         talon_telemetry::outcome("error");
@@ -304,7 +310,7 @@ async fn handle_request(
 
     if expected_version
         .as_ref()
-        .is_some_and(|version| version.0.trim().is_empty())
+        .is_some_and(|(version, _)| version.0.trim().is_empty())
     {
         let mut err = data::encode_typed_error(
             h.request_id,
@@ -340,7 +346,7 @@ async fn handle_request(
     }
 
     let outcome = match expected_version.as_ref() {
-        Some(version) => worker.serve_versioned(&req, version).await,
+        Some((version, size)) => worker.serve_versioned(&req, version, *size).await,
         None => worker.serve(&req).await,
     };
     match outcome {
@@ -414,12 +420,22 @@ async fn handle_request(
     Ok(Some(stream))
 }
 
+// Source version and its caller-supplied total length.
+type PinnedVersion = (Version, u64);
+
 /// Decode origin-backed coordinates, the optional exact version, and tenant.
 fn decode_range_with_tenant(
     header: &FrameHeader,
     payload: &[u8],
-) -> Result<(FrameHeader, data::RangeRequest, Option<Version>, TenantId), talon_transport::DataError>
-{
+) -> Result<
+    (
+        FrameHeader,
+        data::RangeRequest,
+        Option<PinnedVersion>,
+        TenantId,
+    ),
+    talon_transport::DataError,
+> {
     let buf = rejoin(header, payload);
     match header.msg_type {
         MsgType::GetRange => {
@@ -435,7 +451,7 @@ fn decode_range_with_tenant(
             Ok((
                 frame,
                 versioned.request,
-                Some(versioned.version),
+                Some((versioned.version, versioned.object_len)),
                 TenantId::Unattributed,
             ))
         }
@@ -444,7 +460,7 @@ fn decode_range_with_tenant(
             Ok((
                 frame,
                 scoped.request.request,
-                Some(scoped.request.version),
+                Some((scoped.request.version, scoped.request.object_len)),
                 scoped.tenant,
             ))
         }
@@ -1675,6 +1691,7 @@ mod tests {
                         &VersionedRangeRequest {
                             request: req.clone(),
                             version: Version::new("v1"),
+                            object_len: u64::MAX,
                         },
                     )
                     .unwrap()
@@ -1721,6 +1738,7 @@ mod tests {
                         &VersionedRangeRequest {
                             request: req.clone(),
                             version: Version::new("v1"),
+                            object_len: u64::MAX,
                         },
                     )
                     .unwrap()
@@ -1736,6 +1754,74 @@ mod tests {
                 assert_eq!(header.request_id, 42);
                 assert!(!header.flags.contains(Flags::ERROR));
                 assert_eq!(body, (3..11).collect::<Vec<u8>>());
+            }
+        });
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sized_paged_cold_read_needs_no_head() {
+        struct NoHeadBackend;
+        #[async_trait]
+        impl BackendStore for NoHeadBackend {
+            async fn head(&self, _: &ObjectId) -> Result<ObjectStat> {
+                panic!("sized cold reads must not HEAD");
+            }
+            async fn fetch_range(&self, object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+                RampBackend.fetch_range(object, offset, len).await
+            }
+            async fn fetch_range_if_match(
+                &self,
+                object: &ObjectId,
+                offset: u64,
+                len: u64,
+                version: Option<&Version>,
+            ) -> Result<Bytes> {
+                assert_eq!(version, Some(&Version::new("v1")));
+                assert!(offset + len <= 21, "last page must stop at supplied EOF");
+                self.fetch_range(object, offset, len).await
+            }
+        }
+        let root = tmp_root("sized-paged");
+        run(async {
+            let (worker, obs) = build_paged(&root, Arc::new(NoHeadBackend), 16, 4);
+            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            monoio::spawn(async move {
+                let (socket, _) = listener.accept().await.unwrap();
+                handle_conn(socket, worker, obs).await.unwrap();
+            });
+            let mut socket = TcpStream::connect(addr).await.unwrap();
+            for tenant in [false, true] {
+                let request = VersionedRangeRequest {
+                    request: RangeRequest {
+                        object: ObjectId::new(
+                            talon_core::Backend::Azure,
+                            "c",
+                            format!("cold-{tenant}"),
+                        ),
+                        offset: 1,
+                        len: 20,
+                    },
+                    version: Version::new("v1"),
+                    object_len: 21,
+                };
+                let frame = if tenant {
+                    data::encode_versioned_tenant_request(
+                        1,
+                        &data::TenantScopedVersionedRange {
+                            tenant: TenantId::named("tenant"),
+                            request,
+                        },
+                    )
+                    .unwrap()
+                } else {
+                    data::encode_versioned_request(1, &request).unwrap()
+                };
+                socket.write_all(frame).await.0.unwrap();
+                let (header, body) = read_response(&mut socket).await;
+                assert!(!header.flags.contains(Flags::ERROR));
+                assert_eq!(body, (1..21).collect::<Vec<u8>>());
             }
         });
         std::fs::remove_dir_all(root).unwrap();

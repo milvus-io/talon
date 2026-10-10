@@ -1713,6 +1713,7 @@ mod tests {
                     &VersionedRangeRequest {
                         request: req.clone(),
                         version: Version::new("v1"),
+                        object_len: u64::MAX,
                     },
                 )
                 .unwrap()

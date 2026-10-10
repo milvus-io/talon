@@ -9,6 +9,7 @@ crash surface.
 try (TalonClient client = TalonClient.connect("coordinator-host:7000", 8 << 20, 32)) {
     byte[] data = client.read("az://container/dataset.parquet",
                               "0x8DABCDEF",   // object version (ETag)
+                              64L << 20,      // total object size
                               0, 1 << 20);
 }
 ```
@@ -33,6 +34,14 @@ so a path addresses the same object through either client.
 
 The supplied version is exact: if that source generation is no longer
 available, the read fails instead of silently returning replacement bytes.
+Supply both size and version to avoid a metadata HEAD on a cold paged worker:
+
+```java
+byte[] data = client.read("s3://bucket/file", "etag-1", 4096, 0, 512);
+```
+
+The versioned overload requires the total object size and clamps reads at EOF.
+Reads that resolve `stat` internally also forward the resulting size.
 
 ## How correctness is maintained
 

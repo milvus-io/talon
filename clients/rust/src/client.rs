@@ -407,6 +407,7 @@ impl Client {
                 &self.block_read_permits,
                 segment,
                 chunk,
+                stat.size,
             ));
         }
 
@@ -421,6 +422,7 @@ impl Client {
                     &self.block_read_permits,
                     segment,
                     chunk,
+                    stat.size,
                 ));
             }
         }
@@ -433,13 +435,14 @@ async fn read_segment_into(
     permits: &Semaphore,
     segment: BlockSegment,
     dst: &mut [u8],
+    object_len: u64,
 ) -> Result<usize, Error> {
     let _permit = permits
         .acquire()
         .await
         .expect("client never closes its read budget");
     reader
-        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst)
+        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, object_len)
         .await
         .map_err(Error::from)
 }
@@ -532,7 +535,7 @@ mod tests {
         addr
     }
 
-    async fn mock_worker() -> String {
+    async fn mock_worker(size: u64) -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         tokio::spawn(async move {
@@ -552,6 +555,7 @@ mod tests {
                     frame.extend_from_slice(&payload);
                     let (_, versioned) = decode_versioned_request(&frame).unwrap();
                     assert_eq!(versioned.version, Version::new("test-version"));
+                    assert_eq!(versioned.object_len, size);
                     let request = versioned.request;
                     let bytes: Vec<u8> = (0..request.len)
                         .map(|index| ((request.offset + index) % 251) as u8)
@@ -812,7 +816,7 @@ mod tests {
     }
 
     async fn read_client(size: u64) -> (Client, Arc<AtomicUsize>) {
-        let worker = mock_worker().await;
+        let worker = mock_worker(size).await;
         let stat_calls = Arc::new(AtomicUsize::new(0));
         let coordinator = mock_read_coordinator(worker, size, Arc::clone(&stat_calls)).await;
         (

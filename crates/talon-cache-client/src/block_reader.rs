@@ -42,7 +42,7 @@ impl From<BlockReadError> for DetailedBlockReadError {
 #[derive(Clone, Copy)]
 enum OriginReadMode {
     Current,
-    ExactVersion,
+    ExactVersion(u64),
 }
 
 /// Errors from a block read.
@@ -313,9 +313,15 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         dst: &mut [u8],
+        object_len: u64,
     ) -> Result<usize, BlockReadError> {
-        self.read_block_into_with_mode(block, offset_in_block, dst, OriginReadMode::ExactVersion)
-            .await
+        self.read_block_into_with_mode(
+            block,
+            offset_in_block,
+            dst,
+            OriginReadMode::ExactVersion(object_len),
+        )
+        .await
     }
 
     async fn read_block_into_with_mode(
@@ -345,9 +351,15 @@ impl BlockReader {
                 OriginReadMode::Current => {
                     worker.fetch_range_into(&block.object, offset, dst).await
                 }
-                OriginReadMode::ExactVersion => {
+                OriginReadMode::ExactVersion(object_len) => {
                     worker
-                        .fetch_versioned_range_into(&block.object, &block.version, offset, dst)
+                        .fetch_versioned_range_into(
+                            &block.object,
+                            &block.version,
+                            offset,
+                            dst,
+                            object_len,
+                        )
                         .await
                 }
             };
@@ -379,12 +391,13 @@ impl BlockReader {
         block: &BlockId,
         offset_in_block: u32,
         len: u32,
+        object_len: u64,
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
         self.read_block_detailed_with_mode(
             block,
             offset_in_block,
             len,
-            OriginReadMode::ExactVersion,
+            OriginReadMode::ExactVersion(object_len),
         )
         .await
     }
@@ -418,13 +431,14 @@ impl BlockReader {
                         .fetch_range(&block.object, offset, u64::from(len))
                         .await
                 }
-                OriginReadMode::ExactVersion => {
+                OriginReadMode::ExactVersion(object_len) => {
                     worker
                         .fetch_versioned_range(
                             &block.object,
                             &block.version,
                             offset,
                             u64::from(len),
+                            object_len,
                         )
                         .await
                 }
@@ -1498,13 +1512,20 @@ mod tests {
                         .await
                         .unwrap_err(),
                     ReadApi::VersionedInto => reader
-                        .read_versioned_block_into(&block(), 7, &mut dst)
+                        .read_versioned_block_into(&block(), 7, &mut dst, block().offset + 64)
                         .await
                         .unwrap_err(),
-                    ReadApi::Detailed => match reader.read_block_detailed(&block(), 7, 32).await {
-                        Err(DetailedBlockReadError::Block(error)) => error,
-                        _ => panic!("exhausted detailed read must preserve the aggregate error"),
-                    },
+                    ReadApi::Detailed => {
+                        match reader
+                            .read_block_detailed(&block(), 7, 32, block().offset + 64)
+                            .await
+                        {
+                            Err(DetailedBlockReadError::Block(error)) => error,
+                            _ => {
+                                panic!("exhausted detailed read must preserve the aggregate error")
+                            }
+                        }
+                    }
                     ReadApi::Cached => unreachable!(),
                 };
                 let (expected_worker, expected_code, expected_message) = if k == 1 {
@@ -1693,7 +1714,7 @@ mod tests {
                 let mut dst = vec![42; 32];
                 let n = if matches!(api, ReadApi::VersionedInto) {
                     reader
-                        .read_versioned_block_into(&block(), 7, &mut dst)
+                        .read_versioned_block_into(&block(), 7, &mut dst, block().offset + 64)
                         .await
                 } else {
                     reader.read_block_into(&block(), 7, &mut dst).await
@@ -1703,7 +1724,7 @@ mod tests {
                 Ok(dst)
             }
             ReadApi::Detailed => reader
-                .read_block_detailed(&block(), 7, 32)
+                .read_block_detailed(&block(), 7, 32, block().offset + 64)
                 .await
                 .map_err(Into::into),
             ReadApi::Cached => reader.read_cached_block(&block(), 7, 32).await,
