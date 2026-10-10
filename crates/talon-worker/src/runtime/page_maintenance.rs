@@ -117,7 +117,7 @@ impl WorkerRuntime {
         self.page_mutations.drain().await;
     }
 
-    /// Run one disk cleanup batch, including when page TTI or paged reads are disabled.
+    /// Complete one disk cleanup pass, including when page TTI or paged reads are disabled.
     pub async fn cleanup_page_files_once(&self) -> crate::page_gc::CleanupReport {
         let runtime = self.clone();
         let permit = self
@@ -136,8 +136,8 @@ impl WorkerRuntime {
                     .await
                     .run_batch_with_budget(
                         &runtime.page_lifecycle,
-                        runtime.page_gc_config.scan_batch_size,
-                        runtime.page_gc_config.delete_batch_size,
+                        usize::MAX,
+                        usize::MAX,
                         runtime.background_budget.as_deref(),
                     )
                     .await;
@@ -175,42 +175,31 @@ impl WorkerRuntime {
     /// Discover and attempt one complete disk pass before serving traffic.
     /// Errors stay on disk and are rediscovered by the background loop.
     pub async fn recover_page_file_cleanup(&self) {
-        loop {
-            if self.cleanup_page_files_once().await.completed_scan {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        self.cleanup_page_files_once().await;
     }
 
-    /// Run at most one bounded TTI batch; independent of capacity and control-plane health.
+    /// Complete one TTI scan and its deletion attempts, independent of batch limits.
     pub async fn gc_once(&self) -> GcReport {
-        let Ok(mut scan) = self.page_scan.try_lock() else {
+        let Ok(_scan) = self.page_scan.try_lock() else {
             return GcReport::default();
         };
         let started = Instant::now();
-        let mut cursor = std::mem::take(&mut scan.0);
         let lifecycle = self.page_lifecycle.clone();
-        let limit = self.page_gc_config.scan_batch_size;
-        let delete_limit = self.page_gc_config.delete_batch_size;
         let tti = (self.page_gc_config.tti_ms > 0).then_some(self.page_gc_config.tti_ms);
         let now = self.page_clock.now();
-        let (cursor, candidates, stats) = tokio::task::spawn_blocking(move || {
-            let (candidates, stats) = lifecycle.scan(&mut cursor, limit, now, tti, delete_limit);
-            (cursor, candidates, stats)
+        let (candidates, stats) = tokio::task::spawn_blocking(move || {
+            lifecycle.scan(&mut ScanCursor::default(), usize::MAX, now, tti, usize::MAX)
         })
         .await
         .expect("page scanner panicked");
-        scan.0 = cursor;
         self.page_gc_metrics.scanned.add(stats.checked as u64);
-        scan.2 += stats.retries;
         let mut report = GcReport {
             checked: stats.checked,
             completed_scan: stats.completed,
             ..Default::default()
         };
-        // The scanner stops when either budget is exhausted, so its cursor never
-        // skips unattempted deletions (including retries for empty directories).
+        // Finish all candidates before the next scan interval. Disk concurrency,
+        // deletion pacing, and revalidation still apply to every attempt.
         for block in stats.empty {
             self.cleanup_empty_block(block).await;
         }
@@ -225,14 +214,10 @@ impl WorkerRuntime {
                 report.bytes += bytes;
             }
         }
-        if stats.completed {
-            self.page_gc_metrics
-                .scan_duration
-                .set(scan.1.elapsed().as_secs_f64());
-            self.page_gc_metrics.retries.set(scan.2 as f64);
-            scan.1 = Instant::now();
-            scan.2 = 0;
-        }
+        self.page_gc_metrics
+            .scan_duration
+            .set(started.elapsed().as_secs_f64());
+        self.page_gc_metrics.retries.set(stats.retries as f64);
         self.page_gc_metrics
             .batch_duration
             .observe(started.elapsed().as_secs_f64());

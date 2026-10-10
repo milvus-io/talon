@@ -334,10 +334,9 @@ mod tests {
         let r = Arc::new(runtime(root.path(), false, 160));
         let config = WorkerConfig {
             async_eviction_enabled: true,
-            async_eviction_check_interval_secs: 1,
+            async_eviction_check_interval_minutes: 1,
             ..Default::default()
         };
-        let started = tokio::time::Instant::now();
         let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
         tokio::time::timeout(Duration::from_secs(2), async {
             while r.resident_bytes() > 128 {
@@ -348,6 +347,15 @@ mod tests {
         .unwrap();
         // The periodic tick also handles new occupancy without a request driving eviction.
         fill(&r, 10, false).await;
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(59)).await;
+        tokio::time::resume();
+        tokio::task::yield_now().await;
+        assert_eq!(r.resident_bytes(), 144, "configured interval uses minutes");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(2), async {
             while r.resident_bytes() > 128 {
                 tokio::task::yield_now().await;
@@ -355,14 +363,13 @@ mod tests {
         })
         .await
         .unwrap();
-        assert!(
-            started.elapsed() >= Duration::from_secs(1),
-            "configured interval uses seconds"
-        );
         service.shutdown().await;
         r.drain_page_mutations().await;
         fill(&r, 13, false).await;
-        tokio::time::sleep(Duration::from_millis(1100)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(61)).await;
+        tokio::time::resume();
+        tokio::task::yield_now().await;
         assert_eq!(r.resident_bytes(), 144);
         let disabled = crate::runtime::WorkerBackground::start(r.clone(), &WorkerConfig::default());
         tokio::time::sleep(Duration::from_millis(20)).await;

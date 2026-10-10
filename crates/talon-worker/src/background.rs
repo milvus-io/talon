@@ -53,7 +53,7 @@ impl BackgroundScheduler {
         self
     }
 
-    /// Register one bounded batch. The first batch is immediately eligible.
+    /// Register a maintenance invocation. The first invocation is immediately eligible.
     pub fn register<F, Fut>(&mut self, name: &'static str, period: Duration, mut run: F)
     where
         F: FnMut() -> Fut + Send + 'static,

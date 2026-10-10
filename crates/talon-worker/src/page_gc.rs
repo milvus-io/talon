@@ -11,6 +11,7 @@ pub struct PageGcConfig {
     pub tti_ms: u64,
     pub checkpoint_interval_ms: u64,
     pub interval_ms: u64,
+    /// Watermark eviction limits; page GC and file cleanup always scan a full pass.
     pub scan_batch_size: usize,
     pub delete_batch_size: usize,
     pub io_concurrency: usize,
@@ -18,9 +19,9 @@ pub struct PageGcConfig {
 impl From<&WorkerConfig> for PageGcConfig {
     fn from(c: &WorkerConfig) -> Self {
         Self {
-            tti_ms: c.page_tti_ms,
-            checkpoint_interval_ms: c.page_access_checkpoint_interval_ms,
-            interval_ms: c.page_gc_interval_ms,
+            tti_ms: c.page_tti_hours * 3_600_000,
+            checkpoint_interval_ms: c.page_access_checkpoint_interval_minutes * 60_000,
+            interval_ms: c.page_gc_interval_minutes * 60_000,
             scan_batch_size: c.page_gc_scan_batch_size,
             delete_batch_size: c.page_gc_delete_batch_size,
             io_concurrency: c.page_gc_io_concurrency,
@@ -47,7 +48,7 @@ pub struct CheckpointReport {
     pub bytes: u64,
 }
 
-/// Bounded disk cleanup progress. Pending and duration describe a completed pass.
+/// Disk cleanup progress. Pending and duration describe a completed pass.
 #[derive(Default, Debug)]
 pub struct CleanupReport {
     pub checked: usize,
@@ -146,7 +147,7 @@ impl PageGcMetrics {
             bytes: ["tti", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_bytes_total", "Logical bytes successfully unlinked by reason; open descriptors may delay physical release.", talon_core::metrics::labels(&[("reason", reason)]))),
             delete_errors: c("talon_worker_page_gc_delete_errors_total", "Failed page unlink attempts."),
             retries: g("talon_worker_page_gc_pending_retries", "Retry pages observed in the latest complete scan."),
-            batch_duration: r.histogram("talon_worker_page_gc_batch_seconds", "Idle GC batch duration.", Default::default()),
+            batch_duration: r.histogram("talon_worker_page_gc_batch_seconds", "Complete idle GC invocation duration (legacy metric name).", Default::default()),
             scan_duration: g("talon_worker_page_gc_scan_seconds", "Most recent complete idle scan duration."),
             dirty_blocks: g("talon_worker_page_access_dirty_blocks", "Dirty blocks observed in checkpoint traversal."),
             dirty_age: g("talon_worker_page_access_oldest_dirty_seconds", "Age of oldest uncheckpointed modification observed in traversal."),
@@ -159,5 +160,24 @@ impl PageGcMetrics {
             tti_seconds: g("talon_worker_page_tti_seconds", "Configured page time to idle; zero disables idle expiration."),
             checkpoint_interval: g("talon_worker_page_access_checkpoint_interval_seconds", "Configured access checkpoint period."),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn maintenance_config_converts_hours_and_minutes() {
+        let config = WorkerConfig {
+            page_tti_hours: 24,
+            page_access_checkpoint_interval_minutes: 2,
+            page_gc_interval_minutes: 10,
+            ..Default::default()
+        };
+        let gc = PageGcConfig::from(&config);
+        assert_eq!(gc.tti_ms, 86_400_000);
+        assert_eq!(gc.checkpoint_interval_ms, 120_000);
+        assert_eq!(gc.interval_ms, 600_000);
     }
 }

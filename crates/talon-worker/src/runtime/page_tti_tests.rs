@@ -81,15 +81,30 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
     .unwrap()
 }
 async fn collect_all(r: &WorkerRuntime) -> u64 {
-    let mut bytes = 0;
-    for _ in 0..100 {
-        let report = r.gc_once().await;
-        bytes += report.bytes;
-        if report.completed_scan {
-            return bytes;
-        }
+    let report = r.gc_once().await;
+    assert!(report.completed_scan, "one invocation must finish the scan");
+    report.bytes
+}
+
+#[tokio::test]
+async fn gc_scans_all_pages_despite_batch_limits_and_restarts_from_the_beginning() {
+    let root = tempfile::tempdir().unwrap();
+    let mut r = runtime(root.path(), false, 0, 100);
+    r.page_gc_config.scan_batch_size = 1;
+    r.page_gc_config.delete_batch_size = 1;
+    r.page_clock.set(10000);
+    // No data files are needed for a pass that only checks unexpired metadata.
+    let state = r.page_lifecycle.block(&id());
+    let count = 65_537;
+    for page in 0..count {
+        state.register(PageIndex(page), Some(10000), 10000, false);
     }
-    panic!("scan failed to finish");
+    for _ in 0..2 {
+        let report = r.gc_once().await;
+        assert!(report.completed_scan);
+        assert_eq!(report.checked, count as usize);
+        assert_eq!(report.reclaimed, 0);
+    }
 }
 
 #[tokio::test]
@@ -362,23 +377,17 @@ async fn read_pin_blocks_tti_and_capacity_until_resource_is_obtained() {
 }
 
 #[tokio::test]
-async fn bounded_deletion_and_concurrent_sibling_commit() {
+async fn full_gc_ignores_deletion_batch_limit_and_preserves_concurrent_sibling_commit() {
     let root = tempfile::tempdir().unwrap();
     let mut r = runtime(root.path(), false, 0, 100);
     r.page_gc_config.delete_batch_size = 1;
     r.page_clock.set(10000);
     r.serve_range(&request(0, 48)).await.unwrap();
     r.page_clock.set(10101);
-    assert!(r.gc_once().await.reclaimed <= 1);
     let request = request(48, 16);
-    let ((), data) = tokio::join!(
-        async {
-            for _ in 0..4 {
-                r.gc_once().await;
-            }
-        },
-        r.serve_range(&request)
-    );
+    let (report, data) = tokio::join!(r.gc_once(), r.serve_range(&request));
+    assert!(report.completed_scan);
+    assert_eq!(report.reclaimed, 3);
     assert_eq!(data.unwrap().len(), 16);
     assert!(r.paged.as_ref().unwrap().has_page(&id(), PageIndex(3)));
     assert_eq!(r.resident_bytes(), r.lru.total_bytes());
@@ -612,9 +621,10 @@ async fn failed_first_candidate_must_not_starve_later_pages() {
     std::fs::remove_file(dir.join("0.page")).unwrap();
     std::fs::create_dir(dir.join("0.page")).unwrap();
     r.page_clock.set(10101);
-    for _ in 0..10 {
-        r.gc_once().await;
-    }
+    let report = r.gc_once().await;
+    assert!(report.completed_scan);
+    assert_eq!(report.checked, 2);
+    assert_eq!(report.reclaimed, 1);
     assert!(
         !dir.join("1.page").exists(),
         "healthy expired page is starved by a failing first candidate"
@@ -784,6 +794,87 @@ async fn capacity_retries_other_victims_after_unlink_failure() {
     tokio::time::timeout(Duration::from_secs(2), r.enforce_capacity())
         .await
         .unwrap();
+    assert_eq!(r.resident_bytes(), 16);
+}
+
+#[tokio::test]
+async fn file_cleanup_runs_independently_of_gc_interval() {
+    let root = tempfile::tempdir().unwrap();
+    let mut r = runtime(root.path(), false, 0, 0);
+    assert_eq!(r.page_gc_config.interval_ms, 600_000);
+    // Keep GC asleep while checking the independently configured hourly cleanup.
+    r.page_gc_config.interval_ms = 2 * 3_600_000;
+    let r = Arc::new(r);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let config = talon_core::WorkerConfig {
+        file_cleanup_interval_hours: 1,
+        background_scan_batch_size: 1,
+        background_delete_max_per_sec: 0,
+        ..Default::default()
+    };
+    let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+    // Wait for both startup passes, so removing a newly created orphan requires
+    // a later cleanup invocation while GC is still waiting for its next interval.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while r.page_gc_metrics.batch_duration.count() == 0
+            || r.page_gc_metrics.cleanup_scan_at.get() == 0.0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let orphan = r
+        .paged
+        .as_ref()
+        .unwrap()
+        .dir_for(&id())
+        .join("access.meta.tmp.crashed");
+    std::fs::write(&orphan, b"partial").unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(59 * 60)).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
+    assert!(orphan.exists(), "cleanup must wait for its hourly interval");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2 * 60)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while orphan.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.shutdown().await;
+    assert_eq!(r.page_gc_metrics.scanned.get(), 1);
+    assert_eq!(r.resident_bytes(), 16);
+}
+
+#[tokio::test]
+async fn file_cleanup_completes_a_full_pass_despite_batch_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let mut r = runtime(root.path(), false, 0, 0);
+    r.page_gc_config.scan_batch_size = 1;
+    r.page_gc_config.delete_batch_size = 1;
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let dir = r.paged.as_ref().unwrap().dir_for(&id());
+    for suffix in ["first", "second"] {
+        std::fs::write(dir.join(format!("access.meta.tmp.{suffix}")), b"partial").unwrap();
+    }
+    let report = r.cleanup_page_files_once().await;
+    assert!(report.completed_scan);
+    assert!(report.checked > 1);
+    assert_eq!(report.removed, 2);
+    assert_eq!(report.errors, 0);
+    assert!(dir.join("0.page").exists());
+    let next = dir.join("access.meta.tmp.next");
+    std::fs::write(&next, b"partial").unwrap();
+    let report = r.cleanup_page_files_once().await;
+    assert!(report.completed_scan);
+    assert_eq!(report.removed, 1);
+    assert!(!next.exists());
     assert_eq!(r.resident_bytes(), 16);
 }
 

@@ -8,30 +8,47 @@ Worker 的 paged L2 缓存可以按最后访问时间回收。TTI（Time To Idle
 
 ```toml
 l2_page_size_bytes = 1048576
-page_tti_ms = 86400000
-page_access_checkpoint_interval_ms = 60000
-page_gc_interval_ms = 1000
+page_tti_hours = 24
+page_access_checkpoint_interval_minutes = 1
+page_gc_interval_minutes = 10
+file_cleanup_interval_hours = 1
+# 以下批量限制仅用于水位淘汰，不限制 TTI GC 或 file_cleanup。
 page_gc_scan_batch_size = 65536
 page_gc_delete_batch_size = 1024
 page_gc_io_concurrency = 4
 ```
 
 24 小时仅为示例。环境变量为上述字段加 `TALON_WORKER_` 前缀并转为大写，
-例如 `TALON_WORKER_PAGE_TTI_MS=86400000`。环境变量覆盖 TOML；没有专用 CLI flag 或热更新。
+例如 `TALON_WORKER_PAGE_TTI_HOURS=24`。环境变量覆盖 TOML；没有专用 CLI flag 或热更新。
 完整默认值见[配置参考](../reference/configuration.md)。
 
 #580 新增的 TOML 名 `page_ttl_ms` 和环境变量 `TALON_WORKER_PAGE_TTL_MS`
-现统一改为 `page_tti_ms` 和 `TALON_WORKER_PAGE_TTI_MS`，不保留旧名别名。
-如果已经使用 #580 的配置，升级时需同步改名；旧 TOML 字段会报未知字段错误，
-旧环境变量不再读取（未设置新名时沿用 TOML 或默认值 `0`）。过期语义和默认值不变。
+现统一改为 `page_tti_hours` 和 `TALON_WORKER_PAGE_TTI_HOURS`，不保留旧名别名。
+如果已经使用 #580 的配置，升级时需同步改名并将毫秒值换算为小时；旧 TOML 字段会报未知字段错误，
+旧环境变量不再读取（未设置新名时沿用 TOML 或默认值 `0`）。过期语义和默认关闭行为不变。
 
-Rust 字段已改名为 `WorkerConfig::page_tti_ms`、`WorkerConfigPatch::page_tti_ms`
+缓存维护时间配置统一使用分钟或小时，旧名不保留别名；TOML 字段和环境变量均需同步迁移。
+旧 TOML 字段会报未知字段错误，旧环境变量不再读取。
+
+| 旧配置名 | 新配置名 | 新默认值 |
+| --- | --- | --- |
+| `page_tti_ms` | `page_tti_hours` | `0`（关闭） |
+| `page_access_checkpoint_interval_ms` | `page_access_checkpoint_interval_minutes` | `1` |
+| `page_gc_interval_ms` | `page_gc_interval_minutes` | `10` |
+| `file_cleanup_interval_ms` | `file_cleanup_interval_hours` | `1` |
+| `async_eviction_check_interval_secs` | `async_eviction_check_interval_minutes` | `1` |
+
+新配置只接受整数，迁移时需按目标单位重新选择数值，例如 `86400000` 毫秒改为 `24` 小时。
+GC 和文件清理改为每次完整扫描后分别等待 10 分钟、1 小时；不要直接沿用原先批次调度的数值。
+环境变量仍为 `TALON_WORKER_` 加新字段名的大写形式。请求超时、心跳和速率配置不受影响。
+
+Rust 字段已改名为 `WorkerConfig::page_tti_hours`、`WorkerConfigPatch::page_tti_hours`
 和 `PageGcConfig::tti_ms`，调用方需同步更新。
 监控指标 `talon_worker_page_ttl_seconds` 改为 `talon_worker_page_tti_seconds`，
 回收计数器的 `reason="ttl"` 改为 `reason="tti"`；自定义查询、面板和告警需同步更新。
 仓库内的告警规则已使用新名，混合版本部署期间自定义规则需兼顾两种名字。
 
-`page_tti_ms=0` 关闭 TTI 和访问时间 checkpoint，保留容量淘汰。命中时不取时间、
+`page_tti_hours=0` 关闭 TTI 和访问时间 checkpoint，保留容量淘汰。命中时不取时间、
 不更新时间戳或 dirty 状态，仍保留读取/删除仲裁和容量策略的访问记录。
 开启 TTI 必须启用 paged L2，checkpoint 周期不能超过 TTI；其他周期、批量和并发配置必须为正数。
 `capacity_bytes=0` 只关闭容量淘汰，不关闭 TTI。
@@ -50,7 +67,12 @@ TTI 开启时，L1 命中、L2 成功读取、sendfile 成功获取覆盖范围�
 重启时使用当前 Unix 时间恢复年龄，停机时间计入 TTI。记录缺失、损坏或位于未来时，
 page 是可回收候选，实际访问仍可在认领前续期。跨重启时钟异常可能导致提前回收。
 
-TTI 是异步回收条件，不是物理空间释放期限。GC 扫描/删除预算、失败重试及在途 FD
+TTI GC 每次从头完整扫描内存中的 page 元数据，并处理本轮所有回收候选；扫描和候选数量
+不受批量配置限制。扫描在 blocking pool 执行，不读取 page 数据文件，实际删除仍受
+I/O 并发和删除速率限制，并在删除前重新校验访问和读者状态。
+首次启动即可扫描；一轮扫描及删除尝试完成后，再等待 `page_gc_interval_minutes`，默认 10 分钟。失败的删除留到下一轮重试。并发新加入或已越过游标位置的 page 可以留到下一轮。
+
+TTI 是异步回收条件，不是物理空间释放期限。扫描间隔、删除限速、失败重试及在途 FD
 都会影响空间释放延迟。容量淘汰可以在 TTI 到期前回收 page。
 
 ## 模块与并发协议
@@ -163,12 +185,13 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 正式 `access.shard` 通过原子替换更新，不保留历史版本。异常退出留下的临时文件，
 以及最后一个 page 删除后尚未清理的目录，由独立磁盘扫描回收：
 
-- 启动持有 cache root 独占锁，在接收请求前完成一轮限量分批扫描；不依赖 residency
+- 启动持有 cache root 独占锁，在接收请求前完成一轮完整扫描；不依赖 residency
   索引，因此无 page、缺少或损坏 `block.meta` 的目录仍可被发现。
-- 后台按 `page_gc_interval_ms`（默认 1 秒）推进；每批使用 `page_gc_scan_batch_size`
-  和 `page_gc_delete_batch_size` 与全局后台批量上限中的较小值，并共享后台任务并发、
-  I/O 并发和删除速率预算；同一任务完成后再等待下一周期。
-  即使关闭 TTI 或切回 whole-block 读取模式，也继续扫描已有的 `paged/` 目录。
+- 后台每次完整扫描一圈，不受扫描/删除批量上限限制；完成后按独立的
+  `file_cleanup_interval_hours` 等待，默认 1 小时。仍共享后台任务并发、
+  I/O 并发和删除速率预算，删除失败留到下一轮重试。
+  `page_gc_interval_minutes` 不影响文件清理；原先依赖 `page_gc_interval_ms` 调整文件清理频率的部署需改用
+  `file_cleanup_interval_hours`。即使关闭 TTI 或切回 whole-block 读取模式，也继续扫描已有的 `paged/` 目录。
 - 分片目录中的 `access.shard.tmp.*` 使用独立 checkpoint gate 清理；在途写入、未知文件和符号链接保留。正式快照即使为空也保留，避免恢复时重新启用旧 block 文件。
 - 删除已识别的旧 `access.meta.tmp.*`，以及符合现有命名格式的 `block.meta.tmp.<pid>.<seq>`
   和 `<page>.page.tmp.<pid>.<seq>`。清理与在途提交/checkpoint 互斥，不按文件年龄猜测。
@@ -176,8 +199,7 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
   每次确认至多检查三个目录项，逐文件删除后使用非递归 `remove_dir`；存在 page、未知文件
   或符号链接时保留目录。目录读取错误不当作空目录。常规枚举预算外有这项常数开销。
 - 扫描最多保留三级目录迭代器，不积累全局文件列表或无限重试队列。失败后推进其他目录，
-  下一轮从磁盘重新发现；重启也能恢复清理。删除预算为 1 时，metadata 和目录可跨批处理，
-  每次继续前都重新检查是否已有新的 page。
+  下一轮从磁盘重新发现；重启也能恢复清理。删除目录及元数据前重新检查是否已有新的 page。
 
 这保证文件系统恢复可操作且后台持续运行后，已识别残留能够最终清理；永久 I/O 错误
 或未知文件需要按告警排查。清理过程不改变有效 page 的访问时间或 TTI。
@@ -202,7 +224,8 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 
 所有新指标以 `talon_worker_page_` 开头，无 object/page 标签。
 
-- `gc_scanned_total`、`gc_batch_seconds`、`gc_scan_seconds`：扫描进度与耗时。
+- `gc_scanned_total`、`gc_batch_seconds`、`gc_scan_seconds`：扫描进度与耗时；后两者记录完整一轮
+  GC（含删除等待）的耗时，不含轮次之间的间隔，保留 `batch` 指标名以兼容现有监控。
 - `tti_seconds`：配置的空闲过期时长；`0` 表示关闭按空闲时间回收。
 - `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded`。
 - `gc_delete_errors_total`、`gc_pending_retries`：删除故障和最近完整扫描看到的重试量。

@@ -35,12 +35,16 @@ impl WorkerBackground {
             }
         });
         let w = worker.clone();
-        scheduler.register("file_cleanup", period, move || {
-            let w = w.clone();
-            async move {
-                w.cleanup_page_files_once().await;
-            }
-        });
+        scheduler.register(
+            "file_cleanup",
+            Duration::from_secs(config.file_cleanup_interval_hours * 3600),
+            move || {
+                let w = w.clone();
+                async move {
+                    w.cleanup_page_files_once().await;
+                }
+            },
+        );
         if gc.tti_ms > 0 {
             let w = worker.clone();
             let period = Duration::from_millis(
@@ -61,7 +65,7 @@ impl WorkerBackground {
             let w = worker.clone();
             scheduler.register(
                 "cache_eviction",
-                Duration::from_secs(config.async_eviction_check_interval_secs),
+                Duration::from_secs(config.async_eviction_check_interval_minutes * 60),
                 move || {
                     let w = w.clone();
                     let cycle = cycle.clone();
@@ -76,7 +80,7 @@ impl WorkerBackground {
             worker,
         }
     }
-    /// Stop admission, finish batches and owned mutations, then flush access metadata
+    /// Stop admission, finish active maintenance and owned mutations, then flush access metadata
     /// using the same disk budget. External process shutdown deadlines still apply.
     pub async fn shutdown(self) {
         self.scheduler.shutdown().await;
