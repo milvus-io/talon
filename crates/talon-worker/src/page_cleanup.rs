@@ -1,10 +1,10 @@
 //! Bounded, repeatable disk discovery of checkpoint leftovers, independent of TTI.
 use crate::page_gc::CleanupReport;
 use crate::page_lifecycle::PageLifecycle;
-use std::fs::{self, ReadDir};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
+use tokio::fs::{self, ReadDir};
 
 struct DirectoryScan {
     path: PathBuf,
@@ -46,7 +46,16 @@ impl CleanupCursor {
         tracing::warn!(path = %path.display(), %error, "page metadata cleanup failed; will rescan");
     }
 
-    fn unlink(&self, path: &Path, directory: bool, report: &mut CleanupReport) -> bool {
+    async fn unlink(
+        &self,
+        path: &Path,
+        directory: bool,
+        report: &mut CleanupReport,
+        resources: Option<&crate::background::BackgroundBudget>,
+    ) -> bool {
+        if let Some(resources) = resources {
+            resources.delete().await;
+        }
         report.attempted += 1;
         #[cfg(test)]
         if self.fail_deletes {
@@ -58,9 +67,9 @@ impl CleanupCursor {
             return false;
         }
         let result = if directory {
-            fs::remove_dir(path)
+            fs::remove_dir(path).await
         } else {
-            fs::remove_file(path)
+            fs::remove_file(path).await
         };
         match result {
             Ok(()) => {
@@ -78,22 +87,27 @@ impl CleanupCursor {
     /// Returns true if finalization needs another deletion budget. Under the
     /// exclusive directory gate, at most three entries prove whether only the
     /// two known metadata files remain. Never recursively delete a directory.
-    fn finish_directory(
+    async fn finish_directory(
         &self,
         dir: &DirectoryScan,
         budget: usize,
         report: &mut CleanupReport,
+        resources: Option<&crate::background::BackgroundBudget>,
     ) -> io::Result<bool> {
-        let files = match fs::read_dir(&dir.path) {
+        let mut files = match fs::read_dir(&dir.path).await {
             Ok(files) => files,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
         let mut metadata = Vec::with_capacity(2);
-        for entry in files.take(3) {
-            let entry = entry?;
+        for _ in 0..3 {
+            let Some(entry) = files.next_entry().await? else {
+                break;
+            };
             let name = entry.file_name();
-            if !entry.file_type()?.is_file() || (name != "access.meta" && name != "block.meta") {
+            if !entry.file_type().await?.is_file()
+                || (name != "access.meta" && name != "block.meta")
+            {
                 // Includes live pages, unknown files, symlinks and failed temps.
                 return Ok(false);
             }
@@ -104,34 +118,48 @@ impl CleanupCursor {
             if report.attempted == budget {
                 return Ok(true);
             }
-            if !self.unlink(&path, false, report) {
+            if !self.unlink(&path, false, report, resources).await {
                 return Ok(false);
             }
         }
         if report.attempted == budget {
             return Ok(true);
         }
-        self.unlink(&dir.path, true, report);
+        self.unlink(&dir.path, true, report, resources).await;
         Ok(false)
     }
 
-    pub fn run_batch(
+    #[cfg(test)]
+    pub async fn run_batch(
         &mut self,
         lifecycle: &PageLifecycle,
         scan_budget: usize,
         delete_budget: usize,
+    ) -> CleanupReport {
+        self.run_batch_with_budget(lifecycle, scan_budget, delete_budget, None)
+            .await
+    }
+
+    pub async fn run_batch_with_budget(
+        &mut self,
+        lifecycle: &PageLifecycle,
+        scan_budget: usize,
+        delete_budget: usize,
+        resources: Option<&crate::background::BackgroundBudget>,
     ) -> CleanupReport {
         let mut report = CleanupReport::default();
         if self.shards.is_none() {
             self.started = Instant::now();
             self.pending = 0;
             // Do not follow a replaced/symlinked paged root.
-            let root = fs::symlink_metadata(&self.root).and_then(|meta| {
+            let root = async {
+                let meta = fs::symlink_metadata(&self.root).await?;
                 if !meta.is_dir() {
                     return Err(io::Error::other("paged root is not a directory"));
                 }
-                fs::read_dir(&self.root)
-            });
+                fs::read_dir(&self.root).await
+            }
+            .await;
             match root {
                 Ok(shards) => self.shards = Some(shards),
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
@@ -149,16 +177,18 @@ impl CleanupCursor {
         while report.checked < scan_budget && report.attempted < delete_budget {
             if let Some(mut dir) = self.current.take() {
                 let gate = lifecycle.directory_gate(dir.digest);
-                let _exclusive = gate.blocking_write();
+                let _exclusive = gate.write().await;
                 // Revalidate the path after acquiring the gate, including the
                 // shard parent. Metadata is not needed to establish gate identity.
-                let safe = fs::symlink_metadata(dir.path.parent().unwrap()).and_then(|m| {
+                let safe = async {
+                    let m = fs::symlink_metadata(dir.path.parent().unwrap()).await?;
                     if m.is_dir() {
-                        fs::symlink_metadata(&dir.path)
+                        fs::symlink_metadata(&dir.path).await
                     } else {
                         Err(io::Error::other("shard is not a directory"))
                     }
-                });
+                }
+                .await;
                 match safe {
                     Ok(m) if m.is_dir() => {}
                     Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
@@ -183,10 +213,10 @@ impl CleanupCursor {
                     {
                         break;
                     }
-                    match dir.files.next() {
-                        Some(Ok(entry)) => {
+                    match dir.files.next_entry().await {
+                        Ok(Some(entry)) => {
                             report.checked += 1;
-                            match entry.file_type() {
+                            match entry.file_type().await {
                                 Ok(kind)
                                     if kind.is_file()
                                         && entry
@@ -194,7 +224,10 @@ impl CleanupCursor {
                                             .to_str()
                                             .is_some_and(is_owned_temp) =>
                                 {
-                                    if !self.unlink(&entry.path(), false, &mut report) {
+                                    if !self
+                                        .unlink(&entry.path(), false, &mut report, resources)
+                                        .await
+                                    {
                                         dir.failed = true;
                                     }
                                 }
@@ -205,18 +238,21 @@ impl CleanupCursor {
                                 }
                             }
                         }
-                        Some(Err(error)) => {
+                        Err(error) => {
                             report.checked += 1;
                             Self::failed(&mut report, &dir.path, error);
                             dir.failed = true;
                             dir.exhausted = true;
                         }
-                        None => dir.exhausted = true,
+                        Ok(None) => dir.exhausted = true,
                     }
                 }
                 if dir.exhausted {
                     let errors = report.errors;
-                    match self.finish_directory(&dir, delete_budget, &mut report) {
+                    match self
+                        .finish_directory(&dir, delete_budget, &mut report, resources)
+                        .await
+                    {
                         Ok(true) => {
                             self.current = Some(dir);
                         }
@@ -234,8 +270,8 @@ impl CleanupCursor {
                 continue;
             }
             if let Some(directories) = &mut self.directories {
-                match directories.next() {
-                    Some(Ok(entry)) => {
+                match directories.next_entry().await {
+                    Ok(Some(entry)) => {
                         report.checked += 1;
                         let path = entry.path();
                         if entry.file_name().to_str().is_some_and(|name| {
@@ -252,9 +288,12 @@ impl CleanupCursor {
                                 let gate = lifecycle.checkpoint_gate(shard);
                                 // An active writer owns its temp until publication completes.
                                 if let Ok(_guard) = gate.try_lock() {
-                                    match entry.file_type() {
+                                    match entry.file_type().await {
                                         Ok(kind) if kind.is_file() => {
-                                            if !self.unlink(&path, false, &mut report) {
+                                            if !self
+                                                .unlink(&path, false, &mut report, resources)
+                                                .await
+                                            {
                                                 self.pending += 1;
                                             }
                                         }
@@ -271,12 +310,15 @@ impl CleanupCursor {
                         let Some(digest) = directory_digest(&path) else {
                             continue;
                         };
-                        match entry.file_type().and_then(|kind| {
+                        match async {
+                            let kind = entry.file_type().await?;
                             if !kind.is_dir() {
                                 return Ok(None);
                             }
-                            fs::read_dir(&path).map(Some)
-                        }) {
+                            fs::read_dir(&path).await.map(Some)
+                        }
+                        .await
+                        {
                             Ok(Some(files)) => {
                                 self.current = Some(DirectoryScan {
                                     path,
@@ -294,18 +336,18 @@ impl CleanupCursor {
                             }
                         }
                     }
-                    Some(Err(error)) => {
+                    Err(error) => {
                         report.checked += 1;
                         Self::failed(&mut report, &self.root, error);
                         self.pending += 1;
                         self.directories = None;
                     }
-                    None => self.directories = None,
+                    Ok(None) => self.directories = None,
                 }
                 continue;
             }
-            match self.shards.as_mut().unwrap().next() {
-                Some(Ok(entry)) => {
+            match self.shards.as_mut().unwrap().next_entry().await {
+                Ok(Some(entry)) => {
                     report.checked += 1;
                     if !entry
                         .file_name()
@@ -314,12 +356,15 @@ impl CleanupCursor {
                     {
                         continue;
                     }
-                    match entry.file_type().and_then(|kind| {
+                    match async {
+                        let kind = entry.file_type().await?;
                         if !kind.is_dir() {
                             return Ok(None);
                         }
-                        fs::read_dir(entry.path()).map(Some)
-                    }) {
+                        fs::read_dir(entry.path()).await.map(Some)
+                    }
+                    .await
+                    {
                         Ok(dirs) => self.directories = dirs,
                         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                         Err(error) => {
@@ -328,14 +373,14 @@ impl CleanupCursor {
                         }
                     }
                 }
-                Some(Err(error)) => {
+                Err(error) => {
                     report.checked += 1;
                     Self::failed(&mut report, &self.root, error);
                     self.pending += 1;
                     self.complete(&mut report);
                     break;
                 }
-                None => {
+                Ok(None) => {
                     self.complete(&mut report);
                     break;
                 }
@@ -390,6 +435,7 @@ fn directory_digest(path: &Path) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn directory(root: &Path, digest: u64) -> PathBuf {
         let hex = format!("{digest:016x}");
@@ -397,9 +443,9 @@ mod tests {
         fs::create_dir_all(&path).unwrap();
         path
     }
-    fn complete(cursor: &mut CleanupCursor, life: &PageLifecycle) -> CleanupReport {
+    async fn complete(cursor: &mut CleanupCursor, life: &PageLifecycle) -> CleanupReport {
         for _ in 0..1000 {
-            let r = cursor.run_batch(life, 1, 1);
+            let r = cursor.run_batch(life, 1, 1).await;
             assert!(r.checked <= 1);
             assert!(r.attempted <= 1);
             if r.completed_scan {
@@ -409,8 +455,8 @@ mod tests {
         panic!("cleanup made no bounded progress");
     }
 
-    #[test]
-    fn bounded_cleanup_preserves_live_pages_unknown_files_and_symlinks() {
+    #[tokio::test]
+    async fn bounded_cleanup_preserves_live_pages_unknown_files_and_symlinks() {
         let root = tempfile::tempdir().unwrap();
         let external = tempfile::tempdir().unwrap();
         let live = directory(root.path(), 1);
@@ -439,7 +485,7 @@ mod tests {
         .unwrap();
         let life = PageLifecycle::new();
         let mut cursor = CleanupCursor::new(root.path().to_owned());
-        assert_eq!(complete(&mut cursor, &life).pending, 0);
+        assert_eq!(complete(&mut cursor, &life).await.pending, 0);
         assert!(!empty.exists());
         assert!(!live.join("access.meta.tmp.crashed").exists());
         assert_eq!(fs::read(live.join("0.page")).unwrap(), b"page");
@@ -457,24 +503,24 @@ mod tests {
         );
     }
 
-    #[test]
-    fn failed_cleanup_is_rediscovered_after_restart_without_metadata() {
+    #[tokio::test]
+    async fn failed_cleanup_is_rediscovered_after_restart_without_metadata() {
         let root = tempfile::tempdir().unwrap();
         let dir = directory(root.path(), 7);
         fs::write(dir.join("access.meta.tmp.crashed"), b"partial").unwrap();
         let life = PageLifecycle::new();
         let mut cursor = CleanupCursor::new(root.path().to_owned());
         cursor.fail_deletes = true;
-        assert_eq!(complete(&mut cursor, &life).pending, 1);
+        assert_eq!(complete(&mut cursor, &life).await.pending, 1);
         assert!(dir.exists());
         drop(cursor); // No retry list is persisted, and there is no block.meta.
         let mut cursor = CleanupCursor::new(root.path().to_owned());
-        assert_eq!(complete(&mut cursor, &life).pending, 0);
+        assert_eq!(complete(&mut cursor, &life).await.pending, 0);
         assert!(!dir.exists());
     }
 
-    #[test]
-    fn empty_directory_finalization_rechecks_pages_created_between_batches() {
+    #[tokio::test]
+    async fn empty_directory_finalization_rechecks_pages_created_between_batches() {
         let root = tempfile::tempdir().unwrap();
         let dir = directory(root.path(), 9);
         fs::write(dir.join("access.meta"), b"checkpoint").unwrap();
@@ -483,7 +529,7 @@ mod tests {
         let mut cursor = CleanupCursor::new(root.path().to_owned());
         // A budget of one forces metadata removal and rmdir into separate calls.
         for _ in 0..20 {
-            let r = cursor.run_batch(&life, 1, 1);
+            let r = cursor.run_batch(&life, 1, 1).await;
             if r.removed > 0 {
                 break;
             }
@@ -491,7 +537,7 @@ mod tests {
         // A new commit runs while the cleanup gate is released between batches.
         fs::write(dir.join("block.meta"), b"new identity").unwrap();
         fs::write(dir.join("0.page"), b"new page").unwrap();
-        complete(&mut cursor, &life);
+        complete(&mut cursor, &life).await;
         assert_eq!(fs::read(dir.join("block.meta")).unwrap(), b"new identity");
         assert_eq!(fs::read(dir.join("0.page")).unwrap(), b"new page");
     }

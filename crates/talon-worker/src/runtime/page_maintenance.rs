@@ -5,6 +5,18 @@ use crate::page_gc::{CheckpointReport, GcReport};
 use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
 
 impl WorkerRuntime {
+    async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        match &self.background_budget {
+            Some(budget) => Some(budget.io().await),
+            None => None,
+        }
+    }
+    async fn background_delete(&self) {
+        if let Some(budget) = &self.background_budget {
+            budget.delete().await;
+        }
+    }
+
     /// Configure page idle collection and restore persisted ages before serving traffic.
     pub fn with_page_gc(mut self, config: PageGcConfig) -> anyhow::Result<Self> {
         anyhow::ensure!(
@@ -105,7 +117,7 @@ impl WorkerRuntime {
         self.page_mutations.drain().await;
     }
 
-    /// Run one disk cleanup batch, including when page TTI or paged reads are disabled.
+    /// Complete one disk cleanup pass, including when page TTI or paged reads are disabled.
     pub async fn cleanup_page_files_once(&self) -> crate::page_gc::CleanupReport {
         let runtime = self.clone();
         let permit = self
@@ -117,17 +129,18 @@ impl WorkerRuntime {
         self.page_mutations
             .run(async move {
                 let _permit = permit;
-                let worker = runtime.clone();
-                let report = tokio::task::spawn_blocking(move || {
-                    // The runtime retains the root lease until blocking I/O finishes.
-                    worker.page_cleanup.lock().unwrap().run_batch(
-                        &worker.page_lifecycle,
-                        worker.page_gc_config.scan_batch_size,
-                        worker.page_gc_config.delete_batch_size,
+                let _background_io = runtime.background_io().await;
+                let report = runtime
+                    .page_cleanup
+                    .lock()
+                    .await
+                    .run_batch_with_budget(
+                        &runtime.page_lifecycle,
+                        usize::MAX,
+                        usize::MAX,
+                        runtime.background_budget.as_deref(),
                     )
-                })
-                .await
-                .expect("page cleanup task panicked");
+                    .await;
                 runtime
                     .page_gc_metrics
                     .cleanup_scanned
@@ -162,42 +175,31 @@ impl WorkerRuntime {
     /// Discover and attempt one complete disk pass before serving traffic.
     /// Errors stay on disk and are rediscovered by the background loop.
     pub async fn recover_page_file_cleanup(&self) {
-        loop {
-            if self.cleanup_page_files_once().await.completed_scan {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        self.cleanup_page_files_once().await;
     }
 
-    /// Run at most one bounded TTI batch; independent of capacity and control-plane health.
+    /// Complete one TTI scan and its deletion attempts, independent of batch limits.
     pub async fn gc_once(&self) -> GcReport {
-        let Ok(mut scan) = self.page_scan.try_lock() else {
+        let Ok(_scan) = self.page_scan.try_lock() else {
             return GcReport::default();
         };
         let started = Instant::now();
-        let mut cursor = std::mem::take(&mut scan.0);
         let lifecycle = self.page_lifecycle.clone();
-        let limit = self.page_gc_config.scan_batch_size;
-        let delete_limit = self.page_gc_config.delete_batch_size;
         let tti = (self.page_gc_config.tti_ms > 0).then_some(self.page_gc_config.tti_ms);
         let now = self.page_clock.now();
-        let (cursor, candidates, stats) = tokio::task::spawn_blocking(move || {
-            let (candidates, stats) = lifecycle.scan(&mut cursor, limit, now, tti, delete_limit);
-            (cursor, candidates, stats)
+        let (candidates, stats) = tokio::task::spawn_blocking(move || {
+            lifecycle.scan(&mut ScanCursor::default(), usize::MAX, now, tti, usize::MAX)
         })
         .await
         .expect("page scanner panicked");
-        scan.0 = cursor;
         self.page_gc_metrics.scanned.add(stats.checked as u64);
-        scan.2 += stats.retries;
         let mut report = GcReport {
             checked: stats.checked,
             completed_scan: stats.completed,
             ..Default::default()
         };
-        // The scanner stops when either budget is exhausted, so its cursor never
-        // skips unattempted deletions (including retries for empty directories).
+        // Finish all candidates before the next scan interval. Disk concurrency,
+        // deletion pacing, and revalidation still apply to every attempt.
         for block in stats.empty {
             self.cleanup_empty_block(block).await;
         }
@@ -212,14 +214,10 @@ impl WorkerRuntime {
                 report.bytes += bytes;
             }
         }
-        if stats.completed {
-            self.page_gc_metrics
-                .scan_duration
-                .set(scan.1.elapsed().as_secs_f64());
-            self.page_gc_metrics.retries.set(scan.2 as f64);
-            scan.1 = Instant::now();
-            scan.2 = 0;
-        }
+        self.page_gc_metrics
+            .scan_duration
+            .set(started.elapsed().as_secs_f64());
+        self.page_gc_metrics.retries.set(stats.retries as f64);
         self.page_gc_metrics
             .batch_duration
             .observe(started.elapsed().as_secs_f64());
@@ -231,13 +229,25 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
+        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
+            .await
+    }
+
+    async fn evict_page_candidate_to_target(
+        &self,
+        candidate: GcCandidate,
+        reason: usize,
+        target: u64,
+    ) -> Option<u64> {
         let runtime = self.clone();
         let permit = self.page_gc_io.clone().acquire_owned().await.ok()?;
         self.page_mutations.run(async move {
             let _permit = permit;
+            runtime.background_delete().await;
+            let _background_io = runtime.background_io().await;
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
-            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= runtime.capacity_bytes) { return None; }
+            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= target) { return None; }
             let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
@@ -271,6 +281,8 @@ impl WorkerRuntime {
         let runtime = self.clone();
         self.page_mutations
             .run(async move {
+                runtime.background_delete().await;
+                let _background_io = runtime.background_io().await;
                 let _gate = block.gate.lock().await;
                 if !block.inner.lock().unwrap().pages.is_empty() {
                     return;
@@ -304,6 +316,16 @@ impl WorkerRuntime {
         units: Vec<crate::eviction::EvictionCandidate>,
         reason: usize,
     ) {
+        self.unlink_units_to_target(units, reason, self.capacity_bytes)
+            .await;
+    }
+
+    pub(super) async fn unlink_units_to_target(
+        &self,
+        units: Vec<crate::eviction::EvictionCandidate>,
+        reason: usize,
+        target: u64,
+    ) {
         // Capture generations before the first await, not after earlier deletions finish.
         let candidates: Vec<_> = units
             .into_iter()
@@ -323,7 +345,7 @@ impl WorkerRuntime {
                 CacheUnit::Page(_, _) => {
                     if self.lru.candidate_is_current(&unit) {
                         if let Some(c) = candidate {
-                            self.evict_page_candidate(c, reason).await;
+                            self.evict_page_candidate_to_target(c, reason, target).await;
                         }
                     }
                 }
@@ -332,10 +354,12 @@ impl WorkerRuntime {
                     let runtime = self.clone();
                     self.page_mutations
                         .run(async move {
+                            runtime.background_delete().await;
+                            let _background_io = runtime.background_io().await;
                             let _gate = state.gate.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
-                                    || runtime.lru.total_bytes() <= runtime.capacity_bytes)
+                                    || runtime.lru.total_bytes() <= target)
                             {
                                 return;
                             }
@@ -393,9 +417,8 @@ impl WorkerRuntime {
             for _ in 0..if all { crate::page_lifecycle::SHARDS } else { 1 } {
                 let shard = *cursor;
                 *cursor = (shard + 1) % crate::page_lifecycle::SHARDS;
-                let worker = runtime.clone();
-                let result = tokio::task::spawn_blocking(move || worker.checkpoint_shard(shard)).await
-                    .expect("access checkpoint task panicked");
+                let _background_io = runtime.background_io().await;
+                let result = runtime.checkpoint_shard(shard).await;
                 match result {
                     Ok((blocks, bytes)) => {
                         report.blocks += blocks;
@@ -417,88 +440,106 @@ impl WorkerRuntime {
         }).await
     }
 
-    fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
+    async fn checkpoint_shard(&self, shard: usize) -> anyhow::Result<(usize, usize)> {
         let paged = self.paged.as_ref().expect("paged TTI");
         let gate = self.page_lifecycle.checkpoint_gate(shard);
-        let _guard = gate.lock().unwrap();
-        let (ceiling, membership, mut dirty) = self.page_lifecycle.checkpoint_start(shard);
-        let mut slot = 0;
-        let mut snapshots = Vec::new();
-        let mut size = 24;
-        loop {
-            let blocks = self
-                .page_lifecycle
-                .checkpoint_batch(shard, &mut slot, ceiling);
-            if blocks.is_empty() {
-                break;
-            }
-            for block in blocks {
-                let state = block.inner.lock().unwrap();
-                dirty |= state.dirty_since.is_some();
-                // Bound allocation before collecting a potentially large block.
-                let records = state.pages.len();
-                size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
-                anyhow::ensure!(
-                    size <= crate::page_access_shard::MAX_BYTES,
-                    "access shard exceeds 64 MiB limit"
-                );
-                // Consume markers before sampling timestamps. Concurrent reads
-                // remain dirty for the next checkpoint; failure restores markers.
-                let pages: Vec<_> = state
-                    .pages
-                    .iter()
-                    .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
-                    .collect();
-                dirty |= pages.iter().any(PageCheckpoint::dirty);
-                // Include clean blocks too: this file replaces the full shard.
-                let snapshot = AccessSnapshot {
-                    revision: state.revision,
-                    sampled_at: self.page_clock.now(),
-                    records: pages
+        let _guard = gate.lock().await;
+        let worker = self.clone();
+        let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let (ceiling, membership, mut dirty) = worker.page_lifecycle.checkpoint_start(shard);
+            let mut slot = 0;
+            let mut snapshots = Vec::new();
+            let mut size = 24;
+            loop {
+                let blocks = worker
+                    .page_lifecycle
+                    .checkpoint_batch(shard, &mut slot, ceiling);
+                if blocks.is_empty() {
+                    break;
+                }
+                for block in blocks {
+                    let state = block.inner.lock().unwrap();
+                    dirty |= state.dirty_since.is_some();
+                    // Bound allocation before collecting a potentially large block.
+                    let records = state.pages.len();
+                    size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
+                    anyhow::ensure!(
+                        size <= crate::page_access_shard::MAX_BYTES,
+                        "access shard exceeds 64 MiB limit"
+                    );
+                    // Consume markers before sampling timestamps. Concurrent reads
+                    // remain dirty for the next checkpoint; failure restores markers.
+                    let pages: Vec<_> = state
+                        .pages
                         .iter()
-                        .filter_map(|page| page.access.map(|age| (page.page, age)))
-                        .collect(),
-                };
-                let resident = !state.pages.is_empty();
-                drop(state);
-                snapshots.push((block, snapshot, resident, pages));
+                        .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
+                        .collect();
+                    dirty |= pages.iter().any(PageCheckpoint::dirty);
+                    // Include clean blocks too: this file replaces the full shard.
+                    let snapshot = AccessSnapshot {
+                        revision: state.revision,
+                        sampled_at: worker.page_clock.now(),
+                        records: pages
+                            .iter()
+                            .filter_map(|page| page.access.map(|age| (page.page, age)))
+                            .collect(),
+                    };
+                    let resident = !state.pages.is_empty();
+                    drop(state);
+                    snapshots.push((block, snapshot, resident, pages));
+                }
             }
-        }
-        if !dirty {
+            if !dirty {
+                return Ok(None);
+            }
+            let paged = worker.paged.as_ref().expect("paged TTI");
+            let dir = paged.root().join(format!("{shard:02x}"));
+            // Whole-block-only registry entries have no paged directory to persist.
+            if !dir.exists() && snapshots.iter().all(|(_, _, resident, _)| !resident) {
+                worker.page_lifecycle.checkpoint_finished(shard, membership);
+                return Ok(None);
+            }
+            let bytes = crate::page_access_shard::encode(
+                paged.page_size(),
+                snapshots
+                    .iter()
+                    .filter(|(_, _, resident, _)| *resident)
+                    .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
+            )?;
+            Ok(Some((membership, snapshots, bytes)))
+        })
+        .await
+        .expect("access checkpoint preparation panicked")?;
+        let Some((membership, snapshots, bytes)) = prepared else {
             return Ok((0, 0));
-        }
+        };
         let dir = paged.root().join(format!("{shard:02x}"));
-        // Whole-block-only registry entries have no paged directory to persist.
-        if !dir.exists() && snapshots.iter().all(|(_, _, resident, _)| !resident) {
-            self.page_lifecycle.checkpoint_finished(shard, membership);
-            return Ok((0, 0));
-        }
-        let bytes = crate::page_access_shard::checkpoint(
-            &dir,
-            paged.page_size(),
-            snapshots
+        let bytes =
+            crate::page_access_shard::publish(&dir, bytes, self.background_budget.as_deref())
+                .await?;
+        let worker = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let count = snapshots
                 .iter()
                 .filter(|(_, _, resident, _)| *resident)
-                .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
-        )?;
-        let count = snapshots
-            .iter()
-            .filter(|(_, _, resident, _)| *resident)
-            .count();
-        for (block, snapshot, _, pages) in snapshots {
-            let mut state = block.inner.lock().unwrap();
-            if state.revision == snapshot.revision {
-                state.dirty_since = None;
-            } else if let Some(since) = state.dirty_since.as_mut() {
-                *since = (*since).max(snapshot.sampled_at);
+                .count();
+            for (block, snapshot, _, pages) in snapshots {
+                let mut state = block.inner.lock().unwrap();
+                if state.revision == snapshot.revision {
+                    state.dirty_since = None;
+                } else if let Some(since) = state.dirty_since.as_mut() {
+                    *since = (*since).max(snapshot.sampled_at);
+                }
+                drop(state);
+                for page in pages {
+                    page.commit();
+                }
             }
-            drop(state);
-            for page in pages {
-                page.commit();
-            }
-        }
-        self.page_lifecycle.checkpoint_finished(shard, membership);
-        Ok((count, bytes))
+            worker.page_lifecycle.checkpoint_finished(shard, membership);
+            Ok((count, bytes))
+        })
+        .await
+        .expect("access checkpoint completion panicked")
     }
 
     async fn refresh_checkpoint_metrics(&self) {

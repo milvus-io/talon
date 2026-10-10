@@ -81,15 +81,30 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
     .unwrap()
 }
 async fn collect_all(r: &WorkerRuntime) -> u64 {
-    let mut bytes = 0;
-    for _ in 0..100 {
-        let report = r.gc_once().await;
-        bytes += report.bytes;
-        if report.completed_scan {
-            return bytes;
-        }
+    let report = r.gc_once().await;
+    assert!(report.completed_scan, "one invocation must finish the scan");
+    report.bytes
+}
+
+#[tokio::test]
+async fn gc_scans_all_pages_despite_batch_limits_and_restarts_from_the_beginning() {
+    let root = tempfile::tempdir().unwrap();
+    let mut r = runtime(root.path(), false, 0, 100);
+    r.page_gc_config.scan_batch_size = 1;
+    r.page_gc_config.delete_batch_size = 1;
+    r.page_clock.set(10000);
+    // No data files are needed for a pass that only checks unexpired metadata.
+    let state = r.page_lifecycle.block(&id());
+    let count = 65_537;
+    for page in 0..count {
+        state.register(PageIndex(page), Some(10000), 10000, false);
     }
-    panic!("scan failed to finish");
+    for _ in 0..2 {
+        let report = r.gc_once().await;
+        assert!(report.completed_scan);
+        assert_eq!(report.checked, count as usize);
+        assert_eq!(report.reclaimed, 0);
+    }
 }
 
 #[tokio::test]
@@ -362,23 +377,17 @@ async fn read_pin_blocks_tti_and_capacity_until_resource_is_obtained() {
 }
 
 #[tokio::test]
-async fn bounded_deletion_and_concurrent_sibling_commit() {
+async fn full_gc_ignores_deletion_batch_limit_and_preserves_concurrent_sibling_commit() {
     let root = tempfile::tempdir().unwrap();
     let mut r = runtime(root.path(), false, 0, 100);
     r.page_gc_config.delete_batch_size = 1;
     r.page_clock.set(10000);
     r.serve_range(&request(0, 48)).await.unwrap();
     r.page_clock.set(10101);
-    assert!(r.gc_once().await.reclaimed <= 1);
     let request = request(48, 16);
-    let ((), data) = tokio::join!(
-        async {
-            for _ in 0..4 {
-                r.gc_once().await;
-            }
-        },
-        r.serve_range(&request)
-    );
+    let (report, data) = tokio::join!(r.gc_once(), r.serve_range(&request));
+    assert!(report.completed_scan);
+    assert_eq!(report.reclaimed, 3);
     assert_eq!(data.unwrap().len(), 16);
     assert!(r.paged.as_ref().unwrap().has_page(&id(), PageIndex(3)));
     assert_eq!(r.resident_bytes(), r.lru.total_bytes());
@@ -441,7 +450,8 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
     r.serve_range(&request(0, 16)).await.unwrap();
     let r = Arc::new(r);
     r.page_clock.set(10101);
-    let service = crate::page_gc::PageGcService::start(r.clone(), r.page_gc_config.clone());
+    let service =
+        crate::runtime::WorkerBackground::start(r.clone(), &talon_core::WorkerConfig::default());
     tokio::time::timeout(Duration::from_secs(2), async {
         while r.resident_bytes() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -611,9 +621,10 @@ async fn failed_first_candidate_must_not_starve_later_pages() {
     std::fs::remove_file(dir.join("0.page")).unwrap();
     std::fs::create_dir(dir.join("0.page")).unwrap();
     r.page_clock.set(10101);
-    for _ in 0..10 {
-        r.gc_once().await;
-    }
+    let report = r.gc_once().await;
+    assert!(report.completed_scan);
+    assert_eq!(report.checked, 2);
+    assert_eq!(report.reclaimed, 1);
     assert!(
         !dir.join("1.page").exists(),
         "healthy expired page is starved by a failing first candidate"
@@ -787,6 +798,87 @@ async fn capacity_retries_other_victims_after_unlink_failure() {
 }
 
 #[tokio::test]
+async fn file_cleanup_runs_independently_of_gc_interval() {
+    let root = tempfile::tempdir().unwrap();
+    let mut r = runtime(root.path(), false, 0, 0);
+    assert_eq!(r.page_gc_config.interval_ms, 600_000);
+    // Keep GC asleep while checking the independently configured hourly cleanup.
+    r.page_gc_config.interval_ms = 2 * 3_600_000;
+    let r = Arc::new(r);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let config = talon_core::WorkerConfig {
+        file_cleanup_interval_hours: 1,
+        background_scan_batch_size: 1,
+        background_delete_max_per_sec: 0,
+        ..Default::default()
+    };
+    let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+    // Wait for both startup passes, so removing a newly created orphan requires
+    // a later cleanup invocation while GC is still waiting for its next interval.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while r.page_gc_metrics.batch_duration.count() == 0
+            || r.page_gc_metrics.cleanup_scan_at.get() == 0.0
+        {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let orphan = r
+        .paged
+        .as_ref()
+        .unwrap()
+        .dir_for(&id())
+        .join("access.meta.tmp.crashed");
+    std::fs::write(&orphan, b"partial").unwrap();
+    tokio::task::yield_now().await;
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(59 * 60)).await;
+    tokio::time::resume();
+    tokio::task::yield_now().await;
+    assert!(orphan.exists(), "cleanup must wait for its hourly interval");
+    tokio::time::pause();
+    tokio::time::advance(Duration::from_secs(2 * 60)).await;
+    tokio::time::resume();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while orphan.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap();
+    service.shutdown().await;
+    assert_eq!(r.page_gc_metrics.scanned.get(), 1);
+    assert_eq!(r.resident_bytes(), 16);
+}
+
+#[tokio::test]
+async fn file_cleanup_completes_a_full_pass_despite_batch_limits() {
+    let root = tempfile::tempdir().unwrap();
+    let mut r = runtime(root.path(), false, 0, 0);
+    r.page_gc_config.scan_batch_size = 1;
+    r.page_gc_config.delete_batch_size = 1;
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let dir = r.paged.as_ref().unwrap().dir_for(&id());
+    for suffix in ["first", "second"] {
+        std::fs::write(dir.join(format!("access.meta.tmp.{suffix}")), b"partial").unwrap();
+    }
+    let report = r.cleanup_page_files_once().await;
+    assert!(report.completed_scan);
+    assert!(report.checked > 1);
+    assert_eq!(report.removed, 2);
+    assert_eq!(report.errors, 0);
+    assert!(dir.join("0.page").exists());
+    let next = dir.join("access.meta.tmp.next");
+    std::fs::write(&next, b"partial").unwrap();
+    let report = r.cleanup_page_files_once().await;
+    assert!(report.completed_scan);
+    assert_eq!(report.removed, 1);
+    assert!(!next.exists());
+    assert_eq!(r.resident_bytes(), 16);
+}
+
+#[tokio::test]
 async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots() {
     let root = tempfile::tempdir().unwrap();
     let mut r = runtime(root.path(), false, 0, 0);
@@ -794,15 +886,16 @@ async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots()
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
     std::fs::write(dir.join("access.meta"), b"existing checkpoint").unwrap();
     std::fs::write(dir.join("access.meta.tmp.crashed"), b"partial").unwrap();
-    r.page_cleanup.lock().unwrap().fail_deletes = true;
+    r.page_cleanup.lock().await.fail_deletes = true;
     r.recover_page_file_cleanup().await;
     assert!(dir.join("access.meta.tmp.crashed").exists());
     assert!(r.page_gc_metrics.cleanup_errors.get() > 0);
     assert_eq!(r.page_gc_metrics.cleanup_pending.get(), 1.0);
-    r.page_cleanup.lock().unwrap().fail_deletes = false;
+    r.page_cleanup.lock().await.fail_deletes = false;
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
-    let service = crate::page_gc::PageGcService::start(r.clone(), r.page_gc_config.clone());
+    let service =
+        crate::runtime::WorkerBackground::start(r.clone(), &talon_core::WorkerConfig::default());
     tokio::time::timeout(Duration::from_secs(2), async {
         while dir.join("access.meta.tmp.crashed").exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -844,14 +937,11 @@ async fn orphan_cleanup_covers_unindexed_directories_with_paged_reads_disabled()
     // Cleanup after a crash between unlinking the last page and rmdir.
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join("block.meta"), b"unreadable identity").unwrap();
+    let mut r = r;
+    r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
-    let service = crate::page_gc::PageGcService::start(
-        r.clone(),
-        PageGcConfig {
-            interval_ms: 1,
-            ..Default::default()
-        },
-    );
+    let service =
+        crate::runtime::WorkerBackground::start(r.clone(), &talon_core::WorkerConfig::default());
     tokio::time::timeout(Duration::from_secs(2), async {
         while dir.exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -1142,13 +1232,13 @@ async fn cancelled_shard_checkpoint_keeps_publication_owned_and_serialized() {
     let gate = r
         .page_lifecycle
         .checkpoint_gate(crate::page_lifecycle::disk_shard(&id()));
-    // Hold the gate in a blocking thread, never a runtime thread across await.
+    // Hold the async gate until the caller has been cancelled.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let holder = tokio::task::spawn_blocking(move || {
-        let _guard = gate.lock().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::spawn(async move {
+        let _guard = gate.lock().await;
         ready_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
+        release_rx.await.unwrap();
     });
     ready_rx.await.unwrap();
     let worker = r.clone();
@@ -1213,11 +1303,11 @@ async fn recovery_prunes_snapshot_without_pages_and_cleanup_protects_active_shar
     std::fs::write(&temp, b"partial").unwrap();
     let gate = r.page_lifecycle.checkpoint_gate(shard);
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
-    let (release_tx, release_rx) = std::sync::mpsc::channel();
-    let holder = tokio::task::spawn_blocking(move || {
-        let _guard = gate.lock().unwrap();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let holder = tokio::spawn(async move {
+        let _guard = gate.lock().await;
         ready_tx.send(()).unwrap();
-        release_rx.recv().unwrap();
+        release_rx.await.unwrap();
     });
     ready_rx.await.unwrap();
     r.recover_page_file_cleanup().await;
@@ -1230,4 +1320,110 @@ async fn recovery_prunes_snapshot_without_pages_and_cleanup_protects_active_shar
         dir.parent().unwrap().join("access.shard").exists(),
         "empty snapshot prevents legacy fallback"
     );
+}
+
+#[test]
+fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellation() {
+    // One blocking thread makes a sleeping disk job starve unrelated filesystem work.
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap()
+        .block_on(async {
+            for checkpoint in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let mut worker = runtime(root.path(), false, 0, 100);
+                worker.serve_range(&request(0, 16)).await.unwrap();
+                let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+                    background_io_concurrency: 1,
+                    background_io_max_mb_per_sec: 1,
+                    background_delete_max_per_sec: 1,
+                    ..Default::default()
+                });
+                // Reserve time without waiting, so both jobs have a long pacing wait.
+                if checkpoint {
+                    assert!(futures::poll!(std::pin::pin!(budget.bytes(2_000_000))).is_pending());
+                } else {
+                    assert!(futures::poll!(std::pin::pin!(budget.delete())).is_pending());
+                }
+                worker.background_budget = Some(budget.clone());
+                let worker = Arc::new(worker);
+                let dir = worker.paged.as_ref().unwrap().dir_for(&id());
+                let orphan = dir.join("access.meta.tmp.crashed");
+                std::fs::write(&orphan, b"partial").unwrap();
+                let digest =
+                    u64::from_str_radix(dir.file_stem().unwrap().to_str().unwrap(), 16).unwrap();
+                let directory_gate = worker.page_lifecycle.directory_gate(digest);
+                let caller_worker = worker.clone();
+                let caller = tokio::spawn(async move {
+                    if checkpoint {
+                        assert_eq!(caller_worker.checkpoint_access_times().await.failures, 0);
+                    } else {
+                        caller_worker.recover_page_file_cleanup().await;
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    loop {
+                        let waiting = if checkpoint {
+                            std::fs::read_dir(dir.parent().unwrap())
+                                .unwrap()
+                                .any(|entry| {
+                                    entry
+                                        .unwrap()
+                                        .file_name()
+                                        .to_str()
+                                        .unwrap()
+                                        .starts_with(crate::page_access_shard::TEMP_PREFIX)
+                                })
+                        } else {
+                            directory_gate.try_read().is_err()
+                        };
+                        if waiting {
+                            break;
+                        }
+                        tokio::time::sleep(Duration::from_millis(1)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                // The runtime and its only blocking thread remain usable during pacing.
+                tokio::time::timeout(
+                    Duration::from_millis(250),
+                    tokio::task::spawn_blocking(|| ()),
+                )
+                .await
+                .unwrap()
+                .unwrap();
+                assert!(
+                    !caller.is_finished(),
+                    "maintenance must still obey its rate budget"
+                );
+                caller.abort();
+                assert!(caller.await.unwrap_err().is_cancelled());
+                assert_eq!(
+                    budget.available_io(),
+                    0,
+                    "owned mutation retains its I/O slot"
+                );
+                tokio::time::timeout(Duration::from_secs(5), worker.drain_page_mutations())
+                    .await
+                    .unwrap();
+                assert_eq!(budget.available_io(), 1);
+                assert!(dir.join("0.page").exists());
+                if checkpoint {
+                    let recovered = crate::page_access_shard::load(
+                        dir.parent().unwrap(),
+                        crate::page_lifecycle::disk_shard(&id()),
+                        16,
+                        worker.page_clock.now(),
+                    )
+                    .unwrap();
+                    assert!(!recovered.corrupt);
+                    assert_eq!(recovered.records[&id()].records.len(), 1);
+                } else {
+                    assert!(!orphan.exists());
+                }
+            }
+        });
 }

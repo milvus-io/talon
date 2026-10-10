@@ -1,11 +1,8 @@
-//! Worker-local idle collection and checkpoint scheduling, independent of registration.
-use crate::WorkerRuntime;
-use std::hash::{BuildHasher, Hasher};
+//! Page maintenance configuration, reports, metrics, and owned disk mutations.
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,
 };
-use std::time::Duration;
 use talon_core::{Counter, Gauge, Histogram, Metrics, WorkerConfig};
 use tokio::sync::Notify;
 
@@ -14,6 +11,7 @@ pub struct PageGcConfig {
     pub tti_ms: u64,
     pub checkpoint_interval_ms: u64,
     pub interval_ms: u64,
+    /// Watermark eviction limits; page GC and file cleanup always scan a full pass.
     pub scan_batch_size: usize,
     pub delete_batch_size: usize,
     pub io_concurrency: usize,
@@ -21,9 +19,9 @@ pub struct PageGcConfig {
 impl From<&WorkerConfig> for PageGcConfig {
     fn from(c: &WorkerConfig) -> Self {
         Self {
-            tti_ms: c.page_tti_ms,
-            checkpoint_interval_ms: c.page_access_checkpoint_interval_ms,
-            interval_ms: c.page_gc_interval_ms,
+            tti_ms: c.page_tti_hours * 3_600_000,
+            checkpoint_interval_ms: c.page_access_checkpoint_interval_minutes * 60_000,
+            interval_ms: c.page_gc_interval_minutes * 60_000,
             scan_batch_size: c.page_gc_scan_batch_size,
             delete_batch_size: c.page_gc_delete_batch_size,
             io_concurrency: c.page_gc_io_concurrency,
@@ -50,7 +48,7 @@ pub struct CheckpointReport {
     pub bytes: u64,
 }
 
-/// Bounded disk cleanup progress. Pending and duration describe a completed pass.
+/// Disk cleanup progress. Pending and duration describe a completed pass.
 #[derive(Default, Debug)]
 pub struct CleanupReport {
     pub checked: usize,
@@ -149,7 +147,7 @@ impl PageGcMetrics {
             bytes: ["tti", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_bytes_total", "Logical bytes successfully unlinked by reason; open descriptors may delay physical release.", talon_core::metrics::labels(&[("reason", reason)]))),
             delete_errors: c("talon_worker_page_gc_delete_errors_total", "Failed page unlink attempts."),
             retries: g("talon_worker_page_gc_pending_retries", "Retry pages observed in the latest complete scan."),
-            batch_duration: r.histogram("talon_worker_page_gc_batch_seconds", "Idle GC batch duration.", Default::default()),
+            batch_duration: r.histogram("talon_worker_page_gc_batch_seconds", "Complete idle GC invocation duration (legacy metric name).", Default::default()),
             scan_duration: g("talon_worker_page_gc_scan_seconds", "Most recent complete idle scan duration."),
             dirty_blocks: g("talon_worker_page_access_dirty_blocks", "Dirty blocks observed in checkpoint traversal."),
             dirty_age: g("talon_worker_page_access_oldest_dirty_seconds", "Age of oldest uncheckpointed modification observed in traversal."),
@@ -165,76 +163,21 @@ impl PageGcMetrics {
     }
 }
 
-/// Start collector, checkpoint, and disk cleanup loops with orderly shutdown.
-pub struct PageGcService {
-    stop: tokio::sync::watch::Sender<bool>,
-    tasks: Vec<tokio::task::JoinHandle<()>>,
-    worker: Arc<WorkerRuntime>,
-}
-impl PageGcService {
-    pub fn start(worker: Arc<WorkerRuntime>, config: PageGcConfig) -> Self {
-        let (stop, _) = tokio::sync::watch::channel(false);
-        let mut tasks = Vec::new();
-        // Disk leftovers must be reclaimed even after TTI is disabled. Keep
-        // the loops independent so a long checkpoint cannot starve cleanup.
-        for maintenance in 0..3 {
-            if maintenance == 1 && config.tti_ms == 0 {
-                continue;
-            }
-            let worker = worker.clone();
-            let mut stopped = stop.subscribe();
-            let config = config.clone();
-            tasks.push(tokio::spawn(async move {
-                let millis = if maintenance == 1 {
-                    (config.checkpoint_interval_ms / crate::page_lifecycle::SHARDS as u64).max(1)
-                } else {
-                    config.interval_ms
-                };
-                let period = Duration::from_millis(millis);
-                let jitter = std::collections::hash_map::RandomState::new()
-                    .build_hasher()
-                    .finish()
-                    % millis;
-                let mut ticker = tokio::time::interval_at(
-                    tokio::time::Instant::now() + Duration::from_millis(jitter),
-                    period,
-                );
-                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-                loop {
-                    tokio::select! {biased;
-                        _ = stopped.changed() => break,
-                        _ = ticker.tick() => {
-                            match maintenance {
-                                0 => { worker.gc_once().await; }
-                                1 => { worker.checkpoint_next_shard().await; }
-                                _ => { worker.cleanup_page_files_once().await; }
-                            }
-                        }
-                    }
-                }
-            }));
-        }
-        Self {
-            stop,
-            tasks,
-            worker,
-        }
-    }
-    pub fn begin_shutdown(&self) {
-        let _ = self.stop.send(true);
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub async fn shutdown(mut self) {
-        let _ = self.stop.send(true);
-        for task in self.tasks.drain(..) {
-            let _ = task.await;
-        }
-        self.worker.drain_page_mutations().await;
-        self.worker.checkpoint_access_times().await;
-    }
-}
-impl Drop for PageGcService {
-    fn drop(&mut self) {
-        let _ = self.stop.send(true);
+    #[test]
+    fn maintenance_config_converts_hours_and_minutes() {
+        let config = WorkerConfig {
+            page_tti_hours: 24,
+            page_access_checkpoint_interval_minutes: 2,
+            page_gc_interval_minutes: 10,
+            ..Default::default()
+        };
+        let gc = PageGcConfig::from(&config);
+        assert_eq!(gc.tti_ms, 86_400_000);
+        assert_eq!(gc.checkpoint_interval_ms, 120_000);
+        assert_eq!(gc.interval_ms, 600_000);
     }
 }

@@ -135,6 +135,26 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// Maximum concurrently running background maintenance tasks.
+    pub background_task_concurrency: usize,
+    /// Shared local disk I/O concurrency for background maintenance.
+    pub background_io_concurrency: usize,
+    /// Maximum entries scanned per watermark eviction batch.
+    pub background_scan_batch_size: usize,
+    /// Maximum deletion candidates per watermark eviction batch.
+    pub background_delete_batch_size: usize,
+    /// Shared background disk read/write MB/s (decimal); zero disables throttling.
+    pub background_io_max_mb_per_sec: u64,
+    /// Shared background deletion work items per second; zero disables throttling.
+    pub background_delete_max_per_sec: u64,
+    /// Enable background eviction at cache occupancy watermarks.
+    pub async_eviction_enabled: bool,
+    /// Start background eviction at this fraction of capacity_bytes.
+    pub async_eviction_high_watermark: f64,
+    /// Stop background eviction at or below this fraction of capacity_bytes.
+    pub async_eviction_low_watermark: f64,
+    /// Background cache occupancy check interval in minutes.
+    pub async_eviction_check_interval_minutes: u64,
     /// L1 DRAM cache capacity in bytes. Zero disables L1.
     pub l1_capacity_bytes: u64,
     /// Fixed L1 DRAM page size in bytes.
@@ -148,15 +168,17 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
-    /// Page time to idle in milliseconds; 0 disables idle expiration.
-    pub page_tti_ms: u64,
-    /// Dirty page access checkpoint interval in milliseconds.
-    pub page_access_checkpoint_interval_ms: u64,
-    /// Page GC batch interval in milliseconds.
-    pub page_gc_interval_ms: u64,
-    /// Maximum pages examined per GC batch.
+    /// Page time to idle in hours; 0 disables idle expiration.
+    pub page_tti_hours: u64,
+    /// Dirty page access checkpoint interval in minutes.
+    pub page_access_checkpoint_interval_minutes: u64,
+    /// Delay between complete page GC passes in minutes.
+    pub page_gc_interval_minutes: u64,
+    /// Delay between complete file cleanup passes in hours, independent of page GC.
+    pub file_cleanup_interval_hours: u64,
+    /// Maximum entries per watermark eviction batch; does not limit page GC or file cleanup.
     pub page_gc_scan_batch_size: usize,
-    /// Maximum page deletion attempts per GC batch.
+    /// Maximum deletion candidates per watermark eviction batch; does not limit page GC or file cleanup.
     pub page_gc_delete_batch_size: usize,
     /// Maximum concurrent page GC deletion tasks.
     pub page_gc_io_concurrency: usize,
@@ -289,13 +311,24 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            background_task_concurrency: 2,
+            background_io_concurrency: 4,
+            background_scan_batch_size: 65536,
+            background_delete_batch_size: 1024,
+            background_io_max_mb_per_sec: 8,
+            background_delete_max_per_sec: 1024,
+            async_eviction_enabled: false,
+            async_eviction_high_watermark: 0.9,
+            async_eviction_low_watermark: 0.8,
+            async_eviction_check_interval_minutes: 1,
             l1_capacity_bytes: 0,
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
-            page_tti_ms: 0,
-            page_access_checkpoint_interval_ms: 60000,
-            page_gc_interval_ms: 1000,
+            page_tti_hours: 0,
+            page_access_checkpoint_interval_minutes: 1,
+            page_gc_interval_minutes: 10,
+            file_cleanup_interval_hours: 1,
             page_gc_scan_batch_size: 65536,
             page_gc_delete_batch_size: 1024,
             page_gc_io_concurrency: 4,
@@ -354,6 +387,26 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::background_task_concurrency`].
+    pub background_task_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::background_io_concurrency`].
+    pub background_io_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::background_scan_batch_size`].
+    pub background_scan_batch_size: Option<usize>,
+    /// Override for [`WorkerConfig::background_delete_batch_size`].
+    pub background_delete_batch_size: Option<usize>,
+    /// Override for [`WorkerConfig::background_io_max_mb_per_sec`].
+    pub background_io_max_mb_per_sec: Option<u64>,
+    /// Override for [`WorkerConfig::background_delete_max_per_sec`].
+    pub background_delete_max_per_sec: Option<u64>,
+    /// Override for [`WorkerConfig::async_eviction_enabled`].
+    pub async_eviction_enabled: Option<bool>,
+    /// Override for [`WorkerConfig::async_eviction_high_watermark`].
+    pub async_eviction_high_watermark: Option<f64>,
+    /// Override for [`WorkerConfig::async_eviction_low_watermark`].
+    pub async_eviction_low_watermark: Option<f64>,
+    /// Override for [`WorkerConfig::async_eviction_check_interval_minutes`].
+    pub async_eviction_check_interval_minutes: Option<u64>,
     /// Override for [`WorkerConfig::l1_capacity_bytes`].
     pub l1_capacity_bytes: Option<u64>,
     /// Override for [`WorkerConfig::l1_page_size_bytes`].
@@ -362,12 +415,14 @@ pub struct WorkerConfigPatch {
     pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
     pub paged_miss_run_concurrency: Option<usize>,
-    /// Override for [`WorkerConfig::page_tti_ms`].
-    pub page_tti_ms: Option<u64>,
-    /// Override for [`WorkerConfig::page_access_checkpoint_interval_ms`].
-    pub page_access_checkpoint_interval_ms: Option<u64>,
-    /// Override for [`WorkerConfig::page_gc_interval_ms`].
-    pub page_gc_interval_ms: Option<u64>,
+    /// Override for [`WorkerConfig::page_tti_hours`].
+    pub page_tti_hours: Option<u64>,
+    /// Override for [`WorkerConfig::page_access_checkpoint_interval_minutes`].
+    pub page_access_checkpoint_interval_minutes: Option<u64>,
+    /// Override for [`WorkerConfig::page_gc_interval_minutes`].
+    pub page_gc_interval_minutes: Option<u64>,
+    /// Override for [`WorkerConfig::file_cleanup_interval_hours`].
+    pub file_cleanup_interval_hours: Option<u64>,
     /// Override for [`WorkerConfig::page_gc_scan_batch_size`].
     pub page_gc_scan_batch_size: Option<usize>,
     /// Override for [`WorkerConfig::page_gc_delete_batch_size`].
@@ -428,17 +483,50 @@ impl Patch for WorkerConfigPatch {
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            background_task_concurrency: self
+                .background_task_concurrency
+                .or(base.background_task_concurrency),
+            background_io_concurrency: self
+                .background_io_concurrency
+                .or(base.background_io_concurrency),
+            background_scan_batch_size: self
+                .background_scan_batch_size
+                .or(base.background_scan_batch_size),
+            background_delete_batch_size: self
+                .background_delete_batch_size
+                .or(base.background_delete_batch_size),
+            background_io_max_mb_per_sec: self
+                .background_io_max_mb_per_sec
+                .or(base.background_io_max_mb_per_sec),
+            background_delete_max_per_sec: self
+                .background_delete_max_per_sec
+                .or(base.background_delete_max_per_sec),
+            async_eviction_enabled: self.async_eviction_enabled.or(base.async_eviction_enabled),
+            async_eviction_high_watermark: self
+                .async_eviction_high_watermark
+                .or(base.async_eviction_high_watermark),
+            async_eviction_low_watermark: self
+                .async_eviction_low_watermark
+                .or(base.async_eviction_low_watermark),
+            async_eviction_check_interval_minutes: self
+                .async_eviction_check_interval_minutes
+                .or(base.async_eviction_check_interval_minutes),
             l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
             l1_page_size_bytes: self.l1_page_size_bytes.or(base.l1_page_size_bytes),
             l2_page_size_bytes: self.l2_page_size_bytes.or(base.l2_page_size_bytes),
             paged_miss_run_concurrency: self
                 .paged_miss_run_concurrency
                 .or(base.paged_miss_run_concurrency),
-            page_tti_ms: self.page_tti_ms.or(base.page_tti_ms),
-            page_access_checkpoint_interval_ms: self
-                .page_access_checkpoint_interval_ms
-                .or(base.page_access_checkpoint_interval_ms),
-            page_gc_interval_ms: self.page_gc_interval_ms.or(base.page_gc_interval_ms),
+            page_tti_hours: self.page_tti_hours.or(base.page_tti_hours),
+            page_access_checkpoint_interval_minutes: self
+                .page_access_checkpoint_interval_minutes
+                .or(base.page_access_checkpoint_interval_minutes),
+            page_gc_interval_minutes: self
+                .page_gc_interval_minutes
+                .or(base.page_gc_interval_minutes),
+            file_cleanup_interval_hours: self
+                .file_cleanup_interval_hours
+                .or(base.file_cleanup_interval_hours),
             page_gc_scan_batch_size: self
                 .page_gc_scan_batch_size
                 .or(base.page_gc_scan_batch_size),
@@ -608,6 +696,16 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "Worker cache capacity (bytes).",
     },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per watermark eviction batch." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction batch." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC", key: "background_delete_max_per_sec", default: Some("1024"), cli: false, secret: false, help: "Shared background deletion work items per second; zero disables throttling." },
+    ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("false"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
+    ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK", key: "async_eviction_high_watermark", default: Some("0.9"), cli: false, secret: false, help: "Start background eviction at this fraction of capacity_bytes." },
+    ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK", key: "async_eviction_low_watermark", default: Some("0.8"), cli: false, secret: false, help: "Stop background eviction at or below this fraction of capacity_bytes." },
+    ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES", key: "async_eviction_check_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Background cache occupancy check interval in minutes." },
     ConfigVar {
         env: "TALON_WORKER_L1_CAPACITY_BYTES",
         key: "l1_capacity_bytes",
@@ -632,11 +730,12 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_PAGE_TTI_MS", key: "page_tti_ms", default: Some("0"), cli: false, secret: false, help: "Page time to idle in milliseconds; 0 disables idle expiration." },
-    ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS", key: "page_access_checkpoint_interval_ms", default: Some("60000"), cli: false, secret: false, help: "Dirty page access checkpoint interval in milliseconds." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MS", key: "page_gc_interval_ms", default: Some("1000"), cli: false, secret: false, help: "Page GC batch interval in milliseconds." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum pages examined per GC batch." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum page deletion attempts per GC batch." },
+    ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
+    ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES", key: "page_gc_interval_minutes", default: Some("10"), cli: false, secret: false, help: "Delay between complete page GC passes in minutes." },
+    ConfigVar { env: "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS", key: "file_cleanup_interval_hours", default: Some("1"), cli: false, secret: false, help: "Delay between complete file cleanup passes in hours, independent of page GC." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries per watermark eviction batch; does not limit page GC or file cleanup." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction batch; does not limit page GC or file cleanup." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent page GC deletion tasks." },
     ConfigVar {
         env: "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY",
@@ -833,14 +932,26 @@ pub(crate) mod worker_env {
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
+    pub const BACKGROUND_TASK_CONCURRENCY: &str = "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY";
+    pub const BACKGROUND_IO_CONCURRENCY: &str = "TALON_WORKER_BACKGROUND_IO_CONCURRENCY";
+    pub const BACKGROUND_SCAN_BATCH_SIZE: &str = "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE";
+    pub const BACKGROUND_DELETE_BATCH_SIZE: &str = "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE";
+    pub const BACKGROUND_IO_MAX_MB_PER_SEC: &str = "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC";
+    pub const BACKGROUND_DELETE_MAX_PER_SEC: &str = "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC";
+    pub const ASYNC_EVICTION_ENABLED: &str = "TALON_WORKER_ASYNC_EVICTION_ENABLED";
+    pub const ASYNC_EVICTION_HIGH_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK";
+    pub const ASYNC_EVICTION_LOW_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK";
+    pub const ASYNC_EVICTION_CHECK_INTERVAL_MINUTES: &str =
+        "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES";
     pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
-    pub const PAGE_TTI_MS: &str = "TALON_WORKER_PAGE_TTI_MS";
-    pub const PAGE_ACCESS_CHECKPOINT_INTERVAL_MS: &str =
-        "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS";
-    pub const PAGE_GC_INTERVAL_MS: &str = "TALON_WORKER_PAGE_GC_INTERVAL_MS";
+    pub const PAGE_TTI_HOURS: &str = "TALON_WORKER_PAGE_TTI_HOURS";
+    pub const PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES: &str =
+        "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES";
+    pub const PAGE_GC_INTERVAL_MINUTES: &str = "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES";
+    pub const FILE_CLEANUP_INTERVAL_HOURS: &str = "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS";
     pub const PAGE_GC_SCAN_BATCH_SIZE: &str = "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE";
     pub const PAGE_GC_DELETE_BATCH_SIZE: &str = "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE";
     pub const PAGE_GC_IO_CONCURRENCY: &str = "TALON_WORKER_PAGE_GC_IO_CONCURRENCY";
@@ -910,6 +1021,10 @@ impl WorkerConfigPatch {
             v.parse::<usize>()
                 .map_err(|_| Error::Other(format!("{k}: invalid usize: {v:?}")))
         };
+        let parse_f64 = |v: String, k: &str| {
+            v.parse::<f64>()
+                .map_err(|_| Error::Other(format!("{k}: invalid f64: {v:?}")))
+        };
         let parse_bool = |v: String, k: &str| {
             parse_bool_value(&v).ok_or_else(|| Error::Other(format!("{k}: invalid bool: {v:?}")))
         };
@@ -939,6 +1054,38 @@ impl WorkerConfigPatch {
             capacity_bytes: get(worker_env::CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
                 .transpose()?,
+            background_task_concurrency: get(worker_env::BACKGROUND_TASK_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_TASK_CONCURRENCY))
+                .transpose()?,
+            background_io_concurrency: get(worker_env::BACKGROUND_IO_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_IO_CONCURRENCY))
+                .transpose()?,
+            background_scan_batch_size: get(worker_env::BACKGROUND_SCAN_BATCH_SIZE)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_SCAN_BATCH_SIZE))
+                .transpose()?,
+            background_delete_batch_size: get(worker_env::BACKGROUND_DELETE_BATCH_SIZE)
+                .map(|v| parse_usize(v, worker_env::BACKGROUND_DELETE_BATCH_SIZE))
+                .transpose()?,
+            background_io_max_mb_per_sec: get(worker_env::BACKGROUND_IO_MAX_MB_PER_SEC)
+                .map(|v| parse_u64(v, worker_env::BACKGROUND_IO_MAX_MB_PER_SEC))
+                .transpose()?,
+            background_delete_max_per_sec: get(worker_env::BACKGROUND_DELETE_MAX_PER_SEC)
+                .map(|v| parse_u64(v, worker_env::BACKGROUND_DELETE_MAX_PER_SEC))
+                .transpose()?,
+            async_eviction_enabled: get(worker_env::ASYNC_EVICTION_ENABLED)
+                .map(|v| parse_bool(v, worker_env::ASYNC_EVICTION_ENABLED))
+                .transpose()?,
+            async_eviction_high_watermark: get(worker_env::ASYNC_EVICTION_HIGH_WATERMARK)
+                .map(|v| parse_f64(v, worker_env::ASYNC_EVICTION_HIGH_WATERMARK))
+                .transpose()?,
+            async_eviction_low_watermark: get(worker_env::ASYNC_EVICTION_LOW_WATERMARK)
+                .map(|v| parse_f64(v, worker_env::ASYNC_EVICTION_LOW_WATERMARK))
+                .transpose()?,
+            async_eviction_check_interval_minutes: get(
+                worker_env::ASYNC_EVICTION_CHECK_INTERVAL_MINUTES,
+            )
+            .map(|v| parse_u64(v, worker_env::ASYNC_EVICTION_CHECK_INTERVAL_MINUTES))
+            .transpose()?,
             l1_capacity_bytes: get(worker_env::L1_CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::L1_CAPACITY_BYTES))
                 .transpose()?,
@@ -951,14 +1098,19 @@ impl WorkerConfigPatch {
             paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
                 .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
                 .transpose()?,
-            page_tti_ms: get(worker_env::PAGE_TTI_MS)
-                .map(|v| parse_u64(v, worker_env::PAGE_TTI_MS))
+            page_tti_hours: get(worker_env::PAGE_TTI_HOURS)
+                .map(|v| parse_u64(v, worker_env::PAGE_TTI_HOURS))
                 .transpose()?,
-            page_access_checkpoint_interval_ms: get(worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MS)
-                .map(|v| parse_u64(v, worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MS))
+            page_access_checkpoint_interval_minutes: get(
+                worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES,
+            )
+            .map(|v| parse_u64(v, worker_env::PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES))
+            .transpose()?,
+            page_gc_interval_minutes: get(worker_env::PAGE_GC_INTERVAL_MINUTES)
+                .map(|v| parse_u64(v, worker_env::PAGE_GC_INTERVAL_MINUTES))
                 .transpose()?,
-            page_gc_interval_ms: get(worker_env::PAGE_GC_INTERVAL_MS)
-                .map(|v| parse_u64(v, worker_env::PAGE_GC_INTERVAL_MS))
+            file_cleanup_interval_hours: get(worker_env::FILE_CLEANUP_INTERVAL_HOURS)
+                .map(|v| parse_u64(v, worker_env::FILE_CLEANUP_INTERVAL_HOURS))
                 .transpose()?,
             page_gc_scan_batch_size: get(worker_env::PAGE_GC_SCAN_BATCH_SIZE)
                 .map(|v| parse_usize(v, worker_env::PAGE_GC_SCAN_BATCH_SIZE))
@@ -1055,17 +1207,52 @@ impl WorkerConfig {
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
+            background_task_concurrency: merged
+                .background_task_concurrency
+                .unwrap_or(d.background_task_concurrency),
+            background_io_concurrency: merged
+                .background_io_concurrency
+                .unwrap_or(d.background_io_concurrency),
+            background_scan_batch_size: merged
+                .background_scan_batch_size
+                .unwrap_or(d.background_scan_batch_size),
+            background_delete_batch_size: merged
+                .background_delete_batch_size
+                .unwrap_or(d.background_delete_batch_size),
+            background_io_max_mb_per_sec: merged
+                .background_io_max_mb_per_sec
+                .unwrap_or(d.background_io_max_mb_per_sec),
+            background_delete_max_per_sec: merged
+                .background_delete_max_per_sec
+                .unwrap_or(d.background_delete_max_per_sec),
+            async_eviction_enabled: merged
+                .async_eviction_enabled
+                .unwrap_or(d.async_eviction_enabled),
+            async_eviction_high_watermark: merged
+                .async_eviction_high_watermark
+                .unwrap_or(d.async_eviction_high_watermark),
+            async_eviction_low_watermark: merged
+                .async_eviction_low_watermark
+                .unwrap_or(d.async_eviction_low_watermark),
+            async_eviction_check_interval_minutes: merged
+                .async_eviction_check_interval_minutes
+                .unwrap_or(d.async_eviction_check_interval_minutes),
             l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
             l1_page_size_bytes: merged.l1_page_size_bytes.unwrap_or(d.l1_page_size_bytes),
             l2_page_size_bytes: merged.l2_page_size_bytes.unwrap_or(d.l2_page_size_bytes),
             paged_miss_run_concurrency: merged
                 .paged_miss_run_concurrency
                 .unwrap_or(d.paged_miss_run_concurrency),
-            page_tti_ms: merged.page_tti_ms.unwrap_or(d.page_tti_ms),
-            page_access_checkpoint_interval_ms: merged
-                .page_access_checkpoint_interval_ms
-                .unwrap_or(d.page_access_checkpoint_interval_ms),
-            page_gc_interval_ms: merged.page_gc_interval_ms.unwrap_or(d.page_gc_interval_ms),
+            page_tti_hours: merged.page_tti_hours.unwrap_or(d.page_tti_hours),
+            page_access_checkpoint_interval_minutes: merged
+                .page_access_checkpoint_interval_minutes
+                .unwrap_or(d.page_access_checkpoint_interval_minutes),
+            page_gc_interval_minutes: merged
+                .page_gc_interval_minutes
+                .unwrap_or(d.page_gc_interval_minutes),
+            file_cleanup_interval_hours: merged
+                .file_cleanup_interval_hours
+                .unwrap_or(d.file_cleanup_interval_hours),
             page_gc_scan_batch_size: merged
                 .page_gc_scan_batch_size
                 .unwrap_or(d.page_gc_scan_batch_size),
@@ -1200,21 +1387,91 @@ impl WorkerConfig {
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
         }
-        if self.page_tti_ms > 0 && self.l2_page_size_bytes == 0 {
-            return Err(Error::Other("page_tti_ms requires paged L2".into()));
+        for (name, value) in [
+            (
+                "background_task_concurrency",
+                self.background_task_concurrency,
+            ),
+            ("background_io_concurrency", self.background_io_concurrency),
+            (
+                "background_scan_batch_size",
+                self.background_scan_batch_size,
+            ),
+            (
+                "background_delete_batch_size",
+                self.background_delete_batch_size,
+            ),
+        ] {
+            if value == 0 || value > (usize::MAX >> 3) {
+                return Err(Error::Other(format!("invalid {name}")));
+            }
         }
-        if self.page_tti_ms > 0 && self.page_access_checkpoint_interval_ms > self.page_tti_ms {
+        if self
+            .background_io_max_mb_per_sec
+            .checked_mul(1_000_000)
+            .is_none()
+        {
             return Err(Error::Other(
-                "page_access_checkpoint_interval_ms must not exceed page_tti_ms".into(),
+                "background_io_max_mb_per_sec overflows bytes/s".into(),
             ));
         }
-        if self.page_access_checkpoint_interval_ms == 0 {
+        let low = self.async_eviction_low_watermark;
+        let high = self.async_eviction_high_watermark;
+        if !(low.is_finite() && high.is_finite() && 0.0 < low && low < high && high < 1.0) {
             return Err(Error::Other(
-                "page_access_checkpoint_interval_ms must be > 0".into(),
+                "async eviction watermarks must satisfy 0 < low < high < 1".into(),
             ));
         }
-        if self.page_gc_interval_ms == 0 {
-            return Err(Error::Other("page_gc_interval_ms must be > 0".into()));
+        // Validate unit conversion before runtime code converts these values to milliseconds.
+        for (name, value, millis_per_unit, allow_zero) in [
+            ("page_tti_hours", self.page_tti_hours, 3_600_000, true),
+            (
+                "page_access_checkpoint_interval_minutes",
+                self.page_access_checkpoint_interval_minutes,
+                60_000,
+                false,
+            ),
+            (
+                "page_gc_interval_minutes",
+                self.page_gc_interval_minutes,
+                60_000,
+                false,
+            ),
+            (
+                "file_cleanup_interval_hours",
+                self.file_cleanup_interval_hours,
+                3_600_000,
+                false,
+            ),
+            (
+                "async_eviction_check_interval_minutes",
+                self.async_eviction_check_interval_minutes,
+                60_000,
+                false,
+            ),
+        ] {
+            if !allow_zero && value == 0 {
+                return Err(Error::Other(format!("{name} must be > 0")));
+            }
+            let millis = value
+                .checked_mul(millis_per_unit)
+                .ok_or_else(|| Error::Other(format!("{name} overflows milliseconds")))?;
+            if std::time::Instant::now()
+                .checked_add(std::time::Duration::from_millis(millis))
+                .is_none()
+            {
+                return Err(Error::Other(format!("{name} overflows monotonic clock")));
+            }
+        }
+        if self.page_tti_hours > 0 && self.l2_page_size_bytes == 0 {
+            return Err(Error::Other("page_tti_hours requires paged L2".into()));
+        }
+        if self.page_tti_hours > 0
+            && self.page_access_checkpoint_interval_minutes > self.page_tti_hours * 60
+        {
+            return Err(Error::Other(
+                "page_access_checkpoint_interval_minutes must not exceed page_tti_hours".into(),
+            ));
         }
         if self.page_gc_scan_batch_size == 0 {
             return Err(Error::Other("page_gc_scan_batch_size must be > 0".into()));
@@ -1229,20 +1486,6 @@ impl WorkerConfig {
         }
         if self.page_gc_io_concurrency == 0 {
             return Err(Error::Other("page_gc_io_concurrency must be > 0".into()));
-        }
-        for millis in [
-            self.page_tti_ms,
-            self.page_access_checkpoint_interval_ms,
-            self.page_gc_interval_ms,
-        ] {
-            if std::time::Instant::now()
-                .checked_add(std::time::Duration::from_millis(millis))
-                .is_none()
-            {
-                return Err(Error::Other(
-                    "page TTL duration overflows monotonic clock".into(),
-                ));
-            }
         }
         if self.paged_miss_run_concurrency == 0 {
             return Err(Error::Other(
@@ -1827,15 +2070,130 @@ mod tests {
     }
 
     #[test]
+    fn background_config_layers_and_validation() {
+        let patch: WorkerConfigPatch = toml::from_str("background_task_concurrency = 1\nbackground_io_concurrency = 2\nbackground_scan_batch_size = 64\nbackground_delete_batch_size = 4\nbackground_io_max_mb_per_sec = 16\nbackground_delete_max_per_sec = 50").unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC" => Some("3".into()),
+            "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC" => Some("7".into()),
+            _ => None,
+        })
+        .unwrap();
+        let c = WorkerConfig::resolve(patch, env, WorkerConfigPatch::default()).unwrap();
+        assert_eq!(
+            (
+                c.background_task_concurrency,
+                c.background_io_concurrency,
+                c.background_scan_batch_size,
+                c.background_delete_batch_size
+            ),
+            (1, 2, 64, 4)
+        );
+        assert_eq!(
+            (
+                c.background_io_max_mb_per_sec,
+                c.background_delete_max_per_sec
+            ),
+            (3, 7)
+        );
+        for key in [
+            "background_task_concurrency",
+            "background_io_concurrency",
+            "background_scan_batch_size",
+            "background_delete_batch_size",
+        ] {
+            let patch = toml::from_str(&format!("{key} = 0")).unwrap();
+            assert!(WorkerConfig::resolve(
+                patch,
+                WorkerConfigPatch::default(),
+                WorkerConfigPatch::default()
+            )
+            .is_err());
+        }
+        let patch = WorkerConfigPatch {
+            background_io_max_mb_per_sec: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(WorkerConfig::resolve(
+            patch,
+            WorkerConfigPatch::default(),
+            WorkerConfigPatch::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn async_eviction_config_layers_and_validation() {
+        let file = WorkerConfigPatch::from_toml(
+            "async_eviction_enabled = true\nasync_eviction_high_watermark = 0.85\nasync_eviction_low_watermark = 0.75\nasync_eviction_check_interval_minutes = 30",
+        ).unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            "TALON_WORKER_ASYNC_EVICTION_ENABLED" => Some("false".into()),
+            "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK" => Some("0.95".into()),
+            "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK" => Some("0.7".into()),
+            "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES" => Some("1".into()),
+            _ => None,
+        })
+        .unwrap();
+        let c = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert!(!c.async_eviction_enabled);
+        assert_eq!(c.async_eviction_high_watermark, 0.95);
+        assert_eq!(c.async_eviction_low_watermark, 0.7);
+        assert_eq!(c.async_eviction_check_interval_minutes, 1);
+        let d = WorkerConfig::default();
+        assert!(!d.async_eviction_enabled);
+        assert_eq!(
+            (
+                d.async_eviction_high_watermark,
+                d.async_eviction_low_watermark,
+                d.async_eviction_check_interval_minutes
+            ),
+            (0.9, 0.8, 1)
+        );
+        for setting in [
+            "async_eviction_high_watermark = 1.0",
+            "async_eviction_high_watermark = nan",
+            "async_eviction_high_watermark = inf",
+            "async_eviction_low_watermark = nan",
+            "async_eviction_low_watermark = 0.0",
+            "async_eviction_low_watermark = -0.1",
+            "async_eviction_low_watermark = 0.9",
+            "async_eviction_low_watermark = 0.95",
+            "async_eviction_check_interval_minutes = 0",
+        ] {
+            let patch = WorkerConfigPatch::from_toml(setting).unwrap();
+            assert!(
+                WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err(),
+                "{setting}"
+            );
+        }
+        let overflow = WorkerConfigPatch {
+            async_eviction_check_interval_minutes: Some(u64::MAX),
+            ..Default::default()
+        };
+        assert!(WorkerConfig::resolve(overflow, Default::default(), Default::default()).is_err());
+        for key in [
+            "TALON_WORKER_ASYNC_EVICTION_ENABLED",
+            "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK",
+            "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK",
+            "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES",
+        ] {
+            assert!(
+                WorkerConfigPatch::from_env_with(|k| (k == key).then(|| "bad".into())).is_err()
+            );
+        }
+    }
+
+    #[test]
     fn page_tti_config_layers_and_validation() {
         let file = WorkerConfigPatch::from_toml(
-            "l2_page_size_bytes = 1048576\npage_tti_ms = 120000\npage_gc_scan_batch_size = 10\n",
+            "l2_page_size_bytes = 1048576\npage_tti_hours = 2\npage_gc_scan_batch_size = 10\n",
         )
         .unwrap();
         let env = WorkerConfigPatch::from_env_with(|key| match key {
-            "TALON_WORKER_PAGE_TTI_MS" => Some("180000".into()),
-            "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS" => Some("1000".into()),
-            "TALON_WORKER_PAGE_GC_INTERVAL_MS" => Some("500".into()),
+            "TALON_WORKER_PAGE_TTI_HOURS" => Some("3".into()),
+            "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES" => Some("2".into()),
+            "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES" => Some("15".into()),
+            "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS" => Some("4".into()),
             "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE" => Some("100".into()),
             "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE" => Some("5".into()),
             "TALON_WORKER_PAGE_GC_IO_CONCURRENCY" => Some("2".into()),
@@ -1845,11 +2203,11 @@ mod tests {
         let c = WorkerConfig::resolve(file, env, Default::default()).unwrap();
         assert_eq!(
             (
-                c.page_tti_ms,
-                c.page_access_checkpoint_interval_ms,
-                c.page_gc_interval_ms
+                c.page_tti_hours,
+                c.page_access_checkpoint_interval_minutes,
+                c.page_gc_interval_minutes
             ),
-            (180000, 1000, 500)
+            (3, 2, 15)
         );
         assert_eq!(
             (
@@ -1859,15 +2217,26 @@ mod tests {
             ),
             (100, 5, 2)
         );
-        assert_eq!(WorkerConfig::default().page_tti_ms, 0);
+        assert_eq!(WorkerConfig::default().page_tti_hours, 0);
+        assert_eq!(WorkerConfig::default().page_gc_interval_minutes, 10);
+        assert_eq!(WorkerConfig::default().file_cleanup_interval_hours, 1);
+        assert_eq!(c.file_cleanup_interval_hours, 4);
+        let file = WorkerConfigPatch::from_toml("file_cleanup_interval_hours = 2\n").unwrap();
+        assert_eq!(
+            WorkerConfig::resolve(file, Default::default(), Default::default())
+                .unwrap()
+                .file_cleanup_interval_hours,
+            2
+        );
         for setting in [
-            "page_tti_ms = 1",
-            "page_gc_interval_ms = 0",
-            "page_access_checkpoint_interval_ms = 0",
+            "page_tti_hours = 1",
+            "page_gc_interval_minutes = 0",
+            "file_cleanup_interval_hours = 0",
+            "page_access_checkpoint_interval_minutes = 0",
             "page_gc_scan_batch_size = 0",
             "page_gc_delete_batch_size = 0",
             "page_gc_io_concurrency = 0",
-            "l2_page_size_bytes = 1048576\npage_tti_ms = 1000",
+            "l2_page_size_bytes = 1048576\npage_tti_hours = 1\npage_access_checkpoint_interval_minutes = 61",
         ] {
             let patch = WorkerConfigPatch::from_toml(setting).unwrap();
             assert!(
@@ -1876,9 +2245,44 @@ mod tests {
             );
         }
         assert!(WorkerConfigPatch::from_env_with(
-            |key| (key == "TALON_WORKER_PAGE_TTI_MS").then(|| "bad".into())
+            |key| (key == "TALON_WORKER_PAGE_TTI_HOURS").then(|| "bad".into())
         )
         .is_err());
+    }
+
+    #[test]
+    fn maintenance_duration_units_and_overflow() {
+        let config = WorkerConfig::resolve(
+            WorkerConfigPatch::from_toml(
+                "l2_page_size_bytes = 1048576\npage_tti_hours = 1\npage_access_checkpoint_interval_minutes = 60",
+            ).unwrap(),
+            Default::default(),
+            Default::default(),
+        ).unwrap();
+        assert_eq!(config.page_access_checkpoint_interval_minutes, 60);
+        for key in [
+            "TALON_WORKER_PAGE_TTI_HOURS",
+            "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES",
+            "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES",
+            "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS",
+            "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES",
+        ] {
+            let patch =
+                WorkerConfigPatch::from_env_with(|k| (k == key).then(|| u64::MAX.to_string()))
+                    .unwrap();
+            let err =
+                WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap_err();
+            assert!(err.to_string().contains("overflows"), "{key}: {err}");
+        }
+        for old_key in [
+            "page_tti_ms",
+            "page_access_checkpoint_interval_ms",
+            "page_gc_interval_ms",
+            "file_cleanup_interval_ms",
+            "async_eviction_check_interval_secs",
+        ] {
+            assert!(WorkerConfigPatch::from_toml(&format!("{old_key} = 1")).is_err());
+        }
     }
 
     #[test]

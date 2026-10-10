@@ -315,11 +315,14 @@ can recover older access times and cause early eviction and extra origin reads.
 **Alert:** `TalonPageGcScanLag` (warning) — the latest complete page GC scan
 takes more than 10% of the configured TTI for >2m.
 
-1. Compare `talon_worker_page_gc_scan_seconds` with page count, batch latency,
+1. Compare `talon_worker_page_gc_scan_seconds` with page count, invocation latency,
    disk latency, and deletion errors.
-2. Review `page_gc_interval_ms`, `page_gc_scan_batch_size`,
-   `page_gc_delete_batch_size`, and `page_gc_io_concurrency`. Tune budgets against
-   foreground request latency and available I/O capacity.
+2. Page GC completes a full pass per invocation. Review `page_gc_io_concurrency`,
+   `background_io_concurrency`, and `background_delete_max_per_sec` against
+   foreground request latency and available I/O capacity. `page_gc_interval_minutes`
+   controls the delay after a pass (default 10 minutes), not its scan work limit.
+   File cleanup also completes full passes and uses the independent
+   `file_cleanup_interval_hours` (default one hour).
 3. Confirm subsequent scans complete faster. TTI determines eviction eligibility;
    it does not promise physical space release at a fixed deadline.
 

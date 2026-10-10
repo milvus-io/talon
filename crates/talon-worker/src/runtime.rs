@@ -5,7 +5,10 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod async_eviction;
+mod background;
 mod load;
+pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;
@@ -126,9 +129,10 @@ pub struct WorkerRuntime {
     page_gc_metrics: PageGcMetrics,
     page_mutations: Arc<Mutations>,
     page_gc_io: Arc<tokio::sync::Semaphore>,
-    page_scan: Arc<tokio::sync::Mutex<(ScanCursor, Instant, usize)>>,
+    background_budget: Option<Arc<crate::background::BackgroundBudget>>,
+    page_scan: Arc<tokio::sync::Mutex<()>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
-    page_cleanup: Arc<Mutex<crate::page_cleanup::CleanupCursor>>,
+    page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
 impl WorkerRuntime {
@@ -191,9 +195,9 @@ impl WorkerRuntime {
         metrics.update_l1_residency(0, 0);
         Self {
             l1,
-            page_cleanup: Arc::new(Mutex::new(crate::page_cleanup::CleanupCursor::new(
-                store.root().join("paged"),
-            ))),
+            page_cleanup: Arc::new(tokio::sync::Mutex::new(
+                crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
+            )),
             store: Arc::new(store),
             paged: None,
             index,
@@ -218,11 +222,8 @@ impl WorkerRuntime {
             page_gc_config: PageGcConfig::default(),
             page_mutations: Arc::new(Mutations::default()),
             page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
-            page_scan: Arc::new(tokio::sync::Mutex::new((
-                ScanCursor::default(),
-                Instant::now(),
-                0,
-            ))),
+            background_budget: None,
+            page_scan: Arc::new(tokio::sync::Mutex::new(())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }
@@ -235,9 +236,9 @@ impl WorkerRuntime {
     /// of local disk rather than the whole block. Eviction reclaims individual
     /// pages, leaving the block's other pages intact.
     pub fn with_paged_store(mut self, paged: PagedBlockStore) -> Self {
-        self.page_cleanup = Arc::new(Mutex::new(crate::page_cleanup::CleanupCursor::new(
-            paged.root().to_owned(),
-        )));
+        self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
+            crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
+        ));
         for (id, page, _) in self.index.snapshot_units() {
             if let Some(page) = page {
                 let state = self.page_lifecycle.block(&id);
@@ -1866,19 +1867,24 @@ impl WorkerRuntime {
         if self.capacity_bytes == 0 {
             return;
         }
+        self.evict_to_target(self.capacity_bytes).await;
+    }
+
+    /// Capacity reclamation for foreground admissions, bounded by initial residency.
+    async fn evict_to_target(&self, target: u64) {
         // A selected page can become protected or fail to unlink. Refill from
         // other units using actual residency, attempting each unit at most once.
         // Bound the pass even if concurrent admissions keep adding new units.
         let budget = self.lru.len();
         let mut attempted = HashSet::new();
         while attempted.len() < budget {
-            let mut evicted = self.lru.candidates_to_fit(self.capacity_bytes, &attempted);
+            let mut evicted = self.lru.candidates_to_fit(target, &attempted);
             evicted.truncate(budget - attempted.len());
             if evicted.is_empty() {
                 break;
             }
             attempted.extend(evicted.iter().map(|c| c.unit.clone()));
-            self.unlink_units(evicted, 1).await;
+            self.unlink_units_to_target(evicted, 1, target).await;
         }
     }
 

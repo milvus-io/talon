@@ -370,6 +370,86 @@ Worker cache capacity (bytes).
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `background_task_concurrency`
+
+Maximum concurrently running background maintenance tasks.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_TASK_CONCURRENCY`
+- **Default:** `2`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_io_concurrency`
+
+Shared local disk I/O concurrency for background maintenance.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_IO_CONCURRENCY`
+- **Default:** `4`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_scan_batch_size`
+
+Maximum entries scanned per watermark eviction batch.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE`
+- **Default:** `65536`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_delete_batch_size`
+
+Maximum deletion candidates per watermark eviction batch.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_io_max_mb_per_sec`
+
+Shared background disk read/write MB/s (decimal); zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC`
+- **Default:** `8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `background_delete_max_per_sec`
+
+Shared background deletion work items per second; zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_enabled`
+
+Enable background eviction at cache occupancy watermarks.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_ENABLED`
+- **Default:** `false`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_high_watermark`
+
+Start background eviction at this fraction of capacity_bytes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK`
+- **Default:** `0.9`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_low_watermark`
+
+Stop background eviction at or below this fraction of capacity_bytes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK`
+- **Default:** `0.8`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `async_eviction_check_interval_minutes`
+
+Background cache occupancy check interval in minutes.
+
+- **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES`
+- **Default:** `1`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `l1_capacity_bytes`
 
 L1 DRAM cache capacity in bytes; 0 disables L1.
@@ -394,33 +474,41 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
-### `page_tti_ms`
+### `page_tti_hours`
 
-Page time to idle in milliseconds; 0 disables idle expiration.
+Page time to idle in hours; 0 disables idle expiration.
 
-- **Environment variable:** `TALON_WORKER_PAGE_TTI_MS`
+- **Environment variable:** `TALON_WORKER_PAGE_TTI_HOURS`
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
-### `page_access_checkpoint_interval_ms`
+### `page_access_checkpoint_interval_minutes`
 
-Dirty page access checkpoint interval in milliseconds.
+Dirty page access checkpoint interval in minutes.
 
-- **Environment variable:** `TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MS`
-- **Default:** `60000`
+- **Environment variable:** `TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES`
+- **Default:** `1`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
-### `page_gc_interval_ms`
+### `page_gc_interval_minutes`
 
-Page GC batch interval in milliseconds.
+Delay between complete page GC passes in minutes.
 
-- **Environment variable:** `TALON_WORKER_PAGE_GC_INTERVAL_MS`
-- **Default:** `1000`
+- **Environment variable:** `TALON_WORKER_PAGE_GC_INTERVAL_MINUTES`
+- **Default:** `10`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `file_cleanup_interval_hours`
+
+Delay between complete file cleanup passes in hours, independent of page GC.
+
+- **Environment variable:** `TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS`
+- **Default:** `1`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `page_gc_scan_batch_size`
 
-Maximum pages examined per GC batch.
+Maximum entries per watermark eviction batch; does not limit page GC or file cleanup.
 
 - **Environment variable:** `TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE`
 - **Default:** `65536`
@@ -428,7 +516,7 @@ Maximum pages examined per GC batch.
 
 ### `page_gc_delete_batch_size`
 
-Maximum page deletion attempts per GC batch.
+Maximum deletion candidates per watermark eviction batch; does not limit page GC or file cleanup.
 
 - **Environment variable:** `TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE`
 - **Default:** `1024`
