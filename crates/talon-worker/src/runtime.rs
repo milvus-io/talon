@@ -19,7 +19,7 @@ use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use talon_core::{
     Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId,
-    ObjectStore, PageIndex, Version,
+    ObjectStore, PageIndex, Version, UNCHECKED_VERSION,
 };
 use talon_transport::data::{CachedBlockPutRequest, CachedRangeRequest, RangeRequest};
 use talon_transport::frame::{HEADER_LEN, MAX_PAYLOAD_LEN};
@@ -399,6 +399,8 @@ impl WorkerRuntime {
     /// miss is fetched with `version` as an `If-Match` precondition. A paged miss
     /// may HEAD for its length, but must reject metadata for another version.
     /// A changed source propagates `VersionMismatch` to the caller.
+    /// The reserved `__talon_unchecked__` token skips ETag matching only;
+    /// metadata lookup, range validation and caching retain their usual behavior.
     pub async fn serve_versioned(
         &self,
         request: &RangeRequest,
@@ -1155,7 +1157,7 @@ impl WorkerRuntime {
                     &request.object,
                     block.offset + page_start,
                     want,
-                    Some(&block.version),
+                    (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
                 ),
             )
             .await;
@@ -1320,7 +1322,7 @@ impl WorkerRuntime {
                     self.backend.head(object).await.map_err(|error| {
                         anyhow::anyhow!("resolve object length (HEAD): {error}")
                     })?;
-                if stat.version != block.version {
+                if block.version.as_str() != UNCHECKED_VERSION && stat.version != block.version {
                     return Err(Error::VersionMismatch {
                         expected: block.version.0.clone(),
                         found: stat.version.0,
@@ -1582,7 +1584,7 @@ impl WorkerRuntime {
                     &request.object,
                     block.offset,
                     self.block_size as u64,
-                    Some(&block.version),
+                    (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
                 ),
             )
             .await;
@@ -3842,6 +3844,52 @@ mod tests {
         ));
         assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged) + 1);
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn unchecked_version_skips_etag_match_but_preserves_tail_caching() {
+        for paged in [false, true] {
+            let root = tmp_root();
+            let backend = Arc::new(CondBackend {
+                version: std::sync::Mutex::new("v2".into()),
+                body: std::sync::Mutex::new(Bytes::from_static(b"abcdefghijk")),
+                heads: AtomicUsize::new(0),
+                fetches: AtomicUsize::new(0),
+                enforce_precondition: true,
+            });
+            let mut runtime = cond_runtime(backend.clone(), &root, Duration::from_secs(60));
+            if paged {
+                runtime =
+                    runtime.with_paged_store(PagedBlockStore::open(root.join("paged"), 4).unwrap());
+            }
+            let request = RangeRequest {
+                object: ObjectId::new(Backend::Azure, "container", "obj"),
+                offset: 8,
+                len: 3,
+            };
+            let version = Version::new(UNCHECKED_VERSION);
+            let first = runtime.serve_versioned(&request, &version).await.unwrap();
+            assert!(matches!(first, ServeOutcome::Bytes(ref bytes) if bytes.as_ref() == b"ijk"));
+            let cached = runtime.serve_versioned(&request, &version).await.unwrap();
+            assert_eq!(read_handle(cached), b"ijk");
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+            assert_eq!(backend.heads.load(Ordering::SeqCst), usize::from(paged));
+            assert_eq!(runtime.resident_bytes(), 3);
+
+            // Only the exact reserved token bypasses the version comparison.
+            for ordinary in ["v1", "__talon_unchecked__ "] {
+                let error = runtime
+                    .serve_versioned(&request, &Version::new(ordinary))
+                    .await
+                    .err()
+                    .expect("ordinary versions must still match");
+                assert!(matches!(
+                    error.downcast_ref::<Error>(),
+                    Some(Error::VersionMismatch { .. })
+                ));
+            }
+            std::fs::remove_dir_all(root).ok();
+        }
     }
 
     #[tokio::test]

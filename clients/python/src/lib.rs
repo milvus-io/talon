@@ -541,6 +541,7 @@ fn talon(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<LoadFailure>()?;
     m.add("BatchLoadError", m.py().get_type_bound::<BatchLoadError>())?;
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("UNCHECKED_VERSION", talon_rust_client::UNCHECKED_VERSION)?;
     Ok(())
 }
 
