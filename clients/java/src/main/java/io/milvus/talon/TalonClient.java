@@ -9,12 +9,17 @@ import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.net.SocketException;
+import java.net.SocketTimeoutException;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ScheduledThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.ReentrantLock;
 
 /**
  * A client for reading objects through a Talon cache cluster.
@@ -51,8 +56,8 @@ public final class TalonClient implements AutoCloseable {
     private final int blockSize;
     private final ConnectionPool coordinatorPool;
     private final AtomicInteger requestIds = new AtomicInteger(1);
-    private final Object membershipLock = new Object();
-    private CachedMembership membership;
+    private final ReentrantLock membershipLock = new ReentrantLock();
+    private volatile CachedMembership membership;
     private Messages.Discovery discovery;
     private long discoveryExpires;
     private long nextDiscoveryAttempt;
@@ -236,6 +241,10 @@ public final class TalonClient implements AutoCloseable {
     }
 
     private List<LoadResult> loadFiles(List<LoadRequest> files, boolean batch) throws IOException {
+        return loadFiles(files, batch, System.nanoTime() + TimeUnit.MINUTES.toNanos(30));
+    }
+
+    private List<LoadResult> loadFiles(List<LoadRequest> files, boolean batch, long deadline) throws IOException {
         List<LoadResult> results = new ArrayList<>(files.size());
         boolean nonempty = false;
         for (LoadRequest file : files) {
@@ -249,11 +258,10 @@ public final class TalonClient implements AutoCloseable {
             nonempty |= blocks > 0;
         }
         if (!nonempty) return List.copyOf(results);
-        long deadline = System.nanoTime() + java.util.concurrent.TimeUnit.MINUTES.toNanos(30);
         LoadProgress progress = new LoadProgress(results);
         Placement.Table topology = null;
         try {
-            topology = membership().placement;
+            topology = membership(deadline).placement;
             // Bound pending planning across all workers independently of file sizes.
             Map<String, List<IndexedLoad>> groups = new java.util.LinkedHashMap<>();
             Map<String, Long> sizes = new HashMap<>();
@@ -302,16 +310,15 @@ public final class TalonClient implements AutoCloseable {
             }
             if (progress.firstError == null) progress.firstError = failure;
         }
-        synchronized (membershipLock) {
-            // Check even when a deadline interrupted dispatch before the final frame.
-            if (topology != null && membership.placement != topology) {
-                TalonException failure = new TalonException(TalonException.Code.UNAVAILABLE, "membership changed during load");
-                if (!batch) throw failure;
-                for (int i = 0; i < results.size(); i++) {
-                    if (results.get(i).blocks() != 0) progress.fail(i, true, failure.toString());
-                }
-                if (progress.firstError == null) progress.firstError = failure;
+        // The immutable snapshot's volatile reference avoids waiting on another refresh
+        // after a deadline interrupted dispatch. Check topology even on that failure path.
+        if (topology != null && membership.placement != topology) {
+            TalonException failure = new TalonException(TalonException.Code.UNAVAILABLE, "membership changed during load");
+            if (!batch) throw failure;
+            for (int i = 0; i < results.size(); i++) {
+                if (results.get(i).blocks() != 0) progress.fail(i, true, failure.toString());
             }
+            if (progress.firstError == null) progress.firstError = failure;
         }
         if (progress.firstError != null) throw progress.exception();
         return List.copyOf(results);
@@ -329,11 +336,12 @@ public final class TalonClient implements AutoCloseable {
             throw new IOException("load interrupted", interrupted);
         }
         try {
-            membership();
+            membership(deadline);
             ConnectionPool pool;
             String address;
             long instanceDeadline;
-            synchronized (membershipLock) {
+            lockMembership(deadline);
+            try {
                 if (membership.placement != topology) throw new TalonException(TalonException.Code.UNAVAILABLE, "membership changed during load");
                 NodeInfo owner = topology.primary(blocks.get(0).block());
                 if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
@@ -341,12 +349,12 @@ public final class TalonClient implements AutoCloseable {
                         .filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
                 if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "load owner offline or conflicting");
                 address = target.address(); pool = instancePools.get(instanceKey(target)); instanceDeadline = discoveryExpires;
-            }
+            } finally { membershipLock.unlock(); }
             int id = requestIds.getAndIncrement();
             byte[] request = batch ? Messages.batchLoad(id, blocks) : Messages.loadBlock(id, blocks.get(0));
             long rpcDeadline = Math.min(deadline, System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(batch ? 1800 : 120));
             ConnectionPool.checkRetryDeadline(instanceDeadline);
-            return pool.exchange(address, instanceDeadline, socket -> {
+            return pool.exchange(address, instanceDeadline, rpcDeadline, socket -> {
                 ConnectionPool.checkRetryDeadline(instanceDeadline);
                 long left = rpcDeadline - System.nanoTime();
                 if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
@@ -358,10 +366,6 @@ public final class TalonClient implements AutoCloseable {
                     if (header.isError() || header.type() != Frame.MsgType.CONTROL || header.requestId() != id || header.length() > (1 << 20)) {
                         throw new ProtocolException("invalid LOAD reply frame");
                     }
-                    // Recompute the remaining read budget after receiving the header.
-                    left = rpcDeadline - System.nanoTime();
-                    if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
-                    socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
                     Messages.Response response = Messages.decodeBody(readExactly(socket.getInputStream(), header.length()));
                     if (batch && response.tag == Messages.TAG_BATCH_LOAD_RESULT) return Messages.loadFailures(response, blocks.size());
                     if (response.tag != Messages.TAG_ACK) throw unexpected("LOAD", response);
@@ -437,10 +441,11 @@ public final class TalonClient implements AutoCloseable {
 
     @Override
     public void close() {
-        synchronized (membershipLock) {
+        membershipLock.lock();
+        try {
             for (ConnectionPool pool : instancePools.values()) pool.close();
             instancePools.clear();
-        }
+        } finally { membershipLock.unlock(); }
         coordinatorPool.close();
     }
 
@@ -496,7 +501,8 @@ public final class TalonClient implements AutoCloseable {
         ConnectionPool pool;
         String address;
         long retryDeadline;
-        synchronized (membershipLock) {
+        membershipLock.lock();
+        try {
             NodeInfo owner = membership.placement.primary(seg.block);
             if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
             if (System.nanoTime() >= discoveryExpires) throw new TalonException(TalonException.Code.UNAVAILABLE, "expired instance discovery");
@@ -505,28 +511,49 @@ public final class TalonClient implements AutoCloseable {
             address = target.address();
             pool = instancePools.get(instanceKey(target));
             retryDeadline = discoveryExpires;
-        }
+        } finally { membershipLock.unlock(); }
         try { return fetchRange(address, seg, pool, retryDeadline); }
         catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
     private CachedMembership membership() throws IOException {
-        synchronized (membershipLock) {
+        return membership(null);
+    }
+
+    private void lockMembership(Long deadline) throws IOException {
+        if (deadline == null) {
+            membershipLock.lock();
+            return;
+        }
+        try {
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0 || !membershipLock.tryLock(remaining, TimeUnit.NANOSECONDS)) {
+                throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded waiting for discovery");
+            }
+        } catch (InterruptedException interrupted) {
+            Thread.currentThread().interrupt();
+            throw new IOException("load interrupted waiting for discovery", interrupted);
+        }
+    }
+
+    private CachedMembership membership(Long deadline) throws IOException {
+        lockMembership(deadline);
+        try {
             if (discovery != null && System.nanoTime() < discoveryExpires) return membership;
             if (System.nanoTime() < nextDiscoveryAttempt) throw new TalonException(TalonException.Code.UNAVAILABLE, "discovery refresh cooling down");
-            return refreshDiscovery();
-        }
+            return refreshDiscovery(deadline);
+        } finally { membershipLock.unlock(); }
     }
 
     private static String instanceKey(Messages.DiscoveredWorker worker) {
         return worker.id().length() + ":" + worker.id() + worker.instance().length() + ":" + worker.instance() + worker.address();
     }
-    private CachedMembership refreshDiscovery() throws IOException {
+    private CachedMembership refreshDiscovery(Long deadline) throws IOException {
         long started = System.nanoTime();
         nextDiscoveryAttempt = started + 100_000_000L;
         Messages.Discovery view;
         try {
-            view = controlRoundTrip(Messages.membershipQuery(requestIds.getAndIncrement()), response -> {
+            view = controlRoundTrip(Messages.membershipQuery(requestIds.getAndIncrement()), deadline, response -> {
                 if (response.tag != Messages.TAG_MEMBERSHIP_LIST) throw unexpected("MembershipQuery", response);
                 return Messages.readDiscovery(response.body);
             });
@@ -555,7 +582,12 @@ public final class TalonClient implements AutoCloseable {
 
     private <T> T controlRoundTrip(byte[] request, IoFunction<Messages.Response, T> decode)
             throws IOException {
-        try { return coordinatorPool.exchange(coordinator, socket -> {
+        return controlRoundTrip(request, null, decode);
+    }
+
+    private <T> T controlRoundTrip(byte[] request, Long deadline, IoFunction<Messages.Response, T> decode)
+            throws IOException {
+        try { return coordinatorPool.exchange(coordinator, null, deadline, socket -> {
             OutputStream out = socket.getOutputStream();
             out.write(Telemetry.envelope(request, coordinator));
             out.flush();
@@ -607,6 +639,52 @@ public final class TalonClient implements AutoCloseable {
         R apply(T input) throws IOException;
     }
 
+    /** Closes an exclusively owned socket at an absolute deadline, including during writes. */
+    private static final class SocketDeadline implements AutoCloseable {
+        private static final ScheduledThreadPoolExecutor TIMER = timer();
+        private final long deadline;
+        private final ScheduledFuture<?> alarm;
+        private boolean armed = true;
+
+        private static ScheduledThreadPoolExecutor timer() {
+            ScheduledThreadPoolExecutor timer = new ScheduledThreadPoolExecutor(1, task -> {
+                Thread thread = new Thread(task, "talon-load-deadlines");
+                thread.setDaemon(true);
+                return thread;
+            });
+            timer.setRemoveOnCancelPolicy(true);
+            return timer;
+        }
+
+        SocketDeadline(Socket socket, long deadline) throws SocketTimeoutException {
+            this.deadline = deadline;
+            long remaining = deadline - System.nanoTime();
+            if (remaining <= 0) throw timeout();
+            alarm = TIMER.schedule(() -> {
+                synchronized (this) {
+                    if (armed) closeSocket(socket);
+                }
+            }, remaining, TimeUnit.NANOSECONDS);
+        }
+
+        static SocketTimeoutException timeout() {
+            return new SocketTimeoutException("load deadline exceeded");
+        }
+
+        synchronized void finish() throws SocketTimeoutException {
+            close();
+            // Also reject a late response if the timer thread has not run yet.
+            if (deadline - System.nanoTime() <= 0) throw timeout();
+        }
+
+        @Override
+        public synchronized void close() {
+            // Synchronize with the callback before returning this socket to its pool.
+            armed = false;
+            alarm.cancel(false);
+        }
+    }
+
     /** Exclusive checkout; only successfully decoded exchanges return to the pool. */
     private static final class ConnectionPool {
         private static final long IDLE_TTL_NANOS = 30_000_000_000L;
@@ -620,10 +698,10 @@ public final class TalonClient implements AutoCloseable {
             this.maxIdlePerAddr = maxIdlePerAddr;
         }
 
-        <T> T exchange(String address, IoFunction<Socket, T> request) throws IOException {
-            return exchange(address, null, request);
-        }
         <T> T exchange(String address, Long retryDeadline, IoFunction<Socket, T> request) throws IOException {
+            return exchange(address, retryDeadline, null, request);
+        }
+        <T> T exchange(String address, Long retryDeadline, Long deadline, IoFunction<Socket, T> request) throws IOException {
             Socket socket = takeIdle(address);
             boolean reused = socket != null;
             boolean retrying = false;
@@ -631,18 +709,23 @@ public final class TalonClient implements AutoCloseable {
                 if (socket == null) {
                     if (retrying) checkRetryDeadline(retryDeadline);
                     ensureOpen();
-                    // Dial and all request I/O run outside the pool lock.
-                    socket = dial(address);
+                    socket = new Socket();
                 }
                 boolean completed = false;
-                try {
+                try (SocketDeadline guard = deadline == null ? null : new SocketDeadline(socket, deadline)) {
+                    // The same deadline covers connect, write, header, body, and any retry.
+                    if (!socket.isConnected()) connect(socket, address);
                     // Dialing can consume the remaining discovery lifetime.
                     if (retrying) checkRetryDeadline(retryDeadline);
                     T result = request.apply(socket);
+                    if (guard != null) guard.finish();
                     release(address, socket);
                     completed = true;
                     return result;
                 } catch (IOException failure) {
+                    if (deadline != null && deadline - System.nanoTime() <= 0) {
+                        throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded", failure);
+                    }
                     // Data reads retry transport I/O only, never a typed Worker refusal.
                     // Preserve the narrower disconnect-only policy for control requests.
                     if (!reused || failure instanceof TalonException
@@ -721,19 +804,17 @@ public final class TalonClient implements AutoCloseable {
         }
     }
 
-    private static Socket dial(String hostPort) throws IOException {
+    private static void connect(Socket socket, String hostPort) throws IOException {
         int colon = hostPort.lastIndexOf(':');
         if (colon < 0) {
             throw new IOException("address is missing a port: " + hostPort);
         }
         String host = hostPort.substring(0, colon);
         int port = Integer.parseInt(hostPort.substring(colon + 1));
-        Socket socket = new Socket();
         try {
             socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
             socket.setSoTimeout(READ_TIMEOUT_MS);
             socket.setTcpNoDelay(true);
-            return socket;
         } catch (IOException | RuntimeException failure) {
             closeSocket(socket);
             throw failure;
