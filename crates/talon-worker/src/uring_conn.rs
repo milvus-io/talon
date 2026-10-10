@@ -836,7 +836,7 @@ async fn send_splice_header(stream: &mut TcpStream, mut header: Vec<u8>) -> anyh
 
 /// Handle a `Control` frame on the data plane.
 ///
-/// Only `StatObject` is served (#318). Mirrors the Tokio path's semantics
+/// Serves metadata and block prewarm. Mirrors the Tokio path's semantics
 /// exactly — the two data planes must not diverge in what they answer, only in
 /// how they move bytes.
 async fn handle_control_frame(
@@ -871,6 +871,38 @@ async fn handle_control_frame(
     };
 
     let reply = match message {
+        talon_transport::ControlMessage::LoadBlock { block, len } => {
+            if !observability.is_ready() {
+                talon_transport::ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.load_block(&block, len).await {
+                    Ok(()) => talon_transport::ControlMessage::Ack { ok: true, detail: None },
+                    Err(error) => talon_transport::ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
+        talon_transport::ControlMessage::BatchLoad { blocks } => {
+            if !observability.is_ready() {
+                talon_transport::ControlMessage::Ack {
+                    ok: false,
+                    detail: Some("worker is not ready".into()),
+                }
+            } else {
+                match worker.batch_load(&blocks).await {
+                    Ok(failures) => talon_transport::ControlMessage::BatchLoadResult { failures },
+                    Err(error) => talon_transport::ControlMessage::Ack {
+                        ok: false,
+                        detail: Some(error.to_string()),
+                    },
+                }
+            }
+        }
         talon_transport::ControlMessage::StatObject { object } => {
             if !observability.is_ready() {
                 talon_transport::ControlMessage::ControlFailure {
@@ -914,7 +946,7 @@ async fn handle_control_frame(
         other => talon_transport::ControlMessage::Ack {
             ok: false,
             detail: Some(format!(
-                "worker serves only StatObject/ListObjects on the data plane, got {other:?}"
+                "worker serves only StatObject/ListObjects/LoadBlock/BatchLoad on the data plane, got {other:?}"
             )),
         },
     };
@@ -923,7 +955,7 @@ async fn handle_control_frame(
         reply,
         talon_transport::ControlMessage::Ack { ok: false, .. }
             | talon_transport::ControlMessage::ControlFailure { .. }
-    );
+    ) || matches!(&reply, talon_transport::ControlMessage::BatchLoadResult { failures } if !failures.is_empty());
     let buf = talon_transport::envelope::response_version(
         talon_transport::codec::encode(h.request_id, &reply)?,
         response_version,

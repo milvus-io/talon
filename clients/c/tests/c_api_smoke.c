@@ -6,6 +6,22 @@
 static atomic_int callback_done;
 static atomic_int callback_ok;
 
+static void capture_empty_load(talon_result *result, void *user_data) {
+    const talon_load_result *entry = talon_result_load(result, 0);
+    int ok = talon_result_status(result) == TALON_STATUS_OK &&
+             talon_result_operation(result) == (int)(uintptr_t)user_data &&
+             talon_result_load_count(result) == 1 && entry != NULL &&
+             entry->size == 0 && entry->blocks == 0 &&
+             talon_result_load(result, 1) == NULL &&
+             talon_result_load_failure_count(result) == 0 &&
+             talon_result_load_failure_index(result, 0) == SIZE_MAX &&
+             talon_result_load_failure_uncertain(result, 0) == -1 &&
+             talon_result_load_failure_error(result, 0) == NULL;
+    talon_result_free(result);
+    atomic_store_explicit(&callback_ok, ok, memory_order_release);
+    atomic_store_explicit(&callback_done, 1, memory_order_release);
+}
+
 static void capture_zero_length_read(talon_result *result, void *user_data) {
     int ok = user_data == NULL &&
              talon_result_status(result) == TALON_STATUS_OK &&
@@ -101,6 +117,24 @@ int talon_c_api_smoke_test(void) {
         talon_result_version(NULL) != NULL || talon_result_error(NULL) != NULL) {
         talon_client_free(client);
         return 9;
+    }
+    for (int operation = TALON_OPERATION_LOAD; operation <= TALON_OPERATION_BATCH_LOAD; operation++) {
+        atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
+        atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
+        talon_load_request request = {"s3://bucket/empty", "v1", 0};
+        int status = operation == TALON_OPERATION_LOAD
+            ? talon_load_async_with_options(client, request.uri, request.version, request.size,
+                &trace_options, capture_empty_load, (void *)(uintptr_t)operation, &request_id)
+            : talon_batch_load_async_with_options(client, &request, 1, &trace_options,
+                capture_empty_load, (void *)(uintptr_t)operation, &request_id);
+        if (status != TALON_STATUS_OK) { talon_client_free(client); return 12; }
+        for (unsigned int i = 0; i < 100000000u; ++i) {
+            if (atomic_load_explicit(&callback_done, memory_order_acquire)) break;
+        }
+        if (!atomic_load_explicit(&callback_done, memory_order_acquire) ||
+            !atomic_load_explicit(&callback_ok, memory_order_acquire)) {
+            talon_client_free(client); return 13;
+        }
     }
     talon_result_free(NULL);
     talon_client_free(client);

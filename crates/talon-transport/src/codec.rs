@@ -179,6 +179,71 @@ pub enum ControlMessage {
         code: crate::DataErrorCode,
         message: String,
     },
+    /// Client → worker: warm exactly one assigned block.
+    LoadBlock {
+        /// Complete versioned block identity.
+        block: BlockId,
+        /// Logical bytes in the block (the last block may be short).
+        len: u64,
+    },
+    /// Client → worker: execute several block loads in one exchange.
+    BatchLoad {
+        /// Ordered assignments; acknowledged together after all complete.
+        blocks: Vec<LoadBlockRequest>,
+    },
+    /// Worker → client: all assignments were attempted; omitted indices succeeded.
+    BatchLoadResult {
+        /// Failures ordered by the zero-based assignment index in the request.
+        failures: Vec<LoadBlockFailure>,
+    },
+}
+
+/// Maximum assignments in one batch LOAD frame.
+pub const MAX_BATCH_LOAD_BLOCKS: usize = 1024;
+/// Maximum encoded batch body, leaving room under the control-frame cap for tracing.
+pub const MAX_BATCH_LOAD_BYTES: u64 =
+    (crate::MAX_CONTROL_PAYLOAD_LEN - crate::envelope::ENVELOPE_OVERHEAD) as u64;
+/// Bincode schema (u16), enum tag (u32), and vector length (u64).
+pub const BATCH_LOAD_BODY_OVERHEAD: u64 = 14;
+
+/// Maximum UTF-8 bytes in one batch failure diagnostic.
+pub const MAX_LOAD_ERROR_BYTES: usize = 256;
+
+/// A failed assignment in a batch reply. File identities remain in the request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadBlockFailure {
+    /// Zero-based assignment index, not a file index.
+    pub index: u32,
+    /// Bounded diagnostic; clients must not classify errors by its text.
+    pub error: String,
+}
+
+impl LoadBlockFailure {
+    /// Build a bounded diagnostic without splitting a UTF-8 code point.
+    pub fn new(index: u32, mut error: String) -> Self {
+        let mut end = error.len().min(MAX_LOAD_ERROR_BYTES);
+        while !error.is_char_boundary(end) {
+            end -= 1;
+        }
+        error.truncate(end);
+        Self { index, error }
+    }
+}
+
+/// One version-pinned block assignment within a batch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LoadBlockRequest {
+    /// Complete versioned block identity.
+    pub block: BlockId,
+    /// Logical block length, including a possibly short final block.
+    pub len: u64,
+}
+
+impl LoadBlockRequest {
+    /// Exact encoded size used to pack bounded batch frames.
+    pub fn encoded_len(&self) -> Result<u64, CodecError> {
+        Ok(bincode::serialized_size(self)?)
+    }
 }
 
 /// One object listing entry: its mount-relative path and byte size.
@@ -221,6 +286,9 @@ struct Envelope {
 /// Errors from control-message encode/decode.
 #[derive(Debug, thiserror::Error)]
 pub enum CodecError {
+    /// Batch LOAD exceeds its count or byte limit, or contains no assignments.
+    #[error("invalid batch load: {0}")]
+    InvalidBatchLoad(String),
     /// The framing header was invalid.
     #[error("frame error: {0}")]
     Frame(#[from] FrameError),
@@ -384,6 +452,32 @@ fn validate_message(message: &ControlMessage, schema: u16) -> Result<(), CodecEr
             selected: schema,
         });
     }
+    if let ControlMessage::BatchLoad { blocks } = message {
+        if blocks.is_empty() || blocks.len() > MAX_BATCH_LOAD_BLOCKS {
+            return Err(CodecError::InvalidBatchLoad(format!(
+                "expected 1..={MAX_BATCH_LOAD_BLOCKS} assignments"
+            )));
+        }
+        if 2 + bincode::serialized_size(message)? > MAX_BATCH_LOAD_BYTES {
+            return Err(CodecError::InvalidBatchLoad(
+                "encoded body exceeds control-frame limit".into(),
+            ));
+        }
+    }
+    if let ControlMessage::BatchLoadResult { failures } = message {
+        if failures.len() > MAX_BATCH_LOAD_BLOCKS
+            || failures.iter().any(|f| {
+                f.index as usize >= MAX_BATCH_LOAD_BLOCKS || f.error.len() > MAX_LOAD_ERROR_BYTES
+            })
+            || failures
+                .windows(2)
+                .any(|pair| pair[0].index >= pair[1].index)
+        {
+            return Err(CodecError::InvalidBatchLoad(
+                "invalid batch failure list".into(),
+            ));
+        }
+    }
     if let ControlMessage::NodeStatusHeartbeat { status } = message {
         status.validate()?;
         let got = bincode::serialized_size(status)? as usize;
@@ -546,6 +640,85 @@ mod tests {
                     matches!(decode(&incompatible), Err(CodecError::UnsupportedSchema { got, .. }) if got == schema)
                 );
             }
+        }
+    }
+
+    #[test]
+    fn batch_failure_reply_is_bounded_ordered_and_preserves_utf8() {
+        let failure = LoadBlockFailure::new(0, "错".repeat(200));
+        assert!(failure.error.len() <= MAX_LOAD_ERROR_BYTES);
+        let failures = (0..MAX_BATCH_LOAD_BLOCKS)
+            .map(|index| LoadBlockFailure::new(index as u32, "x".repeat(256)))
+            .collect();
+        let reply = ControlMessage::BatchLoadResult { failures };
+        let frame = encode(1, &reply).unwrap();
+        assert!(frame.len() < MAX_BATCH_LOAD_BYTES as usize);
+        assert_eq!(decode(&frame).unwrap().1, reply);
+        for failures in [
+            vec![failure.clone(), failure],
+            vec![LoadBlockFailure::new(1024, "bad index".into())],
+            vec![LoadBlockFailure {
+                index: 0,
+                error: "x".repeat(257),
+            }],
+        ] {
+            let message = ControlMessage::BatchLoadResult { failures };
+            assert!(encode(1, &message).is_err());
+            let body = bincode::serialize(&Envelope {
+                schema: CONTROL_SCHEMA_VERSION,
+                message,
+            })
+            .unwrap();
+            let mut raw = FrameHeader::new(MsgType::Control, 1, body.len() as u32)
+                .encode()
+                .to_vec();
+            raw.extend(body);
+            assert!(decode(&raw).is_err());
+        }
+    }
+
+    #[test]
+    fn batch_load_round_trip_and_bounds_apply_on_encode_and_decode() {
+        let request = LoadBlockRequest {
+            block: BlockId::new(
+                talon_core::ObjectId::new(talon_core::Backend::S3, "bucket", "key"),
+                0,
+                8,
+                talon_core::Version::new("v1"),
+            ),
+            len: 8,
+        };
+        let valid = ControlMessage::BatchLoad {
+            blocks: vec![request.clone(); MAX_BATCH_LOAD_BLOCKS],
+        };
+        let encoded = encode(42, &valid).unwrap();
+        assert_eq!(decode(&encoded).unwrap().1, valid);
+        assert_eq!(
+            (encoded.len() - HEADER_LEN) as u64,
+            BATCH_LOAD_BODY_OVERHEAD
+                + MAX_BATCH_LOAD_BLOCKS as u64 * request.encoded_len().unwrap()
+        );
+        assert!(matches!(
+            decode_with_max_schema(&encoded, 5),
+            Err(CodecError::UnsupportedSchema { .. })
+        ));
+        let mut huge = request.clone();
+        huge.block.version = talon_core::Version::new("x".repeat(MAX_BATCH_LOAD_BYTES as usize));
+        for blocks in [vec![], vec![request; MAX_BATCH_LOAD_BLOCKS + 1], vec![huge]] {
+            let message = ControlMessage::BatchLoad { blocks };
+            assert!(matches!(
+                encode(1, &message),
+                Err(CodecError::InvalidBatchLoad(_))
+            ));
+            let body = bincode::serialize(&Envelope { schema: 6, message }).unwrap();
+            let mut frame = FrameHeader::new(MsgType::Control, 1, body.len() as u32)
+                .encode()
+                .to_vec();
+            frame.extend_from_slice(&body);
+            assert!(matches!(
+                decode(&frame),
+                Err(CodecError::InvalidBatchLoad(_))
+            ));
         }
     }
 

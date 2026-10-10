@@ -23,10 +23,23 @@ typedef enum talon_status {
 
 typedef enum talon_operation {
     TALON_OPERATION_READ = 1,
-    TALON_OPERATION_STAT = 2
+    TALON_OPERATION_STAT = 2,
+    TALON_OPERATION_LOAD = 3,
+    TALON_OPERATION_BATCH_LOAD = 4
 } talon_operation;
 
 typedef void (*talon_callback)(talon_result *result, void *user_data);
+
+typedef struct talon_load_request {
+    const char *uri;
+    const char *version;
+    uint64_t size;
+} talon_load_request;
+
+typedef struct talon_load_result {
+    uint64_t size;
+    uint64_t blocks;
+} talon_load_result;
 
 typedef void (*talon_task_fn)(void *task_ctx);
 typedef void (*talon_executor_submit_fn)(
@@ -154,6 +167,43 @@ int talon_stat_async(
     talon_callback callback,
     void *user_data,
     uint64_t *request_id_out);
+
+/* Prewarm the supplied source version and size without HEAD. Requests and
+ * strings are copied before returning. NULL requests is valid only for count=0.
+ * Successful submission schedules exactly one callback through the client's
+ * callback executor; synchronous errors schedule none. Keep user_data valid
+ * until the callback, and free its result with talon_result_free.
+ * Batch results follow input order, including empty files. A failed operation
+ * exposes its failed/unconfirmed input file indices through load_failure_*;
+ * completed cache fills remain resident subject to eviction.
+ * Batches use up to 1024 block instructions per protocol frame, not one RPC
+ * per file. Worker origin retries apply to both operations. */
+int talon_load_async(talon_client *client, const char *uri, const char *version,
+    uint64_t size, talon_callback callback, void *user_data, uint64_t *request_id_out);
+int talon_load_async_with_options(talon_client *client, const char *uri,
+    const char *version, uint64_t size, const talon_request_options *options,
+    talon_callback callback, void *user_data, uint64_t *request_id_out);
+int talon_batch_load_async(talon_client *client, const talon_load_request *requests,
+    size_t count, talon_callback callback, void *user_data, uint64_t *request_id_out);
+int talon_batch_load_async_with_options(talon_client *client,
+    const talon_load_request *requests, size_t count,
+    const talon_request_options *options, talon_callback callback,
+    void *user_data, uint64_t *request_id_out);
+size_t talon_result_load_count(const talon_result *result);
+/* Borrowed until result is freed; NULL for invalid result/index. */
+const talon_load_result *talon_result_load(const talon_result *result, size_t index);
+
+/* Submitted batches report each failed/unconfirmed input once, in input order.
+ * Omitted files completed successfully. Invalid arguments rejected before dispatch
+ * have no failure list. Unknown completion is retryable but is not proof of failure.
+ * Successful-file load results remain available only on overall success. */
+size_t talon_result_load_failure_count(const talon_result *result);
+/* Returns SIZE_MAX for invalid result/index. */
+size_t talon_result_load_failure_index(const talon_result *result, size_t index);
+/* 1 = unconfirmed, 0 = confirmed failure, -1 = invalid index. */
+int talon_result_load_failure_uncertain(const talon_result *result, size_t index);
+/* Borrowed until result is freed; NULL for invalid result/index. */
+const char *talon_result_load_failure_error(const talon_result *result, size_t index);
 
 int talon_result_status(const talon_result *result);
 int talon_result_operation(const talon_result *result);

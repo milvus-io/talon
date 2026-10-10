@@ -12,7 +12,7 @@
 
 use std::time::{Duration, Instant};
 
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use talon_core::{BlockId, CachePlacementTable, NodeRole, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
@@ -28,10 +28,18 @@ const PLACEHOLDER_VERSION: &str = "e2e-v1";
 
 /// Command-line arguments for the Talon client.
 #[derive(Debug, Parser)]
-#[command(name = "talon-client", version, about)]
+#[command(
+    name = "talon-client",
+    version,
+    about,
+    subcommand_negates_reqs = true,
+    args_conflicts_with_subcommands = true
+)]
 struct Args {
+    #[command(subcommand)]
+    command: Option<Command>,
     /// Address of the coordinator to query for placement.
-    #[arg(long, default_value = "127.0.0.1:7000")]
+    #[arg(long, global = true, default_value = "127.0.0.1:7000")]
     coordinator: String,
     /// Connect directly to one worker, bypassing placement (diagnostics/tests).
     #[arg(long)]
@@ -56,6 +64,42 @@ struct Args {
     out: Option<std::path::PathBuf>,
 }
 
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Prewarm multiple files using batched worker protocol requests.
+    BatchLoad {
+        /// JSON array of {path, version, size} entries.
+        #[arg(long)]
+        manifest: std::path::PathBuf,
+        /// Logical block size; must match workers and readers.
+        #[arg(long, default_value_t = PLACEMENT_BLOCK_SIZE)]
+        block_size: u32,
+    },
+    /// Prewarm a file on the workers responsible for its blocks.
+    Load {
+        /// Object path, e.g. /s3/bucket/key.
+        #[arg(long)]
+        path: String,
+        /// Source version/ETag used by normal version-pinned reads.
+        #[arg(long = "version")]
+        source_version: String,
+        /// Required size of this version in bytes; LOAD issues no HEAD.
+        #[arg(long)]
+        size: u64,
+        /// Logical block size; must match workers and readers.
+        #[arg(long, default_value_t = PLACEMENT_BLOCK_SIZE)]
+        block_size: u32,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoadEntry {
+    path: String,
+    version: String,
+    size: u64,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     #[cfg(feature = "telemetry")]
@@ -77,8 +121,99 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
+async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
+    let (entries, block_size, batch) = match command {
+        Command::Load {
+            path,
+            source_version,
+            size,
+            block_size,
+        } => (
+            vec![LoadEntry {
+                path,
+                version: source_version,
+                size,
+            }],
+            block_size,
+            false,
+        ),
+        Command::BatchLoad {
+            manifest,
+            block_size,
+        } => {
+            let input = tokio::fs::read(manifest).await?;
+            (
+                serde_json::from_slice::<Vec<LoadEntry>>(&input)?,
+                block_size,
+                true,
+            )
+        }
+    };
+    let objects = entries
+        .iter()
+        .map(|entry| ObjectId::from_path(&entry.path))
+        .collect::<Result<Vec<_>, _>>()?;
+    let versions = entries
+        .iter()
+        .map(|entry| Version::new(entry.version.clone()))
+        .collect::<Vec<_>>();
+    let files = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| talon_cache_client::FileView {
+            object: &objects[i],
+            version: &versions[i],
+            size: entry.size,
+            block_size,
+        })
+        .collect::<Vec<_>>();
+    let reader = talon_cache_client::BlockReader::new(
+        talon_cache_client::CoordinatorClient::new(coordinator),
+        std::sync::Arc::new(talon_cache_client::PlacementCache::new(30_000)),
+        1,
+    );
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64;
+    if batch {
+        let results = match reader.batch_load(&files, now_ms).await {
+            Ok(results) => results,
+            Err(error) => {
+                for failure in error.failed_files() {
+                    eprintln!(
+                        "{} input[{}] {}: {}",
+                        if failure.uncertain {
+                            "unconfirmed"
+                        } else {
+                            "failed"
+                        },
+                        failure.index,
+                        entries[failure.index].path,
+                        failure.error
+                    );
+                }
+                return Err(error.into());
+            }
+        };
+        for (entry, result) in entries.iter().zip(results) {
+            println!(
+                "loaded {} bytes in {} blocks: {}",
+                result.size, result.blocks, entry.path
+            );
+        }
+    } else {
+        let result = reader.load(&files[0], now_ms).await?;
+        println!("loaded {} bytes in {} blocks", result.size, result.blocks);
+    }
+    Ok(())
+}
+
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+    if let Some(command) = args.command {
+        return run_load(command, &args.coordinator).await;
+    }
     if args.membership_only {
         let mut nodes = membership_lookup(&args.coordinator).await?.nodes;
         nodes.sort_by(|left, right| {
@@ -286,7 +421,66 @@ fn hex_prefix(bytes: &[u8]) -> String {
 mod tests {
     use clap::Parser;
 
-    use super::Args;
+    use super::{Args, Command};
+
+    #[test]
+    fn batch_load_command_and_manifest_require_explicit_file_coordinates() {
+        let args = Args::try_parse_from(["talon-client", "batch-load", "--manifest", "files.json"])
+            .unwrap();
+        assert!(matches!(args.command, Some(Command::BatchLoad { .. })));
+        assert!(Args::try_parse_from(["talon-client", "batch-load"]).is_err());
+        let entries: Vec<super::LoadEntry> = serde_json::from_str(r#"[{"path":"/s3/bucket/a","version":"v1","size":3},{"path":"/s3/bucket/b","version":"v2","size":0}]"#).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert!(serde_json::from_str::<Vec<super::LoadEntry>>(
+            r#"[{"path":"/s3/bucket/a","version":"v1"}]"#
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn load_command_requires_path_version_and_size_but_not_read_length() {
+        let args = Args::try_parse_from([
+            "talon-client",
+            "load",
+            "--coordinator",
+            "c:7000",
+            "--path",
+            "/s3/bucket/key",
+            "--version",
+            "etag",
+            "--size",
+            "17",
+        ])
+        .unwrap();
+        assert_eq!(args.coordinator, "c:7000");
+        assert!(matches!(args.command, Some(Command::Load { size: 17, .. })));
+        assert!(
+            Args::try_parse_from(["talon-client", "load", "--path", "/s3/bucket/key"]).is_err()
+        );
+        assert!(
+            Args::try_parse_from([
+                "talon-client",
+                "load",
+                "--path",
+                "/s3/bucket/key",
+                "--version",
+                "v1",
+            ])
+            .is_err(),
+            "size is required"
+        );
+        assert!(Args::try_parse_from([
+            "talon-client",
+            "--worker",
+            "w:7001",
+            "load",
+            "--path",
+            "/s3/bucket/key",
+            "--version",
+            "v1"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn direct_worker_mode_is_parsed_without_changing_default_coordinator() {

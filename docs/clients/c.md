@@ -116,7 +116,55 @@ talon_stat_async(client, "az://container/datasets/train.parquet",
                  on_stat, NULL, &request_id);
 ```
 
+## Prewarm
+
+```c
+static void on_load(talon_result *result, void *user_data) {
+    (void)user_data;
+    if (talon_result_status(result) == TALON_STATUS_OK) {
+        for (size_t i = 0; i < talon_result_load_count(result); ++i) {
+            const talon_load_result *file = talon_result_load(result, i);
+            /* file->size and file->blocks describe the completed input file. */
+            (void)file;
+        }
+    } else {
+        for (size_t i = 0; i < talon_result_load_failure_count(result); ++i) {
+            size_t input_index = talon_result_load_failure_index(result, i);
+            int uncertain = talon_result_load_failure_uncertain(result, i);
+            const char *error = talon_result_load_failure_error(result, i);
+            /* Retry the input file at input_index. uncertain=1 means no confirmed outcome. */
+            (void)input_index; (void)uncertain; (void)error;
+        }
+    }
+    talon_result_free(result);
+}
+
+talon_load_async(client, "s3://bucket/file", "etag-1", 4096,
+                 on_load, NULL, &request_id);
+talon_load_request files[] = {
+    {"s3://bucket/a", "etag-a", 4096},
+    {"s3://bucket/b", "etag-b", 8192}
+};
+talon_batch_load_async(client, files, 2, on_load, NULL, &request_id);
+```
+
+Both calls require a source version and size; neither issues HEAD. Batch LOAD
+uses protocol batches with up to 1024 block assignments per frame. The request
+array and strings are copied before submission returns. A successful submission
+delivers one callback through the configured callback executor; keep the client
+and `user_data` alive until it runs. File results follow input order, including
+empty files, and are borrowed until `talon_result_free`. A submitted batch failure
+keeps a non-OK overall status and exposes failed/unconfirmed files through
+`talon_result_load_failure_*`. Input indices are zero-based, unique, and sorted;
+omitted inputs completed successfully. Multiple failed blocks in one file yield
+one entry; duplicate input files keep separate indices. `uncertain=0` means a
+confirmed block failure, `1` means completion could not be confirmed (e.g. a lost
+reply). Empty files succeed locally. The diagnostic pointer is borrowed until
+`talon_result_free`. Validation errors before dispatch have no failure list.
+`talon_result_load_count` still returns zero on failure; completed cache fills
+remain subject to normal eviction. The `_with_options` variants
+accept the same tracing options as reads. Worker origin retries apply to both.
+
 ## Not yet available
 
-The C client exposes async `read` and async `stat` only. It does not yet expose
-`list`, writes, cancellation, batching, or request priorities.
+The C client does not yet expose `list`, writes, cancellation, or request priorities.

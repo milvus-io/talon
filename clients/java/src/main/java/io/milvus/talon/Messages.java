@@ -7,7 +7,7 @@ import java.util.List;
  * Bincode message encoding and decoding for the control plane and versioned
  * data-plane reads.
  *
- * <p>Only the read path is implemented. Variant tags are the Rust enum's
+ * <p>Read and prewarm requests are implemented. Variant tags are the Rust enum's
  * declaration order and are wire-visible: inserting a variant renumbers
  * everything after it, which is a breaking change requiring a schema bump.
  * The values here are asserted against the conformance vectors, so a Rust-side
@@ -31,6 +31,68 @@ final class Messages {
     static final int TAG_OBJECT_LIST = 11;
 
     static final int TAG_CONTROL_FAILURE = 18;
+    static final int TAG_LOAD_BLOCK = 19;
+    static final int TAG_BATCH_LOAD = 20;
+    static final int TAG_BATCH_LOAD_RESULT = 21;
+    static final int MAX_BATCH_LOAD_BLOCKS = 1024;
+    static final int MAX_LOAD_BODY_BYTES = (1 << 20) - 1026;
+    static final int BATCH_LOAD_OVERHEAD = 14;
+
+    record LoadBlock(BlockId block, long length) {}
+
+    record LoadBlockFailure(int index, String error) {}
+
+    static List<LoadBlockFailure> loadFailures(Response response, int count) {
+        int length = response.body.seqLen();
+        if (length > count) throw new ProtocolException("too many batch failures");
+        List<LoadBlockFailure> failures = new ArrayList<>(length);
+        long previous = -1;
+        for (int i = 0; i < length; i++) {
+            long index = response.body.u32();
+            String error = response.body.string();
+            if (index <= previous || index >= count || error.getBytes(java.nio.charset.StandardCharsets.UTF_8).length > 256) {
+                throw new ProtocolException("invalid batch failure entry");
+            }
+            failures.add(new LoadBlockFailure((int) index, error));
+            previous = index;
+        }
+        if (response.body.remaining() != 0) throw new ProtocolException("trailing batch failure bytes");
+        return failures;
+    }
+
+    static long loadBlockSize(LoadBlock request) {
+        BlockId b = request.block();
+        // Backend tag, three length-prefixed strings, offset, block size and length.
+        return 48L + b.object().bucket().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                + b.object().key().getBytes(java.nio.charset.StandardCharsets.UTF_8).length
+                + b.version().getBytes(java.nio.charset.StandardCharsets.UTF_8).length;
+    }
+
+    private static void writeLoadBlock(Bincode.Writer w, LoadBlock request) {
+        BlockId b = request.block();
+        writeObjectId(w, b.object());
+        w.u64(b.offset()).u32(b.blockSize()).string(b.version()).u64(request.length());
+    }
+
+    static byte[] loadBlock(int requestId, LoadBlock request) {
+        Bincode.Writer w = envelope(TAG_LOAD_BLOCK);
+        writeLoadBlock(w, request);
+        byte[] body = w.toBytes();
+        if (body.length > MAX_LOAD_BODY_BYTES) throw new IllegalArgumentException("load frame too large");
+        return framed(requestId, body);
+    }
+
+    static byte[] batchLoad(int requestId, List<LoadBlock> requests) {
+        if (requests.isEmpty() || requests.size() > MAX_BATCH_LOAD_BLOCKS) {
+            throw new IllegalArgumentException("batch load requires 1..1024 blocks");
+        }
+        long size = BATCH_LOAD_OVERHEAD;
+        for (LoadBlock request : requests) size += loadBlockSize(request);
+        if (size > MAX_LOAD_BODY_BYTES) throw new IllegalArgumentException("batch load frame too large");
+        Bincode.Writer w = envelope(TAG_BATCH_LOAD).u64(requests.size());
+        for (LoadBlock request : requests) writeLoadBlock(w, request);
+        return framed(requestId, w.toBytes());
+    }
 
     // Backend enum tags.
     static final int BACKEND_S3 = 0;

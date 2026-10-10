@@ -53,10 +53,13 @@
 mod client;
 mod error;
 
-pub use client::{parse_uri, Client, ClientBuilder, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS};
+pub use client::{
+    parse_uri, Client, ClientBuilder, LoadRequest, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
+};
 pub use error::{Error, ErrorKind, UriError};
 pub use talon_cache_client::{
-    BlockReadError, CacheReadError, CoordinatorError, ObjectStat, WorkerError,
+    BlockReadError, CacheReadError, CoordinatorError, LoadError, LoadFailure, LoadResult,
+    ObjectStat, WorkerError, WorkerLoadError,
 };
 pub use talon_core::{ObjectId, Version};
 pub use talon_transport::{DataErrorCode, DataPlaneError, ObjectEntry};

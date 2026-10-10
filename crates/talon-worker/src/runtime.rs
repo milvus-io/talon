@@ -5,6 +5,7 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod load;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;
@@ -93,6 +94,10 @@ pub struct WorkerRuntime {
     paged: Option<Arc<PagedBlockStore>>,
     index: Arc<BlockIndex>,
     inflight: Arc<InFlightLoads>,
+    /// Admitted LOAD RPCs across all clients and runtime clones.
+    load_slots: Arc<tokio::sync::Semaphore>,
+    /// Active block fills shared by single and batch LOAD RPCs.
+    load_block_slots: Arc<tokio::sync::Semaphore>,
     backend: Arc<dyn BackendStore>,
     /// Backend selected by the worker process. Optional only so unit-test
     /// runtimes that do not exercise backend routing retain their compact
@@ -193,6 +198,10 @@ impl WorkerRuntime {
             paged: None,
             index,
             inflight,
+            load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
+            load_block_slots: Arc::new(tokio::sync::Semaphore::new(
+                load::MAX_CONCURRENT_LOAD_BLOCKS,
+            )),
             backend,
             configured_backend: None,
             block_size,
@@ -846,7 +855,9 @@ impl WorkerRuntime {
         len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         if self.paged.is_some() {
-            return self.paged_block_range(request, block, offset, len).await;
+            return self
+                .paged_block_range(request, block, offset, len, None)
+                .await;
         }
         if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
             return Ok(bytes);
@@ -868,6 +879,7 @@ impl WorkerRuntime {
         block: &BlockId,
         offset: u64,
         len: u64,
+        known_block_len: Option<u64>,
     ) -> anyhow::Result<bytes::Bytes> {
         let page_size = self
             .paged_page_size()
@@ -882,7 +894,13 @@ impl WorkerRuntime {
             }
         }
 
-        let block_len = self.block_len(&request.object, block).await?;
+        // LOAD carries the exact block extent from its caller. Keep that hint
+        // request-local: publishing it as the object's current version would
+        // incorrectly affect unversioned reads and other blocks.
+        let block_len = match known_block_len {
+            Some(len) => len,
+            None => self.block_len(&request.object, block).await?,
+        };
         let len = available_range_len(block_len, offset, len)?;
         if len == 0 {
             return Ok(bytes::Bytes::new());

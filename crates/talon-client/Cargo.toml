@@ -15,11 +15,14 @@ path = "src/main.rs"
 talon-telemetry.workspace = true
 talon-core.workspace = true
 talon-transport.workspace = true
+talon-cache-client.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [features]
 telemetry = ["talon-telemetry/export"]

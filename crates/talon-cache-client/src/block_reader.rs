@@ -109,7 +109,9 @@ pub struct BlockReader {
     /// Settings template for isolated per-instance connection pools.
     worker_pool: Arc<ConnectionPool>,
     /// Logical membership and bounded instance discovery; expired instances fail closed.
-    membership: Arc<MembershipCache>,
+    pub(crate) membership: Arc<MembershipCache>,
+    /// Active LOAD RPCs shared by this reader and its clones.
+    pub(crate) load_slots: Arc<tokio::sync::Semaphore>,
     /// Serializes cold refreshes so an expired snapshot causes one control request.
     membership_refresh: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
     /// This reader's own deployment zone, for read classification (ADR 0006).
@@ -134,6 +136,7 @@ impl BlockReader {
             stats: ReadStats::new(),
             worker_pool: Arc::new(ConnectionPool::new()),
             membership,
+            load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             membership_refresh: Arc::new(tokio::sync::Mutex::new(None)),
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
@@ -567,7 +570,7 @@ impl BlockReader {
         self.zone_observer.worker_read(matched, bytes);
     }
 
-    async fn membership_snapshot(&self) -> Result<MembershipSnapshot, BlockReadError> {
+    pub(crate) async fn membership_snapshot(&self) -> Result<MembershipSnapshot, BlockReadError> {
         if let Some(snapshot) = self.membership.fresh() {
             return Ok(snapshot);
         }

@@ -123,6 +123,8 @@ public final class ConformanceTest {
         versionedRangeEncodesIdentically(byName);
         errorResponseIsFlaggedAndCarriesAMessage(byName);
         connectionPooling();
+        loadBindings(byName);
+        loadDeadlines();
 
         System.out.println();
         if (failures.isEmpty()) {
@@ -135,6 +137,272 @@ public final class ConformanceTest {
     }
 
     // --- the checks --------------------------------------------------------
+
+    private static void loadBindings(Map<String, byte[]> vectors) {
+        check("LOAD encodings match Rust vectors", () -> {
+            assertBytes(vectors.get("control.load_block"), Messages.loadBlock(7,
+                    new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "path/to/object"), 16, 8, "v1"), 1)));
+            assertBytes(vectors.get("control.batch_load"), Messages.batchLoad(8, List.of(
+                    new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "a"), 0, 8, "v1"), 8),
+                    new Messages.LoadBlock(new BlockId(new ObjectId(ObjectId.Backend.AZURE, "container", "b"), 8, 8, "v2"), 3))));
+        });
+        check("batch failures decode Rust vector and reject malformed indices", () -> {
+            byte[] vector = vectors.get("control.batch_load_result");
+            Messages.Response reply = Messages.decodeBody(java.util.Arrays.copyOfRange(vector, Frame.HEADER_LEN, vector.length));
+            assertEquals(List.of(new Messages.LoadBlockFailure(1, "origin unavailable")), Messages.loadFailures(reply, 2), "Rust failure vector");
+            for (int[] indices : List.of(new int[]{2}, new int[]{0, 0}, new int[]{1, 0})) {
+                Bincode.Writer body = new Bincode.Writer().u16(6).variant(Messages.TAG_BATCH_LOAD_RESULT).u64(indices.length);
+                for (int index : indices) body.u32(index).string("error");
+                boolean rejected = false;
+                try { Messages.loadFailures(Messages.decodeBody(body.toBytes()), 2); }
+                catch (ProtocolException expected) { rejected = true; }
+                assertTrue(rejected, "invalid failure indices rejected");
+            }
+        });
+        check("partial batch failure list deduplicates files across frames", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                List<LoadRequest> requests = List.of(
+                    new LoadRequest("s3://bucket/good", "v1", 8),
+                    new LoadRequest("s3://bucket/bad", "v1", 1025 * 8),
+                    new LoadRequest("s3://bucket/bad", "v2", 0),
+                    new LoadRequest("s3://bucket/bad", "v2", 8),
+                    new LoadRequest("s3://bucket/good", "v1", 8));
+                boolean failed = false;
+                try { client.batchLoad(requests); }
+                catch (BatchLoadException error) {
+                    assertEquals(List.of(new LoadFailure(1, false, "origin failure"), new LoadFailure(3, false, "origin failure")), error.failedFiles(), "failed input files");
+                    failed = true;
+                }
+                assertTrue(failed, "batch reported partial failure");
+                assertEquals(1028, peer.loaded.size(), "continues after failed frame");
+                assertEquals(List.of(1024, 4), peer.loadCounts, "still protocol batching");
+            }
+        });
+        check("LOAD and batch LOAD preserve sizes, versions and protocol batching", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                assertEquals(new LoadResult(9, 2), client.load("s3://bucket/file", "v1", 9), "single result");
+                List<LoadRequest> requests = new ArrayList<>();
+                for (int i = 0; i < 1025; i++) requests.add(new LoadRequest("s3://bucket/file-" + i, "v2", 3));
+                requests.add(new LoadRequest("s3://bucket/empty", "v3", 0));
+                List<LoadResult> results = client.batchLoad(requests);
+                assertEquals(1026, results.size(), "result count");
+                assertEquals(new LoadResult(0, 0), results.get(1025), "empty file result");
+                assertTrue(results.subList(0, 1025).stream().allMatch(r -> r.equals(new LoadResult(3, 1))), "ordered results");
+                assertEquals(List.of(0, 0, 1024, 1), peer.loadCounts, "two single frames then two batch frames");
+                assertEquals(List.of(8L, 1L), peer.loaded.subList(0, 2).stream().map(Messages.LoadBlock::length).toList(), "short tail");
+                assertTrue(peer.loaded.subList(2, 1027).stream().allMatch(b -> b.block().version().equals("v2") && b.length() == 3), "version and size preserved");
+                assertEquals(0, peer.statCalls.get(), "no HEAD/stat");
+            }
+        });
+        check("batch LOAD splits by encoded bytes", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                client.batchLoad(List.of(new LoadRequest("s3://bucket/" + "x".repeat(600_000), "v1", 16)));
+                assertEquals(List.of(1, 1), peer.loadCounts, "frame byte limit");
+            }
+        });
+        check("empty LOAD is local and invalid input is rejected", () -> {
+            try (TalonClient client = TalonClient.connect("127.0.0.1:1", 8)) {
+                assertEquals(List.of(), client.batchLoad(List.of()), "empty batch");
+                assertEquals(new LoadResult(0, 0), client.load("s3://bucket/empty", "v1", 0), "empty object");
+                boolean rejected = false;
+                try { client.load("s3://bucket/file", "v1", Long.MAX_VALUE); }
+                catch (IllegalArgumentException expected) { rejected = true; }
+                assertTrue(rejected, "overflow before network I/O");
+            }
+        });
+        check("LOAD refusals and malformed acknowledgements are not retried", () -> {
+            for (boolean malformed : List.of(false, true)) {
+                try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    client.load("s3://bucket/file", "v1", 1); // Prime a reused socket.
+                    peer.rejectLoad = !malformed;
+                    peer.wrongLoadRequestId = malformed;
+                    boolean failed = false;
+                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
+                    catch (BatchLoadException error) {
+                        assertEquals(1, error.failedFiles().size(), "one unknown file");
+                        assertTrue(error.failedFiles().get(0).uncertain(), "legacy refusal or malformed reply is unconfirmed");
+                        assertEquals(malformed, error.getCause() instanceof ProtocolException, "cause preserved");
+                        failed = true;
+                    }
+                    assertTrue(failed, "failure propagated");
+                    assertEquals(List.of(0, 1), peer.loadCounts, "no refusal replay");
+                }
+            }
+        });
+        check("LOAD refuses offline and conflicting owners", () -> {
+            for (int state : List.of(0, 1)) {
+                try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    peer.workerState = state;
+                    boolean failed = false;
+                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
+                    catch (BatchLoadException error) {
+                        assertEquals(TalonException.Code.UNAVAILABLE, ((TalonException) error.getCause()).code(), "availability");
+                        assertEquals(0, error.failedFiles().get(0).index(), "unknown input");
+                        assertTrue(error.failedFiles().get(0).uncertain(), "offline completion unknown");
+                        failed = true;
+                    }
+                    assertTrue(failed, "unavailable owner rejected");
+                    assertTrue(peer.loadCounts.isEmpty(), "no LOAD dispatch");
+                }
+            }
+        });
+    }
+
+    private static void loadDeadlines() {
+        check("LOAD exchange deadline interrupts a blocked socket write", () -> {
+            try (ServerSocket listener = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+                listener.setReceiveBufferSize(1024);
+                ExecutorService peer = Executors.newSingleThreadExecutor();
+                Future<Socket> accepted = peer.submit(listener::accept);
+                try {
+                    Class<?> poolType = Class.forName("io.milvus.talon.TalonClient$ConnectionPool");
+                    java.lang.reflect.Constructor<?> constructor = poolType.getDeclaredConstructor(int.class);
+                    constructor.setAccessible(true);
+                    Object pool = constructor.newInstance(1);
+                    Class<?> function = Class.forName("io.milvus.talon.TalonClient$IoFunction");
+                    AtomicInteger writesCompleted = new AtomicInteger();
+                    Object write = java.lang.reflect.Proxy.newProxyInstance(function.getClassLoader(), new Class<?>[]{function}, (proxy, method, args) -> {
+                        Socket socket = (Socket) args[0];
+                        socket.setSendBufferSize(1024);
+                        socket.getOutputStream().write(new byte[1 << 20]);
+                        writesCompleted.incrementAndGet();
+                        return null;
+                    });
+                    java.lang.reflect.Method exchange = poolType.getDeclaredMethod("exchange", String.class, Long.class, Long.class, function);
+                    exchange.setAccessible(true);
+                    long start = System.nanoTime();
+                    try {
+                        invoke(exchange, pool, "127.0.0.1:" + listener.getLocalPort(), null,
+                                start + TimeUnit.MILLISECONDS.toNanos(300), write);
+                        throw new AssertionError("write was not interrupted");
+                    } catch (TalonException expected) {
+                        assertEquals(TalonException.Code.TIMEOUT, expected.code(), "write timeout classification");
+                    }
+                    assertEquals(0, writesCompleted.get(), "deadline interrupted write, not a later read");
+                    assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(1), "write deadline bounded");
+                } finally {
+                    try { accepted.get(5, TimeUnit.SECONDS).close(); }
+                    finally { peer.shutdownNow(); }
+                }
+            }
+        });
+        check("LOAD deadline bounds fragmented headers and bodies", () -> {
+            for (boolean batch : List.of(false, true)) {
+                for (boolean header : List.of(false, true)) {
+                    try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                        client.load("s3://bucket/file", "v1", 1);
+                        peer.slowLoadHeader = header;
+                        peer.loadByteDelayMs = 100;
+                        long start = System.nanoTime();
+                        try {
+                            sendLoadWithDeadline(client, batch, start + TimeUnit.MILLISECONDS.toNanos(500));
+                            throw new AssertionError("late LOAD reply accepted");
+                        } catch (TalonException expected) {
+                            assertEquals(TalonException.Code.TIMEOUT, expected.code(), "absolute deadline classification");
+                        }
+                        assertTrue(System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(900), "deadline must not reset for each byte");
+                        assertEquals(2, peer.loadCounts.size(), "timeout never retries the request");
+                        peer.loadByteDelayMs = 0;
+                        assertEquals(new LoadResult(1, 1), client.load("s3://bucket/file", "v1", 1), "capacity released and a healthy connection used");
+                    }
+                }
+            }
+        });
+        check("batch timeout preserves completed and empty files", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                peer.slowLoadAfter = 1;
+                peer.loadByteDelayMs = 100;
+                List<LoadRequest> files = new ArrayList<>();
+                for (int i = 0; i < 1025; i++) files.add(new LoadRequest("s3://bucket/file-" + i, "v1", 1));
+                files.add(new LoadRequest("s3://bucket/empty", "v1", 0));
+                try {
+                    loadWithDeadline(client, files, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(500));
+                    throw new AssertionError("late batch reply accepted");
+                } catch (BatchLoadException expected) {
+                    assertEquals(TalonException.Code.TIMEOUT, ((TalonException) expected.getCause()).code(), "timeout cause");
+                    assertEquals(1, expected.failedFiles().size(), "only unfinished file fails");
+                    assertEquals(1024, expected.failedFiles().get(0).index(), "completed frame preserved");
+                    assertTrue(expected.failedFiles().get(0).uncertain(), "late reply remains unconfirmed");
+                }
+            }
+        });
+        check("LOAD overall deadline also bounds discovery and refresh lock waits", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                peer.discoveryArrived = new CountDownLatch(1);
+                peer.discoveryRelease = new CountDownLatch(1);
+                ExecutorService caller = Executors.newSingleThreadExecutor();
+                try {
+                    Future<?> first = caller.submit(() -> {
+                        try { client.load("s3://bucket/file", "v1", 1); }
+                        catch (IOException expected) { /* Discovery may expire while gated. */ }
+                    });
+                    assertTrue(peer.discoveryArrived.await(5, TimeUnit.SECONDS), "discovery owns refresh lock");
+                    expectBatchTimeout(client, 200);
+                    peer.discoveryRelease.countDown();
+                    first.get(5, TimeUnit.SECONDS);
+                } finally {
+                    peer.discoveryRelease.countDown();
+                    caller.shutdownNow();
+                }
+            }
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                peer.discoveryRelease = new CountDownLatch(1);
+                expectBatchTimeout(client, 200);
+                assertTrue(peer.loadCounts.isEmpty(), "expired discovery must not dispatch LOAD");
+            }
+        });
+        check("completed LOAD cancels its timer before connection reuse", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                client.load("s3://bucket/file", "v1", 1);
+                sendLoadWithDeadline(client, true, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200));
+                int connections = peer.accepts.get();
+                peer.loadByteDelayMs = 30;
+                sendLoadWithDeadline(client, true, System.nanoTime() + TimeUnit.SECONDS.toNanos(2));
+                assertEquals(connections, peer.accepts.get(), "old timer did not close or retry reused connection");
+            }
+        });
+    }
+
+    private static void expectBatchTimeout(TalonClient client, long millis) throws Exception {
+        long start = System.nanoTime();
+        try {
+            loadWithDeadline(client, List.of(new LoadRequest("s3://bucket/file", "v1", 1)),
+                    start + TimeUnit.MILLISECONDS.toNanos(millis));
+            throw new AssertionError("deadline was not enforced");
+        } catch (BatchLoadException expected) {
+            assertEquals(TalonException.Code.TIMEOUT, ((TalonException) expected.getCause()).code(), "discovery timeout cause");
+            assertTrue(expected.failedFiles().get(0).uncertain(), "undispatched file is unconfirmed");
+        }
+        assertTrue(System.nanoTime() - start < TimeUnit.SECONDS.toNanos(1), "overall deadline bounded discovery");
+    }
+
+    // Inject short absolute deadlines into the real LOAD paths; production budgets stay unchanged.
+    private static void sendLoadWithDeadline(TalonClient client, boolean batch, long deadline) throws Exception {
+        java.lang.reflect.Method membership = TalonClient.class.getDeclaredMethod("membership");
+        membership.setAccessible(true);
+        Object snapshot = invoke(membership, client);
+        java.lang.reflect.Method placement = snapshot.getClass().getDeclaredMethod("placement");
+        placement.setAccessible(true);
+        java.lang.reflect.Method send = TalonClient.class.getDeclaredMethod("sendLoad", Placement.Table.class, List.class, boolean.class, long.class);
+        send.setAccessible(true);
+        invoke(send, client, invoke(placement, snapshot), List.of(new Messages.LoadBlock(
+                new BlockId(ObjectId.parse("s3://bucket/file"), 0, 8, "v1"), 1)), batch, deadline);
+    }
+
+    private static void loadWithDeadline(TalonClient client, List<LoadRequest> files, long deadline) throws Exception {
+        java.lang.reflect.Method load = TalonClient.class.getDeclaredMethod("loadFiles", List.class, boolean.class, long.class);
+        load.setAccessible(true);
+        invoke(load, client, files, true, deadline);
+    }
+
+    private static Object invoke(java.lang.reflect.Method method, Object target, Object... args) throws Exception {
+        try { return method.invoke(target, args); }
+        catch (java.lang.reflect.InvocationTargetException failure) {
+            if (failure.getCause() instanceof Exception cause) throw cause;
+            if (failure.getCause() instanceof Error cause) throw cause;
+            throw failure;
+        }
+    }
 
     private static void localPlacementMatchesRust() {
         check("client-side Maglev ranking matches Rust", () -> {
@@ -408,6 +676,17 @@ public final class ConformanceTest {
         volatile CountDownLatch arrived = new CountDownLatch(0);
         volatile CountDownLatch release = new CountDownLatch(0);
         volatile boolean malformedStat;
+        volatile boolean rejectLoad;
+        volatile boolean wrongLoadRequestId;
+        volatile boolean slowLoadHeader;
+        volatile int loadByteDelayMs;
+        volatile int slowLoadAfter;
+        volatile CountDownLatch discoveryArrived = new CountDownLatch(0);
+        volatile CountDownLatch discoveryRelease = new CountDownLatch(0);
+        volatile int workerState = 2;
+        final AtomicInteger statCalls = new AtomicInteger();
+        final List<Integer> loadCounts = java.util.Collections.synchronizedList(new ArrayList<>());
+        final List<Messages.LoadBlock> loaded = java.util.Collections.synchronizedList(new ArrayList<>());
 
         PoolPeer() throws IOException {
             threads.submit(() -> {
@@ -428,6 +707,18 @@ public final class ConformanceTest {
             return "localhost:" + listener.getLocalPort();
         }
 
+        private void writeReplyPart(Socket socket, byte[] bytes, int delay) throws IOException, InterruptedException {
+            if (delay == 0) {
+                socket.getOutputStream().write(bytes);
+            } else {
+                for (byte value : bytes) {
+                    Thread.sleep(delay);
+                    socket.getOutputStream().write(value);
+                    socket.getOutputStream().flush();
+                }
+            }
+        }
+
         void serve(Socket socket) {
             try (socket) {
                 DataInputStream in = new DataInputStream(socket.getInputStream());
@@ -438,6 +729,7 @@ public final class ConformanceTest {
                     byte[] body = new byte[request.length()];
                     in.readFully(body);
                     byte[] response;
+                    int byteDelay = 0;
                     if (request.type() == Frame.MsgType.GET_VERSIONED_RANGE) {
                         arrived.countDown();
                         if (!release.await(5, TimeUnit.SECONDS)) {
@@ -445,20 +737,44 @@ public final class ConformanceTest {
                         }
                         response = new byte[] {42};
                     } else if (Messages.decodeBody(body).tag == Messages.TAG_MEMBERSHIP_QUERY) {
-                        response = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
+                        discoveryArrived.countDown();
+                        if (!discoveryRelease.await(5, TimeUnit.SECONDS)) throw new IOException("discovery gate timed out");
+                        Bincode.Writer discovery = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
                                 .u64(1).u64(1).u64(500).u64(1).string("worker").u8(0).u8(0)
-                                .variant(2).string("test-instance").string(address())
-                                .toBytes();
+                                .variant(workerState);
+                        if (workerState == 2) discovery.string("test-instance").string(address());
+                        response = discovery.toBytes();
+                    } else if (Messages.decodeBody(body).tag == Messages.TAG_LOAD_BLOCK
+                            || Messages.decodeBody(body).tag == Messages.TAG_BATCH_LOAD) {
+                        Messages.Response message = Messages.decodeBody(body);
+                        int count = message.tag == Messages.TAG_BATCH_LOAD ? message.body.seqLen() : 1;
+                        loadCounts.add(message.tag == Messages.TAG_BATCH_LOAD ? count : 0);
+                        if (loadCounts.size() > slowLoadAfter) byteDelay = loadByteDelayMs;
+                        List<Integer> failures = new ArrayList<>();
+                        for (int i = 0; i < count; i++) {
+                            ObjectId object = new ObjectId(Messages.backendFrom(message.body.variant()), message.body.string(), message.body.string());
+                            BlockId block = new BlockId(object, message.body.u64(), (int) message.body.u32(), message.body.string());
+                            loaded.add(new Messages.LoadBlock(block, message.body.u64()));
+                            if (object.key().equals("bad")) failures.add(i);
+                        }
+                        Bincode.Writer ack = new Bincode.Writer().u16(6).variant(Messages.TAG_ACK).u8(rejectLoad ? 0 : 1).u8(rejectLoad ? 1 : 0);
+                        if (rejectLoad) ack.string("origin unavailable");
+                        if (message.tag == Messages.TAG_BATCH_LOAD && !rejectLoad) {
+                            ack = new Bincode.Writer().u16(6).variant(Messages.TAG_BATCH_LOAD_RESULT).u64(failures.size());
+                            for (int index : failures) ack.u32(index).string("origin failure");
+                        }
+                        response = ack.toBytes();
                     } else {
+                        statCalls.incrementAndGet();
                         Bincode.Writer w = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_OBJECT_STAT);
                         if (!malformedStat) {
                             w.u64(1).string("v1");
                         }
                         response = w.toBytes();
                     }
-                    socket.getOutputStream().write(new Frame(request.type(), 0,
-                            request.requestId(), response.length).encode());
-                    socket.getOutputStream().write(response);
+                    writeReplyPart(socket, new Frame(request.type(), 0,
+                            request.requestId() + (wrongLoadRequestId ? 1 : 0), response.length).encode(), slowLoadHeader ? byteDelay : 0);
+                    writeReplyPart(socket, response, slowLoadHeader ? 0 : byteDelay);
                     socket.getOutputStream().flush();
                 }
             } catch (IOException expectedOnClose) {

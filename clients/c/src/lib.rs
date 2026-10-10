@@ -87,6 +87,11 @@ const STATUS_TIMEOUT: c_int = 6;
 
 const OPERATION_READ: c_int = 1;
 const OPERATION_STAT: c_int = 2;
+const OPERATION_LOAD: c_int = 3;
+const OPERATION_BATCH_LOAD: c_int = 4;
+
+mod load;
+pub use load::*;
 
 type TalonCallback = unsafe extern "C" fn(*mut TalonResult, *mut c_void);
 type TalonTaskFn = unsafe extern "C" fn(*mut c_void);
@@ -144,6 +149,8 @@ pub struct TalonResult {
     object_size: u64,
     version: Option<CString>,
     error: Option<CString>,
+    loads: Vec<TalonLoadResult>,
+    load_failures: Vec<(talon_rust_client::LoadFailure, CString)>,
 }
 
 struct ReadBuffer {
@@ -647,6 +654,8 @@ impl TalonResult {
                 object_size: 0,
                 version: None,
                 error: None,
+                loads: Vec::new(),
+                load_failures: Vec::new(),
             },
             Err(error) => Self::operation_error(OPERATION_READ, request_id, error),
         }
@@ -662,15 +671,26 @@ impl TalonResult {
                 object_size: stat.size,
                 version: Some(cstring_lossy(stat.version)),
                 error: None,
+                loads: Vec::new(),
+                load_failures: Vec::new(),
             },
             Err(error) => Self::operation_error(OPERATION_STAT, request_id, error),
         }
     }
 
     fn operation_error(operation: c_int, request_id: u64, error: RustError) -> Self {
+        Self::classified_error(operation, request_id, error.kind(), error.to_string())
+    }
+
+    fn classified_error(
+        operation: c_int,
+        request_id: u64,
+        kind: talon_rust_client::ErrorKind,
+        message: String,
+    ) -> Self {
         Self {
             operation,
-            status: match error.kind() {
+            status: match kind {
                 talon_rust_client::ErrorKind::Unavailable => STATUS_UNAVAILABLE,
                 talon_rust_client::ErrorKind::Timeout => STATUS_TIMEOUT,
                 _ => STATUS_OPERATION_ERROR,
@@ -679,7 +699,9 @@ impl TalonResult {
             bytes_written: 0,
             object_size: 0,
             version: None,
-            error: Some(cstring_lossy(error.to_string())),
+            error: Some(cstring_lossy(message)),
+            loads: Vec::new(),
+            load_failures: Vec::new(),
         }
     }
 }
@@ -805,6 +827,8 @@ mod tests {
         object_size: u64,
         version: Option<String>,
         error: Option<String>,
+        loads: Vec<(u64, u64)>,
+        load_failures: Vec<(usize, c_int, String)>,
     }
 
     impl CallbackState {
@@ -858,6 +882,23 @@ mod tests {
             )
         };
         let snapshot = CallbackSnapshot {
+            load_failures: (0..unsafe { talon_result_load_failure_count(result) })
+                .map(|index| unsafe {
+                    (
+                        talon_result_load_failure_index(result, index),
+                        talon_result_load_failure_uncertain(result, index),
+                        CStr::from_ptr(talon_result_load_failure_error(result, index))
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
+                })
+                .collect(),
+            loads: (0..unsafe { talon_result_load_count(result) })
+                .map(|index| {
+                    let entry = unsafe { &*talon_result_load(result, index) };
+                    (entry.size, entry.blocks)
+                })
+                .collect(),
             operation: unsafe { talon_result_operation(result) },
             status: unsafe { talon_result_status(result) },
             request_id: unsafe { talon_result_request_id(result) },
@@ -922,6 +963,238 @@ mod tests {
             }
         });
         addr
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn load_bindings_copy_inputs_and_send_protocol_batches() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let batches = Arc::new(Mutex::new(Vec::new()));
+        let observed = batches.clone();
+        let stats = Arc::new(AtomicUsize::new(0));
+        let coordinator =
+            mock_coordinator_counting(listener.local_addr().unwrap().to_string(), stats.clone())
+                .await;
+        let worker = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let observed = observed.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut header = [0; HEADER_LEN];
+                        if socket.read_exact(&mut header).await.is_err() {
+                            break;
+                        }
+                        let parsed = FrameHeader::decode(&header).unwrap();
+                        let mut frame = header.to_vec();
+                        frame.resize(HEADER_LEN + parsed.length as usize, 0);
+                        socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
+                        let (_, message) = talon_transport::decode(&frame).unwrap();
+                        let batch = matches!(message, ControlMessage::BatchLoad { .. });
+                        let requests = match message {
+                            ControlMessage::LoadBlock { block, len } => {
+                                observed.lock().unwrap().push(0);
+                                vec![talon_transport::LoadBlockRequest { block, len }]
+                            }
+                            ControlMessage::BatchLoad { blocks } => {
+                                observed.lock().unwrap().push(blocks.len());
+                                blocks
+                            }
+                            other => panic!("unexpected request {other:?}"),
+                        };
+                        assert!(requests.iter().all(|r| r.block.version.as_str() == "v1"));
+                        let reply = if batch {
+                            ControlMessage::BatchLoadResult {
+                                failures: requests
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(_, r)| r.block.object.object_path == "bad")
+                                    .map(|(index, _)| {
+                                        talon_transport::LoadBlockFailure::new(
+                                            index as u32,
+                                            "origin failure".into(),
+                                        )
+                                    })
+                                    .collect(),
+                            }
+                        } else {
+                            ControlMessage::Ack {
+                                ok: true,
+                                detail: None,
+                            }
+                        };
+                        socket
+                            .write_all(&talon_transport::encode(parsed.request_id, &reply).unwrap())
+                            .await
+                            .unwrap();
+                    }
+                });
+            }
+        });
+        let mut client = ptr::null_mut();
+        let options = TalonClientOptions {
+            block_size: 8,
+            callback_executor: ptr::null(),
+            max_idle_per_addr: 8,
+        };
+        assert_eq!(
+            unsafe { talon_client_new(cstring(&coordinator).as_ptr(), &options, &mut client) },
+            STATUS_OK
+        );
+        let state = CallbackState::new();
+        let mut id = 0;
+        // These strings and the request array go out of scope immediately after
+        // submission. Callback results own their storage until explicitly freed.
+        {
+            let uri = cstring("s3://bucket/file");
+            let version = cstring("v1");
+            let requests = (0..1025)
+                .map(|_| TalonLoadRequest {
+                    uri: uri.as_ptr(),
+                    version: version.as_ptr(),
+                    size: 3,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                unsafe {
+                    talon_batch_load_async(
+                        client,
+                        requests.as_ptr(),
+                        requests.len(),
+                        Some(capture_callback),
+                        state.user_data(),
+                        &mut id,
+                    )
+                },
+                STATUS_OK
+            );
+        }
+        let result = state.wait();
+        assert_eq!(result.operation, OPERATION_BATCH_LOAD);
+        assert_eq!(result.status, STATUS_OK);
+        assert_eq!(result.loads, vec![(3, 1); 1025]);
+        assert_eq!(result.request_id, id);
+        assert_eq!(
+            unsafe {
+                talon_load_async(
+                    client,
+                    cstring("s3://bucket/file").as_ptr(),
+                    cstring("v1").as_ptr(),
+                    9,
+                    Some(capture_callback),
+                    state.user_data(),
+                    &mut id,
+                )
+            },
+            STATUS_OK
+        );
+        let result = state.wait();
+        assert_eq!(result.operation, OPERATION_LOAD);
+        assert_eq!(result.loads, [(9, 2)]);
+        let mut sizes = batches.lock().unwrap().clone();
+        sizes.sort_unstable();
+        assert_eq!(sizes, [0, 0, 1, 1024]);
+        assert_eq!(stats.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            unsafe {
+                talon_batch_load_async(
+                    client,
+                    ptr::null(),
+                    0,
+                    Some(capture_callback),
+                    state.user_data(),
+                    &mut id,
+                )
+            },
+            STATUS_OK
+        );
+        assert!(state.wait().loads.is_empty());
+        assert_eq!(
+            unsafe {
+                talon_batch_load_async(
+                    client,
+                    ptr::null(),
+                    1,
+                    Some(capture_callback),
+                    ptr::null_mut(),
+                    &mut id,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        assert_eq!(
+            unsafe {
+                talon_load_async(
+                    client,
+                    cstring("s3://bucket/file").as_ptr(),
+                    ptr::null(),
+                    1,
+                    Some(capture_callback),
+                    ptr::null_mut(),
+                    &mut id,
+                )
+            },
+            STATUS_INVALID_ARGUMENT
+        );
+        let good = cstring("s3://bucket/good");
+        let bad = cstring("s3://bucket/bad");
+        let version = cstring("v1");
+        let files = [
+            TalonLoadRequest {
+                uri: good.as_ptr(),
+                version: version.as_ptr(),
+                size: 8,
+            },
+            TalonLoadRequest {
+                uri: bad.as_ptr(),
+                version: version.as_ptr(),
+                size: 1025 * 8,
+            },
+            TalonLoadRequest {
+                uri: bad.as_ptr(),
+                version: version.as_ptr(),
+                size: 0,
+            },
+            TalonLoadRequest {
+                uri: bad.as_ptr(),
+                version: version.as_ptr(),
+                size: 8,
+            },
+        ];
+        assert_eq!(
+            unsafe {
+                talon_batch_load_async(
+                    client,
+                    files.as_ptr(),
+                    files.len(),
+                    Some(capture_callback),
+                    state.user_data(),
+                    &mut id,
+                )
+            },
+            STATUS_OK
+        );
+        let result = state.wait();
+        assert_eq!(result.status, STATUS_OPERATION_ERROR);
+        assert!(result.loads.is_empty());
+        assert_eq!(
+            result.load_failures,
+            [
+                (1, 0, "origin failure".into()),
+                (3, 0, "origin failure".into())
+            ]
+        );
+        assert_eq!(
+            unsafe { talon_result_load_failure_index(ptr::null(), 0) },
+            usize::MAX
+        );
+        assert_eq!(
+            unsafe { talon_result_load_failure_uncertain(ptr::null(), 0) },
+            -1
+        );
+        unsafe {
+            talon_client_free(client);
+        }
+        worker.abort();
     }
 
     async fn mock_coordinator(worker_addr: String) -> String {

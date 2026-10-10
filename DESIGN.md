@@ -257,11 +257,28 @@ isolating it to loader threads keeps the data-plane ring responsive.
 
 ### LOAD (prewarm) path
 
-Master-initiated, similar to miss but not a client data-plane transfer: master
-lists blobs on a background thread, splits into blocks, assigns a primary worker
-via jump hash, and sends `LoadBlobs`. Workers' loader threads download the ranges
-and commit into cache. Workers pull from the backend themselves; no
-client→worker zero-copy involved.
+Clients supply an object, source version, and size; no HEAD or separate version
+validation request is needed. The client splits the object into blocks using
+the read path's persistent Maglev placement and sends `LoadBlock` directly to
+each primary worker. The coordinator provides ordinary membership discovery;
+it does not schedule LOAD. Expired instance discovery must be refreshed before
+dispatch, and unavailable owners are not replaced by other workers.
+
+`BatchLoad` groups assignments across files by worker, carrying up to 1024 block
+instructions per frame within the control-frame byte limit. Workers share a
+limit of eight active block loads across single and batch requests and fill the
+configured whole-block or paged cache using the supplied version. The existing
+origin HTTP retry policy handles transient failures, including S3 throttling,
+while retaining the block's concurrency permit during backoff.
+
+One `BatchLoadResult` follows completion of all assignments. Workers continue
+after individual failures and return their request indices with bounded error
+diagnostics. Clients aggregate these into a unique list of failed input files;
+missing replies or unfinished dispatch are marked as unconfirmed. Successful
+files are omitted from this list, including empty inputs. Completed fills remain
+cached subject to normal eviction; LOAD is not atomic and does not pin residency.
+Workers pull from the backend themselves; no payload returns to the client. See
+the [wire contract](docs/reference/wire-protocol.md) for limits and failure semantics.
 
 ### Why not one mechanism for all data movement
 
@@ -384,7 +401,7 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
     *As implemented:* a worker is either whole-block or paged for every block it
     caches, selected by `l2_page_size_bytes` (`0` = whole). `LoadHint` exists in
     `talon-core` and the coordinator's load plan, but it is not carried on the
-    `Load` control message and no worker reads it. Dynamic promotion (paged →
+    `LoadBlock` or `BatchLoad` control message and no worker reads it. Dynamic promotion (paged →
     whole on detected sequential scan) is likewise deferred.
   - **Page-level miss / in-flight / eviction:** for paged blocks, miss handling,
     `demand_loads_in_flight` tracking, and LRU accounting all descend to

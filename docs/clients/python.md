@@ -109,3 +109,38 @@ URIs raise `ValueError` before any I/O happens.
 `list` is implemented but returns an error until the backends gain a listing
 capability ([#332](https://github.com/milvus-io/talon/issues/332)). Writes go
 through the FUSE mount or the Rust client.
+
+## Prewarm
+
+```python
+result = client.load("s3://bucket/file", version="etag-1", size=4096)
+print(result.size, result.blocks)
+results = client.batch_load([
+    talon.LoadRequest("s3://bucket/a", "etag-a", 4096),
+    talon.LoadRequest("s3://bucket/b", "etag-b", 8192),
+])
+```
+
+Both methods release the GIL while waiting. The supplied version and size are
+required, and no HEAD is issued. `batch_load` sends up to 1024 block instructions
+per protocol frame and returns `LoadResult` objects in input order. Empty input
+succeeds without network I/O. Errors may leave completed fills cached; neither
+method pins cache residency. Transient S3 failures are retried by the worker.
+Both methods accept the optional `trace_context` keyword used by `read`.
+Invalid coordinates raise `ValueError`; availability and deadline failures use
+`UnavailableError` and `TimeoutError`. Worker refusals raise `OSError`.
+
+On a submitted batch failure, catch `talon.BatchLoadError` and inspect
+`error.failed_files`: each `LoadFailure` has `index` (zero-based input index),
+`uncertain`, and `error` (diagnostic). Entries are unique and ordered; omitted
+inputs completed successfully. A confirmed failed block sets `uncertain=False`;
+a missing outcome sets it to `True`. Empty files are successful and duplicate
+inputs retain separate indices. Other files continue after individual failures.
+Invalid arguments rejected before dispatch still raise `ValueError`.
+
+```python
+try:
+    client.batch_load(requests)
+except talon.BatchLoadError as error:
+    retry_requests = [requests[f.index] for f in error.failed_files]
+```

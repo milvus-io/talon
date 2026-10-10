@@ -102,3 +102,43 @@ this implements.
 `list` is implemented but returns an error until the backends gain a listing
 capability ([#332](https://github.com/milvus-io/talon/issues/332)). Writes go
 through the FUSE mount or the Rust client.
+
+## Prewarm
+
+```java
+LoadResult result = client.load("s3://bucket/file", "etag-1", 4096);
+List<LoadResult> results = client.batchLoad(List.of(
+    new LoadRequest("s3://bucket/a", "etag-a", 4096),
+    new LoadRequest("s3://bucket/b", "etag-b", 8192)));
+```
+
+`LoadRequest` accepts either a URI or `ObjectId`. Supply the exact source version
+and its size; no HEAD is issued. Batch LOAD groups blocks by worker and sends up
+to 1024 instructions per frame, splitting earlier for the control-frame byte
+limit. Results follow input order, including empty files. Calls block until
+completion; concurrent calls on a client share eight LOAD RPC permits. Workers
+load blocks concurrently and retry transient origin failures. A failure may
+leave completed cache fills; successful completion does not pin residency.
+
+`load(LoadRequest, RequestOptions)` and `batchLoad(List<LoadRequest>, RequestOptions)`
+accept explicit tracing options. Expired instance discovery must refresh before
+dispatch; offline or conflicting owners produce `TalonException(UNAVAILABLE)` for single
+loads, or an unconfirmed file entry with that cause for batches.
+Worker rejections and malformed acknowledgements are not retried.
+
+A submitted batch failure throws `BatchLoadException`. Its `failedFiles()` list
+contains `LoadFailure(index, uncertain, error)` entries in original input order.
+Indices are zero-based and unique; omitted inputs completed successfully.
+Confirmed block failures have `uncertain=false`; missing outcomes have
+`uncertain=true`. Empty files succeed and duplicate inputs keep separate indices.
+Other files continue after individual failures. Invalid arguments rejected before
+dispatch still throw `IllegalArgumentException`.
+
+```java
+try {
+    client.batchLoad(requests);
+} catch (BatchLoadException error) {
+    List<LoadRequest> retryRequests = error.failedFiles().stream()
+        .map(f -> requests.get(f.index())).toList();
+}
+```
