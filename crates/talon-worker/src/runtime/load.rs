@@ -96,7 +96,12 @@ impl WorkerRuntime {
         });
         let mut pending = stream::iter(jobs)
             .map(|(index, block, offset, len, block_len)| async move {
-                // Reserve before starting any I/O; cancellation while queued is harmless.
+                if self.load_range_cached(&block, offset, len).await {
+                    return (index, Ok(()));
+                }
+                // Only misses wait for payload capacity. The probe opens handles,
+                // without reading cache payloads or admitting them into L1.
+                // Cancellation while queued is harmless.
                 let reservation = if self.paged.is_some() {
                     len
                 } else {
@@ -159,6 +164,44 @@ impl WorkerRuntime {
             }
         }
         failures
+    }
+
+    /// Confirm residency without allocating a payload buffer. As with ordinary
+    /// cache reads, opening the files also handles a stale index/eviction race.
+    async fn load_range_cached(&self, block: &BlockId, offset: u64, len: u64) -> bool {
+        if self.index.is_whole_and_touch(block) {
+            if let Ok(handles) = self.store.get_range(block, offset, len).await {
+                if handles.iter().map(|handle| handle.len).sum::<u64>() == len {
+                    self.record_l2_hit();
+                    return true;
+                }
+            }
+            return false;
+        }
+        let Some(paged) = &self.paged else {
+            return false;
+        };
+        let page_size = u64::from(paged.page_size());
+        let first = PageIndex((offset / page_size) as u32);
+        let end = PageIndex((offset + len).div_ceil(page_size) as u32);
+        let Some((first_guard, guards)) = self.index.page_reads_and_touch(block, first, end) else {
+            return false;
+        };
+        // Hold page readers until the files are confirmed, so GC cannot claim
+        // these pages while LOAD records their access. No guard crosses a wait
+        // for the payload budget, including when only part of the range exists.
+        if let Ok(handles) = paged.get_range(block, offset, len) {
+            if handles.iter().map(|handle| handle.len).sum::<u64>() == len {
+                let now = self.page_access_time();
+                first_guard.record_access_and_release(now);
+                for guard in guards {
+                    guard.record_access_and_release(now);
+                }
+                self.record_l2_hit();
+                return true;
+            }
+        }
+        false
     }
 
     async fn warm_whole_block(
@@ -986,6 +1029,80 @@ mod tests {
             "a short origin response must not publish the page"
         );
         assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn cached_loads_bypass_exhausted_payload_budget_without_populating_l1() {
+        // Cover whole files, page files, and whole files retained by a paged worker.
+        for mode in 0..3 {
+            let (root, backend, runtime) = setup(mode == 1);
+            let mut runtime = runtime.with_load_inflight_bytes(8).unwrap();
+            let requests: Vec<_> = [(0, 8), (8, 8), (16, 5)]
+                .into_iter()
+                .map(|(offset, len)| talon_transport::LoadBlockRequest {
+                    block: block(offset),
+                    len,
+                })
+                .collect();
+            assert!(runtime.batch_load(&requests).await.unwrap().is_empty());
+            if mode == 2 {
+                runtime = runtime
+                    .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 4).unwrap());
+            }
+            runtime.l1 = Arc::new(MemoryStore::with_limits(64, 4));
+            let calls = backend.fetches.load(Ordering::SeqCst);
+            backend.changed.store(true, Ordering::SeqCst);
+            let _budget = runtime.load_bytes.acquire_many(8).await.unwrap();
+            tokio::time::timeout(Duration::from_secs(1), async {
+                for request in &requests {
+                    runtime
+                        .load_block(&request.block, request.len)
+                        .await
+                        .unwrap();
+                }
+                assert!(runtime.batch_load(&requests).await.unwrap().is_empty());
+            })
+            .await
+            .expect("cache hits must complete while all payload permits are held");
+            assert_eq!(runtime.load_bytes.available_permits(), 0);
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), calls);
+            assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.l1.resident_bytes(), 0);
+            assert_eq!(runtime.inflight_loads(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_load_probe_does_not_trust_stale_presence() {
+        for paged in [false, true] {
+            let (_root, backend, runtime) = setup(paged);
+            let runtime = runtime.with_load_inflight_bytes(8).unwrap();
+            let target = block(0);
+            runtime.load_block(&target, 8).await.unwrap();
+            // Prime the fd cache, then remove a file without updating the index.
+            assert!(runtime.load_range_cached(&target, 0, 8).await);
+            if let Some(store) = &runtime.paged {
+                store.evict_page(&target, PageIndex(1)).unwrap();
+            } else {
+                runtime.store.delete(&target).await.unwrap();
+            }
+            let calls = backend.fetches.load(Ordering::SeqCst);
+            let budget = runtime.load_bytes.acquire_many(8).await.unwrap();
+            let load = runtime.load_block(&target, 8);
+            tokio::pin!(load);
+            assert!(tokio::time::timeout(Duration::from_millis(50), &mut load)
+                .await
+                .is_err());
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), calls);
+            drop(budget);
+            tokio::time::timeout(Duration::from_secs(1), load)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), calls + 1);
+            assert!(runtime.load_range_cached(&target, 0, 8).await);
+            assert_eq!(runtime.load_bytes.available_permits(), 8);
+        }
     }
 
     #[tokio::test]

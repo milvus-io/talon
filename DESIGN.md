@@ -273,9 +273,13 @@ normally cover up to 4 MiB, grow to one page if necessary, and shrink to fit the
 budget. Whole-block LOADs reserve one full block. The budget must fit at least
 one page or whole block, respectively. Existing LOAD RPC admission limits remain.
 
-Reserve bytes before starting I/O and retain them through origin retries and
+Fully cached ranges complete before acquiring the payload budget: open file
+handles confirm coverage without reading payloads or populating L1, and page
+read guards preserve GC arbitration and access tracking. Ranges with misses
+reserve bytes before payload I/O and retain them through origin retries and
 cache commits. Accepted range tasks own their reservations and single-flight
-guards even if the RPC is cancelled; waiting jobs can be cancelled without I/O.
+guards even if the RPC is cancelled; waiting jobs can be cancelled without
+starting payload I/O.
 Distinct leader-owned pages may commit concurrently under a shared block gate;
 GC, whole-block replacement, and ordinary commits retain exclusive access.
 Cold fills warm L2 directly without retaining origin slices in L1 or assembling
