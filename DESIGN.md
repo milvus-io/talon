@@ -273,9 +273,10 @@ normally cover up to 4 MiB, grow to one page if necessary, and shrink to fit the
 budget. Whole-block LOADs reserve one full block. The budget must fit at least
 one page or whole block, respectively. Existing LOAD RPC admission limits remain.
 
-Fully cached ranges complete before acquiring the payload budget: open file
-handles confirm coverage without reading payloads or populating L1, and page
-read guards preserve GC arbitration and access tracking. Ranges with misses
+Fully cached ranges complete before acquiring the payload budget, using published
+index metadata and page bitmaps without opening files or populating L1. Page read
+guards preserve GC arbitration and access tracking. LOAD trusts cache residency
+metadata; it does not verify file existence or file lengths. Ranges with misses
 reserve bytes before payload I/O and retain them through origin retries and
 cache commits. Accepted range tasks own their reservations and single-flight
 guards even if the RPC is cancelled; waiting jobs can be cancelled without

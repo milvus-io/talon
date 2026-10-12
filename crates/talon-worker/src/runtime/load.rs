@@ -96,11 +96,11 @@ impl WorkerRuntime {
         });
         let mut pending = stream::iter(jobs)
             .map(|(index, block, offset, len, block_len)| async move {
-                if self.load_range_cached(&block, offset, len).await {
+                if self.load_range_cached(&block, offset, len) {
                     return (index, Ok(()));
                 }
-                // Only misses wait for payload capacity. The probe opens handles,
-                // without reading cache payloads or admitting them into L1.
+                // Only misses wait for payload capacity. The probe uses metadata,
+                // without opening files or admitting cache payloads into L1.
                 // Cancellation while queued is harmless.
                 let reservation = if self.paged.is_some() {
                     len
@@ -166,17 +166,17 @@ impl WorkerRuntime {
         failures
     }
 
-    /// Confirm residency without allocating a payload buffer. As with ordinary
-    /// cache reads, opening the files also handles a stale index/eviction race.
-    async fn load_range_cached(&self, block: &BlockId, offset: u64, len: u64) -> bool {
-        if self.index.is_whole_and_touch(block) {
-            if let Ok(handles) = self.store.get_range(block, offset, len).await {
-                if handles.iter().map(|handle| handle.len).sum::<u64>() == len {
-                    self.record_l2_hit();
-                    return true;
-                }
-            }
+    /// Trust published residency metadata; LOAD does not verify cache files.
+    fn load_range_cached(&self, block: &BlockId, offset: u64, len: u64) -> bool {
+        let Some(meta) = self.index.get_and_touch(block) else {
             return false;
+        };
+        if offset.checked_add(len).map_or(true, |end| end > meta.len) {
+            return false;
+        }
+        if matches!(meta.form, BlockForm::Whole) {
+            self.record_l2_hit();
+            return true;
         }
         let Some(paged) = &self.paged else {
             return false;
@@ -187,21 +187,15 @@ impl WorkerRuntime {
         let Some((first_guard, guards)) = self.index.page_reads_and_touch(block, first, end) else {
             return false;
         };
-        // Hold page readers until the files are confirmed, so GC cannot claim
-        // these pages while LOAD records their access. No guard crosses a wait
-        // for the payload budget, including when only part of the range exists.
-        if let Ok(handles) = paged.get_range(block, offset, len) {
-            if handles.iter().map(|handle| handle.len).sum::<u64>() == len {
-                let now = self.page_access_time();
-                first_guard.record_access_and_release(now);
-                for guard in guards {
-                    guard.record_access_and_release(now);
-                }
-                self.record_l2_hit();
-                return true;
-            }
+        // Preserve read/delete arbitration and access tracking. No guard crosses
+        // a wait for the payload budget, including for partially resident ranges.
+        let now = self.page_access_time();
+        first_guard.record_access_and_release(now);
+        for guard in guards {
+            guard.record_access_and_release(now);
         }
-        false
+        self.record_l2_hit();
+        true
     }
 
     async fn warm_whole_block(
@@ -212,7 +206,7 @@ impl WorkerRuntime {
     ) -> anyhow::Result<()> {
         let key = LoadKey::Whole(block.clone());
         loop {
-            if self.load_range_cached(block, 0, len).await {
+            if self.load_range_cached(block, 0, len) {
                 return Ok(());
             }
             let (admission, flight) = self.inflight.admit_traced(key.clone());
@@ -1048,6 +1042,20 @@ mod tests {
                 runtime = runtime
                     .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 4).unwrap());
             }
+            // LOAD trusts published metadata, even if files disappear outside
+            // the cache lifecycle. This also prevents fd-based probes regressing.
+            for request in &requests {
+                if mode == 1 {
+                    runtime
+                        .paged
+                        .as_ref()
+                        .unwrap()
+                        .delete_block(&request.block)
+                        .unwrap();
+                } else {
+                    runtime.store.delete(&request.block).await.unwrap();
+                }
+            }
             runtime.l1 = Arc::new(MemoryStore::with_limits(64, 4));
             let calls = backend.fetches.load(Ordering::SeqCst);
             backend.changed.store(true, Ordering::SeqCst);
@@ -1115,23 +1123,46 @@ mod tests {
             assert_eq!(runtime.l1.resident_bytes(), 0);
             assert_eq!(runtime.load_bytes.available_permits(), 8);
             assert_eq!(runtime.inflight_loads(), 0);
-            assert!(runtime.load_range_cached(&target, 0, 8).await);
+            assert!(runtime.load_range_cached(&target, 0, 8));
         }
     }
 
     #[tokio::test]
-    async fn cached_load_probe_does_not_trust_stale_presence() {
+    async fn cached_load_probe_checks_extent_and_rejects_deleting_pages() {
+        for paged in [false, true] {
+            let (_root, _, runtime) = setup(paged);
+            let target = block(16);
+            runtime.load_block(&target, 5).await.unwrap();
+            assert!(runtime.load_range_cached(&target, 0, 5));
+            assert!(!runtime.load_range_cached(&target, 0, 8));
+            if paged {
+                let state = runtime.page_lifecycle.block(&target);
+                let _gate = state.gate.lock().await;
+                let candidate = state.candidate(PageIndex(1)).unwrap();
+                assert!(state.claim(&candidate, runtime.page_clock.now(), None));
+                // GC has claimed deletion, but has not unlinked or cleared the bit.
+                assert!(!runtime.load_range_cached(&target, 0, 5));
+                state.abort(&candidate, 0);
+                assert!(runtime.load_range_cached(&target, 0, 5));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_load_probe_respects_missing_residency() {
         for paged in [false, true] {
             let (_root, backend, runtime) = setup(paged);
             let runtime = runtime.with_load_inflight_bytes(8).unwrap();
             let target = block(0);
             runtime.load_block(&target, 8).await.unwrap();
-            // Prime the fd cache, then remove a file without updating the index.
-            assert!(runtime.load_range_cached(&target, 0, 8).await);
+            // Eviction removes both the file and its published residency.
+            assert!(runtime.load_range_cached(&target, 0, 8));
             if let Some(store) = &runtime.paged {
                 store.evict_page(&target, PageIndex(1)).unwrap();
+                runtime.index.clear_page(&target, PageIndex(1));
             } else {
                 runtime.store.delete(&target).await.unwrap();
+                runtime.index.remove(&target);
             }
             let calls = backend.fetches.load(Ordering::SeqCst);
             let budget = runtime.load_bytes.acquire_many(8).await.unwrap();
@@ -1147,7 +1178,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(backend.fetches.load(Ordering::SeqCst), calls + 1);
-            assert!(runtime.load_range_cached(&target, 0, 8).await);
+            assert!(runtime.load_range_cached(&target, 0, 8));
             assert_eq!(runtime.load_bytes.available_permits(), 8);
         }
     }
