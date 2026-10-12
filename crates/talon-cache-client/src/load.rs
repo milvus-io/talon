@@ -126,6 +126,48 @@ fn validate_file(file: &FileView<'_>) -> Result<LoadResult, LoadError> {
 }
 
 impl BlockReader {
+    /// Retry only local discovery expiry, never a worker rejection or an
+    /// ordinary transport failure. Keep the caller's logical placement fixed.
+    async fn with_load_owner<T, F, Fut>(
+        &self,
+        block: &talon_core::BlockId,
+        topology: &std::sync::Arc<talon_core::CachePlacementTable>,
+        mut send: F,
+    ) -> Result<T, LoadError>
+    where
+        F: FnMut(crate::WorkerClient) -> Fut,
+        Fut: std::future::Future<Output = Result<T, LoadError>>,
+    {
+        let mut refreshed = false;
+        loop {
+            let current = self.load_membership_snapshot().await?;
+            if !std::sync::Arc::ptr_eq(&current.placement, topology) {
+                return Err(LoadError::MembershipChanged);
+            }
+            let client = match current.owner(block) {
+                Ok(client) => client,
+                Err(_) if !refreshed && std::time::Instant::now() >= current.valid_until => {
+                    refreshed = true;
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            match send(client).await {
+                Err(
+                    LoadError::Worker {
+                        source: WorkerLoadError::DiscoveryExpired,
+                        ..
+                    }
+                    | LoadError::WorkerBatch {
+                        source: WorkerLoadError::DiscoveryExpired,
+                        ..
+                    },
+                ) if !refreshed => refreshed = true,
+                result => return result,
+            }
+        }
+    }
+
     /// Warm a file directly on its primary workers using the read placement.
     ///
     /// The caller supplies version and size, so no HEAD is issued. Membership
@@ -140,7 +182,7 @@ impl BlockReader {
             return Ok(LoadResult { size: 0, blocks: 0 });
         }
         tokio::time::timeout(Duration::from_secs(30 * 60), async {
-            let snapshot = self.membership_snapshot().await?;
+            let snapshot = self.load_membership_snapshot().await?;
             if snapshot.placement.worker_count() == 0 {
                 return Err(LoadError::Placement(BlockReadError::NoOwners));
             }
@@ -160,19 +202,18 @@ impl BlockReader {
                         .acquire()
                         .await
                         .expect("load semaphore is never closed");
-                    let current = self.membership_snapshot().await?;
-                    if !std::sync::Arc::ptr_eq(&current.placement, topology) {
-                        return Err(LoadError::MembershipChanged);
-                    }
-                    let client = current.owner(&segment.block)?;
-                    client
-                        .load_block(&segment.block, u64::from(segment.len))
-                        .await
-                        .map_err(|source| LoadError::Worker {
-                            worker: client.addr().into(),
-                            offset: segment.block.offset,
-                            source,
-                        })
+                    let block = &segment.block;
+                    self.with_load_owner(block, topology, |client| async move {
+                        client
+                            .load_block(block, u64::from(segment.len))
+                            .await
+                            .map_err(|source| LoadError::Worker {
+                                worker: client.addr().into(),
+                                offset: block.offset,
+                                source,
+                            })
+                    })
+                    .await
                 }
             })
             .buffer_unordered(8)
@@ -239,7 +280,7 @@ impl BlockReader {
         let mut first_error = None;
         let mut topology = None;
         let mut completion = tokio::time::timeout(Duration::from_secs(30 * 60), async {
-            let snapshot = self.membership_snapshot().await?;
+            let snapshot = self.load_membership_snapshot().await?;
             topology = Some(snapshot.placement.clone());
             if snapshot.placement.worker_count() == 0 {
                 return Err(LoadError::Placement(BlockReadError::NoOwners));
@@ -313,19 +354,22 @@ impl BlockReader {
                                     .acquire()
                                     .await
                                     .expect("load semaphore is never closed");
-                                let current = self.membership_snapshot().await?;
-                                if !std::sync::Arc::ptr_eq(&current.placement, topology) {
-                                    return Err(LoadError::MembershipChanged);
-                                }
-                                let client = current.owner(&blocks[0].block)?;
-                                client
-                                    .batch_load(&blocks)
-                                    .await
-                                    .map(|failures| (client.addr().to_owned(), failures))
-                                    .map_err(|source| LoadError::WorkerBatch {
-                                        worker: client.addr().into(),
-                                        source,
-                                    })
+                                let blocks = &blocks;
+                                self.with_load_owner(
+                                    &blocks[0].block,
+                                    topology,
+                                    |client| async move {
+                                        client
+                                            .batch_load(blocks)
+                                            .await
+                                            .map(|failures| (client.addr().to_owned(), failures))
+                                            .map_err(|source| LoadError::WorkerBatch {
+                                                worker: client.addr().into(),
+                                                source,
+                                            })
+                                    },
+                                )
+                                .await
                             }
                             .await;
                             (indices, result)
@@ -529,6 +573,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn load_refreshes_discovery_that_expires_after_owner_selection() {
+        // Exercise both RPC types and the safety gates after discovery changes.
+        for batch in [false, true] {
+            for outcome in ["replacement", "offline", "topology", "expired_again"] {
+                let old = worker("a", Duration::ZERO, true).await;
+                let new = worker(
+                    if outcome == "topology" { "b" } else { "a" },
+                    Duration::ZERO,
+                    true,
+                )
+                .await;
+                let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let reader = reader(
+                    listener.local_addr().unwrap().to_string(),
+                    std::slice::from_ref(&old.node),
+                );
+                let ControlMessage::MembershipList { mut view } =
+                    crate::membership_fixture::plain(vec![new.node.clone()])
+                else {
+                    unreachable!()
+                };
+                view.topology_token = talon_core::worker_membership::MemberRegistry {
+                    format_version: 1,
+                    members: view.workers.iter().map(|w| w.member.clone()).collect(),
+                }
+                .topology_token();
+                if outcome == "offline" {
+                    view.workers[0].state = talon_core::worker_membership::InstanceState::Offline;
+                }
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let (id, request) = receive(&mut socket).await.unwrap();
+                    assert_eq!(request, ControlMessage::MembershipQuery {});
+                    socket
+                        .write_all(
+                            &codec::encode(id, &ControlMessage::MembershipList { view }).unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                });
+                let request = LoadBlockRequest {
+                    block: BlockId::new(object(), 0, 8, Version::new("v1")),
+                    len: 8,
+                };
+                let topology = reader.membership.last_good().unwrap().placement;
+                let attempts = AtomicUsize::new(0);
+                let result = reader
+                    .with_load_owner(&request.block, &topology, |client| {
+                        let attempt = attempts.fetch_add(1, Ordering::SeqCst);
+                        let deadline = reader.membership.last_good().unwrap().valid_until;
+                        let request = &request;
+                        async move {
+                            // Deterministically cross the selected snapshot's deadline
+                            // before the real transport can send any bytes.
+                            if attempt == 0 || outcome == "expired_again" {
+                                tokio::time::sleep_until(
+                                    (deadline + Duration::from_millis(1)).into(),
+                                )
+                                .await;
+                            }
+                            if batch {
+                                client
+                                    .batch_load(std::slice::from_ref(request))
+                                    .await
+                                    .map(|_| ())
+                                    .map_err(|source| LoadError::WorkerBatch {
+                                        worker: client.addr().into(),
+                                        source,
+                                    })
+                            } else {
+                                client
+                                    .load_block(&request.block, request.len)
+                                    .await
+                                    .map_err(|source| LoadError::Worker {
+                                        worker: client.addr().into(),
+                                        offset: 0,
+                                        source,
+                                    })
+                            }
+                        }
+                    })
+                    .await;
+                assert!(
+                    old.requests.lock().unwrap().is_empty(),
+                    "expired instance must not receive LOAD"
+                );
+                match outcome {
+                    "replacement" => {
+                        result.unwrap();
+                        assert_eq!(new.requests.lock().unwrap().len(), 1);
+                        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+                    }
+                    "offline" => assert!(matches!(result, Err(LoadError::Placement(_)))),
+                    "topology" => assert!(matches!(result, Err(LoadError::MembershipChanged))),
+                    "expired_again" => {
+                        assert!(matches!(
+                            result,
+                            Err(LoadError::Worker {
+                                source: WorkerLoadError::DiscoveryExpired,
+                                ..
+                            } | LoadError::WorkerBatch {
+                                source: WorkerLoadError::DiscoveryExpired,
+                                ..
+                            })
+                        ));
+                        assert_eq!(
+                            attempts.load(Ordering::SeqCst),
+                            2,
+                            "refresh retry is bounded"
+                        );
+                    }
+                    _ => unreachable!(),
+                }
+                if outcome != "replacement" {
+                    assert!(new.requests.lock().unwrap().is_empty());
+                }
+                server.await.unwrap();
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn load_refreshes_short_lived_discovery_inside_read_throttle() {
+        let worker = worker("a", Duration::ZERO, true).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let reader = reader(listener.local_addr().unwrap().to_string(), &[]);
+        let node = worker.node.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for valid_for_ms in [1, 500] {
+                let (id, request) = receive(&mut socket).await.unwrap();
+                assert_eq!(request, ControlMessage::MembershipQuery {});
+                let ControlMessage::MembershipList { mut view } =
+                    crate::membership_fixture::plain(vec![node.clone()])
+                else {
+                    unreachable!()
+                };
+                view.valid_for_ms = valid_for_ms;
+                socket
+                    .write_all(
+                        &codec::encode(id, &ControlMessage::MembershipList { view }).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+            }
+        });
+        let first = reader.load_membership_snapshot().await.unwrap();
+        tokio::time::sleep_until((first.valid_until + Duration::from_millis(1)).into()).await;
+        let second = reader.load_membership_snapshot().await.unwrap();
+        assert!(second.valid_until > first.valid_until);
+        assert!(std::time::Instant::now() < second.valid_until);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn load_does_not_route_to_offline_conflicting_or_expired_instances() {
         use talon_core::worker_membership::InstanceState;
         let a = worker("a", Duration::ZERO, true).await;
@@ -581,12 +780,14 @@ mod tests {
             block: BlockId::new(object(), 0, 8, Version::new("v1")),
             len: 8,
         };
-        assert!(
-            matches!(expired.load_block(&request.block, request.len).await, Err(WorkerLoadError::Instance(crate::WorkerError::Remote(error))) if error.code == talon_transport::DataErrorCode::Unavailable)
-        );
-        assert!(
-            matches!(expired.batch_load(&[request]).await, Err(WorkerLoadError::Instance(crate::WorkerError::Remote(error))) if error.code == talon_transport::DataErrorCode::Unavailable)
-        );
+        assert!(matches!(
+            expired.load_block(&request.block, request.len).await,
+            Err(WorkerLoadError::DiscoveryExpired)
+        ));
+        assert!(matches!(
+            expired.batch_load(&[request]).await,
+            Err(WorkerLoadError::DiscoveryExpired)
+        ));
         assert!(a.requests.lock().unwrap().is_empty());
     }
 

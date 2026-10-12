@@ -585,6 +585,21 @@ impl BlockReader {
     }
 
     pub(crate) async fn membership_snapshot(&self) -> Result<MembershipSnapshot, BlockReadError> {
+        self.membership_snapshot_inner(true).await
+    }
+
+    /// LOAD must refresh an expired instance, including inside the read path's
+    /// refresh throttle window. Concurrent refreshes still share the same lock.
+    pub(crate) async fn load_membership_snapshot(
+        &self,
+    ) -> Result<MembershipSnapshot, BlockReadError> {
+        self.membership_snapshot_inner(false).await
+    }
+
+    async fn membership_snapshot_inner(
+        &self,
+        allow_stale: bool,
+    ) -> Result<MembershipSnapshot, BlockReadError> {
         if let Some(snapshot) = self.membership.fresh() {
             return Ok(snapshot);
         }
@@ -593,8 +608,10 @@ impl BlockReader {
             return Ok(snapshot);
         }
         let observed = std::time::Instant::now();
-        if refresh
-            .is_some_and(|at| observed.duration_since(at) < std::time::Duration::from_millis(100))
+        if allow_stale
+            && refresh.is_some_and(|at| {
+                observed.duration_since(at) < std::time::Duration::from_millis(100)
+            })
         {
             if let Some(snapshot) = self.membership.last_good() {
                 // Throttle discovery requests, but never route with an expired instance.

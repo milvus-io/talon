@@ -263,6 +263,11 @@ the read path's persistent Maglev placement and sends `LoadBlock` directly to
 each primary worker. The coordinator provides ordinary membership discovery;
 it does not schedule LOAD. Expired instance discovery must be refreshed before
 dispatch, and unavailable owners are not replaced by other workers.
+If discovery expires between owner selection and transport dispatch, the SDK
+refreshes discovery and retries the assignment once within the existing LOAD
+deadline and concurrency limit. The logical placement must remain unchanged;
+an unavailable owner, changed topology, or another expiry is still an error.
+Worker rejections and ordinary transport failures do not trigger this refresh.
 
 `BatchLoad` groups assignments across files by worker, carrying up to 1024 block
 instructions per frame within the control-frame byte limit. Single and batch

@@ -144,6 +144,9 @@ impl WorkerError {
 /// Errors from a worker's block prewarm control exchange.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerLoadError {
+    /// Discovery expired locally before dispatch or a stale-connection retry.
+    #[error("load instance discovery expired before dispatch")]
+    DiscoveryExpired,
     /// The selected instance is no longer valid for a new request or retry.
     #[error("load instance: {0}")]
     Instance(#[from] WorkerError),
@@ -347,9 +350,9 @@ impl WorkerClient {
             .map_err(talon_transport::CodecError::from)?;
         self.pool
             .with_deadline("worker load", deadline, async {
-                self.check_read_retry_deadline()?;
+                self.check_load_discovery()?;
                 let (mut stream, reused) = self.pool.checkout(&self.addr).await?;
-                self.check_read_retry_deadline()?;
+                self.check_load_discovery()?;
                 let result = async {
                     stream.write_all(&output).await?;
                     stream.flush().await?;
@@ -363,7 +366,9 @@ impl WorkerClient {
                     }
                     Err(WorkerLoadError::Io(_)) if reused => {
                         drop(stream);
-                        let mut stream = self.fresh_read_retry_connection().await?;
+                        self.check_load_discovery()?;
+                        let mut stream = self.pool.fresh(&self.addr).await?;
+                        self.check_load_discovery()?;
                         stream.write_all(&output).await?;
                         stream.flush().await?;
                         let failures =
@@ -375,6 +380,11 @@ impl WorkerClient {
                 }
             })
             .await
+    }
+
+    fn check_load_discovery(&self) -> Result<(), WorkerLoadError> {
+        self.check_read_retry_deadline()
+            .map_err(|_| WorkerLoadError::DiscoveryExpired)
     }
 
     /// Fetch `[offset, offset+len)` of `object` from the worker.
