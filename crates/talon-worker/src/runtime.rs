@@ -99,8 +99,9 @@ pub struct WorkerRuntime {
     inflight: Arc<InFlightLoads>,
     /// Admitted LOAD RPCs across all clients and runtime clones.
     load_slots: Arc<tokio::sync::Semaphore>,
-    /// Active block fills shared by single and batch LOAD RPCs.
-    load_block_slots: Arc<tokio::sync::Semaphore>,
+    /// Payload reservations shared by all single and batch LOADs.
+    load_bytes: Arc<tokio::sync::Semaphore>,
+    load_inflight_bytes: u64,
     backend: Arc<dyn BackendStore>,
     /// Backend selected by the worker process. Optional only so unit-test
     /// runtimes that do not exercise backend routing retain their compact
@@ -203,9 +204,8 @@ impl WorkerRuntime {
             index,
             inflight,
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
-            load_block_slots: Arc::new(tokio::sync::Semaphore::new(
-                load::MAX_CONCURRENT_LOAD_BLOCKS,
-            )),
+            load_bytes: Arc::new(tokio::sync::Semaphore::new(1 << 30)),
+            load_inflight_bytes: 1 << 30,
             backend,
             configured_backend: None,
             block_size,
@@ -910,6 +910,19 @@ impl WorkerRuntime {
         len: u64,
         known_block_len: Option<u64>,
     ) -> anyhow::Result<bytes::Bytes> {
+        self.paged_block_range_inner(request, block, offset, len, known_block_len, false)
+            .await
+    }
+
+    async fn paged_block_range_inner(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+        known_block_len: Option<u64>,
+        warm_only: bool,
+    ) -> anyhow::Result<bytes::Bytes> {
         let page_size = self
             .paged_page_size()
             .ok_or_else(|| anyhow::anyhow!("paged read on a runtime without a paged store"))?;
@@ -990,7 +1003,9 @@ impl WorkerRuntime {
                 pending.push(async move {
                     let run_pages: Vec<_> = leader_run.iter().map(|(_, page, _)| *page).collect();
                     let fetched = self
-                        .fetch_and_commit_pages(request, block, &run_pages, block_len, true)
+                        .fetch_and_commit_pages(
+                            request, block, &run_pages, block_len, true, warm_only,
+                        )
                         .await;
                     (leader_run, fetched)
                 });
@@ -1032,6 +1047,17 @@ impl WorkerRuntime {
             page_slots[slot] = Some(entry);
         }
 
+        if warm_only {
+            if page_slots
+                .iter()
+                .all(|slot| matches!(slot, Some((_, true))))
+            {
+                self.metrics.record_cache_hit();
+            } else {
+                self.metrics.record_cache_miss();
+            }
+            return Ok(bytes::Bytes::new());
+        }
         let mut out = bytes::BytesMut::with_capacity(len as usize);
         let mut hit_all = true;
         for (slot, page) in pages.into_iter().enumerate() {
@@ -1120,7 +1146,7 @@ impl WorkerRuntime {
         block_len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         let mut pages = self
-            .fetch_and_commit_pages(request, block, &[page], block_len, false)
+            .fetch_and_commit_pages(request, block, &[page], block_len, false, false)
             .await?;
         Ok(pages
             .pop()
@@ -1136,6 +1162,7 @@ impl WorkerRuntime {
         pages: &[PageIndex],
         block_len: u64,
         owns_flight: bool,
+        warm_only: bool,
     ) -> anyhow::Result<Vec<bytes::Bytes>> {
         talon_telemetry::observe("talon.refill", "internal", async {
             talon_telemetry::cache_tier("origin");
@@ -1214,6 +1241,8 @@ impl WorkerRuntime {
             talon_telemetry::observe("talon.cache.commit", "internal", async {
                 let mut committed = Vec::with_capacity(pages.len());
                 let mut cursor = 0_usize;
+                let mut writes = FuturesUnordered::new();
+                let mut first_error = None;
                 for page in pages {
                     let page_len =
                         usize::try_from(talon_core::page_len(block_len, page_size, *page))
@@ -1224,12 +1253,41 @@ impl WorkerRuntime {
                         .checked_add(page_len)
                         .ok_or_else(|| anyhow::anyhow!("paged response offset overflows usize"))?;
                     let page_bytes = bytes.slice(cursor..end);
-                    self.commit_fetched_page(block, *page, block_len, page_bytes.clone())
-                        .await?;
-                    talon_telemetry::record("talon.cache.committed_bytes", end as u64);
+                    if warm_only {
+                        writes.push(self.commit_fetched_page_inner(
+                            block,
+                            *page,
+                            block_len,
+                            page_bytes.clone(),
+                            true,
+                        ));
+                        // Bound write-task metadata independently of payload bytes.
+                        if writes.len() == 32 {
+                            if let Some(Err(error)) = writes.next().await {
+                                first_error.get_or_insert(error);
+                            }
+                        }
+                    } else {
+                        self.commit_fetched_page(block, *page, block_len, page_bytes.clone())
+                            .await?;
+                    }
+                    if !warm_only {
+                        talon_telemetry::record("talon.cache.committed_bytes", end as u64);
+                    }
                     committed.push(page_bytes);
                     cursor = end;
                 }
+                // LOAD pages are disjoint leaders. Drain all writes before releasing
+                // the range reservation or its page-level in-flight guards.
+                while let Some(result) = writes.next().await {
+                    if let Err(error) = result {
+                        first_error.get_or_insert(error);
+                    }
+                }
+                if let Some(error) = first_error {
+                    return Err(error);
+                }
+                talon_telemetry::record("talon.cache.committed_bytes", cursor as u64);
                 debug_assert_eq!(cursor, bytes.len());
                 Ok(committed)
             })
@@ -1246,6 +1304,18 @@ impl WorkerRuntime {
         block_len: u64,
         bytes: bytes::Bytes,
     ) -> anyhow::Result<()> {
+        self.commit_fetched_page_inner(block, page, block_len, bytes, false)
+            .await
+    }
+
+    async fn commit_fetched_page_inner(
+        &self,
+        block: &BlockId,
+        page: PageIndex,
+        block_len: u64,
+        bytes: bytes::Bytes,
+        warm_only: bool,
+    ) -> anyhow::Result<()> {
         let runtime = self.clone();
         let id = block.clone();
         let operation = talon_telemetry::Operation::new(
@@ -1258,7 +1328,11 @@ impl WorkerRuntime {
                 let result = operation
                     .scope(async move {
                         let state = runtime.page_lifecycle.block(&id);
-                        let _gate = state.gate.lock().await;
+                        let _gate = if warm_only {
+                            state.gate.lock_page_fill().await
+                        } else {
+                            state.gate.lock().await
+                        };
                         if matches!(
                             runtime.index.get(&id).map(|m| m.form),
                             Some(BlockForm::Whole)
@@ -1288,7 +1362,7 @@ impl WorkerRuntime {
                         let access = runtime.lru.insert(unit.clone(), bytes.len() as u64);
                         runtime.index.set_access(&unit, access);
                         runtime.index.set_page_state(&id, page, handle);
-                        if runtime.l1.is_enabled() {
+                        if !warm_only && runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes);
                         }
                         // Keep pressure handling owned by the worker too: cancellation

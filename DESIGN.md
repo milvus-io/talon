@@ -265,11 +265,25 @@ it does not schedule LOAD. Expired instance discovery must be refreshed before
 dispatch, and unavailable owners are not replaced by other workers.
 
 `BatchLoad` groups assignments across files by worker, carrying up to 1024 block
-instructions per frame within the control-frame byte limit. Workers share a
-limit of eight active block loads across single and batch requests and fill the
-configured whole-block or paged cache using the supplied version. The existing
-origin HTTP retry policy handles transient failures, including S3 throttling,
-while retaining the block's concurrency permit during backoff.
+instructions per frame within the control-frame byte limit. Single and batch
+LOADs share a worker-wide payload budget, `load_inflight_bytes` (default 1 GiB,
+configurable through TOML or `TALON_WORKER_LOAD_INFLIGHT_BYTES`). Paged LOADs
+schedule page-aligned ranges concurrently, including within one block; ranges
+normally cover up to 4 MiB, grow to one page if necessary, and shrink to fit the
+budget. Whole-block LOADs reserve one full block. The budget must fit at least
+one page or whole block, respectively. Existing LOAD RPC admission limits remain.
+
+Reserve bytes before starting I/O and retain them through origin retries and
+cache commits. Accepted range tasks own their reservations and single-flight
+guards even if the RPC is cancelled; waiting jobs can be cancelled without I/O.
+Distinct leader-owned pages may commit concurrently under a shared block gate;
+GC, whole-block replacement, and ordinary commits retain exclusive access.
+Cold fills warm L2 directly without retaining origin slices in L1 or assembling
+an unused read response. Task bookkeeping is bounded separately from bytes.
+The budget covers scheduled payloads, not process RSS, HTTP/allocator overhead,
+L1 residency, or ordinary read cache misses. Normal reads retain their existing
+miss concurrency policy. The existing origin HTTP retry policy handles transient
+failures, including S3 throttling, while holding the byte reservation.
 
 One `BatchLoadResult` follows completion of all assignments. Workers continue
 after individual failures and return their request indices with bounded error

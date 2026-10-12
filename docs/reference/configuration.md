@@ -538,6 +538,14 @@ Maximum independent paged-miss runs fetched concurrently per read.
 - **Default:** `8`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `load_inflight_bytes`
+
+Worker-wide LOAD payload byte budget through cache commit; excludes L1 and transport overhead. Must fit one L2 page in paged mode or one block in whole-block mode.
+
+- **Environment variable:** `TALON_WORKER_LOAD_INFLIGHT_BYTES`
+- **Default:** `1073741824`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `backend`
 
 Object-store backend: azure (default), s3, or gcs.

@@ -159,9 +159,18 @@ the 1024-entry cap, ordered indices, and diagnostic size. Clients also reject
 indices outside the corresponding request. An all-success reply has no entries.
 The worst-case reply fits within the control-frame limit without repeating paths.
 
-Each batch occupies one LOAD RPC admission permit and runs a window of at most
-eight block loads. Single and batch LOADs share a worker-wide limit of eight
-active block loads. A failed assignment does not stop subsequent assignments.
+Each batch occupies one LOAD RPC admission permit. Single and batch LOADs share
+a worker-wide payload budget, `load_inflight_bytes` (default 1 GiB), rather than
+a fixed active-block limit. Paged LOADs schedule concurrent page-aligned ranges
+of up to 4 MiB (or one page if larger), shrinking the range to fit a smaller
+budget. Distinct pages in each range may commit concurrently. Whole-block LOADs
+reserve a full block. Reservations are held through retries and cache commits;
+accepted fills retain them even if the RPC is cancelled. The budget excludes
+HTTP/allocator overhead, L1 residency, and ordinary reads. Cold fills warm L2
+without retaining origin-buffer slices in L1 or constructing a response payload.
+Each RPC schedules at most 1024 pending range jobs; each miss run starts at most
+32 page commits at once to bound task bookkeeping independently of payload size.
+A failed assignment does not stop subsequent assignments.
 Completed fills remain cached. Batch execution is not atomic. Batch RPCs and
 the complete SDK batch operation have a 30-minute deadline.
 

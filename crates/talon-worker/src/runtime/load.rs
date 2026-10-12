@@ -1,23 +1,42 @@
 use super::*;
+use futures::stream;
 
-pub(super) const MAX_CONCURRENT_LOAD_BLOCKS: usize = 8;
+// Bounds scheduler bookkeeping, independently of the shared payload byte budget.
+const MAX_PENDING_LOAD_RANGES: usize = 1024;
+const LOAD_RANGE_BYTES: u64 = 4 << 20;
 
 impl WorkerRuntime {
-    /// Warm one assigned block using the same version-pinned path as reads.
-    /// No payload is returned over the network. Paged stores are warmed in
-    /// bounded windows; whole stores retain their existing whole-block fill.
-    /// `len` comes from the caller's file size, so neither path needs HEAD.
+    /// Set the payload budget shared by LOAD/BatchLoad and all runtime clones.
+    /// Reservations cover origin retries and cache commits, not L1 or HTTP overhead.
+    pub fn with_load_inflight_bytes(mut self, bytes: u64) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            bytes > 0 && bytes <= tokio::sync::Semaphore::MAX_PERMITS as u64,
+            "load_inflight_bytes exceeds semaphore capacity or is zero"
+        );
+        self.load_inflight_bytes = bytes;
+        self.load_bytes = Arc::new(tokio::sync::Semaphore::new(bytes as usize));
+        Ok(self)
+    }
+
+    /// Warm one block. Paged ranges within this block may fill concurrently.
     pub async fn load_block(&self, block: &BlockId, len: u64) -> anyhow::Result<()> {
         self.validate_load_block(block, len)?;
         let _permit = self
             .load_slots
             .try_acquire()
             .map_err(|_| anyhow::anyhow!("worker load capacity exhausted; retry later"))?;
-        self.load_block_with_budget(block, len).await
+        let requests = [talon_transport::LoadBlockRequest {
+            block: block.clone(),
+            len,
+        }];
+        let failures = self.load_assignments(&requests).await;
+        if let Some((_, error)) = failures.into_iter().next() {
+            return Err(error);
+        }
+        Ok(())
     }
 
-    /// Attempt every assignment with a bounded, shared concurrency budget.
-    /// Failures do not cancel unrelated assignments. Reply only after all fills finish.
+    /// Attempt every assignment; failures do not cancel unrelated blocks.
     pub async fn batch_load(
         &self,
         blocks: &[talon_transport::LoadBlockRequest],
@@ -30,45 +49,141 @@ impl WorkerRuntime {
             .load_slots
             .try_acquire()
             .map_err(|_| anyhow::anyhow!("worker load capacity exhausted; retry later"))?;
-        let mut requests = blocks.iter().enumerate();
-        let mut pending = FuturesUnordered::new();
-        let mut failures = Vec::new();
-        loop {
-            while pending.len() < MAX_CONCURRENT_LOAD_BLOCKS {
-                let Some((index, request)) = requests.next() else {
-                    break;
-                };
-                pending.push(async move {
-                    let result = async {
-                        self.validate_load_block(&request.block, request.len)?;
-                        self.load_block_with_budget(&request.block, request.len)
-                            .await
-                    }
-                    .await;
-                    result.err().map(|error| {
-                        talon_transport::LoadBlockFailure::new(index as u32, error.to_string())
-                    })
-                });
-            }
-            match pending.next().await {
-                Some(Some(failure)) => failures.push(failure),
-                Some(None) => {}
-                None => break,
-            }
-        }
-        failures.sort_unstable_by_key(|failure| failure.index);
-        Ok(failures)
+        Ok(self
+            .load_assignments(blocks)
+            .await
+            .into_iter()
+            .map(|(index, error)| {
+                talon_transport::LoadBlockFailure::new(index as u32, error.to_string())
+            })
+            .collect())
     }
 
-    async fn load_block_with_budget(&self, block: &BlockId, len: u64) -> anyhow::Result<()> {
-        // Origin HTTP retries (including S3 throttling backoff) happen inside
-        // this permit. Reuse the backend policy without replaying a whole fill.
-        let _permit = self
-            .load_block_slots
-            .acquire()
-            .await
-            .expect("LOAD block semaphore is never closed");
-        self.load_block_inner(block, len).await
+    async fn load_assignments(
+        &self,
+        blocks: &[talon_transport::LoadBlockRequest],
+    ) -> std::collections::BTreeMap<usize, anyhow::Error> {
+        let mut failures = std::collections::BTreeMap::new();
+        let mut valid = Vec::new();
+        for (index, request) in blocks.iter().enumerate() {
+            match self.validate_load_block(&request.block, request.len) {
+                Ok(()) => valid.push((index, request.clone())),
+                Err(error) => {
+                    failures.insert(index, error);
+                }
+            }
+        }
+        // Round down to whole pages so adjacent jobs never claim the same page.
+        let window = match self.paged_page_size() {
+            Some(size) => {
+                let size = u64::from(size);
+                self.load_inflight_bytes.min(LOAD_RANGE_BYTES.max(size)) / size * size
+            }
+            None => u64::from(self.block_size),
+        };
+        let jobs = valid.into_iter().flat_map(|(index, request)| {
+            (0..request.len)
+                .step_by(window as usize)
+                .map(move |offset| {
+                    (
+                        index,
+                        request.block.clone(),
+                        offset,
+                        window.min(request.len - offset),
+                        request.len,
+                    )
+                })
+        });
+        let mut pending = stream::iter(jobs)
+            .map(|(index, block, offset, len, block_len)| async move {
+                // Reserve before starting any I/O; cancellation while queued is harmless.
+                let reservation = if self.paged.is_some() {
+                    len
+                } else {
+                    u64::from(self.block_size)
+                };
+                let permit = self
+                    .load_bytes
+                    .clone()
+                    .acquire_many_owned(reservation as u32)
+                    .await
+                    .expect("LOAD byte semaphore is never closed");
+                let runtime = self.clone();
+                let operation = talon_telemetry::Operation::new(
+                    "talon.load.range",
+                    "internal",
+                    talon_telemetry::TraceParent::Inherit,
+                );
+                // Accepted work owns the reservation and single-flight guards through
+                // disk+metadata completion, including after RPC cancellation.
+                let result = self
+                    .page_mutations
+                    .run(async move {
+                        let result = operation
+                            .scope(async move {
+                                let _permit = permit;
+                                let request = RangeRequest {
+                                    object: block.object.clone(),
+                                    offset: block.offset + offset,
+                                    len,
+                                };
+                                if runtime.paged.is_some() {
+                                    runtime
+                                        .paged_block_range_inner(
+                                            &request,
+                                            &block,
+                                            offset,
+                                            len,
+                                            Some(block_len),
+                                            true,
+                                        )
+                                        .await?;
+                                } else {
+                                    runtime
+                                        .warm_whole_block(&request, &block, block_len)
+                                        .await?;
+                                }
+                                Ok::<_, anyhow::Error>(())
+                            })
+                            .await;
+                        operation.outcome(if result.is_ok() { "success" } else { "error" });
+                        result
+                    })
+                    .await;
+                (index, result)
+            })
+            .buffer_unordered(MAX_PENDING_LOAD_RANGES);
+        while let Some((index, result)) = pending.next().await {
+            if let Err(error) = result {
+                failures.entry(index).or_insert(error);
+            }
+        }
+        failures
+    }
+
+    async fn warm_whole_block(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        len: u64,
+    ) -> anyhow::Result<()> {
+        let key = LoadKey::Whole(block.clone());
+        loop {
+            if let Some(bytes) = self.cached_block_range(block, 0, len).await? {
+                anyhow::ensure!(bytes.len() as u64 == len, "short cached load for {block}");
+                return Ok(());
+            }
+            let (admission, flight) = self.inflight.admit_traced(key.clone());
+            if let Some(_guard) = admission {
+                self.metrics.record_cache_miss();
+                let bytes = self.fetch_and_commit(request, block, true).await?;
+                anyhow::ensure!(bytes.len() as u64 == len, "short load for {block}");
+                // Prewarm L2 directly; no response assembly or L1 slices retain
+                // the origin allocation after the payload reservation is returned.
+                return Ok(());
+            }
+            talon_telemetry::wait_for(&flight, self.inflight.wait(&key)).await;
+        }
     }
 
     fn validate_load_block(&self, block: &BlockId, len: u64) -> anyhow::Result<()> {
@@ -84,43 +199,17 @@ impl WorkerRuntime {
         {
             anyhow::bail!("invalid load block or block size differs from worker configuration");
         }
+        let minimum = self
+            .paged_page_size()
+            .map(u64::from)
+            .unwrap_or(u64::from(self.block_size));
+        anyhow::ensure!(
+            self.load_inflight_bytes >= minimum,
+            "load_inflight_bytes must fit one page or whole block"
+        );
         self.ensure_configured_backend(block.object.backend)?;
         if block.version.as_str().trim().is_empty() {
             anyhow::bail!("load requires a non-empty source version");
-        }
-        Ok(())
-    }
-
-    async fn load_block_inner(&self, block: &BlockId, len: u64) -> anyhow::Result<()> {
-        let window = self
-            .paged_page_size()
-            .map(|page_size| u64::from(page_size).max(4 << 20))
-            .unwrap_or(len);
-        let mut loaded = 0;
-        while loaded < len {
-            let take = window.min(len - loaded);
-            let request = RangeRequest {
-                object: block.object.clone(),
-                offset: block.offset + loaded,
-                len: take,
-            };
-            let outcome = if self.paged.is_some() {
-                ServeOutcome::Bytes(
-                    self.paged_block_range(&request, block, loaded, take, Some(len))
-                        .await?,
-                )
-            } else {
-                self.serve_at(&request, &block.version, None).await?
-            };
-            let actual = match outcome {
-                ServeOutcome::Bytes(bytes) => bytes.len() as u64,
-                ServeOutcome::Sendfile(handle) => handle.len,
-                ServeOutcome::SendfileMany(handles) => handles.iter().map(|h| h.len).sum(),
-            };
-            if actual != take {
-                anyhow::bail!("short load for {block}: expected {take} bytes, got {actual}");
-            }
-            loaded += take;
         }
         Ok(())
     }
@@ -328,16 +417,162 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn batches_and_single_loads_share_eight_concurrent_block_fills() {
+    async fn default_budget_allows_more_than_eight_block_fills() {
         for paged in [false, true] {
             let origin = Origin::new(206, 0, 0);
             let (_root, runtime) = setup_backend(paged, origin.backend());
+            let clone = runtime.clone();
+            let task = tokio::spawn(async move { clone.batch_load(&assignments(0, 16)).await });
+            origin.wait_for_calls(16).await;
+            assert_eq!(runtime.load_inflight_bytes, 1 << 30);
+            assert_eq!(runtime.load_bytes.available_permits(), (1 << 30) - 128);
+            origin.gate.add_permits(16);
+            assert!(task.await.unwrap().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn one_block_pipelines_ranges_within_budget_and_handles_short_tail() {
+        let origin = Origin::new(206, 0, 0);
+        let (root, mut runtime) = setup_backend(false, origin.backend());
+        runtime.block_size = 16 << 20;
+        runtime.capacity_bytes = 64 << 20;
+        runtime.l1 = Arc::new(MemoryStore::with_limits(32 << 20, 1 << 20));
+        let runtime = runtime
+            .with_paged_store(PagedBlockStore::open(root.path().join("pages"), 1 << 20).unwrap())
+            .with_load_inflight_bytes(8 << 20)
+            .unwrap();
+        let mut id = block(0);
+        id.block_size = runtime.block_size;
+        let len = (10 << 20) + 123;
+        let clone = runtime.clone();
+        let target = id.clone();
+        let task = tokio::spawn(async move { clone.load_block(&target, len).await });
+        origin.wait_for_calls(2).await;
+        assert_eq!(runtime.load_bytes.available_permits(), 0);
+        assert_eq!(
+            *origin.attempts.lock().unwrap(),
+            [(0, 1), (4 << 20, 1)].into()
+        );
+        origin.gate.add_permits(2);
+        origin.wait_for_calls(3).await;
+        origin.gate.add_permits(1);
+        task.await.unwrap().unwrap();
+        assert_eq!(runtime.load_bytes.available_permits(), 8 << 20);
+        assert_eq!(
+            runtime.l1.len(),
+            0,
+            "cold LOAD must not retain range slices in L1"
+        );
+        assert_eq!(
+            *origin.attempts.lock().unwrap(),
+            [(0, 1), (4 << 20, 1), (8 << 20, 1)].into()
+        );
+        let bytes = runtime
+            .serve_versioned(
+                &RangeRequest {
+                    object: id.object.clone(),
+                    offset: 0,
+                    len,
+                },
+                &id.version,
+                len,
+            )
+            .await
+            .unwrap();
+        // Check every page and the final short page through the normal read path.
+        let bytes = match bytes {
+            ServeOutcome::Bytes(bytes) => bytes,
+            _ => panic!("L1 miss should return bytes"),
+        };
+        assert_eq!(bytes.len() as u64, len);
+        assert!(bytes.iter().enumerate().all(|(i, b)| *b == i as u8));
+        assert_eq!(origin.attempts.lock().unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn sub_window_budget_aligns_pages_and_handles_partial_page() {
+        let origin = Origin::new(206, 0, 100);
+        let (_root, runtime) = setup_backend(true, origin.backend());
+        // Five bytes fit one four-byte page, not the usual 4 MiB range.
+        let runtime = runtime.with_load_inflight_bytes(5).unwrap();
+        runtime.load_block(&block(0), 7).await.unwrap();
+        assert_eq!(*origin.attempts.lock().unwrap(), [(0, 1), (4, 1)].into());
+        assert_eq!(runtime.load_bytes.available_permits(), 5);
+        assert_eq!(runtime.inflight_loads(), 0);
+    }
+
+    #[tokio::test]
+    async fn parallel_page_write_errors_drain_and_return_the_budget() {
+        let origin = Origin::new(206, 0, 100);
+        let (_root, runtime) = setup_backend(true, origin.backend());
+        let runtime = runtime.with_load_inflight_bytes(16).unwrap();
+        let dir = runtime.paged.as_ref().unwrap().dir_for(&block(0));
+        std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+        // An ordinary file where the block directory belongs makes both page
+        // writes fail after the HTTP response has already been received.
+        std::fs::write(&dir, b"not a directory").unwrap();
+        let failures = runtime.batch_load(&assignments(0, 2)).await.unwrap();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].index, 0);
+        assert_eq!(runtime.load_bytes.available_permits(), 16);
+        assert_eq!(runtime.page_mutations.active_count(), 0);
+        assert_eq!(runtime.inflight_loads(), 0);
+        assert!(runtime
+            .cached_page(&block(8), PageIndex(0))
+            .await
+            .unwrap()
+            .is_some());
+        std::fs::remove_file(dir).unwrap();
+        runtime.load_block(&block(0), 8).await.unwrap();
+        assert_eq!(runtime.load_bytes.available_permits(), 16);
+    }
+
+    #[tokio::test]
+    async fn cancelled_load_keeps_budget_until_blocked_disk_commit_finishes() {
+        for paged in [false, true] {
+            let origin = Origin::new(206, 0, 100);
+            let (_root, runtime) = setup_backend(paged, origin.backend());
+            let runtime = runtime.with_load_inflight_bytes(8).unwrap();
+            let state = runtime.page_lifecycle.block(&block(0));
+            let gate = state.gate.lock().await;
+            let clone = runtime.clone();
+            let task = tokio::spawn(async move { clone.load_block(&block(0), 8).await });
+            origin.wait_for_calls(1).await;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while runtime.page_mutations.active_count() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(runtime.load_bytes.available_permits(), 0);
+            assert!(runtime.inflight_loads() > 0);
+            drop(gate);
+            tokio::time::timeout(Duration::from_secs(5), runtime.page_mutations.drain())
+                .await
+                .unwrap();
+            assert_eq!(runtime.load_bytes.available_permits(), 8);
+            assert_eq!(runtime.inflight_loads(), 0);
+            runtime.load_block(&block(0), 8).await.unwrap();
+            assert_eq!(origin.attempts.lock().unwrap().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn batches_and_single_loads_share_byte_budget() {
+        for paged in [false, true] {
+            let origin = Origin::new(206, 0, 0);
+            let (_root, runtime) = setup_backend(paged, origin.backend());
+            let runtime = runtime.with_load_inflight_bytes(64).unwrap();
             let clone = runtime.clone();
             let task = tokio::spawn(async move {
                 clone.batch_load(&assignments(0, 16)).await.unwrap();
             });
             origin.wait_for_calls(8).await;
-            assert_eq!(runtime.load_block_slots.available_permits(), 0);
+            assert_eq!(runtime.load_bytes.available_permits(), 0);
             assert_eq!(origin.attempts.lock().unwrap().len(), 8);
 
             let clone = runtime.clone();
@@ -367,7 +602,7 @@ mod tests {
             origin.gate.add_permits(8);
             origin.wait_for_calls(16).await;
             assert_eq!(origin.attempts.lock().unwrap().len(), 16);
-            assert_eq!(runtime.load_block_slots.available_permits(), 0);
+            assert_eq!(runtime.load_bytes.available_permits(), 0);
             origin.gate.add_permits(33);
             tokio::time::timeout(Duration::from_secs(5), task)
                 .await
@@ -378,7 +613,10 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(origin.attempts.lock().unwrap().len(), 33);
-            assert_eq!(runtime.load_block_slots.available_permits(), 8);
+            assert_eq!(
+                runtime.load_bytes.available_permits() as u64,
+                runtime.load_inflight_bytes
+            );
             assert_eq!(runtime.load_slots.available_permits(), 8);
             assert_eq!(runtime.inflight_loads(), 0);
         }
@@ -394,10 +632,11 @@ mod tests {
                 let batch = runtime.batch_load(&requests);
                 tokio::pin!(batch);
                 assert!(futures::poll!(&mut batch).is_pending());
+                origin.wait_for_calls(3).await;
                 assert_eq!(origin.attempts.lock().unwrap().get(&0), Some(&1));
                 assert!(
-                    runtime.load_block_slots.available_permits() < 8,
-                    "retry backoff must retain its block permit"
+                    (runtime.load_bytes.available_permits() as u64) < runtime.load_inflight_bytes,
+                    "retry backoff must retain its payload reservation"
                 );
                 tokio::time::advance(Duration::from_millis(999)).await;
                 assert!(futures::poll!(&mut batch).is_pending());
@@ -418,7 +657,10 @@ mod tests {
                     *origin.attempts.lock().unwrap(),
                     [(0, 3), (8, 1), (16, 1)].into()
                 );
-                assert_eq!(runtime.load_block_slots.available_permits(), 8);
+                assert_eq!(
+                    runtime.load_bytes.available_permits() as u64,
+                    runtime.load_inflight_bytes
+                );
                 assert_eq!(runtime.inflight_loads(), 0);
             }
         }
@@ -438,7 +680,10 @@ mod tests {
                     [(0, calls), (8, 1), (16, 1)].into()
                 );
                 assert_eq!(runtime.load_slots.available_permits(), 8);
-                assert_eq!(runtime.load_block_slots.available_permits(), 8);
+                assert_eq!(
+                    runtime.load_bytes.available_permits() as u64,
+                    runtime.load_inflight_bytes
+                );
                 assert_eq!(runtime.inflight_loads(), 0);
             }
         }
@@ -470,7 +715,10 @@ mod tests {
                 *origin.attempts.lock().unwrap(),
                 (0..16).map(|index| (index * 8, 1)).collect()
             );
-            assert_eq!(runtime.load_block_slots.available_permits(), 8);
+            assert_eq!(
+                runtime.load_bytes.available_permits() as u64,
+                runtime.load_inflight_bytes
+            );
             assert_eq!(runtime.inflight_loads(), 0);
         }
     }
@@ -833,7 +1081,10 @@ mod tests {
             assert_eq!(backend.fetches.load(Ordering::SeqCst), 2);
             assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
             assert_eq!(runtime.load_slots.available_permits(), 8);
-            assert_eq!(runtime.load_block_slots.available_permits(), 8);
+            assert_eq!(
+                runtime.load_bytes.available_permits() as u64,
+                runtime.load_inflight_bytes
+            );
             assert_eq!(runtime.inflight_loads(), 0);
             runtime.load_block(&block(0), 8).await.unwrap();
             runtime.load_block(&block(16), 5).await.unwrap();

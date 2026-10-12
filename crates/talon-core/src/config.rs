@@ -168,6 +168,8 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
+    /// Worker-wide LOAD payload bytes reserved through cache commit (default 1 GiB).
+    pub load_inflight_bytes: u64,
     /// Page time to idle in hours; 0 disables idle expiration.
     pub page_tti_hours: u64,
     /// Dirty page access checkpoint interval in minutes.
@@ -325,6 +327,7 @@ impl Default for WorkerConfig {
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
+            load_inflight_bytes: 1 << 30,
             page_tti_hours: 0,
             page_access_checkpoint_interval_minutes: 1,
             page_gc_interval_minutes: 10,
@@ -415,6 +418,8 @@ pub struct WorkerConfigPatch {
     pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
     pub paged_miss_run_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::load_inflight_bytes`].
+    pub load_inflight_bytes: Option<u64>,
     /// Override for [`WorkerConfig::page_tti_hours`].
     pub page_tti_hours: Option<u64>,
     /// Override for [`WorkerConfig::page_access_checkpoint_interval_minutes`].
@@ -517,6 +522,7 @@ impl Patch for WorkerConfigPatch {
             paged_miss_run_concurrency: self
                 .paged_miss_run_concurrency
                 .or(base.paged_miss_run_concurrency),
+            load_inflight_bytes: self.load_inflight_bytes.or(base.load_inflight_bytes),
             page_tti_hours: self.page_tti_hours.or(base.page_tti_hours),
             page_access_checkpoint_interval_minutes: self
                 .page_access_checkpoint_interval_minutes
@@ -746,6 +752,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "Maximum independent paged-miss runs fetched concurrently per read.",
     },
     ConfigVar {
+        env: "TALON_WORKER_LOAD_INFLIGHT_BYTES",
+        key: "load_inflight_bytes",
+        default: Some("1073741824"),
+        cli: false,
+        secret: false,
+        help: "Worker-wide LOAD payload byte budget through cache commit; excludes L1 and transport overhead. Must fit one L2 page in paged mode or one block in whole-block mode.",
+    },
+    ConfigVar {
         env: "TALON_WORKER_BACKEND",
         key: "backend",
         default: Some("azure"),
@@ -946,6 +960,7 @@ pub(crate) mod worker_env {
     pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
+    pub const LOAD_INFLIGHT_BYTES: &str = "TALON_WORKER_LOAD_INFLIGHT_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
     pub const PAGE_TTI_HOURS: &str = "TALON_WORKER_PAGE_TTI_HOURS";
     pub const PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES: &str =
@@ -1098,6 +1113,9 @@ impl WorkerConfigPatch {
             paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
                 .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
                 .transpose()?,
+            load_inflight_bytes: get(worker_env::LOAD_INFLIGHT_BYTES)
+                .map(|v| parse_u64(v, worker_env::LOAD_INFLIGHT_BYTES))
+                .transpose()?,
             page_tti_hours: get(worker_env::PAGE_TTI_HOURS)
                 .map(|v| parse_u64(v, worker_env::PAGE_TTI_HOURS))
                 .transpose()?,
@@ -1243,6 +1261,7 @@ impl WorkerConfig {
             paged_miss_run_concurrency: merged
                 .paged_miss_run_concurrency
                 .unwrap_or(d.paged_miss_run_concurrency),
+            load_inflight_bytes: merged.load_inflight_bytes.unwrap_or(d.load_inflight_bytes),
             page_tti_hours: merged.page_tti_hours.unwrap_or(d.page_tti_hours),
             page_access_checkpoint_interval_minutes: merged
                 .page_access_checkpoint_interval_minutes
@@ -1486,6 +1505,19 @@ impl WorkerConfig {
         }
         if self.page_gc_io_concurrency == 0 {
             return Err(Error::Other("page_gc_io_concurrency must be > 0".into()));
+        }
+        let minimum_load = if self.l2_page_size_bytes == 0 {
+            u64::from(self.block_size)
+        } else {
+            self.l2_page_size_bytes
+        };
+        if self.load_inflight_bytes == 0
+            || self.load_inflight_bytes < minimum_load
+            || self.load_inflight_bytes > (usize::MAX >> 3) as u64
+        {
+            return Err(Error::Other(
+                "load_inflight_bytes must fit one L2 page (paged) or block (whole) and not exceed semaphore capacity".into(),
+            ));
         }
         if self.paged_miss_run_concurrency == 0 {
             return Err(Error::Other(
@@ -1944,6 +1976,51 @@ mod tests {
             merged.namespace_policy_path.as_deref(),
             Some(std::path::Path::new("/policy/env.toml"))
         );
+    }
+
+    #[test]
+    fn load_byte_budget_defaults_layers_and_validation() {
+        assert_eq!(WorkerConfig::default().load_inflight_bytes, 1 << 30);
+        let file = WorkerConfigPatch::from_toml("load_inflight_bytes = 536870912").unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == worker_env::LOAD_INFLIGHT_BYTES).then(|| "2147483648".into())
+        })
+        .unwrap();
+        assert_eq!(
+            WorkerConfig::resolve(file.clone(), Default::default(), Default::default())
+                .unwrap()
+                .load_inflight_bytes,
+            512 << 20
+        );
+        assert_eq!(
+            WorkerConfig::resolve(file, env, Default::default())
+                .unwrap()
+                .load_inflight_bytes,
+            2 << 30
+        );
+        for budget in [0, (256 << 20) - 1, u64::MAX] {
+            let cfg = WorkerConfig {
+                load_inflight_bytes: budget,
+                ..Default::default()
+            };
+            assert!(cfg
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("load_inflight_bytes"));
+        }
+        let mut cfg = WorkerConfig {
+            l2_page_size_bytes: 64 << 10,
+            load_inflight_bytes: 64 << 10,
+            ..Default::default()
+        };
+        cfg.validate().unwrap();
+        cfg.load_inflight_bytes -= 1;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("load_inflight_bytes"));
     }
 
     #[test]

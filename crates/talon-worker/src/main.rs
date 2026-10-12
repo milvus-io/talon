@@ -182,6 +182,7 @@ impl Args {
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
             paged_miss_run_concurrency: None,
+            load_inflight_bytes: None,
             page_tti_hours: None,
             page_access_checkpoint_interval_minutes: None,
             page_gc_interval_minutes: None,
@@ -395,6 +396,7 @@ async fn run() -> anyhow::Result<()> {
         l1_page_size_bytes = cfg.l1_page_size_bytes,
         l2_page_size_bytes = cfg.l2_page_size_bytes,
         paged_miss_run_concurrency = cfg.paged_miss_run_concurrency,
+        load_inflight_bytes = cfg.load_inflight_bytes,
         azure_account = ?cfg.azure_account,
         azure_endpoint = ?cfg.azure_endpoint,
         "starting talon-worker"
@@ -637,6 +639,7 @@ async fn run() -> anyhow::Result<()> {
     )
     .with_backend_kind(configured_backend)
     .with_paged_miss_run_concurrency(cfg.paged_miss_run_concurrency)
+    .with_load_inflight_bytes(cfg.load_inflight_bytes)?
     .with_rate_limiter(Arc::new(TenantRateLimiter::new(cfg.rate_limits.clone())));
     if cfg.rate_limits.enabled {
         tracing::info!("worker per-tenant rate limiting enabled");

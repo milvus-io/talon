@@ -97,9 +97,16 @@ talon-client batch-load --coordinator coordinator-host:7000 --manifest files.jso
 Batch load groups assignments by worker and sends up to **1024 block load
 instructions in one protocol request**, followed by one acknowledgement.
 Requests also fit the 1 MiB control-frame limit, including tracing metadata;
-long identities can cause earlier splitting. Workers process each batch with up
-to eight concurrent block loads. All batches and single LOADs on a worker share
-that block limit. Workers continue after individual failures and return failed
+long identities can cause earlier splitting. All batches and single LOADs on a
+worker share a configurable payload byte budget (`load_inflight_bytes`, default
+1 GiB; environment: `TALON_WORKER_LOAD_INFLIGHT_BYTES`). Paged LOADs fill
+page-aligned ranges concurrently, including within one block, and commit distinct
+pages concurrently. Reservations last through origin retries and cache commits,
+including accepted work finishing after client cancellation. Cold LOADs prewarm
+L2 without retaining origin buffers in L1 or assembling a response payload.
+The budget covers scheduled payload bytes, not process RSS, HTTP buffering,
+allocator overhead, L1, or ordinary read misses. Whole-block mode reserves one
+full block per fill. Workers continue after individual failures and return failed
 assignment indices after all fills complete, retaining completed cache fills. The SDK
 returns per-file counts in input order on success, or an error on any failed
 batch. Empty input succeeds without network I/O. Single and batch loads share
@@ -122,7 +129,7 @@ Workers automatically retry transient origin failures, including S3 `429` and
 three retries after the first attempt, with exponential backoff and full jitter
 (100 ms base, 5 s cap); `Retry-After` in seconds is honored up to that cap.
 `backend_max_retries`, `backend_retry_base_ms`, and `backend_retry_max_delay_ms`
-configure this policy. Backoff retains the block's concurrency permit. Only the
+configure this policy. Backoff retains the range's byte reservation. Only the
 failed origin request is retried; completed blocks are not replayed. Permission
 denied, missing objects, and version mismatches (`403`, `404`, `412`) are not
 retried. Exhausted retries fail the block and follow the batch failure behavior

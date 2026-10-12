@@ -21,16 +21,30 @@ const DIRECTORY_SHARDS: usize = 256;
 /// cleanup even if block.meta is missing or corrupt.
 pub(crate) struct PageMutationGate {
     directory: Arc<tokio::sync::RwLock<()>>,
-    block: tokio::sync::Mutex<()>,
+    block: tokio::sync::RwLock<()>,
 }
 pub(crate) struct PageMutationGuard<'a> {
     _directory: tokio::sync::OwnedRwLockReadGuard<()>,
-    _block: tokio::sync::MutexGuard<'a, ()>,
+    _block: futures::future::Either<
+        tokio::sync::RwLockReadGuard<'a, ()>,
+        tokio::sync::RwLockWriteGuard<'a, ()>,
+    >,
 }
 impl PageMutationGate {
+    /// Only for fills owning disjoint page-level InFlightGuards. GC, whole-block
+    /// promotion and ordinary commits continue to take the exclusive block lock.
+    pub async fn lock_page_fill(&self) -> PageMutationGuard<'_> {
+        let directory = self.directory.clone().read_owned().await;
+        let block = futures::future::Either::Left(self.block.read().await);
+        PageMutationGuard {
+            _directory: directory,
+            _block: block,
+        }
+    }
+
     pub async fn lock(&self) -> PageMutationGuard<'_> {
         let directory = self.directory.clone().read_owned().await;
-        let block = self.block.lock().await;
+        let block = futures::future::Either::Right(self.block.write().await);
         PageMutationGuard {
             _directory: directory,
             _block: block,
@@ -498,7 +512,7 @@ impl PageLifecycle {
             id: id.clone(),
             gate: Arc::new(PageMutationGate {
                 directory: self.directory_gate(hash.finish()),
-                block: tokio::sync::Mutex::new(()),
+                block: tokio::sync::RwLock::new(()),
             }),
             inner: Mutex::new(BlockPages::default()),
         });
@@ -899,6 +913,28 @@ mod tests {
             .await
             .unwrap();
         assert!(life.directory_gate(digest(&first)).try_write().is_err());
+    }
+
+    #[tokio::test]
+    async fn disjoint_fills_overlap_but_exclude_gc_and_whole_commits() {
+        let life = PageLifecycle::new();
+        let state = life.block(&id());
+        let a = state.gate.lock_page_fill().await;
+        let b = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.gate.lock_page_fill(),
+        )
+        .await
+        .unwrap();
+        let exclusive = state.gate.lock();
+        tokio::pin!(exclusive);
+        assert!(futures::poll!(&mut exclusive).is_pending());
+        assert!(state.gate.directory.try_write().is_err());
+        drop(a);
+        assert!(futures::poll!(&mut exclusive).is_pending());
+        drop(b);
+        let _exclusive = exclusive.await;
+        assert!(futures::poll!(std::pin::pin!(state.gate.lock_page_fill())).is_pending());
     }
 
     #[test]
