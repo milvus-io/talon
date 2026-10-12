@@ -212,8 +212,7 @@ impl WorkerRuntime {
     ) -> anyhow::Result<()> {
         let key = LoadKey::Whole(block.clone());
         loop {
-            if let Some(bytes) = self.cached_block_range(block, 0, len).await? {
-                anyhow::ensure!(bytes.len() as u64 == len, "short cached load for {block}");
+            if self.load_range_cached(block, 0, len).await {
                 return Ok(());
             }
             let (admission, flight) = self.inflight.admit_traced(key.clone());
@@ -1069,6 +1068,54 @@ mod tests {
             assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
             assert_eq!(runtime.l1.resident_bytes(), 0);
             assert_eq!(runtime.inflight_loads(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_load_waiters_recheck_residency_without_populating_l1() {
+        for waiting_on_fill in [false, true] {
+            let (_root, backend, runtime) = setup(false);
+            let mut runtime = runtime.with_load_inflight_bytes(8).unwrap();
+            runtime.l1 = Arc::new(MemoryStore::with_limits(64, 4));
+            let target = block(0);
+            let request = RangeRequest {
+                object: target.object.clone(),
+                offset: 0,
+                len: 8,
+            };
+            let leader = runtime
+                .inflight
+                .admit_owned(LoadKey::Whole(target.clone()))
+                .unwrap();
+            let budget = runtime.load_bytes.acquire_many(8).await.unwrap();
+            let load = async {
+                if waiting_on_fill {
+                    // Poll the inner operation directly to establish that it
+                    // has reached the single-flight wait before publishing.
+                    runtime.warm_whole_block(&request, &target, 8).await
+                } else {
+                    // The initial cache probe misses, then the RPC queues for
+                    // payload capacity while another fill completes.
+                    runtime.load_block(&target, 8).await
+                }
+            };
+            tokio::pin!(load);
+            assert!(futures::poll!(&mut load).is_pending());
+            runtime
+                .commit_cached_block(&target, Bytes::from_static(b"abcdefgh"))
+                .await
+                .unwrap();
+            drop(leader);
+            drop(budget);
+            tokio::time::timeout(Duration::from_secs(1), load)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+            assert_eq!(runtime.l1.resident_bytes(), 0);
+            assert_eq!(runtime.load_bytes.available_permits(), 8);
+            assert_eq!(runtime.inflight_loads(), 0);
+            assert!(runtime.load_range_cached(&target, 0, 8).await);
         }
     }
 
