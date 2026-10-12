@@ -357,6 +357,50 @@ public final class ConformanceTest {
                 } finally { peer.discoveryRelease.countDown(); }
             }
         });
+        check("initial discovery preserves protocol errors and recovers in the background", () -> {
+            for (boolean incompatibleSchema : new boolean[] {true, false}) {
+                try (PoolPeer peer = new PoolPeer()) {
+                    if (incompatibleSchema) peer.discoverySchema = 5;
+                    else peer.workerState = 3;
+                    String diagnostic = incompatibleSchema ? "control schema 5" : "invalid discovered member";
+                    try (TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                        try {
+                            client.read("s3://bucket/file", "v1", 1, 0, 1);
+                            throw new AssertionError("malformed discovery accepted by read");
+                        } catch (ProtocolException expected) {
+                            assertTrue(expected.getMessage().contains(diagnostic), "read preserves protocol diagnostic");
+                        }
+                        try {
+                            client.load("s3://bucket/file", "v1", 1);
+                            throw new AssertionError("malformed discovery accepted by LOAD");
+                        } catch (ProtocolException expected) {
+                            assertTrue(expected.getMessage().contains(diagnostic), "LOAD preserves protocol diagnostic");
+                        }
+                        try {
+                            client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)));
+                            throw new AssertionError("malformed discovery accepted by batch LOAD");
+                        } catch (BatchLoadException expected) {
+                            assertTrue(expected.getCause() instanceof ProtocolException, "batch preserves protocol cause");
+                            assertTrue(expected.getCause().getMessage().contains(diagnostic), "batch preserves protocol diagnostic");
+                        }
+                        assertTrue(peer.loadCounts.isEmpty(), "failed discovery does not dispatch LOAD");
+                        assertEquals(0, peer.dataAccepts.get(), "failed discovery does not dispatch reads");
+                        peer.discoverySchema = Messages.CONTROL_SCHEMA_VERSION;
+                        peer.workerState = 2;
+                        long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(3);
+                        boolean recovered = false;
+                        while (System.nanoTime() < until) {
+                            try {
+                                assertBytes(new byte[] {42}, client.read("s3://bucket/file", "v1", 1, 0, 1));
+                                recovered = true;
+                                break;
+                            } catch (ProtocolException expected) { Thread.sleep(5); }
+                        }
+                        assertTrue(recovered, "background refresh recovers from a protocol error");
+                    }
+                }
+            }
+        });
         check("background discovery publishes availability without blocking requests", () -> {
             try (PoolPeer peer = new PoolPeer()) {
                 peer.discoveryValidityMs = 100;
@@ -724,6 +768,7 @@ public final class ConformanceTest {
         final AtomicInteger dataAccepts = new AtomicInteger();
         final AtomicInteger statAccepts = new AtomicInteger();
         volatile long discoveryValidityMs = 500;
+        volatile int discoverySchema = Messages.CONTROL_SCHEMA_VERSION;
         final ExecutorService threads = Executors.newCachedThreadPool();
         volatile CountDownLatch arrived = new CountDownLatch(0);
         volatile CountDownLatch release = new CountDownLatch(0);
@@ -799,7 +844,7 @@ public final class ConformanceTest {
                         discoveryCalls.incrementAndGet();
                         discoveryArrived.countDown();
                         if (!discoveryRelease.await(5, TimeUnit.SECONDS)) throw new IOException("discovery gate timed out");
-                        Bincode.Writer discovery = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
+                        Bincode.Writer discovery = new Bincode.Writer().u16(discoverySchema).variant(Messages.TAG_MEMBERSHIP_LIST)
                                 .u64(1).u64(1).u64(discoveryValidityMs).u64(1).string("worker").u8(0).u8(0)
                                 .variant(workerState);
                         if (workerState == 2) discovery.string("test-instance").string(address());

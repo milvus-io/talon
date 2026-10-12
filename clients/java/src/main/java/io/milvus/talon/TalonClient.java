@@ -67,7 +67,7 @@ public final class TalonClient implements AutoCloseable {
     private final ConnectionPool discoveryPool;
     private boolean initialDiscoveryDone;
     private boolean closed;
-    private IOException discoveryFailure;
+    private Exception discoveryFailure;
     private final Map<String, ConnectionPool> instancePools = new HashMap<>();
     private final int maxIdlePerAddr;
     private final java.util.concurrent.Semaphore loadSlots = new java.util.concurrent.Semaphore(8);
@@ -565,8 +565,9 @@ public final class TalonClient implements AutoCloseable {
             }
             if (closed) throw new IOException("Talon client is closed");
             if (membership != null) return membership;
-            throw discoveryFailure != null ? discoveryFailure
-                    : new TalonException(TalonException.Code.UNAVAILABLE, "discovery not initialized");
+            if (discoveryFailure instanceof ProtocolException failure) throw failure;
+            if (discoveryFailure instanceof IOException failure) throw failure;
+            throw new TalonException(TalonException.Code.UNAVAILABLE, "discovery not initialized");
         } finally { membershipLock.unlock(); }
     }
 
@@ -590,10 +591,11 @@ public final class TalonClient implements AutoCloseable {
             } finally { membershipLock.unlock(); }
             long remainingMs = view.validForMs() - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
             delayMs = Math.max(100, Math.min(5_000, remainingMs / 2));
-        } catch (IOException failure) {
+        } catch (IOException | ProtocolException failure) {
             membershipLock.lock();
-            try { discoveryFailure = TalonException.transport(failure); }
-            finally { membershipLock.unlock(); }
+            try {
+                discoveryFailure = failure instanceof IOException io ? TalonException.transport(io) : failure;
+            } finally { membershipLock.unlock(); }
         } finally {
             membershipLock.lock();
             try {

@@ -12,6 +12,8 @@ struct Config {
     membership: Arc<MembershipCache>,
     workers: Arc<ConnectionPool>,
     placement: Arc<PlacementCache>,
+    #[cfg(test)]
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 #[derive(Clone, Default)]
@@ -42,6 +44,8 @@ impl DiscoveryRefresh {
             membership,
             workers,
             placement,
+            #[cfg(test)]
+            runtime: None,
         }));
         let background = config.clone();
         let (status_tx, status) = watch::channel(Status::default());
@@ -64,6 +68,10 @@ impl DiscoveryRefresh {
                         return;
                     }
                 };
+                #[cfg(test)]
+                {
+                    background.write_recover().runtime = Some(runtime.handle().clone());
+                }
                 runtime.block_on(async move {
                     loop {
                         let observed = Instant::now();
@@ -104,6 +112,10 @@ impl DiscoveryRefresh {
                         }
                     }
                 });
+                // Cancelling discovery drops its sockets, but Tokio's blocking
+                // DNS resolver cannot be cancelled once started. Do not make
+                // the last client's Drop wait for that resolver to return.
+                runtime.shutdown_background();
             });
         let thread = match thread {
             Ok(thread) => Some(thread),
@@ -361,5 +373,45 @@ mod tests {
             Arc::new(PlacementCache::new(30_000)),
         );
         drop(refresh);
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_wait_for_blocking_dns_work() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let refresh = DiscoveryRefresh::new(
+            &CoordinatorClient::new(listener.local_addr().unwrap().to_string()),
+            Arc::new(MembershipCache::new(30_000)),
+            Arc::new(ConnectionPool::new()),
+            Arc::new(PlacementCache::new(30_000)),
+        );
+        let (mut socket, _) = request(&listener).await;
+        let runtime = refresh.config.read_recover().runtime.clone().unwrap();
+        let (started, started_rx) = std::sync::mpsc::channel();
+        let (release, release_rx) = std::sync::mpsc::channel();
+        // Tokio resolves hostnames in spawn_blocking. Model a resolver that
+        // cannot be cancelled after it starts, without depending on real DNS.
+        let blocking = runtime.spawn_blocking(move || {
+            started.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let (dropped, dropped_rx) = std::sync::mpsc::channel();
+        let drop_thread = std::thread::spawn(move || {
+            drop(refresh);
+            dropped.send(()).unwrap();
+        });
+        let result = dropped_rx.recv_timeout(Duration::from_secs(1));
+        // Always release the resolver and join, including on regression failure.
+        release.send(()).unwrap();
+        drop_thread.join().unwrap();
+        blocking.await.unwrap();
+        result.expect("client shutdown must not wait for blocking DNS work");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), socket.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0,
+        );
     }
 }
