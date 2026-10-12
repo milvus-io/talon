@@ -1,20 +1,8 @@
-//! Tenant identity for per-tenant quality-of-service.
+//! Tenant identity for cache namespaces and quality of service.
 //!
-//! A *tenant* is the resource owner a request is attributed to when the cluster
-//! enforces per-tenant rate limits (and, later, cache quotas). Tenant identity
-//! reaches the enforcing tier in one of two ways:
-//!
-//! - on the **direct data plane**, the native SDK (and FUSE) declares the tenant
-//!   on each request, and the worker enforces against it;
-//! - at the **object-store gateway**, the tenant is resolved from the
-//!   authenticated principal (the provider account) and carried to the worker
-//!   the same way.
-//!
-//! The direct path is not authenticated, so a declared tenant is trusted for
-//! fairness, not treated as a security boundary. Requests that declare no tenant
-//! — a client that has not been taught to, or the FUSE mount — are attributed to
-//! the reserved [`TenantId::Unattributed`] tenant so that their traffic is still
-//! counted and bounded rather than silently escaping per-tenant policy.
+//! Unspecified identities resolve to `default`. `Unattributed` is retained only
+//! for decoding older clients and is normalized at request boundaries. Direct
+//! clients declare their identity; this is not an authentication boundary.
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -25,7 +13,47 @@ use std::fmt;
 /// data-plane requests, serve as map keys on the hot path, and appear in bounded
 /// telemetry. A fixed ceiling keeps every one of those uses bounded regardless
 /// of the caller.
-pub const MAX_TENANT_ID_BYTES: usize = 256;
+pub const MAX_TENANT_ID_BYTES: usize = 255;
+
+/// Tenant used by requests and services without an explicit identity.
+pub const DEFAULT_TENANT: &str = "default";
+
+/// Validated, borrowed tenant identity carried by one request.
+/// Copying the context never allocates or touches shared reference counts.
+#[derive(Debug, Clone, Copy)]
+pub struct TenantContext<'a>(&'a str);
+
+impl<'a> TenantContext<'a> {
+    /// Validate a name once without taking ownership of its storage.
+    pub fn new(name: &'a str) -> Result<Self, TenantIdError> {
+        if name.is_empty() {
+            return Err(TenantIdError::Empty);
+        }
+        if name.len() > MAX_TENANT_ID_BYTES {
+            return Err(TenantIdError::TooLong(name.len()));
+        }
+        if name == "."
+            || name == ".."
+            || !name
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+        {
+            return Err(TenantIdError::UnsafePath);
+        }
+        Ok(Self(name))
+    }
+
+    /// The validated effective tenant name.
+    pub fn name(self) -> &'a str {
+        self.0
+    }
+}
+
+impl Default for TenantContext<'_> {
+    fn default() -> Self {
+        Self(DEFAULT_TENANT)
+    }
+}
 
 /// The resource owner a request is attributed to for QoS.
 ///
@@ -36,13 +64,34 @@ pub const MAX_TENANT_ID_BYTES: usize = 256;
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TenantId {
     /// A named tenant, declared by the SDK on the direct path or resolved from
-    /// the authenticated principal at the gateway.
+    /// the service configuration at the gateway.
     Named(String),
     /// Traffic that declared no tenant.
     Unattributed,
 }
 
+impl Default for TenantId {
+    fn default() -> Self {
+        Self::named(DEFAULT_TENANT)
+    }
+}
+
 impl TenantId {
+    /// Canonical namespace name, including the legacy unspecified identity.
+    pub fn effective_name(&self) -> &str {
+        self.name().unwrap_or(DEFAULT_TENANT)
+    }
+
+    /// Normalize the legacy wire identity before storage or policy lookup.
+    pub fn normalized(&self) -> Self {
+        Self::named(self.effective_name())
+    }
+
+    /// Whether this identity selects the default namespace.
+    pub fn is_default(&self) -> bool {
+        self.effective_name() == DEFAULT_TENANT
+    }
+
     /// Human-readable label for the [`TenantId::Unattributed`] tenant in logs,
     /// the management API, and (allow-listed) telemetry.
     pub const UNATTRIBUTED_LABEL: &'static str = "unattributed";
@@ -67,9 +116,8 @@ impl TenantId {
 
     /// The name of a named tenant, or `None` for the unattributed tenant.
     ///
-    /// Prefer matching on the tenant, or using it directly as a map key, over
-    /// flattening it to a string: two distinct tenants never share a name, and
-    /// the unattributed tenant deliberately has none.
+    /// Use `effective_name` for storage and policy lookup so legacy unspecified
+    /// identities share the default namespace.
     pub fn name(&self) -> Option<&str> {
         match self {
             Self::Named(name) => Some(name),
@@ -82,14 +130,12 @@ impl TenantId {
     /// A named tenant must carry a non-empty name no longer than
     /// [`MAX_TENANT_ID_BYTES`]. The unattributed tenant is always valid.
     pub fn validate(&self) -> Result<(), TenantIdError> {
-        match self {
-            Self::Unattributed => Ok(()),
-            Self::Named(name) if name.is_empty() => Err(TenantIdError::Empty),
-            Self::Named(name) if name.len() > MAX_TENANT_ID_BYTES => {
-                Err(TenantIdError::TooLong(name.len()))
-            }
-            Self::Named(_) => Ok(()),
-        }
+        self.context().map(|_| ())
+    }
+
+    /// Borrow and validate the effective name without copying it.
+    pub fn context(&self) -> Result<TenantContext<'_>, TenantIdError> {
+        TenantContext::new(self.effective_name())
     }
 }
 
@@ -111,6 +157,9 @@ pub enum TenantIdError {
     /// A named tenant exceeded the maximum tenant id length.
     #[error("tenant name of {0} bytes exceeds the maximum tenant id length")]
     TooLong(usize),
+    /// Tenant ids must be single, portable filesystem components.
+    #[error("tenant name must contain only ASCII letters, digits, '.', '_' or '-', and cannot be '.' or '..'")]
+    UnsafePath,
 }
 
 #[cfg(test)]

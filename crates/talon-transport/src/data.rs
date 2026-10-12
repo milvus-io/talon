@@ -465,6 +465,7 @@ pub fn decode_put_header(buf: &[u8]) -> Result<(FrameHeader, PutRequest), DataEr
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     let req: PutRequest = bincode::deserialize(body)?;
     Ok((header, req))
 }
@@ -499,6 +500,7 @@ pub fn decode_cached_block_put_header(
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     Ok((header, bincode::deserialize(body)?))
 }
 
@@ -526,6 +528,7 @@ pub fn decode_delete(buf: &[u8]) -> Result<(FrameHeader, DeleteRequest), DataErr
             actual: body.len(),
         });
     }
+    let (_, body) = crate::envelope::decode(&header, body)?;
     let req: DeleteRequest = bincode::deserialize(body)?;
     Ok((header, req))
 }

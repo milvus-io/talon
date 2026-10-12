@@ -73,7 +73,7 @@ where
     // Decode (validates magic/version/type and the global max), then enforce the
     // per-type cap BEFORE allocating the payload.
     let header = FrameHeader::decode(&header_buf)?;
-    let cap = max_payload_for(header.msg_type).saturating_add(if header.version == 2 {
+    let cap = max_payload_for(header.msg_type).saturating_add(if header.version >= 2 {
         crate::envelope::ENVELOPE_OVERHEAD
     } else {
         0
@@ -277,7 +277,7 @@ impl BufferedFrameReader {
 
         // Enforce the per-type cap BEFORE consuming the header or allocating the
         // payload, so a lying peer cannot pin memory (issue #111).
-        let cap = max_payload_for(header.msg_type).saturating_add(if header.version == 2 {
+        let cap = max_payload_for(header.msg_type).saturating_add(if header.version >= 2 {
             crate::envelope::ENVELOPE_OVERHEAD
         } else {
             0

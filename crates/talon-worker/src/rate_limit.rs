@@ -162,6 +162,8 @@ impl TenantRateLimiter {
         if !self.policy.enabled {
             return Ok(());
         }
+        let default = tenant.is_unattributed().then(TenantId::default);
+        let tenant = default.as_ref().unwrap_or(tenant);
         // Fast path: a warm tenant (an override or a previously-seen
         // default-governed tenant) is charged in place under a shared read lock,
         // so admits for different tenants never block each other and the
@@ -262,6 +264,7 @@ mod tests {
         let limiter = TenantRateLimiter::new(iops_policy(1, 1.0));
         assert!(limiter.admit_at(&TenantId::unattributed(), 0, 0).is_ok());
         assert!(limiter.admit_at(&TenantId::unattributed(), 0, 0).is_err());
+        assert!(limiter.admit_at(&TenantId::default(), 0, 0).is_err());
     }
 
     #[test]

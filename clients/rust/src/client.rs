@@ -3,6 +3,7 @@
 mod membership_fixture;
 
 use std::sync::Arc;
+use talon_core::TenantContext;
 use tokio::sync::Semaphore;
 
 use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
@@ -36,6 +37,13 @@ pub struct Client {
     coordinator: CoordinatorClient,
     reader: BlockReader,
     block_read_permits: Arc<Semaphore>,
+    block_size: u32,
+}
+
+// Resolved once at the API boundary; borrowed through metadata and block RPCs.
+#[derive(Clone, Copy)]
+struct RequestContext<'a> {
+    tenant: TenantContext<'a>,
     block_size: u32,
 }
 
@@ -151,6 +159,19 @@ impl Client {
         self.block_size
     }
 
+    fn request_context<'a>(
+        &self,
+        options: &crate::RequestOptions<'a>,
+    ) -> Result<RequestContext<'a>, Error> {
+        let tenant = TenantContext::new(options.tenant.unwrap_or(talon_core::DEFAULT_TENANT))
+            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        let block_size = options.block_size.unwrap_or(self.block_size);
+        if block_size == 0 {
+            return Err(Error::InvalidArgument("block_size must be positive".into()));
+        }
+        Ok(RequestContext { tenant, block_size })
+    }
+
     /// Prewarm a file's specified version on its Maglev primary workers.
     /// The caller supplies the size of this version; LOAD issues no HEAD.
     /// Waits for all blocks, returning an error on any failure.
@@ -161,19 +182,45 @@ impl Client {
         version: &Version,
         size: u64,
     ) -> Result<crate::LoadResult, crate::LoadError> {
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
+        self.load_with_options(object, version, size, &crate::RequestOptions::default())
+            .await
+    }
+
+    /// Prewarm with per-request tenant, block size and trace options.
+    pub async fn load_with_options(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        size: u64,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<crate::LoadResult, crate::LoadError> {
+        let request = self
+            .request_context(options)
+            .map_err(|e| crate::LoadError::InvalidArgument(e.to_string()))?;
+        let op = talon_telemetry::Operation::new("talon.load", "internal", options.parent);
+        let result = op
+            .scope(self.load_inner(object, version, size, request))
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn load_inner(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        size: u64,
+        request: RequestContext<'_>,
+    ) -> Result<crate::LoadResult, crate::LoadError> {
         self.reader
-            .load(
+            .load_with_context(
                 &talon_cache_client::FileView {
                     object,
                     version,
                     size,
-                    block_size: self.block_size,
+                    block_size: request.block_size,
                 },
-                now_ms,
+                request.tenant,
             )
             .await
     }
@@ -187,20 +234,42 @@ impl Client {
         &self,
         requests: &[LoadRequest],
     ) -> Result<Vec<crate::LoadResult>, crate::LoadError> {
+        self.batch_load_with_options(requests, &crate::RequestOptions::default())
+            .await
+    }
+
+    /// Prewarm a batch for one tenant with per-request planning and trace options.
+    pub async fn batch_load_with_options(
+        &self,
+        requests: &[LoadRequest],
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<Vec<crate::LoadResult>, crate::LoadError> {
+        let request = self
+            .request_context(options)
+            .map_err(|e| crate::LoadError::InvalidArgument(e.to_string()))?;
+        let op = talon_telemetry::Operation::new("talon.batch_load", "internal", options.parent);
+        let result = op.scope(self.batch_load_inner(requests, request)).await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn batch_load_inner(
+        &self,
+        requests: &[LoadRequest],
+        request: RequestContext<'_>,
+    ) -> Result<Vec<crate::LoadResult>, crate::LoadError> {
         let files = requests
             .iter()
-            .map(|request| talon_cache_client::FileView {
-                object: &request.object,
-                version: &request.version,
-                size: request.size,
-                block_size: self.block_size,
+            .map(|file| talon_cache_client::FileView {
+                object: &file.object,
+                version: &file.version,
+                size: file.size,
+                block_size: request.block_size,
             })
             .collect::<Vec<_>>();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-        self.reader.batch_load(&files, now_ms).await
+        self.reader
+            .batch_load_with_context(&files, request.tenant)
+            .await
     }
 
     /// Return an object's current size and source version.
@@ -216,18 +285,45 @@ impl Client {
         options: &crate::RequestOptions<'_>,
     ) -> Result<ObjectStat, Error> {
         let op = talon_telemetry::Operation::new("talon.stat", "internal", options.parent);
-        let result = op.scope(self.stat_inner(object)).await;
+        let request = self.request_context(options)?;
+        let result = op.scope(self.stat_inner(object, request)).await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
     }
 
-    async fn stat_inner(&self, object: &ObjectId) -> Result<ObjectStat, Error> {
-        Ok(self.coordinator.stat_object(object).await?)
+    async fn stat_inner(
+        &self,
+        object: &ObjectId,
+        request: RequestContext<'_>,
+    ) -> Result<ObjectStat, Error> {
+        Ok(self
+            .coordinator
+            .stat_object_with_context(object, request.tenant)
+            .await?)
     }
 
     /// List objects below a mount-relative prefix.
     pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectEntry>, Error> {
-        Ok(self.coordinator.list_objects(prefix).await?)
+        self.list_with_options(prefix, &crate::RequestOptions::default())
+            .await
+    }
+
+    /// List objects using the request's tenant and trace options.
+    pub async fn list_with_options(
+        &self,
+        prefix: &str,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<Vec<ObjectEntry>, Error> {
+        let request = self.request_context(options)?;
+        let op = talon_telemetry::Operation::new("talon.list", "internal", options.parent);
+        let result = op
+            .scope(
+                self.coordinator
+                    .list_objects_with_context(prefix, request.tenant),
+            )
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        Ok(result?)
     }
 
     /// Read an object range into a newly allocated buffer.
@@ -264,8 +360,9 @@ impl Client {
         options: &crate::RequestOptions<'_>,
     ) -> Result<Vec<u8>, Error> {
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
+        let request = self.request_context(options)?;
         let result = op
-            .scope(self.read_inner(object, offset, length, known_stat))
+            .scope(self.read_inner(object, offset, length, known_stat, request))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -277,13 +374,14 @@ impl Client {
         offset: u64,
         length: Option<u64>,
         known_stat: Option<&ObjectStat>,
+        request: RequestContext<'_>,
     ) -> Result<Vec<u8>, Error> {
         if length == Some(0) {
             return Ok(Vec::new());
         }
         let stat = match known_stat {
             Some(stat) => stat.clone(),
-            None => self.stat_inner(object).await?,
+            None => self.stat_inner(object, request).await?,
         };
         let requested = length.unwrap_or_else(|| stat.size.saturating_sub(offset));
         let planned = requested.min(stat.size.saturating_sub(offset));
@@ -302,7 +400,7 @@ impl Client {
 
         let mut bytes = vec![0_u8; planned];
         let written = self
-            .read_into_resolved(object, offset, &mut bytes, &stat)
+            .read_into_resolved(object, offset, &mut bytes, &stat, request)
             .await?;
         bytes.truncate(written);
         Ok(bytes)
@@ -338,8 +436,9 @@ impl Client {
         options: &crate::RequestOptions<'_>,
     ) -> Result<usize, Error> {
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
+        let request = self.request_context(options)?;
         let result = op
-            .scope(self.read_into_inner(object, offset, dst, known_stat))
+            .scope(self.read_into_inner(object, offset, dst, known_stat, request))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -351,15 +450,17 @@ impl Client {
         offset: u64,
         dst: &mut [u8],
         known_stat: Option<&ObjectStat>,
+        request: RequestContext<'_>,
     ) -> Result<usize, Error> {
         if dst.is_empty() {
             return Ok(0);
         }
         let stat = match known_stat {
             Some(stat) => stat.clone(),
-            None => self.stat_inner(object).await?,
+            None => self.stat_inner(object, request).await?,
         };
-        self.read_into_resolved(object, offset, dst, &stat).await
+        self.read_into_resolved(object, offset, dst, &stat, request)
+            .await
     }
 
     async fn read_into_resolved(
@@ -368,6 +469,7 @@ impl Client {
         offset: u64,
         dst: &mut [u8],
         stat: &ObjectStat,
+        request: RequestContext<'_>,
     ) -> Result<usize, Error> {
         let requested = u64::try_from(dst.len())
             .map_err(|_| Error::InvalidArgument("destination length does not fit in u64".into()))?;
@@ -382,7 +484,7 @@ impl Client {
             object,
             offset,
             requested,
-            self.block_size,
+            request.block_size,
             &version,
             stat.size,
         );
@@ -391,8 +493,8 @@ impl Client {
         let blocks = if planned_len == 0 {
             0
         } else {
-            (offset % u64::from(self.block_size) + planned_len as u64)
-                .div_ceil(u64::from(self.block_size))
+            (offset % u64::from(request.block_size) + planned_len as u64)
+                .div_ceil(u64::from(request.block_size))
         };
         talon_telemetry::record("talon.read.planned_blocks", blocks);
         if planned_len == 0 {
@@ -409,6 +511,7 @@ impl Client {
                 segment,
                 chunk,
                 stat.size,
+                request.tenant,
             ));
         }
 
@@ -424,6 +527,7 @@ impl Client {
                     segment,
                     chunk,
                     stat.size,
+                    request.tenant,
                 ));
             }
         }
@@ -437,13 +541,20 @@ async fn read_segment_into(
     segment: BlockSegment,
     dst: &mut [u8],
     object_len: u64,
+    tenant: TenantContext<'_>,
 ) -> Result<usize, Error> {
     let _permit = permits
         .acquire()
         .await
         .expect("client never closes its read budget");
     reader
-        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, object_len)
+        .read_versioned_block_into_with_context(
+            &segment.block,
+            segment.offset_in_block,
+            dst,
+            object_len,
+            tenant,
+        )
         .await
         .map_err(Error::from)
 }
@@ -492,6 +603,183 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{Notify, Semaphore};
+
+    #[tokio::test]
+    async fn one_client_isolates_concurrent_request_tenants_and_geometry() {
+        use talon_transport::{codec, data, envelope, MsgType};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer = address.clone();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let address = peer.clone();
+                let reads = reads.clone();
+                let barrier = barrier.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut raw = [0; HEADER_LEN];
+                        if socket.read_exact(&mut raw).await.is_err() {
+                            return;
+                        }
+                        let header = FrameHeader::decode(&raw).unwrap();
+                        let mut payload = vec![0; header.length as usize];
+                        socket.read_exact(&mut payload).await.unwrap();
+                        let (metadata, _) = envelope::decode(&header, &payload).unwrap();
+                        let tenant = metadata.tenant.unwrap_or_default();
+                        let name = tenant.effective_name();
+                        let expected_size = match name {
+                            "a" => 4,
+                            "b" => 8,
+                            "default" => 16,
+                            _ => panic!("unexpected tenant"),
+                        };
+                        let mut frame = raw.to_vec();
+                        frame.extend(payload);
+                        let response = if header.msg_type == MsgType::Control {
+                            let reply = match codec::decode_request(&frame).unwrap().1 {
+                                ControlMessage::MembershipQuery {} => {
+                                    membership_fixture::zoned(vec![
+                                        talon_transport::ZonedNodeInfo {
+                                            info: NodeInfo {
+                                                id: NodeId::new("worker"),
+                                                address: address.clone(),
+                                                role: NodeRole::Worker,
+                                            },
+                                            zone: None,
+                                        },
+                                    ])
+                                }
+                                ControlMessage::StatObject { .. } => ControlMessage::ObjectStat {
+                                    size: 17,
+                                    version: name.into(),
+                                },
+                                ControlMessage::ListObjects { .. } => ControlMessage::ObjectList {
+                                    entries: vec![ObjectEntry {
+                                        path: name.into(),
+                                        size: 17,
+                                    }],
+                                },
+                                ControlMessage::LoadBlock { block, .. } => {
+                                    assert_eq!(block.block_size, expected_size);
+                                    ControlMessage::Ack {
+                                        ok: true,
+                                        detail: None,
+                                    }
+                                }
+                                ControlMessage::BatchLoad { blocks } => {
+                                    assert!(blocks
+                                        .iter()
+                                        .all(|r| r.block.block_size == expected_size));
+                                    ControlMessage::BatchLoadResult { failures: vec![] }
+                                }
+                                _ => panic!("unexpected control"),
+                            };
+                            codec::encode(header.request_id, &reply).unwrap()
+                        } else {
+                            let request = if header.msg_type == MsgType::GetVersionedRangeTenant {
+                                data::decode_versioned_tenant_request(&frame)
+                                    .unwrap()
+                                    .1
+                                    .request
+                            } else {
+                                data::decode_versioned_request(&frame).unwrap().1
+                            };
+                            assert_eq!(
+                                request.version.as_str(),
+                                name,
+                                "stat must use the same tenant as the read"
+                            );
+                            if reads.fetch_add(1, Ordering::SeqCst) < 2 {
+                                barrier.wait().await;
+                            }
+                            let mut reply =
+                                response_header_ok(header.request_id, request.request.len as u32)
+                                    .to_vec();
+                            reply.extend(vec![name.as_bytes()[0]; request.request.len as usize]);
+                            reply
+                        };
+                        socket.write_all(&response).await.unwrap();
+                        socket.flush().await.unwrap();
+                    }
+                });
+            }
+        });
+        let client = ClientBuilder::default()
+            .with_coordinator(address)
+            .with_block_size(16)
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        let exercise = |tenant: &'static str, block_size| {
+            let client = &client;
+            let object = &object;
+            async move {
+                let options = crate::RequestOptions {
+                    tenant: Some(tenant),
+                    block_size: Some(block_size),
+                    ..Default::default()
+                };
+                assert_eq!(
+                    client
+                        .read_with_options(object, 0, Some(1), None, &options)
+                        .await
+                        .unwrap(),
+                    [tenant.as_bytes()[0]]
+                );
+                let mut dst = [0];
+                client
+                    .read_into_with_options(object, 0, &mut dst, None, &options)
+                    .await
+                    .unwrap();
+                assert_eq!(dst, [tenant.as_bytes()[0]]);
+                assert_eq!(
+                    client
+                        .list_with_options("s3/bucket", &options)
+                        .await
+                        .unwrap()[0]
+                        .path,
+                    tenant
+                );
+                let result = client
+                    .load_with_options(object, &Version::new("v1"), 9, &options)
+                    .await
+                    .unwrap();
+                assert_eq!(result.blocks, 9_u64.div_ceil(block_size as u64));
+                client
+                    .batch_load_with_options(
+                        &[LoadRequest {
+                            object: object.clone(),
+                            version: Version::new("v1"),
+                            size: 9,
+                        }],
+                        &options,
+                    )
+                    .await
+                    .unwrap();
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(exercise("a", 4), exercise("b", 8));
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            client.read(&object, 0, Some(1), None).await.unwrap(),
+            [b'd']
+        );
+        assert_eq!(
+            client
+                .load(&object, &Version::new("v1"), 9)
+                .await
+                .unwrap()
+                .blocks,
+            1
+        );
+        assert_eq!(client.block_size(), 16);
+        server.abort();
+    }
 
     async fn mock_coordinator() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1370,11 +1658,32 @@ mod tests {
         let first_stat = stat.clone();
         let first = tokio::spawn(async move {
             first_client
-                .read(&first_object, 0, Some(8), Some(&first_stat))
+                .read_with_options(
+                    &first_object,
+                    0,
+                    Some(8),
+                    Some(&first_stat),
+                    &crate::RequestOptions {
+                        tenant: Some("a"),
+                        ..Default::default()
+                    },
+                )
                 .await
         });
-        let second =
-            tokio::spawn(async move { client.read(&object, 8, Some(8), Some(&stat)).await });
+        let second = tokio::spawn(async move {
+            client
+                .read_with_options(
+                    &object,
+                    8,
+                    Some(8),
+                    Some(&stat),
+                    &crate::RequestOptions {
+                        tenant: Some("b"),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
 
         wait_for_started(&started, &started_notify, 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;

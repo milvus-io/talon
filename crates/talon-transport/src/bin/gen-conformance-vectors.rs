@@ -281,6 +281,25 @@ fn vectors() -> Vec<Vector> {
             2,
         ),
     });
+    for (name, source) in [
+        ("v3.range.tenant", "data.range_request"),
+        ("v3.range.context_tenant", "v2.range.context"),
+        ("v3.load.tenant", "control.load_block"),
+    ] {
+        let mut bytes = result
+            .iter()
+            .find(|v| v.name == source)
+            .unwrap()
+            .bytes
+            .clone();
+        talon_transport::envelope::encode_tenant(&mut bytes, &talon_core::TenantId::named("acme"))
+            .unwrap();
+        result.push(Vector {
+            name,
+            note: "v3 requires tenant acme; original business payload unchanged",
+            bytes,
+        });
+    }
     use talon_core::worker_membership::*;
     result.push(control(
         "control.membership_instances",

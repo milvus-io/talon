@@ -12,6 +12,8 @@
 //! their TCP connection to a shared pool; stale pooled sockets are retried once
 //! on a fresh connection.
 
+use talon_core::TenantContext;
+
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -169,8 +171,8 @@ pub enum WorkerLoadError {
 pub struct WorkerClient {
     addr: String,
     pool: Arc<ConnectionPool>,
-    /// Tenant every fetch from this client is attributed to. `Unattributed`
-    /// unless set with [`with_tenant`](Self::with_tenant).
+    /// Tenant every fetch from this client is attributed to. `default`
+    /// unless set with [`request`](Self::request).
     tenant: TenantId,
 }
 
@@ -189,7 +191,7 @@ impl WorkerClient {
         Self {
             addr: addr.into(),
             pool,
-            tenant: TenantId::Unattributed,
+            tenant: TenantId::default(),
         }
     }
 
@@ -198,25 +200,23 @@ impl WorkerClient {
         &self.addr
     }
 
-    /// Attribute every fetch from this client to `tenant` for per-tenant QoS.
-    ///
-    /// A named tenant is sent as a `GetRangeTenant` frame; the default
-    /// (`Unattributed`) sends an ordinary `GetRange`. Send a named tenant only
-    /// to workers known to understand the type — an older worker fails the
-    /// request closed rather than misreading it.
-    pub fn with_tenant(mut self, tenant: TenantId) -> Self {
-        self.tenant = tenant;
-        self
+    /// Create an immutable request handle sharing this client's connection pool.
+    /// Concurrent handles may select different tenants; the client is unchanged.
+    pub fn request(&self, tenant: &TenantId) -> Result<Self, talon_core::TenantIdError> {
+        tenant.validate()?;
+        let mut request = self.clone();
+        request.tenant = tenant.normalized();
+        Ok(request)
     }
 
-    /// Encode a range request, as a tenant-scoped frame when this client is
-    /// bound to a named tenant, else as a plain `GetRange`.
+    /// Encode a tenant-scoped range frame when the request handle selects a
+    /// non-default tenant, else a plain `GetRange`.
     fn encode_range_request(
         &self,
         request_id: u32,
         request: RangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_unattributed() {
+        if self.tenant.is_default() {
             encode_request(request_id, &request)
         } else {
             encode_tenant_request(
@@ -229,8 +229,8 @@ impl WorkerClient {
         }
     }
 
-    /// Encode a cache-only range request, as a tenant-scoped frame when this
-    /// client is bound to a named tenant, else as a plain `GetCachedRange`. A
+    /// Encode a tenant-scoped cache-only frame when the request handle selects a
+    /// non-default tenant, else a plain `GetCachedRange`. A
     /// named tenant keeps resident-only reads attributed so they are metered by
     /// the worker like any other read.
     fn encode_cached_range_request(
@@ -238,7 +238,7 @@ impl WorkerClient {
         request_id: u32,
         request: CachedRangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_unattributed() {
+        if self.tenant.is_default() {
             encode_cached_request(request_id, &request)
         } else {
             encode_cached_tenant_request(
@@ -259,7 +259,7 @@ impl WorkerClient {
         request_id: u32,
         request: VersionedRangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_unattributed() {
+        if self.tenant.is_default() {
             encode_versioned_request(request_id, &request)
         } else {
             encode_versioned_tenant_request(
@@ -276,12 +276,23 @@ impl WorkerClient {
     /// The two-minute deadline covers connection setup, exchange, and at most
     /// one retry of a stale pooled socket. Rejections are never retried.
     pub async fn load_block(&self, block: &BlockId, len: u64) -> Result<(), WorkerLoadError> {
+        self.load_block_with_context(block, len, self.tenant.context().expect("validated tenant"))
+            .await
+    }
+
+    pub(crate) async fn load_block_with_context(
+        &self,
+        block: &BlockId,
+        len: u64,
+        tenant: TenantContext<'_>,
+    ) -> Result<(), WorkerLoadError> {
         self.load_control(
             &talon_transport::ControlMessage::LoadBlock {
                 block: block.clone(),
                 len,
             },
             Duration::from_secs(120),
+            tenant,
         )
         .await
         .map(|_| ())
@@ -293,11 +304,21 @@ impl WorkerClient {
         &self,
         blocks: &[talon_transport::LoadBlockRequest],
     ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
+        self.batch_load_with_context(blocks, self.tenant.context().expect("validated tenant"))
+            .await
+    }
+
+    pub(crate) async fn batch_load_with_context(
+        &self,
+        blocks: &[talon_transport::LoadBlockRequest],
+        tenant: TenantContext<'_>,
+    ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
         self.load_control(
             &talon_transport::ControlMessage::BatchLoad {
                 blocks: blocks.to_vec(),
             },
             Duration::from_secs(30 * 60),
+            tenant,
         )
         .await
     }
@@ -306,6 +327,7 @@ impl WorkerClient {
         &self,
         message: &talon_transport::ControlMessage,
         deadline: Duration,
+        tenant: TenantContext<'_>,
     ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
         let batch_count = match message {
             talon_transport::ControlMessage::BatchLoad { blocks } => Some(blocks.len()),
@@ -313,7 +335,7 @@ impl WorkerClient {
         };
         let request_id = RequestId::next().0;
         let mut output = talon_transport::codec::encode(request_id, message)?;
-        talon_transport::envelope::outbound(&mut output, &self.addr)
+        talon_transport::envelope::outbound_tenant_context(&mut output, &self.addr, tenant)
             .map_err(talon_transport::CodecError::from)?;
         self.pool
             .with_deadline("worker load", deadline, async {
@@ -383,7 +405,7 @@ impl WorkerClient {
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut out, &self.addr)?;
+                    talon_transport::envelope::outbound_tenant(&mut out, &self.addr, &self.tenant)?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
@@ -431,12 +453,23 @@ impl WorkerClient {
         };
         let request_id = RequestId::next();
         let mut output = self.encode_range_request(request_id.0, request)?;
-        match self.exchange_into(&mut output, dst).await {
+        match self
+            .exchange_into(
+                &mut output,
+                dst,
+                self.tenant.context().expect("validated tenant"),
+            )
+            .await
+        {
             Ok(n) => Ok(n),
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+                    talon_transport::envelope::outbound_tenant(
+                        &mut output,
+                        &self.addr,
+                        &self.tenant,
+                    )?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let n = self
@@ -496,7 +529,11 @@ impl WorkerClient {
             Err((true, error)) if error.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+                    talon_transport::envelope::outbound_tenant(
+                        &mut output,
+                        &self.addr,
+                        &self.tenant,
+                    )?;
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
                         .pool
@@ -536,6 +573,26 @@ impl WorkerClient {
         dst: &mut [u8],
         object_len: u64,
     ) -> Result<usize, WorkerError> {
+        self.fetch_versioned_range_into_with_context(
+            object,
+            version,
+            offset,
+            dst,
+            object_len,
+            self.tenant.context().expect("validated tenant"),
+        )
+        .await
+    }
+
+    pub(crate) async fn fetch_versioned_range_into_with_context(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        dst: &mut [u8],
+        object_len: u64,
+        tenant: TenantContext<'_>,
+    ) -> Result<usize, WorkerError> {
         let request = VersionedRangeRequest {
             request: RangeRequest {
                 object: object.clone(),
@@ -546,13 +603,17 @@ impl WorkerClient {
             object_len,
         };
         let request_id = RequestId::next();
-        let mut output = self.encode_versioned_range_request(request_id.0, request)?;
-        match self.exchange_into(&mut output, dst).await {
+        let mut output = encode_versioned_request(request_id.0, &request)?;
+        match self.exchange_into(&mut output, dst, tenant).await {
             Ok(n) => Ok(n),
             Err((true, error)) if error.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+                    talon_transport::envelope::outbound_tenant_context(
+                        &mut output,
+                        &self.addr,
+                        tenant,
+                    )?;
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let n = self
                         .pool
@@ -607,7 +668,11 @@ impl WorkerClient {
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut output, &self.addr)?;
+                    talon_transport::envelope::outbound_tenant(
+                        &mut output,
+                        &self.addr,
+                        &self.tenant,
+                    )?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
@@ -636,7 +701,7 @@ impl WorkerClient {
         body: &[u8],
     ) -> Result<(), WorkerError> {
         let request_id = RequestId::next();
-        let header = encode_cached_block_put_header(
+        let mut header = encode_cached_block_put_header(
             request_id.0,
             &CachedBlockPutRequest {
                 block: block.clone(),
@@ -644,6 +709,7 @@ impl WorkerClient {
                 body_len: body.len() as u64,
             },
         )?;
+        talon_transport::envelope::outbound_tenant(&mut header, &self.addr, &self.tenant)?;
         match self.admit_exchange(&header, body).await {
             Ok(()) => Ok(()),
             Err((true, err)) if err.is_transport_failure() => {
@@ -708,7 +774,7 @@ impl WorkerClient {
     ) -> Result<Vec<u8>, (bool, WorkerError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound(out, &self.addr)
+            talon_transport::envelope::outbound_tenant(out, &self.addr, &self.tenant)
                 .map_err(|e| (false, WorkerError::Frame(e)))?;
 
             let (mut stream, reused) = self
@@ -743,10 +809,11 @@ impl WorkerClient {
         &self,
         output: &mut Vec<u8>,
         dst: &mut [u8],
+        tenant: TenantContext<'_>,
     ) -> Result<usize, (bool, WorkerError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound(output, &self.addr)
+            talon_transport::envelope::outbound_tenant_context(output, &self.addr, tenant)
                 .map_err(|e| (false, WorkerError::Frame(e)))?;
 
             let (mut stream, reused) = self
@@ -785,6 +852,7 @@ impl WorkerClient {
 /// [`ConnectionPool`] like the read path (issue #181, #226/#230).
 #[derive(Debug, Clone)]
 pub struct WriteClient {
+    tenant: TenantId,
     addr: String,
     pool: Arc<ConnectionPool>,
 }
@@ -799,8 +867,17 @@ impl WriteClient {
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
             addr: addr.into(),
+            tenant: TenantId::default(),
             pool,
         }
+    }
+
+    /// Create a per-request write/delete handle sharing the connection pool.
+    pub fn request(&self, tenant: &TenantId) -> Result<Self, talon_core::TenantIdError> {
+        tenant.validate()?;
+        let mut request = self.clone();
+        request.tenant = tenant.normalized();
+        Ok(request)
     }
 
     /// The worker address this client talks to.
@@ -820,13 +897,14 @@ impl WriteClient {
     /// instead of risking a duplicate backend write.
     pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
         let req_id = RequestId::next();
-        let header = encode_put_header(
+        let mut header = encode_put_header(
             req_id.0,
             &PutRequest {
                 object: object.clone(),
                 body_len: body.len() as u64,
             },
         )?;
+        talon_transport::envelope::outbound_tenant(&mut header, &self.addr, &self.tenant)?;
         match self.put_exchange(&header, body).await {
             Ok(version) => Ok(version),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -870,13 +948,14 @@ impl WriteClient {
             return Err(short_file_error(actual_len, len));
         }
         let req_id = RequestId::next();
-        let header = encode_put_header(
+        let mut header = encode_put_header(
             req_id.0,
             &PutRequest {
                 object: object.clone(),
                 body_len: len,
             },
         )?;
+        talon_transport::envelope::outbound_tenant(&mut header, &self.addr, &self.tenant)?;
         match self.put_file_exchange(&header, &mut file, len).await {
             Ok(version) => Ok(version),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -976,12 +1055,13 @@ impl WriteClient {
     /// Delete `object` at the worker (which deletes it at the backend).
     pub async fn delete_object(&self, object: &ObjectId) -> Result<(), WorkerError> {
         let req_id = RequestId::next();
-        let frame = encode_delete(
+        let mut frame = encode_delete(
             req_id.0,
             &DeleteRequest {
                 object: object.clone(),
             },
         )?;
+        talon_transport::envelope::outbound_tenant(&mut frame, &self.addr, &self.tenant)?;
         match self.delete_exchange(&frame).await {
             Ok(()) => Ok(()),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -1186,6 +1266,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tenant_reaches_writes_admission_and_load_controls() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            // WriteClient and WorkerClient each reuse their own connection.
+            for expected in [
+                vec![
+                    (MsgType::Put, "a"),
+                    (MsgType::Delete, "b"),
+                    (MsgType::Put, "default"),
+                    (MsgType::Delete, "default"),
+                ],
+                vec![
+                    (MsgType::AdmitCachedBlock, "a"),
+                    (MsgType::Control, "b"),
+                    (MsgType::Control, "default"),
+                ],
+            ] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                for (kind, tenant) in expected {
+                    let mut raw = [0; HEADER_LEN];
+                    socket.read_exact(&mut raw).await.unwrap();
+                    let header = FrameHeader::decode(&raw).unwrap();
+                    assert_eq!(header.msg_type, kind);
+                    assert_eq!(header.version, if tenant == "default" { 1 } else { 3 });
+                    let mut payload = vec![0; header.length as usize];
+                    socket.read_exact(&mut payload).await.unwrap();
+                    let (metadata, _) =
+                        talon_transport::envelope::decode(&header, &payload).unwrap();
+                    assert_eq!(metadata.tenant.unwrap_or_default().effective_name(), tenant);
+                    let mut full = raw.to_vec();
+                    full.extend(payload);
+                    let reply = match kind {
+                        MsgType::Put | MsgType::AdmitCachedBlock => {
+                            let mut body = [0; 4];
+                            socket.read_exact(&mut body).await.unwrap();
+                            assert_eq!(body, [42; 4]);
+                            if kind == MsgType::Put {
+                                let mut response =
+                                    response_header_ok(header.request_id, 2).to_vec();
+                                response.extend(b"v1");
+                                response
+                            } else {
+                                response_header_ok(header.request_id, 0).to_vec()
+                            }
+                        }
+                        MsgType::Control => {
+                            use talon_transport::ControlMessage;
+                            let reply =
+                                match talon_transport::codec::decode_request(&full).unwrap().1 {
+                                    ControlMessage::LoadBlock { .. } => ControlMessage::Ack {
+                                        ok: true,
+                                        detail: None,
+                                    },
+                                    ControlMessage::BatchLoad { .. } => {
+                                        ControlMessage::BatchLoadResult { failures: vec![] }
+                                    }
+                                    _ => panic!("unexpected control"),
+                                };
+                            talon_transport::codec::encode(header.request_id, &reply).unwrap()
+                        }
+                        _ => response_header_ok(header.request_id, 0).to_vec(),
+                    };
+                    socket.write_all(&reply).await.unwrap();
+                    socket.flush().await.unwrap();
+                }
+            }
+        });
+        let writer = WriteClient::new(addr.clone());
+        assert_eq!(
+            writer
+                .request(&TenantId::named("a"))
+                .unwrap()
+                .put_object(&object(), &[42; 4])
+                .await
+                .unwrap(),
+            Version::new("v1")
+        );
+        writer
+            .request(&TenantId::named("b"))
+            .unwrap()
+            .delete_object(&object())
+            .await
+            .unwrap();
+        writer.put_object(&object(), &[42; 4]).await.unwrap();
+        writer.delete_object(&object()).await.unwrap();
+        let client = WorkerClient::new(addr);
+        let block = BlockId::new(object(), 0, 4, Version::new("v1"));
+        client
+            .request(&TenantId::named("a"))
+            .unwrap()
+            .admit_cached_block(&block, 4, &[42; 4])
+            .await
+            .unwrap();
+        client
+            .request(&TenantId::named("b"))
+            .unwrap()
+            .load_block(&block, 4)
+            .await
+            .unwrap();
+        client
+            .batch_load(&[talon_transport::LoadBlockRequest { block, len: 4 }])
+            .await
+            .unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn cache_admission_sends_exact_versioned_block_and_body() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1374,7 +1562,9 @@ mod tests {
             sock.flush().await.unwrap();
         });
 
-        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let client = WorkerClient::new(addr)
+            .request(&TenantId::named("acme"))
+            .unwrap();
         let bytes = client.fetch_range(&object(), 0, 16).await.unwrap();
         assert_eq!(bytes.len(), 16);
         assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
@@ -1468,7 +1658,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_client_sends_a_cached_tenant_scoped_frame() {
-        // A tenant-bound client attributes cache-only reads too, so a resident
+        // A tenant-scoped request attributes cache-only reads too, so a resident
         // read cannot slip past per-tenant metering on the worker.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
@@ -1493,7 +1683,9 @@ mod tests {
             sock.flush().await.unwrap();
         });
 
-        let client = WorkerClient::new(addr).with_tenant(TenantId::named("acme"));
+        let client = WorkerClient::new(addr)
+            .request(&TenantId::named("acme"))
+            .unwrap();
         let bytes = client
             .fetch_cached_range(&object(), &Version::new("etag-v2"), 0, 16)
             .await

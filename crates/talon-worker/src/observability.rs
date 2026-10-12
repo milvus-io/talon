@@ -509,23 +509,6 @@ impl WorkerMetrics {
         }
     }
 
-    fn refresh_runtime(
-        &self,
-        index: &BlockIndex,
-        inflight: &InFlightLoads,
-        started: Instant,
-        ready: bool,
-    ) {
-        self.refresh_values(
-            inflight.len() as u64,
-            index.len() as u64,
-            index.page_count(),
-            index.resident_bytes(),
-            started,
-            ready,
-        );
-    }
-
     fn refresh_values(
         &self,
         inflight_loads: u64,
@@ -702,6 +685,7 @@ impl WorkerReadiness {
 
 /// Shared worker observability state exposed to HTTP and heartbeats.
 pub struct WorkerObservability {
+    tenant_runtime: std::sync::OnceLock<std::sync::Weak<crate::WorkerRuntime>>,
     node: NodeInfo,
     cluster_id: String,
     admin_address: String,
@@ -751,6 +735,7 @@ impl WorkerObservability {
         inflight: Arc<InFlightLoads>,
     ) -> std::io::Result<Self> {
         Ok(Self {
+            tenant_runtime: std::sync::OnceLock::new(),
             node,
             cluster_id,
             admin_address,
@@ -772,6 +757,33 @@ impl WorkerObservability {
     pub fn with_zone(mut self, zone: Option<String>) -> Self {
         self.zone = zone;
         self
+    }
+
+    /// Aggregate residency across the worker's tenant namespaces.
+    pub fn attach_tenant_runtime(&self, worker: &Arc<crate::WorkerRuntime>) {
+        let _ = self.tenant_runtime.set(Arc::downgrade(worker));
+    }
+
+    fn residency(&self) -> (u64, u64, u64, u64) {
+        if let Some(worker) = self.tenant_runtime.get().and_then(std::sync::Weak::upgrade) {
+            let tenants = worker.tenant_runtimes();
+            return tenants
+                .iter()
+                .fold((0, 0, 0, 0), |(loads, blocks, pages, bytes), tenant| {
+                    (
+                        loads + tenant.inflight_count(),
+                        blocks + tenant.block_count(),
+                        pages + tenant.page_count(),
+                        bytes + tenant.resident_bytes(),
+                    )
+                });
+        }
+        (
+            self.inflight.len() as u64,
+            self.index.len() as u64,
+            self.index.page_count(),
+            self.index.resident_bytes(),
+        )
     }
 
     /// Worker metric handles for data and control paths.
@@ -826,10 +838,7 @@ impl WorkerObservability {
         } else {
             locally_ready
         };
-        let inflight_loads = self.inflight.len() as u64;
-        let block_count = self.index.len() as u64;
-        let page_count = self.index.page_count();
-        let resident_bytes = self.index.resident_bytes();
+        let (inflight_loads, block_count, page_count, resident_bytes) = self.residency();
         self.metrics.refresh_values(
             inflight_loads,
             block_count,
@@ -866,9 +875,12 @@ impl WorkerObservability {
     }
 
     fn metrics_text(&self) -> String {
-        self.metrics.refresh_runtime(
-            &self.index,
-            &self.inflight,
+        let (loads, blocks, pages, bytes) = self.residency();
+        self.metrics.refresh_values(
+            loads,
+            blocks,
+            pages,
+            bytes,
             self.started,
             self.readiness.is_ready(),
         );

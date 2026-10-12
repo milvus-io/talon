@@ -1,7 +1,11 @@
 //! Worker maintenance registrations; scheduling policy lives in `background`.
 use super::{async_eviction::EvictionCycle, WorkerRuntime};
 use crate::background::{BackgroundBudget, BackgroundHandle, BackgroundScheduler};
-use std::{sync::Arc, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use talon_core::WorkerConfig;
 
 /// Unified worker GC, checkpoint, disk cleanup, and capacity eviction lifecycle.
@@ -27,12 +31,27 @@ impl WorkerBackground {
         let mut scheduler = BackgroundScheduler::new(config.background_task_concurrency)
             .with_metrics(worker.metrics.registry.clone());
         let gc = &worker.page_gc_config;
-        let period = Duration::from_millis(gc.interval_ms);
+        let global_gc = crate::page_gc::PageGcConfig::from(config);
+        let period = Duration::from_millis(
+            worker
+                .tenant_runtimes()
+                .iter()
+                .map(|w| w.page_gc_config.interval_ms)
+                .chain([gc.interval_ms, global_gc.interval_ms])
+                .min()
+                .unwrap(),
+        );
         let w = worker.clone();
+        let last_gc = Arc::new(Mutex::new(HashMap::new()));
         scheduler.register("tti_gc", period, move || {
             let w = w.clone();
+            let last = last_gc.clone();
             async move {
-                w.gc_once().await;
+                for tenant in w.tenant_runtimes() {
+                    if due(&last, &tenant, tenant.page_gc_config.interval_ms) {
+                        tenant.gc_once().await;
+                    }
+                }
             }
         });
         let w = worker.clone();
@@ -42,19 +61,48 @@ impl WorkerBackground {
             move || {
                 let w = w.clone();
                 async move {
-                    w.cleanup_page_files_once().await;
+                    for tenant in w.tenant_runtimes() {
+                        tenant.cleanup_page_files_once().await;
+                    }
                 }
             },
         );
-        if gc.tti_ms > 0 {
+        if worker
+            .tenant_runtimes()
+            .iter()
+            .any(|w| w.page_gc_config.tti_ms > 0)
+            || config.page_tti_hours > 0
+        {
             let w = worker.clone();
             let period = Duration::from_millis(
-                (gc.checkpoint_interval_ms / crate::page_lifecycle::SHARDS as u64).max(1),
+                (worker
+                    .tenant_runtimes()
+                    .iter()
+                    .map(|w| w.page_gc_config.checkpoint_interval_ms)
+                    .chain([gc.checkpoint_interval_ms, global_gc.checkpoint_interval_ms])
+                    .min()
+                    .unwrap()
+                    / crate::page_lifecycle::SHARDS as u64)
+                    .max(1),
             );
+            let last_checkpoint = Arc::new(Mutex::new(HashMap::new()));
             scheduler.register("access_checkpoint", period, move || {
                 let w = w.clone();
+                let last = last_checkpoint.clone();
                 async move {
-                    w.checkpoint_next_shard().await;
+                    for tenant in w.tenant_runtimes() {
+                        if tenant.page_gc_config.tti_ms > 0
+                            && due(
+                                &last,
+                                &tenant,
+                                (tenant.page_gc_config.checkpoint_interval_ms
+                                    / crate::page_lifecycle::SHARDS as u64)
+                                    .max(1),
+                            )
+                        {
+                            tenant.checkpoint_next_shard().await;
+                        }
+                    }
                 }
             });
         }
@@ -62,7 +110,11 @@ impl WorkerBackground {
             let w = worker.clone();
             scheduler.register("stale_gc", Duration::from_secs(3600), move || {
                 let w = w.clone();
-                async move { super::stale_gc::StaleGc::run_round(&w).await }
+                async move {
+                    for tenant in w.tenant_runtimes() {
+                        super::stale_gc::StaleGc::run_round(&tenant).await;
+                    }
+                }
             });
         }
         if config.ownership_gc_enabled {
@@ -116,7 +168,24 @@ impl WorkerBackground {
     /// using the same disk budget. External process shutdown deadlines still apply.
     pub async fn shutdown(self) {
         self.scheduler.shutdown().await;
-        self.worker.drain_page_mutations().await;
-        self.worker.checkpoint_access_times().await;
+        self.worker.drain_tenant_initializers().await;
+        for tenant in self.worker.tenant_runtimes() {
+            tenant.drain_page_mutations().await;
+            tenant.checkpoint_access_times().await;
+        }
     }
+}
+
+fn due(last: &Mutex<HashMap<String, Instant>>, worker: &WorkerRuntime, millis: u64) -> bool {
+    let mut last = last.lock().unwrap();
+    let now = Instant::now();
+    let name = worker.tenant.effective_name();
+    if last
+        .get(name)
+        .is_some_and(|previous| now.duration_since(*previous) < Duration::from_millis(millis))
+    {
+        return false;
+    }
+    last.insert(name.to_owned(), now);
+    true
 }

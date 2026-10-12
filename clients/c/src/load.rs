@@ -175,18 +175,25 @@ unsafe fn submit(
                 "talon.c.load",
                 "internal",
                 parent
+                    .parent
                     .as_ref()
                     .map(talon_telemetry::TraceParent::Explicit)
                     .unwrap_or(talon_telemetry::TraceParent::Root),
             );
+            let options = parent.borrowed();
             let result = operation
                 .scope(async {
                     if batch {
-                        client.batch_load(&requests).await
+                        client.batch_load_with_options(&requests, &options).await
                     } else {
                         let request = &requests[0];
                         client
-                            .load(&request.object, &request.version, request.size)
+                            .load_with_options(
+                                &request.object,
+                                &request.version,
+                                request.size,
+                                &options,
+                            )
                             .await
                             .map(|result| vec![result])
                     }

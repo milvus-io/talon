@@ -127,7 +127,7 @@ public final class Frame {
                             magic, MAGIC));
         }
         int version = b.get() & 0xFF;
-        if (version != 1 && version != 2) {
+        if (version != 1 && version != 2 && version != 3) {
             throw new ProtocolException(
                     "unsupported protocol version " + version + "; this client speaks "
                             + PROTOCOL_VERSION);

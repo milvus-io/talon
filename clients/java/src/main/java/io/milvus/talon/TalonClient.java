@@ -145,7 +145,7 @@ public final class TalonClient implements AutoCloseable {
 
     private byte[] readInternal(String uri, long offset, long length) throws IOException {
         ObjectId object = ObjectId.parse(uri);
-        ObjectStat stat = stat(object);
+        ObjectStat stat = statInternal(object);
         return readInternal(object, stat.version(), stat.size(), offset, length);
     }
 
@@ -259,10 +259,10 @@ public final class TalonClient implements AutoCloseable {
         List<LoadResult> results = new ArrayList<>(files.size());
         boolean nonempty = false;
         for (LoadRequest file : files) {
-            long blocks = file.size() == 0 ? 0 : (file.size() - 1) / blockSize + 1;
-            if (blocks > Long.MAX_VALUE / blockSize) throw new IllegalArgumentException("load extent overflows block addressing");
+            long blocks = file.size() == 0 ? 0 : (file.size() - 1) / Telemetry.blockSize(this.blockSize) + 1;
+            if (blocks > Long.MAX_VALUE / Telemetry.blockSize(this.blockSize)) throw new IllegalArgumentException("load extent overflows block addressing");
             if (blocks > 0 && Messages.BATCH_LOAD_OVERHEAD + Messages.loadBlockSize(
-                    new Messages.LoadBlock(new BlockId(file.object(), 0, blockSize, file.version()), 1)) > Messages.MAX_LOAD_BODY_BYTES) {
+                    new Messages.LoadBlock(new BlockId(file.object(), 0, Telemetry.blockSize(this.blockSize), file.version()), 1)) > Messages.MAX_LOAD_BODY_BYTES) {
                 throw new IllegalArgumentException("load identity exceeds frame limit");
             }
             results.add(new LoadResult(file.size(), blocks));
@@ -282,9 +282,9 @@ public final class TalonClient implements AutoCloseable {
                 LoadRequest file = files.get(fileIndex);
                 for (long offset = 0; offset < file.size();) {
                     if (System.nanoTime() >= deadline) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
-                    int length = (int) Math.min(blockSize, file.size() - offset);
+                    int length = (int) Math.min(Telemetry.blockSize(this.blockSize), file.size() - offset);
                     Messages.LoadBlock request = new Messages.LoadBlock(
-                            new BlockId(file.object(), offset, blockSize, file.version()), length);
+                            new BlockId(file.object(), offset, Telemetry.blockSize(this.blockSize), file.version()), length);
                     if (!batch) {
                         sendLoad(topology, List.of(request), false, deadline);
                     } else {
@@ -368,7 +368,7 @@ public final class TalonClient implements AutoCloseable {
                 if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
                 socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
                 try {
-                    socket.getOutputStream().write(Telemetry.envelope(request, address));
+                    socket.getOutputStream().write(Telemetry.tenantEnvelope(request, address, Telemetry.tenant()));
                     socket.getOutputStream().flush();
                     Frame header = readHeader(socket.getInputStream());
                     if (header.isError() || header.type() != Frame.MsgType.CONTROL || header.requestId() != id || header.length() > (1 << 20)) {
@@ -398,7 +398,7 @@ public final class TalonClient implements AutoCloseable {
     }
 
     private ObjectStat statInternal(String uri) throws IOException {
-        return stat(ObjectId.parse(uri));
+        return statInternal(ObjectId.parse(uri));
     }
 
     /** As {@link #stat(String)}, with a parsed object id. */
@@ -433,6 +433,14 @@ public final class TalonClient implements AutoCloseable {
      * instead of returning an incomplete list; use a narrower prefix.
      */
     public List<ObjectEntry> list(String prefix) throws IOException {
+        return list(prefix, RequestOptions.INHERIT);
+    }
+
+    public List<ObjectEntry> list(String prefix, RequestOptions options) throws IOException {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> listInternal(prefix));
+    }
+
+    private List<ObjectEntry> listInternal(String prefix) throws IOException {
         int id = requestIds.getAndIncrement();
         return controlRoundTrip(Messages.listObjects(id, prefix), resp -> {
             if (resp.tag == Messages.TAG_OBJECT_LIST) {
@@ -489,13 +497,13 @@ public final class TalonClient implements AutoCloseable {
         long remaining = length;
         long pos = offset;
         while (remaining > 0) {
-            long blockStart = (pos / blockSize) * (long) blockSize;
+            long blockStart = (pos / Telemetry.blockSize(this.blockSize)) * (long) Telemetry.blockSize(this.blockSize);
             long offsetInBlock = pos - blockStart;
-            long available = blockSize - offsetInBlock;
+            long available = Telemetry.blockSize(this.blockSize) - offsetInBlock;
             int take = (int) Math.min(available, remaining);
             segments.add(
                     new Segment(
-                            new BlockId(object, blockStart, blockSize, version),
+                            new BlockId(object, blockStart, Telemetry.blockSize(this.blockSize), version),
                             offsetInBlock,
                             take));
             pos += take;
@@ -641,7 +649,7 @@ public final class TalonClient implements AutoCloseable {
                                   IoFunction<Messages.Response, T> decode) throws IOException {
         try { return pool.exchange(coordinator, false, deadline, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(Telemetry.envelope(request, coordinator));
+            out.write(Telemetry.tenantEnvelope(request, coordinator, Telemetry.tenant()));
             out.flush();
 
             Frame header = readHeader(socket.getInputStream());
@@ -670,7 +678,7 @@ public final class TalonClient implements AutoCloseable {
 
         return pool.exchange(workerAddress, true, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(Telemetry.envelope(request, workerAddress));
+            out.write(Telemetry.tenantEnvelope(request, workerAddress, Telemetry.tenant()));
             out.flush();
 
             InputStream in = socket.getInputStream();

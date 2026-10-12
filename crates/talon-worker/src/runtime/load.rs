@@ -902,7 +902,7 @@ mod tests {
                     talon_transport::data::encode_versioned_tenant_request(
                         8,
                         &talon_transport::TenantScopedVersionedRange {
-                            tenant: talon_core::TenantId::named("tenant"),
+                            tenant: talon_core::TenantId::default(),
                             request,
                         },
                     )

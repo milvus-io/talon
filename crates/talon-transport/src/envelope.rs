@@ -1,4 +1,4 @@
-//! Protocol v2 request-only metadata. Responses retain their original body.
+//! Protocol v2 trace and v3 tenant request-only metadata. Responses retain their original body.
 use crate::frame::{FrameError, FrameHeader, MsgType, HEADER_LEN};
 use talon_telemetry::TraceContext;
 
@@ -18,9 +18,11 @@ pub fn supports_v2(kind: MsgType) -> bool {
     )
 }
 
-/// Parsed metadata has no heap allocation. Invalid trace fields discard context.
+/// Invalid trace fields discard context without changing the required tenant.
 #[derive(Default, Debug)]
 pub struct Metadata {
+    /// Required routing identity on protocol v3 requests.
+    pub tenant: Option<talon_core::TenantId>,
     pub context: Option<TraceContext>,
     pub read_id: Option<[u8; 16]>,
     pub detail: Option<u8>,
@@ -36,7 +38,7 @@ pub fn decode<'a>(
     if header.version == 1 {
         return Ok((Metadata::default(), payload));
     }
-    if !supports_v2(header.msg_type) || payload.len() < 2 {
+    if (header.version == 2 && !supports_v2(header.msg_type)) || payload.len() < 2 {
         return Err(FrameError::InvalidEnvelope);
     }
     let len = u16::from_be_bytes([payload[0], payload[1]]) as usize;
@@ -84,11 +86,29 @@ pub fn decode<'a>(
             },
             4 if value.len() == 1 && value[0] <= 1 => result.detail = Some(value[0]),
             4 => invalid = true,
+            5 if header.version == 3 => {
+                if result.tenant.is_some() {
+                    return Err(FrameError::InvalidEnvelope);
+                }
+                let name = std::str::from_utf8(value).map_err(|_| FrameError::InvalidEnvelope)?;
+                let tenant = talon_core::TenantId::named(name);
+                tenant.validate().map_err(|_| FrameError::InvalidEnvelope)?;
+                result.tenant = Some(tenant);
+            }
             _ => {}
         }
     }
+    if header.version == 3 && result.tenant.is_none() {
+        return Err(FrameError::InvalidEnvelope);
+    }
     if invalid {
-        return Ok((Metadata::default(), business));
+        return Ok((
+            Metadata {
+                tenant: result.tenant,
+                ..Metadata::default()
+            },
+            business,
+        ));
     }
     result.context = parent.and_then(|p| TraceContext::from_w3c(p, state));
     if result.context.is_none() {
@@ -155,6 +175,9 @@ pub fn encode(
 
 /// Select v2 only using the explicit capability policy. v1 borrows the buffer.
 pub fn outbound(frame: &mut Vec<u8>, endpoint: &str) -> Result<(), FrameError> {
+    if FrameHeader::decode(frame)?.version == 3 {
+        return Ok(());
+    }
     if !talon_telemetry::v2_enabled(endpoint) {
         talon_telemetry::text("talon.propagation.gap", "unconfirmed_v2_peer");
         return Ok(());
@@ -183,4 +206,90 @@ pub fn outbound(frame: &mut Vec<u8>, endpoint: &str) -> Result<(), FrameError> {
 pub fn response_version<T: AsMut<[u8]>>(mut frame: T, version: u8) -> T {
     frame.as_mut()[2] = version;
     frame
+}
+
+/// Attach a required tenant carrier. Older servers reject protocol v3 rather
+/// than silently ignoring routing metadata and writing into the default tenant.
+/// Raw PUT/admission bytes remain outside the framed header.
+pub fn encode_tenant(frame: &mut Vec<u8>, tenant: &talon_core::TenantId) -> Result<(), FrameError> {
+    encode_tenant_context(
+        frame,
+        tenant.context().map_err(|_| FrameError::InvalidEnvelope)?,
+    )
+}
+
+/// Encode a tenant that was validated at the request boundary, without copying its name.
+pub fn encode_tenant_context(
+    frame: &mut Vec<u8>,
+    tenant: talon_core::TenantContext<'_>,
+) -> Result<(), FrameError> {
+    let mut header = FrameHeader::decode(frame)?;
+    if frame.len() != HEADER_LEN + header.length as usize {
+        return Err(FrameError::InvalidEnvelope);
+    }
+    if header.version == 3 {
+        let (metadata, _) = decode(&header, &frame[HEADER_LEN..])?;
+        return if metadata.tenant.as_ref().map(|t| t.effective_name()) == Some(tenant.name()) {
+            Ok(())
+        } else {
+            Err(FrameError::InvalidEnvelope)
+        };
+    }
+    let old_metadata = if header.version == 2 {
+        decode(&header, &frame[HEADER_LEN..])?;
+        u16::from_be_bytes([frame[HEADER_LEN], frame[HEADER_LEN + 1]]) as usize
+    } else {
+        0
+    };
+    let name = tenant.name().as_bytes();
+    let new_metadata = old_metadata + 3 + name.len();
+    if new_metadata > MAX_METADATA_LEN {
+        return Err(FrameError::InvalidEnvelope);
+    }
+    let prefix = if header.version == 1 { 2 } else { 0 };
+    let added = prefix + 3 + name.len();
+    let insertion = HEADER_LEN
+        + if header.version == 2 {
+            2 + old_metadata
+        } else {
+            0
+        };
+    let old_len = frame.len();
+    frame.resize(old_len + added, 0);
+    frame.copy_within(insertion..old_len, insertion + added);
+    frame[HEADER_LEN..HEADER_LEN + 2].copy_from_slice(&(new_metadata as u16).to_be_bytes());
+    let insertion = HEADER_LEN + 2 + old_metadata;
+    frame[insertion] = 5;
+    frame[insertion + 1..insertion + 3].copy_from_slice(&(name.len() as u16).to_be_bytes());
+    frame[insertion + 3..insertion + 3 + name.len()].copy_from_slice(name);
+    header.length += added as u32;
+    header.version = 3;
+    frame[..HEADER_LEN].copy_from_slice(&header.encode());
+    Ok(())
+}
+
+/// Preserve trace propagation and scope every worker operation to its tenant.
+pub fn outbound_tenant(
+    frame: &mut Vec<u8>,
+    endpoint: &str,
+    tenant: &talon_core::TenantId,
+) -> Result<(), FrameError> {
+    outbound_tenant_context(
+        frame,
+        endpoint,
+        tenant.context().map_err(|_| FrameError::InvalidEnvelope)?,
+    )
+}
+
+/// Propagate a borrowed request context without revalidating or owning its name.
+pub fn outbound_tenant_context(
+    frame: &mut Vec<u8>,
+    endpoint: &str,
+    tenant: talon_core::TenantContext<'_>,
+) -> Result<(), FrameError> {
+    outbound(frame, endpoint)?;
+    if tenant.name() != talon_core::DEFAULT_TENANT {
+        encode_tenant_context(frame, tenant)?;
+    }
+    Ok(())
 }

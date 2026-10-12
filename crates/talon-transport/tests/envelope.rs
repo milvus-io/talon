@@ -213,3 +213,138 @@ fn malformed_metadata_is_bounded_but_bad_context_does_not_break_business() {
     put[2] = 2;
     assert!(FrameHeader::decode(&put).is_err());
 }
+
+#[test]
+fn tenant_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
+    use talon_transport::data::{CachedBlockPutRequest, DeleteRequest, PutRequest};
+    let object = ObjectId::new(Backend::S3, "bucket", "key");
+    let block = talon_core::BlockId::new(object.clone(), 0, 16, Version::new("v1"));
+    let frames = vec![
+        talon_transport::codec::encode(
+            7,
+            &talon_transport::ControlMessage::LoadBlock {
+                block: block.clone(),
+                len: 16,
+            },
+        )
+        .unwrap(),
+        talon_transport::data::encode_put_header(
+            7,
+            &PutRequest {
+                object: object.clone(),
+                body_len: 16,
+            },
+        )
+        .unwrap(),
+        talon_transport::data::encode_delete(
+            7,
+            &DeleteRequest {
+                object: object.clone(),
+            },
+        )
+        .unwrap(),
+        talon_transport::data::encode_cached_block_put_header(
+            7,
+            &CachedBlockPutRequest {
+                block,
+                object_len: 16,
+                body_len: 16,
+            },
+        )
+        .unwrap(),
+    ];
+    for mut frame in frames {
+        let before = frame[talon_transport::HEADER_LEN..].to_vec();
+        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("acme")).unwrap();
+        let header = talon_transport::FrameHeader::decode(&frame).unwrap();
+        assert_eq!(header.version, 3);
+        let (metadata, business) =
+            talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..])
+                .unwrap();
+        assert_eq!(metadata.tenant, Some(TenantId::named("acme")));
+        assert_eq!(business, before);
+        match header.msg_type {
+            talon_transport::MsgType::Put => assert_eq!(
+                talon_transport::data::decode_put_header(&frame)
+                    .unwrap()
+                    .1
+                    .body_len,
+                16
+            ),
+            talon_transport::MsgType::Delete => assert_eq!(
+                talon_transport::data::decode_delete(&frame)
+                    .unwrap()
+                    .1
+                    .object,
+                object
+            ),
+            talon_transport::MsgType::AdmitCachedBlock => assert_eq!(
+                talon_transport::data::decode_cached_block_put_header(&frame)
+                    .unwrap()
+                    .1
+                    .body_len,
+                16
+            ),
+            _ => {
+                talon_transport::codec::decode_request(&frame).unwrap();
+            }
+        }
+        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("acme")).unwrap();
+        assert!(talon_transport::envelope::encode_tenant(
+            &mut frame,
+            &TenantId::named("different")
+        )
+        .is_err());
+    }
+    let mut frame = talon_transport::data::encode_request(
+        1,
+        &talon_transport::data::RangeRequest {
+            object,
+            offset: 0,
+            len: 4,
+        },
+    )
+    .unwrap();
+    let trace = talon_telemetry::TraceContext::from_w3c(
+        "00-11111111111111111111111111111111-2222222222222222-01",
+        None,
+    )
+    .unwrap();
+    talon_transport::envelope::encode(&mut frame, Some(&trace), Some([9; 16])).unwrap();
+    talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("acme")).unwrap();
+    let header = talon_transport::FrameHeader::decode(&frame).unwrap();
+    let (metadata, _) =
+        talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..]).unwrap();
+    assert_eq!(metadata.read_id, Some([9; 16]));
+    assert_eq!(metadata.context.unwrap().traceparent(), trace.traceparent());
+    // Corrupting trace context must not discard the routing identity.
+    frame[talon_transport::HEADER_LEN + 5] = b'!';
+    let (metadata, _) =
+        talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..]).unwrap();
+    assert!(metadata.context.is_none());
+    assert_eq!(metadata.tenant, Some(TenantId::named("acme")));
+}
+
+#[test]
+fn v3_cannot_silently_fall_back_when_tenant_metadata_is_invalid() {
+    let mut frame = talon_transport::data::encode_request(
+        1,
+        &talon_transport::data::RangeRequest {
+            object: ObjectId::new(Backend::S3, "bucket", "key"),
+            offset: 0,
+            len: 4,
+        },
+    )
+    .unwrap();
+    talon_transport::envelope::encode(&mut frame, None, None).unwrap();
+    frame[2] = 3;
+    let header = talon_transport::FrameHeader::decode(&frame).unwrap();
+    assert!(
+        talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..]).is_err()
+    );
+    frame[2] = 2;
+    assert!(
+        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("../escape"))
+            .is_err()
+    );
+}

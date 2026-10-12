@@ -270,6 +270,55 @@ pub struct WorkerConfig {
     /// table sets `enabled = true`. This is the local, single-worker stage of
     /// the eventual-global-tenant-rate-limits design.
     pub rate_limits: RateLimitPolicy,
+    /// Optional named cache policies; unknown tenants inherit worker defaults.
+    pub tenants: std::collections::BTreeMap<String, TenantCacheConfig>,
+}
+
+/// Per-tenant cache overrides. Omitted fields inherit the worker defaults.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct TenantCacheConfig {
+    pub block_size: Option<u32>,
+    pub l2_page_size_bytes: Option<u64>,
+    pub l1_page_size_bytes: Option<u64>,
+    pub page_tti_hours: Option<u64>,
+    pub page_access_checkpoint_interval_minutes: Option<u64>,
+    pub page_gc_interval_minutes: Option<u64>,
+    pub paged_miss_run_concurrency: Option<usize>,
+}
+
+impl WorkerConfig {
+    /// Resolve cache settings without changing process-wide resource budgets.
+    pub fn for_tenant(&self, tenant: &crate::TenantId) -> Result<Self> {
+        tenant.validate().map_err(|e| Error::Other(e.to_string()))?;
+        let mut result = self.clone();
+        result.tenants.clear();
+        if let Some(overrides) = self.tenants.get(tenant.effective_name()) {
+            if let Some(value) = overrides.block_size {
+                result.block_size = value;
+            }
+            if let Some(value) = overrides.l2_page_size_bytes {
+                result.l2_page_size_bytes = value;
+            }
+            if let Some(value) = overrides.l1_page_size_bytes {
+                result.l1_page_size_bytes = value;
+            }
+            if let Some(value) = overrides.page_tti_hours {
+                result.page_tti_hours = value;
+            }
+            if let Some(value) = overrides.page_access_checkpoint_interval_minutes {
+                result.page_access_checkpoint_interval_minutes = value;
+            }
+            if let Some(value) = overrides.page_gc_interval_minutes {
+                result.page_gc_interval_minutes = value;
+            }
+            if let Some(value) = overrides.paged_miss_run_concurrency {
+                result.paged_miss_run_concurrency = value;
+            }
+        }
+        result.validate()?;
+        Ok(result)
+    }
 }
 
 /// Read the Azure SAS token from the environment (`TALON_WORKER_AZURE_SAS`).
@@ -368,6 +417,7 @@ impl Default for WorkerConfig {
             data_plane_rings: 0,
             data_plane_connections_per_thread: 8192,
             rate_limits: RateLimitPolicy::default(),
+            tenants: Default::default(),
         }
     }
 }
@@ -493,6 +543,7 @@ pub struct WorkerConfigPatch {
     pub data_plane_connections_per_thread: Option<usize>,
     /// Optional `[rate_limits]` table: the per-tenant rate-limit policy.
     pub rate_limits: Option<RateLimitPolicy>,
+    pub tenants: Option<std::collections::BTreeMap<String, TenantCacheConfig>>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -595,6 +646,7 @@ impl Patch for WorkerConfigPatch {
                 .data_plane_connections_per_thread
                 .or(base.data_plane_connections_per_thread),
             rate_limits: self.rate_limits.or(base.rate_limits),
+            tenants: self.tenants.or(base.tenants),
         }
     }
 }
@@ -1235,6 +1287,7 @@ impl WorkerConfigPatch {
                 .transpose()?,
             // The [rate_limits] table is file-only; env does not override it.
             rate_limits: None,
+            tenants: None,
         })
     }
 }
@@ -1374,6 +1427,7 @@ impl WorkerConfig {
                 .data_plane_connections_per_thread
                 .unwrap_or(d.data_plane_connections_per_thread),
             rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
+            tenants: merged.tenants.unwrap_or(d.tenants),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1414,6 +1468,9 @@ impl WorkerConfig {
         }
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
+        }
+        for name in self.tenants.keys() {
+            self.for_tenant(&crate::TenantId::named(name))?;
         }
         self.rate_limits
             .validate()
@@ -1754,6 +1811,14 @@ impl Patch for FuseConfigPatch {
 /// Single source of truth for the FUSE client's `TALON_FUSE_*` environment
 /// variables, shared by the parser and the documentation generator.
 pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
+    ConfigVar {
+        env: "TALON_FUSE_TENANT_ID",
+        key: "tenant_id",
+        default: Some("default"),
+        cli: false,
+        secret: false,
+        help: "Tenant cache namespace for all requests from this mount.",
+    },
     ConfigVar {
         env: "TALON_FUSE_MOUNTPOINT",
         key: "mountpoint",
@@ -2956,5 +3021,51 @@ mod tests {
         };
         let err = FuseConfig::resolve(Default::default(), Default::default(), cli).unwrap_err();
         assert!(err.to_string().contains("255"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod tenant_tests {
+    use super::*;
+    #[test]
+    fn tenant_overrides_inherit_and_validate_complete_geometry() {
+        let cfg = WorkerConfig::default();
+        let mut cfg = cfg;
+        let patch = WorkerConfigPatch::from_toml(
+            r#"
+[tenants.acme]
+block_size = 33554432
+l2_page_size_bytes = 1048576
+page_tti_hours = 2
+[tenants.default]
+block_size = 67108864
+"#,
+        )
+        .unwrap();
+        cfg.tenants = patch.tenants.unwrap();
+        cfg.validate().unwrap();
+        let acme = cfg.for_tenant(&crate::TenantId::named("acme")).unwrap();
+        assert_eq!(acme.block_size, 33554432);
+        assert_eq!(acme.l2_page_size_bytes, 1048576);
+        assert_eq!(acme.page_tti_hours, 2);
+        assert_eq!(acme.capacity_bytes, cfg.capacity_bytes);
+        assert_eq!(
+            cfg.for_tenant(&crate::TenantId::Unattributed)
+                .unwrap()
+                .block_size,
+            67108864
+        );
+        assert_eq!(
+            cfg.for_tenant(&crate::TenantId::named("unknown"))
+                .unwrap()
+                .block_size,
+            cfg.block_size
+        );
+        cfg.tenants.get_mut("acme").unwrap().l2_page_size_bytes = Some(3);
+        assert!(cfg.validate().is_err());
+        cfg.tenants.clear();
+        cfg.tenants
+            .insert("../escape".into(), TenantCacheConfig::default());
+        assert!(cfg.validate().is_err());
     }
 }

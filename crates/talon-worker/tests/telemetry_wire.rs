@@ -135,7 +135,7 @@ async fn v2_stat_cold_hit_cache_only_and_v1_on_same_connection() {
             1 => data::encode_versioned_tenant_request(
                 2,
                 &data::TenantScopedVersionedRange {
-                    tenant: talon_core::TenantId::named("acme"),
+                    tenant: talon_core::TenantId::default(),
                     request: versioned,
                 },
             )

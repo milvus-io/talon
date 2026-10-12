@@ -17,7 +17,7 @@ use crate::membership_fixture;
 
 use std::sync::Arc;
 
-use talon_core::{BlockId, ObjectId, Version};
+use talon_core::{BlockId, ObjectId, TenantContext, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::membership_cache::{MembershipCache, MembershipSnapshot};
@@ -103,6 +103,7 @@ pub struct FileView<'a> {
 /// Orchestrates local block placement and worker reads with caching.
 #[derive(Clone)]
 pub struct BlockReader {
+    pub(crate) tenant: talon_core::TenantId,
     coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
     /// Maximum number of ranked logical workers attempted per block read.
@@ -141,6 +142,7 @@ impl BlockReader {
             cache.clone(),
         ));
         Self {
+            tenant: talon_core::TenantId::default(),
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
@@ -152,6 +154,24 @@ impl BlockReader {
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
+    }
+
+    /// Tenant selected for all operations through this reader.
+    pub fn tenant(&self) -> &talon_core::TenantId {
+        &self.tenant
+    }
+
+    /// Create a per-request handle for reads, admissions and prewarm. Placement keys
+    /// and membership may be shared because they are independent of tenancy.
+    pub fn request(
+        &self,
+        tenant: &talon_core::TenantId,
+    ) -> Result<Self, talon_core::TenantIdError> {
+        tenant.validate()?;
+        let mut request = self.clone();
+        request.tenant = tenant.normalized();
+        request.coordinator = self.coordinator.request(tenant)?;
+        Ok(request)
     }
 
     /// Record metrics into the provided counters, shared by reader clones.
@@ -239,7 +259,9 @@ impl BlockReader {
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
-                Ok(worker) => worker,
+                Ok(worker) => worker
+                    .request(&self.tenant)
+                    .expect("validated request tenant"),
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;
@@ -286,7 +308,11 @@ impl BlockReader {
             .membership_snapshot()
             .await
             .map_err(cache_block_error)?;
-        let worker = snapshot.owner(block).map_err(cache_block_error)?;
+        let worker = snapshot
+            .owner(block)
+            .map_err(cache_block_error)?
+            .request(&self.tenant)
+            .expect("validated request tenant");
         worker
             .admit_cached_block(block, object_len, body)
             .await
@@ -327,8 +353,14 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
     ) -> Result<usize, BlockReadError> {
-        self.read_block_into_with_mode(block, offset_in_block, dst, OriginReadMode::Current)
-            .await
+        self.read_block_into_with_mode(
+            block,
+            offset_in_block,
+            dst,
+            OriginReadMode::Current,
+            self.tenant.context().expect("validated tenant"),
+        )
+        .await
     }
 
     /// Read into `dst` from the exact source version carried by `block`.
@@ -343,11 +375,31 @@ impl BlockReader {
         dst: &mut [u8],
         object_len: u64,
     ) -> Result<usize, BlockReadError> {
+        self.read_versioned_block_into_with_context(
+            block,
+            offset_in_block,
+            dst,
+            object_len,
+            self.tenant.context().expect("validated tenant"),
+        )
+        .await
+    }
+
+    /// Read an exact-version block using a borrowed request context.
+    pub async fn read_versioned_block_into_with_context(
+        &self,
+        block: &BlockId,
+        offset_in_block: u32,
+        dst: &mut [u8],
+        object_len: u64,
+        tenant: TenantContext<'_>,
+    ) -> Result<usize, BlockReadError> {
         self.read_block_into_with_mode(
             block,
             offset_in_block,
             dst,
             OriginReadMode::ExactVersion(object_len),
+            tenant,
         )
         .await
     }
@@ -358,6 +410,7 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
         mode: OriginReadMode,
+        tenant: TenantContext<'_>,
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
@@ -377,16 +430,21 @@ impl BlockReader {
             self.stats.record_worker_fetch();
             let result = match mode {
                 OriginReadMode::Current => {
-                    worker.fetch_range_into(&block.object, offset, dst).await
+                    worker
+                        .request(&self.tenant)
+                        .expect("validated tenant")
+                        .fetch_range_into(&block.object, offset, dst)
+                        .await
                 }
                 OriginReadMode::ExactVersion(object_len) => {
                     worker
-                        .fetch_versioned_range_into(
+                        .fetch_versioned_range_into_with_context(
                             &block.object,
                             &block.version,
                             offset,
                             dst,
                             object_len,
+                            tenant,
                         )
                         .await
                 }
@@ -446,7 +504,9 @@ impl BlockReader {
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
-                Ok(worker) => worker,
+                Ok(worker) => worker
+                    .request(&self.tenant)
+                    .expect("validated request tenant"),
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;

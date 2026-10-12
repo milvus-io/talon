@@ -123,11 +123,15 @@ typedef struct talon_request_options {
     size_t traceparent_len;
     const char *tracestate;
     size_t tracestate_len;
+    /* Copied before submission. NULL tenant selects default.
+     * Zero block_size uses the client planning default. */
+    const char *tenant;
+    uint32_t block_size;
 } talon_request_options;
 
-/* Initialize only the v1 fields; size must be at least sizeof(options).
- * Submission copies the carrier before returning. NULL/NONE never inherits
- * ambient context. Invalid W3C data does not fail a valid business request.
+/* Initialize the current request options structure.
+ * Submission copies tenant and trace strings before returning. NULL/NONE never
+ * inherits ambient context. Invalid W3C data does not fail a valid business request.
  * Unknown version/flags/mode or a short struct returns INVALID_ARGUMENT
  * synchronously, without scheduling a callback. */
 int talon_request_options_init(talon_request_options *options, size_t size);

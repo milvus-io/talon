@@ -404,3 +404,22 @@ does not permit origin fallback.
 `message: String`. Coordinators and Workers use it for typed discovery and
 metadata failures. Only availability and timeout permit caller-selected origin
 fallback. Conformance vectors cover membership and metadata failure messages.
+
+## Protocol v3 tenant routing
+
+V3 requests use the v2 metadata envelope (`u16` big-endian length followed by
+TLVs and the unchanged business payload). TLV key **5** is the required UTF-8
+tenant name, with exactly one occurrence. It must be a valid tenant filesystem
+component (see [tenant cache isolation](tenant-cache-isolation.md)). Missing,
+duplicate, invalid or conflicting identities reject the request. Malformed
+optional trace context never discards the tenant identity.
+
+V3 supports all request types, including control LOAD/BatchLoad and raw-body
+PUT/admission headers. Raw object bytes still follow the framed header; responses
+retain their raw business payload without a metadata prefix. The metadata limit
+remains 1024 bytes. Tenant identity is per request, including on reused sockets.
+
+Unscoped v1/v2 requests select `default`; existing tenant-scoped read variants
+still work. V3 is required for new named-tenant clients so an old server rejects
+unsupported routing instead of ignoring an unknown v2 TLV. Default clients can
+continue using v1/v2. Block IDs and control-schema discriminants are unchanged.

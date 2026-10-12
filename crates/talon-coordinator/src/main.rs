@@ -699,7 +699,8 @@ impl Coordinator {
         attempt_deadline: tokio::time::Instant,
     ) -> anyhow::Result<(TcpStream, ControlMessage)> {
         let mut buf = codec::encode(0, message)?;
-        talon_transport::envelope::outbound(&mut buf, address)?;
+        let tenant = REQUEST_TENANT.try_with(Clone::clone).unwrap_or_default();
+        talon_transport::envelope::outbound_tenant(&mut buf, address, &tenant)?;
         stream.write_all(&buf).await?;
         stream.flush().await?;
 
@@ -1582,6 +1583,11 @@ async fn serve_worker_control(
     result
 }
 
+tokio::task_local! {
+    // Bounded to one incoming request, including all serial metadata proxy attempts.
+    static REQUEST_TENANT: talon_core::TenantId;
+}
+
 async fn handle_conn<S>(
     mut stream: S,
     state: Arc<Coordinator>,
@@ -1629,7 +1635,12 @@ where
                         detail: Some(error),
                     }
                 } else {
-                    state.dispatch(message).await
+                    REQUEST_TENANT
+                        .scope(
+                            metadata.tenant.clone().unwrap_or_default(),
+                            state.dispatch(message),
+                        )
+                        .await
                 };
                 let error = matches!(
                     &reply,
@@ -2232,6 +2243,36 @@ mod tests {
         );
         drop(held);
         assert_eq!(coordinator.worker_proxy_slots.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn proxy_keeps_request_tenant_on_reused_worker_connections() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for tenant in ["a", "b", "default"] {
+                let (_, _, metadata) = read_control(&mut stream).await.unwrap().unwrap();
+                assert_eq!(metadata.tenant.unwrap_or_default().effective_name(), tenant);
+                stream
+                    .write_all(&codec::encode(0, &stat_reply()).unwrap())
+                    .await
+                    .unwrap();
+                stream.flush().await.unwrap();
+            }
+        });
+        let coordinator = proxy_test_coordinator();
+        let workers = vec![proxy_worker(address)];
+        for tenant in ["a", "b", "default"] {
+            let reply = REQUEST_TENANT
+                .scope(
+                    talon_core::TenantId::named(tenant),
+                    coordinator.proxy_to_workers(&workers, stat_request()),
+                )
+                .await;
+            assert_eq!(reply, stat_reply());
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

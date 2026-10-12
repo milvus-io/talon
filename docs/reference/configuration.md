@@ -752,6 +752,14 @@ Azure SAS token; env-only, never from a config file or logged.
 
 ## FUSE client
 
+### `tenant_id`
+
+Tenant cache namespace for all requests from this mount.
+
+- **Environment variable:** `TALON_FUSE_TENANT_ID`
+- **Default:** `default`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `mountpoint`
 
 Directory to mount the Talon filesystem at.

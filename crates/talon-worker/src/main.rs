@@ -42,9 +42,10 @@ use talon_worker::mapping_guard::MappingGuard;
 use talon_worker::tokio_conn::{handle_conn, read_control};
 #[cfg(target_os = "linux")]
 use talon_worker::uring_conn;
+#[cfg(test)]
+use talon_worker::WholeBlockStore;
 use talon_worker::{
-    serve_admin, BlockIndex, ConnectionAdmission, InFlightLoads, PagedBlockStore,
-    TenantRateLimiter, WholeBlockStore, WorkerObservability, WorkerRuntime,
+    serve_admin, BlockIndex, ConnectionAdmission, InFlightLoads, WorkerObservability, WorkerRuntime,
 };
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -213,6 +214,7 @@ impl Args {
             gcs_endpoint: None,
             // The [rate_limits] table is file-only; the CLI leaves it unset.
             rate_limits: None,
+            tenants: None,
         }
     }
 }
@@ -422,65 +424,10 @@ async fn run() -> anyhow::Result<()> {
         cfg.l2_page_size_bytes,
     )?;
     cfg.node_id = Some(identity.worker_id);
-    let store = WholeBlockStore::open(&root)?.with_root_lock(cache_root_lock.clone());
-    // Paged L2 is opt-in: with `l2_page_size_bytes` set, a miss materializes only
-    // the pages a read touches, under `<root>/paged`, instead of whole blocks.
-    let paged = match u32::try_from(cfg.l2_page_size_bytes) {
-        Ok(page_size) if page_size > 0 => Some(
-            PagedBlockStore::open(root.join("paged"), page_size)?
-                .with_root_lock(cache_root_lock.clone()),
-        ),
-        _ => None,
-    };
-
-    // Rebuild the in-memory index from blocks already on local disk so a restart
-    // does not re-download the resident working set (issue #114).
     let index = Arc::new(BlockIndex::new());
-    if let Some(paged) = &paged {
-        // Rebuild paged entries first; their present bitmaps come from the page
-        // files actually on disk.
-        match paged.scan() {
-            Ok(metas) => {
-                let count = metas.len();
-                for meta in metas {
-                    index.commit(meta);
-                }
-                if count > 0 {
-                    tracing::info!(
-                        blocks = count,
-                        pages = index.page_count(),
-                        "rebuilt paged block index from on-disk cache"
-                    );
-                }
-            }
-            Err(error) => {
-                return Err(error)
-                    .map_err(|error| anyhow::anyhow!("failed to recover paged cache: {error}"));
-            }
-        }
-    }
-    match store.scan() {
-        Ok(metas) => {
-            let count = metas.len();
-            for meta in metas {
-                index.commit(meta);
-            }
-            if count > 0 {
-                tracing::info!(
-                    blocks = count,
-                    resident_bytes = index.resident_bytes(),
-                    "rebuilt block index from on-disk cache"
-                );
-            }
-        }
-        Err(error) => {
-            return Err(error)
-                .map_err(|error| anyhow::anyhow!("failed to recover block cache: {error}"));
-        }
-    }
     let inflight = Arc::new(InFlightLoads::new());
     let backend_kind = cfg.backend.as_deref().unwrap_or("azure");
-    let configured_backend: Backend = backend_kind.parse().map_err(|error| {
+    let _configured_backend: Backend = backend_kind.parse().map_err(|error| {
         anyhow::anyhow!(
             "unknown TALON_WORKER_BACKEND {backend_kind:?}; expected azure, s3, or gcs: {error}"
         )
@@ -629,34 +576,17 @@ async fn run() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let mut runtime = WorkerRuntime::new_with_l1(
-        store,
-        index,
-        inflight,
+    let runtime = WorkerRuntime::open_tenants(
+        &cfg,
+        cache_root_lock,
         backend,
-        cfg.block_size,
-        cfg.capacity_bytes,
-        cfg.l1_capacity_bytes,
-        cfg.l1_page_size_bytes,
         observability.metrics().clone(),
-    )
-    .with_backend_kind(configured_backend)
-    .with_paged_miss_run_concurrency(cfg.paged_miss_run_concurrency)
-    .with_load_inflight_bytes(cfg.load_inflight_bytes)?
-    .with_rate_limiter(Arc::new(TenantRateLimiter::new(cfg.rate_limits.clone())));
-    if cfg.rate_limits.enabled {
-        tracing::info!("worker per-tenant rate limiting enabled");
-    }
-    if let Some(paged) = paged {
-        runtime = runtime.with_paged_store(paged);
-    }
-    let page_gc_config = talon_worker::page_gc::PageGcConfig::from(&cfg);
-    runtime = runtime.with_page_gc(page_gc_config.clone())?;
+    )?;
     let worker = Arc::new(runtime);
-
-    // The cache root lease is held and no foreground mutations have started.
-    // This disk pass also finds directories omitted from residency recovery.
-    worker.recover_page_file_cleanup().await;
+    observability.attach_tenant_runtime(&worker);
+    for tenant in worker.tenant_runtimes() {
+        tenant.recover_page_file_cleanup().await;
+    }
 
     let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
     tracing::info!(listen = %cfg.admin_listen, "worker serving administration API");

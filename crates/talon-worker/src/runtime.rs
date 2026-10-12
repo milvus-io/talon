@@ -10,6 +10,7 @@ mod background;
 mod load;
 mod ownership_gc;
 mod stale_gc;
+mod tenants;
 pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]
@@ -91,6 +92,9 @@ pub struct WorkerRuntime {
     /// Latest control-plane observation, shared by runtime clones.
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
+    tenant: talon_core::TenantId,
+    tenants: Option<Arc<tenants::TenantRuntimes>>,
+    tenant_parent: std::sync::Weak<tenants::TenantRuntimes>,
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
     l1: Arc<MemoryStore>,
@@ -211,6 +215,9 @@ impl WorkerRuntime {
         Self {
             membership: Arc::new(Mutex::new(None)),
             membership_changed: tokio::sync::watch::channel(()).0,
+            tenant: talon_core::TenantId::default(),
+            tenants: None,
+            tenant_parent: std::sync::Weak::new(),
             l1,
             page_cleanup: Arc::new(tokio::sync::Mutex::new(
                 crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
@@ -1766,8 +1773,15 @@ impl WorkerRuntime {
     }
 
     fn refresh_l1_metrics(&self) {
-        self.metrics
-            .update_l1_residency(self.l1.len() as u64, self.l1.resident_bytes());
+        let (pages, bytes) = self
+            .registry()
+            .map(|r| {
+                r.snapshot().iter().fold((0, 0), |(pages, bytes), w| {
+                    (pages + w.l1.len() as u64, bytes + w.l1.resident_bytes())
+                })
+            })
+            .unwrap_or((self.l1.len() as u64, self.l1.resident_bytes()));
+        self.metrics.update_l1_residency(pages, bytes);
     }
 
     /// Fetch a block from the backend and commit it to the local cache.
@@ -2082,7 +2096,25 @@ impl WorkerRuntime {
         if self.capacity_bytes == 0 {
             return;
         }
-        self.evict_to_target(self.capacity_bytes).await;
+        if let Some(registry) = self.registry() {
+            let mut workers = registry.snapshot();
+            // Prefer reclaiming from the admitting tenant. Its new unit is
+            // pinned until publication completes, so pressure must also be
+            // able to reclaim idle units belonging to other tenants.
+            workers.sort_by_key(|worker| worker.tenant != self.tenant);
+            for worker in &workers {
+                let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
+                if total <= self.capacity_bytes {
+                    break;
+                }
+                let target = worker
+                    .resident_bytes()
+                    .saturating_sub(total - self.capacity_bytes);
+                worker.evict_to_target(target).await;
+            }
+        } else {
+            self.evict_to_target(self.capacity_bytes).await;
+        }
     }
 
     /// Capacity reclamation for foreground admissions, bounded by initial residency.

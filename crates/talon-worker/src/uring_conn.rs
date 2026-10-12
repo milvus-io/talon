@@ -145,6 +145,20 @@ async fn handle_request(
     send_pipe: &mut Option<(Pipe, Pipe)>,
 ) -> anyhow::Result<Option<TcpStream>> {
     let response_version = header.version;
+    let selected = match worker.for_request(header, payload).await {
+        Ok(selected) => selected,
+        Err(error) => {
+            let error = talon_transport::envelope::response_version(
+                data::encode_typed_error(header.request_id, error.code, error.message),
+                header.version,
+            );
+            write_all(&mut stream, error).await?;
+            // Raw PUT bodies may follow; close instead of interpreting them as a frame.
+            return Ok(None);
+        }
+    };
+    let worker = &selected;
+
     match header.msg_type {
         MsgType::Put => {
             handle_put(
@@ -326,7 +340,7 @@ async fn handle_request(
         return Ok(Some(stream));
     }
 
-    if let Err(throttled) = worker.rate_limiter().admit(&tenant, req.len) {
+    if let Err(throttled) = worker.rate_limiter().admit(worker.tenant(), req.len) {
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::RateLimited,
@@ -669,8 +683,8 @@ async fn handle_cached_range(
     }
     // Meter the cache-only read too, so a resident-version read cannot escape
     // the tenant's read_iops / read_throughput limits (a plain GetCachedRange
-    // carries no tenant and is charged to Unattributed under the default).
-    if let Err(throttled) = worker.rate_limiter().admit(&tenant, request.len) {
+    // without tenant metadata is charged to the default tenant).
+    if let Err(throttled) = worker.rate_limiter().admit(worker.tenant(), request.len) {
         let mut reply = data::encode_typed_error(
             decoded.request_id,
             DataErrorCode::RateLimited,
@@ -1037,7 +1051,7 @@ async fn handle_put(
             .write_object(&req.object, bytes::Bytes::from(body))
             .await
     } else {
-        let staged = tempfile::NamedTempFile::new()?;
+        let staged = worker.staging_file()?;
         let mut file = staged.reopen()?;
         let mut remaining = req.body_len;
         while remaining > 0 {
@@ -1810,7 +1824,7 @@ mod tests {
                     data::encode_versioned_tenant_request(
                         1,
                         &data::TenantScopedVersionedRange {
-                            tenant: TenantId::named("tenant"),
+                            tenant: TenantId::default(),
                             request,
                         },
                     )

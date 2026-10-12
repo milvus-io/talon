@@ -65,6 +65,37 @@ public final class ConformanceTest {
             assertBytes(byName.get("v2.response.raw"), Frame.decode(byName.get("v2.response.raw")).encode());
             assertTrue(TraceContext.fromW3c("invalid", null) == null, "invalid parent");
         });
+        check("v3 tenant envelopes match Rust", () -> {
+            assertBytes(byName.get("v3.range.tenant"), Telemetry.tenantEnvelope(byName.get("data.range_request"), "worker", "acme"));
+            assertBytes(byName.get("v3.range.context_tenant"), Telemetry.tenantEnvelope(byName.get("v2.range.context"), "worker", "acme"));
+            assertBytes(byName.get("v3.load.tenant"), Telemetry.tenantEnvelope(byName.get("control.load_block"), "worker", "acme"));
+            assertBytes(byName.get("data.range_request"), Telemetry.tenantEnvelope(byName.get("data.range_request"), "worker", "default"));
+        });
+        check("one client serves concurrent tenants and falls back to default per call", () -> {
+            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 16, 8)) {
+                peer.tenantPayload = true;
+                ExecutorService callers = Executors.newFixedThreadPool(2);
+                try {
+                    List<Future<?>> calls = new ArrayList<>();
+                    for (String tenant : List.of("a", "b")) {
+                        calls.add(callers.submit(() -> {
+                            RequestOptions options = RequestOptions.INHERIT.withTenant(tenant).withBlockSize(tenant.equals("a") ? 4 : 8);
+                            assertBytes(new byte[] {(byte) tenant.charAt(0)}, client.read("s3://bucket/key", 0, 1, options));
+                            assertEquals(tenant, client.stat("s3://bucket/key", options).version(), "stat tenant");
+                            assertEquals(tenant, client.list("s3/bucket", options).get(0).path(), "list tenant");
+                            assertEquals(new LoadResult(9, tenant.equals("a") ? 3 : 2), client.load(new LoadRequest("s3://bucket/key", "v1", 9), options), "tenant geometry");
+                            client.batchLoad(List.of(new LoadRequest("s3://bucket/other", "v1", 8)), options);
+                            return null;
+                        }));
+                    }
+                    for (Future<?> call : calls) call.get(10, TimeUnit.SECONDS);
+                } finally { callers.shutdownNow(); }
+                assertBytes(new byte[] {'d'}, client.read("s3://bucket/key", 0, 1));
+                assertEquals(new LoadResult(9, 1), client.load("s3://bucket/key", "v1", 9), "client default geometry unchanged");
+                assertTrue(peer.tenants.containsAll(List.of("a", "b", "default")), "all tenant identities observed");
+                assertEquals("default", Telemetry.tenant(), "request scope restored");
+            }
+        });
         check("context override, nesting and capability policy", () -> {
             TraceContext a = TraceContext.fromW3c("00-11111111111111111111111111111111-1111111111111111-00", null);
             TraceContext b = TraceContext.fromW3c("00-22222222222222222222222222222222-2222222222222222-00", null);
@@ -772,6 +803,7 @@ public final class ConformanceTest {
         final ExecutorService threads = Executors.newCachedThreadPool();
         volatile CountDownLatch arrived = new CountDownLatch(0);
         volatile CountDownLatch release = new CountDownLatch(0);
+        volatile boolean tenantPayload;
         volatile boolean malformedStat;
         volatile boolean rejectLoad;
         volatile boolean wrongLoadRequestId;
@@ -781,6 +813,7 @@ public final class ConformanceTest {
         volatile CountDownLatch discoveryArrived = new CountDownLatch(0);
         volatile CountDownLatch discoveryRelease = new CountDownLatch(0);
         volatile int workerState = 2;
+        final List<String> tenants = java.util.Collections.synchronizedList(new ArrayList<>());
         final AtomicInteger statCalls = new AtomicInteger();
         final List<Long> readSizes = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<Integer> loadCounts = java.util.Collections.synchronizedList(new ArrayList<>());
@@ -827,6 +860,19 @@ public final class ConformanceTest {
                     Frame request = Frame.decode(header);
                     byte[] body = new byte[request.length()];
                     in.readFully(body);
+                    String tenant = "default";
+                    if (header[2] >= 2) {
+                        java.nio.ByteBuffer metadata = java.nio.ByteBuffer.wrap(body);
+                        int end = 2 + Short.toUnsignedInt(metadata.getShort());
+                        while (metadata.position() < end) {
+                            int key = Byte.toUnsignedInt(metadata.get());
+                            byte[] value = new byte[Short.toUnsignedInt(metadata.getShort())];
+                            metadata.get(value);
+                            if (key == 5) tenant = new String(value, StandardCharsets.UTF_8);
+                        }
+                        body = Arrays.copyOfRange(body, end, body.length);
+                    }
+                    tenants.add(tenant);
                     byte[] response;
                     int byteDelay = 0;
                     if (request.type() == Frame.MsgType.GET_VERSIONED_RANGE) {
@@ -839,7 +885,7 @@ public final class ConformanceTest {
                         if (!release.await(5, TimeUnit.SECONDS)) {
                             throw new IOException("test response gate timed out");
                         }
-                        response = new byte[] {42};
+                        response = new byte[] {tenantPayload ? (byte) tenant.charAt(0) : 42};
                     } else if (Messages.decodeBody(body).tag == Messages.TAG_MEMBERSHIP_QUERY) {
                         discoveryCalls.incrementAndGet();
                         discoveryArrived.countDown();
@@ -869,12 +915,14 @@ public final class ConformanceTest {
                             for (int index : failures) ack.u32(index).string("origin failure");
                         }
                         response = ack.toBytes();
+                    } else if (Messages.decodeBody(body).tag == Messages.TAG_LIST_OBJECTS) {
+                        response = new Bincode.Writer().u16(6).variant(Messages.TAG_OBJECT_LIST).u64(1).string(tenant).u64(1).toBytes();
                     } else {
                         if (!counted) { statAccepts.incrementAndGet(); counted = true; }
                         statCalls.incrementAndGet();
                         Bincode.Writer w = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_OBJECT_STAT);
                         if (!malformedStat) {
-                            w.u64(1).string("v1");
+                            w.u64(1).string(tenantPayload ? tenant : "v1");
                         }
                         response = w.toBytes();
                     }

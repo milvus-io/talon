@@ -155,11 +155,11 @@ pub struct RateLimitPolicy {
 
 impl RateLimitPolicy {
     /// The limits that apply to `tenant`: its override if present, else the
-    /// default. The unattributed tenant always uses the default.
+    /// default. Unattributed requests resolve to the `default` tenant override.
     pub fn limits_for(&self, tenant: &TenantId) -> MetricLimits {
-        tenant
-            .name()
-            .and_then(|name| self.overrides.get(name).copied())
+        self.overrides
+            .get(tenant.effective_name())
+            .copied()
             .unwrap_or(self.default)
     }
 

@@ -6,7 +6,10 @@
 
 use bytes::{Bytes, BytesMut};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    Arc, Mutex,
+};
 use talon_core::{BlockId, PageIndex};
 
 /// Identity of one L1 page.
@@ -30,7 +33,17 @@ pub enum MemoryInsert {
     },
 }
 
+struct BudgetGuard {
+    bytes: u64,
+    used: Arc<AtomicU64>,
+}
+impl Drop for BudgetGuard {
+    fn drop(&mut self) {
+        self.used.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
 struct Entry {
+    _budget: Option<BudgetGuard>,
     value: Bytes,
     last_used: u64,
 }
@@ -43,6 +56,7 @@ struct Inner {
 
 /// An in-memory, byte-capacity LRU over fixed-size block pages.
 pub struct MemoryStore {
+    shared_budget: Option<Arc<AtomicU64>>,
     inner: Mutex<Inner>,
     capacity_bytes: u64,
     page_size_bytes: u64,
@@ -62,6 +76,7 @@ impl MemoryStore {
     /// Create an L1 store bounded by total bytes with fixed-size pages.
     pub fn with_limits(capacity_bytes: u64, page_size_bytes: u64) -> Self {
         Self {
+            shared_budget: None,
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
                 resident_bytes: 0,
@@ -69,6 +84,14 @@ impl MemoryStore {
             }),
             capacity_bytes,
             page_size_bytes,
+        }
+    }
+
+    /// Separate tenant keys while retaining one process-wide memory ceiling.
+    pub(crate) fn with_shared_budget(capacity: u64, page_size: u64, used: Arc<AtomicU64>) -> Self {
+        Self {
+            shared_budget: Some(used),
+            ..Self::with_limits(capacity, page_size)
         }
     }
 
@@ -216,16 +239,48 @@ impl MemoryStore {
                 .resident_bytes
                 .saturating_sub(previous.value.len() as u64);
         }
+        let mut evicted = Vec::new();
+        let budget = if let Some(used) = &self.shared_budget {
+            loop {
+                if used
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |current| {
+                        current
+                            .checked_add(len)
+                            .filter(|next| *next <= self.capacity_bytes)
+                    })
+                    .is_ok()
+                {
+                    break Some(BudgetGuard {
+                        bytes: len,
+                        used: used.clone(),
+                    });
+                }
+                let victim = inner
+                    .entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_used)
+                    .map(|(key, _)| key.clone());
+                let Some(victim) = victim else {
+                    return MemoryInsert::TooLarge;
+                };
+                let entry = inner.entries.remove(&victim).unwrap();
+                inner.resident_bytes -= entry.value.len() as u64;
+                drop(entry);
+                evicted.push(victim);
+            }
+        } else {
+            None
+        };
         inner.resident_bytes = inner.resident_bytes.saturating_add(len);
         inner.entries.insert(
             key,
             Entry {
+                _budget: budget,
                 value,
                 last_used: tick,
             },
         );
 
-        let mut evicted = Vec::new();
         while inner.resident_bytes > self.capacity_bytes {
             let victim = inner
                 .entries

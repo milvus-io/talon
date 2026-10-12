@@ -208,7 +208,7 @@ impl FrameHeader {
             return Err(FrameError::BadMagic(magic));
         }
         let version = buf[2];
-        if version != 1 && version != 2 {
+        if version != 1 && version != 2 && version != 3 {
             return Err(FrameError::UnsupportedVersion(version));
         }
         let msg_type = MsgType::from_u8(buf[3])?;
@@ -299,10 +299,10 @@ mod tests {
     #[test]
     fn decode_bad_version() {
         let mut bytes = FrameHeader::new(MsgType::Get, 1, 0).encode();
-        bytes[2] = PROTOCOL_VERSION + 2;
+        bytes[2] = PROTOCOL_VERSION + 3;
         assert_eq!(
             FrameHeader::decode(&bytes),
-            Err(FrameError::UnsupportedVersion(PROTOCOL_VERSION + 2))
+            Err(FrameError::UnsupportedVersion(PROTOCOL_VERSION + 3))
         );
     }
 

@@ -32,6 +32,7 @@ use tracing_subscriber::EnvFilter;
 type MainResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 struct Settings {
+    tenant: talon_core::TenantId,
     protocol: String,
     bind: SocketAddr,
     mode: GatewayMode,
@@ -252,7 +253,12 @@ impl Settings {
             )),
         };
 
+        let tenant = talon_core::TenantId::named(
+            value(&mut get, "TALON_GATEWAY_TENANT_ID").unwrap_or_else(|| "default".into()),
+        );
+        tenant.validate()?;
         let settings = Self {
+            tenant,
             protocol,
             bind,
             mode,
@@ -401,6 +407,8 @@ fn cache_reader(
             Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
             settings.replicas,
         )
+        .request(&settings.tenant)
+        .expect("validated gateway tenant")
         .with_zone_affinity(
             zone,
             settings.zone_affinity,

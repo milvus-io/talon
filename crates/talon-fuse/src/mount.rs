@@ -363,7 +363,9 @@ impl TalonFuse {
         let version = self.version.clone();
         self.runtime.block_on(async move {
             let addr = reader.resolve_owner(&object, block_size, &version).await?;
-            let client = crate::worker_client::WriteClient::with_pool(addr, pool);
+            let client = crate::worker_client::WriteClient::with_pool(addr, pool)
+                .request(reader.tenant())
+                .expect("validated mount tenant");
             match source {
                 WritebackSource::Memory(bytes) => {
                     client.put_object(&object, &bytes).await?;
@@ -413,7 +415,9 @@ impl TalonFuse {
         let version = self.version.clone();
         self.runtime.block_on(async move {
             let addr = reader.resolve_owner(&object, block_size, &version).await?;
-            let client = crate::worker_client::WriteClient::with_pool(addr, pool);
+            let client = crate::worker_client::WriteClient::with_pool(addr, pool)
+                .request(reader.tenant())
+                .expect("validated mount tenant");
             client.delete_object(&object).await?;
             Ok::<(), anyhow::Error>(())
         })
