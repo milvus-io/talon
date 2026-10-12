@@ -144,9 +144,6 @@ impl WorkerError {
 /// Errors from a worker's block prewarm control exchange.
 #[derive(Debug, thiserror::Error)]
 pub enum WorkerLoadError {
-    /// Discovery expired locally before dispatch or a stale-connection retry.
-    #[error("load instance discovery expired before dispatch")]
-    DiscoveryExpired,
     /// The selected instance is no longer valid for a new request or retry.
     #[error("load instance: {0}")]
     Instance(#[from] WorkerError),
@@ -171,7 +168,6 @@ pub enum WorkerLoadError {
 #[derive(Debug, Clone)]
 pub struct WorkerClient {
     addr: String,
-    read_retry_deadline: Option<std::time::Instant>,
     pool: Arc<ConnectionPool>,
     /// Tenant every fetch from this client is attributed to. `Unattributed`
     /// unless set with [`with_tenant`](Self::with_tenant).
@@ -192,38 +188,9 @@ impl WorkerClient {
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
             addr: addr.into(),
-            read_retry_deadline: None,
             pool,
             tenant: TenantId::Unattributed,
         }
-    }
-
-    /// Bound stale-connection recovery to the discovery snapshot that selected us.
-    pub(crate) fn with_read_retry_deadline(mut self, deadline: std::time::Instant) -> Self {
-        self.read_retry_deadline = Some(deadline);
-        self
-    }
-
-    fn check_read_retry_deadline(&self) -> Result<(), WorkerError> {
-        if self
-            .read_retry_deadline
-            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
-        {
-            return Err(WorkerError::Remote(DataPlaneError {
-                code: talon_transport::DataErrorCode::Unavailable,
-                message: "instance discovery expired before read retry".into(),
-            }));
-        }
-        Ok(())
-    }
-
-    async fn fresh_read_retry_connection(&self) -> Result<TcpStream, WorkerError> {
-        self.check_read_retry_deadline()?;
-        let stream = self.pool.fresh(&self.addr).await?;
-        // Connecting may consume the remaining discovery lifetime. Do not send
-        // another request using an observation that expired while dialing.
-        self.check_read_retry_deadline()?;
-        Ok(stream)
     }
 
     /// The worker address this client talks to.
@@ -350,9 +317,7 @@ impl WorkerClient {
             .map_err(talon_transport::CodecError::from)?;
         self.pool
             .with_deadline("worker load", deadline, async {
-                self.check_load_discovery()?;
                 let (mut stream, reused) = self.pool.checkout(&self.addr).await?;
-                self.check_load_discovery()?;
                 let result = async {
                     stream.write_all(&output).await?;
                     stream.flush().await?;
@@ -366,9 +331,7 @@ impl WorkerClient {
                     }
                     Err(WorkerLoadError::Io(_)) if reused => {
                         drop(stream);
-                        self.check_load_discovery()?;
                         let mut stream = self.pool.fresh(&self.addr).await?;
-                        self.check_load_discovery()?;
                         stream.write_all(&output).await?;
                         stream.flush().await?;
                         let failures =
@@ -380,11 +343,6 @@ impl WorkerClient {
                 }
             })
             .await
-    }
-
-    fn check_load_discovery(&self) -> Result<(), WorkerLoadError> {
-        self.check_read_retry_deadline()
-            .map_err(|_| WorkerLoadError::DiscoveryExpired)
     }
 
     /// Fetch `[offset, offset+len)` of `object` from the worker.
@@ -427,7 +385,7 @@ impl WorkerClient {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut out, &self.addr)?;
 
-                    let mut stream = self.fresh_read_retry_connection().await?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
                         .pool
                         .with_request_deadline("worker fetch_range retry", async {
@@ -480,7 +438,7 @@ impl WorkerClient {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
 
-                    let mut stream = self.fresh_read_retry_connection().await?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
                     let n = self
                         .pool
                         .with_request_deadline("worker fetch_range retry", async {
@@ -539,7 +497,7 @@ impl WorkerClient {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
-                    let mut stream = self.fresh_read_retry_connection().await?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
                         .pool
                         .with_request_deadline("worker fetch_versioned_range retry", async {
@@ -595,7 +553,7 @@ impl WorkerClient {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
-                    let mut stream = self.fresh_read_retry_connection().await?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
                     let n = self
                         .pool
                         .with_request_deadline("worker fetch_versioned_range retry", async {
@@ -651,7 +609,7 @@ impl WorkerClient {
                     talon_telemetry::text("server.address", &self.addr);
                     talon_transport::envelope::outbound(&mut output, &self.addr)?;
 
-                    let mut stream = self.fresh_read_retry_connection().await?;
+                    let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
                         .pool
                         .with_request_deadline("worker fetch_cached_range retry", async {
@@ -1700,9 +1658,7 @@ mod tests {
                     });
                 }
             });
-            let client = WorkerClient::new(addr).with_read_retry_deadline(
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            );
+            let client = WorkerClient::new(addr);
 
             let a = retry_test_read(&client, api).await.unwrap();
             assert_eq!(a, vec![7u8; 8]);
@@ -1711,50 +1667,6 @@ mod tests {
             assert_eq!(b, vec![7u8; 8]);
             // Two connections were accepted (the retry dialed a fresh one).
             assert_eq!(accepts.load(Ordering::SeqCst), 2);
-        }
-    }
-
-    #[tokio::test]
-    async fn expired_discovery_does_not_redial_a_stale_connection() {
-        use std::sync::atomic::Ordering;
-        for api in 0..5 {
-            let accepts = Arc::new(std::sync::atomic::AtomicU32::new(0));
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let addr = listener.local_addr().unwrap().to_string();
-            let accepts_srv = Arc::clone(&accepts);
-            tokio::spawn(async move {
-                loop {
-                    let (mut sock, _) = match listener.accept().await {
-                        Ok(v) => v,
-                        Err(_) => return,
-                    };
-                    accepts_srv.fetch_add(1, Ordering::SeqCst);
-                    tokio::spawn(async move {
-                        let mut hdr = [0u8; HEADER_LEN];
-                        if sock.read_exact(&mut hdr).await.is_err() {
-                            return;
-                        }
-                        let header = FrameHeader::decode(&hdr).unwrap();
-                        let mut body = vec![0u8; header.length as usize];
-                        sock.read_exact(&mut body).await.unwrap();
-                        let out = response_header_ok(0, 8).to_vec();
-                        let mut full = out;
-                        full.extend_from_slice(&[7u8; 8]);
-                        sock.write_all(&full).await.unwrap();
-                        sock.flush().await.unwrap();
-                    });
-                }
-            });
-            let client =
-                WorkerClient::new(addr).with_read_retry_deadline(std::time::Instant::now());
-
-            let a = retry_test_read(&client, api).await.unwrap();
-            assert_eq!(a, vec![7u8; 8]);
-            let error = retry_test_read(&client, api).await.unwrap_err();
-            assert!(
-                matches!(error, WorkerError::Remote(ref e) if e.code == talon_transport::DataErrorCode::Unavailable)
-            );
-            assert_eq!(accepts.load(Ordering::SeqCst), 1);
         }
     }
 
@@ -1783,9 +1695,7 @@ mod tests {
                     // Close both the warmed socket and the failed fresh retry.
                 }
             });
-            let client = WorkerClient::new(addr).with_read_retry_deadline(
-                std::time::Instant::now() + std::time::Duration::from_secs(5),
-            );
+            let client = WorkerClient::new(addr);
             assert_eq!(retry_test_read(&client, api).await.unwrap(), vec![7; 8]);
             assert!(retry_test_read(&client, api)
                 .await

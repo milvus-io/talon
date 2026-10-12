@@ -2,6 +2,9 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+/// Maximum observation lifetime advertised as a client background-refresh hint.
+pub const DISCOVERY_MAX_AGE_MS: u64 = 30_000;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkerMember {
     pub worker_id: String,
@@ -135,7 +138,7 @@ impl WorkerDiscovery {
         Self {
             topology_token: registry.topology_token(),
             state_token,
-            valid_for_ms: 500,
+            valid_for_ms: DISCOVERY_MAX_AGE_MS,
             workers,
         }
     }
@@ -221,6 +224,7 @@ mod tests {
             coordinator,
         ];
         let view = WorkerDiscovery::retained(&registry, &instances);
+        assert_eq!(view.valid_for_ms, 30_000);
         assert_eq!(view.workers.len(), 3);
         assert_eq!(view.workers[0].state, InstanceState::Conflict);
         assert_eq!(view.workers[1].state, InstanceState::Offline);

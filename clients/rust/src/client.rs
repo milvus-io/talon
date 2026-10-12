@@ -91,7 +91,8 @@ impl ClientBuilder {
         self
     }
 
-    /// Validate configuration and construct a client without selecting a Tokio runtime.
+    /// Validate configuration and start shared background discovery on its own thread.
+    /// No caller Tokio runtime is required at construction.
     pub fn build(self) -> Result<Client, Error> {
         let Self {
             coordinator,
@@ -938,9 +939,10 @@ mod tests {
                     let server = tokio::spawn(async move {
                         loop {
                             let (mut socket, _) = listener.accept().await.unwrap();
-                            count.fetch_add(1, Ordering::SeqCst);
+                            let count = count.clone();
                             let barrier = Arc::clone(&barrier);
                             tokio::spawn(async move {
+                                let mut counted = false;
                                 loop {
                                     let mut header_bytes = [0_u8; HEADER_LEN];
                                     if socket.read_exact(&mut header_bytes).await.is_err() {
@@ -949,6 +951,24 @@ mod tests {
                                     let header = FrameHeader::decode(&header_bytes).unwrap();
                                     let mut payload = vec![0_u8; header.length as usize];
                                     socket.read_exact(&mut payload).await.unwrap();
+                                    if !worker {
+                                        let full =
+                                            [header_bytes.as_slice(), payload.as_slice()].concat();
+                                        let (_, message) = talon_transport::decode(&full).unwrap();
+                                        if matches!(message, ControlMessage::MembershipQuery {}) {
+                                            let response = talon_transport::encode(
+                                                header.request_id,
+                                                &membership_fixture::plain(vec![]),
+                                            )
+                                            .unwrap();
+                                            socket.write_all(&response).await.unwrap();
+                                            continue;
+                                        }
+                                    }
+                                    if !counted {
+                                        count.fetch_add(1, Ordering::SeqCst);
+                                        counted = true;
+                                    }
                                     let response = if worker {
                                         let mut frame = header_bytes.to_vec();
                                         frame.extend_from_slice(&payload);

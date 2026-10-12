@@ -72,7 +72,7 @@ for the format this implements.
 
 ## Rolling upgrades
 
-Schema-6 clusters with persistent membership preserve block owners while Workers restart. Reads select one logical owner and resolve its current process. A stale pooled connection can be retried once within the original discovery lifetime; this does not refresh discovery or switch owners. Availability failures return `TalonException` with `code()` equal to `UNAVAILABLE` or `TIMEOUT`. `fallbackEligible()` is advisory and never accesses origin storage. Version mismatch, rate limits, origin failures and protocol failures remain distinct. Discovery expires after at most 500 ms and refresh failures are coalesced; idle sockets belong to a single process incarnation.
+Schema-6 clusters with persistent membership preserve block owners while Workers restart. Reads select one logical owner and resolve its current process. A stale pooled connection can be retried once; this does not refresh discovery or switch owners. Availability failures return `TalonException` with `code()` equal to `UNAVAILABLE` or `TIMEOUT`. `fallbackEligible()` is advisory and never accesses origin storage. Version mismatch, rate limits, origin failures and protocol failures remain distinct. A daemon thread starts discovery at client creation and refreshes at half the remaining advertised lifetime (capped at 30 seconds), clamped to 100 ms through 5 seconds. Failed refreshes retry after 1 second and retain the last successful snapshot. Requests wait only for the initial attempt; afterward they use published availability without checking snapshot age or triggering refresh. `close()` cancels discovery and its active socket. Idle sockets belong to a single process incarnation.
 
 ## Prewarm
 
@@ -92,8 +92,8 @@ load blocks concurrently and retry transient origin failures. A failure may
 leave completed cache fills; successful completion does not pin residency.
 
 `load(LoadRequest, RequestOptions)` and `batchLoad(List<LoadRequest>, RequestOptions)`
-accept explicit tracing options. Expired instance discovery must refresh before
-dispatch; offline or conflicting owners produce `TalonException(UNAVAILABLE)` for single
+accept explicit tracing options. Dispatch uses the background snapshot;
+offline or conflicting owners produce `TalonException(UNAVAILABLE)` for single
 loads, or an unconfirmed file entry with that cause for batches.
 Worker rejections and malformed acknowledgements are not retried.
 

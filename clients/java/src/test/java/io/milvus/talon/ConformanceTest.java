@@ -107,6 +107,13 @@ public final class ConformanceTest {
                 assertTrue(rejected, "schema " + schema + " must be rejected");
             }
         });
+        check("discovery respects advertised lifetime and thirty second cap", () -> {
+            for (long[] limits : new long[][] {{0, 0}, {50, 50}, {30_000, 30_000}, {60_000, 30_000}}) {
+                byte[] body = new Bincode.Writer().u64(1).u64(2).u64(limits[0]).u64(0).toBytes();
+                Messages.Discovery view = Messages.readDiscovery(new Bincode.Reader(body));
+                assertEquals(limits[1], view.validForMs(), "discovery lifetime");
+            }
+        });
         check("membership preserves offline and conflicting logical owners", () -> {
             Bincode.Writer w = new Bincode.Writer().u64(1).u64(2).u64(500).u64(2);
             w.string("offline").u8(1).string("zone-a").u8(0).variant(0);
@@ -279,11 +286,11 @@ public final class ConformanceTest {
                         writesCompleted.incrementAndGet();
                         return null;
                     });
-                    java.lang.reflect.Method exchange = poolType.getDeclaredMethod("exchange", String.class, Long.class, Long.class, function);
+                    java.lang.reflect.Method exchange = poolType.getDeclaredMethod("exchange", String.class, boolean.class, Long.class, function);
                     exchange.setAccessible(true);
                     long start = System.nanoTime();
                     try {
-                        invoke(exchange, pool, "127.0.0.1:" + listener.getLocalPort(), null,
+                        invoke(exchange, pool, "127.0.0.1:" + listener.getLocalPort(), false,
                                 start + TimeUnit.MILLISECONDS.toNanos(300), write);
                         throw new AssertionError("write was not interrupted");
                     } catch (TalonException expected) {
@@ -337,29 +344,59 @@ public final class ConformanceTest {
                 }
             }
         });
-        check("LOAD overall deadline also bounds discovery and refresh lock waits", () -> {
-            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
+        check("LOAD overall deadline bounds initial background discovery wait", () -> {
+            try (PoolPeer peer = new PoolPeer()) {
                 peer.discoveryArrived = new CountDownLatch(1);
                 peer.discoveryRelease = new CountDownLatch(1);
-                ExecutorService caller = Executors.newSingleThreadExecutor();
-                try {
-                    Future<?> first = caller.submit(() -> {
-                        try { client.load("s3://bucket/file", "v1", 1); }
-                        catch (IOException expected) { /* Discovery may expire while gated. */ }
-                    });
-                    assertTrue(peer.discoveryArrived.await(5, TimeUnit.SECONDS), "discovery owns refresh lock");
+                try (TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    assertTrue(peer.discoveryArrived.await(5, TimeUnit.SECONDS), "background discovery starts without LOAD");
                     expectBatchTimeout(client, 200);
+                    assertTrue(peer.loadCounts.isEmpty(), "initial discovery is still pending");
                     peer.discoveryRelease.countDown();
-                    first.get(5, TimeUnit.SECONDS);
-                } finally {
-                    peer.discoveryRelease.countDown();
-                    caller.shutdownNow();
-                }
+                    assertEquals(new LoadResult(1, 1), client.load("s3://bucket/file", "v1", 1), "background initialization survives request timeout");
+                } finally { peer.discoveryRelease.countDown(); }
             }
-            try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                peer.discoveryRelease = new CountDownLatch(1);
-                expectBatchTimeout(client, 200);
-                assertTrue(peer.loadCounts.isEmpty(), "expired discovery must not dispatch LOAD");
+        });
+        check("background discovery publishes availability without blocking requests", () -> {
+            try (PoolPeer peer = new PoolPeer()) {
+                peer.discoveryValidityMs = 100;
+                try (TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    client.load("s3://bucket/file", "v1", 1);
+                    peer.discoveryRelease = new CountDownLatch(1);
+                    peer.discoveryArrived = new CountDownLatch(1);
+                    assertTrue(peer.discoveryArrived.await(2, TimeUnit.SECONDS), "idle timer refreshes without requests");
+                    Thread.sleep(150); // Exceed the advertised age while discovery remains blocked.
+                    int queries = peer.discoveryCalls.get();
+                    for (int i = 0; i < 10; i++) assertBytes(new byte[] {42}, client.read("s3://bucket/file", "v1", 1, 0, 1));
+                    client.load("s3://bucket/file", "v1", 1);
+                    client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)));
+                    assertEquals(queries, peer.discoveryCalls.get(), "foreground never requests discovery");
+                    peer.workerState = 0;
+                    peer.discoveryRelease.countDown();
+                    long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
+                    boolean offline = false;
+                    while (System.nanoTime() < until) {
+                        try { client.read("s3://bucket/file", "v1", 1, 0, 1); }
+                        catch (TalonException expected) {
+                            assertEquals(TalonException.Code.UNAVAILABLE, expected.code(), "offline classification");
+                            offline = true; break;
+                        }
+                        Thread.sleep(5);
+                    }
+                    assertTrue(offline, "background publishes offline owner");
+                    int loads = peer.loadCounts.size();
+                    try { client.load("s3://bucket/file", "v1", 1); throw new AssertionError("offline LOAD accepted"); }
+                    catch (TalonException expected) { assertEquals(TalonException.Code.UNAVAILABLE, expected.code(), "offline LOAD"); }
+                    assertEquals(loads, peer.loadCounts.size(), "offline owner is not contacted");
+                    peer.discoveryRelease = new CountDownLatch(1);
+                    peer.discoveryArrived = new CountDownLatch(1);
+                    assertTrue(peer.discoveryArrived.await(2, TimeUnit.SECONDS), "next refresh is independently scheduled");
+                    java.lang.reflect.Field executorField = TalonClient.class.getDeclaredField("discoveryExecutor");
+                    executorField.setAccessible(true);
+                    java.util.concurrent.ExecutorService executor = (java.util.concurrent.ExecutorService) executorField.get(client);
+                    client.close();
+                    assertTrue(executor.awaitTermination(1, TimeUnit.SECONDS), "close cancels stalled discovery I/O and stops its thread");
+                } finally { peer.discoveryRelease.countDown(); }
             }
         });
         check("completed LOAD cancels its timer before connection reuse", () -> {
@@ -611,12 +648,12 @@ public final class ConformanceTest {
                     TalonClient client = TalonClient.connect(peer.address(), 1024, 2)) {
                 poolWave(client, peer, 10, false);
                 poolWave(client, peer, 10, false);
-                assertEquals(19, peer.accepts.get(), "two idle worker connections reused");
+                assertEquals(18, peer.dataAccepts.get(), "two idle worker connections reused");
                 for (Socket socket : peer.sockets) {
                     socket.close();
                 }
                 assertEquals("v1", client.stat("s3://bucket/key").version(), "fresh retry response");
-                assertEquals(20, peer.accepts.get(), "closed pooled connection retried once fresh");
+                assertEquals(1, peer.statAccepts.get(), "fresh metadata connection after closing sockets");
                 peer.malformedStat = true;
                 try {
                     client.stat("s3://bucket/key");
@@ -626,7 +663,7 @@ public final class ConformanceTest {
                 }
                 peer.malformedStat = false;
                 client.stat("s3://bucket/key");
-                assertEquals(21, peer.accepts.get(), "malformed connection was discarded");
+                assertEquals(2, peer.statAccepts.get(), "malformed connection was discarded");
             }
         });
         check("default idle limit is 8; concurrent reads reuse both pools", () -> {
@@ -635,9 +672,9 @@ public final class ConformanceTest {
                 poolWave(client, peer, 10, false);
                 client.stat("s3://bucket/key");
                 client.stat("s3://bucket/key");
-                assertEquals(11, peer.accepts.get(), "ten worker connections and one control");
+                assertEquals(11, peer.dataAccepts.get() + peer.statAccepts.get(), "ten worker connections and one metadata connection");
                 poolWave(client, peer, 10, false);
-                assertEquals(13, peer.accepts.get(), "eight idle worker connections reused");
+                assertEquals(13, peer.dataAccepts.get() + peer.statAccepts.get(), "eight idle worker connections reused");
                 poolWave(client, peer, 1, true);
                 long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
                 while (!peer.sockets.isEmpty() && System.nanoTime() < deadline) {
@@ -683,6 +720,10 @@ public final class ConformanceTest {
         final ServerSocket listener = new ServerSocket(0, 50, java.net.InetAddress.getLoopbackAddress());
         final Set<Socket> sockets = ConcurrentHashMap.newKeySet();
         final AtomicInteger accepts = new AtomicInteger();
+        final AtomicInteger discoveryCalls = new AtomicInteger();
+        final AtomicInteger dataAccepts = new AtomicInteger();
+        final AtomicInteger statAccepts = new AtomicInteger();
+        volatile long discoveryValidityMs = 500;
         final ExecutorService threads = Executors.newCachedThreadPool();
         volatile CountDownLatch arrived = new CountDownLatch(0);
         volatile CountDownLatch release = new CountDownLatch(0);
@@ -734,6 +775,7 @@ public final class ConformanceTest {
         void serve(Socket socket) {
             try (socket) {
                 DataInputStream in = new DataInputStream(socket.getInputStream());
+                boolean counted = false;
                 while (true) {
                     byte[] header = new byte[Frame.HEADER_LEN];
                     in.readFully(header);
@@ -743,6 +785,7 @@ public final class ConformanceTest {
                     byte[] response;
                     int byteDelay = 0;
                     if (request.type() == Frame.MsgType.GET_VERSIONED_RANGE) {
+                        if (!counted) { dataAccepts.incrementAndGet(); counted = true; }
                         Bincode.Reader range = new Bincode.Reader(body);
                         range.variant(); range.string(); range.string();
                         range.u64(); range.u64(); range.string();
@@ -753,10 +796,11 @@ public final class ConformanceTest {
                         }
                         response = new byte[] {42};
                     } else if (Messages.decodeBody(body).tag == Messages.TAG_MEMBERSHIP_QUERY) {
+                        discoveryCalls.incrementAndGet();
                         discoveryArrived.countDown();
                         if (!discoveryRelease.await(5, TimeUnit.SECONDS)) throw new IOException("discovery gate timed out");
                         Bincode.Writer discovery = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_MEMBERSHIP_LIST)
-                                .u64(1).u64(1).u64(500).u64(1).string("worker").u8(0).u8(0)
+                                .u64(1).u64(1).u64(discoveryValidityMs).u64(1).string("worker").u8(0).u8(0)
                                 .variant(workerState);
                         if (workerState == 2) discovery.string("test-instance").string(address());
                         response = discovery.toBytes();
@@ -781,6 +825,7 @@ public final class ConformanceTest {
                         }
                         response = ack.toBytes();
                     } else {
+                        if (!counted) { statAccepts.incrementAndGet(); counted = true; }
                         statCalls.incrementAndGet();
                         Bincode.Writer w = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION).variant(Messages.TAG_OBJECT_STAT);
                         if (!malformedStat) {

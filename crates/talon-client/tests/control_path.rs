@@ -203,7 +203,7 @@ async fn retained_cli(
 }
 
 #[tokio::test]
-async fn retained_cli_keeps_offline_owner_and_checks_discovery_expiry() {
+async fn retained_cli_uses_published_availability_without_age_checks() {
     use talon_core::worker_membership::*;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap().to_string();
@@ -282,16 +282,6 @@ async fn retained_cli_keeps_offline_owner_and_checks_discovery_expiry() {
         address: address.clone(),
     };
     view.valid_for_ms = 0;
-    let expired = retained_cli(view.clone(), &read_args).await;
-    assert!(!expired.status.success());
-    assert!(String::from_utf8_lossy(&expired.stderr).contains("expired instance discovery"));
-    assert!(
-        tokio::time::timeout(Duration::from_millis(20), listener.accept())
-            .await
-            .is_err()
-    );
-
-    view.valid_for_ms = 500;
     let worker = tokio::spawn(async move {
         let (mut socket, _) = listener.accept().await.unwrap();
         let mut header = [0; HEADER_LEN];

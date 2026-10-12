@@ -97,7 +97,7 @@ Retained members and sole serving process observations
 
 | Status | Body | Description |
 |--------|------|-------------|
-| `200` | — | WorkerDiscovery JSON. Freshness is at most 500ms; responses are not a durable serving lease. |
+| `200` | — | WorkerDiscovery JSON. Advertised lifetime is capped at 30 seconds and schedules client background refresh; responses are not a durable serving lease. |
 | `503` | — | Registry or instance state unavailable. |
 
 ### `GET /api/v1/worker-membership`

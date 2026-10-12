@@ -124,6 +124,10 @@ impl CoordinatorClient {
         }
     }
 
+    pub(crate) fn isolated(&self) -> Self {
+        Self::with_pool(self.addr.clone(), Arc::new(self.pool.isolated()))
+    }
+
     /// The coordinator address this client talks to.
     pub fn addr(&self) -> &str {
         &self.addr

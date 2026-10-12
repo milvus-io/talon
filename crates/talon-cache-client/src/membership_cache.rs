@@ -24,6 +24,7 @@ pub struct MembershipSnapshot {
     pub affinity_fallback: bool,
     /// Serving instances keyed by logical worker ID. Missing IDs are offline or conflicted.
     pub instances: Arc<HashMap<String, (String, crate::WorkerClient)>>,
+    /// Refresh scheduling hint only; requests use published availability.
     pub valid_until: std::time::Instant,
 }
 
@@ -57,6 +58,10 @@ impl MembershipCache {
         self
     }
 
+    pub(crate) fn empty_with_same_policy(&self) -> Self {
+        Self::new(self.ttl_ms).with_zone_affinity(self.zone.clone(), self.zone_affinity)
+    }
+
     /// Return the snapshot only while its refresh TTL is current.
     pub fn fresh(&self) -> Option<MembershipSnapshot> {
         self.entry.read_recover().as_ref().and_then(|snapshot| {
@@ -77,8 +82,10 @@ impl MembershipCache {
         pool: &crate::ConnectionPool,
     ) -> MembershipSnapshot {
         use talon_core::worker_membership::InstanceState;
-        let mut entry = self.entry.write_recover();
-        let old = entry.as_ref();
+        // Build the next view without blocking foreground snapshot readers.
+        // Discovery has a single background publisher.
+        let previous = self.last_good();
+        let old = previous.as_ref();
         let local: Vec<_> = view
             .workers
             .iter()
@@ -143,17 +150,18 @@ impl MembershipCache {
             instances: Arc::new(instances),
             valid_until: observed
                 + std::time::Duration::from_millis(
-                    view.valid_for_ms.min(self.ttl_ms.max(1)).min(500),
+                    view.valid_for_ms
+                        .min(self.ttl_ms.max(1))
+                        .min(talon_core::worker_membership::DISCOVERY_MAX_AGE_MS),
                 ),
         };
-        *entry = Some(snapshot.clone());
+        *self.entry.write_recover() = Some(snapshot.clone());
         snapshot
     }
 }
 
 impl MembershipSnapshot {
-    /// Rank logical candidates before resolving availability. Each resolution
-    /// checks expiry when the candidate is attempted, including after an await.
+    /// Rank logical candidates before resolving their published availability.
     pub(crate) fn candidates(
         &self,
         block: &talon_core::BlockId,
@@ -207,17 +215,9 @@ impl MembershipSnapshot {
     }
 
     fn instance(&self, worker_id: &str) -> Result<crate::WorkerClient, crate::WorkerError> {
-        if std::time::Instant::now() >= self.valid_until {
-            return Err(crate::WorkerError::Remote(
-                talon_transport::DataPlaneError {
-                    code: talon_transport::DataErrorCode::Unavailable,
-                    message: format!("worker {worker_id} has expired instance discovery"),
-                },
-            ));
-        }
         self.instances
             .get(worker_id)
-            .map(|(_, client)| client.clone().with_read_retry_deadline(self.valid_until))
+            .map(|(_, client)| client.clone())
             .ok_or_else(|| {
                 crate::WorkerError::Remote(talon_transport::DataPlaneError {
                     code: talon_transport::DataErrorCode::Unavailable,
@@ -266,7 +266,40 @@ mod tests {
     }
 
     #[test]
-    fn expiry_retains_diagnostics_but_cannot_route_reads() {
+    fn discovery_lifetime_respects_server_client_and_thirty_second_bounds() {
+        let pool = crate::ConnectionPool::new();
+        let observed = Instant::now();
+        for (advertised, configured, expected) in [
+            (30_000, 30_000, 30_000),
+            (60_000, 60_000, 30_000),
+            (50, 30_000, 50),
+            (30_000, 5_000, 5_000),
+            (30_000, 0, 1),
+            (0, 30_000, 0),
+        ] {
+            let cache = MembershipCache::new(configured);
+            let mut discovery = view(&[None]);
+            discovery.valid_for_ms = advertised;
+            let snapshot = cache.replace(discovery, observed, &pool);
+            assert_eq!(
+                snapshot.valid_until,
+                observed + Duration::from_millis(expected)
+            );
+        }
+        let cache = MembershipCache::new(30_000);
+        let mut discovery = view(&[None]);
+        discovery.valid_for_ms = 30_000;
+        cache.replace(discovery.clone(), observed - Duration::from_secs(1), &pool);
+        assert!(
+            cache.fresh().is_some(),
+            "discovery survives the old 500ms limit"
+        );
+        cache.replace(discovery, observed - Duration::from_secs(31), &pool);
+        assert!(cache.fresh().is_none());
+    }
+
+    #[test]
+    fn expiry_marks_refresh_due_but_retains_published_snapshot() {
         let cache = MembershipCache::new(100);
         let pool = crate::ConnectionPool::new();
         let observed = Instant::now();
@@ -362,7 +395,7 @@ mod tests {
             std::time::Instant::now() - std::time::Duration::from_secs(1),
             &pool,
         );
-        assert!(expired.owner(&block).is_err());
+        assert_eq!(expired.owner(&block).unwrap().addr(), "127.0.0.1:3");
         assert!(cache.fresh().is_none());
         assert!(cache.last_good().is_some());
     }

@@ -261,13 +261,16 @@ Clients supply an object, source version, and size; no HEAD or separate version
 validation request is needed. The client splits the object into blocks using
 the read path's persistent Maglev placement and sends `LoadBlock` directly to
 each primary worker. The coordinator provides ordinary membership discovery;
-it does not schedule LOAD. Expired instance discovery must be refreshed before
-dispatch, and unavailable owners are not replaced by other workers.
-If discovery expires between owner selection and transport dispatch, the SDK
-refreshes discovery and retries the assignment once within the existing LOAD
-deadline and concurrency limit. The logical placement must remain unchanged;
-an unavailable owner, changed topology, or another expiry is still an error.
-Worker rejections and ordinary transport failures do not trigger this refresh.
+it does not schedule LOAD. One background discovery thread per shared client
+starts immediately and refreshes independently of foreground traffic. It uses
+half the remaining advertised lifetime (bounded by the client TTL and 30 seconds),
+clamped to 100 ms through 5 seconds; failed attempts retry after 1 second.
+Only initial startup may wait for the first attempt. Thereafter requests use the
+last published snapshot without checking its age or triggering discovery I/O.
+An authoritative offline/conflicting owner fails before dispatch. Refresh failures
+retain the last successful snapshot, and worker connection errors remain visible.
+LOAD keeps its initial logical topology and fails if a published topology changes.
+The last Rust client clone's drop or Java client's close cancels background I/O.
 
 `BatchLoad` groups assignments across files by worker, carrying up to 1024 block
 instructions per frame within the control-frame byte limit. Single and batch

@@ -92,6 +92,7 @@ impl From<&talon_cache_client::LoadError> for ErrorKind {
             LoadError::Timeout => ErrorKind::Timeout,
             LoadError::MembershipChanged => ErrorKind::Unavailable,
             LoadError::Placement(BlockReadError::Coordinator(e)) => coordinator(e),
+            LoadError::Placement(BlockReadError::Discovery(e)) => coordinator(e),
             LoadError::Placement(BlockReadError::NoOwners) => ErrorKind::Unavailable,
             LoadError::Placement(
                 BlockReadError::Worker(e)
@@ -121,6 +122,7 @@ impl Error {
                 | BlockReadError::AllReplicasFailed { source: e, .. },
             ) => worker(e),
             Self::Block(BlockReadError::NoOwners) => ErrorKind::Unavailable,
+            Self::Block(BlockReadError::Discovery(e)) => coordinator(e),
         }
     }
     pub fn fallback_eligible(&self) -> bool {

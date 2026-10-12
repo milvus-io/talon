@@ -62,8 +62,12 @@ public final class TalonClient implements AutoCloseable {
     private final ReentrantLock membershipLock = new ReentrantLock();
     private volatile CachedMembership membership;
     private Messages.Discovery discovery;
-    private long discoveryExpires;
-    private long nextDiscoveryAttempt;
+    private final java.util.concurrent.locks.Condition discoveryReady = membershipLock.newCondition();
+    private final java.util.concurrent.ScheduledExecutorService discoveryExecutor;
+    private final ConnectionPool discoveryPool;
+    private boolean initialDiscoveryDone;
+    private boolean closed;
+    private IOException discoveryFailure;
     private final Map<String, ConnectionPool> instancePools = new HashMap<>();
     private final int maxIdlePerAddr;
     private final java.util.concurrent.Semaphore loadSlots = new java.util.concurrent.Semaphore(8);
@@ -73,6 +77,13 @@ public final class TalonClient implements AutoCloseable {
         this.coordinator = coordinator;
         this.blockSize = blockSize;
         this.coordinatorPool = new ConnectionPool(maxIdlePerAddr);
+        this.discoveryPool = new ConnectionPool(maxIdlePerAddr);
+        this.discoveryExecutor = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(task -> {
+            Thread thread = new Thread(task, "talon-discovery");
+            thread.setDaemon(true);
+            return thread;
+        });
+        discoveryExecutor.execute(this::refreshDiscovery);
     }
 
     /**
@@ -339,7 +350,6 @@ public final class TalonClient implements AutoCloseable {
             membership(deadline);
             ConnectionPool pool;
             String address;
-            long instanceDeadline;
             lockMembership(deadline);
             try {
                 if (membership.placement != topology) throw new TalonException(TalonException.Code.UNAVAILABLE, "membership changed during load");
@@ -348,14 +358,12 @@ public final class TalonClient implements AutoCloseable {
                 Messages.DiscoveredWorker target = discovery.workers().stream()
                         .filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
                 if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "load owner offline or conflicting");
-                address = target.address(); pool = instancePools.get(instanceKey(target)); instanceDeadline = discoveryExpires;
+                address = target.address(); pool = instancePools.get(instanceKey(target));
             } finally { membershipLock.unlock(); }
             int id = requestIds.getAndIncrement();
             byte[] request = batch ? Messages.batchLoad(id, blocks) : Messages.loadBlock(id, blocks.get(0));
             long rpcDeadline = Math.min(deadline, System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(batch ? 1800 : 120));
-            ConnectionPool.checkRetryDeadline(instanceDeadline);
-            return pool.exchange(address, instanceDeadline, rpcDeadline, socket -> {
-                ConnectionPool.checkRetryDeadline(instanceDeadline);
+            return pool.exchange(address, true, rpcDeadline, socket -> {
                 long left = rpcDeadline - System.nanoTime();
                 if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
                 socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
@@ -443,6 +451,11 @@ public final class TalonClient implements AutoCloseable {
     public void close() {
         membershipLock.lock();
         try {
+            if (closed) return;
+            closed = true;
+            discoveryReady.signalAll();
+            discoveryExecutor.shutdownNow();
+            discoveryPool.closeActive();
             for (ConnectionPool pool : instancePools.values()) pool.close();
             instancePools.clear();
         } finally { membershipLock.unlock(); }
@@ -500,19 +513,16 @@ public final class TalonClient implements AutoCloseable {
         membership();
         ConnectionPool pool;
         String address;
-        long retryDeadline;
         membershipLock.lock();
         try {
             NodeInfo owner = membership.placement.primary(seg.block);
             if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
-            if (System.nanoTime() >= discoveryExpires) throw new TalonException(TalonException.Code.UNAVAILABLE, "expired instance discovery");
             Messages.DiscoveredWorker target = discovery.workers().stream().filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
             if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "worker " + owner.id() + " offline or conflicting");
             address = target.address();
             pool = instancePools.get(instanceKey(target));
-            retryDeadline = discoveryExpires;
         } finally { membershipLock.unlock(); }
-        try { return fetchRange(address, seg, pool, retryDeadline, objectSize); }
+        try { return fetchRange(address, seg, pool, objectSize); }
         catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
@@ -539,25 +549,62 @@ public final class TalonClient implements AutoCloseable {
     private CachedMembership membership(Long deadline) throws IOException {
         lockMembership(deadline);
         try {
-            if (discovery != null && System.nanoTime() < discoveryExpires) return membership;
-            if (System.nanoTime() < nextDiscoveryAttempt) throw new TalonException(TalonException.Code.UNAVAILABLE, "discovery refresh cooling down");
-            return refreshDiscovery(deadline);
+            // Only startup can wait. This never starts, accelerates, or performs a refresh.
+            while (membership == null && !initialDiscoveryDone && !closed) {
+                try {
+                    if (deadline == null) discoveryReady.await();
+                    else {
+                        long remaining = deadline - System.nanoTime();
+                        if (remaining <= 0) throw TalonException.transport(SocketDeadline.timeout());
+                        discoveryReady.awaitNanos(remaining);
+                    }
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw new IOException("interrupted waiting for initial discovery", interrupted);
+                }
+            }
+            if (closed) throw new IOException("Talon client is closed");
+            if (membership != null) return membership;
+            throw discoveryFailure != null ? discoveryFailure
+                    : new TalonException(TalonException.Code.UNAVAILABLE, "discovery not initialized");
         } finally { membershipLock.unlock(); }
     }
 
     private static String instanceKey(Messages.DiscoveredWorker worker) {
         return worker.id().length() + ":" + worker.id() + worker.instance().length() + ":" + worker.instance() + worker.address();
     }
-    private CachedMembership refreshDiscovery(Long deadline) throws IOException {
+    private void refreshDiscovery() {
         long started = System.nanoTime();
-        nextDiscoveryAttempt = started + 100_000_000L;
-        Messages.Discovery view;
+        long delayMs = 1_000;
         try {
-            view = controlRoundTrip(Messages.membershipQuery(requestIds.getAndIncrement()), deadline, response -> {
+            Messages.Discovery view = controlRoundTrip(discoveryPool,
+                    Messages.membershipQuery(requestIds.getAndIncrement()), null, response -> {
                 if (response.tag != Messages.TAG_MEMBERSHIP_LIST) throw unexpected("MembershipQuery", response);
                 return Messages.readDiscovery(response.body);
             });
-        } catch (IOException failure) { throw TalonException.transport(failure); }
+            membershipLock.lock();
+            try {
+                if (closed) return;
+                installDiscovery(view);
+                discoveryFailure = null;
+            } finally { membershipLock.unlock(); }
+            long remainingMs = view.validForMs() - TimeUnit.NANOSECONDS.toMillis(System.nanoTime() - started);
+            delayMs = Math.max(100, Math.min(5_000, remainingMs / 2));
+        } catch (IOException failure) {
+            membershipLock.lock();
+            try { discoveryFailure = TalonException.transport(failure); }
+            finally { membershipLock.unlock(); }
+        } finally {
+            membershipLock.lock();
+            try {
+                initialDiscoveryDone = true;
+                discoveryReady.signalAll();
+                if (!closed) discoveryExecutor.schedule(this::refreshDiscovery, delayMs, TimeUnit.MILLISECONDS);
+            } finally { membershipLock.unlock(); }
+        }
+    }
+
+    private void installDiscovery(Messages.Discovery view) {
         List<NodeInfo> logical = new ArrayList<>();
         java.util.Set<String> keys = new java.util.HashSet<>();
         for (Messages.DiscoveredWorker worker : view.workers()) {
@@ -575,9 +622,7 @@ public final class TalonClient implements AutoCloseable {
         Placement.Table table = discovery != null && discovery.topology() == view.topology()
                 ? membership.placement : new Placement.Table(logical);
         discovery = view;
-        discoveryExpires = started + view.validForMs() * 1_000_000L;
         membership = new CachedMembership(table);
-        return membership;
     }
 
     private <T> T controlRoundTrip(byte[] request, IoFunction<Messages.Response, T> decode)
@@ -587,7 +632,12 @@ public final class TalonClient implements AutoCloseable {
 
     private <T> T controlRoundTrip(byte[] request, Long deadline, IoFunction<Messages.Response, T> decode)
             throws IOException {
-        try { return coordinatorPool.exchange(coordinator, null, deadline, socket -> {
+        return controlRoundTrip(coordinatorPool, request, deadline, decode);
+    }
+
+    private <T> T controlRoundTrip(ConnectionPool pool, byte[] request, Long deadline,
+                                  IoFunction<Messages.Response, T> decode) throws IOException {
+        try { return pool.exchange(coordinator, false, deadline, socket -> {
             OutputStream out = socket.getOutputStream();
             out.write(Telemetry.envelope(request, coordinator));
             out.flush();
@@ -605,7 +655,7 @@ public final class TalonClient implements AutoCloseable {
         } catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
-    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool, long retryDeadline, long objectSize) throws IOException {
+    private byte[] fetchRange(String workerAddress, Segment seg, ConnectionPool pool, long objectSize) throws IOException {
         int id = requestIds.getAndIncrement();
         byte[] request =
                 Messages.versionedRange(
@@ -616,7 +666,7 @@ public final class TalonClient implements AutoCloseable {
                         seg.block.version(),
                         objectSize);
 
-        return pool.exchange(workerAddress, retryDeadline, socket -> {
+        return pool.exchange(workerAddress, true, socket -> {
             OutputStream out = socket.getOutputStream();
             out.write(Telemetry.envelope(request, workerAddress));
             out.flush();
@@ -693,31 +743,31 @@ public final class TalonClient implements AutoCloseable {
 
         private final Map<String, List<Idle>> idle = new HashMap<>();
         private final int maxIdlePerAddr;
+        private final java.util.Set<Socket> active = new java.util.HashSet<>();
         private boolean closed;
 
         ConnectionPool(int maxIdlePerAddr) {
             this.maxIdlePerAddr = maxIdlePerAddr;
         }
 
-        <T> T exchange(String address, Long retryDeadline, IoFunction<Socket, T> request) throws IOException {
-            return exchange(address, retryDeadline, null, request);
+        <T> T exchange(String address, boolean workerRequest, IoFunction<Socket, T> request) throws IOException {
+            return exchange(address, workerRequest, null, request);
         }
-        <T> T exchange(String address, Long retryDeadline, Long deadline, IoFunction<Socket, T> request) throws IOException {
+        <T> T exchange(String address, boolean workerRequest, Long deadline, IoFunction<Socket, T> request) throws IOException {
             Socket socket = takeIdle(address);
             boolean reused = socket != null;
-            boolean retrying = false;
             for (;;) {
                 if (socket == null) {
-                    if (retrying) checkRetryDeadline(retryDeadline);
                     ensureOpen();
                     socket = new Socket();
                 }
                 boolean completed = false;
+                try {
+                    synchronized (this) { ensureOpen(); active.add(socket); }
+                } catch (IOException failure) { closeSocket(socket); throw failure; }
                 try (SocketDeadline guard = deadline == null ? null : new SocketDeadline(socket, deadline)) {
                     // The same deadline covers connect, write, header, body, and any retry.
                     if (!socket.isConnected()) connect(socket, address);
-                    // Dialing can consume the remaining discovery lifetime.
-                    if (retrying) checkRetryDeadline(retryDeadline);
                     T result = request.apply(socket);
                     if (guard != null) guard.finish();
                     release(address, socket);
@@ -730,26 +780,19 @@ public final class TalonClient implements AutoCloseable {
                     // Data reads retry transport I/O only, never a typed Worker refusal.
                     // Preserve the narrower disconnect-only policy for control requests.
                     if (!reused || failure instanceof TalonException
-                            || (retryDeadline == null
+                            || (!workerRequest
                                 && !(failure instanceof EOFException || failure instanceof SocketException))) {
                         throw failure;
                     }
                     // The peer may close an idle socket. Retry once, bypassing the pool.
                     reused = false;
-                    retrying = true;
                 } finally {
+                    synchronized (this) { active.remove(socket); }
                     if (!completed) {
                         closeSocket(socket);
                     }
                 }
                 socket = null;
-            }
-        }
-
-        private static void checkRetryDeadline(Long deadline) throws TalonException {
-            if (deadline != null && System.nanoTime() >= deadline) {
-                throw new TalonException(TalonException.Code.UNAVAILABLE,
-                        "instance discovery expired before read retry");
             }
         }
 
@@ -784,6 +827,11 @@ public final class TalonClient implements AutoCloseable {
                 }
             }
             closeSocket(socket);
+        }
+
+        synchronized void closeActive() {
+            close();
+            for (Socket socket : active) closeSocket(socket);
         }
 
         synchronized void close() {

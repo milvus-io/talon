@@ -10,7 +10,7 @@
 //! Prints byte count + elapsed time; writes the bytes to `--out` when given so
 //! the caller can `cmp` two reads for byte-exactness.
 
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use clap::{Parser, Subcommand};
 use talon_core::{BlockId, CachePlacementTable, NodeRole, ObjectId, Version};
@@ -249,21 +249,17 @@ async fn run() -> anyhow::Result<()> {
         Version::new(PLACEHOLDER_VERSION),
     );
 
-    let (worker_addr, valid_until) = match args.worker {
+    let worker_addr = match args.worker {
         Some(worker) => {
             tracing::info!(worker_addr = %worker, "using direct worker");
-            (worker, None)
+            worker
         }
         None => {
             let membership = membership_lookup(&args.coordinator).await?;
             let placement = CachePlacementTable::new(&membership.nodes);
-            let owner = placement.primary(&block).ok_or_else(|| {
-                if membership.valid_until.is_some() {
-                    unavailable("no registered worker owns this block".into())
-                } else {
-                    anyhow::anyhow!("no worker owns this block (empty cluster?)")
-                }
-            })?;
+            let owner = placement
+                .primary(&block)
+                .ok_or_else(|| unavailable("no registered worker owns this block".into()))?;
             tracing::info!(owner = %owner.id, "resolved owner");
             if owner.address.is_empty() {
                 return Err(unavailable(format!(
@@ -273,7 +269,7 @@ async fn run() -> anyhow::Result<()> {
             }
             let worker_addr = owner.address.clone();
             tracing::info!(%worker_addr, "resolved worker address");
-            (worker_addr, membership.valid_until)
+            worker_addr
         }
     };
 
@@ -284,7 +280,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Fetch the range from the selected worker.
     let start = Instant::now();
-    let bytes = fetch_range(&worker_addr, &object, args.offset, len, valid_until).await?;
+    let bytes = fetch_range(&worker_addr, &object, args.offset, len).await?;
     let elapsed = start.elapsed();
 
     // Verify the worker returned the full requested range. A short read means
@@ -318,7 +314,6 @@ async fn run() -> anyhow::Result<()> {
 struct CliMembership {
     // Logical members remain present even when their serving address is absent.
     nodes: Vec<talon_core::NodeInfo>,
-    valid_until: Option<Instant>,
 }
 
 fn unavailable(message: String) -> anyhow::Error {
@@ -329,13 +324,11 @@ fn unavailable(message: String) -> anyhow::Error {
     .into()
 }
 
-/// Return logical membership and its bounded instance-validity deadline.
+/// Resolve the published membership for this one-shot CLI operation.
 async fn membership_lookup(coordinator: &str) -> anyhow::Result<CliMembership> {
     use talon_core::worker_membership::InstanceState;
-    let observed = Instant::now();
     match request_control(coordinator, &ControlMessage::MembershipQuery {}).await? {
         ControlMessage::MembershipList { view } => {
-            let valid_until = Some(observed + Duration::from_millis(view.valid_for_ms.min(500)));
             let nodes = view
                 .workers
                 .into_iter()
@@ -349,7 +342,7 @@ async fn membership_lookup(coordinator: &str) -> anyhow::Result<CliMembership> {
                     role: NodeRole::Worker,
                 })
                 .collect();
-            Ok(CliMembership { nodes, valid_until })
+            Ok(CliMembership { nodes })
         }
         other => anyhow::bail!("unexpected membership reply: {other:?}"),
     }
@@ -380,11 +373,7 @@ async fn fetch_range(
     object: &ObjectId,
     offset: u64,
     len: u64,
-    valid_until: Option<Instant>,
 ) -> anyhow::Result<Vec<u8>> {
-    if valid_until.is_some_and(|deadline| Instant::now() >= deadline) {
-        return Err(unavailable("expired instance discovery".into()));
-    }
     let mut stream = TcpStream::connect(worker_addr).await?;
     let req = RangeRequest {
         object: object.clone(),

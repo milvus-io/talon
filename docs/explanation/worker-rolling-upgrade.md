@@ -141,7 +141,7 @@ Separate the topology content token from the instance-state content token. The t
 
 Each block request ranks up to `replicas_k` distinct logical Workers, primary first, from one discovery snapshot. The default is one and zero is treated as one. Offline and conflicted members retain their rank; the reader may skip them and try the next candidate. Retryable failures similarly advance to the next candidate, without changing logical ownership or refreshing the snapshot within that read.
 
-Resolve each candidate's serving instance immediately before attempting it and check discovery expiration again after any preceding network wait. Each candidate is visited once. If a reused connection fails with an I/O error, the client may redial and resend once, checking discovery expiration before dialing and again before sending. A failure on a fresh connection or a Worker error response does not trigger this transport retry. This bounds each candidate to at most two exchanges; after failed recovery, advance to the next candidate. After exhaustion, return `BlockReadError::AllReplicasFailed { worker, source }`, retaining the last candidate address (or logical ID if no address is known) and original typed cause. SDK and stream classification follow `source`; an empty candidate list still returns `NoOwners`. Invalid requests, missing origin objects, version mismatches, origin failures, and tenant rate limits terminate the read immediately.
+Resolve each candidate's published serving instance immediately before attempting it; request paths do not check snapshot age. Each candidate is visited once. If a reused connection fails with an I/O error, the client may redial and resend once, without refreshing discovery or checking snapshot age. A failure on a fresh connection or a Worker error response does not trigger this transport retry. This bounds each candidate to at most two exchanges; after failed recovery, advance to the next candidate. After exhaustion, return `BlockReadError::AllReplicasFailed { worker, source }`, retaining the last candidate address (or logical ID if no address is known) and original typed cause. SDK and stream classification follow `source`; an empty candidate list still returns `NoOwners`. Invalid requests, missing origin objects, version mismatches, origin failures, and tenant rate limits terminate the read immediately.
 
 `replicas_k` preserves the read-candidate mechanism for future replication and hot-block serving. It does not proactively populate backups or balance successful primary reads across them. Cache admission continues to target only the primary. Candidates remain within the logical zone-affinity subset, even when all local candidates are offline.
 
@@ -174,11 +174,11 @@ A streaming read may deliver successful chunks followed by an error; previously 
 
 ### 6.4 Recovery for Subsequent Requests
 
-Separate failure delivery from membership refresh. The current request fails directly and may trigger a coalesced background instance-view refresh for subsequent requests. Refresh has a concurrency bound, minimum interval, and deadline; do not create a background task for every failed request.
+Separate failure delivery from membership refresh. The current request fails directly without triggering or accelerating discovery. One background refresher runs independently with a minimum interval and an RPC deadline.
 
-While requests are active, the SDK refreshes instance views at the configured interval, including instances locally marked offline. Idle clients need not poll continuously, but must revalidate expired state when activity resumes. Retaining an offline snapshot must never permanently disable rediscovery.
+The SDK starts an independent background discovery thread at construction and keeps refreshing even while idle, including when the published owner is offline. Successful refreshes run after half the remaining advertised lifetime, clamped to 100 ms through 5 seconds; failed attempts retry after 1 second. Foreground requests wait only for the initial attempt and never trigger discovery RPCs.
 
-State caches have finite validity. The Coordinator returns remaining session validity or equivalent freshness information, which the client converts to a local monotonic-clock deadline. Expired or unconfirmed state must not authorize arbitrary use of an old process, although the logical membership snapshot may be retained. Remove broken connections from the pool when a cached address fails. On observing a new incarnation, discard connections to the old instance even if the IP is unchanged.
+The Coordinator returns observation freshness information that schedules background refresh. Clients retain the last successfully published instance view across refresh failures, regardless of its age; only published Offline/Conflict states prevent owner dispatch. Worker-side service admission and request deadlines continue to apply. Remove broken connections from the pool when a cached address fails. On observing a new incarnation, discard connections to the old instance even if the IP is unchanged.
 
 The Coordinator proxy paths for `StatObject` / `ListObjects` must also avoid offline instances. These operations do not have block-owner semantics and may choose healthy Workers under their existing proxy policy; metadata calls need not use the same instance as block reads. Metadata failures must expose recognizable categories too. Otherwise, a read without `known_stat` loses the fallback signal before reaching the block request.
 
@@ -284,7 +284,7 @@ Workers whose control connections close reconnect through the stable Service. Th
 
 Clients discard failed Coordinator connections and use the stable Service for subsequent discovery. Any retry of a control operation follows that operation's existing idempotency and deadline rules. This does not authorize restarting a block read's candidate list; Section 6's bounded candidate policy still applies to the Worker data path.
 
-Clients with an unexpired Worker instance view can continue direct Worker requests while Coordinator connections change. If a request requires fresh discovery and no Coordinator can provide it, return a recognizable error instead of waiting for the rollout or publishing an empty topology. Keep the logical member snapshot even when instance freshness expires.
+Clients with a published Worker instance view continue direct Worker requests while Coordinator connections change. Background discovery retries independently, retaining the last successful view; only clients without an initial snapshot must report discovery failure. A published offline/conflicting owner remains unavailable until a later observation changes it.
 
 Keep heartbeat reconnect and backend recovery within the configured Worker session validity budget. If a session does expire, that Worker may temporarily become unavailable to clients, but its membership and block ownership remain unchanged. Coordinator HA reduces control-plane interruptions; it does not guarantee that every in-flight control request succeeds.
 
@@ -351,9 +351,9 @@ Management APIs continue to use their leased node-status projection for node det
 | --- | --- |
 | Worker receives SIGKILL | Kernel releases the lock; membership persists; requests return unavailability/timeout; the replacement performs crash recovery |
 | Heartbeats stop while the process remains alive | Session expiration makes the instance unavailable without changing topology; reporting recovery restores availability |
-| Stale cached address or pooled connection | Fail the current request and discard the broken connection; coalesce refreshes for subsequent requests |
+| Stale cached address or pooled connection | Apply bounded transport retry and discard broken connections; background refresh independently discovers replacements |
 | New instance starts before the old writable record expires | A temporary conflict may be reported; do not arbitrarily select a writer; recover after the old record is withdrawn or expires |
-| Temporary Coordinator/state-backend outage | Retain logical views; expired instance state cannot claim availability indefinitely; fail requests that require unavailable fresh state |
+| Temporary Coordinator/state-backend outage | Retain the last published view; online entries are attempted and Worker-side admission or transport errors remain visible |
 | Disk loss or incompatible format | Do not claim that the original cache was recovered; operators repair it or explicitly rebuild/remove the member |
 | Permanent Worker failure | Continue reporting offline status until an administrator explicitly removes the member; only then change placement |
 
@@ -373,7 +373,7 @@ The table below is the acceptance contract. Per-layer executed checks and valida
 | Addition, explicit removal, and delayed heartbeats after retirement | Topology follows membership operations; ordinary heartbeats cannot undo retirement |
 | Multiple Coordinators with etcd and Kubernetes backends | Membership survives Coordinator restarts; offline is distinct from removal; identical member snapshots produce identical placement |
 | Cache recovery after normal and abnormal shutdown | Valid whole-block/page data remains a cache hit; backend request counts confirm identity changes did not trigger refetches; count TTI expiration and corruption separately |
-| Offline Worker, connection refusal, EOF, and timeout | Every public SDK exposes stable categories; attempts stay within the configured logical candidates, stale-connection recovery is limited to one redial per candidate, and expired discovery cannot route reads |
+| Offline Worker, connection refusal, EOF, and timeout | Every public SDK exposes stable categories; attempts stay within the configured logical candidates, stale-connection recovery is limited to one redial per candidate, and published offline/conflicting owners are not contacted |
 | Object-version change, origin errors, and rate limiting | Return the original error immediately without trying another candidate |
 | Malformed frames and incomplete replies | Bounded candidate fallback may recover; if exhausted, preserve the last error category and never report partial bytes as success |
 | Multi-block reads, streaming, and caller-owned buffers | Failure is not reported as complete success; no buffer access after the callback; delivered prefixes and retry ranges remain well-defined |

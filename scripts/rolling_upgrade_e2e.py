@@ -32,8 +32,9 @@ STATE_LEASE_TTL_MS = 10000
 HTTP_TIMEOUT_SECONDS = STATE_REQUEST_TIMEOUT_MS / 1000 + 2
 OBSERVATION_TIMEOUT_SECONDS = 30
 # Allow a reconciliation already in flight, the next heartbeat, and the SDK's
-# 500 ms discovery validity to expire before asserting a changed serving state.
-SETTLE_SECONDS = (STATE_REQUEST_TIMEOUT_MS + HEARTBEAT_MS) / 1000 + 0.6
+# independently scheduled background refresh to publish changed serving state.
+DISCOVERY_REFRESH_MAX_MS = 5000
+SETTLE_SECONDS = (STATE_REQUEST_TIMEOUT_MS + HEARTBEAT_MS + DISCOVERY_REFRESH_MAX_MS) / 1000 + 0.1
 OUTAGE_SECONDS = STATE_FAILURE_GRACE_MS / 1000 + SETTLE_SECONDS
 
 

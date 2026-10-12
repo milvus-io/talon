@@ -203,8 +203,8 @@ replay completed blocks; exhaustion is a block failure as described above.
 
 The SDK assigns blocks to the same persistent Maglev primaries used by reads,
 using one logical topology. Before dispatch, it resolves each primary through
-valid instance discovery and its isolated connection pool. Expired discovery
-must be refreshed; offline or conflicting owners fail without remapping.
+the last background-published instance snapshot and its isolated connection pool.
+Offline or conflicting owners fail without remapping; snapshot age does not gate dispatch.
 Topology changes fail the operation. The coordinator only serves existing membership
 discovery; it does not receive or orchestrate LOAD. The caller must provide
 the correct size for the requested version. Workers use that extent without
@@ -302,15 +302,22 @@ compatibility operation for older clients.
 **Instance discovery.** Placement selects a logical worker ID. The same discovery
 snapshot resolves that ID to its sole serving instance and address. Instance or
 address changes replace the isolated connection pool without changing logical
-ownership. The observation expires after the smaller of the advertised lifetime,
-the client's configured TTL, and 500 ms; expired instances cannot serve reads.
+ownership. One background thread per shared Rust client (or Java client)
+refreshes independently of request traffic. The advertised lifetime is bounded by
+the client's configured TTL and 30 seconds for scheduling: after each response,
+refresh at half its remaining lifetime, clamped to 100 ms through 5 seconds.
+Failed attempts retry after 1 second and retain the last successful snapshot.
+The Coordinator still limits its advertised lifetime to the observation's remaining
+failure grace (`state.unhealthy_after_ms`, 15 seconds by default). This is a refresh
+hint, not a request admission deadline. Foreground requests wait only for initial
+startup, then read the latest snapshot without age checks or discovery RPCs.
+Closing the client stops background work; Rust clones share one refresh thread.
 
 **Bounded replica fallback.** Each block read ranks up to `replicas_k` distinct
 logical workers, primary first (default 1). Offline and conflicted candidates
 retain their rank but may be skipped; retryable read failures try the next
-candidate in the same snapshot, checking its discovery deadline before use.
-A reused connection that fails with an I/O error may be redialed once; discovery
-must still be valid before dialing and before resending. Fresh-connection failures
+candidate in the same snapshot.
+A reused connection that fails with an I/O error may be redialed once. Fresh-connection failures
 and Worker error responses do not trigger this transport retry. Failure does not
 refresh discovery or restart the candidate list.
 Invalid requests, missing origin objects, version mismatches, origin failures,
@@ -321,9 +328,9 @@ candidate address (or logical ID when no address is known) and typed cause.
 or distribute successful primary reads across backups. Admission still targets
 the primary only.
 
-A later request refreshes expired discovery; concurrent refreshes are serialized
-and cached snapshots limit refreshes to one per 100 ms. Last-good snapshots are
-retained for diagnostics, but never permit reads through expired instances.
+Only background refresh publishes new availability. Reads continue using the last
+successful view during discovery failures; published Offline/Conflict states remain
+unavailable until a successful refresh observes a serving instance.
 
 **Legacy epoch reconciliation.** `PlacementResponse` carries the epoch its
 owners were computed at. Clients still using this compatibility operation must
@@ -380,15 +387,15 @@ A discovered worker contains `WorkerMember` (`worker_id: String`,
 Conflict=1, Serving=2. Serving carries `instance_id: String`, then
 `address: String`. The view contains `topology_token`, `state_token`,
 `valid_for_ms` and the workers. Tokens are opaque equality values; address and
-lease changes do not change logical ownership. Client instance freshness is
-bounded by `valid_for_ms` and 500 ms. Each block read uses one discovery snapshot
+lease changes do not change logical ownership. `valid_for_ms` schedules background
+refresh, bounded by the client TTL and 30 seconds. Each block read uses one discovery snapshot
 and ranks up to `replicas_k` logical candidates (default one), skipping offline
 or conflicted candidates and advancing after retryable failures. A reused
 connection that fails with an I/O error may be redialed and resent once per
-candidate; discovery expiration is checked before dialing and before resending.
+candidate, independently of snapshot age.
 Fresh-connection failures and Worker error responses do not trigger that
 same-candidate retry. The SDK does not refresh discovery or restart the candidate
-list within the read; later requests may refresh and recover. Invalid requests,
+list within the read; the background thread publishes recovery for later requests. Invalid requests,
 missing origin objects, version conflicts, rate limits and origin errors terminate
 the read without trying another candidate. A protocol error returned to the caller
 does not permit origin fallback.

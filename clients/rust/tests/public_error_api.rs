@@ -23,6 +23,7 @@ fn classify(error: Error) -> (CacheReadError, String) {
         Error::Coordinator(source) | Error::Block(BlockReadError::Coordinator(source)) => {
             source.into()
         }
+        Error::Block(BlockReadError::Discovery(source)) => source.as_ref().into(),
         Error::Block(BlockReadError::Worker(source))
         | Error::Block(BlockReadError::Target { source, .. })
         | Error::Block(BlockReadError::AllReplicasFailed { source, .. }) => source.into(),

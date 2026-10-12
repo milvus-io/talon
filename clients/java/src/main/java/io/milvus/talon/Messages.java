@@ -130,7 +130,7 @@ final class Messages {
             workers.add(new DiscoveredWorker(id, zone, status, instance, address));
         }
         if (r.remaining() != 0) throw new ProtocolException("trailing discovery bytes");
-        return new Discovery(topology, state, Math.min(validity, 500), List.copyOf(workers));
+        return new Discovery(topology, state, Math.min(validity, 30_000), List.copyOf(workers));
     }
 
     /** Wrap a bincode body in a Control frame. */

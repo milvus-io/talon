@@ -151,7 +151,9 @@ public final class RollingUpgradeTest {
             });
             try (TalonClient client = TalonClient.connect("127.0.0.1:" + coordinator.getLocalPort(), 64)) {
                 client.read("s3://bucket/key", "v", 8, 0, 8);
-                try {
+                if (mode.equals("expired")) {
+                    if (client.read("s3://bucket/key", "v", 8, 0, 8).length != 8) throw new AssertionError("retry after discovery age");
+                } else try {
                     client.read("s3://bucket/key", "v", 8, 0, 8);
                     throw new AssertionError("failure hidden: " + mode);
                 } catch (TalonException expected) {
@@ -164,11 +166,11 @@ public final class RollingUpgradeTest {
                 } catch (ProtocolException expected) {
                     if (!mode.equals("protocol")) throw expected;
                 }
-                int expectedAccepts = mode.equals("retry-fails") ? 2 : 1;
-                int expectedReads = mode.equals("retry-fails") ? 3 : 2;
+                int expectedAccepts = (mode.equals("retry-fails") || mode.equals("expired")) ? 2 : 1;
+                int expectedReads = (mode.equals("retry-fails") || mode.equals("expired")) ? 3 : 2;
                 if (accepts.get() != expectedAccepts || reads.get() != expectedReads)
                     throw new AssertionError("unexpected retry count: " + mode);
-                if (discoveries.get() != 1) throw new AssertionError("read retry refreshed discovery: " + mode);
+                if (!mode.equals("expired") && discoveries.get() != 1) throw new AssertionError("read retry refreshed discovery: " + mode);
             } finally {
                 coordinator.close(); worker.close(); tasks.shutdownNow();
             }

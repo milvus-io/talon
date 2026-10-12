@@ -96,8 +96,14 @@ impl From<WorkerError> for CacheReadError {
 
 impl From<CoordinatorError> for CacheReadError {
     fn from(error: CoordinatorError) -> Self {
+        Self::from(&error)
+    }
+}
+
+impl From<&CoordinatorError> for CacheReadError {
+    fn from(error: &CoordinatorError) -> Self {
         match error {
-            CoordinatorError::Remote(error) => WorkerError::Remote(error).into(),
+            CoordinatorError::Remote(error) => WorkerError::Remote(error.clone()).into(),
             CoordinatorError::Io(error) if error.kind() == std::io::ErrorKind::TimedOut => {
                 Self::Timeout(error.to_string())
             }
@@ -111,6 +117,9 @@ impl From<DetailedBlockReadError> for CacheReadError {
     fn from(error: DetailedBlockReadError) -> Self {
         match error {
             DetailedBlockReadError::Block(BlockReadError::Coordinator(error)) => error.into(),
+            DetailedBlockReadError::Block(BlockReadError::Discovery(error)) => {
+                error.as_ref().into()
+            }
             DetailedBlockReadError::Block(BlockReadError::Target { source: error, .. })
             | DetailedBlockReadError::Block(BlockReadError::Worker(error))
             | DetailedBlockReadError::Block(BlockReadError::AllReplicasFailed {

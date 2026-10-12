@@ -4,9 +4,8 @@ Persistent membership retains logical ownership while a Worker is offline.
 Each block read ranks up to `replicas_k` logical candidates (default one) from
 one discovery snapshot. Offline/conflicted candidates are skipped and retryable
 failures advance to the next candidate. A reused connection that fails with an
-I/O error may be redialed and resent once per candidate, only while discovery
-remains valid. The SDK does not refresh discovery or restart the candidate list
-within that read; subsequent requests may refresh and recover. After candidate
+I/O error may be redialed and resent once per candidate. The SDK does not refresh discovery or restart the candidate list
+within that read; background refresh publishes recovery for subsequent requests. After candidate
 exhaustion, an availability failure reaches the caller as `Unavailable` or
 `Timeout`, and the application decides whether to use origin fallback. Invalid
 requests, missing origin objects, version conflicts, rate limits and origin
@@ -95,8 +94,9 @@ At each ordinal check:
   `state_token` change. Offline/conflicting owners remain in the placement table.
 - Readiness recovers only after the directory lock, disk recovery, listener and
   sole-instance registration succeed. Persistent clients recover on subsequent
-  requests; discovery freshness is at most 500 ms, with refresh attempts limited
-  to one per client per 100 ms.
+  requests after background discovery publishes the new instance. Refresh runs
+  independently of requests, every 100 ms to 5 seconds based on the advertised
+  lifetime; failures retry after 1 second while retaining the last successful view.
 - Previously cached, valid bytes remain hits. Compare origin GET counts before
   and after restart; separate TTI expiry, eviction and corruption from identity
   changes. Check unavailable/timeout rates and caller fallback independently.

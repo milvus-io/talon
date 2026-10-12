@@ -105,7 +105,7 @@
         "description": "Independent observation with topology_token, state_token, valid_for_ms, and workers. Each worker has member (worker_id, zone, retired) and state Offline, Conflict, or Serving {instance_id,address}. Equality tokens are opaque, not watch revisions. Offline members remain owners; retired members are excluded. The legacy /nodes snapshot is not this inventory.",
         "responses": {
           "200": {
-            "description": "WorkerDiscovery JSON. Freshness is at most 500ms; responses are not a durable serving lease."
+            "description": "WorkerDiscovery JSON. Advertised lifetime is capped at 30 seconds and schedules client background refresh; responses are not a durable serving lease."
           },
           "503": {
             "description": "Registry or instance state unavailable."

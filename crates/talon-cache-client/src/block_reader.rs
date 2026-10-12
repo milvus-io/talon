@@ -4,8 +4,8 @@
 //! then resolves up to `replicas_k` candidates from bounded instance discovery.
 //! Offline or conflicted candidates keep their rank but can be skipped. Retryable
 //! read failures try the next ranked candidate without an
-//! in-request discovery refresh. Expired discovery cannot route any candidate.
-//! A stale reused connection may be redialed once while discovery is valid.
+//! in-request discovery refresh. A background thread publishes instance updates.
+//! A stale reused connection may be redialed once; snapshot age does not gate reads.
 //! Instance-specific connection pools prevent a replacement process from
 //! inheriting an old process's sockets.
 //!
@@ -51,6 +51,9 @@ pub enum BlockReadError {
     /// Authoritative membership refresh failed.
     #[error(transparent)]
     Coordinator(#[from] CoordinatorError),
+    /// The most recent background discovery attempt failed.
+    #[error(transparent)]
+    Discovery(Arc<CoordinatorError>),
     /// The worker fetch failed.
     #[error(transparent)]
     Worker(#[from] WorkerError),
@@ -108,12 +111,12 @@ pub struct BlockReader {
     stats: ReadStats,
     /// Settings template for isolated per-instance connection pools.
     worker_pool: Arc<ConnectionPool>,
-    /// Logical membership and bounded instance discovery; expired instances fail closed.
+    /// Last published logical membership and instance availability.
     pub(crate) membership: Arc<MembershipCache>,
     /// Active LOAD RPCs shared by this reader and its clones.
     pub(crate) load_slots: Arc<tokio::sync::Semaphore>,
-    /// Serializes cold refreshes so an expired snapshot causes one control request.
-    membership_refresh: Arc<tokio::sync::Mutex<Option<std::time::Instant>>>,
+    /// One independently scheduled discovery thread shared by reader clones.
+    discovery_refresh: Arc<crate::discovery::DiscoveryRefresh>,
     /// This reader's own deployment zone, for read classification (ADR 0006).
     zone: Option<String>,
     /// Sink for zone-classified read events; defaults to a no-op.
@@ -122,6 +125,7 @@ pub struct BlockReader {
 
 impl BlockReader {
     /// Create a reader over the given coordinator client and placement cache.
+    /// Starts independent background discovery; clones share its lifetime.
     ///
     /// `replicas_k` bounds the ordered candidate list, primary first. It does not
     /// populate replicas; zero is treated as one.
@@ -129,15 +133,22 @@ impl BlockReader {
     /// [`with_stats`](Self::with_stats) to share an existing one.
     pub fn new(coordinator: CoordinatorClient, cache: Arc<PlacementCache>, replicas_k: u8) -> Self {
         let membership = Arc::new(MembershipCache::new(cache.ttl_ms()));
+        let worker_pool = Arc::new(ConnectionPool::new());
+        let discovery_refresh = Arc::new(crate::discovery::DiscoveryRefresh::new(
+            &coordinator,
+            membership.clone(),
+            worker_pool.clone(),
+            cache.clone(),
+        ));
         Self {
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
             stats: ReadStats::new(),
-            worker_pool: Arc::new(ConnectionPool::new()),
+            worker_pool,
             membership,
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
-            membership_refresh: Arc::new(tokio::sync::Mutex::new(None)),
+            discovery_refresh,
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
@@ -152,6 +163,8 @@ impl BlockReader {
     /// Use these pool settings for each isolated worker instance pool.
     pub fn with_worker_pool(mut self, worker_pool: Arc<ConnectionPool>) -> Self {
         self.worker_pool = worker_pool;
+        self.membership = Arc::new(self.membership.empty_with_same_policy());
+        self.configure_discovery();
         self
     }
 
@@ -172,10 +185,25 @@ impl BlockReader {
         self.membership = Arc::new(
             MembershipCache::new(self.cache.ttl_ms()).with_zone_affinity(zone.clone(), enabled),
         );
-        self.membership_refresh = Arc::new(tokio::sync::Mutex::new(None));
+        self.configure_discovery();
         self.zone = zone;
         self.zone_observer = observer;
         self
+    }
+
+    fn configure_discovery(&mut self) {
+        if Arc::strong_count(&self.discovery_refresh) == 1 {
+            self.discovery_refresh
+                .configure(self.membership.clone(), self.worker_pool.clone());
+        } else {
+            // Reconfiguring a clone must not change other readers' policies.
+            self.discovery_refresh = Arc::new(crate::discovery::DiscoveryRefresh::new(
+                &self.coordinator,
+                self.membership.clone(),
+                self.worker_pool.clone(),
+                self.cache.clone(),
+            ));
+        }
     }
 
     /// The coordinator address this reader resolves placement against.
@@ -267,9 +295,9 @@ impl BlockReader {
 
     /// Read `len` bytes at `offset_in_block` within `block`.
     ///
-    /// Rank up to `replicas_k` logical candidates and resolve their unexpired
+    /// Rank up to `replicas_k` logical candidates and resolve their published
     /// instances. Retryable failures try the next candidate without refreshing
-    /// discovery. Stale reused connections may be redialed once before expiry.
+    /// discovery. Stale reused connections may be redialed once.
     ///
     /// This FUSE entry point follows the current origin generation. Use
     /// [`read_versioned_block_into`](Self::read_versioned_block_into) to pin the source.
@@ -585,49 +613,14 @@ impl BlockReader {
     }
 
     pub(crate) async fn membership_snapshot(&self) -> Result<MembershipSnapshot, BlockReadError> {
-        self.membership_snapshot_inner(true).await
-    }
-
-    /// LOAD must refresh an expired instance, including inside the read path's
-    /// refresh throttle window. Concurrent refreshes still share the same lock.
-    pub(crate) async fn load_membership_snapshot(
-        &self,
-    ) -> Result<MembershipSnapshot, BlockReadError> {
-        self.membership_snapshot_inner(false).await
-    }
-
-    async fn membership_snapshot_inner(
-        &self,
-        allow_stale: bool,
-    ) -> Result<MembershipSnapshot, BlockReadError> {
-        if let Some(snapshot) = self.membership.fresh() {
-            return Ok(snapshot);
-        }
-        let mut refresh = self.membership_refresh.lock().await;
-        if let Some(snapshot) = self.membership.fresh() {
-            return Ok(snapshot);
-        }
-        let observed = std::time::Instant::now();
-        if allow_stale
-            && refresh.is_some_and(|at| {
-                observed.duration_since(at) < std::time::Duration::from_millis(100)
-            })
-        {
-            if let Some(snapshot) = self.membership.last_good() {
-                // Throttle discovery requests, but never route with an expired instance.
-                return Ok(snapshot);
-            }
-        }
-        *refresh = Some(observed);
-        let view = self.coordinator.discovery().await?;
-        self.cache.clear();
-        Ok(self.membership.replace(view, observed, &self.worker_pool))
+        self.discovery_refresh.snapshot().await
     }
 }
 
 fn cache_block_error(error: BlockReadError) -> CacheReadError {
     match error {
         BlockReadError::Coordinator(error) => error.into(),
+        BlockReadError::Discovery(error) => error.as_ref().into(),
         BlockReadError::Worker(error)
         | BlockReadError::Target { source: error, .. }
         | BlockReadError::AllReplicasFailed { source: error, .. } => error.into(),
@@ -1318,7 +1311,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn coordinator_outage_does_not_use_expired_instances() {
+    async fn coordinator_outage_keeps_the_last_published_online_instances() {
         let hits = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let worker_addr = mock_worker(Arc::clone(&hits)).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1352,8 +1345,8 @@ mod tests {
         let mut next = block();
         next.offset += u64::from(next.block_size);
         tokio::time::sleep(std::time::Duration::from_millis(510)).await;
-        assert!(reader.read_block(&next, 0, 16).await.is_err());
-        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(reader.read_block(&next, 0, 16).await.unwrap().len(), 16);
+        assert_eq!(hits.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1436,28 +1429,34 @@ mod tests {
         let mut second = block();
         second.offset += u64::from(second.block_size);
 
-        reader.membership_snapshot().await.unwrap();
+        let initial = reader.membership_snapshot().await.unwrap();
+        let old_address = initial.owner(&first).unwrap().addr().to_owned();
         assert!(reader.read_block(&first, 0, 16).await.is_err());
-        tokio::time::sleep(std::time::Duration::from_millis(110)).await;
-        let intermediate = reader.membership_snapshot().await;
-        assert_eq!(intermediate.is_err(), fail_intermediate);
-        assert_eq!(membership_calls.load(Ordering::SeqCst), 2);
-        // A later refresh can recover after either an error or an unchanged view.
-        tokio::time::sleep(std::time::Duration::from_millis(110)).await;
-        reader.membership_snapshot().await.unwrap();
+        // Recovery must happen on the timer even with no foreground reads.
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let current = reader.membership_snapshot().await.unwrap();
+                if current.owner(&first).unwrap().addr() != old_address {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
         let bytes = reader.read_block(&second, 0, 16).await.unwrap();
         assert_eq!(bytes.len(), 16);
-        assert_eq!(membership_calls.load(Ordering::SeqCst), 3);
+        assert!(membership_calls.load(Ordering::SeqCst) >= 3);
         assert_eq!(recovered_requests.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn failed_refresh_does_not_suppress_the_next_sequential_refresh() {
+    async fn background_refresh_recovers_after_failure() {
         assert_intermediate_refresh_does_not_suppress_next(true).await;
     }
 
     #[tokio::test]
-    async fn unchanged_refresh_does_not_suppress_the_next_sequential_refresh() {
+    async fn background_refresh_continues_after_unchanged_view() {
         assert_intermediate_refresh_does_not_suppress_next(false).await;
     }
 
@@ -1886,7 +1885,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_expiring_during_reused_read_prevents_redial() {
+    async fn discovery_age_does_not_prevent_stale_socket_retry() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
@@ -1906,12 +1905,15 @@ mod tests {
                 }
             }
             drop(socket);
-            // Keep listening so a forbidden retry would connect and send bytes.
-            assert!(
-                tokio::time::timeout(std::time::Duration::from_millis(50), listener.accept())
-                    .await
-                    .is_err()
-            );
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            socket.read_exact(&mut header).await.unwrap();
+            let header = FrameHeader::decode(&header).unwrap();
+            let mut body = vec![0; header.length as usize];
+            socket.read_exact(&mut body).await.unwrap();
+            let mut response = response_header_ok(header.request_id, 8).to_vec();
+            response.extend_from_slice(&[7; 8]);
+            socket.write_all(&response).await.unwrap();
         });
         let coordinator = mock_coordinator(address).await;
         let reader = BlockReader::new(
@@ -1920,15 +1922,12 @@ mod tests {
             1,
         );
         assert_eq!(reader.read_block(&block(), 0, 8).await.unwrap(), vec![7; 8]);
-        let error = reader.read_block(&block(), 0, 8).await.unwrap_err();
-        assert!(matches!(error, BlockReadError::AllReplicasFailed {
-            source: WorkerError::Remote(ref remote), ..
-        } if remote.code == DataErrorCode::Unavailable && remote.message.contains("expired before read retry")));
+        assert_eq!(reader.read_block(&block(), 0, 8).await.unwrap(), vec![7; 8]);
         server.await.unwrap();
     }
 
     #[tokio::test]
-    async fn discovery_expiring_during_primary_read_prevents_replica_attempt() {
+    async fn discovery_age_does_not_prevent_replica_attempt() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let primary = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
@@ -1956,11 +1955,12 @@ mod tests {
             Arc::new(PlacementCache::new(500)),
             2,
         );
-        let error = read_via(&reader, ReadApi::Into).await.unwrap_err();
-        assert!(matches!(error, CacheReadError::Unavailable(_)));
-        assert!(error.to_string().contains("expired instance discovery"));
-        assert_eq!(hits.load(Ordering::SeqCst), 0);
-        assert_eq!(reader.stats().snapshot().worker_fetches, 1);
+        assert_eq!(
+            read_via(&reader, ReadApi::Into).await.unwrap(),
+            (7..39).collect::<Vec<u8>>()
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(reader.stats().snapshot().worker_fetches, 2);
         server.await.unwrap();
     }
 
