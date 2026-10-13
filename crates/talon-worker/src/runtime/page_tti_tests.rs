@@ -177,6 +177,23 @@ async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
 }
 
 #[tokio::test]
+#[allow(clippy::await_holding_lock)] // Deliberately prove the clean path does not acquire this lock.
+async fn clean_checkpoint_does_not_traverse_page_states() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 1000);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    assert_eq!(r.checkpoint_access_times().await.blocks, 1);
+    let block = r.page_lifecycle.block(&id());
+    let held = block.inner.lock().unwrap();
+    let result =
+        tokio::time::timeout(Duration::from_millis(500), r.checkpoint_access_times()).await;
+    drop(held);
+    let report = result.expect("a clean checkpoint must not lock resident page states");
+    assert_eq!(report.blocks, 0);
+    assert_eq!(report.bytes, 0);
+}
+
+#[tokio::test]
 async fn access_only_checkpoint_failure_retries_without_structural_changes() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 1000);
@@ -190,7 +207,6 @@ async fn access_only_checkpoint_failure_retries_without_structural_changes() {
     {
         let state = block.inner.lock().unwrap();
         assert_eq!(state.revision, revision);
-        assert_eq!(state.dirty_since, None);
         assert_eq!(state.dirty_since(), Some(10100));
     }
     let dir = r.paged.as_ref().unwrap().dir_for(&id());
@@ -885,7 +901,7 @@ async fn file_cleanup_runs_independently_of_gc_interval() {
     .await
     .unwrap();
     service.shutdown().await;
-    assert_eq!(r.page_gc_metrics.scanned.get(), 1);
+    assert_eq!(r.page_gc_metrics.scanned.get(), 0);
     assert_eq!(r.resident_bytes(), 16);
 }
 

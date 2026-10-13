@@ -28,8 +28,9 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
 
 - **Task concurrency** bounds active invocations across all registrations. Each task
   has at most one invocation. Ready tasks are admitted in round-robin order; there
-  is no queue of missed timer events. A task becomes eligible again one configured
-  interval after its previous invocation finishes. The first invocation is eligible at
+  is no queue of missed timer events. Scans with pending work become eligible again
+  immediately after a slice; completed rounds wait their configured interval.
+  The first invocation is eligible at
   startup. Resource contention can delay admission.
 - **I/O concurrency** is shared by checkpoint writes, page/whole-block eviction,
   and orphan cleanup. A slot stays owned until disk and metadata changes finish,
@@ -47,7 +48,8 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
   its task slot and immediately resumes pending work. The full pass is independent
   of configured batch limits. Pages added behind the cursor may wait for the next pass.
   This task also retries failed capacity/superseded page deletions and cleans up
-  empty page directories, so it continues running when TTI is disabled. The
+  empty page directories, so it continues running when TTI is disabled. With TTI
+  disabled, it visits only retry/cleanup indexes, not all resident pages. The
   scheduler task label is now `tti_gc` (previously `page_gc`); update queries
   filtering the background-task metrics by that label. Existing `page_gc_*`
   configuration names and shared page-reclamation metrics remain unchanged.
@@ -99,7 +101,8 @@ Metrics `talon_worker_background_task_active`,
 `talon_worker_background_task_completed_total`,
 `talon_worker_background_task_panics_total`, and
 `talon_worker_background_task_seconds` use a `task` label. Invocation duration includes
-resource waits, including the complete TTI GC pass. A panicking registration is
+resource waits within each scheduler slice. Complete TTI scan metrics aggregate
+all slices and publish only when the round completes. A panicking registration is
 logged and retried after its interval; other registrations continue. Existing
 GC/checkpoint error and progress metrics remain available.
 
@@ -236,3 +239,13 @@ Hourly supplements seek directly into a separate latest-admission index, so one
 new fill does not traverse older unchanged blocks. Refills move the block to its
 new admission position. Membership changes discard old progress and use the new
 event boundary; all unlinks still validate the current membership and activity.
+
+## Clean access checkpoints
+
+Each shard tracks dirty block summaries, including access-only updates and
+structural changes. A clean shard returns before snapshot allocation. The first
+dirty timestamp update per page/checkpoint registers its block; subsequent reads
+only update page atomics. Snapshot preparation consumes summaries before sampling,
+restoring them on failure, and preserves concurrent changes for the next pass.
+Dirty metrics traverse these summaries instead of rescanning every resident page.
+A dirty shard still writes its complete atomic snapshot; the disk format is unchanged.

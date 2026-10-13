@@ -67,10 +67,11 @@ TTI 开启时，L1 命中、L2 成功读取、sendfile 成功获取覆盖范围�
 重启时使用当前 Unix 时间恢复年龄，停机时间计入 TTI。记录缺失、损坏或位于未来时，
 page 是可回收候选，实际访问仍可在认领前续期。跨重启时钟异常可能导致提前回收。
 
-TTI GC 每次从头完整扫描内存中的 page 元数据，并处理本轮所有回收候选；扫描和候选数量
-不受批量配置限制。扫描在 blocking pool 执行，不读取 page 数据文件，实际删除仍受
+TTI GC 每轮完整扫描内存中的 page 元数据，并处理本轮所有回收候选。单次调度最多
+检查 4096 个条目、保留 64 个候选，随后交还任务槽并立即续扫；批量配置不截断整轮。
+扫描在 blocking pool 执行，不读取 page 数据文件，实际删除仍受
 I/O 并发和删除速率限制，并在删除前重新校验访问和读者状态。
-后台任务名为 `tti_gc`（原 `page_gc`）。除 TTI 过期回收外，它还重试容量/旧版本淘汰失败的 page 删除，并清理空目录，因此关闭 TTI 不会停掉整个任务。现有 `page_gc_*` 配置和共享回收指标名称保持不变。
+后台任务名为 `tti_gc`（原 `page_gc`）。除 TTI 过期回收外，它还重试容量/旧版本淘汰失败的 page 删除，并清理空目录，因此关闭 TTI 不会停掉整个任务。TTI 关闭后仅查询删除重试和空目录待办索引；健康状态不遍历 resident pages。现有 `page_gc_*` 配置和共享回收指标名称保持不变。
 
 首次启动即可扫描；一轮扫描及删除尝试完成后，再等待 `page_gc_interval_minutes`，默认 10 分钟。失败的删除留到下一轮重试。并发新加入或已越过游标位置的 page 可以留到下一轮。
 
@@ -159,19 +160,20 @@ page 文件扫描始终是驻留事实来源：没有 page 文件的记录被忽
 
 TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范围共用一个时间值。
 时间戳只向前推进；同一毫秒或晚完成的较早读取跳过时间戳和 dirty 写入。
-时间戳推进时只更新本 page 的原子 dirty 标记，不修改 block 共享状态。
+时间戳推进时更新本 page 的原子 dirty 标记。每个 page 在两次 checkpoint 采样之间
+第一次变脏时，额外登记分片的 dirty block 摘要；后续访问不重复登记，也不获取 block 锁。
 这些是路径上的开销减少，不代表已通过性能验收。
 后台通过[统一调度器](async-eviction.md)轮转 256 个分片，每批处理一个分片；
 批次完成后等待配置周期的 1/256（最小 1 ms）。同一 Worker 同时只有一个 checkpoint，
 写入按 64 KiB 分块，使用共享 `background_io_max_mb_per_sec` 预算，默认 8 MB/s（十进制）；
 实际全轮耗时可能因 I/O、数据规模和调度超过配置周期。显式 flush 和关闭时遍历全部
-分片，不等待后台 tick；关闭时保留共享预算，独立显式 flush 使用默认字节速率限制。未变脏且成员未变化的分片不写盘。
+分片，不等待后台 tick；关闭时保留共享预算，独立显式 flush 使用默认字节速率限制。未变脏且成员未变化的分片在构造快照前返回，不遍历 page，也不写盘。
 
 每次只构造一个分片的快照，registry 遍历每批最多 64 个 block。重写分片时包含
 其中未变脏的存量 block，避免覆盖丢失。小范围访问也可能重写整个分片；这是减少
 逐 block fsync 次数与额外顺序写入之间的取舍。删除的条目会在后续快照中移除。
-采样时先原子取走每个 page 的 dirty 标记，再读取时间戳，并记录 block 结构 revision。
-随后发生的访问会留下新标记；保存失败或快照构造提前退出会恢复取走的标记。
+采样前先取走 block 的 dirty 摘要，再原子取走每个 page 的 dirty 标记，再读取时间戳，并记录 block 结构 revision。
+随后发生的访问会留下新标记；保存失败或快照构造提前退出会恢复取走的标记及摘要。
 成功保存只确认已采样的标记和结构 revision，不清除并发访问留下的新标记。
 复制完成后释放状态锁，在 blocking pool 写临时文件、
 同步文件、原子替换、同步父目录。checkpoint 不持有 block mutation gate，不阻塞
@@ -226,12 +228,13 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 
 所有新指标以 `talon_worker_page_` 开头，无 object/page 标签。
 
-- `gc_scanned_total`、`gc_batch_seconds`、`gc_scan_seconds`：扫描进度与耗时；后两者记录完整一轮
-  GC（含删除等待）的耗时，不含轮次之间的间隔，保留 `batch` 指标名以兼容现有监控。
+- `gc_scanned_total`：检查过的 page 数；`gc_batch_seconds`：单次调度片耗时；
+  `gc_scan_seconds`：最近完整扫描各调度片的累计活动时间，含删除等待，不含片间调度排队。
 - `tti_seconds`：配置的空闲过期时长；`0` 表示关闭按空闲时间回收。
 - `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded|backend_deleted|ownership`；`ownership` 来自stale GC 中的[归属清理任务](ownership-gc.md)。
 - `gc_delete_errors_total`、`gc_pending_retries`：删除故障和最近完整扫描看到的重试量。
-- `access_dirty_blocks`、`access_oldest_dirty_seconds`：checkpoint 遍历观察到的未保存状态。
+- `access_dirty_blocks`、`access_oldest_dirty_seconds`：从 dirty block 摘要统计的待保存状态，
+  包含待持久化的删除；无需再次遍历全部 pages。
 - `access_checkpoint_bytes_total`、`access_checkpoint_errors_total`、
   `access_checkpoint_timestamp_seconds`：保存流量、失败和最近成功时间。
 - `access_recovery_missing_total`、`access_recovery_corrupt_total`、

@@ -570,7 +570,10 @@ impl WorkerRuntime {
         let _guard = gate.lock().await;
         let worker = self.clone();
         let prepared = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let (ceiling, membership, mut dirty) = worker.page_lifecycle.checkpoint_start(shard);
+            let (ceiling, membership, dirty) = worker.page_lifecycle.checkpoint_start(shard);
+            if !dirty {
+                return Ok(None);
+            }
             let mut slot = 0;
             let mut snapshots = Vec::new();
             let mut size = 24;
@@ -583,7 +586,7 @@ impl WorkerRuntime {
                 }
                 for block in blocks {
                     let state = block.inner.lock().unwrap();
-                    dirty |= state.dirty_since.is_some();
+                    let summary = state.work.checkpoint();
                     // Bound allocation before collecting a potentially large block.
                     let records = state.pages.len();
                     size += serde_json::to_vec(&block.id)?.len() + records * 12 + 52;
@@ -598,7 +601,6 @@ impl WorkerRuntime {
                         .iter()
                         .map(|(&page, entry)| PageCheckpoint::new(page, &entry.handle))
                         .collect();
-                    dirty |= pages.iter().any(PageCheckpoint::dirty);
                     // Include clean blocks too: this file replaces the full shard.
                     let snapshot = AccessSnapshot {
                         revision: state.revision,
@@ -610,16 +612,19 @@ impl WorkerRuntime {
                     };
                     let resident = !state.pages.is_empty();
                     drop(state);
-                    snapshots.push((block, snapshot, resident, pages));
+                    snapshots.push((block, snapshot, resident, pages, summary));
                 }
-            }
-            if !dirty {
-                return Ok(None);
             }
             let paged = worker.paged.as_ref().expect("paged TTI");
             let dir = paged.root().join(format!("{shard:02x}"));
             // Whole-block-only registry entries have no paged directory to persist.
-            if !dir.exists() && snapshots.iter().all(|(_, _, resident, _)| !resident) {
+            if !dir.exists() && snapshots.iter().all(|(_, _, resident, _, _)| !resident) {
+                for (_, _, _, pages, summary) in snapshots {
+                    for page in pages {
+                        page.commit();
+                    }
+                    summary.commit();
+                }
                 worker.page_lifecycle.checkpoint_finished(shard, membership);
                 return Ok(None);
             }
@@ -627,8 +632,8 @@ impl WorkerRuntime {
                 paged.page_size(),
                 snapshots
                     .iter()
-                    .filter(|(_, _, resident, _)| *resident)
-                    .map(|(block, snapshot, _, _)| (&block.id, snapshot)),
+                    .filter(|(_, _, resident, _, _)| *resident)
+                    .map(|(block, snapshot, _, _, _)| (&block.id, snapshot)),
             )?;
             Ok(Some((membership, snapshots, bytes)))
         })
@@ -645,19 +650,13 @@ impl WorkerRuntime {
         tokio::task::spawn_blocking(move || {
             let count = snapshots
                 .iter()
-                .filter(|(_, _, resident, _)| *resident)
+                .filter(|(_, _, resident, _, _)| *resident)
                 .count();
-            for (block, snapshot, _, pages) in snapshots {
-                let mut state = block.inner.lock().unwrap();
-                if state.revision == snapshot.revision {
-                    state.dirty_since = None;
-                } else if let Some(since) = state.dirty_since.as_mut() {
-                    *since = (*since).max(snapshot.sampled_at);
-                }
-                drop(state);
+            for (_, _, _, pages, summary) in snapshots {
                 for page in pages {
                     page.commit();
                 }
+                summary.commit();
             }
             worker.page_lifecycle.checkpoint_finished(shard, membership);
             Ok((count, bytes))
@@ -667,22 +666,8 @@ impl WorkerRuntime {
     }
 
     async fn refresh_checkpoint_metrics(&self) {
-        let mut cursor = ScanCursor::default();
-        let mut remaining = 0;
-        let mut oldest = 0;
-        loop {
-            let (blocks, done) = self.page_lifecycle.dirty_batch(&mut cursor, 64);
-            for block in blocks {
-                if let Some(since) = block.inner.lock().unwrap().dirty_since() {
-                    remaining += 1;
-                    oldest = oldest.max(self.page_clock.now().saturating_sub(since));
-                }
-            }
-            if done {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        let (remaining, since) = self.page_lifecycle.dirty_summary();
+        let oldest = since.map_or(0, |since| self.page_clock.now().saturating_sub(since));
         self.page_gc_metrics.dirty_blocks.set(remaining as f64);
         self.page_gc_metrics.dirty_age.set(oldest as f64 / 1000.0);
     }

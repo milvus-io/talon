@@ -1,7 +1,7 @@
 //! Page residency and idle age. Disk operations never run under these locks.
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use talon_core::{BlockId, PageIndex};
@@ -99,23 +99,92 @@ const CLOSED: u64 = 1 << 62;
 const ACCESSED: u64 = 1 << 63;
 const UNKNOWN: u64 = u64::MAX;
 
+#[derive(Default)]
+struct ShardWork {
+    dirty: Mutex<BTreeMap<u64, u64>>,
+    pending: Mutex<BTreeSet<u64>>,
+}
+
+#[derive(Default)]
+pub(crate) struct BlockWork {
+    shard: Arc<ShardWork>,
+    slot: u64,
+    retired: AtomicBool,
+}
+impl BlockWork {
+    fn dirty(&self, now: u64) {
+        let mut dirty = self.shard.dirty.lock().unwrap();
+        if self.retired.load(Ordering::Relaxed) {
+            return;
+        }
+        dirty
+            .entry(self.slot)
+            .and_modify(|old| *old = (*old).min(now))
+            .or_insert(now);
+    }
+    fn pending(&self) {
+        self.shard.pending.lock().unwrap().insert(self.slot);
+    }
+    fn retire(&self) {
+        // Serialize retirement with late checkpoint rollback. A snapshot can
+        // release its BlockState before its page/summary guards are dropped.
+        let mut dirty = self.shard.dirty.lock().unwrap();
+        self.retired.store(true, Ordering::Relaxed);
+        dirty.remove(&self.slot);
+        self.shard.pending.lock().unwrap().remove(&self.slot);
+    }
+    pub fn checkpoint(self: &Arc<Self>) -> BlockCheckpoint {
+        let since = self.shard.dirty.lock().unwrap().remove(&self.slot);
+        BlockCheckpoint {
+            work: self.clone(),
+            since,
+        }
+    }
+}
+
+/// Removing the summary before sampling pages lets concurrent changes register
+/// a later checkpoint. Failure and cancellation restore the consumed summary.
+pub(crate) struct BlockCheckpoint {
+    work: Arc<BlockWork>,
+    since: Option<u64>,
+}
+impl BlockCheckpoint {
+    pub fn commit(mut self) {
+        self.since = None;
+    }
+}
+impl Drop for BlockCheckpoint {
+    fn drop(&mut self) {
+        if let Some(since) = self.since {
+            self.work.dirty(since);
+        }
+    }
+}
+
 pub(crate) struct PageState {
     state: AtomicU64,
     last_access: AtomicU64,
     dirty_since: AtomicU64,
+    work: Arc<BlockWork>,
 }
 impl PageState {
+    #[cfg(test)]
     fn new(access: Option<u64>) -> Self {
+        Self::with_work(access, Arc::default())
+    }
+    fn with_work(access: Option<u64>, work: Arc<BlockWork>) -> Self {
         Self {
             state: AtomicU64::new(0),
             last_access: AtomicU64::new(access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1))),
             dirty_since: AtomicU64::new(UNKNOWN),
+            work,
         }
     }
     pub fn last_access(&self) -> Option<u64> {
         let t = self.last_access.load(Ordering::Acquire);
         (t != UNKNOWN).then_some(t)
     }
+    #[cfg(test)]
     fn dirty_since(&self) -> Option<u64> {
         let t = self.dirty_since.load(Ordering::Acquire);
         (t != UNKNOWN).then_some(t)
@@ -134,8 +203,11 @@ impl PageState {
             ) {
                 Ok(_) => {
                     // Always a release RMW: a checkpoint consuming this marker
-                    // must also see this timestamp. No block-shared cache line.
-                    self.dirty_since.fetch_min(now, Ordering::Release);
+                    // must also see this timestamp. Only the first dirty touch
+                    // per page/checkpoint updates the shard summary.
+                    if self.dirty_since.fetch_min(now, Ordering::Release) == UNKNOWN {
+                        self.work.dirty(now);
+                    }
                     break;
                 }
                 Err(actual) => old = actual,
@@ -200,8 +272,9 @@ pub(crate) struct BlockPages {
     pub pages: BTreeMap<u32, PageEntry>,
     // Structural changes only: hot reads never lock or modify their block.
     pub revision: u64,
-    pub dirty_since: Option<u64>,
     pub cleanup_pending: bool,
+    retries: BTreeSet<u32>,
+    pub work: Arc<BlockWork>,
 }
 impl BlockPages {
     pub fn changed(&mut self, now: u64) {
@@ -209,13 +282,17 @@ impl BlockPages {
             .revision
             .checked_add(1)
             .expect("access revision exhausted");
-        self.dirty_since.get_or_insert(now);
+        self.work.dirty(now);
     }
+    #[cfg(test)]
     pub fn dirty_since(&self) -> Option<u64> {
-        self.dirty_since
-            .into_iter()
-            .chain(self.pages.values().filter_map(|p| p.handle.dirty_since()))
-            .min()
+        self.work
+            .shard
+            .dirty
+            .lock()
+            .unwrap()
+            .get(&self.work.slot)
+            .copied()
     }
 }
 pub(crate) struct BlockState {
@@ -238,7 +315,9 @@ impl BlockPageClaim {
     pub fn finish(mut self, now: u64) {
         let mut g = self.block.inner.lock().unwrap();
         g.pages.clear();
+        g.retries.clear();
         g.cleanup_pending = false;
+        g.work.pending();
         g.changed(now);
         self.committed = true;
     }
@@ -287,9 +366,10 @@ impl BlockState {
     ) -> Arc<PageState> {
         let mut g = self.inner.lock().unwrap();
         g.cleanup_pending = false;
+        let work = g.work.clone();
         // A duplicate same-version fill preserves existing guards and identity.
         let e = g.pages.entry(page.0).or_insert_with(|| PageEntry {
-            handle: Arc::new(PageState::new(access)),
+            handle: Arc::new(PageState::with_work(access, work)),
             selection: 0,
         });
         if dirty {
@@ -395,12 +475,16 @@ impl BlockState {
             // Removed handles stay closed forever, even after the same page is
             // admitted again. Outstanding old handles cannot pin a new file.
             g.pages.remove(&c.page.0);
+            g.retries.remove(&c.page.0);
             g.cleanup_pending = g.pages.is_empty();
+            if g.cleanup_pending {
+                g.work.pending();
+            }
             g.changed(now);
         }
     }
     pub fn abort(&self, c: &GcCandidate, reason: usize) {
-        let g = self.inner.lock().unwrap();
+        let mut g = self.inner.lock().unwrap();
         if let Some(e) = g.pages.get(&c.page.0) {
             if Arc::ptr_eq(&e.handle, &c.handle) && e.selection == c.selection {
                 e.handle
@@ -409,6 +493,8 @@ impl BlockState {
                         Some((old & !(CLOSED | RETRY)) | ((reason as u64 + 1) << RETRY_SHIFT))
                     })
                     .unwrap();
+                g.retries.insert(c.page.0);
+                g.work.pending();
             }
         }
     }
@@ -463,6 +549,7 @@ impl PageCheckpoint {
             dirty_since,
         }
     }
+    #[cfg(test)]
     pub fn dirty(&self) -> bool {
         self.dirty_since != UNKNOWN
     }
@@ -476,6 +563,7 @@ impl Drop for PageCheckpoint {
             self.handle
                 .dirty_since
                 .fetch_min(self.dirty_since, Ordering::Release);
+            self.handle.work.dirty(self.dirty_since);
         }
     }
 }
@@ -531,12 +619,14 @@ pub(crate) struct ScanReport {
 }
 pub(crate) struct PageLifecycle {
     shards: Vec<Mutex<Registry>>,
+    work: Vec<Arc<ShardWork>>,
     directories: Vec<Arc<tokio::sync::RwLock<()>>>,
     checkpoints: Vec<Arc<tokio::sync::Mutex<()>>>,
 }
 impl PageLifecycle {
     pub fn new() -> Self {
         Self {
+            work: (0..SHARDS).map(|_| Arc::default()).collect(),
             shards: (0..SHARDS)
                 .map(|_| Mutex::new(Registry::default()))
                 .collect(),
@@ -563,6 +653,9 @@ impl PageLifecycle {
             let state = block.inner.lock().unwrap();
             let empty =
                 state.pages.is_empty() && !state.cleanup_pending && Arc::strong_count(block) == 1;
+            if empty {
+                state.work.retire();
+            }
             drop(state);
             if empty {
                 g.ordered.remove(&n);
@@ -587,10 +680,19 @@ impl PageLifecycle {
                 directory: self.directory_gate(hash.finish()),
                 block: tokio::sync::RwLock::new(()),
             }),
-            inner: Mutex::new(BlockPages::default()),
+            inner: Mutex::new(BlockPages {
+                work: Arc::new(BlockWork {
+                    shard: self.work[disk_shard(id)].clone(),
+                    slot: n,
+                    retired: AtomicBool::new(false),
+                }),
+                ..Default::default()
+            }),
         });
         g.by_id.insert(id.clone(), n);
         g.ordered.insert(n, block.clone());
+        // Failed fills and whole-block operations can leave empty registry state.
+        self.work[disk_shard(id)].pending.lock().unwrap().insert(n);
         block
     }
     /// Ordered block slots and page keys let a batch resume without copying the registry.
@@ -610,7 +712,18 @@ impl PageLifecycle {
             let mut registry = self.shards[cursor.shard].lock().unwrap();
             let ceiling = *cursor.ceiling.get_or_insert(registry.next);
             let next = if cursor.block <= ceiling {
-                registry.ordered.range(cursor.block..=ceiling).next()
+                if tti.is_some() {
+                    registry.ordered.range(cursor.block..=ceiling).next()
+                } else {
+                    let slot = self.work[cursor.shard]
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .range(cursor.block..=ceiling)
+                        .next()
+                        .copied();
+                    slot.and_then(|slot| registry.ordered.get_key_value(&slot))
+                }
             } else {
                 None
             };
@@ -636,6 +749,7 @@ impl PageLifecycle {
             }
             if state.pages.is_empty() && !state.cleanup_pending && Arc::strong_count(block) == 1 {
                 let id = block.id.clone();
+                state.work.retire();
                 drop(state);
                 registry.ordered.remove(&slot);
                 registry.by_id.remove(&id);
@@ -647,10 +761,18 @@ impl PageLifecycle {
             }
             let mut exhausted = true;
             let mut in_block = 0;
-            for (&page, entry) in state
-                .pages
-                .range_mut((cursor.page.min(u32::MAX as u64) as u32)..)
-            {
+            let start = cursor.page.min(u32::MAX as u64) as u32;
+            let keys: Vec<_> = if tti.is_some() {
+                state
+                    .pages
+                    .range(start..)
+                    .map(|(&page, _)| page)
+                    .take(64)
+                    .collect()
+            } else {
+                state.retries.range(start..).copied().take(64).collect()
+            };
+            for page in keys {
                 if (page as u64) < cursor.page {
                     continue;
                 }
@@ -658,8 +780,12 @@ impl PageLifecycle {
                 in_block += 1;
                 report.checked += 1;
                 cursor.page = u64::from(page) + 1;
-                let flags = entry.handle.state.load(Ordering::Acquire);
+                let flags = state.pages[&page].handle.state.load(Ordering::Acquire);
                 let retry = PageState::retry(flags);
+                if retry.is_none() {
+                    state.retries.remove(&page);
+                }
+                let entry = state.pages.get_mut(&page).unwrap();
                 if retry.is_some() {
                     report.retries += 1;
                 }
@@ -683,6 +809,13 @@ impl PageLifecycle {
                     break;
                 }
             }
+            if !state.pages.is_empty() && state.retries.is_empty() && !state.cleanup_pending {
+                self.work[cursor.shard]
+                    .pending
+                    .lock()
+                    .unwrap()
+                    .remove(&slot);
+            }
             if exhausted {
                 cursor.block = slot + 1;
                 cursor.page = 0;
@@ -701,7 +834,8 @@ impl PageLifecycle {
         (
             g.next,
             g.membership,
-            g.membership != g.checkpointed_membership,
+            g.membership != g.checkpointed_membership
+                || !self.work[shard].dirty.lock().unwrap().is_empty(),
         )
     }
     pub fn checkpoint_batch(
@@ -733,40 +867,18 @@ impl PageLifecycle {
         // crash. There may be no live BlockState left to carry a dirty bit.
         self.shards[shard].lock().unwrap().membership += 1;
     }
-    /// Checkpoint iteration is bounded by blocks examined, including clean blocks.
-    pub fn dirty_batch(
-        &self,
-        cursor: &mut ScanCursor,
-        limit: usize,
-    ) -> (Vec<Arc<BlockState>>, bool) {
-        let mut out = Vec::new();
-        let mut examined = 0;
-        while examined < limit {
-            let g = self.shards[cursor.shard].lock().unwrap();
-            let ceiling = *cursor.ceiling.get_or_insert(g.next);
-            let next = if cursor.block <= ceiling {
-                g.ordered.range(cursor.block..=ceiling).next()
-            } else {
-                None
-            };
-            let Some((&slot, block)) = next else {
-                cursor.shard += 1;
-                cursor.block = 0;
-                cursor.ceiling = None;
-                if cursor.shard == SHARDS {
-                    cursor.shard = 0;
-                    return (out, true);
-                }
-                continue;
-            };
-            cursor.block = slot + 1;
-            examined += 1;
-            let inner = block.inner.lock().unwrap();
-            if inner.dirty_since().is_some() && !inner.pages.is_empty() {
-                out.push(block.clone());
+    /// Summaries contain only dirty blocks, never a traversal of resident pages.
+    pub fn dirty_summary(&self) -> (usize, Option<u64>) {
+        let mut count = 0;
+        let mut oldest: Option<u64> = None;
+        for shard in &self.work {
+            let dirty = shard.dirty.lock().unwrap();
+            count += dirty.len();
+            if let Some(since) = dirty.values().copied().min() {
+                oldest = Some(oldest.map_or(since, |old| old.min(since)));
             }
         }
-        (out, false)
+        (count, oldest)
     }
 }
 
@@ -1018,6 +1130,111 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_rollback_cannot_resurrect_retired_dirty_summary() {
+        let life = PageLifecycle::new();
+        let block = life.block(&id());
+        let page = block.register(PageIndex(0), Some(10), 10, true);
+        page.acquire().unwrap().record_access_and_release(Some(20));
+        let summary = block.inner.lock().unwrap().work.checkpoint();
+        let snapshot = PageCheckpoint::new(0, &page);
+        block.claim_all_pages().unwrap().finish(30);
+        drop(block);
+        life.retire_empty(&id());
+        assert!(life.get(&id()).is_none());
+        // Model failed publication dropping its retained guards after retirement.
+        drop(snapshot);
+        drop(summary);
+        assert_eq!(life.dirty_summary(), (0, None));
+    }
+
+    #[test]
+    fn disabled_tti_retires_empty_states_after_external_references_release() {
+        let life = PageLifecycle::new();
+        let block = life.block(&id());
+        // An incomplete fill's empty state stays pending while a caller owns it.
+        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
+        drop(block);
+        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
+        assert!(life.get(&id()).is_none());
+
+        let block = life.block(&id());
+        block.register(PageIndex(0), Some(1), 1, true);
+        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
+        block.claim_all_pages().unwrap().finish(100);
+        life.retire_empty(&id()); // Still protected by this caller's Arc.
+        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
+        drop(block);
+        life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
+        assert!(life.get(&id()).is_none());
+        assert_eq!(life.dirty_summary(), (0, None));
+    }
+
+    #[test]
+    fn disabled_tti_examines_only_retry_pages() {
+        let life = PageLifecycle::new();
+        let block = life.block(&id());
+        for page in 0..10000 {
+            block.register(PageIndex(page), None, 1, false);
+        }
+        let (_, clean) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
+        assert!(clean.completed);
+        assert_eq!(clean.checked, 0);
+        let retry = block.candidate(PageIndex(9000)).unwrap();
+        block.abort(&retry, 1);
+        let (candidates, retry_scan) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
+        assert_eq!(retry_scan.checked, 1);
+        assert_eq!(candidates.len(), 1);
+        block
+            .acquire(PageIndex(9000))
+            .unwrap()
+            .record_access_and_release(None);
+        let (candidates, _) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
+        assert!(candidates.is_empty());
+        let (_, clean) = life.scan(&mut ScanCursor::default(), 100, 10000, None, 10);
+        assert_eq!(
+            clean.checked, 0,
+            "successful reads retire cancelled retries"
+        );
+    }
+
+    #[test]
+    fn checkpoint_summary_preserves_changes_and_restores_failed_snapshots() {
+        let life = PageLifecycle::new();
+        let block = life.block(&id());
+        let handle = block.register(PageIndex(0), Some(10), 10, false);
+        let shard = disk_shard(&id());
+        let (_, membership, _) = life.checkpoint_start(shard);
+        life.checkpoint_finished(shard, membership);
+        assert!(!life.checkpoint_start(shard).2);
+        handle
+            .acquire()
+            .unwrap()
+            .record_access_and_release(Some(20));
+        assert_eq!(life.dirty_summary(), (1, Some(20)));
+        let work = block.inner.lock().unwrap().work.clone();
+        let summary = work.checkpoint();
+        let page = PageCheckpoint::new(0, &handle);
+        handle
+            .acquire()
+            .unwrap()
+            .record_access_and_release(Some(30));
+        page.commit();
+        summary.commit();
+        assert_eq!(life.dirty_summary(), (1, Some(30)));
+        let summary = work.checkpoint();
+        let page = PageCheckpoint::new(0, &handle);
+        drop(page);
+        drop(summary);
+        assert!(life.checkpoint_start(shard).2);
+        assert_eq!(life.dirty_summary(), (1, Some(30)));
+        let summary = work.checkpoint();
+        PageCheckpoint::new(0, &handle).commit();
+        summary.commit();
+        assert_eq!(life.dirty_summary(), (0, None));
+        assert!(!life.checkpoint_start(shard).2);
+    }
+
+    #[test]
     fn disabled_tti_keeps_unknown_pages_but_discovers_cleanup_retries() {
         let life = PageLifecycle::new();
         let block = life.block(&id());
@@ -1060,7 +1277,10 @@ mod tests {
             let mut id = id();
             id.offset = offset * 64;
             let state = life.block(&id);
-            state.inner.lock().unwrap().cleanup_pending = true;
+            state.register(PageIndex(0), Some(1), 1, false);
+            let candidate = state.candidate(PageIndex(0)).unwrap();
+            assert!(state.claim(&candidate, 100, None));
+            state.finish(&candidate, 100);
         }
         let mut cursor = ScanCursor::default();
         let mut seen = std::collections::HashSet::new();
