@@ -49,7 +49,7 @@ int talon_c_api_smoke_test(void) {
     const char *last_error;
     talon_request_options trace_options;
     if (talon_request_options_init(&trace_options, sizeof(trace_options)) != TALON_STATUS_OK ||
-        trace_options.struct_size != sizeof(trace_options) || trace_options.version != TALON_REQUEST_OPTIONS_VERSION_1 ||
+        trace_options.struct_size != sizeof(trace_options) || trace_options.version != 1 ||
         trace_options.flags != 0 || trace_options.parent_mode != 0) return 10;
 
     talon_client_options_init(&options);

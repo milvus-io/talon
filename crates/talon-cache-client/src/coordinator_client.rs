@@ -21,8 +21,6 @@
 #[cfg(test)]
 use crate::membership_fixture;
 
-use talon_core::NamespaceContext;
-
 use std::collections::HashMap;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
@@ -108,7 +106,6 @@ impl CoordinatorError {
 /// TCP handshake (issue #181). Cloneable — clones share the same pool.
 #[derive(Debug, Clone)]
 pub struct CoordinatorClient {
-    namespace: talon_core::NamespaceId,
     addr: String,
     pool: Arc<ConnectionPool>,
 }
@@ -122,7 +119,6 @@ impl CoordinatorClient {
     /// Create a client that reuses connections from the shared `pool`.
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
-            namespace: talon_core::NamespaceId::default(),
             addr: addr.into(),
             pool,
         }
@@ -130,17 +126,6 @@ impl CoordinatorClient {
 
     pub(crate) fn isolated(&self) -> Self {
         Self::with_pool(self.addr.clone(), Arc::new(self.pool.isolated()))
-    }
-
-    /// Create a per-request control handle, including proxied metadata calls.
-    pub fn request(
-        &self,
-        namespace: &talon_core::NamespaceId,
-    ) -> Result<Self, talon_core::NamespaceIdError> {
-        namespace.validate()?;
-        let mut request = self.clone();
-        request.namespace = namespace.normalized();
-        Ok(request)
     }
 
     /// The coordinator address this client talks to.
@@ -231,26 +216,10 @@ impl CoordinatorClient {
     /// version resolution if the mount ever becomes version-aware; kept for that
     /// and covered by its own test.
     pub async fn stat_object(&self, object: &ObjectId) -> Result<ObjectStat, CoordinatorError> {
-        self.stat_object_with_context(
-            object,
-            self.namespace.context().expect("validated namespace"),
-        )
-        .await
-    }
-
-    /// Fetch metadata with a borrowed request namespace, reusing this client's pool.
-    pub async fn stat_object_with_context(
-        &self,
-        object: &ObjectId,
-        namespace: NamespaceContext<'_>,
-    ) -> Result<ObjectStat, CoordinatorError> {
         let req = ControlMessage::StatObject {
             object: object.clone(),
         };
-        match self
-            .round_trip_with_context(req, "StatObject", namespace)
-            .await?
-        {
+        match self.round_trip(req, "StatObject").await? {
             ControlMessage::ControlFailure { code, message } => {
                 Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
                     code,
@@ -273,26 +242,10 @@ impl CoordinatorClient {
         &self,
         prefix: &str,
     ) -> Result<Vec<talon_transport::ObjectEntry>, CoordinatorError> {
-        self.list_objects_with_context(
-            prefix,
-            self.namespace.context().expect("validated namespace"),
-        )
-        .await
-    }
-
-    /// List metadata with a borrowed request namespace, reusing this client's pool.
-    pub async fn list_objects_with_context(
-        &self,
-        prefix: &str,
-        namespace: NamespaceContext<'_>,
-    ) -> Result<Vec<talon_transport::ObjectEntry>, CoordinatorError> {
         let req = ControlMessage::ListObjects {
             prefix: prefix.to_string(),
         };
-        match self
-            .round_trip_with_context(req, "ListObjects", namespace)
-            .await?
-        {
+        match self.round_trip(req, "ListObjects").await? {
             ControlMessage::ControlFailure { code, message } => {
                 Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
                     code,
@@ -355,30 +308,14 @@ impl CoordinatorClient {
         msg: ControlMessage,
         expected: &'static str,
     ) -> Result<ControlMessage, CoordinatorError> {
-        self.round_trip_with_context(
-            msg,
-            expected,
-            self.namespace.context().expect("validated namespace"),
-        )
-        .await
-    }
-
-    async fn round_trip_with_context(
-        &self,
-        msg: ControlMessage,
-        expected: &'static str,
-        namespace: NamespaceContext<'_>,
-    ) -> Result<ControlMessage, CoordinatorError> {
         let mut out = talon_transport::encode(0, &msg)?;
-        match self.exchange(&mut out, expected, namespace).await {
+        match self.exchange(&mut out, expected).await {
             Ok(reply) => Ok(reply),
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_namespace_context(
-                        &mut out, &self.addr, namespace,
-                    )
-                    .map_err(talon_transport::CodecError::from)?;
+                    talon_transport::envelope::outbound(&mut out, &self.addr)
+                        .map_err(talon_transport::CodecError::from)?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let reply = self
@@ -407,11 +344,10 @@ impl CoordinatorClient {
         &self,
         out: &mut Vec<u8>,
         expected: &'static str,
-        namespace: NamespaceContext<'_>,
     ) -> Result<ControlMessage, (bool, CoordinatorError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound_namespace_context(out, &self.addr, namespace)
+            talon_transport::envelope::outbound(out, &self.addr)
                 .map_err(|e| (false, CoordinatorError::Codec(e.into())))?;
 
             let (mut stream, reused) = self
@@ -521,82 +457,6 @@ mod tests {
             id: NodeId::new(id),
             address: addr.to_string(),
             role: NodeRole::Worker,
-        }
-    }
-
-    #[tokio::test]
-    async fn borrowed_namespace_survives_metadata_and_read_retries() {
-        for metadata in [true, false] {
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap().to_string();
-            let server = tokio::spawn(async move {
-                for (attempt, names) in [["default", "a"], ["a", "default"]].iter().enumerate() {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    for (index, name) in names.iter().enumerate() {
-                        let mut raw = [0; HEADER_LEN];
-                        socket.read_exact(&mut raw).await.unwrap();
-                        let header = FrameHeader::decode(&raw).unwrap();
-                        let mut body = vec![0; header.length as usize];
-                        socket.read_exact(&mut body).await.unwrap();
-                        let (context, _) =
-                            talon_transport::envelope::decode(&header, &body).unwrap();
-                        assert_eq!(
-                            context.namespace.unwrap_or_default().effective_name(),
-                            *name
-                        );
-                        // Fail only the named request on a previously successful socket.
-                        if attempt == 0 && index == 1 {
-                            break;
-                        }
-                        let reply = if metadata {
-                            talon_transport::encode(
-                                header.request_id,
-                                &ControlMessage::ObjectStat {
-                                    size: 1,
-                                    version: name.to_string(),
-                                },
-                            )
-                            .unwrap()
-                        } else {
-                            let mut reply =
-                                talon_transport::response_header_ok(header.request_id, 1).to_vec();
-                            reply.push(name.as_bytes()[0]);
-                            reply
-                        };
-                        socket.write_all(&reply).await.unwrap();
-                    }
-                }
-            });
-            let coordinator = CoordinatorClient::new(address.clone());
-            let worker = crate::WorkerClient::new(address);
-            let object = block().object;
-            let version = Version::new("v1");
-            for name in ["default", "a", "default"] {
-                let namespace = NamespaceContext::new(name).unwrap();
-                if metadata {
-                    assert_eq!(
-                        coordinator
-                            .stat_object_with_context(&object, namespace)
-                            .await
-                            .unwrap()
-                            .version,
-                        name
-                    );
-                } else {
-                    let mut dst = [0];
-                    assert_eq!(
-                        worker
-                            .fetch_versioned_range_into_with_context(
-                                &object, &version, 0, &mut dst, 1, namespace
-                            )
-                            .await
-                            .unwrap(),
-                        1
-                    );
-                    assert_eq!(dst[0], name.as_bytes()[0]);
-                }
-            }
-            server.await.unwrap();
         }
     }
 

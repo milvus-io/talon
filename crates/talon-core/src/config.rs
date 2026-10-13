@@ -278,7 +278,6 @@ pub struct WorkerConfig {
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct NamespaceCacheConfig {
-    pub block_size: Option<u32>,
     pub l2_page_size_bytes: Option<u64>,
     pub l1_page_size_bytes: Option<u64>,
     pub page_tti_hours: Option<u64>,
@@ -296,9 +295,6 @@ impl WorkerConfig {
         let mut result = self.clone();
         result.namespaces.clear();
         if let Some(overrides) = self.namespaces.get(namespace.effective_name()) {
-            if let Some(value) = overrides.block_size {
-                result.block_size = value;
-            }
             if let Some(value) = overrides.l2_page_size_bytes {
                 result.l2_page_size_bytes = value;
             }
@@ -1741,8 +1737,6 @@ fn normalize_worker_advertise_addr(advertise_addr: String, listen: &str) -> Stri
 /// coordinator it asks for placement, and its client-side caching / readahead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuseConfig {
-    /// Cache namespace selected by all requests from this mount.
-    pub namespace_id: String,
     /// Directory to mount the Talon filesystem at.
     pub mountpoint: PathBuf,
     /// Address of the coordinator to resolve placement + membership against.
@@ -1768,7 +1762,6 @@ pub struct FuseConfig {
 impl Default for FuseConfig {
     fn default() -> Self {
         Self {
-            namespace_id: crate::DEFAULT_NAMESPACE.into(),
             mountpoint: PathBuf::from("/mnt/talon"),
             coordinator: "127.0.0.1:7000".into(),
             namespace_prefix: String::new(),
@@ -1786,8 +1779,6 @@ impl Default for FuseConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuseConfigPatch {
-    /// Override for [`FuseConfig::namespace_id`].
-    pub namespace_id: Option<String>,
     /// Override for [`FuseConfig::mountpoint`].
     pub mountpoint: Option<PathBuf>,
     /// Override for [`FuseConfig::coordinator`].
@@ -1805,7 +1796,6 @@ pub struct FuseConfigPatch {
 impl Patch for FuseConfigPatch {
     fn merge(self, base: Self) -> Self {
         Self {
-            namespace_id: self.namespace_id.or(base.namespace_id),
             mountpoint: self.mountpoint.or(base.mountpoint),
             coordinator: self.coordinator.or(base.coordinator),
             namespace_prefix: self.namespace_prefix.or(base.namespace_prefix),
@@ -1819,14 +1809,6 @@ impl Patch for FuseConfigPatch {
 /// Single source of truth for the FUSE client's `TALON_FUSE_*` environment
 /// variables, shared by the parser and the documentation generator.
 pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
-    ConfigVar {
-        env: "TALON_FUSE_NAMESPACE_ID",
-        key: "namespace_id",
-        default: Some("default"),
-        cli: false,
-        secret: false,
-        help: "Cache namespace for all requests from this mount.",
-    },
     ConfigVar {
         env: "TALON_FUSE_MOUNTPOINT",
         key: "mountpoint",
@@ -1878,7 +1860,6 @@ pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
 ];
 
 pub(crate) mod fuse_env {
-    pub const NAMESPACE_ID: &str = "TALON_FUSE_NAMESPACE_ID";
     pub const MOUNTPOINT: &str = "TALON_FUSE_MOUNTPOINT";
     pub const COORDINATOR: &str = "TALON_FUSE_COORDINATOR";
     pub const NAMESPACE_PREFIX: &str = "TALON_FUSE_NAMESPACE_PREFIX";
@@ -1904,7 +1885,7 @@ impl FuseConfigPatch {
 
     /// Assemble a patch from `TALON_FUSE_*` environment variables.
     ///
-    /// Recognized keys: `TALON_FUSE_NAMESPACE_ID`, `TALON_FUSE_MOUNTPOINT`, `TALON_FUSE_COORDINATOR`,
+    /// Recognized keys: `TALON_FUSE_MOUNTPOINT`, `TALON_FUSE_COORDINATOR`,
     /// `TALON_FUSE_NAMESPACE_PREFIX`, `TALON_FUSE_BLOCK_SIZE`,
     /// `TALON_FUSE_PLACEMENT_TTL_MS`, `TALON_FUSE_READAHEAD_BLOCKS`.
     pub fn from_env() -> Result<Self> {
@@ -1922,7 +1903,6 @@ impl FuseConfigPatch {
                 .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
         };
         Ok(Self {
-            namespace_id: get(fuse_env::NAMESPACE_ID),
             mountpoint: get(fuse_env::MOUNTPOINT).map(PathBuf::from),
             coordinator: get(fuse_env::COORDINATOR),
             namespace_prefix: get(fuse_env::NAMESPACE_PREFIX),
@@ -1949,7 +1929,6 @@ impl FuseConfig {
         let merged = cli.merge(env).merge(file);
         let d = FuseConfig::default();
         let cfg = FuseConfig {
-            namespace_id: merged.namespace_id.unwrap_or(d.namespace_id),
             mountpoint: merged.mountpoint.unwrap_or(d.mountpoint),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
             namespace_prefix: merged.namespace_prefix.unwrap_or(d.namespace_prefix),
@@ -1963,8 +1942,6 @@ impl FuseConfig {
 
     /// Fail fast on invalid configuration with an actionable message.
     pub fn validate(&self) -> Result<()> {
-        crate::NamespaceContext::new(&self.namespace_id)
-            .map_err(|error| Error::Other(format!("invalid namespace_id: {error}")))?;
         if self.mountpoint.as_os_str().is_empty() {
             return Err(Error::Other("mountpoint must not be empty".into()));
         }
@@ -2894,38 +2871,6 @@ mod tests {
     }
 
     #[test]
-    fn fuse_cache_namespace_file_env_defaults_and_validation() {
-        let file = FuseConfigPatch::from_toml(
-            "namespace_prefix = 's3/bucket'\nnamespace_id = 'analytics'",
-        )
-        .unwrap();
-        let cfg =
-            FuseConfig::resolve(file.clone(), Default::default(), Default::default()).unwrap();
-        assert_eq!(cfg.namespace_id, "analytics");
-        let env = FuseConfigPatch::from_env_with(|key| {
-            (key == "TALON_FUSE_NAMESPACE_ID").then(|| "online".into())
-        })
-        .unwrap();
-        let cfg = FuseConfig::resolve(file.clone(), env, Default::default()).unwrap();
-        assert_eq!(cfg.namespace_id, "online");
-        let default_file = FuseConfigPatch::from_toml("namespace_prefix = 's3/bucket'").unwrap();
-        assert_eq!(
-            FuseConfig::resolve(default_file, Default::default(), Default::default())
-                .unwrap()
-                .namespace_id,
-            "default"
-        );
-        for name in ["", "../escape", "worker_identity"] {
-            let env = FuseConfigPatch {
-                namespace_id: Some(name.into()),
-                ..Default::default()
-            };
-            let error = FuseConfig::resolve(file.clone(), env, Default::default()).unwrap_err();
-            assert!(error.to_string().contains("invalid namespace_id"));
-        }
-    }
-
-    #[test]
     fn fuse_namespace_prefix_is_required() {
         let err = FuseConfig::resolve(Default::default(), Default::default(), Default::default())
             .unwrap_err();
@@ -3083,17 +3028,28 @@ mod namespace_tests {
     }
 
     #[test]
+    fn namespaces_cannot_override_block_size() {
+        for name in ["default", "analytics"] {
+            let error = WorkerConfigPatch::from_toml(&format!(
+                "[namespaces.{name}]\nblock_size = 67108864\n"
+            ))
+            .unwrap_err();
+            assert!(error.to_string().contains("block_size"), "{error}");
+        }
+    }
+
+    #[test]
     fn namespace_overrides_inherit_and_validate_complete_geometry() {
         let cfg = WorkerConfig::default();
         let mut cfg = cfg;
         let patch = WorkerConfigPatch::from_toml(
             r#"
 [namespaces.acme]
-block_size = 33554432
 l2_page_size_bytes = 1048576
 page_tti_hours = 2
 [namespaces.default]
-block_size = 67108864
+l2_page_size_bytes = 2097152
+page_tti_hours = 4
 "#,
         )
         .unwrap();
@@ -3102,7 +3058,7 @@ block_size = 67108864
         let acme = cfg
             .for_namespace(&crate::NamespaceId::named("acme"))
             .unwrap();
-        assert_eq!(acme.block_size, 33554432);
+        assert_eq!(acme.block_size, cfg.block_size);
         assert_eq!(acme.l2_page_size_bytes, 1048576);
         assert_eq!(acme.page_tti_hours, 2);
         assert_eq!(acme.capacity_bytes, cfg.capacity_bytes);
@@ -3110,7 +3066,7 @@ block_size = 67108864
             cfg.for_namespace(&crate::NamespaceId::Unattributed)
                 .unwrap()
                 .block_size,
-            67108864
+            cfg.block_size
         );
         assert_eq!(
             cfg.for_namespace(&crate::NamespaceId::named("unknown"))

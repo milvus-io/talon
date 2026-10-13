@@ -81,7 +81,6 @@ impl Args {
     /// Assemble the highest-precedence (CLI) config patch from parsed flags.
     fn to_patch(&self) -> FuseConfigPatch {
         FuseConfigPatch {
-            namespace_id: None,
             mountpoint: self.mountpoint.clone(),
             coordinator: self.coordinator.clone(),
             namespace_prefix: self.namespace_prefix.clone(),
@@ -123,7 +122,6 @@ async fn run() -> anyhow::Result<()> {
     let cfg = FuseConfig::resolve(file, env, args.to_patch())?;
 
     tracing::info!(
-        namespace_id = %cfg.namespace_id,
         mountpoint = %cfg.mountpoint.display(),
         coordinator = %cfg.coordinator,
         namespace_prefix = %cfg.namespace_prefix,
@@ -134,8 +132,7 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // Read-path components, shared by the metadata and data callbacks.
-    let namespace = talon_core::NamespaceId::named(&cfg.namespace_id);
-    let coordinator = CoordinatorClient::new(cfg.coordinator.clone()).request(&namespace)?;
+    let coordinator = CoordinatorClient::new(cfg.coordinator.clone());
     let cache = Arc::new(PlacementCache::new(cfg.placement_ttl_ms));
     // Zone affinity (ADR 0006): env-only for the mount — the FUSE client
     // typically runs outside Kubernetes, so there is no node-label lookup.
@@ -154,13 +151,11 @@ async fn run() -> anyhow::Result<()> {
             "zone affinity configuration"
         );
     }
-    let reader = BlockReader::new(coordinator.clone(), cache, 1)
-        .request(&namespace)?
-        .with_zone_affinity(
-            zone,
-            zone_affinity,
-            Arc::new(LoggingZoneObserver::default()),
-        );
+    let reader = BlockReader::new(coordinator.clone(), cache, 1).with_zone_affinity(
+        zone,
+        zone_affinity,
+        Arc::new(LoggingZoneObserver::default()),
+    );
 
     // Populate the namespace before mounting. A listing failure is fatal: an
     // apparently healthy mount with an empty tree hides backend/configuration

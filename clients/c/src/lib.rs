@@ -450,7 +450,12 @@ pub unsafe extern "C" fn talon_read_async_with_options(
         };
         use tracing::instrument::WithSubscriber;
         let task = async move {
-            let options = trace_context.borrowed();
+            let options = talon_rust_client::RequestOptions {
+                parent: trace_context
+                    .as_ref()
+                    .map(talon_rust_client::TraceParent::Explicit)
+                    .unwrap_or(talon_rust_client::TraceParent::Root),
+            };
             let result = async {
                 if read_buffer.len == 0 {
                     return Ok(0);
@@ -534,7 +539,12 @@ pub unsafe extern "C" fn talon_stat_async_with_options(
         let dispatcher = Arc::clone(&inner.dispatcher);
         use tracing::instrument::WithSubscriber;
         let task = async move {
-            let options = trace_context.borrowed();
+            let options = talon_rust_client::RequestOptions {
+                parent: trace_context
+                    .as_ref()
+                    .map(talon_rust_client::TraceParent::Explicit)
+                    .unwrap_or(talon_rust_client::TraceParent::Root),
+            };
             let result = client.stat_with_options(&object, &options).await;
             dispatch_result(
                 dispatcher,
@@ -960,8 +970,6 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let batches = Arc::new(Mutex::new(Vec::new()));
         let observed = batches.clone();
-        let namespaces = Arc::new(Mutex::new(Vec::new()));
-        let observed_namespaces = namespaces.clone();
         let stats = Arc::new(AtomicUsize::new(0));
         let coordinator =
             mock_coordinator_counting(listener.local_addr().unwrap().to_string(), stats.clone())
@@ -970,7 +978,6 @@ mod tests {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let observed = observed.clone();
-                let observed_namespaces = observed_namespaces.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut header = [0; HEADER_LEN];
@@ -981,11 +988,7 @@ mod tests {
                         let mut frame = header.to_vec();
                         frame.resize(HEADER_LEN + parsed.length as usize, 0);
                         socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
-                        let (metadata, _) =
-                            talon_transport::envelope::decode(&parsed, &frame[HEADER_LEN..])
-                                .unwrap();
-                        let namespace = metadata.namespace.unwrap_or_default();
-                        let (_, message) = talon_transport::codec::decode_request(&frame).unwrap();
+                        let (_, message) = talon_transport::decode(&frame).unwrap();
                         let batch = matches!(message, ControlMessage::BatchLoad { .. });
                         let requests = match message {
                             ControlMessage::LoadBlock { block, len } => {
@@ -999,17 +1002,6 @@ mod tests {
                             other => panic!("unexpected request {other:?}"),
                         };
                         assert!(requests.iter().all(|r| r.block.version.as_str() == "v1"));
-                        let expected_size = match namespace.effective_name() {
-                            "a" => 4,
-                            "b" => 16,
-                            "default" => 8,
-                            other => panic!("unexpected namespace {other}"),
-                        };
-                        assert!(requests.iter().all(|r| r.block.block_size == expected_size));
-                        observed_namespaces
-                            .lock()
-                            .unwrap()
-                            .push(namespace.effective_name().to_owned());
                         let reply = if batch {
                             ControlMessage::BatchLoadResult {
                                 failures: requests
@@ -1102,59 +1094,6 @@ mod tests {
         sizes.sort_unstable();
         assert_eq!(sizes, [0, 0, 1, 1024]);
         assert_eq!(stats.load(Ordering::SeqCst), 0);
-        // Concurrent submissions on one C handle copy their own namespace/options.
-        let a = CallbackState::new();
-        let b = CallbackState::new();
-        namespaces.lock().unwrap().clear();
-        for (name, block_size, callback) in [("a", 4, &a), ("b", 16, &b)] {
-            let name = cstring(name);
-            let mut options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
-            unsafe {
-                assert_eq!(
-                    talon_request_options_init(
-                        options.as_mut_ptr(),
-                        std::mem::size_of::<TalonRequestOptions>()
-                    ),
-                    STATUS_OK
-                );
-                let mut options = options.assume_init();
-                options.namespace_id = name.as_ptr();
-                options.block_size = block_size;
-                assert_eq!(
-                    talon_load_async_with_options(
-                        client,
-                        cstring("s3://bucket/file").as_ptr(),
-                        cstring("v1").as_ptr(),
-                        9,
-                        &options,
-                        Some(capture_callback),
-                        callback.user_data(),
-                        &mut id,
-                    ),
-                    STATUS_OK
-                );
-            }
-        }
-        assert_eq!(a.wait().loads, [(9, 3)]);
-        assert_eq!(b.wait().loads, [(9, 1)]);
-        assert_eq!(
-            unsafe {
-                talon_load_async(
-                    client,
-                    cstring("s3://bucket/file").as_ptr(),
-                    cstring("v1").as_ptr(),
-                    9,
-                    Some(capture_callback),
-                    state.user_data(),
-                    &mut id,
-                )
-            },
-            STATUS_OK
-        );
-        assert_eq!(state.wait().loads, [(9, 2)]);
-        let mut names = namespaces.lock().unwrap().clone();
-        names.sort();
-        assert_eq!(names, ["a", "a", "a", "b", "default", "default"]);
         assert_eq!(
             unsafe {
                 talon_batch_load_async(

@@ -32,7 +32,6 @@ use tracing_subscriber::EnvFilter;
 type MainResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 struct Settings {
-    namespace: talon_core::NamespaceId,
     protocol: String,
     bind: SocketAddr,
     mode: GatewayMode,
@@ -253,12 +252,7 @@ impl Settings {
             )),
         };
 
-        let namespace = talon_core::NamespaceId::named(
-            value(&mut get, "TALON_GATEWAY_NAMESPACE_ID").unwrap_or_else(|| "default".into()),
-        );
-        namespace.validate()?;
         let settings = Self {
-            namespace,
             protocol,
             bind,
             mode,
@@ -407,8 +401,6 @@ fn cache_reader(
             Arc::new(PlacementCache::new(settings.placement_ttl_ms)),
             settings.replicas,
         )
-        .request(&settings.namespace)
-        .expect("validated gateway namespace")
         .with_zone_affinity(
             zone,
             settings.zone_affinity,

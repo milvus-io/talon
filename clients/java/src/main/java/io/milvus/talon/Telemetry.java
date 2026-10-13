@@ -25,15 +25,9 @@ public final class Telemetry {
     private static final class CallContext {
         final TraceContext parent;
         final byte[] readId;
-        final String namespace;
-        final Integer blockSize;
-        CallContext(TraceContext parent, RequestOptions options, CallContext previous) {
-            namespace = options.namespace;
-            blockSize = options.blockSize;
+        CallContext(TraceContext parent) {
             this.parent = parent;
-            if (options.inherit && previous != null) {
-                readId = previous.readId;
-            } else if (parent != null && (Character.digit(parent.traceparent.charAt(54), 16) & 1) != 0) {
+            if (parent != null && (Character.digit(parent.traceparent.charAt(54), 16) & 1) != 0) {
                 UUID id = UUID.randomUUID();
                 readId = ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
             } else {
@@ -44,24 +38,16 @@ public final class Telemetry {
     interface IOCall<T> { T run() throws IOException; }
 
     static <T> T call(RequestOptions options, IOCall<T> call) throws IOException {
+        if (v2Endpoints.isEmpty()) return call.run();
         CallContext previous = CURRENT.get();
+        if (options.inherit && previous != null) return call.run();
         TraceContext parent = options.parent;
         if (options.inherit) {
-            try { parent = previous != null ? previous.parent : contextSupplier.get(); } catch (RuntimeException ignored) { parent = null; }
+            try { parent = contextSupplier.get(); } catch (RuntimeException ignored) { parent = null; }
         }
-        CURRENT.set(new CallContext(parent, options, previous));
+        CURRENT.set(new CallContext(parent));
         try { return call.run(); }
         finally { if (previous == null) CURRENT.remove(); else CURRENT.set(previous); }
-    }
-
-    static String namespace() {
-        CallContext current = CURRENT.get();
-        return current == null ? "default" : current.namespace;
-    }
-
-    static int blockSize(int fallback) {
-        CallContext current = CURRENT.get();
-        return current == null || current.blockSize == null ? fallback : current.blockSize;
     }
 
     static boolean canSend(String endpoint) {
@@ -87,27 +73,6 @@ public final class Telemetry {
         ByteBuffer.wrap(result).putInt(12, result.length - Frame.HEADER_LEN).putShort(16, (short) values.length);
         System.arraycopy(values, 0, result, 18, values.length);
         System.arraycopy(frame, 16, result, 18 + values.length, frame.length - 16);
-        return result;
-    }
-
-    static byte[] namespaceEnvelope(byte[] request, String endpoint, String namespace) {
-        byte[] frame = envelope(request, endpoint);
-        if (namespace.equals("default")) return frame;
-        byte[] name = namespace.getBytes(StandardCharsets.US_ASCII);
-        int oldMetadata = frame[2] == 2 ? Short.toUnsignedInt(ByteBuffer.wrap(frame).getShort(16)) : 0;
-        int oldBusiness = frame[2] == 2 ? 18 + oldMetadata : 16;
-        int newMetadata = oldMetadata + 3 + name.length;
-        if (newMetadata > 1024) throw new ProtocolException("namespace metadata too large");
-        byte[] result = new byte[18 + newMetadata + frame.length - oldBusiness];
-        System.arraycopy(frame, 0, result, 0, 16);
-        if (oldMetadata > 0) System.arraycopy(frame, 18, result, 18, oldMetadata);
-        int position = 18 + oldMetadata;
-        result[position] = 5;
-        ByteBuffer.wrap(result).putShort(position + 1, (short) name.length);
-        System.arraycopy(name, 0, result, position + 3, name.length);
-        System.arraycopy(frame, oldBusiness, result, 18 + newMetadata, frame.length - oldBusiness);
-        result[2] = 3;
-        ByteBuffer.wrap(result).putInt(12, result.length - 16).putShort(16, (short) newMetadata);
         return result;
     }
 

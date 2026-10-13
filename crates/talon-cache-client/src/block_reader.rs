@@ -17,7 +17,7 @@ use crate::membership_fixture;
 
 use std::sync::Arc;
 
-use talon_core::{BlockId, NamespaceContext, ObjectId, Version};
+use talon_core::{BlockId, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::membership_cache::{MembershipCache, MembershipSnapshot};
@@ -103,7 +103,6 @@ pub struct FileView<'a> {
 /// Orchestrates local block placement and worker reads with caching.
 #[derive(Clone)]
 pub struct BlockReader {
-    pub(crate) namespace: talon_core::NamespaceId,
     coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
     /// Maximum number of ranked logical workers attempted per block read.
@@ -142,7 +141,6 @@ impl BlockReader {
             cache.clone(),
         ));
         Self {
-            namespace: talon_core::NamespaceId::default(),
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
@@ -154,24 +152,6 @@ impl BlockReader {
             zone: None,
             zone_observer: Arc::new(crate::metrics::NoopZoneReadObserver),
         }
-    }
-
-    /// Namespace selected for all operations through this reader.
-    pub fn namespace(&self) -> &talon_core::NamespaceId {
-        &self.namespace
-    }
-
-    /// Create a per-request handle for reads, admissions and prewarm. Placement keys
-    /// and membership may be shared because they are independent of tenancy.
-    pub fn request(
-        &self,
-        namespace: &talon_core::NamespaceId,
-    ) -> Result<Self, talon_core::NamespaceIdError> {
-        namespace.validate()?;
-        let mut request = self.clone();
-        request.namespace = namespace.normalized();
-        request.coordinator = self.coordinator.request(namespace)?;
-        Ok(request)
     }
 
     /// Record metrics into the provided counters, shared by reader clones.
@@ -259,9 +239,7 @@ impl BlockReader {
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
-                Ok(worker) => worker
-                    .request(&self.namespace)
-                    .expect("validated request namespace"),
+                Ok(worker) => worker,
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;
@@ -308,11 +286,7 @@ impl BlockReader {
             .membership_snapshot()
             .await
             .map_err(cache_block_error)?;
-        let worker = snapshot
-            .owner(block)
-            .map_err(cache_block_error)?
-            .request(&self.namespace)
-            .expect("validated request namespace");
+        let worker = snapshot.owner(block).map_err(cache_block_error)?;
         worker
             .admit_cached_block(block, object_len, body)
             .await
@@ -353,14 +327,8 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
     ) -> Result<usize, BlockReadError> {
-        self.read_block_into_with_mode(
-            block,
-            offset_in_block,
-            dst,
-            OriginReadMode::Current,
-            self.namespace.context().expect("validated namespace"),
-        )
-        .await
+        self.read_block_into_with_mode(block, offset_in_block, dst, OriginReadMode::Current)
+            .await
     }
 
     /// Read into `dst` from the exact source version carried by `block`.
@@ -375,31 +343,11 @@ impl BlockReader {
         dst: &mut [u8],
         object_len: u64,
     ) -> Result<usize, BlockReadError> {
-        self.read_versioned_block_into_with_context(
-            block,
-            offset_in_block,
-            dst,
-            object_len,
-            self.namespace.context().expect("validated namespace"),
-        )
-        .await
-    }
-
-    /// Read an exact-version block using a borrowed request context.
-    pub async fn read_versioned_block_into_with_context(
-        &self,
-        block: &BlockId,
-        offset_in_block: u32,
-        dst: &mut [u8],
-        object_len: u64,
-        namespace: NamespaceContext<'_>,
-    ) -> Result<usize, BlockReadError> {
         self.read_block_into_with_mode(
             block,
             offset_in_block,
             dst,
             OriginReadMode::ExactVersion(object_len),
-            namespace,
         )
         .await
     }
@@ -410,7 +358,6 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
         mode: OriginReadMode,
-        namespace: NamespaceContext<'_>,
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
@@ -430,21 +377,16 @@ impl BlockReader {
             self.stats.record_worker_fetch();
             let result = match mode {
                 OriginReadMode::Current => {
-                    worker
-                        .request(&self.namespace)
-                        .expect("validated namespace")
-                        .fetch_range_into(&block.object, offset, dst)
-                        .await
+                    worker.fetch_range_into(&block.object, offset, dst).await
                 }
                 OriginReadMode::ExactVersion(object_len) => {
                     worker
-                        .fetch_versioned_range_into_with_context(
+                        .fetch_versioned_range_into(
                             &block.object,
                             &block.version,
                             offset,
                             dst,
                             object_len,
-                            namespace,
                         )
                         .await
                 }
@@ -504,9 +446,7 @@ impl BlockReader {
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
-                Ok(worker) => worker
-                    .request(&self.namespace)
-                    .expect("validated request namespace"),
+                Ok(worker) => worker,
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;

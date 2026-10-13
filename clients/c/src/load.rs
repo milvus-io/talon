@@ -171,16 +171,28 @@ unsafe fn submit(
         let dispatcher = Arc::clone(&inner.dispatcher);
         let user_data = UserData(user_data);
         let task = async move {
-            let options = parent.borrowed();
-            let result = if batch {
-                client.batch_load_with_options(&requests, &options).await
-            } else {
-                let request = &requests[0];
-                client
-                    .load_with_options(&request.object, &request.version, request.size, &options)
-                    .await
-                    .map(|result| vec![result])
-            };
+            let operation = talon_telemetry::Operation::new(
+                "talon.c.load",
+                "internal",
+                parent
+                    .as_ref()
+                    .map(talon_telemetry::TraceParent::Explicit)
+                    .unwrap_or(talon_telemetry::TraceParent::Root),
+            );
+            let result = operation
+                .scope(async {
+                    if batch {
+                        client.batch_load(&requests).await
+                    } else {
+                        let request = &requests[0];
+                        client
+                            .load(&request.object, &request.version, request.size)
+                            .await
+                            .map(|result| vec![result])
+                    }
+                })
+                .await;
+            operation.outcome(if result.is_ok() { "success" } else { "error" });
             let kind = if batch {
                 OPERATION_BATCH_LOAD
             } else {

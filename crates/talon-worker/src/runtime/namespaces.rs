@@ -760,6 +760,110 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unscoped_v1_and_v2_operations_select_default_namespace() {
+        use talon_transport::{codec, data, envelope, ControlMessage, FrameHeader, HEADER_LEN};
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(dir.path(), &config(), Arc::default());
+        let default = root.for_namespace(&NamespaceId::default()).await.unwrap();
+        // An earlier named request must not make omission inherit that namespace.
+        root.for_namespace(&NamespaceId::named("previous"))
+            .await
+            .unwrap();
+        let mut frames = vec![
+            data::encode_request(1, &request()).unwrap(),
+            data::encode_cached_request(
+                2,
+                &CachedRangeRequest {
+                    object: request().object,
+                    version: Version::new("v1"),
+                    offset: 0,
+                    len: 4,
+                },
+            )
+            .unwrap(),
+            data::encode_versioned_request(
+                3,
+                &data::VersionedRangeRequest {
+                    request: request(),
+                    version: Version::new("v1"),
+                    object_len: 64,
+                },
+            )
+            .unwrap(),
+            data::encode_put_header(
+                4,
+                &data::PutRequest {
+                    object: request().object,
+                    body_len: 16,
+                },
+            )
+            .unwrap(),
+            data::encode_delete(
+                5,
+                &data::DeleteRequest {
+                    object: request().object,
+                },
+            )
+            .unwrap(),
+            data::encode_cached_block_put_header(
+                6,
+                &CachedBlockPutRequest {
+                    block: block(16),
+                    object_len: 64,
+                    body_len: 16,
+                },
+            )
+            .unwrap(),
+        ];
+        for message in [
+            ControlMessage::StatObject {
+                object: request().object,
+            },
+            ControlMessage::ListObjects {
+                prefix: "s3/bucket".into(),
+            },
+            ControlMessage::LoadBlock {
+                block: block(16),
+                len: 16,
+            },
+            ControlMessage::BatchLoad {
+                blocks: vec![talon_transport::LoadBlockRequest {
+                    block: block(16),
+                    len: 16,
+                }],
+            },
+        ] {
+            frames.push(codec::encode(7, &message).unwrap());
+        }
+        let trace = talon_telemetry::TraceContext::from_w3c(
+            "00-11111111111111111111111111111111-2222222222222222-01",
+            None,
+        )
+        .unwrap();
+        for frame in frames {
+            let kind = FrameHeader::decode(&frame).unwrap().msg_type;
+            for version in [1, 2] {
+                if version == 2 && !envelope::supports_v2(kind) {
+                    continue;
+                }
+                let mut wire = frame.clone();
+                if version == 2 {
+                    envelope::encode(&mut wire, Some(&trace), Some([1; 16])).unwrap();
+                }
+                let header = FrameHeader::decode(&wire).unwrap();
+                let resolved = root
+                    .for_request(&header, &wire[HEADER_LEN..])
+                    .await
+                    .unwrap();
+                assert!(Arc::ptr_eq(&resolved, &default), "{kind:?} v{version}");
+                assert!(resolved.store.root().ends_with("default/shared"));
+            }
+        }
+        assert_eq!(root.namespace_runtimes().len(), 2);
+        assert!(!dir.path().join("unattributed").exists());
+    }
+
+    #[tokio::test]
     async fn unspecified_and_explicit_default_share_one_namespace() {
         let dir = tempfile::tempdir().unwrap();
         let root = open(dir.path(), &config(), Arc::default());
@@ -795,7 +899,6 @@ mod tests {
         config.namespaces.insert(
             "long".into(),
             NamespaceCacheConfig {
-                block_size: Some(32),
                 l2_page_size_bytes: Some(8),
                 page_tti_hours: Some(2),
                 ..Default::default()
@@ -817,7 +920,7 @@ mod tests {
         assert_eq!(inherited.block_size, 16);
         assert_eq!(inherited.paged_page_size(), Some(4));
         assert_eq!(inherited.page_gc_config.tti_ms, 0);
-        assert_eq!(long.block_size, 32);
+        assert_eq!(long.block_size, 16);
         assert_eq!(long.paged_page_size(), Some(8));
         for worker in [&short, &long] {
             worker.page_clock.set(10_000);
@@ -832,8 +935,8 @@ mod tests {
         assert_eq!(long.gc_once().await.bytes, 0);
         assert_eq!(short.block_count(), 0);
         assert_eq!(long.resident_bytes(), 8);
-        assert!(long.load_block(&block(16), 16).await.is_err());
-        long.load_block(&block(32), 32).await.unwrap();
+        assert!(long.load_block(&block(32), 32).await.is_err());
+        long.load_block(&block(16), 16).await.unwrap();
     }
 
     #[tokio::test]
@@ -1001,8 +1104,7 @@ mod tests {
             exchange(&mut stream, cached(), Some("a"), &[]).await.1,
             [42; 4]
         );
-        // The SDK carries the borrowed namespace only in v3 metadata; the read body
-        // uses the ordinary versioned request rather than owning another namespace string.
+        // V3 metadata selects the namespace without changing the versioned read body.
         let versioned = data::encode_versioned_request(
             8,
             &data::VersionedRangeRequest {

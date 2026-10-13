@@ -28,7 +28,6 @@ l1_page_size_bytes = 65536
 page_tti_hours = 24
 
 [namespaces.analytics]
-block_size = 67108864
 l2_page_size_bytes = 262144
 l1_page_size_bytes = 32768
 page_tti_hours = 6
@@ -41,14 +40,12 @@ page_tti_hours = 48
 ```
 
 All namespace fields are optional and inherit the resolved global value, including
-CLI/environment overrides. These seven fields are the supported namespace overrides;
+CLI/environment overrides. These six fields are the supported namespace overrides;
 unknown fields and invalid combinations fail configuration validation. A
 `[namespaces.default]` entry applies only to the default namespace: `analytics` and
 unconfigured namespaces inherit the global settings, not that entry. Namespace tables
-are file-only and apply on worker restart. All workers serving a namespace must use
-the same block geometry. Configure SDK block sizes to match the namespace's block
-size, including for LOAD and cache admission; configuration is not automatically
-discovered by clients.
+are file-only and apply on worker restart. All namespaces use the same fixed logical
+block size; it cannot be overridden by a namespace or a request. L1 and L2 page sizes remain namespace settings.
 
 TTI and page GC apply to paged L2 storage. A zero TTI disables idle expiration;
 a zero L2 page size selects whole-block storage. Checkpoint and GC intervals
@@ -98,111 +95,37 @@ worker metadata and are rejected by request and configuration validation.
 Names are case-sensitive. Namespace directories and
 `shared` directories must be real directories, not symlinks.
 
-## Selecting a namespace per request
+## Client compatibility
 
-A reusable client owns connection pools and discovery, not a namespace. Every
-operation selects its own namespace, and omission always selects `default`.
-Concurrent operations on one client can use different namespaces and block sizes;
-request options do not mutate that client's defaults. One BatchLoad invocation
-has one namespace; submit separate concurrent batches to target different namespaces.
+The C, Rust, Python and Java SDK APIs remain unchanged. Requests from these
+clients carry no cache namespace, so the worker selects `default` for reads,
+metadata, cache admission, PUT, DELETE, LOAD and BatchLoad. Gateway and FUSE
+also continue using their existing unscoped requests. Applications do not need
+a new request option or a rebuilt C options structure to use the default cache.
 
-The Rust SDK validates the namespace once and borrows its name through metadata,
-read and prewarm calls. Request contexts contain only that borrowed identity and
-the resolved block size; selecting a namespace does not clone the client, reader,
-coordinator or their shared resources. The cache-client `*_with_context` methods
-accept the same validated `NamespaceContext`, including across retries.
-
-Rust uses `RequestOptions` on `read_with_options`, `read_into_with_options`,
-`stat_with_options`, `list_with_options`, `load_with_options` and
-`batch_load_with_options`:
-
-```rust
-let options = talon_rust_client::RequestOptions {
-    namespace: Some("analytics"),
-    block_size: Some(67108864),
-    ..Default::default()
-};
-let bytes = client.read_with_options(&object, 0, Some(4096), None, &options).await?;
-// The same client's ordinary read(...) uses the default namespace.
-```
-
-Python accepts keyword arguments on operations, not the constructor:
-
-```python
-client = Client("coordinator:7000")
-a = client.read("s3://bucket/key", length=4096, namespace="analytics", block_size=67108864)
-b = client.read("s3://bucket/key", length=4096, namespace="other")
-c = client.read("s3://bucket/key", length=4096)  # default
-client.load("s3://bucket/key", version="etag", size=4096,
-            namespace="analytics", block_size=67108864)
-```
-
-`read`, `load` and `batch_load` accept `namespace` and optional `block_size`;
-`stat` and `list` accept `namespace`. If `block_size` is omitted, the operation uses
-the client planning default. It must match the selected namespace's worker policy.
-
-Java operations accept immutable `RequestOptions`, including `list`:
-
-```java
-RequestOptions options = RequestOptions.INHERIT
-    .withNamespace("analytics").withBlockSize(67108864);
-byte[] bytes = client.read("s3://bucket/key", 0, 4096, options);
-```
-
-C keeps the original `talon_client_new` constructor. Pass `namespace_id` and
-`block_size` in the existing request options with the `*_async_with_options`
-entrypoints for reads, stat, LOAD and BatchLoad:
-
-```c
-talon_request_options options;
-talon_request_options_init(&options, sizeof(options));
-options.namespace_id = "analytics";
-options.block_size = 67108864;
-```
-
-Submission copies the namespace and trace strings before returning. NULL options
-or a NULL namespace_id select `default`. A zero request block size uses the client's
-default. The request options structure is extended directly; callers must
-rebuild against the current header and library.
-
-The Rust cache-client layer exposes `client.request(&namespace)?` handles on
-`BlockReader`, `WorkerClient`, `WriteClient` and `CoordinatorClient`. These
-immutable handles share the original client's pools and budgets, and support
-reads, metadata, admission, write/delete and prewarm without changing the
-original client. For example, `writer.request(&namespace)?.put_object(...)` scopes
-one write, and `writer.delete_object(...)` uses `default`.
-
-Gateway uses `TALON_GATEWAY_NAMESPACE_ID` as its service request namespace; FUSE uses
-`TALON_FUSE_NAMESPACE_ID` for the mount's requests, including write/delete. Unset
-service variables select `default`. Namespace IDs are declared routing identities,
-not authentication credentials. Gateway authentication does not dynamically map
-each principal to a namespace.
+The worker also accepts the existing namespace-scoped read messages and protocol
+v3 namespace metadata. Explicit names select independent caches; omitted names
+and the legacy `Unattributed` identity select the same `default` runtime.
+Namespace IDs are declared routing identities, not authentication credentials.
 
 ## Naming migration
 
-The cache scope formerly called tenant is now namespace. Update `[tenants.NAME]`
-to `[namespaces.NAME]`, Rust/Python request option `tenant` to `namespace`, Java
-`withTenant` to `withNamespace`, and C `talon_request_options.tenant` to
-`namespace_id` (because `namespace` is a C++ keyword). Gateway and FUSE service
-variables are now `TALON_GATEWAY_NAMESPACE_ID` and `TALON_FUSE_NAMESPACE_ID`.
-The FUSE configuration key is `namespace_id`; `TALON_FUSE_NAMESPACE_ID` overrides
-the file value, and omission selects `default`. These are source/configuration
-renames; the former names are not aliases. Update service environment variables
-explicitly so an omitted namespace does not select `default` unexpectedly.
+The cache scope formerly called tenant is now namespace. Rust core and transport
+types use `NamespaceId` and namespace-named messages. The existing low-level
+`WorkerClient::with_tenant` method is renamed to `with_namespace`; its wire
+encoding and client-scoped behavior are unchanged. The high-level SDKs do not
+add namespace selection APIs in this change.
 
-Protocol versions, message numbers, namespace encoding, `BlockId` hashing and
-cache directory layout are unchanged by this rename. Keep the same namespace
-name to reuse an existing isolated cache directory. The source-object policy
-configuration `namespace_policy_path` and its environment variables also remain
-unchanged; its Rust policy type is now `ObjectNamespacePolicy`.
+Protocol message numbers, legacy namespace encoding and `BlockId` hashing remain
+unchanged by the rename. The source-object authorization policy still uses
+`namespace_policy_path`; its Rust type is now `ObjectNamespacePolicy`.
 
 ## Upgrade and recovery
 
-Upgrade coordinators and workers before enabling named namespaces in new clients.
-Named requests use protocol v3 with required namespace metadata for every operation;
-older servers reject v3 rather than silently using the default namespace. New
-servers still accept v1/v2 unscoped requests and legacy namespace-scoped reads.
-Default clients continue using the existing v1/v2 encoding.
+Upgrade coordinators and workers to enable the isolated cache layout. Existing
+clients continue using v1/v2 requests and land in `default`. Protocol v3 requires
+namespace metadata and is rejected by older servers; the new worker also accepts
+legacy namespace-scoped reads.
 
 Use a new empty cache root when upgrading an existing flat cache layout. Startup
 rejects legacy nonempty cache subdirectories; it does not migrate, delete, or
