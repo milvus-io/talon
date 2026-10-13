@@ -1393,7 +1393,7 @@ fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellati
                                         .starts_with(crate::page_access_shard::TEMP_PREFIX)
                                 })
                         } else {
-                            directory_gate.try_read().is_err()
+                            worker.page_mutations.active_count() > 0 && budget.available_io() == 0
                         };
                         if waiting {
                             break;
@@ -1403,6 +1403,13 @@ fn maintenance_rate_waits_release_blocking_threads_and_survive_caller_cancellati
                 })
                 .await
                 .unwrap();
+                if !checkpoint {
+                    let guard =
+                        tokio::time::timeout(Duration::from_millis(250), directory_gate.read())
+                            .await
+                            .expect("cleanup must release directory stripes during pacing");
+                    drop(guard);
+                }
                 // The runtime and its only blocking thread remain usable during pacing.
                 tokio::time::timeout(
                     Duration::from_millis(250),

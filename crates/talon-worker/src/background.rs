@@ -323,7 +323,19 @@ impl BackgroundBudget {
     }
     /// Charge each resident page even when a stale block is removed as a directory.
     pub async fn delete_units(&self, units: u64) {
-        self.deletes.charge(units).await;
+        // Never reserve an entire large block ahead of every other task. Bound
+        // each reservation to about 10 ms (one item at very low rates), then
+        // rejoin the shared clock so small deletions can make progress.
+        if self.deletes.per_second == 0 {
+            return;
+        }
+        let quantum = (self.deletes.per_second / 100).max(1);
+        let mut remaining = units;
+        while remaining > 0 {
+            let batch = remaining.min(quantum);
+            self.deletes.charge(batch).await;
+            remaining -= batch;
+        }
     }
     /// Await before each bounded read/write chunk.
     pub async fn bytes(&self, bytes: usize) {
@@ -530,6 +542,23 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn large_delete_reservation_does_not_block_small_deletions() {
+        let budget = BackgroundBudget::new(&WorkerConfig {
+            background_delete_max_per_sec: 100,
+            ..Default::default()
+        });
+        let large_budget = budget.clone();
+        let large = tokio::spawn(async move { large_budget.delete_units(1000).await });
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        tokio::time::timeout(Duration::from_millis(200), budget.delete())
+            .await
+            .expect("small work must not wait for all large-block credits");
+        assert!(!large.is_finished());
+        large.abort();
+        let _ = large.await;
     }
 
     #[tokio::test]

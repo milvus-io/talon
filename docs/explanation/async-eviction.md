@@ -78,6 +78,11 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
   device-IOPS limit. Deleting a 1 GiB cache block does not charge 1 GiB to the disk
   byte budget.
 
+  Large blocks acquire deletion credits in short reservations so other tasks
+  can interleave small deletions. Orphan cleanup waits for credits outside the
+  directory stripe lock, then revalidates the directory before unlinking; rate
+  waits do not block foreground fills in unrelated blocks on that stripe.
+
 Limits apply to scheduled maintenance and its final checkpoint flush. Startup
 recovery and foreground request/capacity work are outside these shared budgets.
 Fair admission does not preempt a running invocation; a slow filesystem operation or

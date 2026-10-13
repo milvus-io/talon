@@ -46,16 +46,7 @@ impl CleanupCursor {
         tracing::warn!(path = %path.display(), %error, "page metadata cleanup failed; will rescan");
     }
 
-    async fn unlink(
-        &self,
-        path: &Path,
-        directory: bool,
-        report: &mut CleanupReport,
-        resources: Option<&crate::background::BackgroundBudget>,
-    ) -> bool {
-        if let Some(resources) = resources {
-            resources.delete().await;
-        }
+    async fn unlink(&self, path: &Path, directory: bool, report: &mut CleanupReport) -> bool {
         report.attempted += 1;
         #[cfg(test)]
         if self.fail_deletes {
@@ -84,21 +75,18 @@ impl CleanupCursor {
         }
     }
 
-    /// Returns true if finalization needs another deletion budget. Under the
-    /// exclusive directory gate, at most three entries prove whether only the
-    /// two known metadata files remain. Never recursively delete a directory.
-    async fn finish_directory(
-        &self,
-        dir: &DirectoryScan,
-        budget: usize,
-        report: &mut CleanupReport,
-        resources: Option<&crate::background::BackgroundBudget>,
-    ) -> io::Result<bool> {
-        let mut files = match fs::read_dir(&dir.path).await {
-            Ok(files) => files,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
-            Err(error) => return Err(error),
-        };
+    async fn validate_directory(path: &Path) -> io::Result<()> {
+        for path in [path.parent().unwrap(), path] {
+            if !fs::symlink_metadata(path).await?.is_dir() {
+                return Err(io::Error::other("cleanup path is not a directory"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn metadata_only(path: &Path) -> io::Result<Option<Vec<PathBuf>>> {
+        Self::validate_directory(path).await?;
+        let mut files = fs::read_dir(path).await?;
         let mut metadata = Vec::with_capacity(2);
         for _ in 0..3 {
             let Some(entry) = files.next_entry().await? else {
@@ -108,24 +96,56 @@ impl CleanupCursor {
             if !entry.file_type().await?.is_file()
                 || (name != "access.meta" && name != "block.meta")
             {
-                // Includes live pages, unknown files, symlinks and failed temps.
-                return Ok(false);
+                return Ok(None);
             }
             metadata.push(entry.path());
         }
-        // The two accepted names are unique, so this implies a complete listing.
+        Ok(Some(metadata))
+    }
+
+    /// Pay outside the stripe, then re-list under the lock: a fill may have
+    /// created live pages while we waited. Never recursively remove directories.
+    async fn finish_directory(
+        &self,
+        dir: &DirectoryScan,
+        lifecycle: &PageLifecycle,
+        budget: usize,
+        report: &mut CleanupReport,
+        resources: Option<&crate::background::BackgroundBudget>,
+    ) -> io::Result<bool> {
+        let gate = lifecycle.directory_gate(dir.digest);
+        let guard = gate.write().await;
+        let metadata = match Self::metadata_only(&dir.path).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let credits = (metadata.len() + 1).min(budget - report.attempted);
+        drop(guard);
+        if let Some(resources) = resources {
+            resources.delete_units(credits as u64).await;
+        }
+        let _guard = gate.write().await;
+        let metadata = match Self::metadata_only(&dir.path).await {
+            Ok(Some(metadata)) => metadata,
+            Ok(None) => return Ok(false),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e),
+        };
+        let stop = report.attempted + credits;
         for path in metadata {
-            if report.attempted == budget {
+            if report.attempted == stop {
                 return Ok(true);
             }
-            if !self.unlink(&path, false, report, resources).await {
+            if !self.unlink(&path, false, report).await {
                 return Ok(false);
             }
         }
-        if report.attempted == budget {
+        if report.attempted == stop {
             return Ok(true);
         }
-        self.unlink(&dir.path, true, report, resources).await;
+        self.unlink(&dir.path, true, report).await;
         Ok(false)
     }
 
@@ -177,7 +197,7 @@ impl CleanupCursor {
         while report.checked < scan_budget && report.attempted < delete_budget {
             if let Some(mut dir) = self.current.take() {
                 let gate = lifecycle.directory_gate(dir.digest);
-                let _exclusive = gate.write().await;
+                let mut exclusive = gate.write().await;
                 // Revalidate the path after acquiring the gate, including the
                 // shard parent. Metadata is not needed to establish gate identity.
                 let safe = async {
@@ -224,11 +244,30 @@ impl CleanupCursor {
                                             .to_str()
                                             .is_some_and(is_owned_temp) =>
                                 {
-                                    if !self
-                                        .unlink(&entry.path(), false, &mut report, resources)
-                                        .await
-                                    {
+                                    drop(exclusive);
+                                    if let Some(resources) = resources {
+                                        resources.delete().await;
+                                    }
+                                    exclusive = gate.write().await;
+                                    // Revalidate after waiting without the stripe.
+                                    if let Err(error) = Self::validate_directory(&dir.path).await {
+                                        Self::failed(&mut report, &dir.path, error);
                                         dir.failed = true;
+                                        break;
+                                    }
+                                    match fs::symlink_metadata(entry.path()).await {
+                                        Ok(meta) if meta.is_file() => {
+                                            if !self.unlink(&entry.path(), false, &mut report).await
+                                            {
+                                                dir.failed = true;
+                                            }
+                                        }
+                                        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                                        Ok(_) => {}
+                                        Err(e) => {
+                                            Self::failed(&mut report, &entry.path(), e);
+                                            dir.failed = true;
+                                        }
                                     }
                                 }
                                 Ok(_) => {}
@@ -247,10 +286,11 @@ impl CleanupCursor {
                         Ok(None) => dir.exhausted = true,
                     }
                 }
+                drop(exclusive);
                 if dir.exhausted {
                     let errors = report.errors;
                     match self
-                        .finish_directory(&dir, delete_budget, &mut report, resources)
+                        .finish_directory(&dir, lifecycle, delete_budget, &mut report, resources)
                         .await
                     {
                         Ok(true) => {
@@ -285,15 +325,15 @@ impl CleanupCursor {
                             if let Some(shard) =
                                 shard.filter(|s| *s < crate::page_lifecycle::SHARDS)
                             {
+                                if let Some(resources) = resources {
+                                    resources.delete().await;
+                                }
                                 let gate = lifecycle.checkpoint_gate(shard);
                                 // An active writer owns its temp until publication completes.
                                 if let Ok(_guard) = gate.try_lock() {
                                     match entry.file_type().await {
                                         Ok(kind) if kind.is_file() => {
-                                            if !self
-                                                .unlink(&path, false, &mut report, resources)
-                                                .await
-                                            {
+                                            if !self.unlink(&path, false, &mut report).await {
                                                 self.pending += 1;
                                             }
                                         }
