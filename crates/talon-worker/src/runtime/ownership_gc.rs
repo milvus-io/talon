@@ -7,12 +7,18 @@ use std::{
 };
 use talon_core::{BlockId, CachePlacementTable, NodeId, WorkerConfig};
 
+const SUPPLEMENT_INTERVAL: Duration = Duration::from_secs(3600);
+
 pub(super) struct OwnershipGc {
     worker: NodeId,
     replicas: usize,
     membership: Option<Arc<MembershipSnapshot>>,
     placement: Vec<CachePlacementTable>,
     completed_generation: u64,
+    completed_limit: u64,
+    // Retain fixed supplemental bounds across cancellation and protected retries.
+    supplement: Option<std::ops::Range<u64>>,
+    next_supplement: tokio::time::Instant,
 }
 
 impl OwnershipGc {
@@ -28,35 +34,59 @@ impl OwnershipGc {
             membership: None,
             placement: Vec::new(),
             completed_generation: 0,
+            completed_limit: 0,
+            supplement: None,
+            next_supplement: tokio::time::Instant::now() + SUPPLEMENT_INTERVAL,
         }
     }
 
-    /// Stable, converged membership has no timer. Only unfinished old data retries.
+    /// Retry unfinished work promptly; otherwise check for new admissions hourly.
     pub(super) fn next_delay(&self, worker: &WorkerRuntime) -> Option<Duration> {
         worker
             .membership_snapshot()
             .filter(|view| {
-                view.generation != self.completed_generation
-                    && view
-                        .members
-                        .iter()
-                        .any(|member| member.info.id == self.worker)
+                view.members
+                    .iter()
+                    .any(|member| member.info.id == self.worker)
             })
-            .map(|_| Duration::from_secs(1))
+            .map(|view| {
+                if view.generation != self.completed_generation || self.supplement.is_some() {
+                    Duration::from_secs(1)
+                } else {
+                    self.next_supplement
+                        .saturating_duration_since(tokio::time::Instant::now())
+                }
+            })
     }
 
     pub(super) async fn run_round(&mut self, worker: &WorkerRuntime) {
         let Some(view) = self.prepare_ownership(worker) else {
             return;
         };
-        let mut cursor = (0, view.scan_limit);
+        let range = if view.generation != self.completed_generation {
+            // Topology changes supersede any pending supplemental pass.
+            self.supplement = None;
+            0..view.scan_limit
+        } else {
+            if self.supplement.is_none() {
+                let limit = worker.lru.ownership_admission_ceiling();
+                if limit <= self.completed_limit {
+                    // No writes: no index traversal, hashing, disk or backend work.
+                    self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
+                    return;
+                }
+                self.supplement = Some(self.completed_limit..limit);
+            }
+            self.supplement.clone().expect("supplemental bounds")
+        };
+        let mut cursor = (0, range.end);
         let mut complete = true;
         let mut slice_start = Instant::now();
         while let Some(candidate) = worker.lru.next_ownership_block(&mut cursor) {
             if !worker.membership_is_current(&view) {
                 return;
             }
-            if candidate.revision < view.scan_limit {
+            if range.contains(&candidate.revision) {
                 worker.page_gc_metrics.ownership_checked.inc();
                 if !self.owns(&candidate.block) {
                     complete &= self.reclaim_block(worker, candidate, &view).await;
@@ -71,6 +101,9 @@ impl OwnershipGc {
         }
         if complete && worker.membership_is_current(&view) {
             self.completed_generation = view.generation;
+            self.completed_limit = range.end;
+            self.supplement = None;
+            self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
         }
     }
 
@@ -78,7 +111,9 @@ impl OwnershipGc {
     fn prepare_ownership(&mut self, worker: &WorkerRuntime) -> Option<Arc<MembershipSnapshot>> {
         let id = &self.worker;
         let snapshot = worker.membership_snapshot().filter(|view| {
-            view.generation != self.completed_generation
+            (view.generation != self.completed_generation
+                || self.supplement.is_some()
+                || tokio::time::Instant::now() >= self.next_supplement)
                 && view.members.iter().any(|member| &member.info.id == id)
         })?;
         if self
@@ -122,7 +157,7 @@ impl OwnershipGc {
         })
     }
 
-    /// Reclaim one pre-event block; false leaves the event pending for retry.
+    /// Reclaim one pre-boundary block; false leaves the pass pending for retry.
     async fn reclaim_block(
         &self,
         worker: &WorkerRuntime,
@@ -273,6 +308,161 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn hourly_supplement_reclaims_late_fills_and_refills_without_rehashing_unchanged_blocks()
+    {
+        for paged in [false, true] {
+            let fixture = MembershipFixture::new();
+            let root = tempfile::tempdir().unwrap();
+            let r = runtime(root.path(), paged, Arc::new(Origin::default()));
+            let owned = placed("a", 0);
+            let refilled = placed("b", 0);
+            let rewritten = placed("b", 1);
+            let new = placed("b", 2);
+            for id in [&owned, &refilled, &rewritten] {
+                fill(&r, id, paged).await;
+            }
+            let mut gc = fixture.gc(&r);
+            // Old-route traffic after publication excludes the entire old block.
+            if paged {
+                r.commit_fetched_page(&rewritten, PageIndex(2), 64, Bytes::from_static(&[1; 16]))
+                    .await
+                    .unwrap();
+            } else {
+                fill(&r, &rewritten, false).await;
+            }
+            gc.run_round(&r).await;
+            assert!(r.index.get(&refilled).is_none());
+            assert!(r.index.get(&rewritten).is_some());
+            fill(&r, &refilled, paged).await;
+            fill(&r, &new, paged).await;
+            let checked = r.page_gc_metrics.ownership_checked.get();
+            fixture.publish(&r);
+            gc.run_round(&r).await;
+            assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked);
+
+            gc.next_supplement = tokio::time::Instant::now();
+            gc.run_round(&r).await;
+            for id in [&refilled, &rewritten, &new] {
+                assert!(r.index.get(id).is_none());
+            }
+            assert!(r.index.get(&owned).is_some());
+            assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked + 3);
+            assert!(gc.supplement.is_none());
+            assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
+
+            // Hot cache hits and capacity-policy selections do not cause a new sweep.
+            let ceiling = r.lru.ownership_admission_ceiling();
+            for candidate in r.lru.block_candidates(&owned) {
+                r.lru.touch(&candidate.unit);
+            }
+            assert_eq!(r.lru.ownership_admission_ceiling(), ceiling);
+            gc.next_supplement = tokio::time::Instant::now();
+            gc.run_round(&r).await;
+            assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked + 3);
+            assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
+        }
+    }
+
+    #[tokio::test]
+    async fn supplement_retries_keep_bounds_across_membership_outage() {
+        let fixture = MembershipFixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), true, Arc::new(Origin::default()));
+        let mut gc = fixture.gc(&r);
+        gc.run_round(&r).await;
+        let old = placed("b", 0);
+        let later = placed("b", 1);
+        fill(&r, &old, true).await;
+        let state = r.page_lifecycle.block(&old);
+        let reader = state.acquire(PageIndex(0)).unwrap();
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_round(&r).await;
+        let bounds = gc.supplement.clone().unwrap();
+        assert_eq!(gc.next_delay(&r), Some(Duration::from_secs(1)));
+        fill(&r, &later, true).await;
+        r.update_membership(None, Instant::now()).unwrap();
+        gc.run_round(&r).await;
+        assert_eq!(gc.next_delay(&r), None);
+        assert_eq!(gc.supplement, Some(bounds.clone()));
+        fixture.publish(&r);
+        drop(reader);
+        gc.run_round(&r).await;
+        assert!(r.index.get(&old).is_none());
+        assert!(r.index.get(&later).is_some());
+        assert_eq!(gc.completed_limit, bounds.end);
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_round(&r).await;
+        assert!(r.index.get(&later).is_none());
+    }
+
+    #[tokio::test]
+    async fn membership_event_supersedes_pending_supplement() {
+        let fixture = MembershipFixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), false, Arc::new(Origin::default()));
+        let mut gc = fixture.gc(&r);
+        gc.run_round(&r).await;
+        let old = placed("b", 0);
+        fill(&r, &old, false).await;
+        let pin = r.lru.pin_guard(CacheUnit::Whole(old.clone())).unwrap();
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_round(&r).await;
+        assert!(gc.supplement.is_some());
+        drop(pin);
+        // This Worker now owns everything; stale supplemental placement cannot delete.
+        *fixture.members.lock().unwrap() = Some(vec!["a"]);
+        fixture.publish(&r);
+        gc.run_round(&r).await;
+        assert!(gc.supplement.is_none());
+        assert!(r.index.get(&old).is_some());
+        assert_eq!(
+            gc.completed_generation,
+            r.membership_snapshot().unwrap().generation
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_supplement_keeps_bounds_and_defers_later_page_fills() {
+        let fixture = MembershipFixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), true, Arc::new(Origin::default()));
+        let mut gc = fixture.gc(&r);
+        gc.run_round(&r).await;
+        let old = placed("b", 0);
+        let rewritten = placed("b", 1);
+        fill(&r, &old, true).await;
+        fill(&r, &rewritten, true).await;
+        let state = r.page_lifecycle.block(&old);
+        let gate = state.gate.lock().await;
+        gc.next_supplement = tokio::time::Instant::now();
+        {
+            let round = gc.run_round(&r);
+            tokio::pin!(round);
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::select! { biased;
+                    _ = async {
+                        while r.page_mutations.active_count() == 0 { tokio::task::yield_now().await; }
+                    } => {},
+                    _ = &mut round => panic!("mutation gate must hold the scan"),
+                }
+            }).await.unwrap();
+        }
+        let bounds = gc.supplement.clone().unwrap();
+        r.commit_fetched_page(&rewritten, PageIndex(2), 64, Bytes::from_static(&[1; 16]))
+            .await
+            .unwrap();
+        drop(gate);
+        r.drain_page_mutations().await;
+        gc.run_round(&r).await;
+        assert!(r.index.get(&old).is_none());
+        assert!(r.index.get(&rewritten).is_some());
+        assert_eq!(gc.completed_limit, bounds.end);
+        gc.next_supplement = tokio::time::Instant::now();
+        gc.run_round(&r).await;
+        assert!(r.index.get(&rewritten).is_none());
+    }
+
+    #[tokio::test]
     async fn membership_event_freezes_preexisting_blocks_and_converges() {
         for paged in [false, true] {
             let fixture = MembershipFixture::new();
@@ -299,7 +489,7 @@ mod tests {
             assert!(r.index.get(&rewritten).is_some());
             assert!(r.index.get(&new).is_some());
             assert_eq!(gc.completed_generation, event.generation);
-            assert_eq!(gc.next_delay(&r), None);
+            assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
             let checked = r.page_gc_metrics.ownership_checked.get();
             fixture.publish(&r); // identical observation cannot widen the event
             fill(&r, &placed("b", 3), paged).await;
@@ -313,7 +503,7 @@ mod tests {
             assert!(!r.membership_is_current(&event));
             gc.run_round(&r).await;
             assert!(r.index.is_empty());
-            assert_eq!(gc.next_delay(&r), None);
+            assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
         }
     }
 
@@ -351,7 +541,7 @@ mod tests {
         assert!(r.index.get(&old).is_none());
         assert!(r.index.get(&placed("b", 1)).is_none());
         assert!(r.index.get(&new).is_some());
-        assert_eq!(gc.next_delay(&r), None);
+        assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -660,7 +850,7 @@ mod tests {
         gc.run_round(&r).await;
         assert!(r.index.get(&old).is_none());
         assert!(r.index.get(&new).is_some());
-        assert_eq!(gc.next_delay(&r), None);
+        assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
     }
 
     #[tokio::test]
@@ -803,7 +993,7 @@ mod tests {
                 config.background_scan_batch_size = 1;
                 (
                     super::super::WorkerBackground::start(r.clone(), &config),
-                    7200,
+                    3600,
                 )
             } else {
                 (
@@ -851,12 +1041,6 @@ mod tests {
             tokio::time::pause();
             tokio::time::advance(Duration::from_secs(2)).await;
             tokio::time::resume();
-            if ownership_enabled {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                assert_eq!(completed.get(), 1, "converged ownership has no timer");
-                *fixture.as_ref().unwrap().members.lock().unwrap() = Some(vec!["a"]);
-                fixture.as_ref().unwrap().publish(&r);
-            }
             tokio::time::timeout(Duration::from_secs(5), async {
                 while completed.get() < 2 {
                     tokio::task::yield_now().await;
@@ -864,8 +1048,29 @@ mod tests {
             })
             .await
             .unwrap();
+            if let Some(fixture) = &fixture {
+                assert_eq!(
+                    r.page_gc_metrics.ownership_checked.get(),
+                    2,
+                    "hourly wake with no admissions must not recheck residents"
+                );
+                *fixture.members.lock().unwrap() = Some(vec!["a"]);
+                fixture.publish(&r);
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while completed.get() < 3 {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                assert_eq!(
+                    r.page_gc_metrics.ownership_checked.get(),
+                    4,
+                    "membership events must still scan immediately"
+                );
+            }
             service.shutdown().await;
-            assert_eq!(completed.get(), 2);
+            assert_eq!(completed.get(), if ownership_enabled { 3 } else { 2 });
         }
     }
 }

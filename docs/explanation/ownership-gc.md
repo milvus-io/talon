@@ -14,7 +14,8 @@ ownership_gc_replicas = 1
 ```
 
 Ownership cleanup defaults to disabled. Enabling it registers `ownership_gc` for
-logical membership changes. `stale_gc_enabled` independently enables backend
+logical membership changes and hourly supplemental admission checks.
+`stale_gc_enabled` independently enables backend
 object deletion checks, which retain their one-hour delay after each completed
 backend round. Each setting controls its own task.
 
@@ -28,7 +29,7 @@ Set `ownership_gc_replicas` to at least the largest candidate count used by any
 reader or load planner. The Worker retains the union of global and local-zone
 top-k placement candidates, supporting mixed global and zone-affine readers.
 There is no automatic replica-count negotiation. Prewarming outside these
-candidates can be reclaimed by a later membership event.
+candidates can be reclaimed by a later membership event or supplemental pass.
 
 ## Membership events and scan boundaries
 
@@ -61,8 +62,8 @@ blocks are gone and the generation remains valid. Reader/pin protection, activit
 races and unlink failure leave the event pending. Retrying after one second scans
 the same bounded old prefix; it may recheck retained owned blocks while converging,
 but uses no retry index or per-block ownership state. Cancellation discards local
-progress and retries the original event boundary. Once converged, stable membership
-and new writes cause no further ownership scans.
+progress and retries the original event boundary. Once converged, new writes do
+not immediately wake ownership; the supplemental check handles them later.
 
 A newer event supersedes the old generation, including A -> B -> A changes observed
 by the publisher between GC invocations. Missing, expired or self-excluding membership
@@ -70,6 +71,35 @@ pauses ownership. Recovery or another topology event wakes it. GC never performs
 waits for discovery. Coordinator upgrade must precede enabling cleanup: retained
 membership queries must be allowed on its authenticated Worker listener. No wire
 schema changes are needed.
+
+## Low-frequency supplemental cleanup
+
+Clients may continue using old placement while discovering a topology change.
+Their page fills and refills fall outside the event boundary. One hour after a
+completed pass, ownership checks whether any cache admissions have occurred since
+its completed boundary. Without admissions, it returns without traversing the
+resident index, hashing blocks, or doing disk/backend I/O. This check is constant
+time in resident-cache size; normal membership validation still depends on the
+number of Workers. Reads and capacity-policy rotations do not advance this marker.
+
+When admissions exist, a supplemental pass captures a fixed new upper boundary
+and traverses the existing in-memory block index. Only blocks whose latest
+admission revision lies between the completed and new boundaries are hashed and
+checked against the cached placement tables. The traversal visits blocks, not
+individual pages; unchanged residents are not rehashed. Existing blocks must also
+be visited because a later page fill changes their revision without moving their
+original index position. There is no disk-directory scan or additional per-block
+index, and admission adds only one scalar assignment under its existing lock.
+
+Supplemental passes use the same yielding, deletion budgets and protection checks
+as event passes. Reader/pin protection and unlink failure retry the fixed bounds
+after one second. Cancellation or a same-topology discovery outage preserves those
+bounds. Admissions during the pass are deferred to the next hourly pass, including
+page fills into older blocks. A new membership generation supersedes a pending
+supplemental pass and checks the new event's entire prefix immediately. Hourly
+timing restarts on completion; invalid or self-excluding membership pauses work.
+No timer waits occupy a background task slot. Continued admissions can cause an
+index traversal each hour, so this is not constant-time cleanup under write load.
 
 ## Independent tasks and bounded work
 
@@ -79,8 +109,9 @@ membership. They share only the resident block index, deletion budgets and guard
 whole-block mutation.
 
 `OwnershipGc::run_round` keeps its cursor and current candidate local. Its persistent
-state is configuration, cached placement snapshot/tables, and the last converged
-generation. Maglev tables rebuild only when placement changes. Each eligible block
+state is configuration, cached placement snapshot/tables, the last converged
+generation/admission boundary, and a supplemental deadline and optional fixed range.
+Maglev tables rebuild only when placement changes. Each eligible block
 is hashed and checked against those tables. No ownership/hash cache is added to
 block metadata or reads. Membership canonicalization costs O(N log N); scans use
 the resident index without cloning the full index or walking cache directories.
@@ -91,7 +122,7 @@ sleep or block-count limit. Each block rechecks membership. Actual deletions con
 shared page/disk credits; pending
 protected blocks retry after one second. The event scheduler coalesces changes
 received during active work. Once converged, ownership waits for a membership
-event without occupying a task slot.
+event or its hourly admission check without occupying a task slot.
 
 Independent `stale_gc` retains its hourly round delay, one-second batch pacing,
 24-hour idle filter and positive HEAD cooldown. Only authoritative `NotFound`
@@ -129,7 +160,8 @@ Shutdown stops admission and drains active rounds and owned mutations.
 
 Tests cover event boundaries, post-event admissions/page fills, convergence,
 A -> B -> A, recovery without widening scope, cancellation, reader/pin and unlink
-retries, events during active work, idle scheduler slots, independent task
+retries, supplemental cleanup of late fills/refills, unchanged-admission no-ops,
+supplemental cancellation/recovery boundaries, events during active work, idle scheduler slots, independent task
 schedules, heartbeat progress, placement replicas/zones, and authorization after rate,
 I/O and mutation-gate waits. Existing stale-block tests cover HEAD cooldown and
 bounds, concurrent reads/fills and deletion cancellation. These are local
