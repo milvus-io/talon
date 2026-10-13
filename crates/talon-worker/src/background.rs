@@ -12,11 +12,12 @@ use tokio::{
     time::Instant,
 };
 
-type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
+type Work = Pin<Box<dyn Future<Output = Option<Duration>> + Send>>;
 struct Task {
     name: &'static str,
-    period: Duration,
-    next: Instant,
+    retry: Duration,
+    next: Option<Instant>,
+    trigger: Option<watch::Receiver<()>>,
     running: bool,
     run: Box<dyn FnMut() -> Work + Send>,
     metrics: Option<TaskMetrics>,
@@ -30,7 +31,7 @@ struct TaskMetrics {
     duration: talon_core::Histogram,
 }
 
-/// Fixed-delay scheduler. Each registration has at most one active invocation;
+/// Timer/event scheduler. Each registration has at most one active invocation;
 /// overdue work is coalesced, and ready tasks are admitted in round-robin order.
 pub struct BackgroundScheduler {
     tasks: Vec<Task>,
@@ -60,6 +61,40 @@ impl BackgroundScheduler {
         Fut: Future<Output = ()> + Send + 'static,
     {
         assert!(!period.is_zero() && Instant::now().checked_add(period).is_some());
+        self.register_work(name, period, None, move || {
+            let work = run();
+            async move {
+                work.await;
+                Some(period)
+            }
+        });
+    }
+
+    /// Register event-driven work. Initial admission observes any event published
+    /// before subscription. Return a delay only for pending retry or periodic work;
+    /// `None` sleeps until the next event without occupying a task slot.
+    pub fn register_triggered<F, Fut>(
+        &mut self,
+        name: &'static str,
+        trigger: watch::Receiver<()>,
+        run: F,
+    ) where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Option<Duration>> + Send + 'static,
+    {
+        self.register_work(name, Duration::from_secs(1), Some(trigger), run);
+    }
+
+    fn register_work<F, Fut>(
+        &mut self,
+        name: &'static str,
+        retry: Duration,
+        trigger: Option<watch::Receiver<()>>,
+        mut run: F,
+    ) where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Option<Duration>> + Send + 'static,
+    {
         assert!(!self.tasks.iter().any(|task| task.name == name));
         let metrics = self.metrics.as_ref().map(|r| {
             let labels = || talon_core::metrics::labels(&[("task", name)]);
@@ -89,8 +124,9 @@ impl BackgroundScheduler {
         self.tasks.push(Task {
             metrics,
             name,
-            period,
-            next: Instant::now(),
+            retry,
+            next: Some(Instant::now()),
+            trigger,
             running: false,
             run: Box::new(move || Box::pin(run())),
         });
@@ -105,6 +141,19 @@ impl BackgroundScheduler {
         }
     }
     async fn run(mut self, mut stopped: watch::Receiver<bool>) {
+        async fn changed(
+            i: usize,
+            mut trigger: watch::Receiver<()>,
+        ) -> (usize, Option<watch::Receiver<()>>) {
+            let open = trigger.changed().await.is_ok();
+            (i, open.then_some(trigger))
+        }
+        let mut triggers = FuturesUnordered::new();
+        for (i, task) in self.tasks.iter_mut().enumerate() {
+            if let Some(trigger) = task.trigger.take() {
+                triggers.push(changed(i, trigger));
+            }
+        }
         let mut active = FuturesUnordered::new();
         let mut cursor = 0;
         loop {
@@ -118,26 +167,27 @@ impl BackgroundScheduler {
                 let i = cursor;
                 cursor = (cursor + 1) % self.tasks.len();
                 let task = &mut self.tasks[i];
-                if !task.running && task.next <= Instant::now() {
+                if !task.running && task.next.is_some_and(|at| at <= Instant::now()) {
                     task.running = true;
+                    task.next = None;
                     // Catch both construction and polling panics so one task cannot
                     // silently disable the other maintenance registrations.
                     let future =
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.run)()));
                     let name = task.name;
+                    let retry = task.retry;
                     let metrics = task.metrics.clone();
                     active.push(async move {
                         let start = Instant::now();
                         if let Some(m) = &metrics {
                             m.active.set(1.0);
                         }
-                        let ok = match future {
-                            Ok(future) => std::panic::AssertUnwindSafe(future)
-                                .catch_unwind()
-                                .await
-                                .is_ok(),
-                            Err(_) => false,
+                        let result = match future {
+                            Ok(future) => std::panic::AssertUnwindSafe(future).catch_unwind().await,
+                            Err(error) => Err(error),
                         };
+                        let ok = result.is_ok();
+                        let delay = result.unwrap_or(Some(retry));
                         if let Some(m) = &metrics {
                             m.active.set(0.0);
                             m.completed.inc();
@@ -152,7 +202,7 @@ impl BackgroundScheduler {
                                 "background task panicked; retrying after its interval"
                             );
                         }
-                        i
+                        (i, delay)
                     });
                 }
             }
@@ -160,16 +210,24 @@ impl BackgroundScheduler {
                 self.tasks
                     .iter()
                     .filter(|t| !t.running)
-                    .map(|t| t.next)
+                    .filter_map(|t| t.next)
                     .min()
             } else {
                 None
             };
             tokio::select! { biased;
                 _ = stopped.changed() => break,
-                Some(i) = active.next(), if !active.is_empty() => {
+                Some((i, delay)) = active.next(), if !active.is_empty() => {
                     self.tasks[i].running = false;
-                    self.tasks[i].next = Instant::now() + self.tasks[i].period;
+                    let timed = delay.map(|delay| Instant::now() + delay);
+                    // Preserve/coalesce a trigger received while the invocation ran.
+                    self.tasks[i].next = self.tasks[i].next.into_iter().chain(timed).min();
+                }
+                Some((i, trigger)) = triggers.next(), if !triggers.is_empty() => {
+                    if let Some(trigger) = trigger {
+                        self.tasks[i].next = Some(Instant::now());
+                        triggers.push(changed(i, trigger));
+                    }
                 }
                 _ = async { match next { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {}
             }
@@ -277,6 +335,87 @@ impl BackgroundBudget {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn event_during_work_is_coalesced_and_idle_wait_releases_slot() {
+        let (trigger, receiver) = watch::channel(());
+        let gate = Arc::new(Semaphore::new(0));
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut scheduler = BackgroundScheduler::new(1);
+        let event_gate = gate.clone();
+        let event_sent = sent.clone();
+        scheduler.register_triggered("event", receiver, move || {
+            let gate = event_gate.clone();
+            let sent = event_sent.clone();
+            async move {
+                sent.send("event").unwrap();
+                gate.acquire().await.unwrap().forget();
+                None
+            }
+        });
+        scheduler.register("timer", Duration::from_secs(3600), move || {
+            let sent = sent.clone();
+            async move {
+                sent.send("timer").unwrap();
+            }
+        });
+        let handle = scheduler.start();
+        assert_eq!(received.recv().await, Some("event"));
+        trigger.send_replace(());
+        trigger.send_replace(());
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(
+            received.try_recv().is_err(),
+            "event must not overlap itself"
+        );
+        gate.add_permits(1);
+        assert_eq!(received.recv().await, Some("timer"));
+        assert_eq!(received.recv().await, Some("event"));
+        gate.add_permits(1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(received.try_recv().is_err(), "multiple events coalesce");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3601)).await;
+        tokio::time::resume();
+        assert_eq!(
+            received.recv().await,
+            Some("timer"),
+            "idle event wait holds no slot"
+        );
+        trigger.send_replace(());
+        assert_eq!(received.recv().await, Some("event"));
+        handle.begin_shutdown();
+        trigger.send_replace(());
+        gate.add_permits(1);
+        handle.shutdown().await;
+        assert!(
+            received.try_recv().is_err(),
+            "no event admission after stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn event_work_retries_only_while_requested() {
+        let (_trigger, receiver) = watch::channel(());
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let mut scheduler = BackgroundScheduler::new(1);
+        let mut calls = 0;
+        scheduler.register_triggered("event", receiver, move || {
+            calls += 1;
+            let call = calls;
+            let sent = sent.clone();
+            async move {
+                sent.send(call).unwrap();
+                (call == 1).then_some(Duration::from_millis(10))
+            }
+        });
+        let handle = scheduler.start();
+        assert_eq!(received.recv().await, Some(1));
+        assert_eq!(received.recv().await, Some(2));
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(received.try_recv().is_err());
+        handle.shutdown().await;
+    }
 
     #[tokio::test]
     async fn begin_shutdown_stops_admission_before_join_and_drains_active_work() {

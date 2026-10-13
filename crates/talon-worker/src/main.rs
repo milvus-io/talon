@@ -183,7 +183,7 @@ impl Args {
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
             paged_miss_run_concurrency: None,
-            ownership_gc_interval_secs: None,
+            ownership_gc_enabled: None,
             ownership_gc_replicas: None,
             ownership_gc_scan_batch_size: None,
             ownership_gc_delete_batch_size: None,
@@ -705,7 +705,7 @@ async fn run() -> anyhow::Result<()> {
         control_tls.clone(),
         Arc::clone(&observability),
         Duration::from_millis(cfg.heartbeat_interval_ms),
-        (cfg.ownership_gc_interval_secs > 0).then(|| worker.clone()),
+        cfg.ownership_gc_enabled.then(|| worker.clone()),
     );
 
     let background = talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg);
@@ -1572,7 +1572,7 @@ mod tests {
             worker.clone(),
             &WorkerConfig {
                 node_id: Some(node.id.0),
-                ownership_gc_interval_secs: 1,
+                ownership_gc_enabled: true,
                 stale_gc_enabled: false,
                 ..Default::default()
             },

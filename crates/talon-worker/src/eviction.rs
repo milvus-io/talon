@@ -109,9 +109,8 @@ pub(crate) struct EvictionCandidate {
 pub(crate) struct StaleBlockCandidate {
     pub block: BlockId,
     pub units: usize,
-    revision: u64,
+    pub revision: u64,
     pub last_access: u64,
-    pub position: u64,
 }
 
 struct BlockActivity {
@@ -569,27 +568,12 @@ impl Lru {
                 units: activity.units,
                 revision: activity.revision,
                 last_access: access,
-                position,
             });
             if out.len() >= delete_budget {
                 break;
             }
         }
         out
-    }
-
-    /// Reuse the admission queue for deferred ownership work, outside this
-    /// round's frozen boundary. There is no second per-block index.
-    pub(crate) fn defer_stale_block(&self, block: &BlockId) {
-        let mut g = self.inner.lock().unwrap();
-        let position = g.clock;
-        let Some(activity) = g.block_access.get_mut(block) else {
-            return;
-        };
-        let old = std::mem::replace(&mut activity.position, position);
-        g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
-        g.block_queue.remove(&old);
-        g.block_queue.insert(position, block.clone());
     }
 
     pub(crate) fn stale_scan_ceiling(&self) -> u64 {

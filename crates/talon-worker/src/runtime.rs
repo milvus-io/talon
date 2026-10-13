@@ -7,7 +7,10 @@ use std::time::{Duration, Instant};
 
 mod async_eviction;
 mod background;
+#[cfg(test)]
+mod gc_test_support;
 mod load;
+mod ownership_gc;
 mod stale_gc;
 pub use background::WorkerBackground;
 mod page_maintenance;
@@ -89,6 +92,7 @@ pub enum ServeOutcome {
 pub struct WorkerRuntime {
     /// Latest control-plane observation, shared by runtime clones.
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
+    membership_changed: tokio::sync::watch::Sender<()>,
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
     l1: Arc<MemoryStore>,
@@ -140,9 +144,12 @@ pub struct WorkerRuntime {
 }
 
 /// Placement data published by the control plane; GC never performs discovery.
+#[derive(Clone)]
 struct MembershipSnapshot {
     members: Vec<talon_transport::ZonedNodeInfo>,
     valid_until: Instant,
+    generation: u64,
+    scan_limit: u64,
 }
 
 impl WorkerRuntime {
@@ -205,6 +212,7 @@ impl WorkerRuntime {
         metrics.update_l1_residency(0, 0);
         Self {
             membership: Arc::new(Mutex::new(None)),
+            membership_changed: tokio::sync::watch::channel(()).0,
             l1,
             page_cleanup: Arc::new(tokio::sync::Mutex::new(
                 crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
@@ -241,8 +249,9 @@ impl WorkerRuntime {
     /// Publish retained membership from the control-plane refresh task.
     ///
     /// `observed` is the query start time, so network time consumes validity.
-    /// Missing or invalid observations revoke the previous snapshot. Consumers
-    /// also check expiry if the publisher stops without reporting a failure.
+    /// Missing or invalid observations expire the previous snapshot. Its topology
+    /// and admission boundary survive failures so recovery cannot widen a sweep.
+    /// Logical membership changes capture a block boundary and wake maintenance.
     pub fn update_membership(
         &self,
         view: Option<talon_core::worker_membership::WorkerDiscovery>,
@@ -276,13 +285,48 @@ impl WorkerRuntime {
                 })
                 .collect();
             members.sort_unstable_by(|a, b| a.info.id.0.cmp(&b.info.id.0));
-            Ok(Some(Arc::new(MembershipSnapshot {
-                members,
-                valid_until,
-            })))
+            Ok(Some((members, valid_until)))
         })();
-        *self.membership.lock().unwrap() = snapshot.as_ref().ok().cloned().flatten();
-        snapshot.map(|_| ())
+        let mut held = self.membership.lock().unwrap();
+        match snapshot {
+            Ok(Some((members, valid_until))) => {
+                let changed = held.as_ref().map_or(true, |old| old.members != members);
+                let wake = changed
+                    || held
+                        .as_ref()
+                        .is_some_and(|old| Instant::now() >= old.valid_until);
+                let (generation, scan_limit) = if changed {
+                    (
+                        held.as_ref().map_or(1, |old| {
+                            old.generation
+                                .checked_add(1)
+                                .expect("membership generation exhausted")
+                        }),
+                        self.lru.stale_scan_ceiling(),
+                    )
+                } else {
+                    let old = held.as_ref().expect("unchanged membership");
+                    (old.generation, old.scan_limit)
+                };
+                *held = Some(Arc::new(MembershipSnapshot {
+                    members,
+                    valid_until,
+                    generation,
+                    scan_limit,
+                }));
+                drop(held);
+                if wake {
+                    self.membership_changed.send_replace(());
+                }
+                Ok(())
+            }
+            result => {
+                if let Some(old) = held.as_mut() {
+                    Arc::make_mut(old).valid_until = Instant::now();
+                }
+                result.map(|_| ())
+            }
+        }
     }
 
     fn membership_snapshot(&self) -> Option<Arc<MembershipSnapshot>> {
@@ -295,9 +339,8 @@ impl WorkerRuntime {
     }
 
     fn membership_is_current(&self, expected: &Arc<MembershipSnapshot>) -> bool {
-        self.membership_snapshot().is_some_and(|current| {
-            Arc::ptr_eq(&current, expected) || current.members == expected.members
-        })
+        self.membership_snapshot()
+            .is_some_and(|current| current.generation == expected.generation)
     }
 
     /// Enable paged L2: cache individual pages instead of whole blocks.

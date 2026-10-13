@@ -149,16 +149,16 @@ unit conversion, and environment-variable migration, see [Page TTI](page-tti.md#
 
 `stale_gc_enabled = true` (the default) enables the backend-deletion policy in
 `stale_gc`. The first round is eligible at startup; after a complete round finishes,
-it waits **one hour** before starting another, unless ownership cleanup configures
-the shared interval below. Rounds never overlap.
+it waits **one hour** before starting another. Membership events do not reset
+this backend deadline. Rounds never overlap.
 Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable backend-deletion checks.
 
-The same scan includes optional [ownership cleanup](ownership-gc.md).
-`ownership_gc_interval_secs` defaults to `0` (disabled); enabling it sets the
-shared round interval. Both predicates share one cursor and whole-block reclaimer.
-Ownership is checked first using the valid membership snapshot published by the
-Worker control-plane task, without an idle-age or HEAD requirement. GC does not
-perform membership communication. Disabling both predicates removes the task.
+Optional [ownership cleanup](ownership-gc.md) runs as a separate `ownership_gc`
+task. `ownership_gc_enabled` defaults to `false`. Logical membership changes
+trigger scans of pre-event blocks; stable, converged membership requires no further
+scanning. Ownership uses the snapshot published by the Worker control plane and
+never issues backend HEADs. The tasks share the resident block index, deletion
+budgets and whole-block reclaimer, while keeping scans and schedules independent.
 
 For backend-deletion checks, only blocks idle for **more than 24 hours** are eligible. Reads and admissions
 refresh a process-local, monotonic block timestamp, shared by all of its pages.

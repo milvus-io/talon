@@ -58,21 +58,31 @@ impl WorkerBackground {
                 }
             });
         }
-        if config.stale_gc_enabled || config.ownership_gc_interval_secs > 0 {
-            let period = Duration::from_secs(if config.ownership_gc_interval_secs > 0 {
-                config.ownership_gc_interval_secs
-            } else {
-                3600
-            });
-            let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
-                config,
-            )));
+        if config.stale_gc_enabled {
             let w = worker.clone();
-            scheduler.register("stale_gc", period, move || {
+            scheduler.register("stale_gc", Duration::from_secs(3600), move || {
                 let w = w.clone();
-                let gc = gc.clone();
-                async move { gc.lock().await.run_round(&w).await }
+                async move { super::stale_gc::StaleGc::run_round(&w).await }
             });
+        }
+        if config.ownership_gc_enabled {
+            let gc = Arc::new(tokio::sync::Mutex::new(
+                super::ownership_gc::OwnershipGc::new(config),
+            ));
+            let w = worker.clone();
+            scheduler.register_triggered(
+                "ownership_gc",
+                worker.membership_changed.subscribe(),
+                move || {
+                    let w = w.clone();
+                    let gc = gc.clone();
+                    async move {
+                        let mut gc = gc.lock().await;
+                        gc.run_round(&w).await;
+                        gc.next_delay(&w)
+                    }
+                },
+            );
         }
         if config.async_eviction_enabled && worker.capacity_bytes > 0 {
             let cycle = Arc::new(tokio::sync::Mutex::new(EvictionCycle::new(

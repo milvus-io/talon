@@ -170,13 +170,13 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
-    /// Shared stale-GC round interval when ownership is enabled; 0 disables ownership cleanup.
-    pub ownership_gc_interval_secs: u64,
+    /// Reclaim misplaced cache blocks after logical membership changes.
+    pub ownership_gc_enabled: bool,
     /// Number of placement candidates to retain; must cover every reader replica count.
     pub ownership_gc_replicas: usize,
-    /// Maximum blocks scanned per shared stale-GC batch when ownership is enabled.
+    /// Maximum blocks scanned per ownership-GC batch.
     pub ownership_gc_scan_batch_size: usize,
-    /// Maximum block candidates per shared stale-GC batch when ownership is enabled.
+    /// Maximum block candidates per ownership-GC batch.
     pub ownership_gc_delete_batch_size: usize,
     /// Worker-wide LOAD payload bytes reserved through cache commit (default 1 GiB).
     pub load_inflight_bytes: u64,
@@ -343,7 +343,7 @@ impl Default for WorkerConfig {
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
-            ownership_gc_interval_secs: 0,
+            ownership_gc_enabled: false,
             ownership_gc_replicas: 1,
             ownership_gc_scan_batch_size: 1024,
             ownership_gc_delete_batch_size: 1024,
@@ -441,8 +441,8 @@ pub struct WorkerConfigPatch {
     pub l2_page_size_bytes: Option<u64>,
     /// Override for [`WorkerConfig::paged_miss_run_concurrency`].
     pub paged_miss_run_concurrency: Option<usize>,
-    /// Override for [`WorkerConfig::ownership_gc_interval_secs`].
-    pub ownership_gc_interval_secs: Option<u64>,
+    /// Override for [`WorkerConfig::ownership_gc_enabled`].
+    pub ownership_gc_enabled: Option<bool>,
     /// Override for [`WorkerConfig::ownership_gc_replicas`].
     pub ownership_gc_replicas: Option<usize>,
     /// Override for [`WorkerConfig::ownership_gc_scan_batch_size`].
@@ -556,9 +556,7 @@ impl Patch for WorkerConfigPatch {
             paged_miss_run_concurrency: self
                 .paged_miss_run_concurrency
                 .or(base.paged_miss_run_concurrency),
-            ownership_gc_interval_secs: self
-                .ownership_gc_interval_secs
-                .or(base.ownership_gc_interval_secs),
+            ownership_gc_enabled: self.ownership_gc_enabled.or(base.ownership_gc_enabled),
             ownership_gc_replicas: self.ownership_gc_replicas.or(base.ownership_gc_replicas),
             ownership_gc_scan_batch_size: self
                 .ownership_gc_scan_batch_size
@@ -784,10 +782,10 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS", key: "ownership_gc_interval_secs", default: Some("0"), cli: false, secret: false, help: "Shared stale-GC round interval when ownership is enabled; 0 disables ownership cleanup." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("false"), cli: false, secret: false, help: "Reclaim misplaced cache blocks after logical membership changes." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE", key: "ownership_gc_scan_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum blocks scanned per shared stale-GC batch when ownership is enabled." },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE", key: "ownership_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum block candidates per shared stale-GC batch when ownership is enabled." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE", key: "ownership_gc_scan_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum blocks scanned per ownership-GC batch." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE", key: "ownership_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum block candidates per ownership-GC batch." },
     ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES", key: "page_gc_interval_minutes", default: Some("10"), cli: false, secret: false, help: "Delay between complete page GC passes in minutes." },
@@ -1023,7 +1021,7 @@ pub(crate) mod worker_env {
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const LOAD_INFLIGHT_BYTES: &str = "TALON_WORKER_LOAD_INFLIGHT_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
-    pub const OWNERSHIP_GC_INTERVAL_SECS: &str = "TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS";
+    pub const OWNERSHIP_GC_ENABLED: &str = "TALON_WORKER_OWNERSHIP_GC_ENABLED";
     pub const OWNERSHIP_GC_REPLICAS: &str = "TALON_WORKER_OWNERSHIP_GC_REPLICAS";
     pub const OWNERSHIP_GC_SCAN_BATCH_SIZE: &str = "TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE";
     pub const OWNERSHIP_GC_DELETE_BATCH_SIZE: &str = "TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE";
@@ -1183,8 +1181,8 @@ impl WorkerConfigPatch {
             paged_miss_run_concurrency: get(worker_env::PAGED_MISS_RUN_CONCURRENCY)
                 .map(|v| parse_usize(v, worker_env::PAGED_MISS_RUN_CONCURRENCY))
                 .transpose()?,
-            ownership_gc_interval_secs: get(worker_env::OWNERSHIP_GC_INTERVAL_SECS)
-                .map(|v| parse_u64(v, worker_env::OWNERSHIP_GC_INTERVAL_SECS))
+            ownership_gc_enabled: get(worker_env::OWNERSHIP_GC_ENABLED)
+                .map(|v| parse_bool(v, worker_env::OWNERSHIP_GC_ENABLED))
                 .transpose()?,
             ownership_gc_replicas: get(worker_env::OWNERSHIP_GC_REPLICAS)
                 .map(|v| parse_usize(v, worker_env::OWNERSHIP_GC_REPLICAS))
@@ -1347,9 +1345,9 @@ impl WorkerConfig {
             paged_miss_run_concurrency: merged
                 .paged_miss_run_concurrency
                 .unwrap_or(d.paged_miss_run_concurrency),
-            ownership_gc_interval_secs: merged
-                .ownership_gc_interval_secs
-                .unwrap_or(d.ownership_gc_interval_secs),
+            ownership_gc_enabled: merged
+                .ownership_gc_enabled
+                .unwrap_or(d.ownership_gc_enabled),
             ownership_gc_replicas: merged
                 .ownership_gc_replicas
                 .unwrap_or(d.ownership_gc_replicas),
@@ -1514,14 +1512,6 @@ impl WorkerConfig {
             return Err(Error::Other(
                 "ownership GC replicas and batch sizes must be positive".into(),
             ));
-        }
-        if std::time::Instant::now()
-            .checked_add(std::time::Duration::from_secs(
-                self.ownership_gc_interval_secs,
-            ))
-            .is_none()
-        {
-            return Err(Error::Other("ownership GC duration is too large".into()));
         }
         for (name, value) in [
             (
@@ -2000,19 +1990,19 @@ mod tests {
 
     #[test]
     fn ownership_gc_configuration_precedence_and_validation() {
-        let file = WorkerConfigPatch::from_toml("ownership_gc_interval_secs = 3600\nownership_gc_replicas = 2\nownership_gc_scan_batch_size = 64\nownership_gc_delete_batch_size = 8\n").unwrap();
+        let file = WorkerConfigPatch::from_toml("ownership_gc_enabled = false\nownership_gc_replicas = 2\nownership_gc_scan_batch_size = 64\nownership_gc_delete_batch_size = 8\n").unwrap();
         let env = WorkerConfigPatch::from_env_with(|name| match name {
-            "TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS" => Some("7200".into()),
+            "TALON_WORKER_OWNERSHIP_GC_ENABLED" => Some("true".into()),
             "TALON_WORKER_OWNERSHIP_GC_REPLICAS" => Some("3".into()),
             _ => None,
         })
         .unwrap();
         let cfg = WorkerConfig::resolve(file, env, Default::default()).unwrap();
-        assert_eq!(cfg.ownership_gc_interval_secs, 7200);
+        assert!(cfg.ownership_gc_enabled);
         assert_eq!(cfg.ownership_gc_replicas, 3);
         assert_eq!(cfg.ownership_gc_scan_batch_size, 64);
         assert_eq!(cfg.ownership_gc_delete_batch_size, 8);
-        assert_eq!(WorkerConfig::default().ownership_gc_interval_secs, 0);
+        assert!(!WorkerConfig::default().ownership_gc_enabled);
         for invalid in [
             "ownership_gc_replicas = 0",
             "ownership_gc_scan_batch_size = 0",
