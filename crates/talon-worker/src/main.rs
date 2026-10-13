@@ -183,6 +183,10 @@ impl Args {
             l1_page_size_bytes: None,
             l2_page_size_bytes: None,
             paged_miss_run_concurrency: None,
+            ownership_gc_interval_secs: None,
+            ownership_gc_replicas: None,
+            ownership_gc_scan_batch_size: None,
+            ownership_gc_delete_batch_size: None,
             load_inflight_bytes: None,
             page_tti_hours: None,
             page_access_checkpoint_interval_minutes: None,
@@ -703,7 +707,12 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
-    let background = talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg);
+    let background = talon_worker::runtime::WorkerBackground::start_with_ownership(
+        worker.clone(),
+        &cfg,
+        node.id.clone(),
+        control_tls.clone(),
+    );
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
     tokio::pin!(data);

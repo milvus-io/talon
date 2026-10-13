@@ -610,6 +610,15 @@ impl Lru {
         }
     }
 
+    /// Snapshot a bounded set of units selected by the ownership scanner.
+    pub(crate) fn ownership_candidates(&self, units: Vec<CacheUnit>) -> Vec<EvictionCandidate> {
+        let mut g = self.inner.lock().unwrap();
+        units
+            .into_iter()
+            .filter_map(|unit| g.entries.contains_key(&unit).then(|| g.snapshot(unit)))
+            .collect()
+    }
+
     /// Recheck with the block mutation gate held. Commits also pin under that gate.
     pub(crate) fn candidate_is_current(&self, candidate: &EvictionCandidate) -> bool {
         self.inner

@@ -61,7 +61,8 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
 - **Batch sizes** cap scanned entries and deletion candidates for watermark
   eviction and stale GC. The legacy `page_gc_scan_batch_size` and
   `page_gc_delete_batch_size` settings also apply to both tasks; the
-  smaller limit wins. Neither TTI GC nor file cleanup is truncated by these
+  smaller limit wins for backend-deletion checks. Ownership cleanup uses its own
+  batch sizes capped by the shared background limits. Neither TTI GC nor file cleanup is truncated by these
   limits. Checkpoints retain their atomic one-shard transaction, bounded by the
   existing 64 MiB format limit.
 - **Disk throughput** meters application data bytes before each checkpoint write
@@ -146,10 +147,16 @@ unit conversion, and environment-variable migration, see [Page TTI](page-tti.md#
 
 ## Stale GC: deleted backend objects
 
-`stale_gc_enabled = true` (the default) registers `stale_gc` with the same
-scheduler. The first round is eligible at startup; after a complete round finishes,
-the scheduler waits **one hour** before starting another. Rounds never overlap.
-Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable it.
+`stale_gc_enabled = true` (the default) enables the backend-deletion policy in
+`stale_gc`. The first round is eligible at startup; after a complete round finishes,
+this policy waits **one hour** before starting another. Rounds never overlap.
+Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable backend-deletion checks.
+
+The same task also hosts optional [ownership cleanup](ownership-gc.md), controlled
+independently by `ownership_gc_interval_secs` (default `0`, disabled). Ownership
+cleanup checks fresh Coordinator placement without an idle-age or backend HEAD
+requirement. The task picks the oldest due policy for each invocation; both keep
+their own scan cursors and round intervals. Disabling both removes the task.
 
 Only blocks idle for **more than 24 hours** are eligible. Reads and admissions
 refresh a process-local, monotonic block timestamp, shared by all of its pages.
@@ -166,8 +173,9 @@ five-second backend-work deadline per batch. Unprocessed candidates carry over
 to the next batch in the same round so slow objects cannot starve the remainder.
 Batches within a round have a one-second delay after completion; this is pacing,
 not the interval between full scans. Local deletion waits can extend a batch
-beyond the HEAD deadline. A full round retains its background task slot until all
-batches finish, as TTI GC does; other maintenance shares the remaining slots.
+beyond the HEAD deadline. Each batch releases its background task slot before the
+continuation delay, allowing other maintenance and the ownership policy to run.
+The `stale_gc` task metrics now count batches, rather than complete scan rounds.
 The existing disk concurrency and deletion rate budgets apply to unlinks, not
 HEAD traffic. A whole-block removal charges deletion work for all resident pages,
 even though they are removed together as a directory.

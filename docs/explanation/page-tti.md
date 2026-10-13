@@ -229,7 +229,7 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 - `gc_scanned_total`、`gc_batch_seconds`、`gc_scan_seconds`：扫描进度与耗时；后两者记录完整一轮
   GC（含删除等待）的耗时，不含轮次之间的间隔，保留 `batch` 指标名以兼容现有监控。
 - `tti_seconds`：配置的空闲过期时长；`0` 表示关闭按空闲时间回收。
-- `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded|backend_deleted`。
+- `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded|backend_deleted|ownership`；`ownership` 来自stale GC 中的[归属清理任务](ownership-gc.md)。
 - `gc_delete_errors_total`、`gc_pending_retries`：删除故障和最近完整扫描看到的重试量。
 - `access_dirty_blocks`、`access_oldest_dirty_seconds`：checkpoint 遍历观察到的未保存状态。
 - `access_checkpoint_bytes_total`、`access_checkpoint_errors_total`、

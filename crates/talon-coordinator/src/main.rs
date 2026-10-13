@@ -1454,6 +1454,18 @@ impl ControlAccess {
         }
     }
 
+    fn allows_message(&self, message: &ControlMessage) -> bool {
+        // Ownership GC reads the same ready-gated membership as public clients.
+        // Permit this read on the authenticated Worker channel as well.
+        if matches!(message, ControlMessage::MembershipQuery {}) {
+            return true;
+        }
+        self.allows(matches!(
+            message,
+            ControlMessage::NodeStatusHeartbeat { .. }
+        ))
+    }
+
     fn authorize(&self, message: &ControlMessage) -> Result<(), String> {
         let Self::WorkerService(identity) = self else {
             return Ok(());
@@ -1598,8 +1610,7 @@ where
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
         let result: anyhow::Result<()> = operation
             .scope(async {
-                let worker_service = matches!(message, ControlMessage::NodeStatusHeartbeat { .. });
-                let allowed = access.allows(worker_service);
+                let allowed = access.allows_message(&message);
                 let operation = talon_coordinator::ControlOperation::from_message(&message);
                 let started = Instant::now();
                 let reply = if !allowed {
@@ -1872,6 +1883,8 @@ mod tests {
         assert!(ControlAccess::Legacy.allows(true));
         assert!(ControlAccess::Legacy.allows(false));
         assert!(worker.allows(true));
+        assert!(worker.allows_message(&ControlMessage::MembershipQuery {}));
+        assert!(ControlAccess::PublicOnly.allows_message(&ControlMessage::MembershipQuery {}));
         assert!(!worker.allows(false));
         assert!(!ControlAccess::PublicOnly.allows(true));
         assert!(ControlAccess::PublicOnly.allows(false));

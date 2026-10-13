@@ -482,6 +482,38 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 - **Default:** `0`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `ownership_gc_interval_secs`
+
+Ownership GC scan-round interval in seconds; 0 disables ownership cleanup.
+
+- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS`
+- **Default:** `0`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `ownership_gc_replicas`
+
+Number of placement candidates to retain; must cover every reader replica count.
+
+- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_REPLICAS`
+- **Default:** `1`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `ownership_gc_scan_batch_size`
+
+Maximum blocks checked per ownership GC tick.
+
+- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `ownership_gc_delete_batch_size`
+
+Maximum cache units attempted per ownership GC tick.
+
+- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `page_tti_hours`
 
 Page time to idle in hours; 0 disables idle expiration.
