@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 mod async_eviction;
 mod background;
 mod load;
+mod stale_gc;
 pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]

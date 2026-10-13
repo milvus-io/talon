@@ -139,9 +139,9 @@ pub struct WorkerConfig {
     pub background_task_concurrency: usize,
     /// Shared local disk I/O concurrency for background maintenance.
     pub background_io_concurrency: usize,
-    /// Maximum entries scanned per watermark eviction batch.
+    /// Maximum entries scanned per watermark eviction or stale GC batch.
     pub background_scan_batch_size: usize,
-    /// Maximum deletion candidates per watermark eviction batch.
+    /// Maximum deletion candidates per watermark eviction or stale GC batch.
     pub background_delete_batch_size: usize,
     /// Shared background disk read/write MB/s (decimal); zero disables throttling.
     pub background_io_max_mb_per_sec: u64,
@@ -149,6 +149,8 @@ pub struct WorkerConfig {
     pub background_delete_max_per_sec: u64,
     /// Enable background eviction at cache occupancy watermarks.
     pub async_eviction_enabled: bool,
+    /// Reclaim idle cache entries whose backend object no longer exists.
+    pub stale_gc_enabled: bool,
     /// Start background eviction at this fraction of capacity_bytes.
     pub async_eviction_high_watermark: f64,
     /// Stop background eviction at or below this fraction of capacity_bytes.
@@ -178,9 +180,9 @@ pub struct WorkerConfig {
     pub page_gc_interval_minutes: u64,
     /// Delay between complete file cleanup passes in hours, independent of page GC.
     pub file_cleanup_interval_hours: u64,
-    /// Maximum entries per watermark eviction batch; does not limit page GC or file cleanup.
+    /// Maximum entries per watermark eviction or stale GC batch; does not limit page GC or file cleanup.
     pub page_gc_scan_batch_size: usize,
-    /// Maximum deletion candidates per watermark eviction batch; does not limit page GC or file cleanup.
+    /// Maximum deletion candidates per watermark eviction or stale GC batch; does not limit page GC or file cleanup.
     pub page_gc_delete_batch_size: usize,
     /// Maximum concurrent page GC deletion tasks.
     pub page_gc_io_concurrency: usize,
@@ -325,6 +327,7 @@ impl Default for WorkerConfig {
             background_io_max_mb_per_sec: 8,
             background_delete_max_per_sec: 1024,
             async_eviction_enabled: false,
+            stale_gc_enabled: true,
             async_eviction_high_watermark: 0.9,
             async_eviction_low_watermark: 0.8,
             async_eviction_check_interval_minutes: 1,
@@ -410,6 +413,8 @@ pub struct WorkerConfigPatch {
     pub background_delete_max_per_sec: Option<u64>,
     /// Override for [`WorkerConfig::async_eviction_enabled`].
     pub async_eviction_enabled: Option<bool>,
+    /// Override for [`WorkerConfig::stale_gc_enabled`].
+    pub stale_gc_enabled: Option<bool>,
     /// Override for [`WorkerConfig::async_eviction_high_watermark`].
     pub async_eviction_high_watermark: Option<f64>,
     /// Override for [`WorkerConfig::async_eviction_low_watermark`].
@@ -515,6 +520,7 @@ impl Patch for WorkerConfigPatch {
                 .background_delete_max_per_sec
                 .or(base.background_delete_max_per_sec),
             async_eviction_enabled: self.async_eviction_enabled.or(base.async_eviction_enabled),
+            stale_gc_enabled: self.stale_gc_enabled.or(base.stale_gc_enabled),
             async_eviction_high_watermark: self
                 .async_eviction_high_watermark
                 .or(base.async_eviction_high_watermark),
@@ -715,10 +721,11 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },
-    ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per watermark eviction batch." },
-    ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction batch." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per watermark eviction or stale GC batch." },
+    ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE", key: "background_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC", key: "background_delete_max_per_sec", default: Some("1024"), cli: false, secret: false, help: "Shared background deletion work items per second; zero disables throttling." },
+    ConfigVar { env: "TALON_WORKER_STALE_GC_ENABLED", key: "stale_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Check blocks idle over 24 hours for deleted backend objects; cache successful checks for 24 hours." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("false"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK", key: "async_eviction_high_watermark", default: Some("0.9"), cli: false, secret: false, help: "Start background eviction at this fraction of capacity_bytes." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK", key: "async_eviction_low_watermark", default: Some("0.8"), cli: false, secret: false, help: "Stop background eviction at or below this fraction of capacity_bytes." },
@@ -751,8 +758,8 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES", key: "page_gc_interval_minutes", default: Some("10"), cli: false, secret: false, help: "Delay between complete page GC passes in minutes." },
     ConfigVar { env: "TALON_WORKER_FILE_CLEANUP_INTERVAL_HOURS", key: "file_cleanup_interval_hours", default: Some("1"), cli: false, secret: false, help: "Delay between complete file cleanup passes in hours, independent of page GC." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries per watermark eviction batch; does not limit page GC or file cleanup." },
-    ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction batch; does not limit page GC or file cleanup." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE", key: "page_gc_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries per watermark eviction or stale GC batch; does not limit page GC or file cleanup." },
+    ConfigVar { env: "TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE", key: "page_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum deletion candidates per watermark eviction or stale GC batch; does not limit page GC or file cleanup." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_IO_CONCURRENCY", key: "page_gc_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent page GC deletion tasks." },
     ConfigVar {
         env: "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY",
@@ -971,6 +978,7 @@ pub(crate) mod worker_env {
     pub const BACKGROUND_DELETE_BATCH_SIZE: &str = "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE";
     pub const BACKGROUND_IO_MAX_MB_PER_SEC: &str = "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC";
     pub const BACKGROUND_DELETE_MAX_PER_SEC: &str = "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC";
+    pub const STALE_GC_ENABLED: &str = "TALON_WORKER_STALE_GC_ENABLED";
     pub const ASYNC_EVICTION_ENABLED: &str = "TALON_WORKER_ASYNC_EVICTION_ENABLED";
     pub const ASYNC_EVICTION_HIGH_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK";
     pub const ASYNC_EVICTION_LOW_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK";
@@ -1107,6 +1115,9 @@ impl WorkerConfigPatch {
                 .transpose()?,
             background_delete_max_per_sec: get(worker_env::BACKGROUND_DELETE_MAX_PER_SEC)
                 .map(|v| parse_u64(v, worker_env::BACKGROUND_DELETE_MAX_PER_SEC))
+                .transpose()?,
+            stale_gc_enabled: get(worker_env::STALE_GC_ENABLED)
+                .map(|v| parse_bool(v, worker_env::STALE_GC_ENABLED))
                 .transpose()?,
             async_eviction_enabled: get(worker_env::ASYNC_EVICTION_ENABLED)
                 .map(|v| parse_bool(v, worker_env::ASYNC_EVICTION_ENABLED))
@@ -1267,6 +1278,7 @@ impl WorkerConfig {
             background_delete_max_per_sec: merged
                 .background_delete_max_per_sec
                 .unwrap_or(d.background_delete_max_per_sec),
+            stale_gc_enabled: merged.stale_gc_enabled.unwrap_or(d.stale_gc_enabled),
             async_eviction_enabled: merged
                 .async_eviction_enabled
                 .unwrap_or(d.async_eviction_enabled),
@@ -2280,6 +2292,35 @@ mod tests {
             patch,
             WorkerConfigPatch::default(),
             WorkerConfigPatch::default()
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn stale_gc_config_layers() {
+        let file = WorkerConfigPatch::from_toml("stale_gc_enabled = false").unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_STALE_GC_ENABLED").then(|| "true".into())
+        })
+        .unwrap();
+        assert!(WorkerConfig::default().stale_gc_enabled);
+        assert!(
+            !WorkerConfig::resolve(file.clone(), Default::default(), Default::default())
+                .unwrap()
+                .stale_gc_enabled
+        );
+        assert!(
+            WorkerConfig::resolve(file.clone(), env.clone(), Default::default())
+                .unwrap()
+                .stale_gc_enabled
+        );
+        assert!(
+            !WorkerConfig::resolve(file.clone(), env, file)
+                .unwrap()
+                .stale_gc_enabled
+        );
+        assert!(WorkerConfigPatch::from_env_with(
+            |key| (key == "TALON_WORKER_STALE_GC_ENABLED").then(|| "invalid".into())
         )
         .is_err());
     }

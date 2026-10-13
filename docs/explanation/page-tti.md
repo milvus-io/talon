@@ -70,6 +70,8 @@ page 是可回收候选，实际访问仍可在认领前续期。跨重启时钟
 TTI GC 每次从头完整扫描内存中的 page 元数据，并处理本轮所有回收候选；扫描和候选数量
 不受批量配置限制。扫描在 blocking pool 执行，不读取 page 数据文件，实际删除仍受
 I/O 并发和删除速率限制，并在删除前重新校验访问和读者状态。
+后台任务名为 `tti_gc`（原 `page_gc`）。除 TTI 过期回收外，它还重试容量/旧版本淘汰失败的 page 删除，并清理空目录，因此关闭 TTI 不会停掉整个任务。现有 `page_gc_*` 配置和共享回收指标名称保持不变。
+
 首次启动即可扫描；一轮扫描及删除尝试完成后，再等待 `page_gc_interval_minutes`，默认 10 分钟。失败的删除留到下一轮重试。并发新加入或已越过游标位置的 page 可以留到下一轮。
 
 TTI 是异步回收条件，不是物理空间释放期限。扫描间隔、删除限速、失败重试及在途 FD
@@ -227,7 +229,7 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 - `gc_scanned_total`、`gc_batch_seconds`、`gc_scan_seconds`：扫描进度与耗时；后两者记录完整一轮
   GC（含删除等待）的耗时，不含轮次之间的间隔，保留 `batch` 指标名以兼容现有监控。
 - `tti_seconds`：配置的空闲过期时长；`0` 表示关闭按空闲时间回收。
-- `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded`。
+- `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded|backend_deleted`。
 - `gc_delete_errors_total`、`gc_pending_retries`：删除故障和最近完整扫描看到的重试量。
 - `access_dirty_blocks`、`access_oldest_dirty_seconds`：checkpoint 遍历观察到的未保存状态。
 - `access_checkpoint_bytes_total`、`access_checkpoint_errors_total`、

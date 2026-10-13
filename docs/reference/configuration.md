@@ -388,7 +388,7 @@ Shared local disk I/O concurrency for background maintenance.
 
 ### `background_scan_batch_size`
 
-Maximum entries scanned per watermark eviction batch.
+Maximum entries scanned per watermark eviction or stale GC batch.
 
 - **Environment variable:** `TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE`
 - **Default:** `65536`
@@ -396,7 +396,7 @@ Maximum entries scanned per watermark eviction batch.
 
 ### `background_delete_batch_size`
 
-Maximum deletion candidates per watermark eviction batch.
+Maximum deletion candidates per watermark eviction or stale GC batch.
 
 - **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE`
 - **Default:** `1024`
@@ -416,6 +416,14 @@ Shared background deletion work items per second; zero disables throttling.
 
 - **Environment variable:** `TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC`
 - **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `stale_gc_enabled`
+
+Check blocks idle over 24 hours for deleted backend objects; cache successful checks for 24 hours.
+
+- **Environment variable:** `TALON_WORKER_STALE_GC_ENABLED`
+- **Default:** `true`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `async_eviction_enabled`
@@ -508,7 +516,7 @@ Delay between complete file cleanup passes in hours, independent of page GC.
 
 ### `page_gc_scan_batch_size`
 
-Maximum entries per watermark eviction batch; does not limit page GC or file cleanup.
+Maximum entries per watermark eviction or stale GC batch; does not limit page GC or file cleanup.
 
 - **Environment variable:** `TALON_WORKER_PAGE_GC_SCAN_BATCH_SIZE`
 - **Default:** `65536`
@@ -516,7 +524,7 @@ Maximum entries per watermark eviction batch; does not limit page GC or file cle
 
 ### `page_gc_delete_batch_size`
 
-Maximum deletion candidates per watermark eviction batch; does not limit page GC or file cleanup.
+Maximum deletion candidates per watermark eviction or stale GC batch; does not limit page GC or file cleanup.
 
 - **Environment variable:** `TALON_WORKER_PAGE_GC_DELETE_BATCH_SIZE`
 - **Default:** `1024`

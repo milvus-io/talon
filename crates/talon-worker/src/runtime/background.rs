@@ -28,7 +28,7 @@ impl WorkerBackground {
         let gc = &worker.page_gc_config;
         let period = Duration::from_millis(gc.interval_ms);
         let w = worker.clone();
-        scheduler.register("page_gc", period, move || {
+        scheduler.register("tti_gc", period, move || {
             let w = w.clone();
             async move {
                 w.gc_once().await;
@@ -54,6 +54,15 @@ impl WorkerBackground {
                 let w = w.clone();
                 async move {
                     w.checkpoint_next_shard().await;
+                }
+            });
+        }
+        if config.stale_gc_enabled {
+            let w = worker.clone();
+            scheduler.register("stale_gc", Duration::from_secs(3600), move || {
+                let w = w.clone();
+                async move {
+                    super::stale_gc::StaleGc::run_round(&w).await;
                 }
             });
         }

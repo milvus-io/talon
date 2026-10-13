@@ -108,8 +108,8 @@ impl Mutations {
 #[derive(Clone)]
 pub(crate) struct PageGcMetrics {
     pub scanned: Counter,
-    pub deleted: [Counter; 3],
-    pub bytes: [Counter; 3],
+    pub deleted: [Counter; 4],
+    pub bytes: [Counter; 4],
     pub delete_errors: Counter,
     pub retries: Gauge,
     pub batch_duration: Histogram,
@@ -143,8 +143,8 @@ impl PageGcMetrics {
             cleanup_scan_seconds: g("talon_worker_page_cleanup_scan_seconds", "Latest complete disk cleanup scan duration."),
             cleanup_scan_at: g("talon_worker_page_cleanup_scan_timestamp_seconds", "Last completed disk cleanup scan Unix timestamp."),
             scanned: c("talon_worker_page_gc_scanned_total", "Pages examined by idle GC."),
-            deleted: ["tti", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_total", "Pages successfully unlinked by reason.", talon_core::metrics::labels(&[("reason", reason)]))),
-            bytes: ["tti", "capacity", "superseded"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_bytes_total", "Logical bytes successfully unlinked by reason; open descriptors may delay physical release.", talon_core::metrics::labels(&[("reason", reason)]))),
+            deleted: ["tti", "capacity", "superseded", "backend_deleted"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_total", "Pages successfully unlinked by reason.", talon_core::metrics::labels(&[("reason", reason)]))),
+            bytes: ["tti", "capacity", "superseded", "backend_deleted"].map(|reason| r.counter("talon_worker_page_gc_reclaimed_bytes_total", "Logical bytes successfully unlinked by reason; open descriptors may delay physical release.", talon_core::metrics::labels(&[("reason", reason)]))),
             delete_errors: c("talon_worker_page_gc_delete_errors_total", "Failed page unlink attempts."),
             retries: g("talon_worker_page_gc_pending_retries", "Retry pages observed in the latest complete scan."),
             batch_duration: r.histogram("talon_worker_page_gc_batch_seconds", "Complete idle GC invocation duration (legacy metric name).", Default::default()),

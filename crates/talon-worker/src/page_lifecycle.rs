@@ -223,7 +223,61 @@ pub(crate) struct BlockState {
     pub gate: Arc<PageMutationGate>,
     pub inner: Mutex<BlockPages>,
 }
+/// Holds every page closed until the owning block mutation either commits or
+/// fails. A failed claim or unlink reopens all pages, without scheduling page GC.
+pub(crate) struct BlockPageClaim {
+    block: Arc<BlockState>,
+    handles: Vec<Arc<PageState>>,
+    committed: bool,
+}
+impl BlockPageClaim {
+    pub fn len(&self) -> usize {
+        self.handles.len()
+    }
+
+    pub fn finish(mut self, now: u64) {
+        let mut g = self.block.inner.lock().unwrap();
+        g.pages.clear();
+        g.cleanup_pending = false;
+        g.changed(now);
+        self.committed = true;
+    }
+}
+impl Drop for BlockPageClaim {
+    fn drop(&mut self) {
+        if !self.committed {
+            for handle in &self.handles {
+                handle.state.fetch_and(!CLOSED, Ordering::Release);
+            }
+        }
+    }
+}
+
 impl BlockState {
+    /// Caller holds the block mutation gate and rechecks block activity after
+    /// claiming. CAS with each reader counter prevents partial block eviction.
+    pub fn claim_all_pages(self: &Arc<Self>) -> Option<BlockPageClaim> {
+        let g = self.inner.lock().unwrap();
+        let mut claim = BlockPageClaim {
+            block: self.clone(),
+            handles: Vec::with_capacity(g.pages.len()),
+            committed: false,
+        };
+        for entry in g.pages.values() {
+            let flags = entry.handle.state.load(Ordering::Acquire);
+            if flags & (READERS | CLOSED) != 0
+                || entry
+                    .handle
+                    .state
+                    .compare_exchange(flags, flags | CLOSED, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_err()
+            {
+                return None;
+            }
+            claim.handles.push(entry.handle.clone());
+        }
+        Some(claim)
+    }
     pub fn register(
         &self,
         page: PageIndex,

@@ -12,8 +12,8 @@
 //! are deferred per DESIGN.md.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use talon_core::{BlockId, ObjectId, PageIndex, Version};
 
@@ -27,7 +27,7 @@ pub enum CacheUnit {
 }
 
 impl CacheUnit {
-    fn block(&self) -> &BlockId {
+    pub(crate) fn block(&self) -> &BlockId {
         match self {
             Self::Whole(block) | Self::Page(block, _) => block,
         }
@@ -61,13 +61,36 @@ impl From<&BlockId> for LogicalBlock {
 
 /// Stable recency token for one resident unit. Keeping this token does not pin
 /// data. After removal it cannot affect a new admission of the same identity.
-#[derive(Clone, Default)]
-pub struct AccessHandle(Arc<AtomicBool>);
+#[derive(Clone)]
+pub struct AccessHandle(Arc<AtomicBool>, Arc<AtomicU64>);
+
+/// Process-local monotonic age. Restarted residents start a fresh idle window.
+pub(crate) fn access_millis() -> u64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1
+}
+
+impl Default for AccessHandle {
+    fn default() -> Self {
+        Self(
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicU64::new(access_millis())),
+        )
+    }
+}
 
 impl AccessHandle {
     /// Coalesce hits until the eviction hand consumes this second chance.
     /// This is advisory recency only, so relaxed ordering is sufficient.
     pub fn touch(&self) {
+        let now = access_millis();
+        if self.1.load(Ordering::Relaxed) < now {
+            self.1.fetch_max(now, Ordering::Relaxed);
+        }
         if !self.0.load(Ordering::Relaxed) {
             self.0.store(true, Ordering::Relaxed);
         }
@@ -79,6 +102,23 @@ impl AccessHandle {
 pub(crate) struct EvictionCandidate {
     pub unit: CacheUnit,
     revision: u64,
+}
+
+/// One complete resident block, independent of its whole/paged representation.
+#[derive(Clone, Debug)]
+pub(crate) struct StaleBlockCandidate {
+    pub block: BlockId,
+    pub units: usize,
+    revision: u64,
+    last_access: u64,
+}
+
+struct BlockActivity {
+    units: usize,
+    pins: usize,
+    position: u64,
+    revision: u64,
+    access: Arc<AtomicU64>,
 }
 
 struct Entry {
@@ -113,6 +153,10 @@ struct Inner {
     /// Only live units are indexed. `None` denotes a whole block; storing page
     /// indices avoids duplicating object paths and versions for every page.
     versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>>,
+    // Reference counts track resident units, not outstanding reader tokens.
+    block_access: HashMap<BlockId, BlockActivity>,
+    block_queue: BTreeMap<u64, BlockId>,
+    object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
     total_bytes: u64,
     clock: u64,
 }
@@ -150,6 +194,22 @@ impl Inner {
         let entry = self.entries.remove(unit)?;
         self.queue.remove(&entry.position);
         let block = unit.block();
+        let activity = self.block_access.get_mut(block).expect("tracked block");
+        activity.units -= 1;
+        activity.pins -= entry.pins as usize;
+        if activity.units == 0 {
+            let position = activity.position;
+            self.block_access.remove(block);
+            self.block_queue.remove(&position);
+        }
+        let check = self
+            .object_checks
+            .get_mut(&block.object)
+            .expect("tracked object");
+        check.0 -= 1;
+        if check.0 == 0 {
+            self.object_checks.remove(&block.object);
+        }
         let key = LogicalBlock::from(block);
         let versions = self.versions.get_mut(&key).expect("tracked logical block");
         let units = versions.get_mut(&block.version).expect("tracked version");
@@ -192,6 +252,9 @@ impl Lru {
                 entries: HashMap::new(),
                 queue: BTreeMap::new(),
                 versions: HashMap::new(),
+                block_access: HashMap::new(),
+                block_queue: BTreeMap::new(),
+                object_checks: HashMap::new(),
                 total_bytes: 0,
                 clock: 0,
             }),
@@ -218,11 +281,17 @@ impl Lru {
     /// existing admission preserves its pins and token.
     pub fn insert(&self, unit: CacheUnit, bytes: u64) -> AccessHandle {
         let mut g = self.inner.lock().unwrap();
+        let position = g.clock;
+        g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
             e.bytes = bytes;
             e.access.touch();
             let access = e.access.clone();
+            g.block_access
+                .get_mut(unit.block())
+                .expect("tracked block")
+                .revision = position;
             Self::subtract_bytes(&mut g.total_bytes, old);
             Self::add_bytes(&mut g.total_bytes, bytes);
             return access;
@@ -235,9 +304,29 @@ impl Lru {
             .entry(block.version.clone())
             .or_default()
             .insert(unit.page());
-        let access = AccessHandle::default();
-        let position = g.clock;
-        g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
+        if !g.block_access.contains_key(block) {
+            g.block_queue.insert(position, block.clone());
+            g.block_access.insert(
+                block.clone(),
+                BlockActivity {
+                    units: 0,
+                    pins: 0,
+                    position,
+                    revision: position,
+                    access: Arc::new(AtomicU64::new(access_millis())),
+                },
+            );
+        }
+        let activity = g.block_access.get_mut(block).expect("tracked block");
+        activity.units += 1;
+        activity.revision = position;
+        let access = AccessHandle(Arc::new(AtomicBool::new(false)), activity.access.clone());
+        // New pages also refresh the shared block idle age.
+        access.1.fetch_max(access_millis(), Ordering::Relaxed);
+        g.object_checks
+            .entry(block.object.clone())
+            .or_insert((0, None))
+            .0 += 1;
         let unit = Arc::new(unit);
         g.queue.insert(position, unit.clone());
         g.entries.insert(
@@ -269,6 +358,10 @@ impl Lru {
         match g.entries.get_mut(unit) {
             Some(e) => {
                 e.pins += 1;
+                g.block_access
+                    .get_mut(unit.block())
+                    .expect("tracked block")
+                    .pins += 1;
                 true
             }
             None => false,
@@ -286,7 +379,13 @@ impl Lru {
     pub fn unpin(&self, unit: &CacheUnit) {
         let mut g = self.inner.lock().unwrap();
         if let Some(e) = g.entries.get_mut(unit) {
-            e.pins = e.pins.saturating_sub(1);
+            if e.pins > 0 {
+                e.pins -= 1;
+                g.block_access
+                    .get_mut(unit.block())
+                    .expect("tracked block")
+                    .pins -= 1;
+            }
         }
     }
 
@@ -418,6 +517,97 @@ impl Lru {
             })
             .collect();
         units.into_iter().map(|unit| g.snapshot(unit)).collect()
+    }
+
+    /// Visit each block once, regardless of its number of cached pages. The
+    /// admission-ordered block queue is separate from the capacity eviction hand.
+    pub(crate) fn stale_gc_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        scan_budget: usize,
+        delete_budget: usize,
+    ) -> Vec<StaleBlockCandidate> {
+        let mut out = Vec::new();
+        if cursor.0 >= cursor.1 {
+            *cursor = (0, self.inner.lock().unwrap().clock);
+        }
+        for _ in 0..scan_budget {
+            let g = self.inner.lock().unwrap();
+            let Some((&position, block)) = g.block_queue.range(cursor.0..cursor.1).next() else {
+                cursor.0 = cursor.1;
+                break;
+            };
+            cursor.0 = position + 1;
+            let activity = &g.block_access[block];
+            let access = activity.access.load(Ordering::Relaxed);
+            let verified = g.object_checks[&block.object].1;
+            if activity.pins != 0
+                || now.saturating_sub(access) <= age
+                || verified.is_some_and(|at| now.saturating_sub(at) < age)
+            {
+                continue;
+            }
+            out.push(StaleBlockCandidate {
+                block: block.clone(),
+                units: activity.units,
+                revision: activity.revision,
+                last_access: access,
+            });
+            if out.len() >= delete_budget {
+                break;
+            }
+        }
+        out
+    }
+
+    pub(crate) fn stale_candidate_is_current(&self, candidate: &StaleBlockCandidate) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .block_access
+            .get(&candidate.block)
+            .is_some_and(|entry| {
+                entry.pins == 0
+                    && entry.revision == candidate.revision
+                    && entry.access.load(Ordering::Relaxed) == candidate.last_access
+            })
+    }
+
+    /// Called under the block mutation gate after its complete on-disk deletion.
+    pub(crate) fn remove_block(&self, block: &BlockId) {
+        let mut g = self.inner.lock().unwrap();
+        let Some(pages) = g
+            .versions
+            .get(&LogicalBlock::from(block))
+            .and_then(|versions| versions.get(&block.version))
+        else {
+            return;
+        };
+        let pages: Vec<_> = pages.iter().copied().collect();
+        for page in pages {
+            let unit = match page {
+                Some(page) => CacheUnit::Page(block.clone(), page),
+                None => CacheUnit::Whole(block.clone()),
+            };
+            g.remove(&unit);
+        }
+    }
+
+    pub(crate) fn stale_check_due(&self, object: &ObjectId, now: u64, age: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .object_checks
+            .get(object)
+            .is_some_and(|(_, at)| at.map_or(true, |at| now.saturating_sub(at) >= age))
+    }
+
+    pub(crate) fn stale_verified(&self, object: &ObjectId, now: u64) {
+        if let Some(check) = self.inner.lock().unwrap().object_checks.get_mut(object) {
+            check.1 = Some(now);
+        }
     }
 
     /// Recheck with the block mutation gate held. Commits also pin under that gate.
@@ -554,6 +744,57 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn stale_gc_age_boundary_and_sibling_activity() {
+        let lru = Lru::new();
+        let first = CacheUnit::Page(blk(1), PageIndex(0));
+        let second = CacheUnit::Page(blk(1), PageIndex(1));
+        let access = lru.insert(first, 16);
+        lru.insert(second.clone(), 16);
+        access.1.store(100, Ordering::Relaxed);
+        let mut cursor = (0, 0);
+        assert!(lru
+            .stale_gc_candidates(&mut cursor, 200, 100, 8, 8)
+            .is_empty());
+        let candidates = lru.stale_gc_candidates(&mut cursor, 201, 100, 8, 8);
+        assert_eq!(candidates.len(), 1);
+        assert!(candidates.iter().all(|c| lru.stale_candidate_is_current(c)));
+        // A touch of either page invalidates the block candidate.
+        access.1.store(201, Ordering::Relaxed);
+        lru.touch(&second);
+        assert!(candidates
+            .iter()
+            .all(|c| !lru.stale_candidate_is_current(c)));
+    }
+
+    #[test]
+    fn stale_gc_admission_replacement_and_metadata_retirement() {
+        let lru = Lru::new();
+        let unit = whole(1);
+        let old = lru.insert(unit.clone(), 16);
+        old.1.store(1, Ordering::Relaxed);
+        let candidates = lru.stale_gc_candidates(&mut (0, 0), 200, 100, 8, 8);
+        assert_eq!(candidates.len(), 1);
+        lru.stale_verified(&unit.block().object, 200);
+        lru.remove(&unit);
+        {
+            let g = lru.inner.lock().unwrap();
+            assert!(g.block_access.is_empty());
+            assert!(g.block_queue.is_empty());
+            assert!(g.object_checks.is_empty());
+        }
+        let new = lru.insert(unit, 16);
+        assert!(!Arc::ptr_eq(&old.1, &new.1));
+        assert!(!lru.stale_candidate_is_current(&candidates[0]));
+        assert!(lru
+            .inner
+            .lock()
+            .unwrap()
+            .object_checks
+            .values()
+            .all(|(_, at)| at.is_none()));
     }
 
     #[test]

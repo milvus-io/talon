@@ -310,6 +310,53 @@ impl WorkerRuntime {
             .await;
     }
 
+    /// Retire an entire stale block in one owned mutation. Page count affects
+    /// disk pacing, never which subset of the block is selected for eviction.
+    pub(super) async fn unlink_stale_block(&self, candidate: crate::eviction::StaleBlockCandidate) {
+        let runtime = self.clone();
+        self.page_mutations.run(async move {
+            let _permit = runtime.page_gc_io.clone().acquire_owned().await
+                .expect("page GC semaphore closed");
+            if let Some(budget) = &runtime.background_budget {
+                budget.delete_units(candidate.units as u64).await;
+            }
+            let _background_io = runtime.background_io().await;
+            let state = runtime.page_lifecycle.block(&candidate.block);
+            {
+                let _gate = state.gate.lock().await;
+                if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
+                let Some(claim) = state.claim_all_pages() else { return; };
+                // A reader may have completed while the pages were being closed.
+                if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
+                let id = &candidate.block;
+                let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
+                let pages = claim.len();
+                if let Err(error) = runtime.store.delete(id).await {
+                    runtime.page_gc_metrics.delete_errors.inc();
+                    tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
+                    return;
+                }
+                if let Some(paged) = &runtime.paged {
+                    if let Err(error) = paged.delete_block_async(id).await {
+                        runtime.page_gc_metrics.delete_errors.inc();
+                        tracing::warn!(block = %id, %error, "stale paged block unlink failed; retaining accounting");
+                        return;
+                    }
+                }
+                runtime.invalidate_l1(id);
+                runtime.index.remove(id);
+                runtime.lru.remove_block(id);
+                claim.finish(runtime.page_clock.now());
+                runtime.metrics.record_eviction();
+                if pages > 0 {
+                    runtime.page_gc_metrics.deleted[3].add(pages as u64);
+                    runtime.page_gc_metrics.bytes[3].add(bytes);
+                }
+            }
+            runtime.page_lifecycle.retire_empty(&candidate.block);
+        }).await;
+    }
+
     /// Capacity and superseded page eviction share the same commit protocol as TTI.
     pub(super) async fn unlink_units(
         &self,

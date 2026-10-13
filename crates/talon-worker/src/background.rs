@@ -261,7 +261,11 @@ impl BackgroundBudget {
             .expect("background budget remains open")
     }
     pub async fn delete(&self) {
-        self.deletes.charge(1).await;
+        self.delete_units(1).await;
+    }
+    /// Charge each resident page even when a stale block is removed as a directory.
+    pub async fn delete_units(&self, units: u64) {
+        self.deletes.charge(units).await;
     }
     /// Await before each bounded read/write chunk.
     pub async fn bytes(&self, bytes: usize) {
