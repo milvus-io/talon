@@ -225,3 +225,14 @@ without per-batch sleeps. Backend HEAD traffic has an independent paced budget:
 local deletion waits do not consume that timeout. Only NotFound authorizes
 removal, and pins/activity are revalidated before unlink. Large-block deletion
 credits accumulate across scheduler slices without holding I/O permits.
+
+## Ownership scan progress
+
+Membership sweeps keep their admission boundary and cursor across scheduler
+slices. A slice examines at most 64 blocks, yielding after ten milliseconds of
+work or a bounded deletion-credit payment. Protected blocks enter a retry set;
+one-second retries revisit only those admissions, not every resident block.
+Hourly supplements seek directly into a separate latest-admission index, so one
+new fill does not traverse older unchanged blocks. Refills move the block to its
+new admission position. Membership changes discard old progress and use the new
+event boundary; all unlinks still validate the current membership and activity.

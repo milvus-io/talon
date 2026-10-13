@@ -156,6 +156,7 @@ struct Inner {
     // Reference counts track resident units, not outstanding reader tokens.
     block_access: HashMap<BlockId, BlockActivity>,
     block_queue: BTreeMap<u64, BlockId>,
+    ownership_queue: BTreeMap<u64, BlockId>,
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
     total_bytes: u64,
     clock: u64,
@@ -201,6 +202,8 @@ impl Inner {
         activity.pins -= entry.pins as usize;
         if activity.units == 0 {
             let position = activity.position;
+            let revision = activity.revision;
+            self.ownership_queue.remove(&revision);
             self.block_access.remove(block);
             self.block_queue.remove(&position);
         }
@@ -256,6 +259,7 @@ impl Lru {
                 versions: HashMap::new(),
                 block_access: HashMap::new(),
                 block_queue: BTreeMap::new(),
+                ownership_queue: BTreeMap::new(),
                 object_checks: HashMap::new(),
                 total_bytes: 0,
                 clock: 0,
@@ -287,6 +291,11 @@ impl Lru {
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
         g.admission_ceiling = g.clock;
+        if let Some(activity) = g.block_access.get(unit.block()) {
+            let previous = activity.revision;
+            g.ownership_queue.remove(&previous);
+        }
+        g.ownership_queue.insert(position, unit.block().clone());
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
             e.bytes = bytes;
@@ -573,7 +582,7 @@ impl Lru {
         cursor: &mut (u64, u64),
     ) -> Option<StaleBlockCandidate> {
         let g = self.inner.lock().unwrap();
-        let (&position, block) = g.block_queue.range(cursor.0..cursor.1).next()?;
+        let (&position, block) = g.ownership_queue.range(cursor.0..cursor.1).next()?;
         cursor.0 = position + 1;
         let activity = &g.block_access[block];
         Some(StaleBlockCandidate {

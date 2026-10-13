@@ -2,6 +2,7 @@
 use super::{MembershipSnapshot, WorkerRuntime};
 use crate::eviction::StaleBlockCandidate;
 use std::{
+    collections::BTreeSet,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -19,6 +20,19 @@ pub(super) struct OwnershipGc {
     // Retain fixed supplemental bounds across cancellation and protected retries.
     supplement: Option<std::ops::Range<u64>>,
     next_supplement: tokio::time::Instant,
+    pass: Option<OwnershipPass>,
+    round_ended: bool,
+}
+
+struct OwnershipPass {
+    generation: u64,
+    range: std::ops::Range<u64>,
+    cursor: (u64, u64),
+    scanning: bool,
+    retry_cursor: u64,
+    retries: BTreeSet<u64>,
+    // Publish before awaiting so cancellation cannot lose a selected block.
+    attempt: Option<(StaleBlockCandidate, u64)>,
 }
 
 impl OwnershipGc {
@@ -37,6 +51,8 @@ impl OwnershipGc {
             completed_limit: 0,
             supplement: None,
             next_supplement: tokio::time::Instant::now() + SUPPLEMENT_INTERVAL,
+            pass: None,
+            round_ended: false,
         }
     }
 
@@ -50,7 +66,10 @@ impl OwnershipGc {
                     .any(|member| member.info.id == self.worker)
             })
             .map(|view| {
-                if view.generation != self.completed_generation || self.supplement.is_some() {
+                if self.pass.is_some() && !self.round_ended {
+                    Duration::ZERO
+                } else if view.generation != self.completed_generation || self.supplement.is_some()
+                {
                     Duration::from_secs(1)
                 } else {
                     self.next_supplement
@@ -59,55 +78,138 @@ impl OwnershipGc {
             })
     }
 
+    #[cfg(test)]
     pub(super) async fn run_round(&mut self, worker: &WorkerRuntime) {
+        let generation = worker.membership_snapshot().map(|view| view.generation);
+        loop {
+            self.run_slice(worker).await;
+            if self.next_delay(worker) != Some(Duration::ZERO)
+                || worker.membership_snapshot().map(|view| view.generation) != generation
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(super) async fn run_slice(&mut self, worker: &WorkerRuntime) {
         let Some(view) = self.prepare_ownership(worker) else {
             return;
         };
-        let range = if view.generation != self.completed_generation {
-            // Topology changes supersede any pending supplemental pass.
+        if self
+            .pass
+            .as_ref()
+            .is_some_and(|pass| pass.generation != view.generation)
+        {
+            self.pass = None;
             self.supplement = None;
-            // Namespaces first created after publication start at an empty
-            // boundary; their admissions belong to the hourly supplement.
-            0..view
-                .scan_limits
-                .get(worker.namespace.effective_name())
-                .copied()
-                .unwrap_or(0)
-        } else {
-            if self.supplement.is_none() {
+        }
+        if self.pass.is_none() {
+            let range = if view.generation != self.completed_generation {
+                self.supplement = None;
+                // Each namespace retains its own publication boundary.
+                0..view.scan_limits.get(worker.namespace.effective_name()).copied().unwrap_or(0)
+            } else {
                 let limit = worker.lru.ownership_admission_ceiling();
                 if limit <= self.completed_limit {
-                    // No writes: no index traversal, hashing, disk or backend work.
                     self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
                     return;
                 }
                 self.supplement = Some(self.completed_limit..limit);
-            }
-            self.supplement.clone().expect("supplemental bounds")
-        };
-        let mut cursor = (0, range.end);
-        let mut complete = true;
-        let mut slice_start = Instant::now();
-        while let Some(candidate) = worker.lru.next_ownership_block(&mut cursor) {
+                self.supplement.clone().unwrap()
+            };
+            self.pass = Some(OwnershipPass {
+                generation: view.generation,
+                cursor: (range.start, range.end),
+                retry_cursor: range.start,
+                range,
+                scanning: true,
+                retries: BTreeSet::new(),
+                attempt: None,
+            });
+        }
+        if self.round_ended {
+            let pass = self.pass.as_mut().unwrap();
+            pass.retry_cursor = pass.range.start;
+        }
+        self.round_ended = false;
+        let started = Instant::now();
+        for _ in 0..64 {
             if !worker.membership_is_current(&view) {
                 return;
             }
-            if range.contains(&candidate.revision) {
+            let pass = self.pass.as_mut().unwrap();
+            if pass.attempt.is_none() {
+                let next = if pass.scanning {
+                    worker.lru.next_ownership_block(&mut pass.cursor)
+                } else {
+                    let Some(revision) = pass.retries.range(pass.retry_cursor..).next().copied()
+                    else {
+                        self.finish_round(&view);
+                        return;
+                    };
+                    pass.retry_cursor = revision + 1;
+                    // A newer admission or independent deletion retires the old retry.
+                    let candidate = worker
+                        .lru
+                        .next_ownership_block(&mut (revision, revision + 1));
+                    if candidate.is_none() {
+                        pass.retries.remove(&revision);
+                        continue;
+                    }
+                    candidate
+                };
+                let Some(candidate) = next else {
+                    pass.scanning = false;
+                    self.finish_round(&view);
+                    return;
+                };
                 worker.page_gc_metrics.ownership_checked.inc();
-                if !self.owns(&candidate.block) {
-                    complete &= self.reclaim_block(worker, candidate, &view).await;
-                }
+                pass.attempt = Some((candidate, 0));
             }
-            // Yield by elapsed work time, not block count. Keep only one candidate;
-            // actual deletion waits already yield and use the shared I/O budgets.
-            if slice_start.elapsed() >= Duration::from_millis(10) {
-                tokio::task::yield_now().await;
-                slice_start = Instant::now();
+            let (candidate, paid) = self
+                .pass
+                .as_ref()
+                .unwrap()
+                .attempt
+                .as_ref()
+                .unwrap()
+                .clone();
+            let success =
+                if self.owns(&candidate.block) || worker.index.get(&candidate.block).is_none() {
+                    true
+                } else if !worker.lru.stale_candidate_is_current(&candidate) {
+                    false
+                } else {
+                    if let Some(budget) = &worker.background_budget {
+                        let credits = budget.delete_slice(candidate.units as u64 - paid).await;
+                        self.pass.as_mut().unwrap().attempt.as_mut().unwrap().1 += credits;
+                        if paid + credits < candidate.units as u64 {
+                            return;
+                        }
+                    }
+                    self.reclaim_block(worker, candidate.clone(), &view).await
+                };
+            let pass = self.pass.as_mut().unwrap();
+            pass.attempt = None;
+            if success {
+                pass.retries.remove(&candidate.revision);
+            } else {
+                pass.retries.insert(candidate.revision);
+            }
+            if started.elapsed() >= Duration::from_millis(10) {
+                return;
             }
         }
-        if complete && worker.membership_is_current(&view) {
+    }
+
+    fn finish_round(&mut self, view: &MembershipSnapshot) {
+        let pass = self.pass.as_ref().unwrap();
+        self.round_ended = true;
+        if pass.retries.is_empty() {
             self.completed_generation = view.generation;
-            self.completed_limit = range.end;
+            self.completed_limit = pass.range.end;
+            self.pass = None;
             self.supplement = None;
             self.next_supplement = tokio::time::Instant::now() + SUPPLEMENT_INTERVAL;
         }
@@ -170,9 +272,6 @@ impl OwnershipGc {
         candidate: StaleBlockCandidate,
         expected: &Arc<MembershipSnapshot>,
     ) -> bool {
-        if let Some(budget) = &worker.background_budget {
-            budget.delete_units(candidate.units as u64).await;
-        }
         // Rate waiting may outlive an observation: consume its latest renewal,
         // while requiring the original event generation.
         let Some(snapshot) = worker
@@ -570,6 +669,29 @@ mod tests {
             assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked + 3);
             assert!(gc.next_delay(&r).unwrap() > Duration::from_secs(1));
         }
+    }
+
+    #[tokio::test]
+    async fn protected_retry_does_not_rescan_owned_blocks() {
+        let fixture = MembershipFixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), false, Arc::new(Origin::default()));
+        for offset in 0..20 {
+            fill(&r, &placed("a", offset), false).await;
+        }
+        let outside = placed("b", 0);
+        fill(&r, &outside, false).await;
+        let pin = r.lru.pin_guard(CacheUnit::Whole(outside.clone())).unwrap();
+        let mut gc = fixture.gc(&r);
+        gc.run_round(&r).await;
+        let checked = r.page_gc_metrics.ownership_checked.get();
+        assert_eq!(checked, 21);
+        gc.run_round(&r).await;
+        assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked + 1);
+        drop(pin);
+        gc.run_round(&r).await;
+        assert!(r.index.get(&outside).is_none());
+        assert_eq!(r.index.len(), 20);
     }
 
     #[tokio::test]

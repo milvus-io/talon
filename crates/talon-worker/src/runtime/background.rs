@@ -185,7 +185,7 @@ impl WorkerBackground {
                             let gc = states
                                 .entry(namespace.namespace().effective_name().to_owned())
                                 .or_insert_with(|| super::ownership_gc::OwnershipGc::new(&config));
-                            gc.run_round(&namespace).await;
+                            gc.run_slice(&namespace).await;
                             if let Some(delay) = gc.next_delay(&namespace) {
                                 next = Some(next.map_or(delay, |old: Duration| old.min(delay)));
                             }
