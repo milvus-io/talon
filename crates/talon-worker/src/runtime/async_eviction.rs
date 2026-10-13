@@ -32,8 +32,14 @@ impl EvictionCycle {
             }
             if self.active {
                 for namespace in &workers {
-                    let target = ((namespace.lru.total_bytes() as u128 * self.low as u128)
-                        / total.max(1) as u128) as u64;
+                    // Cache units are indivisible: one namespace can release more
+                    // than requested. Recompute the global excess before reclaiming
+                    // from the next namespace instead of giving each a fixed share.
+                    let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
+                    if total <= self.low {
+                        break;
+                    }
+                    let target = namespace.lru.total_bytes().saturating_sub(total - self.low);
                     let lru = namespace.lru.clone();
                     let scan = namespace.page_gc_config.scan_batch_size;
                     let deletes = namespace.page_gc_config.delete_batch_size;
@@ -141,6 +147,100 @@ mod tests {
             r.commit_cached_block(&block(n), Bytes::from_static(&[1; 16]))
                 .await
                 .unwrap();
+        }
+    }
+
+    async fn filled_namespaces(
+        root: &Path,
+        paged: bool,
+        low_watermark: f64,
+    ) -> (Arc<WorkerRuntime>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
+        let config = WorkerConfig {
+            block_size: 16,
+            capacity_bytes: 160,
+            l2_page_size_bytes: if paged { 16 } else { 0 },
+            page_tti_hours: 0,
+            backend: Some("s3".into()),
+            async_eviction_low_watermark: low_watermark,
+            ..Default::default()
+        };
+        let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
+        let worker = Arc::new(
+            WorkerRuntime::open_namespaces(
+                &config,
+                lock,
+                Arc::new(UnusedOrigin),
+                WorkerMetrics::new(config.capacity_bytes),
+            )
+            .unwrap(),
+        );
+        let mut namespaces = Vec::new();
+        for n in 0..9 {
+            let namespace = worker
+                .for_namespace(&talon_core::NamespaceId::named(format!("ns-{n}")))
+                .await
+                .unwrap();
+            fill(&namespace, n, paged).await;
+            namespaces.push(namespace);
+        }
+        (worker, config, namespaces)
+    }
+
+    #[tokio::test]
+    async fn namespaces_stop_eviction_at_global_low_watermark() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, config, namespaces) = filled_namespaces(root.path(), paged, 0.8).await;
+            let resident = || namespaces.iter().map(|w| w.resident_bytes()).sum::<u64>();
+            assert_eq!(resident(), 144);
+            let mut cycle = EvictionCycle::new(config.capacity_bytes, &config);
+            cycle.tick(&worker).await;
+            assert_eq!(
+                resident(),
+                128,
+                "only one of the nine cache units must be evicted"
+            );
+            assert_eq!(
+                namespaces.iter().filter(|w| w.block_count() == 1).count(),
+                8
+            );
+            assert!(!cycle.active);
+            cycle.tick(&worker).await;
+            assert_eq!(
+                resident(),
+                128,
+                "a completed cycle must leave other namespaces intact"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn namespaces_resume_eviction_below_high_watermark_after_pins_release() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, config, namespaces) = filled_namespaces(root.path(), paged, 0.7).await;
+            let resident = || namespaces.iter().map(|w| w.resident_bytes()).sum::<u64>();
+            let pins: Vec<_> = namespaces[..8]
+                .iter()
+                .enumerate()
+                .map(|(n, w)| w.lru.pin_guard(unit(n as u64, paged)).unwrap())
+                .collect();
+            let mut cycle = EvictionCycle::new(config.capacity_bytes, &config);
+            cycle.tick(&worker).await;
+            assert_eq!(resident(), 128);
+            assert!(
+                cycle.active,
+                "pins prevent reaching the global low watermark of 112"
+            );
+            assert_eq!(namespaces[8].resident_bytes(), 0);
+            drop(pins);
+            cycle.tick(&worker).await;
+            assert_eq!(
+                resident(),
+                112,
+                "resume below high=144 and reclaim only one more unit"
+            );
+            assert!(!cycle.active);
         }
     }
 
