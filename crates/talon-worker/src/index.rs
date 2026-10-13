@@ -42,6 +42,14 @@ pub struct BlockIndex {
 struct Inner {
     map: HashMap<BlockId, IndexedBlock>,
     resident_bytes: u64,
+    resident_pages: u64,
+}
+
+fn materialized_pages(meta: &BlockMeta) -> u64 {
+    match &meta.form {
+        BlockForm::Whole => 0,
+        BlockForm::Paged { present, .. } => u64::from(present.count()),
+    }
 }
 
 struct IndexedBlock {
@@ -132,16 +140,7 @@ impl BlockIndex {
 
     /// Number of materialized pages across all paged blocks.
     pub fn page_count(&self) -> u64 {
-        self.inner
-            .read()
-            .unwrap()
-            .map
-            .values()
-            .map(|entry| match &entry.meta.form {
-                BlockForm::Whole => 0,
-                BlockForm::Paged { present, .. } => u64::from(present.count()),
-            })
-            .sum()
+        self.inner.read().unwrap().resident_pages
     }
 
     /// Look up a copy of a block's metadata.
@@ -258,10 +257,13 @@ impl BlockIndex {
     pub fn commit(&self, meta: BlockMeta) {
         let mut g = self.inner.write().unwrap();
         let added = meta.resident_bytes();
+        let pages = materialized_pages(&meta);
         if let Some(prev) = g.map.insert(meta.id.clone(), meta.into()) {
             g.resident_bytes = g.resident_bytes.saturating_sub(prev.meta.resident_bytes());
+            g.resident_pages -= materialized_pages(&prev.meta);
         }
         g.resident_bytes = g.resident_bytes.saturating_add(added);
+        g.resident_pages += pages;
     }
 
     /// Insert a paged block with an empty presence bitmap, unless one is already
@@ -310,12 +312,13 @@ impl BlockIndex {
         let BlockForm::Paged { page_size, present } = &mut meta.form else {
             return false;
         };
-        if present.is_present(page) {
+        if page.0 >= present.len() || present.is_present(page) {
             return false;
         }
         present.set(page);
         let bytes = talon_core::page_len(meta.len, *page_size, page);
         g.resident_bytes = g.resident_bytes.saturating_add(bytes);
+        g.resident_pages += 1;
         true
     }
 
@@ -342,6 +345,7 @@ impl BlockIndex {
         }
         let bytes = talon_core::page_len(meta.len, *page_size, page);
         g.resident_bytes = g.resident_bytes.saturating_sub(bytes);
+        g.resident_pages -= 1;
         true
     }
 
@@ -373,6 +377,7 @@ impl BlockIndex {
         let removed = g.map.remove(id).map(|entry| entry.meta);
         if let Some(meta) = &removed {
             g.resident_bytes = g.resident_bytes.saturating_sub(meta.resident_bytes());
+            g.resident_pages -= materialized_pages(meta);
         }
         removed
     }
@@ -399,6 +404,43 @@ mod tests {
             form: BlockForm::Whole,
             len,
         }
+    }
+
+    #[test]
+    fn page_accounting_survives_recovery_replacement_and_duplicate_mutations() {
+        let index = BlockIndex::new();
+        let id = block(1);
+        let mut present = PresentBitmap::new(id.page_count(4096));
+        present.set(PageIndex(0));
+        present.set(PageIndex(65));
+        let recovered = BlockMeta {
+            id: id.clone(),
+            form: BlockForm::Paged {
+                page_size: 4096,
+                present,
+            },
+            len: u64::from(id.block_size),
+        };
+        index.commit(recovered.clone());
+        index.commit(recovered);
+        assert_eq!(index.page_count(), 2);
+        assert!(!index.init_paged(id.clone(), 4096, u64::from(id.block_size)));
+        assert!(!index.mark_page(&id, PageIndex(65)));
+        assert!(!index.mark_page(&id, PageIndex(u32::MAX)));
+        assert!(index.mark_page(&id, PageIndex(100)));
+        assert_eq!(index.page_count(), 3);
+        assert!(index.clear_page(&id, PageIndex(0)));
+        assert!(!index.clear_page(&id, PageIndex(0)));
+        assert_eq!(index.page_count(), 2);
+        index.commit(whole_meta(id.clone(), u64::from(id.block_size)));
+        assert_eq!(index.page_count(), 0);
+        index.remove(&id);
+        index.init_paged(id.clone(), 4096, u64::from(id.block_size));
+        index.mark_page(&id, PageIndex(1));
+        assert_eq!(index.page_count(), 1);
+        index.remove(&id);
+        index.remove(&id);
+        assert_eq!(index.page_count(), 0);
     }
 
     #[test]
