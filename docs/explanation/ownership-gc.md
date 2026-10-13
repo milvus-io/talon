@@ -13,8 +13,10 @@ ownership_gc_enabled = true
 ownership_gc_replicas = 1
 ```
 
-Ownership cleanup defaults to disabled. Enabling it registers `ownership_gc` for
-logical membership changes and hourly supplemental admission checks.
+Ownership cleanup defaults to enabled. It registers `ownership_gc` for logical
+membership changes and hourly supplemental admission checks. Set
+`ownership_gc_enabled = false` or `TALON_WORKER_OWNERSHIP_GC_ENABLED=false` to
+stop both ownership maintenance and its control-plane membership refresh.
 `stale_gc_enabled` independently enables backend
 object deletion checks, which retain their one-hour delay after each completed
 backend round. Each setting controls its own task.
@@ -68,9 +70,10 @@ not immediately wake ownership; the supplemental check handles them later.
 A newer event supersedes the old generation, including A -> B -> A changes observed
 by the publisher between GC invocations. Missing, expired or self-excluding membership
 pauses ownership. Recovery or another topology event wakes it. GC never performs or
-waits for discovery. Coordinator upgrade must precede enabling cleanup: retained
-membership queries must be allowed on its authenticated Worker listener. No wire
-schema changes are needed.
+waits for discovery. Upgrade the Coordinator before Workers using the default-on
+cleanup: retained membership queries must be allowed on its authenticated Worker
+listener. Until then, explicitly disable ownership cleanup on Workers; failed
+membership queries otherwise defer cleanup. No wire schema changes are needed.
 
 ## Low-frequency supplemental cleanup
 

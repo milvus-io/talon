@@ -484,10 +484,10 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 
 ### `ownership_gc_enabled`
 
-Reclaim misplaced cache blocks after logical membership changes.
+Reclaim misplaced cache blocks on membership changes and hourly admission checks.
 
 - **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_ENABLED`
-- **Default:** `false`
+- **Default:** `true`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `ownership_gc_replicas`

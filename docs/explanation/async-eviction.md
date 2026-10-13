@@ -153,11 +153,12 @@ it waits **one hour** before starting another. Membership events do not reset
 this backend deadline. Rounds never overlap.
 Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable backend-deletion checks.
 
-Optional [ownership cleanup](ownership-gc.md) runs as a separate `ownership_gc`
-task. `ownership_gc_enabled` defaults to `false`. Logical membership changes
-trigger scans of pre-event blocks; stable, converged membership requires no further
-scanning. Ownership uses the snapshot published by the Worker control plane and
-never issues backend HEADs. The tasks share the resident block index, deletion
+[Ownership cleanup](ownership-gc.md) runs as a separate `ownership_gc` task and
+is enabled by default. Set `ownership_gc_enabled = false` to disable it. Logical
+membership changes trigger scans of pre-event blocks; hourly supplemental checks
+handle later admissions, skipping the resident scan when no admissions occurred.
+Ownership uses the snapshot published by the Worker control plane and never issues
+backend HEADs. The tasks share the resident block index, deletion
 budgets and whole-block reclaimer, while keeping scans and schedules independent.
 
 For backend-deletion checks, only blocks idle for **more than 24 hours** are eligible. Reads and admissions

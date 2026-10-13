@@ -504,7 +504,13 @@ mod tests {
     async fn stale_gc_scheduler_waits_an_hour_between_complete_rounds() {
         let root = tempfile::tempdir().unwrap();
         let r = Arc::new(runtime(root.path(), false, Arc::new(Origin::default())));
-        let service = super::super::WorkerBackground::start(r.clone(), &Default::default());
+        let service = super::super::WorkerBackground::start(
+            r.clone(),
+            &talon_core::WorkerConfig {
+                ownership_gc_enabled: false,
+                ..Default::default()
+            },
+        );
         let completed = r.metrics.registry.counter(
             "talon_worker_background_task_completed_total",
             "Completed background batches by task.",

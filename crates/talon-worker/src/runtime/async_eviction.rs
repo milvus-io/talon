@@ -243,7 +243,13 @@ mod tests {
         for paged in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let r = runtime(root.path(), paged, 160);
-            let mut cycle = EvictionCycle::new(160, &WorkerConfig::default());
+            let mut cycle = EvictionCycle::new(
+                160,
+                &WorkerConfig {
+                    ownership_gc_enabled: false,
+                    ..Default::default()
+                },
+            );
             for n in 0..8 {
                 fill(&r, n, paged).await;
             }
@@ -335,6 +341,7 @@ mod tests {
         let config = WorkerConfig {
             async_eviction_enabled: true,
             async_eviction_check_interval_minutes: 1,
+            ownership_gc_enabled: false,
             ..Default::default()
         };
         let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
@@ -371,7 +378,13 @@ mod tests {
         tokio::time::resume();
         tokio::task::yield_now().await;
         assert_eq!(r.resident_bytes(), 144);
-        let disabled = crate::runtime::WorkerBackground::start(r.clone(), &WorkerConfig::default());
+        let disabled = crate::runtime::WorkerBackground::start(
+            r.clone(),
+            &WorkerConfig {
+                ownership_gc_enabled: false,
+                ..Default::default()
+            },
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(r.resident_bytes(), 144);
         disabled.shutdown().await;
@@ -393,6 +406,7 @@ mod tests {
             let config = WorkerConfig {
                 async_eviction_enabled: true,
                 background_task_concurrency: 4,
+                ownership_gc_enabled: false,
                 ..Default::default()
             };
             let service = crate::runtime::WorkerBackground::start(r.clone(), &config);

@@ -170,7 +170,7 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
-    /// Reclaim misplaced cache blocks after logical membership changes.
+    /// Reclaim misplaced cache blocks on membership changes and hourly admission checks.
     pub ownership_gc_enabled: bool,
     /// Number of placement candidates to retain; must cover every reader replica count.
     pub ownership_gc_replicas: usize,
@@ -339,7 +339,7 @@ impl Default for WorkerConfig {
             l1_page_size_bytes: 256 << 10,
             l2_page_size_bytes: 0,
             paged_miss_run_concurrency: 8,
-            ownership_gc_enabled: false,
+            ownership_gc_enabled: true,
             ownership_gc_replicas: 1,
             load_inflight_bytes: 1 << 30,
             page_tti_hours: 0,
@@ -766,7 +766,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("false"), cli: false, secret: false, help: "Reclaim misplaced cache blocks after logical membership changes." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
     ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
@@ -1968,7 +1968,29 @@ mod tests {
         let cfg = WorkerConfig::resolve(file, env, Default::default()).unwrap();
         assert!(cfg.ownership_gc_enabled);
         assert_eq!(cfg.ownership_gc_replicas, 3);
-        assert!(!WorkerConfig::default().ownership_gc_enabled);
+        assert!(WorkerConfig::default().ownership_gc_enabled);
+        assert!(
+            WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+                .unwrap()
+                .ownership_gc_enabled
+        );
+        let disabled = WorkerConfigPatch::from_toml("ownership_gc_enabled = false").unwrap();
+        assert!(
+            !WorkerConfig::resolve(disabled, Default::default(), Default::default())
+                .unwrap()
+                .ownership_gc_enabled
+        );
+        let env_disabled = WorkerConfigPatch::from_env_with(|name| match name {
+            "TALON_WORKER_OWNERSHIP_GC_ENABLED" => Some("false".into()),
+            _ => None,
+        })
+        .unwrap();
+        let enabled = WorkerConfigPatch::from_toml("ownership_gc_enabled = true").unwrap();
+        assert!(
+            !WorkerConfig::resolve(enabled, env_disabled, Default::default())
+                .unwrap()
+                .ownership_gc_enabled
+        );
         let patch = WorkerConfigPatch::from_toml("ownership_gc_replicas = 0").unwrap();
         assert!(WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err());
     }

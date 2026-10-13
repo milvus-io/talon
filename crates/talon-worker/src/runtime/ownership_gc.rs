@@ -265,7 +265,6 @@ mod tests {
                 members: std::sync::Mutex::new(Some(vec!["a", "b"])),
                 config: WorkerConfig {
                     node_id: Some("a".into()),
-                    ownership_gc_enabled: true,
                     stale_gc_enabled: false,
                     ..Default::default()
                 },
@@ -989,7 +988,7 @@ mod tests {
                 }
                 fixture.publish(&r);
                 let mut config = fixture.config.clone();
-                config.ownership_gc_enabled = true;
+                assert!(config.ownership_gc_enabled);
                 config.background_scan_batch_size = 1;
                 (
                     super::super::WorkerBackground::start(r.clone(), &config),
@@ -997,7 +996,13 @@ mod tests {
                 )
             } else {
                 (
-                    super::super::WorkerBackground::start(r.clone(), &Default::default()),
+                    super::super::WorkerBackground::start(
+                        r.clone(),
+                        &WorkerConfig {
+                            ownership_gc_enabled: false,
+                            ..Default::default()
+                        },
+                    ),
                     3600,
                 )
             };
