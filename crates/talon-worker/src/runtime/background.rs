@@ -34,7 +34,7 @@ impl WorkerBackground {
         let global_gc = crate::page_gc::PageGcConfig::from(config);
         let period = Duration::from_millis(
             worker
-                .tenant_runtimes()
+                .namespace_runtimes()
                 .iter()
                 .map(|w| w.page_gc_config.interval_ms)
                 .chain([gc.interval_ms, global_gc.interval_ms])
@@ -47,9 +47,9 @@ impl WorkerBackground {
             let w = w.clone();
             let last = last_gc.clone();
             async move {
-                for tenant in w.tenant_runtimes() {
-                    if due(&last, &tenant, tenant.page_gc_config.interval_ms) {
-                        tenant.gc_once().await;
+                for namespace in w.namespace_runtimes() {
+                    if due(&last, &namespace, namespace.page_gc_config.interval_ms) {
+                        namespace.gc_once().await;
                     }
                 }
             }
@@ -61,14 +61,14 @@ impl WorkerBackground {
             move || {
                 let w = w.clone();
                 async move {
-                    for tenant in w.tenant_runtimes() {
-                        tenant.cleanup_page_files_once().await;
+                    for namespace in w.namespace_runtimes() {
+                        namespace.cleanup_page_files_once().await;
                     }
                 }
             },
         );
         if worker
-            .tenant_runtimes()
+            .namespace_runtimes()
             .iter()
             .any(|w| w.page_gc_config.tti_ms > 0)
             || config.page_tti_hours > 0
@@ -76,7 +76,7 @@ impl WorkerBackground {
             let w = worker.clone();
             let period = Duration::from_millis(
                 (worker
-                    .tenant_runtimes()
+                    .namespace_runtimes()
                     .iter()
                     .map(|w| w.page_gc_config.checkpoint_interval_ms)
                     .chain([gc.checkpoint_interval_ms, global_gc.checkpoint_interval_ms])
@@ -90,17 +90,17 @@ impl WorkerBackground {
                 let w = w.clone();
                 let last = last_checkpoint.clone();
                 async move {
-                    for tenant in w.tenant_runtimes() {
-                        if tenant.page_gc_config.tti_ms > 0
+                    for namespace in w.namespace_runtimes() {
+                        if namespace.page_gc_config.tti_ms > 0
                             && due(
                                 &last,
-                                &tenant,
-                                (tenant.page_gc_config.checkpoint_interval_ms
+                                &namespace,
+                                (namespace.page_gc_config.checkpoint_interval_ms
                                     / crate::page_lifecycle::SHARDS as u64)
                                     .max(1),
                             )
                         {
-                            tenant.checkpoint_next_shard().await;
+                            namespace.checkpoint_next_shard().await;
                         }
                     }
                 }
@@ -111,16 +111,15 @@ impl WorkerBackground {
             scheduler.register("stale_gc", Duration::from_secs(3600), move || {
                 let w = w.clone();
                 async move {
-                    for tenant in w.tenant_runtimes() {
-                        super::stale_gc::StaleGc::run_round(&tenant).await;
+                    for namespace in w.namespace_runtimes() {
+                        super::stale_gc::StaleGc::run_round(&namespace).await;
                     }
                 }
             });
         }
         if config.ownership_gc_enabled {
-            let gc = Arc::new(tokio::sync::Mutex::new(
-                super::ownership_gc::OwnershipGc::new(config),
-            ));
+            let gc = Arc::new(tokio::sync::Mutex::new(HashMap::new()));
+            let config = Arc::new(config.clone());
             let w = worker.clone();
             scheduler.register_triggered(
                 "ownership_gc",
@@ -128,10 +127,20 @@ impl WorkerBackground {
                 move || {
                     let w = w.clone();
                     let gc = gc.clone();
+                    let config = config.clone();
                     async move {
-                        let mut gc = gc.lock().await;
-                        gc.run_round(&w).await;
-                        gc.next_delay(&w)
+                        let mut states = gc.lock().await;
+                        let mut next = None;
+                        for namespace in w.namespace_runtimes() {
+                            let gc = states
+                                .entry(namespace.namespace().effective_name().to_owned())
+                                .or_insert_with(|| super::ownership_gc::OwnershipGc::new(&config));
+                            gc.run_round(&namespace).await;
+                            if let Some(delay) = gc.next_delay(&namespace) {
+                                next = Some(next.map_or(delay, |old: Duration| old.min(delay)));
+                            }
+                        }
+                        next
                     }
                 },
             );
@@ -168,10 +177,10 @@ impl WorkerBackground {
     /// using the same disk budget. External process shutdown deadlines still apply.
     pub async fn shutdown(self) {
         self.scheduler.shutdown().await;
-        self.worker.drain_tenant_initializers().await;
-        for tenant in self.worker.tenant_runtimes() {
-            tenant.drain_page_mutations().await;
-            tenant.checkpoint_access_times().await;
+        self.worker.drain_namespace_initializers().await;
+        for namespace in self.worker.namespace_runtimes() {
+            namespace.drain_page_mutations().await;
+            namespace.checkpoint_access_times().await;
         }
     }
 }
@@ -179,7 +188,7 @@ impl WorkerBackground {
 fn due(last: &Mutex<HashMap<String, Instant>>, worker: &WorkerRuntime, millis: u64) -> bool {
     let mut last = last.lock().unwrap();
     let now = Instant::now();
-    let name = worker.tenant.effective_name();
+    let name = worker.namespace.effective_name();
     if last
         .get(name)
         .is_some_and(|previous| now.duration_since(*previous) < Duration::from_millis(millis))

@@ -43,7 +43,7 @@ public final class Frame {
         PING(4),
         DELETE(5),
         GET_VERSIONED_RANGE(10),
-        GET_VERSIONED_RANGE_TENANT(11);
+        GET_VERSIONED_RANGE_NAMESPACE(11);
 
         final int value;
 

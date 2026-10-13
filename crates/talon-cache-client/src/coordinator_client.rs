@@ -21,7 +21,7 @@
 #[cfg(test)]
 use crate::membership_fixture;
 
-use talon_core::TenantContext;
+use talon_core::NamespaceContext;
 
 use std::collections::HashMap;
 #[cfg(test)]
@@ -108,7 +108,7 @@ impl CoordinatorError {
 /// TCP handshake (issue #181). Cloneable — clones share the same pool.
 #[derive(Debug, Clone)]
 pub struct CoordinatorClient {
-    tenant: talon_core::TenantId,
+    namespace: talon_core::NamespaceId,
     addr: String,
     pool: Arc<ConnectionPool>,
 }
@@ -122,7 +122,7 @@ impl CoordinatorClient {
     /// Create a client that reuses connections from the shared `pool`.
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
-            tenant: talon_core::TenantId::default(),
+            namespace: talon_core::NamespaceId::default(),
             addr: addr.into(),
             pool,
         }
@@ -135,11 +135,11 @@ impl CoordinatorClient {
     /// Create a per-request control handle, including proxied metadata calls.
     pub fn request(
         &self,
-        tenant: &talon_core::TenantId,
-    ) -> Result<Self, talon_core::TenantIdError> {
-        tenant.validate()?;
+        namespace: &talon_core::NamespaceId,
+    ) -> Result<Self, talon_core::NamespaceIdError> {
+        namespace.validate()?;
         let mut request = self.clone();
-        request.tenant = tenant.normalized();
+        request.namespace = namespace.normalized();
         Ok(request)
     }
 
@@ -231,21 +231,24 @@ impl CoordinatorClient {
     /// version resolution if the mount ever becomes version-aware; kept for that
     /// and covered by its own test.
     pub async fn stat_object(&self, object: &ObjectId) -> Result<ObjectStat, CoordinatorError> {
-        self.stat_object_with_context(object, self.tenant.context().expect("validated tenant"))
-            .await
+        self.stat_object_with_context(
+            object,
+            self.namespace.context().expect("validated namespace"),
+        )
+        .await
     }
 
-    /// Fetch metadata with a borrowed request tenant, reusing this client's pool.
+    /// Fetch metadata with a borrowed request namespace, reusing this client's pool.
     pub async fn stat_object_with_context(
         &self,
         object: &ObjectId,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<ObjectStat, CoordinatorError> {
         let req = ControlMessage::StatObject {
             object: object.clone(),
         };
         match self
-            .round_trip_with_context(req, "StatObject", tenant)
+            .round_trip_with_context(req, "StatObject", namespace)
             .await?
         {
             ControlMessage::ControlFailure { code, message } => {
@@ -270,21 +273,24 @@ impl CoordinatorClient {
         &self,
         prefix: &str,
     ) -> Result<Vec<talon_transport::ObjectEntry>, CoordinatorError> {
-        self.list_objects_with_context(prefix, self.tenant.context().expect("validated tenant"))
-            .await
+        self.list_objects_with_context(
+            prefix,
+            self.namespace.context().expect("validated namespace"),
+        )
+        .await
     }
 
-    /// List metadata with a borrowed request tenant, reusing this client's pool.
+    /// List metadata with a borrowed request namespace, reusing this client's pool.
     pub async fn list_objects_with_context(
         &self,
         prefix: &str,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<Vec<talon_transport::ObjectEntry>, CoordinatorError> {
         let req = ControlMessage::ListObjects {
             prefix: prefix.to_string(),
         };
         match self
-            .round_trip_with_context(req, "ListObjects", tenant)
+            .round_trip_with_context(req, "ListObjects", namespace)
             .await?
         {
             ControlMessage::ControlFailure { code, message } => {
@@ -352,7 +358,7 @@ impl CoordinatorClient {
         self.round_trip_with_context(
             msg,
             expected,
-            self.tenant.context().expect("validated tenant"),
+            self.namespace.context().expect("validated namespace"),
         )
         .await
     }
@@ -361,16 +367,16 @@ impl CoordinatorClient {
         &self,
         msg: ControlMessage,
         expected: &'static str,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<ControlMessage, CoordinatorError> {
         let mut out = talon_transport::encode(0, &msg)?;
-        match self.exchange(&mut out, expected, tenant).await {
+        match self.exchange(&mut out, expected, namespace).await {
             Ok(reply) => Ok(reply),
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_tenant_context(
-                        &mut out, &self.addr, tenant,
+                    talon_transport::envelope::outbound_namespace_context(
+                        &mut out, &self.addr, namespace,
                     )
                     .map_err(talon_transport::CodecError::from)?;
 
@@ -401,11 +407,11 @@ impl CoordinatorClient {
         &self,
         out: &mut Vec<u8>,
         expected: &'static str,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<ControlMessage, (bool, CoordinatorError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound_tenant_context(out, &self.addr, tenant)
+            talon_transport::envelope::outbound_namespace_context(out, &self.addr, namespace)
                 .map_err(|e| (false, CoordinatorError::Codec(e.into())))?;
 
             let (mut stream, reused) = self
@@ -519,7 +525,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn borrowed_tenant_survives_metadata_and_read_retries() {
+    async fn borrowed_namespace_survives_metadata_and_read_retries() {
         for metadata in [true, false] {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap().to_string();
@@ -534,7 +540,10 @@ mod tests {
                         socket.read_exact(&mut body).await.unwrap();
                         let (context, _) =
                             talon_transport::envelope::decode(&header, &body).unwrap();
-                        assert_eq!(context.tenant.unwrap_or_default().effective_name(), *name);
+                        assert_eq!(
+                            context.namespace.unwrap_or_default().effective_name(),
+                            *name
+                        );
                         // Fail only the named request on a previously successful socket.
                         if attempt == 0 && index == 1 {
                             break;
@@ -563,11 +572,11 @@ mod tests {
             let object = block().object;
             let version = Version::new("v1");
             for name in ["default", "a", "default"] {
-                let tenant = TenantContext::new(name).unwrap();
+                let namespace = NamespaceContext::new(name).unwrap();
                 if metadata {
                     assert_eq!(
                         coordinator
-                            .stat_object_with_context(&object, tenant)
+                            .stat_object_with_context(&object, namespace)
                             .await
                             .unwrap()
                             .version,
@@ -578,7 +587,7 @@ mod tests {
                     assert_eq!(
                         worker
                             .fetch_versioned_range_into_with_context(
-                                &object, &version, 0, &mut dst, 1, tenant
+                                &object, &version, 0, &mut dst, 1, namespace
                             )
                             .await
                             .unwrap(),

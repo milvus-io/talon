@@ -339,17 +339,17 @@ impl WorkerMetrics {
         self.request_duration_seconds.observe(elapsed.as_secs_f64());
     }
 
-    /// Record a request rejected by per-tenant rate limiting.
+    /// Record a request rejected by per-namespace rate limiting.
     ///
-    /// Labelled only by the exceeded metric, never by tenant, to keep the series
-    /// bounded; per-tenant drill-down is a management-API concern. A throttle is
+    /// Labelled only by the exceeded metric, never by namespace, to keep the series
+    /// bounded; per-namespace drill-down is a management-API concern. A throttle is
     /// a distinct outcome from success or error, so it does not touch the
     /// request success/error counters.
     pub fn record_rate_limited(&self, metric: RateMetric) {
         self.registry
             .counter(
                 "talon_worker_rate_limited_total",
-                "Requests rejected by per-tenant rate limiting, by exceeded metric.",
+                "Requests rejected by per-namespace rate limiting, by exceeded metric.",
                 labels(&[("metric", metric.label())]),
             )
             .inc();
@@ -685,7 +685,7 @@ impl WorkerReadiness {
 
 /// Shared worker observability state exposed to HTTP and heartbeats.
 pub struct WorkerObservability {
-    tenant_runtime: std::sync::OnceLock<std::sync::Weak<crate::WorkerRuntime>>,
+    namespace_runtime: std::sync::OnceLock<std::sync::Weak<crate::WorkerRuntime>>,
     node: NodeInfo,
     cluster_id: String,
     admin_address: String,
@@ -735,7 +735,7 @@ impl WorkerObservability {
         inflight: Arc<InFlightLoads>,
     ) -> std::io::Result<Self> {
         Ok(Self {
-            tenant_runtime: std::sync::OnceLock::new(),
+            namespace_runtime: std::sync::OnceLock::new(),
             node,
             cluster_id,
             admin_address,
@@ -759,24 +759,29 @@ impl WorkerObservability {
         self
     }
 
-    /// Aggregate residency across the worker's tenant namespaces.
-    pub fn attach_tenant_runtime(&self, worker: &Arc<crate::WorkerRuntime>) {
-        let _ = self.tenant_runtime.set(Arc::downgrade(worker));
+    /// Aggregate residency across the worker's namespaces.
+    pub fn attach_namespace_runtime(&self, worker: &Arc<crate::WorkerRuntime>) {
+        let _ = self.namespace_runtime.set(Arc::downgrade(worker));
     }
 
     fn residency(&self) -> (u64, u64, u64, u64) {
-        if let Some(worker) = self.tenant_runtime.get().and_then(std::sync::Weak::upgrade) {
-            let tenants = worker.tenant_runtimes();
-            return tenants
-                .iter()
-                .fold((0, 0, 0, 0), |(loads, blocks, pages, bytes), tenant| {
+        if let Some(worker) = self
+            .namespace_runtime
+            .get()
+            .and_then(std::sync::Weak::upgrade)
+        {
+            let namespaces = worker.namespace_runtimes();
+            return namespaces.iter().fold(
+                (0, 0, 0, 0),
+                |(loads, blocks, pages, bytes), namespace| {
                     (
-                        loads + tenant.inflight_count(),
-                        blocks + tenant.block_count(),
-                        pages + tenant.page_count(),
-                        bytes + tenant.resident_bytes(),
+                        loads + namespace.inflight_count(),
+                        blocks + namespace.block_count(),
+                        pages + namespace.page_count(),
+                        bytes + namespace.resident_bytes(),
                     )
-                });
+                },
+            );
         }
         (
             self.inflight.len() as u64,

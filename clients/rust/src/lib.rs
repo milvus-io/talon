@@ -62,17 +62,17 @@ pub use talon_cache_client::{
     BlockReadError, CacheReadError, CoordinatorError, LoadError, LoadFailure, LoadResult,
     ObjectStat, WorkerError, WorkerLoadError,
 };
-pub use talon_core::{ObjectId, TenantId, Version, DEFAULT_TENANT, UNCHECKED_VERSION};
+pub use talon_core::{NamespaceId, ObjectId, Version, DEFAULT_NAMESPACE, UNCHECKED_VERSION};
 pub use talon_transport::{DataErrorCode, DataPlaneError, ObjectEntry};
 
 pub use talon_telemetry::{TraceContext, TraceParent};
 
-/// Per-operation routing and trace options. Omitted tenant selects `default`.
-/// A batch uses one tenant; concurrent batches on the same client may differ.
+/// Per-operation routing and trace options. Omitted namespace selects `default`.
+/// A batch uses one namespace; concurrent batches on the same client may differ.
 #[derive(Clone, Copy, Default)]
 pub struct RequestOptions<'a> {
     pub parent: TraceParent<'a>,
-    pub tenant: Option<&'a str>,
-    /// Override the client's planning default to match this tenant's worker policy.
+    pub namespace: Option<&'a str>,
+    /// Override the client's planning default to match this namespace's worker policy.
     pub block_size: Option<u32>,
 }

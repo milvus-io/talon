@@ -25,10 +25,10 @@ public final class Telemetry {
     private static final class CallContext {
         final TraceContext parent;
         final byte[] readId;
-        final String tenant;
+        final String namespace;
         final Integer blockSize;
         CallContext(TraceContext parent, RequestOptions options, CallContext previous) {
-            tenant = options.tenant;
+            namespace = options.namespace;
             blockSize = options.blockSize;
             this.parent = parent;
             if (options.inherit && previous != null) {
@@ -54,9 +54,9 @@ public final class Telemetry {
         finally { if (previous == null) CURRENT.remove(); else CURRENT.set(previous); }
     }
 
-    static String tenant() {
+    static String namespace() {
         CallContext current = CURRENT.get();
-        return current == null ? "default" : current.tenant;
+        return current == null ? "default" : current.namespace;
     }
 
     static int blockSize(int fallback) {
@@ -90,14 +90,14 @@ public final class Telemetry {
         return result;
     }
 
-    static byte[] tenantEnvelope(byte[] request, String endpoint, String tenant) {
+    static byte[] namespaceEnvelope(byte[] request, String endpoint, String namespace) {
         byte[] frame = envelope(request, endpoint);
-        if (tenant.equals("default")) return frame;
-        byte[] name = tenant.getBytes(StandardCharsets.US_ASCII);
+        if (namespace.equals("default")) return frame;
+        byte[] name = namespace.getBytes(StandardCharsets.US_ASCII);
         int oldMetadata = frame[2] == 2 ? Short.toUnsignedInt(ByteBuffer.wrap(frame).getShort(16)) : 0;
         int oldBusiness = frame[2] == 2 ? 18 + oldMetadata : 16;
         int newMetadata = oldMetadata + 3 + name.length;
-        if (newMetadata > 1024) throw new ProtocolException("tenant metadata too large");
+        if (newMetadata > 1024) throw new ProtocolException("namespace metadata too large");
         byte[] result = new byte[18 + newMetadata + frame.length - oldBusiness];
         System.arraycopy(frame, 0, result, 0, 16);
         if (oldMetadata > 0) System.arraycopy(frame, 18, result, 18, oldMetadata);

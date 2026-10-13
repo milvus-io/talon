@@ -64,28 +64,28 @@ pub enum MsgType {
     /// Admit one complete, versioned block into the worker cache without
     /// accessing the configured backend.
     AdmitCachedBlock = 7,
-    /// A sub-range fetch that declares the tenant it is attributed to, for
-    /// per-tenant QoS (a bincode
-    /// [`TenantScopedRange`](crate::data::TenantScopedRange) header). The reply
+    /// A sub-range fetch that declares the namespace it is attributed to, for
+    /// per-namespace QoS (a bincode
+    /// [`NamespaceScopedRange`](crate::data::NamespaceScopedRange) header). The reply
     /// is an ordinary `GetRange` frame; an older worker rejects this distinct
-    /// type rather than misreading the tenant prefix as part of the request.
-    GetRangeTenant = 8,
-    /// A cache-only versioned range fetch that declares the tenant it is
+    /// type rather than misreading the namespace prefix as part of the request.
+    GetRangeNamespace = 8,
+    /// A cache-only versioned range fetch that declares the namespace it is
     /// attributed to (a bincode
-    /// [`TenantScopedCachedRange`](crate::data::TenantScopedCachedRange) header),
-    /// so resident-only reads are still metered per tenant. Like
+    /// [`NamespaceScopedCachedRange`](crate::data::NamespaceScopedCachedRange) header),
+    /// so resident-only reads are still metered per namespace. Like
     /// `GetCachedRange` it must never access the worker backend, and like
-    /// `GetRangeTenant` an older worker rejects this distinct type rather than
-    /// misreading the tenant prefix.
-    GetCachedRangeTenant = 9,
+    /// `GetRangeNamespace` an older worker rejects this distinct type rather than
+    /// misreading the namespace prefix.
+    GetCachedRangeNamespace = 9,
     /// An origin-backed range fetch pinned to an exact source version.
     /// The worker may serve the matching cache entry or fill it from the
     /// backend with a conditional request, but must never switch to a newer
     /// source version.
     GetVersionedRange = 10,
-    /// A version-pinned origin-backed range fetch attributed to a tenant.
+    /// A version-pinned origin-backed range fetch attributed to a namespace.
     /// The reply is an ordinary `GetRange` frame, like every range fetch.
-    GetVersionedRangeTenant = 11,
+    GetVersionedRangeNamespace = 11,
 }
 
 impl MsgType {
@@ -100,10 +100,10 @@ impl MsgType {
             5 => MsgType::Delete,
             6 => MsgType::GetCachedRange,
             7 => MsgType::AdmitCachedBlock,
-            8 => MsgType::GetRangeTenant,
-            9 => MsgType::GetCachedRangeTenant,
+            8 => MsgType::GetRangeNamespace,
+            9 => MsgType::GetCachedRangeNamespace,
             10 => MsgType::GetVersionedRange,
-            11 => MsgType::GetVersionedRangeTenant,
+            11 => MsgType::GetVersionedRangeNamespace,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }
@@ -256,10 +256,10 @@ mod tests {
             MsgType::Delete,
             MsgType::GetCachedRange,
             MsgType::AdmitCachedBlock,
-            MsgType::GetRangeTenant,
-            MsgType::GetCachedRangeTenant,
+            MsgType::GetRangeNamespace,
+            MsgType::GetCachedRangeNamespace,
             MsgType::GetVersionedRange,
-            MsgType::GetVersionedRangeTenant,
+            MsgType::GetVersionedRangeNamespace,
         ]
         .into_iter()
         .enumerate()

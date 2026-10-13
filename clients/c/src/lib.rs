@@ -960,8 +960,8 @@ mod tests {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let batches = Arc::new(Mutex::new(Vec::new()));
         let observed = batches.clone();
-        let tenants = Arc::new(Mutex::new(Vec::new()));
-        let observed_tenants = tenants.clone();
+        let namespaces = Arc::new(Mutex::new(Vec::new()));
+        let observed_namespaces = namespaces.clone();
         let stats = Arc::new(AtomicUsize::new(0));
         let coordinator =
             mock_coordinator_counting(listener.local_addr().unwrap().to_string(), stats.clone())
@@ -970,7 +970,7 @@ mod tests {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let observed = observed.clone();
-                let observed_tenants = observed_tenants.clone();
+                let observed_namespaces = observed_namespaces.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut header = [0; HEADER_LEN];
@@ -984,7 +984,7 @@ mod tests {
                         let (metadata, _) =
                             talon_transport::envelope::decode(&parsed, &frame[HEADER_LEN..])
                                 .unwrap();
-                        let tenant = metadata.tenant.unwrap_or_default();
+                        let namespace = metadata.namespace.unwrap_or_default();
                         let (_, message) = talon_transport::codec::decode_request(&frame).unwrap();
                         let batch = matches!(message, ControlMessage::BatchLoad { .. });
                         let requests = match message {
@@ -999,17 +999,17 @@ mod tests {
                             other => panic!("unexpected request {other:?}"),
                         };
                         assert!(requests.iter().all(|r| r.block.version.as_str() == "v1"));
-                        let expected_size = match tenant.effective_name() {
+                        let expected_size = match namespace.effective_name() {
                             "a" => 4,
                             "b" => 16,
                             "default" => 8,
-                            other => panic!("unexpected tenant {other}"),
+                            other => panic!("unexpected namespace {other}"),
                         };
                         assert!(requests.iter().all(|r| r.block.block_size == expected_size));
-                        observed_tenants
+                        observed_namespaces
                             .lock()
                             .unwrap()
-                            .push(tenant.effective_name().to_owned());
+                            .push(namespace.effective_name().to_owned());
                         let reply = if batch {
                             ControlMessage::BatchLoadResult {
                                 failures: requests
@@ -1102,10 +1102,10 @@ mod tests {
         sizes.sort_unstable();
         assert_eq!(sizes, [0, 0, 1, 1024]);
         assert_eq!(stats.load(Ordering::SeqCst), 0);
-        // Concurrent submissions on one C handle copy their own tenant/options.
+        // Concurrent submissions on one C handle copy their own namespace/options.
         let a = CallbackState::new();
         let b = CallbackState::new();
-        tenants.lock().unwrap().clear();
+        namespaces.lock().unwrap().clear();
         for (name, block_size, callback) in [("a", 4, &a), ("b", 16, &b)] {
             let name = cstring(name);
             let mut options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
@@ -1118,7 +1118,7 @@ mod tests {
                     STATUS_OK
                 );
                 let mut options = options.assume_init();
-                options.tenant = name.as_ptr();
+                options.namespace_id = name.as_ptr();
                 options.block_size = block_size;
                 assert_eq!(
                     talon_load_async_with_options(
@@ -1152,7 +1152,7 @@ mod tests {
             STATUS_OK
         );
         assert_eq!(state.wait().loads, [(9, 2)]);
-        let mut names = tenants.lock().unwrap().clone();
+        let mut names = namespaces.lock().unwrap().clone();
         names.sort();
         assert_eq!(names, ["a", "a", "a", "b", "default", "default"]);
         assert_eq!(

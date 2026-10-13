@@ -88,7 +88,7 @@ Lowercase DNS trust domain required in peer workload URI SANs.
 
 ### `namespace_policy_path`
 
-Mounted static namespace authorization policy (TOML).
+Mounted static object namespace authorization policy (TOML).
 
 - **Environment variable:** `TALON_COORDINATOR_NAMESPACE_POLICY_PATH`
 - **Default:** none
@@ -332,7 +332,7 @@ Lowercase DNS trust domain required in peer workload URI SANs.
 
 ### `namespace_policy_path`
 
-Mounted static namespace authorization policy (TOML).
+Mounted static object namespace authorization policy (TOML).
 
 - **Environment variable:** `TALON_WORKER_NAMESPACE_POLICY_PATH`
 - **Default:** none
@@ -752,11 +752,11 @@ Azure SAS token; env-only, never from a config file or logged.
 
 ## FUSE client
 
-### `tenant_id`
+### `namespace_id`
 
-Tenant cache namespace for all requests from this mount.
+Cache namespace for all requests from this mount.
 
-- **Environment variable:** `TALON_FUSE_TENANT_ID`
+- **Environment variable:** `TALON_FUSE_NAMESPACE_ID`
 - **Default:** `default`
 - **CLI flag:** not settable via CLI (config file or environment only)
 

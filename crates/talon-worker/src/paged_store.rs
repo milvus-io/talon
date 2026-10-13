@@ -80,10 +80,6 @@ where
     }
 }
 
-/// Per-shard capacity of the paged store's open-fd cache. See the
-/// `fd_cache` field on [`PagedBlockStore`].
-const PAGE_FD_CACHE_SHARD_CAPACITY: usize = 512;
-
 /// A local, file-backed store for paged blocks (per-page files).
 pub struct PagedBlockStore {
     root: PathBuf,
@@ -96,7 +92,7 @@ pub struct PagedBlockStore {
     /// working set needs proportionally more descriptors. 16 shards x 512
     /// caps this at 8192 descriptors, which at a 1 MiB page size covers an
     /// 8 GiB hot set.
-    fd_cache: FdCache,
+    fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
@@ -110,6 +106,14 @@ impl PagedBlockStore {
     /// Open (creating if needed) a paged store rooted at `root`, using
     /// `page_size`-byte pages.
     pub fn open(root: impl Into<PathBuf>, page_size: u32) -> Result<Self> {
+        Self::open_with_fd_cache(root, page_size, Arc::new(FdCache::for_pages()))
+    }
+
+    pub(crate) fn open_with_fd_cache(
+        root: impl Into<PathBuf>,
+        page_size: u32,
+        fd_cache: Arc<FdCache>,
+    ) -> Result<Self> {
         if page_size == 0 {
             return Err(Error::Other("page_size must be > 0".into()));
         }
@@ -119,7 +123,7 @@ impl PagedBlockStore {
             root_lock: None,
             root,
             page_size,
-            fd_cache: FdCache::with_capacity(PAGE_FD_CACHE_SHARD_CAPACITY),
+            fd_cache,
         })
     }
 

@@ -38,7 +38,7 @@
 
 ### 1.2 范围
 
-一期完整覆盖原生读取中的 GetRange、tenant range、cache-only range，以及必要的 StatObject 和 Coordinator 转发。后续覆盖 Gateway 自行回源及流式 body、多语言入口、预热和写入路径。
+一期完整覆盖原生读取中的 GetRange、namespace range、cache-only range，以及必要的 StatObject 和 Coordinator 转发。后续覆盖 Gateway 自行回源及流式 body、多语言入口、预热和写入路径。
 
 不包含修改缓存算法、读取并发策略、连接池语义、重试策略、对象版本语义和缓存持久化格式。trace context 不写入 WAL、block sidecar、对象元数据或 coordinator 的持久化业务状态。
 
@@ -537,7 +537,7 @@ key 4: detail_level，1 byte，standard/diagnostic 提示；接收端策略优�
 
 metadata 的拟议硬上限为 1024 bytes，不含 metadata_length 的 2 bytes。tracestate 遵循标准限制；未知 TLV 在长度合法时跳过；重复已知字段、非法长度按下面的错误策略处理。该上限和 key 分配在 wire conformance PR 中冻结，当前不是已发布契约。
 
-metadata_length=0 表示无上下文。v2 request header.length 包含 2 + metadata_length + 原业务 payload 长度。控制消息 payload 仍使用现有 codec；租户信息继续由原有业务请求表达，trace metadata 不覆盖认证/tenant 数据。
+metadata_length=0 表示无上下文。v2 request header.length 包含 2 + metadata_length + 原业务 payload 长度。控制消息 payload 仍使用现有 codec；命名空间信息继续由原有业务请求表达，trace metadata 不覆盖认证/namespace 数据。
 
 成功响应保持原业务响应形态：GetRange 是原始字节，Control 是原有控制响应；不加响应 metadata 前缀。响应 header 使用对应请求的协议版本。这样不改变 sendfile/splice 的 payload，也不要求 SDK 在成功读响应后另收一个 trailer。
 
@@ -753,9 +753,9 @@ observed_total = async return - submit_time
 
 资源属性包括 service.name、service.version、service.instance.id、部署环境和集群标识。Worker 节点、ring ID、runtime 可作为 span 属性。
 
-span 名称固定，不插入 object key、offset、tenant ID。对象/版本采用受控标识或脱敏表达，详细诊断才允许经配置的原始标识。禁止在日志/span 中写入 Authorization、session token、预签名 query、完整凭据 URL。
+span 名称固定，不插入 object key、offset、namespace ID。对象/版本采用受控标识或脱敏表达，详细诊断才允许经配置的原始标识。禁止在日志/span 中写入 Authorization、session token、预签名 query、完整凭据 URL。
 
-trace/read/refill/object/tenant 标识不能作为无限制的 Prometheus label。日志首先加入 trace_id/span_id；不要求一期把所有日志改成 OTLP Logs。exemplar 需验证当前指标导出器的支持，不能假设现有自定义 registry 自动支持。
+trace/read/refill/object/namespace 标识不能作为无限制的 Prometheus label。日志首先加入 trace_id/span_id；不要求一期把所有日志改成 OTLP Logs。exemplar 需验证当前指标导出器的支持，不能假设现有自定义 registry 自动支持。
 
 ### 11.3 查询视图
 

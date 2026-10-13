@@ -1,13 +1,16 @@
-//! Tenant namespaces own their cache state; placement continues to hash BlockId.
+//! Cache namespaces own their cache state; placement continues to hash BlockId.
 use super::*;
+use crate::fd_cache::FdCache;
 use crate::page_access_store::CacheRootLock;
 use std::{collections::BTreeMap, path::Path, sync::RwLock};
-use talon_core::{TenantId, WorkerConfig, DEFAULT_TENANT};
+use talon_core::{NamespaceId, WorkerConfig, DEFAULT_NAMESPACE};
 
 /// Bounds disk namespaces and runtime metadata created by declared identities.
-const MAX_TENANTS: usize = 4096;
+const MAX_NAMESPACES: usize = 4096;
 
-pub(super) struct TenantRuntimes {
+pub(super) struct NamespaceRuntimes {
+    membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
+    membership_changed: tokio::sync::watch::Sender<()>,
     workers: RwLock<BTreeMap<String, Arc<WorkerRuntime>>>,
     initialize: tokio::sync::Mutex<()>,
     initializers: Arc<Mutations>,
@@ -15,33 +18,35 @@ pub(super) struct TenantRuntimes {
     root_lock: Arc<CacheRootLock>,
     backend: Arc<dyn BackendStore>,
     metrics: WorkerMetrics,
-    limiter: Arc<TenantRateLimiter>,
+    limiter: Arc<NamespaceRateLimiter>,
     load_slots: Arc<tokio::sync::Semaphore>,
     load_bytes: Arc<tokio::sync::Semaphore>,
-    l1_budget: Arc<std::sync::atomic::AtomicU64>,
+    pub(super) l1_budget: Arc<crate::memory_store::L1Budget>,
+    whole_fds: Arc<FdCache>,
+    page_fds: Arc<FdCache>,
     background_budget: Arc<crate::background::BackgroundBudget>,
 }
 
-impl TenantRuntimes {
+impl NamespaceRuntimes {
     pub(super) fn snapshot(&self) -> Vec<Arc<WorkerRuntime>> {
         self.workers.read().unwrap().values().cloned().collect()
     }
 
-    fn open(self: &Arc<Self>, tenant: &TenantId) -> anyhow::Result<WorkerRuntime> {
-        let config = self.config.for_tenant(tenant)?;
-        let tenant_root = self.root_lock.root.join(tenant.effective_name());
-        checked_dir(&tenant_root)?;
-        let root = tenant_root.join("shared");
+    fn open(self: &Arc<Self>, namespace: &NamespaceId) -> anyhow::Result<WorkerRuntime> {
+        let config = self.config.for_namespace(namespace)?;
+        let namespace_root = self.root_lock.root.join(namespace.effective_name());
+        checked_dir(&namespace_root)?;
+        let root = namespace_root.join("shared");
         checked_dir(&root)?;
-        // Persist geometry independently for each tenant. A changed page size
+        // Persist geometry independently for each namespace. A changed page size
         // must never reinterpret existing page indices on restart.
         let identity_path = root.join("cache_geometry.json");
         let geometry = (config.block_size, config.l2_page_size_bytes);
         match std::fs::read(&identity_path) {
             Ok(bytes) => anyhow::ensure!(
                 serde_json::from_slice::<(u32, u64)>(&bytes)? == geometry,
-                "cache geometry changed for tenant {}; use a new empty tenant cache directory",
-                tenant.effective_name()
+                "cache geometry changed for namespace {}; use a new empty namespace cache directory",
+                namespace.effective_name()
             ),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 use std::io::Write;
@@ -58,13 +63,18 @@ impl TenantRuntimes {
             }
             Err(error) => return Err(error.into()),
         }
-        let store = WholeBlockStore::open(&root)?.with_root_lock(self.root_lock.clone());
+        let store = WholeBlockStore::open_with_fd_cache(&root, self.whole_fds.clone())?
+            .with_root_lock(self.root_lock.clone());
         let index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
             checked_dir(&root.join("paged"))?;
             Some(
-                PagedBlockStore::open(root.join("paged"), config.l2_page_size_bytes as u32)?
-                    .with_root_lock(self.root_lock.clone()),
+                PagedBlockStore::open_with_fd_cache(
+                    root.join("paged"),
+                    config.l2_page_size_bytes as u32,
+                    self.page_fds.clone(),
+                )?
+                .with_root_lock(self.root_lock.clone()),
             )
         } else {
             None
@@ -91,6 +101,8 @@ impl TenantRuntimes {
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
+        worker.page_gc_metrics =
+            PageGcMetrics::new(&self.metrics.registry, namespace.effective_name());
         worker.l1 = Arc::new(MemoryStore::with_shared_budget(
             config.l1_capacity_bytes,
             config.l1_page_size_bytes,
@@ -105,8 +117,10 @@ impl TenantRuntimes {
             .delete_batch_size
             .min(config.background_delete_batch_size);
         worker = worker.with_page_gc(gc)?;
-        worker.tenant = tenant.normalized();
-        worker.tenant_parent = Arc::downgrade(self);
+        worker.membership = self.membership.clone();
+        worker.membership_changed = self.membership_changed.clone();
+        worker.namespace = namespace.normalized();
+        worker.namespace_parent = Arc::downgrade(self);
         worker.load_slots = self.load_slots.clone();
         worker.load_bytes = self.load_bytes.clone();
         worker.load_inflight_bytes = config.load_inflight_bytes;
@@ -114,16 +128,19 @@ impl TenantRuntimes {
         Ok(worker)
     }
 
-    async fn resolve(self: &Arc<Self>, tenant: &TenantId) -> anyhow::Result<Arc<WorkerRuntime>> {
-        tenant.validate()?;
-        if let Some(worker) = self.workers.read().unwrap().get(tenant.effective_name()) {
+    async fn resolve(
+        self: &Arc<Self>,
+        namespace: &NamespaceId,
+    ) -> anyhow::Result<Arc<WorkerRuntime>> {
+        namespace.validate()?;
+        if let Some(worker) = self.workers.read().unwrap().get(namespace.effective_name()) {
             return Ok(worker.clone());
         }
         // The initializer owns publication even when the triggering request is
         // cancelled. Holding this mutex in a detached task prevents duplicate
         // runtimes and competing writes to the same namespace.
         let registry = self.clone();
-        let tenant = tenant.normalized();
+        let namespace = namespace.normalized();
         self.initializers
             .run(async move {
                 let _guard = registry.initialize.lock().await;
@@ -131,24 +148,25 @@ impl TenantRuntimes {
                     .workers
                     .read()
                     .unwrap()
-                    .get(tenant.effective_name())
+                    .get(namespace.effective_name())
                 {
                     return Ok(worker.clone());
                 }
                 anyhow::ensure!(
-                    registry.workers.read().unwrap().len() < MAX_TENANTS,
-                    "tenant namespace limit reached"
+                    registry.workers.read().unwrap().len() < MAX_NAMESPACES,
+                    "namespace limit reached"
                 );
                 let owner = registry.clone();
-                let name = tenant.effective_name().to_owned();
+                let name = namespace.effective_name().to_owned();
                 let worker =
-                    Arc::new(tokio::task::spawn_blocking(move || owner.open(&tenant)).await??);
+                    Arc::new(tokio::task::spawn_blocking(move || owner.open(&namespace)).await??);
                 worker.recover_page_file_cleanup().await;
                 registry
                     .workers
                     .write()
                     .unwrap()
                     .insert(name, worker.clone());
+                registry.membership_changed.send_replace(());
                 Ok::<_, anyhow::Error>(worker)
             })
             .await
@@ -159,7 +177,7 @@ fn checked_dir(path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => anyhow::ensure!(
             meta.is_dir() && !meta.file_type().is_symlink(),
-            "tenant cache path must be a real directory: {}",
+            "namespace cache path must be a real directory: {}",
             path.display()
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)?,
@@ -176,31 +194,33 @@ impl WorkerRuntime {
         self.index.page_count()
     }
 
-    /// Keep streamed PUT staging in the same tenant directory as cached data.
+    /// Keep streamed PUT staging in the same namespace directory as cached data.
     pub(crate) fn staging_file(&self) -> std::io::Result<tempfile::NamedTempFile> {
         tempfile::NamedTempFile::new_in(self.store.root())
     }
 
-    /// Effective resource owner of this cache runtime.
-    pub fn tenant(&self) -> &TenantId {
-        &self.tenant
+    /// Effective namespace of this cache runtime.
+    pub fn namespace(&self) -> &NamespaceId {
+        &self.namespace
     }
 
-    pub(super) async fn drain_tenant_initializers(&self) {
+    pub(super) async fn drain_namespace_initializers(&self) {
         if let Some(registry) = self.registry() {
             registry.initializers.drain().await;
         }
     }
 
-    /// Open all persisted and configured tenant namespaces under one locked root.
-    pub fn open_tenants(
+    /// Open all persisted and configured namespaces under one locked root.
+    pub fn open_namespaces(
         config: &WorkerConfig,
         root_lock: Arc<CacheRootLock>,
         backend: Arc<dyn BackendStore>,
         metrics: WorkerMetrics,
     ) -> anyhow::Result<Self> {
         config.validate()?;
-        let registry = Arc::new(TenantRuntimes {
+        let registry = Arc::new(NamespaceRuntimes {
+            membership: Arc::new(Mutex::new(None)),
+            membership_changed: tokio::sync::watch::channel(()).0,
             workers: RwLock::new(BTreeMap::new()),
             initialize: tokio::sync::Mutex::new(()),
             initializers: Arc::new(Mutations::default()),
@@ -208,16 +228,18 @@ impl WorkerRuntime {
             root_lock,
             backend,
             metrics,
-            limiter: Arc::new(TenantRateLimiter::new(config.rate_limits.clone())),
+            limiter: Arc::new(NamespaceRateLimiter::new(config.rate_limits.clone())),
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             load_bytes: Arc::new(tokio::sync::Semaphore::new(
                 config.load_inflight_bytes as usize,
             )),
-            l1_budget: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            l1_budget: Arc::default(),
+            whole_fds: Arc::new(FdCache::new()),
+            page_fds: Arc::new(FdCache::for_pages()),
             background_budget: crate::background::BackgroundBudget::new(config),
         });
-        let mut names = std::collections::BTreeSet::from([DEFAULT_TENANT.to_owned()]);
-        names.extend(config.tenants.keys().cloned());
+        let mut names = std::collections::BTreeSet::from([DEFAULT_NAMESPACE.to_owned()]);
+        names.extend(config.namespaces.keys().cloned());
         for entry in std::fs::read_dir(&registry.root_lock.root)? {
             let entry = entry?;
             if entry.file_name() == "lost+found" {
@@ -227,66 +249,69 @@ impl WorkerRuntime {
                 let name = entry
                     .file_name()
                     .into_string()
-                    .map_err(|_| anyhow::anyhow!("invalid tenant directory"))?;
-                // Never silently strand an old flat cache or adopt it as a tenant.
-                anyhow::ensure!(entry.path().join("shared").is_dir() || (entry.file_type()?.is_dir() && std::fs::read_dir(entry.path())?.next().is_none()), "legacy/unrecognized cache directory {}; configure a new cache root for tenant storage", entry.path().display());
+                    .map_err(|_| anyhow::anyhow!("invalid namespace directory"))?;
+                // Never silently strand an old flat cache or adopt it as a namespace.
+                anyhow::ensure!(entry.path().join("shared").is_dir() || (entry.file_type()?.is_dir() && std::fs::read_dir(entry.path())?.next().is_none()), "legacy/unrecognized cache directory {}; configure a new cache root for namespace storage", entry.path().display());
                 names.insert(name);
             }
         }
-        anyhow::ensure!(names.len() <= MAX_TENANTS, "too many tenant namespaces");
+        anyhow::ensure!(names.len() <= MAX_NAMESPACES, "too many namespaces");
         for name in names {
-            let tenant = TenantId::named(&name);
-            let worker = Arc::new(registry.open(&tenant)?);
+            let namespace = NamespaceId::named(&name);
+            let worker = Arc::new(registry.open(&namespace)?);
             registry.workers.write().unwrap().insert(name, worker);
         }
         let mut worker = (**registry
             .workers
             .read()
             .unwrap()
-            .get(DEFAULT_TENANT)
+            .get(DEFAULT_NAMESPACE)
             .unwrap())
         .clone();
-        worker.tenants = Some(registry);
+        worker.namespaces = Some(registry);
         Ok(worker)
     }
 
     /// Resolve an explicit identity, inheriting the global cache policy when absent.
-    pub async fn for_tenant(self: &Arc<Self>, tenant: &TenantId) -> anyhow::Result<Arc<Self>> {
-        tenant.validate()?;
+    pub async fn for_namespace(
+        self: &Arc<Self>,
+        namespace: &NamespaceId,
+    ) -> anyhow::Result<Arc<Self>> {
+        namespace.validate()?;
         if let Some(registry) = self
-            .tenants
+            .namespaces
             .as_ref()
             .cloned()
-            .or_else(|| self.tenant_parent.upgrade())
+            .or_else(|| self.namespace_parent.upgrade())
         {
-            registry.resolve(tenant).await
+            registry.resolve(namespace).await
         } else {
             anyhow::ensure!(
-                tenant.effective_name() == self.tenant.effective_name(),
-                "runtime has no tenant namespace registry"
+                namespace.effective_name() == self.namespace.effective_name(),
+                "runtime has no namespace registry"
             );
             Ok(self.clone())
         }
     }
 
     /// Snapshot used by maintenance and aggregate process metrics.
-    pub fn tenant_runtimes(self: &Arc<Self>) -> Vec<Arc<Self>> {
+    pub fn namespace_runtimes(self: &Arc<Self>) -> Vec<Arc<Self>> {
         match self
-            .tenants
+            .namespaces
             .as_ref()
             .cloned()
-            .or_else(|| self.tenant_parent.upgrade())
+            .or_else(|| self.namespace_parent.upgrade())
         {
             Some(registry) => registry.snapshot(),
             None => vec![self.clone()],
         }
     }
 
-    pub(super) fn registry(&self) -> Option<Arc<TenantRuntimes>> {
-        self.tenants
+    pub(super) fn registry(&self) -> Option<Arc<NamespaceRuntimes>> {
+        self.namespaces
             .as_ref()
             .cloned()
-            .or_else(|| self.tenant_parent.upgrade())
+            .or_else(|| self.namespace_parent.upgrade())
     }
 
     /// Resolve legacy read carriers and v3 metadata consistently for every operation.
@@ -296,43 +321,49 @@ impl WorkerRuntime {
         payload: &[u8],
     ) -> Result<Arc<Self>, talon_transport::DataPlaneError> {
         use talon_transport::{data, DataErrorCode, DataPlaneError, MsgType, HEADER_LEN};
-        let tenant = (|| -> anyhow::Result<TenantId> {
+        let namespace = (|| -> anyhow::Result<NamespaceId> {
             let (metadata, _) = talon_transport::envelope::decode(header, payload)?;
             let mut frame = Vec::new();
             let legacy = if matches!(
                 header.msg_type,
-                MsgType::GetRangeTenant
-                    | MsgType::GetCachedRangeTenant
-                    | MsgType::GetVersionedRangeTenant
+                MsgType::GetRangeNamespace
+                    | MsgType::GetCachedRangeNamespace
+                    | MsgType::GetVersionedRangeNamespace
             ) {
                 frame.reserve(HEADER_LEN + payload.len());
                 frame.extend_from_slice(&header.encode());
                 frame.extend_from_slice(payload);
                 Some(match header.msg_type {
-                    MsgType::GetRangeTenant => data::decode_tenant_request(&frame)?.1.tenant,
-                    MsgType::GetCachedRangeTenant => {
-                        data::decode_cached_tenant_request(&frame)?.1.tenant
+                    MsgType::GetRangeNamespace => {
+                        data::decode_namespace_request(&frame)?.1.namespace
                     }
-                    _ => data::decode_versioned_tenant_request(&frame)?.1.tenant,
+                    MsgType::GetCachedRangeNamespace => {
+                        data::decode_cached_namespace_request(&frame)?.1.namespace
+                    }
+                    _ => {
+                        data::decode_versioned_namespace_request(&frame)?
+                            .1
+                            .namespace
+                    }
                 })
             } else {
                 None
             };
-            if let (Some(a), Some(b)) = (&metadata.tenant, &legacy) {
+            if let (Some(a), Some(b)) = (&metadata.namespace, &legacy) {
                 anyhow::ensure!(
                     a.effective_name() == b.effective_name(),
-                    "conflicting tenant identities"
+                    "conflicting namespace identities"
                 );
             }
-            let tenant = metadata.tenant.or(legacy).unwrap_or_default();
-            tenant.validate()?;
-            Ok(tenant)
+            let namespace = metadata.namespace.or(legacy).unwrap_or_default();
+            namespace.validate()?;
+            Ok(namespace)
         })()
         .map_err(|error| DataPlaneError {
             code: DataErrorCode::InvalidRequest,
             message: error.to_string(),
         })?;
-        self.for_tenant(&tenant)
+        self.for_namespace(&namespace)
             .await
             .map_err(|error| DataPlaneError {
                 code: DataErrorCode::Internal,
@@ -346,7 +377,7 @@ mod tests {
     use super::*;
     use bytes::Bytes;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use talon_core::{ObjectStat, TenantCacheConfig};
+    use talon_core::{NamespaceCacheConfig, ObjectStat};
 
     #[derive(Default)]
     struct Origin {
@@ -403,7 +434,7 @@ mod tests {
     fn open(root: &Path, config: &WorkerConfig, backend: Arc<Origin>) -> Arc<WorkerRuntime> {
         let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
         Arc::new(
-            WorkerRuntime::open_tenants(
+            WorkerRuntime::open_namespaces(
                 config,
                 lock,
                 backend,
@@ -430,7 +461,159 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenants_share_block_hash_but_never_files_indices_or_inflight_fills() {
+    async fn maintenance_gauges_preserve_each_namespaces_policy_and_checkpoint_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.page_tti_hours = 1;
+        cfg.namespaces.insert(
+            "disabled".into(),
+            NamespaceCacheConfig {
+                page_tti_hours: Some(0),
+                page_access_checkpoint_interval_minutes: Some(2),
+                ..Default::default()
+            },
+        );
+        let root = open(dir.path(), &cfg, Arc::default());
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        let z = root.for_namespace(&NamespaceId::named("z")).await.unwrap();
+        let disabled = root
+            .for_namespace(&NamespaceId::named("disabled"))
+            .await
+            .unwrap();
+        assert_eq!(a.page_gc_metrics.tti_seconds.get(), 3600.0);
+        assert_eq!(disabled.page_gc_metrics.tti_seconds.get(), 0.0);
+        assert_eq!(a.page_gc_metrics.checkpoint_interval.get(), 60.0);
+        assert_eq!(disabled.page_gc_metrics.checkpoint_interval.get(), 120.0);
+
+        a.page_clock.set(10_000);
+        read(&a).await;
+        let pages = a.paged.as_ref().unwrap().dir_for(&block(16));
+        // A directory at the publication path makes the checkpoint rename fail.
+        let checkpoint = pages.parent().unwrap().join("access.shard");
+        std::fs::create_dir(&checkpoint).unwrap();
+        a.page_clock.set(210_000);
+        assert_eq!(a.checkpoint_access_times().await.failures, 1);
+        assert_eq!(z.checkpoint_access_times().await.failures, 0);
+        assert_eq!(a.page_gc_metrics.dirty_blocks.get(), 1.0);
+        assert_eq!(a.page_gc_metrics.dirty_age.get(), 200.0);
+        assert_eq!(z.page_gc_metrics.dirty_blocks.get(), 0.0);
+        let rendered = root.metrics.render();
+        assert!(
+            rendered.contains("talon_worker_page_access_dirty_blocks{namespace=\"a\"} 1\n"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("talon_worker_page_access_dirty_blocks{namespace=\"z\"} 0\n"),
+            "{rendered}"
+        );
+        std::fs::remove_dir(checkpoint).unwrap();
+        assert_eq!(a.checkpoint_access_times().await.failures, 0);
+        assert_eq!(a.page_gc_metrics.dirty_blocks.get(), 0.0);
+    }
+
+    #[tokio::test]
+    async fn l1_metrics_refresh_does_not_wait_for_namespace_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.l1_capacity_bytes = 8;
+        cfg.l1_page_size_bytes = 4;
+        let root = open(dir.path(), &cfg, Arc::default());
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        read(&a).await;
+        let registry = root.registry().unwrap();
+        let guard = registry.workers.write().unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            a.refresh_l1_metrics();
+            send.send(()).unwrap();
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        drop(guard);
+        thread.join().unwrap();
+        result.expect("L1 accounting must not scan the namespace registry");
+        assert!(root
+            .metrics
+            .render()
+            .contains("talon_worker_l1_resident_bytes 4\n"));
+    }
+
+    #[tokio::test]
+    async fn namespace_runtime_reads_populate_shared_descriptor_caches() {
+        for paged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut config = config();
+            if !paged {
+                config.l2_page_size_bytes = 0;
+            }
+            let root = open(dir.path(), &config, Arc::default());
+            for name in ["a", "b", "c"] {
+                let namespace = root.for_namespace(&NamespaceId::named(name)).await.unwrap();
+                read(&namespace).await;
+                // A warm serve opens and retains a descriptor after the handle drops.
+                read(&namespace).await;
+            }
+            let registry = root.registry().unwrap();
+            assert_eq!(registry.whole_fds.len(), if paged { 0 } else { 3 });
+            assert_eq!(registry.page_fds.len(), if paged { 3 } else { 0 });
+        }
+    }
+
+    #[tokio::test]
+    async fn new_namespace_stat_preserves_existing_l1_metrics() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.l1_capacity_bytes = 8;
+        config.l1_page_size_bytes = 4;
+        let root = open(dir.path(), &config, Arc::default());
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        read(&a).await;
+        let check = || {
+            assert_eq!(a.l1_resident_bytes(), 4);
+            let metrics = root.metrics.render();
+            assert!(metrics.contains("talon_worker_l1_pages 1\n"), "{metrics}");
+            assert!(
+                metrics.contains("talon_worker_l1_resident_bytes 4\n"),
+                "{metrics}"
+            );
+        };
+        check();
+        let b = root.for_namespace(&NamespaceId::named("b")).await.unwrap();
+        b.stat_object(&request().object).await.unwrap();
+        check();
+        read(&a).await;
+        check();
+    }
+
+    #[tokio::test]
+    async fn reserved_namespaces_fail_request_validation_before_opening_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(dir.path(), &config(), Arc::default());
+        for name in ["worker_identity", ".worker.lock"] {
+            let frame = talon_transport::data::encode_namespace_request(
+                1,
+                &talon_transport::data::NamespaceScopedRange {
+                    namespace: NamespaceId::named(name),
+                    request: request(),
+                },
+            )
+            .unwrap();
+            let header = talon_transport::FrameHeader::decode(&frame).unwrap();
+            let result = root
+                .for_request(&header, &frame[talon_transport::HEADER_LEN..])
+                .await;
+            assert!(matches!(
+                result,
+                Err(talon_transport::DataPlaneError {
+                    code: talon_transport::DataErrorCode::InvalidRequest,
+                    ..
+                })
+            ));
+        }
+        assert_eq!(root.namespace_runtimes().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn namespaces_share_block_hash_but_never_files_indices_or_inflight_fills() {
         for paged in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let origin = Arc::new(Origin::default());
@@ -439,8 +622,8 @@ mod tests {
                 config.l2_page_size_bytes = 0;
             }
             let root = open(dir.path(), &config, origin.clone());
-            let (ta, tb) = (TenantId::named("a"), TenantId::named("b"));
-            let (a, b) = tokio::join!(root.for_tenant(&ta), root.for_tenant(&tb));
+            let (ta, tb) = (NamespaceId::named("a"), NamespaceId::named("b"));
+            let (a, b) = tokio::join!(root.for_namespace(&ta), root.for_namespace(&tb));
             let (a, b) = (a.unwrap(), b.unwrap());
             tokio::join!(read(&a), read(&b));
             assert_eq!(origin.reads.load(Ordering::SeqCst), 2);
@@ -456,8 +639,8 @@ mod tests {
                 assert!(ap.starts_with(dir.path().join("a/shared/paged")));
                 assert!(bp.starts_with(dir.path().join("b/shared/paged")));
             } else {
-                for tenant in [&a, &b] {
-                    assert_eq!(tenant.store.scan().unwrap()[0].id, block(16));
+                for namespace in [&a, &b] {
+                    assert_eq!(namespace.store.scan().unwrap()[0].id, block(16));
                 }
                 assert!(a.store.root().ends_with("a/shared"));
                 assert!(b.store.root().ends_with("b/shared"));
@@ -466,13 +649,19 @@ mod tests {
             drop(b);
             drop(root);
             let restarted = open(dir.path(), &config, origin.clone());
-            let a = restarted.for_tenant(&TenantId::named("a")).await.unwrap();
-            let b = restarted.for_tenant(&TenantId::named("b")).await.unwrap();
+            let a = restarted
+                .for_namespace(&NamespaceId::named("a"))
+                .await
+                .unwrap();
+            let b = restarted
+                .for_namespace(&NamespaceId::named("b"))
+                .await
+                .unwrap();
             tokio::join!(read(&a), read(&b));
             assert_eq!(
                 origin.reads.load(Ordering::SeqCst),
                 2,
-                "restart must recover both tenant caches"
+                "restart must recover both namespace caches"
             );
         }
     }
@@ -482,7 +671,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("partial")).unwrap();
         let root = open(dir.path(), &config(), Arc::default());
-        let partial = root.for_tenant(&TenantId::named("partial")).await.unwrap();
+        let partial = root
+            .for_namespace(&NamespaceId::named("partial"))
+            .await
+            .unwrap();
         read(&partial).await;
         assert!(dir
             .path()
@@ -490,12 +682,15 @@ mod tests {
             .exists());
         let outside = tempfile::tempdir().unwrap();
         std::os::unix::fs::symlink(outside.path(), dir.path().join("alias")).unwrap();
-        assert!(root.for_tenant(&TenantId::named("alias")).await.is_err());
+        assert!(root
+            .for_namespace(&NamespaceId::named("alias"))
+            .await
+            .is_err());
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
         drop(partial);
         drop(root);
         let lock = Arc::new(CacheRootLock::acquire(dir.path()).unwrap());
-        assert!(WorkerRuntime::open_tenants(
+        assert!(WorkerRuntime::open_namespaces(
             &config(),
             lock,
             Arc::new(Origin::default()),
@@ -511,7 +706,8 @@ mod tests {
         let registry = root.registry().unwrap();
         let guard = registry.initialize.lock().await;
         let request = root.clone();
-        let task = tokio::spawn(async move { request.for_tenant(&TenantId::named("new")).await });
+        let task =
+            tokio::spawn(async move { request.for_namespace(&NamespaceId::named("new")).await });
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while registry.initializers.active_count() == 0 {
                 tokio::task::yield_now().await;
@@ -522,10 +718,16 @@ mod tests {
         task.abort();
         let _ = task.await;
         drop(guard);
-        root.drain_tenant_initializers().await;
+        root.drain_namespace_initializers().await;
         assert_eq!(registry.snapshot().len(), 2);
-        let a = root.for_tenant(&TenantId::named("new")).await.unwrap();
-        let b = root.for_tenant(&TenantId::named("new")).await.unwrap();
+        let a = root
+            .for_namespace(&NamespaceId::named("new"))
+            .await
+            .unwrap();
+        let b = root
+            .for_namespace(&NamespaceId::named("new"))
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(&a, &b));
         assert!(a
             .staging_file()
@@ -535,7 +737,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn foreground_capacity_is_shared_across_tenants() {
+    async fn foreground_capacity_is_shared_across_namespaces() {
         for paged in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let mut cfg = config();
@@ -545,9 +747,9 @@ mod tests {
             }
             let root = open(dir.path(), &cfg, Arc::default());
             for name in ["a", "b", "c", "d", "e"] {
-                read(&root.for_tenant(&TenantId::named(name)).await.unwrap()).await;
+                read(&root.for_namespace(&NamespaceId::named(name)).await.unwrap()).await;
                 assert!(
-                    root.tenant_runtimes()
+                    root.namespace_runtimes()
                         .iter()
                         .map(|w| w.resident_bytes())
                         .sum::<u64>()
@@ -561,15 +763,21 @@ mod tests {
     async fn unspecified_and_explicit_default_share_one_namespace() {
         let dir = tempfile::tempdir().unwrap();
         let root = open(dir.path(), &config(), Arc::default());
-        let legacy = root.for_tenant(&TenantId::Unattributed).await.unwrap();
-        let named = root.for_tenant(&TenantId::named("default")).await.unwrap();
+        let legacy = root
+            .for_namespace(&NamespaceId::Unattributed)
+            .await
+            .unwrap();
+        let named = root
+            .for_namespace(&NamespaceId::named("default"))
+            .await
+            .unwrap();
         assert!(Arc::ptr_eq(&legacy, &named));
         read(&legacy).await;
         assert_eq!(named.block_count(), 1);
         assert!(named.store.root().ends_with("default/shared"));
         assert!(!dir.path().join("unattributed").exists());
         for name in ["../escape", ".", "..", "a/b", "a\\b", ""] {
-            assert!(root.for_tenant(&TenantId::named(name)).await.is_err());
+            assert!(root.for_namespace(&NamespaceId::named(name)).await.is_err());
         }
     }
 
@@ -577,16 +785,16 @@ mod tests {
     async fn policies_control_geometry_and_idle_expiration_independently() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config();
-        config.tenants.insert(
+        config.namespaces.insert(
             "short".into(),
-            TenantCacheConfig {
+            NamespaceCacheConfig {
                 page_tti_hours: Some(1),
                 ..Default::default()
             },
         );
-        config.tenants.insert(
+        config.namespaces.insert(
             "long".into(),
-            TenantCacheConfig {
+            NamespaceCacheConfig {
                 block_size: Some(32),
                 l2_page_size_bytes: Some(8),
                 page_tti_hours: Some(2),
@@ -594,10 +802,16 @@ mod tests {
             },
         );
         let root = open(dir.path(), &config, Arc::default());
-        let short = root.for_tenant(&TenantId::named("short")).await.unwrap();
-        let long = root.for_tenant(&TenantId::named("long")).await.unwrap();
+        let short = root
+            .for_namespace(&NamespaceId::named("short"))
+            .await
+            .unwrap();
+        let long = root
+            .for_namespace(&NamespaceId::named("long"))
+            .await
+            .unwrap();
         let inherited = root
-            .for_tenant(&TenantId::named("unconfigured"))
+            .for_namespace(&NamespaceId::named("unconfigured"))
             .await
             .unwrap();
         assert_eq!(inherited.block_size, 16);
@@ -623,18 +837,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn one_l1_budget_and_load_budget_cover_all_tenants() {
+    async fn one_l1_budget_and_load_budget_cover_all_namespaces() {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config();
         config.l1_capacity_bytes = 4;
         config.l1_page_size_bytes = 4;
+        config.load_inflight_bytes = 32;
         let root = open(dir.path(), &config, Arc::default());
-        let a = root.for_tenant(&TenantId::named("a")).await.unwrap();
-        let b = root.for_tenant(&TenantId::named("b")).await.unwrap();
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        let b = root.for_namespace(&NamespaceId::named("b")).await.unwrap();
         tokio::join!(read(&a), read(&b));
         assert!(a.l1_resident_bytes() + b.l1_resident_bytes() <= 4);
         assert!(Arc::ptr_eq(&a.load_slots, &b.load_slots));
         assert!(Arc::ptr_eq(&a.load_bytes, &b.load_bytes));
+        assert_eq!(a.load_inflight_bytes, 32);
+        assert_eq!(b.load_inflight_bytes, 32);
+        let reservation = a.load_bytes.clone().try_acquire_many_owned(32).unwrap();
+        assert!(b.load_bytes.try_acquire().is_err());
+        assert!(root.load_bytes.try_acquire().is_err());
+        drop(reservation);
+        assert_eq!(b.load_bytes.available_permits(), 32);
         assert!(Arc::ptr_eq(
             a.background_budget.as_ref().unwrap(),
             b.background_budget.as_ref().unwrap()
@@ -646,33 +868,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut config = config();
         let root = open(dir.path(), &config, Arc::default());
-        let mut frame = talon_transport::data::encode_tenant_request(
+        let mut frame = talon_transport::data::encode_namespace_request(
             1,
-            &talon_transport::data::TenantScopedRange {
-                tenant: TenantId::named("a"),
+            &talon_transport::data::NamespaceScopedRange {
+                namespace: NamespaceId::named("a"),
                 request: request(),
             },
         )
         .unwrap();
-        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("b")).unwrap();
+        talon_transport::envelope::encode_namespace(&mut frame, &NamespaceId::named("b")).unwrap();
         let header = talon_transport::FrameHeader::decode(&frame).unwrap();
         assert!(root
             .for_request(&header, &frame[talon_transport::HEADER_LEN..])
             .await
             .is_err());
-        let a = root.for_tenant(&TenantId::named("a")).await.unwrap();
+        let a = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
         read(&a).await;
         drop(a);
         drop(root);
-        config.tenants.insert(
+        config.namespaces.insert(
             "a".into(),
-            TenantCacheConfig {
+            NamespaceCacheConfig {
                 l2_page_size_bytes: Some(8),
                 ..Default::default()
             },
         );
         let lock = Arc::new(CacheRootLock::acquire(dir.path()).unwrap());
-        assert!(WorkerRuntime::open_tenants(
+        assert!(WorkerRuntime::open_namespaces(
             &config,
             lock,
             Arc::new(Origin::default()),
@@ -681,18 +903,21 @@ mod tests {
         .is_err());
     }
     #[tokio::test]
-    async fn mixed_tenant_wire_requests_isolate_reads_admission_load_and_batch_load() {
+    async fn mixed_namespace_wire_requests_isolate_reads_admission_load_and_batch_load() {
         use talon_transport::{codec, data, ControlMessage, Flags, FrameHeader, HEADER_LEN};
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         async fn exchange(
             stream: &mut tokio::net::TcpStream,
             mut frame: Vec<u8>,
-            tenant: Option<&str>,
+            namespace: Option<&str>,
             body: &[u8],
         ) -> (FrameHeader, Vec<u8>) {
-            if let Some(tenant) = tenant {
-                talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named(tenant))
-                    .unwrap();
+            if let Some(namespace) = namespace {
+                talon_transport::envelope::encode_namespace(
+                    &mut frame,
+                    &NamespaceId::named(namespace),
+                )
+                .unwrap();
             }
             stream.write_all(&frame).await.unwrap();
             stream.write_all(body).await.unwrap();
@@ -723,7 +948,7 @@ mod tests {
             )
             .unwrap(),
         );
-        obs.attach_tenant_runtime(&worker);
+        obs.attach_namespace_runtime(&worker);
         obs.readiness().set_backend_ready(true);
         obs.readiness().set_store_ready(true);
         obs.readiness().set_control_registered(true);
@@ -737,7 +962,7 @@ mod tests {
                 .unwrap();
         });
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
-        // Same physical connection switches tenant on every request.
+        // Same physical connection switches namespace on every request.
         let admission = data::encode_cached_block_put_header(
             1,
             &CachedBlockPutRequest {
@@ -764,8 +989,8 @@ mod tests {
             )
             .unwrap()
         };
-        for tenant in [None, Some("b")] {
-            let (header, body) = exchange(&mut stream, cached(), tenant, &[]).await;
+        for namespace in [None, Some("b")] {
+            let (header, body) = exchange(&mut stream, cached(), namespace, &[]).await;
             assert!(header.flags.contains(Flags::ERROR));
             assert_eq!(
                 data::decode_error_payload(&body).code,
@@ -776,8 +1001,8 @@ mod tests {
             exchange(&mut stream, cached(), Some("a"), &[]).await.1,
             [42; 4]
         );
-        // The SDK carries the borrowed tenant only in v3 metadata; the read body
-        // uses the ordinary versioned request rather than owning another tenant string.
+        // The SDK carries the borrowed namespace only in v3 metadata; the read body
+        // uses the ordinary versioned request rather than owning another namespace string.
         let versioned = data::encode_versioned_request(
             8,
             &data::VersionedRangeRequest {
@@ -840,7 +1065,7 @@ mod tests {
         for name in ["default", "a", "b"] {
             assert_eq!(
                 worker
-                    .for_tenant(&TenantId::named(name))
+                    .for_namespace(&NamespaceId::named(name))
                     .await
                     .unwrap()
                     .block_count(),

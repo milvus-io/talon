@@ -23,7 +23,7 @@ use std::path::PathBuf;
 
 use crate::status::MAX_STATUS_FIELD_BYTES;
 use crate::{
-    ControlTlsConfig, ControlTlsConfigPatch, Error, NamespacePolicy, ObjectNamespace,
+    ControlTlsConfig, ControlTlsConfigPatch, Error, ObjectNamespace, ObjectNamespacePolicy,
     RateLimitPolicy, Result,
 };
 
@@ -122,7 +122,7 @@ pub struct WorkerConfig {
     /// Optional mTLS material for the privileged coordinator-worker channel.
     pub control_tls: Option<ControlTlsConfig>,
     /// Operator-owned grants loaded from mounted static policy data.
-    pub namespace_policy: Option<NamespacePolicy>,
+    pub namespace_policy: Option<ObjectNamespacePolicy>,
     /// Stable node identity; defaults to the RPC listen address when unset.
     pub node_id: Option<String>,
     /// Control-plane heartbeat interval in milliseconds. After a detected failure,
@@ -266,18 +266,18 @@ pub struct WorkerConfig {
     /// or by the Tokio runtime worker-thread count on the fallback path.
     /// Idle accepted connections also consume this budget.
     pub data_plane_connections_per_thread: usize,
-    /// Static per-tenant rate-limit policy. Disabled unless a `[rate_limits]`
+    /// Static per-namespace rate-limit policy. Disabled unless a `[rate_limits]`
     /// table sets `enabled = true`. This is the local, single-worker stage of
-    /// the eventual-global-tenant-rate-limits design.
+    /// the eventual-global-namespace-rate-limits design.
     pub rate_limits: RateLimitPolicy,
-    /// Optional named cache policies; unknown tenants inherit worker defaults.
-    pub tenants: std::collections::BTreeMap<String, TenantCacheConfig>,
+    /// Optional named cache policies; unknown namespaces inherit worker defaults.
+    pub namespaces: std::collections::BTreeMap<String, NamespaceCacheConfig>,
 }
 
-/// Per-tenant cache overrides. Omitted fields inherit the worker defaults.
+/// Per-namespace cache overrides. Omitted fields inherit the worker defaults.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct TenantCacheConfig {
+pub struct NamespaceCacheConfig {
     pub block_size: Option<u32>,
     pub l2_page_size_bytes: Option<u64>,
     pub l1_page_size_bytes: Option<u64>,
@@ -289,11 +289,13 @@ pub struct TenantCacheConfig {
 
 impl WorkerConfig {
     /// Resolve cache settings without changing process-wide resource budgets.
-    pub fn for_tenant(&self, tenant: &crate::TenantId) -> Result<Self> {
-        tenant.validate().map_err(|e| Error::Other(e.to_string()))?;
+    pub fn for_namespace(&self, namespace: &crate::NamespaceId) -> Result<Self> {
+        namespace
+            .validate()
+            .map_err(|e| Error::Other(e.to_string()))?;
         let mut result = self.clone();
-        result.tenants.clear();
-        if let Some(overrides) = self.tenants.get(tenant.effective_name()) {
+        result.namespaces.clear();
+        if let Some(overrides) = self.namespaces.get(namespace.effective_name()) {
             if let Some(value) = overrides.block_size {
                 result.block_size = value;
             }
@@ -417,7 +419,7 @@ impl Default for WorkerConfig {
             data_plane_rings: 0,
             data_plane_connections_per_thread: 8192,
             rate_limits: RateLimitPolicy::default(),
-            tenants: Default::default(),
+            namespaces: Default::default(),
         }
     }
 }
@@ -443,7 +445,7 @@ pub struct WorkerConfigPatch {
     pub cluster_id: Option<String>,
     /// Optional `[control_tls]` block.
     pub control_tls: Option<ControlTlsConfigPatch>,
-    /// Path to a static namespace authorization policy.
+    /// Path to a static object namespace authorization policy.
     pub namespace_policy_path: Option<PathBuf>,
     /// Override for [`WorkerConfig::node_id`].
     pub node_id: Option<String>,
@@ -541,9 +543,9 @@ pub struct WorkerConfigPatch {
     pub data_plane_rings: Option<usize>,
     /// Override for [`WorkerConfig::data_plane_connections_per_thread`].
     pub data_plane_connections_per_thread: Option<usize>,
-    /// Optional `[rate_limits]` table: the per-tenant rate-limit policy.
+    /// Optional `[rate_limits]` table: the per-namespace rate-limit policy.
     pub rate_limits: Option<RateLimitPolicy>,
-    pub tenants: Option<std::collections::BTreeMap<String, TenantCacheConfig>>,
+    pub namespaces: Option<std::collections::BTreeMap<String, NamespaceCacheConfig>>,
 }
 
 impl Patch for WorkerConfigPatch {
@@ -646,7 +648,7 @@ impl Patch for WorkerConfigPatch {
                 .data_plane_connections_per_thread
                 .or(base.data_plane_connections_per_thread),
             rate_limits: self.rate_limits.or(base.rate_limits),
-            tenants: self.tenants.or(base.tenants),
+            namespaces: self.namespaces.or(base.namespaces),
         }
     }
 }
@@ -749,7 +751,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: None,
         cli: false,
         secret: false,
-        help: "Mounted static namespace authorization policy (TOML).",
+        help: "Mounted static object namespace authorization policy (TOML).",
     },
     ConfigVar {
         env: "TALON_WORKER_HEARTBEAT_INTERVAL_MS",
@@ -1287,7 +1289,7 @@ impl WorkerConfigPatch {
                 .transpose()?,
             // The [rate_limits] table is file-only; env does not override it.
             rate_limits: None,
-            tenants: None,
+            namespaces: None,
         })
     }
 }
@@ -1315,7 +1317,7 @@ impl WorkerConfig {
         let namespace_policy = merged
             .namespace_policy_path
             .as_deref()
-            .map(NamespacePolicy::from_file)
+            .map(ObjectNamespacePolicy::from_file)
             .transpose()?;
         let cfg = WorkerConfig {
             // Advertise the routable address if set, else fall back to the bind
@@ -1427,7 +1429,7 @@ impl WorkerConfig {
                 .data_plane_connections_per_thread
                 .unwrap_or(d.data_plane_connections_per_thread),
             rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
-            tenants: merged.tenants.unwrap_or(d.tenants),
+            namespaces: merged.namespaces.unwrap_or(d.namespaces),
         };
         cfg.validate()?;
         Ok(cfg)
@@ -1469,8 +1471,8 @@ impl WorkerConfig {
         if self.cluster_id.is_empty() {
             return Err(Error::Other("cluster_id must not be empty".into()));
         }
-        for name in self.tenants.keys() {
-            self.for_tenant(&crate::TenantId::named(name))?;
+        for name in self.namespaces.keys() {
+            self.for_namespace(&crate::NamespaceId::named(name))?;
         }
         self.rate_limits
             .validate()
@@ -1739,6 +1741,8 @@ fn normalize_worker_advertise_addr(advertise_addr: String, listen: &str) -> Stri
 /// coordinator it asks for placement, and its client-side caching / readahead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuseConfig {
+    /// Cache namespace selected by all requests from this mount.
+    pub namespace_id: String,
     /// Directory to mount the Talon filesystem at.
     pub mountpoint: PathBuf,
     /// Address of the coordinator to resolve placement + membership against.
@@ -1764,6 +1768,7 @@ pub struct FuseConfig {
 impl Default for FuseConfig {
     fn default() -> Self {
         Self {
+            namespace_id: crate::DEFAULT_NAMESPACE.into(),
             mountpoint: PathBuf::from("/mnt/talon"),
             coordinator: "127.0.0.1:7000".into(),
             namespace_prefix: String::new(),
@@ -1781,6 +1786,8 @@ impl Default for FuseConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FuseConfigPatch {
+    /// Override for [`FuseConfig::namespace_id`].
+    pub namespace_id: Option<String>,
     /// Override for [`FuseConfig::mountpoint`].
     pub mountpoint: Option<PathBuf>,
     /// Override for [`FuseConfig::coordinator`].
@@ -1798,6 +1805,7 @@ pub struct FuseConfigPatch {
 impl Patch for FuseConfigPatch {
     fn merge(self, base: Self) -> Self {
         Self {
+            namespace_id: self.namespace_id.or(base.namespace_id),
             mountpoint: self.mountpoint.or(base.mountpoint),
             coordinator: self.coordinator.or(base.coordinator),
             namespace_prefix: self.namespace_prefix.or(base.namespace_prefix),
@@ -1812,12 +1820,12 @@ impl Patch for FuseConfigPatch {
 /// variables, shared by the parser and the documentation generator.
 pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar {
-        env: "TALON_FUSE_TENANT_ID",
-        key: "tenant_id",
+        env: "TALON_FUSE_NAMESPACE_ID",
+        key: "namespace_id",
         default: Some("default"),
         cli: false,
         secret: false,
-        help: "Tenant cache namespace for all requests from this mount.",
+        help: "Cache namespace for all requests from this mount.",
     },
     ConfigVar {
         env: "TALON_FUSE_MOUNTPOINT",
@@ -1870,6 +1878,7 @@ pub const FUSE_ENV_SCHEMA: &[ConfigVar] = &[
 ];
 
 pub(crate) mod fuse_env {
+    pub const NAMESPACE_ID: &str = "TALON_FUSE_NAMESPACE_ID";
     pub const MOUNTPOINT: &str = "TALON_FUSE_MOUNTPOINT";
     pub const COORDINATOR: &str = "TALON_FUSE_COORDINATOR";
     pub const NAMESPACE_PREFIX: &str = "TALON_FUSE_NAMESPACE_PREFIX";
@@ -1895,7 +1904,7 @@ impl FuseConfigPatch {
 
     /// Assemble a patch from `TALON_FUSE_*` environment variables.
     ///
-    /// Recognized keys: `TALON_FUSE_MOUNTPOINT`, `TALON_FUSE_COORDINATOR`,
+    /// Recognized keys: `TALON_FUSE_NAMESPACE_ID`, `TALON_FUSE_MOUNTPOINT`, `TALON_FUSE_COORDINATOR`,
     /// `TALON_FUSE_NAMESPACE_PREFIX`, `TALON_FUSE_BLOCK_SIZE`,
     /// `TALON_FUSE_PLACEMENT_TTL_MS`, `TALON_FUSE_READAHEAD_BLOCKS`.
     pub fn from_env() -> Result<Self> {
@@ -1913,6 +1922,7 @@ impl FuseConfigPatch {
                 .map_err(|_| Error::Other(format!("{k}: invalid u64: {v:?}")))
         };
         Ok(Self {
+            namespace_id: get(fuse_env::NAMESPACE_ID),
             mountpoint: get(fuse_env::MOUNTPOINT).map(PathBuf::from),
             coordinator: get(fuse_env::COORDINATOR),
             namespace_prefix: get(fuse_env::NAMESPACE_PREFIX),
@@ -1939,6 +1949,7 @@ impl FuseConfig {
         let merged = cli.merge(env).merge(file);
         let d = FuseConfig::default();
         let cfg = FuseConfig {
+            namespace_id: merged.namespace_id.unwrap_or(d.namespace_id),
             mountpoint: merged.mountpoint.unwrap_or(d.mountpoint),
             coordinator: merged.coordinator.unwrap_or(d.coordinator),
             namespace_prefix: merged.namespace_prefix.unwrap_or(d.namespace_prefix),
@@ -1952,6 +1963,8 @@ impl FuseConfig {
 
     /// Fail fast on invalid configuration with an actionable message.
     pub fn validate(&self) -> Result<()> {
+        crate::NamespaceContext::new(&self.namespace_id)
+            .map_err(|error| Error::Other(format!("invalid namespace_id: {error}")))?;
         if self.mountpoint.as_os_str().is_empty() {
             return Err(Error::Other("mountpoint must not be empty".into()));
         }
@@ -2134,7 +2147,7 @@ mod tests {
 
         config.node_id = Some("worker-a".into());
         config.namespace_policy = Some(
-            NamespacePolicy::from_toml(
+            ObjectNamespacePolicy::from_toml(
                 "version = 1\n\
                  [[workers]]\n\
                  node_id = \"worker-a\"\n\
@@ -2881,6 +2894,38 @@ mod tests {
     }
 
     #[test]
+    fn fuse_cache_namespace_file_env_defaults_and_validation() {
+        let file = FuseConfigPatch::from_toml(
+            "namespace_prefix = 's3/bucket'\nnamespace_id = 'analytics'",
+        )
+        .unwrap();
+        let cfg =
+            FuseConfig::resolve(file.clone(), Default::default(), Default::default()).unwrap();
+        assert_eq!(cfg.namespace_id, "analytics");
+        let env = FuseConfigPatch::from_env_with(|key| {
+            (key == "TALON_FUSE_NAMESPACE_ID").then(|| "online".into())
+        })
+        .unwrap();
+        let cfg = FuseConfig::resolve(file.clone(), env, Default::default()).unwrap();
+        assert_eq!(cfg.namespace_id, "online");
+        let default_file = FuseConfigPatch::from_toml("namespace_prefix = 's3/bucket'").unwrap();
+        assert_eq!(
+            FuseConfig::resolve(default_file, Default::default(), Default::default())
+                .unwrap()
+                .namespace_id,
+            "default"
+        );
+        for name in ["", "../escape", "worker_identity"] {
+            let env = FuseConfigPatch {
+                namespace_id: Some(name.into()),
+                ..Default::default()
+            };
+            let error = FuseConfig::resolve(file.clone(), env, Default::default()).unwrap_err();
+            assert!(error.to_string().contains("invalid namespace_id"));
+        }
+    }
+
+    #[test]
     fn fuse_namespace_prefix_is_required() {
         let err = FuseConfig::resolve(Default::default(), Default::default(), Default::default())
             .unwrap_err();
@@ -3025,47 +3070,59 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tenant_tests {
+mod namespace_tests {
     use super::*;
     #[test]
-    fn tenant_overrides_inherit_and_validate_complete_geometry() {
+    fn reserved_namespace_names_fail_configuration_validation() {
+        for name in ["worker_identity", ".worker.lock"] {
+            let mut cfg = WorkerConfig::default();
+            cfg.namespaces
+                .insert(name.into(), NamespaceCacheConfig::default());
+            assert!(cfg.validate().unwrap_err().to_string().contains("reserved"));
+        }
+    }
+
+    #[test]
+    fn namespace_overrides_inherit_and_validate_complete_geometry() {
         let cfg = WorkerConfig::default();
         let mut cfg = cfg;
         let patch = WorkerConfigPatch::from_toml(
             r#"
-[tenants.acme]
+[namespaces.acme]
 block_size = 33554432
 l2_page_size_bytes = 1048576
 page_tti_hours = 2
-[tenants.default]
+[namespaces.default]
 block_size = 67108864
 "#,
         )
         .unwrap();
-        cfg.tenants = patch.tenants.unwrap();
+        cfg.namespaces = patch.namespaces.unwrap();
         cfg.validate().unwrap();
-        let acme = cfg.for_tenant(&crate::TenantId::named("acme")).unwrap();
+        let acme = cfg
+            .for_namespace(&crate::NamespaceId::named("acme"))
+            .unwrap();
         assert_eq!(acme.block_size, 33554432);
         assert_eq!(acme.l2_page_size_bytes, 1048576);
         assert_eq!(acme.page_tti_hours, 2);
         assert_eq!(acme.capacity_bytes, cfg.capacity_bytes);
         assert_eq!(
-            cfg.for_tenant(&crate::TenantId::Unattributed)
+            cfg.for_namespace(&crate::NamespaceId::Unattributed)
                 .unwrap()
                 .block_size,
             67108864
         );
         assert_eq!(
-            cfg.for_tenant(&crate::TenantId::named("unknown"))
+            cfg.for_namespace(&crate::NamespaceId::named("unknown"))
                 .unwrap()
                 .block_size,
             cfg.block_size
         );
-        cfg.tenants.get_mut("acme").unwrap().l2_page_size_bytes = Some(3);
+        cfg.namespaces.get_mut("acme").unwrap().l2_page_size_bytes = Some(3);
         assert!(cfg.validate().is_err());
-        cfg.tenants.clear();
-        cfg.tenants
-            .insert("../escape".into(), TenantCacheConfig::default());
+        cfg.namespaces.clear();
+        cfg.namespaces
+            .insert("../escape".into(), NamespaceCacheConfig::default());
         assert!(cfg.validate().is_err());
     }
 }

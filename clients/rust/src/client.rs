@@ -3,7 +3,7 @@
 mod membership_fixture;
 
 use std::sync::Arc;
-use talon_core::TenantContext;
+use talon_core::NamespaceContext;
 use tokio::sync::Semaphore;
 
 use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
@@ -43,7 +43,7 @@ pub struct Client {
 // Resolved once at the API boundary; borrowed through metadata and block RPCs.
 #[derive(Clone, Copy)]
 struct RequestContext<'a> {
-    tenant: TenantContext<'a>,
+    namespace: NamespaceContext<'a>,
     block_size: u32,
 }
 
@@ -163,13 +163,17 @@ impl Client {
         &self,
         options: &crate::RequestOptions<'a>,
     ) -> Result<RequestContext<'a>, Error> {
-        let tenant = TenantContext::new(options.tenant.unwrap_or(talon_core::DEFAULT_TENANT))
-            .map_err(|e| Error::InvalidArgument(e.to_string()))?;
+        let namespace =
+            NamespaceContext::new(options.namespace.unwrap_or(talon_core::DEFAULT_NAMESPACE))
+                .map_err(|e| Error::InvalidArgument(e.to_string()))?;
         let block_size = options.block_size.unwrap_or(self.block_size);
         if block_size == 0 {
             return Err(Error::InvalidArgument("block_size must be positive".into()));
         }
-        Ok(RequestContext { tenant, block_size })
+        Ok(RequestContext {
+            namespace,
+            block_size,
+        })
     }
 
     /// Prewarm a file's specified version on its Maglev primary workers.
@@ -186,7 +190,7 @@ impl Client {
             .await
     }
 
-    /// Prewarm with per-request tenant, block size and trace options.
+    /// Prewarm with per-request namespace, block size and trace options.
     pub async fn load_with_options(
         &self,
         object: &ObjectId,
@@ -220,7 +224,7 @@ impl Client {
                     size,
                     block_size: request.block_size,
                 },
-                request.tenant,
+                request.namespace,
             )
             .await
     }
@@ -238,7 +242,7 @@ impl Client {
             .await
     }
 
-    /// Prewarm a batch for one tenant with per-request planning and trace options.
+    /// Prewarm a batch for one namespace with per-request planning and trace options.
     pub async fn batch_load_with_options(
         &self,
         requests: &[LoadRequest],
@@ -268,7 +272,7 @@ impl Client {
             })
             .collect::<Vec<_>>();
         self.reader
-            .batch_load_with_context(&files, request.tenant)
+            .batch_load_with_context(&files, request.namespace)
             .await
     }
 
@@ -298,7 +302,7 @@ impl Client {
     ) -> Result<ObjectStat, Error> {
         Ok(self
             .coordinator
-            .stat_object_with_context(object, request.tenant)
+            .stat_object_with_context(object, request.namespace)
             .await?)
     }
 
@@ -308,7 +312,7 @@ impl Client {
             .await
     }
 
-    /// List objects using the request's tenant and trace options.
+    /// List objects using the request's namespace and trace options.
     pub async fn list_with_options(
         &self,
         prefix: &str,
@@ -319,7 +323,7 @@ impl Client {
         let result = op
             .scope(
                 self.coordinator
-                    .list_objects_with_context(prefix, request.tenant),
+                    .list_objects_with_context(prefix, request.namespace),
             )
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
@@ -511,7 +515,7 @@ impl Client {
                 segment,
                 chunk,
                 stat.size,
-                request.tenant,
+                request.namespace,
             ));
         }
 
@@ -527,7 +531,7 @@ impl Client {
                     segment,
                     chunk,
                     stat.size,
-                    request.tenant,
+                    request.namespace,
                 ));
             }
         }
@@ -541,7 +545,7 @@ async fn read_segment_into(
     segment: BlockSegment,
     dst: &mut [u8],
     object_len: u64,
-    tenant: TenantContext<'_>,
+    namespace: NamespaceContext<'_>,
 ) -> Result<usize, Error> {
     let _permit = permits
         .acquire()
@@ -553,7 +557,7 @@ async fn read_segment_into(
             segment.offset_in_block,
             dst,
             object_len,
-            tenant,
+            namespace,
         )
         .await
         .map_err(Error::from)
@@ -605,7 +609,7 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     #[tokio::test]
-    async fn one_client_isolates_concurrent_request_tenants_and_geometry() {
+    async fn one_client_isolates_concurrent_request_namespaces_and_geometry() {
         use talon_transport::{codec, data, envelope, MsgType};
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -627,13 +631,13 @@ mod tests {
                         let mut payload = vec![0; header.length as usize];
                         socket.read_exact(&mut payload).await.unwrap();
                         let (metadata, _) = envelope::decode(&header, &payload).unwrap();
-                        let tenant = metadata.tenant.unwrap_or_default();
-                        let name = tenant.effective_name();
+                        let namespace = metadata.namespace.unwrap_or_default();
+                        let name = namespace.effective_name();
                         let expected_size = match name {
                             "a" => 4,
                             "b" => 8,
                             "default" => 16,
-                            _ => panic!("unexpected tenant"),
+                            _ => panic!("unexpected namespace"),
                         };
                         let mut frame = raw.to_vec();
                         frame.extend(payload);
@@ -678,8 +682,9 @@ mod tests {
                             };
                             codec::encode(header.request_id, &reply).unwrap()
                         } else {
-                            let request = if header.msg_type == MsgType::GetVersionedRangeTenant {
-                                data::decode_versioned_tenant_request(&frame)
+                            let request = if header.msg_type == MsgType::GetVersionedRangeNamespace
+                            {
+                                data::decode_versioned_namespace_request(&frame)
                                     .unwrap()
                                     .1
                                     .request
@@ -689,7 +694,7 @@ mod tests {
                             assert_eq!(
                                 request.version.as_str(),
                                 name,
-                                "stat must use the same tenant as the read"
+                                "stat must use the same namespace as the read"
                             );
                             if reads.fetch_add(1, Ordering::SeqCst) < 2 {
                                 barrier.wait().await;
@@ -712,12 +717,12 @@ mod tests {
             .build()
             .unwrap();
         let object = parse_uri("s3://bucket/key").unwrap();
-        let exercise = |tenant: &'static str, block_size| {
+        let exercise = |namespace: &'static str, block_size| {
             let client = &client;
             let object = &object;
             async move {
                 let options = crate::RequestOptions {
-                    tenant: Some(tenant),
+                    namespace: Some(namespace),
                     block_size: Some(block_size),
                     ..Default::default()
                 };
@@ -726,21 +731,21 @@ mod tests {
                         .read_with_options(object, 0, Some(1), None, &options)
                         .await
                         .unwrap(),
-                    [tenant.as_bytes()[0]]
+                    [namespace.as_bytes()[0]]
                 );
                 let mut dst = [0];
                 client
                     .read_into_with_options(object, 0, &mut dst, None, &options)
                     .await
                     .unwrap();
-                assert_eq!(dst, [tenant.as_bytes()[0]]);
+                assert_eq!(dst, [namespace.as_bytes()[0]]);
                 assert_eq!(
                     client
                         .list_with_options("s3/bucket", &options)
                         .await
                         .unwrap()[0]
                         .path,
-                    tenant
+                    namespace
                 );
                 let result = client
                     .load_with_options(object, &Version::new("v1"), 9, &options)
@@ -1664,7 +1669,7 @@ mod tests {
                     Some(8),
                     Some(&first_stat),
                     &crate::RequestOptions {
-                        tenant: Some("a"),
+                        namespace: Some("a"),
                         ..Default::default()
                     },
                 )
@@ -1678,7 +1683,7 @@ mod tests {
                     Some(8),
                     Some(&stat),
                     &crate::RequestOptions {
-                        tenant: Some("b"),
+                        namespace: Some("b"),
                         ..Default::default()
                     },
                 )

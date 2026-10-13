@@ -168,7 +168,7 @@ pub enum FailureReason {
     Internal,
     /// The operation is not in the advertised compatibility matrix.
     Unsupported,
-    /// The tenant exceeded its rate limit and was throttled.
+    /// The namespace exceeded its rate limit and was throttled.
     RateLimited,
 }
 

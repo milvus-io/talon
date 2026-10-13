@@ -1,0 +1,57 @@
+rule_files:
+  - talon.alerts.yml
+evaluation_interval: 1m
+tests:
+  - name: namespace maintenance failures survive a healthy peer
+    interval: 1m
+    input_series:
+      - series: 'talon_worker_process_uptime_seconds{instance="worker-1",job="talon-worker"}'
+        values: '0+60x20'
+      - series: 'talon_worker_page_access_checkpoint_interval_seconds{instance="worker-1",job="talon-worker",namespace="a"}'
+        values: '60+0x20'
+      - series: 'talon_worker_page_access_checkpoint_interval_seconds{instance="worker-1",job="talon-worker",namespace="z"}'
+        values: '120+0x20'
+      - series: 'talon_worker_page_access_checkpoint_timestamp_seconds{instance="worker-1",job="talon-worker",namespace="a"}'
+        values: '0+0x20'
+      - series: 'talon_worker_page_access_checkpoint_timestamp_seconds{instance="worker-1",job="talon-worker",namespace="z"}'
+        values: '0+60x20'
+      - series: 'talon_worker_page_access_dirty_blocks{instance="worker-1",job="talon-worker",namespace="a"}'
+        values: '1+0x20'
+      - series: 'talon_worker_page_access_dirty_blocks{instance="worker-1",job="talon-worker",namespace="z"}'
+        values: '0+0x20'
+      # Keep age zero to exercise the never-checkpointed uptime branch alone.
+      - series: 'talon_worker_page_access_oldest_dirty_seconds{instance="worker-1",job="talon-worker",namespace="a"}'
+        values: '0+0x20'
+      - series: 'talon_worker_page_access_oldest_dirty_seconds{instance="worker-1",job="talon-worker",namespace="z"}'
+        values: '0+0x20'
+      - series: 'talon_worker_page_cleanup_scan_timestamp_seconds{instance="worker-1",job="talon-worker",namespace="a"}'
+        values: '0+0x20'
+      - series: 'talon_worker_page_cleanup_scan_timestamp_seconds{instance="worker-1",job="talon-worker",namespace="z"}'
+        values: '0+60x20'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: TalonPageAccessCheckpointLag
+        exp_alerts:
+          - exp_labels:
+              instance: worker-1
+              job: talon-worker
+              namespace: a
+              severity: warning
+              component: worker
+            exp_annotations:
+              summary: Page access checkpoints lag on worker-1
+              description: 'Access records remain unsaved beyond three checkpoint periods; restart can cause early eviction and origin traffic. Check disk space, permissions and I/O latency.'
+              runbook_url: https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-access-checkpoint-lag
+      - eval_time: 21m
+        alertname: TalonPageCleanupScanStalled
+        exp_alerts:
+          - exp_labels:
+              instance: worker-1
+              job: talon-worker
+              namespace: a
+              severity: warning
+              component: worker
+            exp_annotations:
+              summary: Page metadata cleanup scan is stalled on worker-1
+              description: 'No disk cleanup scan completed for 15 minutes. Check filesystem latency and scan/delete budgets; large cache roots may need a higher alert threshold.'
+              runbook_url: https://github.com/milvus-io/talon/blob/main/docs/operations/runbook.md#page-cleanup-scan-stalled

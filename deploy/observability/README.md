@@ -36,6 +36,7 @@ Validate locally with the upstream tool (also run structurally in CI):
 
 ```sh
 promtool check rules prometheus/talon.rules.yml prometheus/talon.alerts.yml
+promtool test rules prometheus/namespace-alerts.test.yml
 ```
 
 ### Missing scrape vs. stale data

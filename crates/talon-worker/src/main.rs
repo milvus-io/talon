@@ -32,7 +32,7 @@ use talon_backend::{
 };
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
-    Backend, BackendStore, NamespacePolicy, NodeId, NodeInfo, NodeRole, ObjectNamespace,
+    Backend, BackendStore, NodeId, NodeInfo, NodeRole, ObjectNamespace, ObjectNamespacePolicy,
     WorkerConfig, WorkerConfigPatch, WorkloadIdentity, WorkloadRole,
 };
 use talon_metadata::MappingRevision;
@@ -214,7 +214,7 @@ impl Args {
             gcs_endpoint: None,
             // The [rate_limits] table is file-only; the CLI leaves it unset.
             rate_limits: None,
-            tenants: None,
+            namespaces: None,
         }
     }
 }
@@ -576,16 +576,16 @@ async fn run() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let runtime = WorkerRuntime::open_tenants(
+    let runtime = WorkerRuntime::open_namespaces(
         &cfg,
         cache_root_lock,
         backend,
         observability.metrics().clone(),
     )?;
     let worker = Arc::new(runtime);
-    observability.attach_tenant_runtime(&worker);
-    for tenant in worker.tenant_runtimes() {
-        tenant.recover_page_file_cleanup().await;
+    observability.attach_namespace_runtime(&worker);
+    for namespace in worker.namespace_runtimes() {
+        namespace.recover_page_file_cleanup().await;
     }
 
     let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
@@ -991,7 +991,7 @@ async fn serve_control(
     cluster_id: String,
     worker_id: String,
     worker_incarnation: String,
-    policy: Option<NamespacePolicy>,
+    policy: Option<ObjectNamespacePolicy>,
     guard: Arc<MappingGuard>,
     shutdown: Arc<talon_transport::shutdown::Shutdown>,
 ) -> anyhow::Result<()> {
@@ -1081,7 +1081,7 @@ fn handle_revision_update(
     cluster_id: &str,
     worker_id: &str,
     worker_incarnation: &str,
-    policy: Option<&NamespacePolicy>,
+    policy: Option<&ObjectNamespacePolicy>,
     guard: &MappingGuard,
 ) -> Result<ControlMessage, String> {
     let ControlMessage::MappingRevisionUpdate {
@@ -1168,8 +1168,8 @@ mod tests {
         .unwrap()
     }
 
-    fn revision_policy() -> NamespacePolicy {
-        NamespacePolicy::from_toml(
+    fn revision_policy() -> ObjectNamespacePolicy {
+        ObjectNamespacePolicy::from_toml(
             "version = 1\n\
              [[workers]]\n\
              node_id = \"worker-1\"\n\

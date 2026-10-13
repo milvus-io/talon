@@ -61,9 +61,9 @@ fn default_and_named_request_setup_do_not_allocate() {
     let object = parse_uri("s3://bucket/key").unwrap();
     let version = Version::new("v1");
     let exercise = || {
-        for tenant in [None, Some("a"), Some("b"), None] {
+        for namespace in [None, Some("a"), Some("b"), None] {
             let options = RequestOptions {
-                tenant,
+                namespace,
                 block_size: Some(4096),
                 ..Default::default()
             };
@@ -94,6 +94,6 @@ fn default_and_named_request_setup_do_not_allocate() {
     let allocations = ALLOCATIONS.with(|count| count.replace(None).unwrap());
     assert_eq!(
         allocations, 0,
-        "selecting a request tenant must not allocate client copies"
+        "selecting a request namespace must not allocate client copies"
     );
 }

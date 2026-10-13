@@ -12,22 +12,22 @@
 //! their TCP connection to a shared pool; stale pooled sockets are retried once
 //! on a fresh connection.
 
-use talon_core::TenantContext;
+use talon_core::NamespaceContext;
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use talon_core::{BlockId, ObjectId, RequestId, TenantId, Version};
+use talon_core::{BlockId, NamespaceId, ObjectId, RequestId, Version};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{
-    decode_error_payload, encode_cached_block_put_header, encode_cached_request,
-    encode_cached_tenant_request, encode_delete, encode_put_header, encode_request,
-    encode_tenant_request, encode_versioned_request, encode_versioned_tenant_request,
-    CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest, Flags, PutRequest,
-    RangeRequest, TenantScopedCachedRange, TenantScopedRange, TenantScopedVersionedRange,
-    VersionedRangeRequest, MAX_CONTROL_PAYLOAD_LEN,
+    decode_error_payload, encode_cached_block_put_header, encode_cached_namespace_request,
+    encode_cached_request, encode_delete, encode_namespace_request, encode_put_header,
+    encode_request, encode_versioned_namespace_request, encode_versioned_request,
+    CachedBlockPutRequest, CachedRangeRequest, DataPlaneError, DeleteRequest, Flags,
+    NamespaceScopedCachedRange, NamespaceScopedRange, NamespaceScopedVersionedRange, PutRequest,
+    RangeRequest, VersionedRangeRequest, MAX_CONTROL_PAYLOAD_LEN,
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -171,9 +171,9 @@ pub enum WorkerLoadError {
 pub struct WorkerClient {
     addr: String,
     pool: Arc<ConnectionPool>,
-    /// Tenant every fetch from this client is attributed to. `default`
+    /// Namespace every fetch from this client is attributed to. `default`
     /// unless set with [`request`](Self::request).
-    tenant: TenantId,
+    namespace: NamespaceId,
 }
 
 impl WorkerClient {
@@ -191,7 +191,7 @@ impl WorkerClient {
         Self {
             addr: addr.into(),
             pool,
-            tenant: TenantId::default(),
+            namespace: NamespaceId::default(),
         }
     }
 
@@ -201,50 +201,50 @@ impl WorkerClient {
     }
 
     /// Create an immutable request handle sharing this client's connection pool.
-    /// Concurrent handles may select different tenants; the client is unchanged.
-    pub fn request(&self, tenant: &TenantId) -> Result<Self, talon_core::TenantIdError> {
-        tenant.validate()?;
+    /// Concurrent handles may select different namespaces; the client is unchanged.
+    pub fn request(&self, namespace: &NamespaceId) -> Result<Self, talon_core::NamespaceIdError> {
+        namespace.validate()?;
         let mut request = self.clone();
-        request.tenant = tenant.normalized();
+        request.namespace = namespace.normalized();
         Ok(request)
     }
 
-    /// Encode a tenant-scoped range frame when the request handle selects a
-    /// non-default tenant, else a plain `GetRange`.
+    /// Encode a namespace-scoped range frame when the request handle selects a
+    /// non-default namespace, else a plain `GetRange`.
     fn encode_range_request(
         &self,
         request_id: u32,
         request: RangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_default() {
+        if self.namespace.is_default() {
             encode_request(request_id, &request)
         } else {
-            encode_tenant_request(
+            encode_namespace_request(
                 request_id,
-                &TenantScopedRange {
-                    tenant: self.tenant.clone(),
+                &NamespaceScopedRange {
+                    namespace: self.namespace.clone(),
                     request,
                 },
             )
         }
     }
 
-    /// Encode a tenant-scoped cache-only frame when the request handle selects a
-    /// non-default tenant, else a plain `GetCachedRange`. A
-    /// named tenant keeps resident-only reads attributed so they are metered by
+    /// Encode a namespace-scoped cache-only frame when the request handle selects a
+    /// non-default namespace, else a plain `GetCachedRange`. A
+    /// named namespace keeps resident-only reads attributed so they are metered by
     /// the worker like any other read.
     fn encode_cached_range_request(
         &self,
         request_id: u32,
         request: CachedRangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_default() {
+        if self.namespace.is_default() {
             encode_cached_request(request_id, &request)
         } else {
-            encode_cached_tenant_request(
+            encode_cached_namespace_request(
                 request_id,
-                &TenantScopedCachedRange {
-                    tenant: self.tenant.clone(),
+                &NamespaceScopedCachedRange {
+                    namespace: self.namespace.clone(),
                     request,
                 },
             )
@@ -252,20 +252,20 @@ impl WorkerClient {
     }
 
     /// Encode an origin-backed range request pinned to one source version.
-    /// Named tenants use a distinct attributed message type; both variants fail
+    /// Named namespaces use a distinct attributed message type; both variants fail
     /// closed on workers that predate version-pinned reads.
     fn encode_versioned_range_request(
         &self,
         request_id: u32,
         request: VersionedRangeRequest,
     ) -> Result<Vec<u8>, talon_transport::DataError> {
-        if self.tenant.is_default() {
+        if self.namespace.is_default() {
             encode_versioned_request(request_id, &request)
         } else {
-            encode_versioned_tenant_request(
+            encode_versioned_namespace_request(
                 request_id,
-                &TenantScopedVersionedRange {
-                    tenant: self.tenant.clone(),
+                &NamespaceScopedVersionedRange {
+                    namespace: self.namespace.clone(),
                     request,
                 },
             )
@@ -276,15 +276,19 @@ impl WorkerClient {
     /// The two-minute deadline covers connection setup, exchange, and at most
     /// one retry of a stale pooled socket. Rejections are never retried.
     pub async fn load_block(&self, block: &BlockId, len: u64) -> Result<(), WorkerLoadError> {
-        self.load_block_with_context(block, len, self.tenant.context().expect("validated tenant"))
-            .await
+        self.load_block_with_context(
+            block,
+            len,
+            self.namespace.context().expect("validated namespace"),
+        )
+        .await
     }
 
     pub(crate) async fn load_block_with_context(
         &self,
         block: &BlockId,
         len: u64,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<(), WorkerLoadError> {
         self.load_control(
             &talon_transport::ControlMessage::LoadBlock {
@@ -292,7 +296,7 @@ impl WorkerClient {
                 len,
             },
             Duration::from_secs(120),
-            tenant,
+            namespace,
         )
         .await
         .map(|_| ())
@@ -304,21 +308,24 @@ impl WorkerClient {
         &self,
         blocks: &[talon_transport::LoadBlockRequest],
     ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
-        self.batch_load_with_context(blocks, self.tenant.context().expect("validated tenant"))
-            .await
+        self.batch_load_with_context(
+            blocks,
+            self.namespace.context().expect("validated namespace"),
+        )
+        .await
     }
 
     pub(crate) async fn batch_load_with_context(
         &self,
         blocks: &[talon_transport::LoadBlockRequest],
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
         self.load_control(
             &talon_transport::ControlMessage::BatchLoad {
                 blocks: blocks.to_vec(),
             },
             Duration::from_secs(30 * 60),
-            tenant,
+            namespace,
         )
         .await
     }
@@ -327,7 +334,7 @@ impl WorkerClient {
         &self,
         message: &talon_transport::ControlMessage,
         deadline: Duration,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<Vec<talon_transport::LoadBlockFailure>, WorkerLoadError> {
         let batch_count = match message {
             talon_transport::ControlMessage::BatchLoad { blocks } => Some(blocks.len()),
@@ -335,7 +342,7 @@ impl WorkerClient {
         };
         let request_id = RequestId::next().0;
         let mut output = talon_transport::codec::encode(request_id, message)?;
-        talon_transport::envelope::outbound_tenant_context(&mut output, &self.addr, tenant)
+        talon_transport::envelope::outbound_namespace_context(&mut output, &self.addr, namespace)
             .map_err(talon_transport::CodecError::from)?;
         self.pool
             .with_deadline("worker load", deadline, async {
@@ -405,7 +412,11 @@ impl WorkerClient {
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_tenant(&mut out, &self.addr, &self.tenant)?;
+                    talon_transport::envelope::outbound_namespace(
+                        &mut out,
+                        &self.addr,
+                        &self.namespace,
+                    )?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
@@ -457,7 +468,7 @@ impl WorkerClient {
             .exchange_into(
                 &mut output,
                 dst,
-                self.tenant.context().expect("validated tenant"),
+                self.namespace.context().expect("validated namespace"),
             )
             .await
         {
@@ -465,10 +476,10 @@ impl WorkerClient {
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_tenant(
+                    talon_transport::envelope::outbound_namespace(
                         &mut output,
                         &self.addr,
-                        &self.tenant,
+                        &self.namespace,
                     )?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
@@ -529,10 +540,10 @@ impl WorkerClient {
             Err((true, error)) if error.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_tenant(
+                    talon_transport::envelope::outbound_namespace(
                         &mut output,
                         &self.addr,
-                        &self.tenant,
+                        &self.namespace,
                     )?;
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let bytes = self
@@ -579,7 +590,7 @@ impl WorkerClient {
             offset,
             dst,
             object_len,
-            self.tenant.context().expect("validated tenant"),
+            self.namespace.context().expect("validated namespace"),
         )
         .await
     }
@@ -591,7 +602,7 @@ impl WorkerClient {
         offset: u64,
         dst: &mut [u8],
         object_len: u64,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<usize, WorkerError> {
         let request = VersionedRangeRequest {
             request: RangeRequest {
@@ -604,15 +615,15 @@ impl WorkerClient {
         };
         let request_id = RequestId::next();
         let mut output = encode_versioned_request(request_id.0, &request)?;
-        match self.exchange_into(&mut output, dst, tenant).await {
+        match self.exchange_into(&mut output, dst, namespace).await {
             Ok(n) => Ok(n),
             Err((true, error)) if error.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_tenant_context(
+                    talon_transport::envelope::outbound_namespace_context(
                         &mut output,
                         &self.addr,
-                        tenant,
+                        namespace,
                     )?;
                     let mut stream = self.pool.fresh(&self.addr).await?;
                     let n = self
@@ -668,10 +679,10 @@ impl WorkerClient {
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound_tenant(
+                    talon_transport::envelope::outbound_namespace(
                         &mut output,
                         &self.addr,
-                        &self.tenant,
+                        &self.namespace,
                     )?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
@@ -709,7 +720,7 @@ impl WorkerClient {
                 body_len: body.len() as u64,
             },
         )?;
-        talon_transport::envelope::outbound_tenant(&mut header, &self.addr, &self.tenant)?;
+        talon_transport::envelope::outbound_namespace(&mut header, &self.addr, &self.namespace)?;
         match self.admit_exchange(&header, body).await {
             Ok(()) => Ok(()),
             Err((true, err)) if err.is_transport_failure() => {
@@ -774,7 +785,7 @@ impl WorkerClient {
     ) -> Result<Vec<u8>, (bool, WorkerError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound_tenant(out, &self.addr, &self.tenant)
+            talon_transport::envelope::outbound_namespace(out, &self.addr, &self.namespace)
                 .map_err(|e| (false, WorkerError::Frame(e)))?;
 
             let (mut stream, reused) = self
@@ -809,11 +820,11 @@ impl WorkerClient {
         &self,
         output: &mut Vec<u8>,
         dst: &mut [u8],
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<usize, (bool, WorkerError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound_tenant_context(output, &self.addr, tenant)
+            talon_transport::envelope::outbound_namespace_context(output, &self.addr, namespace)
                 .map_err(|e| (false, WorkerError::Frame(e)))?;
 
             let (mut stream, reused) = self
@@ -852,7 +863,7 @@ impl WorkerClient {
 /// [`ConnectionPool`] like the read path (issue #181, #226/#230).
 #[derive(Debug, Clone)]
 pub struct WriteClient {
-    tenant: TenantId,
+    namespace: NamespaceId,
     addr: String,
     pool: Arc<ConnectionPool>,
 }
@@ -867,16 +878,16 @@ impl WriteClient {
     pub fn with_pool(addr: impl Into<String>, pool: Arc<ConnectionPool>) -> Self {
         Self {
             addr: addr.into(),
-            tenant: TenantId::default(),
+            namespace: NamespaceId::default(),
             pool,
         }
     }
 
     /// Create a per-request write/delete handle sharing the connection pool.
-    pub fn request(&self, tenant: &TenantId) -> Result<Self, talon_core::TenantIdError> {
-        tenant.validate()?;
+    pub fn request(&self, namespace: &NamespaceId) -> Result<Self, talon_core::NamespaceIdError> {
+        namespace.validate()?;
         let mut request = self.clone();
-        request.tenant = tenant.normalized();
+        request.namespace = namespace.normalized();
         Ok(request)
     }
 
@@ -904,7 +915,7 @@ impl WriteClient {
                 body_len: body.len() as u64,
             },
         )?;
-        talon_transport::envelope::outbound_tenant(&mut header, &self.addr, &self.tenant)?;
+        talon_transport::envelope::outbound_namespace(&mut header, &self.addr, &self.namespace)?;
         match self.put_exchange(&header, body).await {
             Ok(version) => Ok(version),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -955,7 +966,7 @@ impl WriteClient {
                 body_len: len,
             },
         )?;
-        talon_transport::envelope::outbound_tenant(&mut header, &self.addr, &self.tenant)?;
+        talon_transport::envelope::outbound_namespace(&mut header, &self.addr, &self.namespace)?;
         match self.put_file_exchange(&header, &mut file, len).await {
             Ok(version) => Ok(version),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -1061,7 +1072,7 @@ impl WriteClient {
                 object: object.clone(),
             },
         )?;
-        talon_transport::envelope::outbound_tenant(&mut frame, &self.addr, &self.tenant)?;
+        talon_transport::envelope::outbound_namespace(&mut frame, &self.addr, &self.namespace)?;
         match self.delete_exchange(&frame).await {
             Ok(()) => Ok(()),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -1255,8 +1266,8 @@ mod tests {
     use std::time::Duration;
     use talon_core::Backend;
     use talon_transport::{
-        decode_cached_block_put_header, decode_cached_request, decode_cached_tenant_request,
-        decode_request, decode_tenant_request, decode_versioned_request, encode_error,
+        decode_cached_block_put_header, decode_cached_namespace_request, decode_cached_request,
+        decode_namespace_request, decode_request, decode_versioned_request, encode_error,
         response_header_ok,
     };
     use tokio::net::TcpListener;
@@ -1266,7 +1277,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_reaches_writes_admission_and_load_controls() {
+    async fn namespace_reaches_writes_admission_and_load_controls() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
         let server = tokio::spawn(async move {
@@ -1285,17 +1296,20 @@ mod tests {
                 ],
             ] {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                for (kind, tenant) in expected {
+                for (kind, namespace) in expected {
                     let mut raw = [0; HEADER_LEN];
                     socket.read_exact(&mut raw).await.unwrap();
                     let header = FrameHeader::decode(&raw).unwrap();
                     assert_eq!(header.msg_type, kind);
-                    assert_eq!(header.version, if tenant == "default" { 1 } else { 3 });
+                    assert_eq!(header.version, if namespace == "default" { 1 } else { 3 });
                     let mut payload = vec![0; header.length as usize];
                     socket.read_exact(&mut payload).await.unwrap();
                     let (metadata, _) =
                         talon_transport::envelope::decode(&header, &payload).unwrap();
-                    assert_eq!(metadata.tenant.unwrap_or_default().effective_name(), tenant);
+                    assert_eq!(
+                        metadata.namespace.unwrap_or_default().effective_name(),
+                        namespace
+                    );
                     let mut full = raw.to_vec();
                     full.extend(payload);
                     let reply = match kind {
@@ -1337,7 +1351,7 @@ mod tests {
         let writer = WriteClient::new(addr.clone());
         assert_eq!(
             writer
-                .request(&TenantId::named("a"))
+                .request(&NamespaceId::named("a"))
                 .unwrap()
                 .put_object(&object(), &[42; 4])
                 .await
@@ -1345,7 +1359,7 @@ mod tests {
             Version::new("v1")
         );
         writer
-            .request(&TenantId::named("b"))
+            .request(&NamespaceId::named("b"))
             .unwrap()
             .delete_object(&object())
             .await
@@ -1355,13 +1369,13 @@ mod tests {
         let client = WorkerClient::new(addr);
         let block = BlockId::new(object(), 0, 4, Version::new("v1"));
         client
-            .request(&TenantId::named("a"))
+            .request(&NamespaceId::named("a"))
             .unwrap()
             .admit_cached_block(&block, 4, &[42; 4])
             .await
             .unwrap();
         client
-            .request(&TenantId::named("b"))
+            .request(&NamespaceId::named("b"))
             .unwrap()
             .load_block(&block, 4)
             .await
@@ -1537,23 +1551,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_client_sends_a_tenant_scoped_frame() {
+    async fn namespace_client_sends_a_namespace_scoped_frame() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen: Arc<std::sync::Mutex<Option<NamespaceId>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let recorded = Arc::clone(&seen);
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut hdr = [0u8; HEADER_LEN];
             sock.read_exact(&mut hdr).await.unwrap();
             let header = FrameHeader::decode(&hdr).unwrap();
-            assert_eq!(header.msg_type, MsgType::GetRangeTenant);
+            assert_eq!(header.msg_type, MsgType::GetRangeNamespace);
             let mut body = vec![0u8; header.length as usize];
             sock.read_exact(&mut body).await.unwrap();
             let mut full = hdr.to_vec();
             full.extend_from_slice(&body);
-            let (_h, scoped) = decode_tenant_request(&full).unwrap();
-            *recorded.lock().unwrap() = Some(scoped.tenant);
+            let (_h, scoped) = decode_namespace_request(&full).unwrap();
+            *recorded.lock().unwrap() = Some(scoped.namespace);
             // Reply with the requested bytes so the client fetch succeeds; the
             // reply is an ordinary GetRange frame.
             let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
@@ -1563,16 +1578,19 @@ mod tests {
         });
 
         let client = WorkerClient::new(addr)
-            .request(&TenantId::named("acme"))
+            .request(&NamespaceId::named("acme"))
             .unwrap();
         let bytes = client.fetch_range(&object(), 0, 16).await.unwrap();
         assert_eq!(bytes.len(), 16);
-        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(NamespaceId::named("acme"))
+        );
     }
 
     #[tokio::test]
     async fn default_client_sends_a_plain_getrange() {
-        // Without a tenant the client sends an ordinary GetRange, which the
+        // Without a namespace the client sends an ordinary GetRange, which the
         // GetRange-only mock worker decodes successfully (backward compatible).
         let addr = mock_worker(|req| {
             let mut out = response_header_ok(0, req.len as u32).to_vec();
@@ -1657,26 +1675,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tenant_client_sends_a_cached_tenant_scoped_frame() {
-        // A tenant-scoped request attributes cache-only reads too, so a resident
-        // read cannot slip past per-tenant metering on the worker.
+    async fn namespace_client_sends_a_cached_namespace_scoped_frame() {
+        // A namespace-scoped request attributes cache-only reads too, so a resident
+        // read cannot slip past per-namespace metering on the worker.
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap().to_string();
-        let seen: Arc<std::sync::Mutex<Option<TenantId>>> = Arc::new(std::sync::Mutex::new(None));
+        let seen: Arc<std::sync::Mutex<Option<NamespaceId>>> =
+            Arc::new(std::sync::Mutex::new(None));
         let recorded = Arc::clone(&seen);
         tokio::spawn(async move {
             let (mut sock, _) = listener.accept().await.unwrap();
             let mut hdr = [0u8; HEADER_LEN];
             sock.read_exact(&mut hdr).await.unwrap();
             let header = FrameHeader::decode(&hdr).unwrap();
-            assert_eq!(header.msg_type, MsgType::GetCachedRangeTenant);
+            assert_eq!(header.msg_type, MsgType::GetCachedRangeNamespace);
             let mut body = vec![0u8; header.length as usize];
             sock.read_exact(&mut body).await.unwrap();
             let mut full = hdr.to_vec();
             full.extend_from_slice(&body);
-            let (_h, scoped) = decode_cached_tenant_request(&full).unwrap();
+            let (_h, scoped) = decode_cached_namespace_request(&full).unwrap();
             assert_eq!(scoped.request.version, Version::new("etag-v2"));
-            *recorded.lock().unwrap() = Some(scoped.tenant);
+            *recorded.lock().unwrap() = Some(scoped.namespace);
             let mut out = response_header_ok(header.request_id, scoped.request.len as u32).to_vec();
             out.resize(out.len() + scoped.request.len as usize, 0);
             sock.write_all(&out).await.unwrap();
@@ -1684,14 +1703,17 @@ mod tests {
         });
 
         let client = WorkerClient::new(addr)
-            .request(&TenantId::named("acme"))
+            .request(&NamespaceId::named("acme"))
             .unwrap();
         let bytes = client
             .fetch_cached_range(&object(), &Version::new("etag-v2"), 0, 16)
             .await
             .unwrap();
         assert_eq!(bytes.len(), 16);
-        assert_eq!(seen.lock().unwrap().take(), Some(TenantId::named("acme")));
+        assert_eq!(
+            seen.lock().unwrap().take(),
+            Some(NamespaceId::named("acme"))
+        );
     }
 
     #[tokio::test]

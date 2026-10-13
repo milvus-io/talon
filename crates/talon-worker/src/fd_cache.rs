@@ -63,6 +63,19 @@ impl FdCache {
         Self::with_capacity(FD_CACHE_SHARD_CAPACITY)
     }
 
+    /// Pages need a larger working set: 16 shards x 512 = 8192 descriptors.
+    pub(crate) fn for_pages() -> Self {
+        Self::with_capacity(512)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn len(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| shard.lock().unwrap().len())
+            .sum()
+    }
+
     /// A cache with an explicit per-shard capacity, for callers whose files are
     /// far smaller than a whole block (a 1 MiB page vs a 256 MiB block) and
     /// which therefore need proportionally more descriptors to cover the same
@@ -181,6 +194,55 @@ mod tests {
             assert!(shard.lock().unwrap().len() <= 2);
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn namespace_stores_share_one_descriptor_limit_and_keep_paths_distinct() {
+        use bytes::Bytes;
+        use talon_core::{Backend, BlockId, ObjectId, ObjectStore, PageIndex, Version};
+
+        let root = tempfile::tempdir().unwrap();
+        let whole_fds = Arc::new(FdCache::with_capacity(1));
+        let page_fds = Arc::new(FdCache::with_capacity(1));
+        let id = BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", "key"),
+            0,
+            16,
+            Version::new("v1"),
+        );
+        let mut stores = Vec::new();
+        for n in 0..64 {
+            let path = root.path().join(n.to_string());
+            let whole =
+                crate::WholeBlockStore::open_with_fd_cache(&path, whole_fds.clone()).unwrap();
+            let paged = crate::PagedBlockStore::open_with_fd_cache(
+                path.join("paged"),
+                16,
+                page_fds.clone(),
+            )
+            .unwrap();
+            // The same BlockId in every namespace must still resolve its own file.
+            let len = n % 16 + 1;
+            whole
+                .put(&id, Bytes::from(vec![n as u8; len]))
+                .await
+                .unwrap();
+            paged
+                .put_page(&id, PageIndex(0), Bytes::from(vec![n as u8; len]))
+                .unwrap();
+            assert_eq!(whole.get_block(&id).await.unwrap().len, len as u64);
+            assert_eq!(paged.get_page(&id, PageIndex(0)).unwrap().len, len as u64);
+            assert!(whole_fds.len() <= FD_CACHE_SHARDS);
+            assert!(page_fds.len() <= FD_CACHE_SHARDS);
+            stores.push((whole, paged, len));
+        }
+        // Reopen entries evicted by other namespaces without crossing namespaces.
+        for (whole, paged, len) in &stores {
+            assert_eq!(whole.get_block(&id).await.unwrap().len, *len as u64);
+            assert_eq!(paged.get_page(&id, PageIndex(0)).unwrap().len, *len as u64);
+            assert!(whole_fds.len() <= FD_CACHE_SHARDS);
+            assert!(page_fds.len() <= FD_CACHE_SHARDS);
+        }
     }
 
     /// Deleting a paged block unlinks a whole directory of page files at once.

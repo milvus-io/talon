@@ -81,7 +81,7 @@ where
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
     root: PathBuf,
-    fd_cache: FdCache,
+    fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
@@ -94,12 +94,19 @@ impl WholeBlockStore {
 
     /// Open (creating if needed) a store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
+        Self::open_with_fd_cache(root, Arc::new(FdCache::new()))
+    }
+
+    pub(crate) fn open_with_fd_cache(
+        root: impl Into<PathBuf>,
+        fd_cache: Arc<FdCache>,
+    ) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             root_lock: None,
             root,
-            fd_cache: FdCache::new(),
+            fd_cache,
         })
     }
 

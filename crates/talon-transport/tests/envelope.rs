@@ -1,4 +1,4 @@
-use talon_core::{Backend, ObjectId, TenantId, Version};
+use talon_core::{Backend, NamespaceId, ObjectId, Version};
 use talon_transport::{codec, data, envelope, FrameHeader, MsgType};
 
 #[test]
@@ -87,10 +87,10 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
     .unwrap();
     let requests = [
         data::encode_request(7, &req).unwrap(),
-        data::encode_tenant_request(
+        data::encode_namespace_request(
             7,
-            &data::TenantScopedRange {
-                tenant: TenantId::Unattributed,
+            &data::NamespaceScopedRange {
+                namespace: NamespaceId::Unattributed,
                 request: req.clone(),
             },
         )
@@ -104,10 +104,10 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             },
         )
         .unwrap(),
-        data::encode_versioned_tenant_request(
+        data::encode_versioned_namespace_request(
             7,
-            &data::TenantScopedVersionedRange {
-                tenant: TenantId::named("acme"),
+            &data::NamespaceScopedVersionedRange {
+                namespace: NamespaceId::named("acme"),
                 request: data::VersionedRangeRequest {
                     request: req.clone(),
                     version: cached.version.clone(),
@@ -117,10 +117,10 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
         )
         .unwrap(),
         data::encode_cached_request(7, &cached).unwrap(),
-        data::encode_cached_tenant_request(
+        data::encode_cached_namespace_request(
             7,
-            &data::TenantScopedCachedRange {
-                tenant: TenantId::Unattributed,
+            &data::NamespaceScopedCachedRange {
+                namespace: NamespaceId::Unattributed,
                 request: cached.clone(),
             },
         )
@@ -146,8 +146,11 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             MsgType::GetRange => {
                 assert_eq!(data::decode_request(&frame).unwrap().1, req);
             }
-            MsgType::GetRangeTenant => {
-                assert_eq!(data::decode_tenant_request(&frame).unwrap().1.request, req);
+            MsgType::GetRangeNamespace => {
+                assert_eq!(
+                    data::decode_namespace_request(&frame).unwrap().1.request,
+                    req
+                );
             }
             MsgType::GetVersionedRange => {
                 let decoded = data::decode_versioned_request(&frame).unwrap().1;
@@ -155,9 +158,9 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
                 assert_eq!(decoded.version, cached.version);
                 assert_eq!(decoded.object_len, 100_000);
             }
-            MsgType::GetVersionedRangeTenant => {
-                let decoded = data::decode_versioned_tenant_request(&frame).unwrap().1;
-                assert_eq!(decoded.tenant, TenantId::named("acme"));
+            MsgType::GetVersionedRangeNamespace => {
+                let decoded = data::decode_versioned_namespace_request(&frame).unwrap().1;
+                assert_eq!(decoded.namespace, NamespaceId::named("acme"));
                 assert_eq!(decoded.request.request, req);
                 assert_eq!(decoded.request.object_len, 100_000);
                 assert_eq!(decoded.request.version, cached.version);
@@ -165,9 +168,9 @@ fn read_variants_roundtrip_and_responses_remain_raw() {
             MsgType::GetCachedRange => {
                 assert_eq!(data::decode_cached_request(&frame).unwrap().1, cached);
             }
-            MsgType::GetCachedRangeTenant => {
+            MsgType::GetCachedRangeNamespace => {
                 assert_eq!(
-                    data::decode_cached_tenant_request(&frame)
+                    data::decode_cached_namespace_request(&frame)
                         .unwrap()
                         .1
                         .request,
@@ -215,7 +218,7 @@ fn malformed_metadata_is_bounded_but_bad_context_does_not_break_business() {
 }
 
 #[test]
-fn tenant_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
+fn namespace_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
     use talon_transport::data::{CachedBlockPutRequest, DeleteRequest, PutRequest};
     let object = ObjectId::new(Backend::S3, "bucket", "key");
     let block = talon_core::BlockId::new(object.clone(), 0, 16, Version::new("v1"));
@@ -255,13 +258,14 @@ fn tenant_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
     ];
     for mut frame in frames {
         let before = frame[talon_transport::HEADER_LEN..].to_vec();
-        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("acme")).unwrap();
+        talon_transport::envelope::encode_namespace(&mut frame, &NamespaceId::named("acme"))
+            .unwrap();
         let header = talon_transport::FrameHeader::decode(&frame).unwrap();
         assert_eq!(header.version, 3);
         let (metadata, business) =
             talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..])
                 .unwrap();
-        assert_eq!(metadata.tenant, Some(TenantId::named("acme")));
+        assert_eq!(metadata.namespace, Some(NamespaceId::named("acme")));
         assert_eq!(business, before);
         match header.msg_type {
             talon_transport::MsgType::Put => assert_eq!(
@@ -289,10 +293,11 @@ fn tenant_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
                 talon_transport::codec::decode_request(&frame).unwrap();
             }
         }
-        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("acme")).unwrap();
-        assert!(talon_transport::envelope::encode_tenant(
+        talon_transport::envelope::encode_namespace(&mut frame, &NamespaceId::named("acme"))
+            .unwrap();
+        assert!(talon_transport::envelope::encode_namespace(
             &mut frame,
-            &TenantId::named("different")
+            &NamespaceId::named("different")
         )
         .is_err());
     }
@@ -311,7 +316,7 @@ fn tenant_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
     )
     .unwrap();
     talon_transport::envelope::encode(&mut frame, Some(&trace), Some([9; 16])).unwrap();
-    talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("acme")).unwrap();
+    talon_transport::envelope::encode_namespace(&mut frame, &NamespaceId::named("acme")).unwrap();
     let header = talon_transport::FrameHeader::decode(&frame).unwrap();
     let (metadata, _) =
         talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..]).unwrap();
@@ -322,11 +327,11 @@ fn tenant_v3_covers_control_and_raw_body_headers_and_preserves_trace() {
     let (metadata, _) =
         talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..]).unwrap();
     assert!(metadata.context.is_none());
-    assert_eq!(metadata.tenant, Some(TenantId::named("acme")));
+    assert_eq!(metadata.namespace, Some(NamespaceId::named("acme")));
 }
 
 #[test]
-fn v3_cannot_silently_fall_back_when_tenant_metadata_is_invalid() {
+fn v3_cannot_silently_fall_back_when_namespace_metadata_is_invalid() {
     let mut frame = talon_transport::data::encode_request(
         1,
         &talon_transport::data::RangeRequest {
@@ -343,8 +348,9 @@ fn v3_cannot_silently_fall_back_when_tenant_metadata_is_invalid() {
         talon_transport::envelope::decode(&header, &frame[talon_transport::HEADER_LEN..]).is_err()
     );
     frame[2] = 2;
-    assert!(
-        talon_transport::envelope::encode_tenant(&mut frame, &TenantId::named("../escape"))
-            .is_err()
-    );
+    assert!(talon_transport::envelope::encode_namespace(
+        &mut frame,
+        &NamespaceId::named("../escape")
+    )
+    .is_err());
 }

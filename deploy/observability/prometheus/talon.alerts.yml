@@ -176,7 +176,7 @@ groups:
             (talon_worker_page_access_dirty_blocks > 0)
             and (
               ((time() - talon_worker_page_access_checkpoint_timestamp_seconds > 3 * talon_worker_page_access_checkpoint_interval_seconds) and (talon_worker_page_access_checkpoint_timestamp_seconds > 0))
-              or ((talon_worker_process_uptime_seconds > 3 * talon_worker_page_access_checkpoint_interval_seconds) and (talon_worker_page_access_checkpoint_timestamp_seconds == 0))
+              or ((talon_worker_process_uptime_seconds > ignoring(namespace) group_right() (3 * talon_worker_page_access_checkpoint_interval_seconds)) and (talon_worker_page_access_checkpoint_timestamp_seconds == 0))
             )
           )
         for: 2m
@@ -220,7 +220,7 @@ groups:
       - alert: TalonPageCleanupScanStalled
         expr: |
           ((time() - talon_worker_page_cleanup_scan_timestamp_seconds > 900) and (talon_worker_page_cleanup_scan_timestamp_seconds > 0))
-          or ((talon_worker_process_uptime_seconds > 900) and (talon_worker_page_cleanup_scan_timestamp_seconds == 0))
+          or ((talon_worker_page_cleanup_scan_timestamp_seconds == 0) and ignoring(namespace) (talon_worker_process_uptime_seconds > 900))
         for: 5m
         labels:
           severity: warning

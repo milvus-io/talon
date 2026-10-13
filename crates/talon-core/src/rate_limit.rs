@@ -1,4 +1,4 @@
-//! Per-tenant rate-limit primitives shared by every enforcement tier.
+//! Per-namespace rate-limit primitives shared by every enforcement tier.
 //!
 //! This module holds the tier-agnostic building blocks — the metrics a policy
 //! is expressed over, a single metric's `(rate, burst_ratio)` limit, and a
@@ -11,7 +11,7 @@
 //! "theoretical arrival time" (TAT) timestamp held in a single [`AtomicU64`], so
 //! concurrent callers admit or throttle with a single compare-and-swap and never
 //! serialize on a lock. That property is what lets the data-plane rings charge a
-//! shared per-tenant limit without contention.
+//! shared per-namespace limit without contention.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
-use crate::TenantId;
+use crate::NamespaceId;
 
-/// A rate-limited traffic dimension for one tenant.
+/// A rate-limited traffic dimension for one namespace.
 ///
 /// Costs are expressed in the metric's natural unit: one request for
 /// [`RateMetric::ReadIops`], one byte for the byte-rate metrics.
@@ -63,7 +63,7 @@ impl std::fmt::Display for RateMetric {
 
 /// The default burst window, in seconds, when a limit does not set its own.
 ///
-/// A ratio of 1.0 lets a tenant burst up to one second's worth of its sustained
+/// A ratio of 1.0 lets a namespace burst up to one second's worth of its sustained
 /// rate before pacing takes over.
 pub const DEFAULT_BURST_RATIO: f64 = 1.0;
 
@@ -113,7 +113,7 @@ pub enum RateLimitError {
     InvalidBurstRatio(f64),
 }
 
-/// The per-metric limits applied to one tenant. A `None` leaves that metric
+/// The per-metric limits applied to one namespace. A `None` leaves that metric
 /// unlimited. Deserialized from a config table such as
 /// `read_iops = { rate = 1000, burst_ratio = 2.0 }`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
@@ -140,25 +140,25 @@ impl MetricLimits {
     }
 }
 
-/// A static per-worker rate-limit policy: one default applied to every tenant
-/// plus optional per-tenant overrides, keyed by tenant name.
+/// A static per-worker rate-limit policy: one default applied to every namespace
+/// plus optional per-namespace overrides, keyed by namespace name.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct RateLimitPolicy {
     /// When false the limiter admits everything (the feature is off).
     pub enabled: bool,
-    /// Limits applied to a tenant with no explicit override.
+    /// Limits applied to a namespace with no explicit override.
     pub default: MetricLimits,
-    /// Per-tenant overrides, keyed by [`TenantId`] name.
+    /// Per-namespace overrides, keyed by [`NamespaceId`] name.
     pub overrides: HashMap<String, MetricLimits>,
 }
 
 impl RateLimitPolicy {
-    /// The limits that apply to `tenant`: its override if present, else the
-    /// default. Unattributed requests resolve to the `default` tenant override.
-    pub fn limits_for(&self, tenant: &TenantId) -> MetricLimits {
+    /// The limits that apply to `namespace`: its override if present, else the
+    /// default. Unattributed requests resolve to the `default` namespace override.
+    pub fn limits_for(&self, namespace: &NamespaceId) -> MetricLimits {
         self.overrides
-            .get(tenant.effective_name())
+            .get(namespace.effective_name())
             .copied()
             .unwrap_or(self.default)
     }
@@ -195,7 +195,7 @@ impl RateDecision {
 
 const NANOS_PER_SEC: u64 = 1_000_000_000;
 
-/// A lock-free GCRA rate-limit cell for one `(tenant, metric)`.
+/// A lock-free GCRA rate-limit cell for one `(namespace, metric)`.
 ///
 /// The cell admits a burst of up to `rate * burst_ratio` units instantaneously
 /// and then paces admissions at `rate` units per second. All state is one atomic
@@ -254,7 +254,7 @@ impl Gcra {
         // idle cell instead of being rejected forever with a retry_after that
         // could never come true. Such a request is admitted only once the cell
         // has drained to "now", then advances the TAT by the full increment,
-        // pacing the tenant for the oversized cost. For the common
+        // pacing the namespace for the oversized cost. For the common
         // `increment <= tolerance` case the ceiling is exactly the burst.
         let ceiling = self.tolerance_nanos.max(increment);
         loop {
@@ -334,16 +334,19 @@ mod tests {
         let policy: RateLimitPolicy = toml::from_str(toml).unwrap();
         assert!(policy.enabled);
         assert_eq!(policy.default.read_iops, Some(limit(1000, 2.0)));
-        // A named override wins over the default for that tenant, and its
+        // A named override wins over the default for that namespace, and its
         // throughput limit uses the default burst ratio.
-        let acme = policy.limits_for(&TenantId::named("acme"));
+        let acme = policy.limits_for(&NamespaceId::named("acme"));
         assert_eq!(
             acme.read_throughput,
             Some(limit(1_048_576, DEFAULT_BURST_RATIO))
         );
         assert_eq!(acme.read_iops, None);
-        // Any other tenant falls back to the default.
-        assert_eq!(policy.limits_for(&TenantId::named("other")), policy.default);
+        // Any other namespace falls back to the default.
+        assert_eq!(
+            policy.limits_for(&NamespaceId::named("other")),
+            policy.default
+        );
         policy.validate().unwrap();
     }
 

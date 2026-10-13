@@ -1,4 +1,4 @@
-//! Size/version checked request options; submission owns copied tenant and trace strings.
+//! Size/version checked request options; submission owns copied namespace and trace strings.
 use super::*;
 use talon_rust_client::TraceContext;
 
@@ -12,14 +12,14 @@ pub struct TalonRequestOptions {
     pub traceparent_len: usize,
     pub tracestate: *const c_char,
     pub tracestate_len: usize,
-    pub tenant: *const c_char,
+    pub namespace_id: *const c_char,
     pub block_size: u32,
 }
 
 #[derive(Default)]
 pub struct OwnedOptions {
     pub parent: Option<TraceContext>,
-    pub tenant: Option<String>,
+    pub namespace: Option<String>,
     pub block_size: Option<u32>,
 }
 impl OwnedOptions {
@@ -30,7 +30,7 @@ impl OwnedOptions {
                 .as_ref()
                 .map(talon_rust_client::TraceParent::Explicit)
                 .unwrap_or(talon_rust_client::TraceParent::Root),
-            tenant: self.tenant.as_deref(),
+            namespace: self.namespace.as_deref(),
             block_size: self.block_size,
         }
     }
@@ -60,7 +60,7 @@ pub unsafe extern "C" fn talon_request_options_init(
             traceparent_len: 0,
             tracestate: ptr::null(),
             tracestate_len: 0,
-            tenant: ptr::null(),
+            namespace_id: ptr::null(),
             block_size: 0,
         });
         Ok(())
@@ -90,12 +90,12 @@ pub unsafe fn copy_options(
         ));
     }
     let mut copied = OwnedOptions::default();
-    if !o.tenant.is_null() {
-        let name = c_string(o.tenant, "tenant")?;
-        talon_rust_client::TenantId::named(&name)
+    if !o.namespace_id.is_null() {
+        let name = c_string(o.namespace_id, "namespace")?;
+        talon_rust_client::NamespaceId::named(&name)
             .validate()
             .map_err(|e| (STATUS_INVALID_ARGUMENT, e.to_string()))?;
-        copied.tenant = Some(name);
+        copied.namespace = Some(name);
     }
     copied.block_size = (o.block_size != 0).then_some(o.block_size);
     if o.parent_mode == 0 || !talon_telemetry::enabled() || o.traceparent_len > 1024 {
@@ -123,7 +123,7 @@ pub unsafe fn copy_options(
 mod tests {
     use super::*;
     #[test]
-    fn submission_owns_tenant_and_omission_selects_default() {
+    fn submission_owns_namespace_and_omission_selects_default() {
         let mut options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
         unsafe {
             assert_eq!(
@@ -137,14 +137,14 @@ mod tests {
         let mut options = unsafe { options.assume_init() };
         assert_eq!(options.version, 1);
         let defaults = unsafe { copy_options(&options) }.unwrap();
-        assert!(defaults.borrowed().tenant.is_none());
+        assert!(defaults.borrowed().namespace.is_none());
         assert!(defaults.borrowed().block_size.is_none());
-        let name = CString::new("tenant-a").unwrap();
-        options.tenant = name.as_ptr();
+        let name = CString::new("namespace-a").unwrap();
+        options.namespace_id = name.as_ptr();
         options.block_size = 4096;
         let copied = unsafe { copy_options(&options) }.unwrap();
         drop(name);
-        assert_eq!(copied.borrowed().tenant, Some("tenant-a"));
+        assert_eq!(copied.borrowed().namespace, Some("namespace-a"));
         assert_eq!(copied.borrowed().block_size, Some(4096));
     }
 
@@ -166,7 +166,7 @@ mod tests {
             traceparent_len: parent.len(),
             tracestate: state.as_ptr().cast(),
             tracestate_len: state.len(),
-            tenant: ptr::null(),
+            namespace_id: ptr::null(),
             block_size: 0,
         };
         let copied = unsafe { copy_options(&options) }.unwrap().parent.unwrap();

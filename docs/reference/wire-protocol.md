@@ -39,10 +39,10 @@ Message types:
 | 5 | `Delete` | data |
 | 6 | `GetCachedRange` | data |
 | 7 | `AdmitCachedBlock` | data |
-| 8 | `GetRangeTenant` | data |
-| 9 | `GetCachedRangeTenant` | data |
+| 8 | `GetRangeNamespace` | data |
+| 9 | `GetCachedRangeNamespace` | data |
 | 10 | `GetVersionedRange` | data |
-| 11 | `GetVersionedRangeTenant` | data |
+| 11 | `GetVersionedRangeNamespace` | data |
 
 A zero payload length is legal and must not be treated as end-of-stream.
 
@@ -256,8 +256,8 @@ struct VersionedRangeRequest { request: RangeRequest, version: Version, object_l
 The worker must serve the exact versioned cache identity or fill it from the
 backend with `version` as a conditional request. It returns `VersionMismatch`
 if that generation is no longer available; it must not re-resolve and serve a
-newer generation. `GetVersionedRangeTenant` (message type 11) wraps the request
-with a `TenantId`.
+newer generation. `GetVersionedRangeNamespace` (message type 11) wraps the request
+with a `NamespaceId`.
 
 `object_len` is the required total byte length of that exact version, not the
 requested range length. Workers use it to size pages, including the final short
@@ -321,7 +321,7 @@ A reused connection that fails with an I/O error may be redialed once. Fresh-con
 and Worker error responses do not trigger this transport retry. Failure does not
 refresh discovery or restart the candidate list.
 Invalid requests, missing origin objects, version mismatches, origin failures,
-and tenant rate limits return immediately. Exhaustion returns
+and namespace rate limits return immediately. Exhaustion returns
 `BlockReadError::AllReplicasFailed { worker, source }`, preserving the last
 candidate address (or logical ID when no address is known) and typed cause.
 `replicas_k` bounds read candidates; it does not proactively populate replicas
@@ -405,21 +405,21 @@ does not permit origin fallback.
 metadata failures. Only availability and timeout permit caller-selected origin
 fallback. Conformance vectors cover membership and metadata failure messages.
 
-## Protocol v3 tenant routing
+## Protocol v3 namespace routing
 
 V3 requests use the v2 metadata envelope (`u16` big-endian length followed by
 TLVs and the unchanged business payload). TLV key **5** is the required UTF-8
-tenant name, with exactly one occurrence. It must be a valid tenant filesystem
-component (see [tenant cache isolation](tenant-cache-isolation.md)). Missing,
+namespace name, with exactly one occurrence. It must be a valid namespace filesystem
+component (see [namespace cache isolation](namespace-cache-isolation.md)). Missing,
 duplicate, invalid or conflicting identities reject the request. Malformed
-optional trace context never discards the tenant identity.
+optional trace context never discards the namespace identity.
 
 V3 supports all request types, including control LOAD/BatchLoad and raw-body
 PUT/admission headers. Raw object bytes still follow the framed header; responses
 retain their raw business payload without a metadata prefix. The metadata limit
-remains 1024 bytes. Tenant identity is per request, including on reused sockets.
+remains 1024 bytes. Namespace identity is per request, including on reused sockets.
 
-Unscoped v1/v2 requests select `default`; existing tenant-scoped read variants
-still work. V3 is required for new named-tenant clients so an old server rejects
+Unscoped v1/v2 requests select `default`; existing namespace-scoped read variants
+still work. V3 is required for new named-namespace clients so an old server rejects
 unsupported routing instead of ignoring an unknown v2 TLV. Default clients can
 continue using v1/v2. Block IDs and control-schema discriminants are unchanged.

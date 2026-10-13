@@ -368,7 +368,7 @@ public final class TalonClient implements AutoCloseable {
                 if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
                 socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
                 try {
-                    socket.getOutputStream().write(Telemetry.tenantEnvelope(request, address, Telemetry.tenant()));
+                    socket.getOutputStream().write(Telemetry.namespaceEnvelope(request, address, Telemetry.namespace()));
                     socket.getOutputStream().flush();
                     Frame header = readHeader(socket.getInputStream());
                     if (header.isError() || header.type() != Frame.MsgType.CONTROL || header.requestId() != id || header.length() > (1 << 20)) {
@@ -649,7 +649,7 @@ public final class TalonClient implements AutoCloseable {
                                   IoFunction<Messages.Response, T> decode) throws IOException {
         try { return pool.exchange(coordinator, false, deadline, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(Telemetry.tenantEnvelope(request, coordinator, Telemetry.tenant()));
+            out.write(Telemetry.namespaceEnvelope(request, coordinator, Telemetry.namespace()));
             out.flush();
 
             Frame header = readHeader(socket.getInputStream());
@@ -678,7 +678,7 @@ public final class TalonClient implements AutoCloseable {
 
         return pool.exchange(workerAddress, true, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(Telemetry.tenantEnvelope(request, workerAddress, Telemetry.tenant()));
+            out.write(Telemetry.namespaceEnvelope(request, workerAddress, Telemetry.namespace()));
             out.flush();
 
             InputStream in = socket.getInputStream();

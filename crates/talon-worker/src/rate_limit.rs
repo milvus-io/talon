@@ -1,31 +1,31 @@
-//! Worker-side per-tenant rate limiting.
+//! Worker-side per-namespace rate limiting.
 //!
-//! A [`TenantRateLimiter`] enforces a static, per-worker local policy: for each
-//! tenant it holds one lock-free GCRA cell per limited metric and admits or
+//! A [`NamespaceRateLimiter`] enforces a static, per-worker local policy: for each
+//! namespace it holds one lock-free GCRA cell per limited metric and admits or
 //! throttles a request with a single atomic op, so the io_uring rings never
-//! serialize on a global QoS lock — only same-tenant requests briefly touch the
+//! serialize on a global QoS lock — only same-namespace requests briefly touch the
 //! same cell.
 //!
 //! This is the local, single-worker stage of the eventual global design: limits
 //! are per worker and per process, sized so the fleet aggregate stays bounded.
 //! Cross-worker owners and snapshot propagation are a later stage, as is
-//! enforcing [`RateMetric::OriginReadBytes`] (which needs the tenant threaded
+//! enforcing [`RateMetric::OriginReadBytes`] (which needs the namespace threaded
 //! into the cache-miss path).
 
 use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
-use talon_core::{Gcra, MetricLimits, RateDecision, RateLimitPolicy, RateMetric, TenantId};
+use talon_core::{Gcra, MetricLimits, NamespaceId, RateDecision, RateLimitPolicy, RateMetric};
 
-/// One tenant's GCRA cells, one per limited metric.
+/// One namespace's GCRA cells, one per limited metric.
 #[derive(Debug)]
-struct TenantCells {
+struct NamespaceCells {
     read_iops: Option<Gcra>,
     read_throughput: Option<Gcra>,
 }
 
-impl TenantCells {
+impl NamespaceCells {
     fn from_limits(limits: &MetricLimits) -> Self {
         Self {
             read_iops: limits.read_iops.map(Gcra::new),
@@ -33,7 +33,7 @@ impl TenantCells {
         }
     }
 
-    /// Charge one read of `read_bytes` against this tenant's cells.
+    /// Charge one read of `read_bytes` against this namespace's cells.
     fn charge(&self, read_bytes: u64, now_nanos: u64) -> Result<(), Throttled> {
         if let Some(cell) = &self.read_iops {
             if let RateDecision::Throttled { retry_after } = cell.charge_at(1, now_nanos) {
@@ -64,45 +64,45 @@ pub struct Throttled {
     pub retry_after: Duration,
 }
 
-/// The maximum number of distinct tenants that get their own dedicated GCRA
+/// The maximum number of distinct namespaces that get their own dedicated GCRA
 /// cells on one worker.
 ///
 /// The direct data plane is unauthenticated, so a client can declare
-/// arbitrarily many distinct tenant names; without a ceiling the cell map would
-/// grow without bound — a memory-exhaustion vector. Tenants first seen beyond
+/// arbitrarily many distinct namespace names; without a ceiling the cell map would
+/// grow without bound — a memory-exhaustion vector. Namespaces first seen beyond
 /// this cap share a single overflow cell governed by the default limit, so
 /// memory stays bounded while the (almost certainly abusive or misconfigured)
 /// excess is still paced. Configured overrides are pre-created and never lost to
 /// the cap.
-const MAX_TENANT_CELLS: usize = 4096;
+const MAX_NAMESPACE_CELLS: usize = 4096;
 
-/// Worker-global, `Arc`-shared per-tenant limiter.
+/// Worker-global, `Arc`-shared per-namespace limiter.
 #[derive(Debug)]
-pub struct TenantRateLimiter {
+pub struct NamespaceRateLimiter {
     policy: RateLimitPolicy,
     /// Monotonic clock origin; GCRA cells advance in nanoseconds from here.
     origin: Instant,
-    /// Per-tenant cells: created eagerly for configured overrides and lazily for
-    /// default-governed tenants. A read lock covers the common warm lookup; the
-    /// write lock is taken only the first time a default-governed tenant is
-    /// seen. Bounded at `max_cells` entries (see [`MAX_TENANT_CELLS`]).
-    cells: RwLock<HashMap<TenantId, TenantCells>>,
-    /// Shared fallback cell for tenants first seen after the cap is reached,
+    /// Per-namespace cells: created eagerly for configured overrides and lazily for
+    /// default-governed namespaces. A read lock covers the common warm lookup; the
+    /// write lock is taken only the first time a default-governed namespace is
+    /// seen. Bounded at `max_cells` entries (see [`MAX_NAMESPACE_CELLS`]).
+    cells: RwLock<HashMap<NamespaceId, NamespaceCells>>,
+    /// Shared fallback cell for namespaces first seen after the cap is reached,
     /// governed by the default limit. `None` when the default limits nothing
-    /// (then default-governed tenants are admitted without a cell at all).
-    overflow: Option<TenantCells>,
-    /// Ceiling on the number of distinct tenant cells (see [`MAX_TENANT_CELLS`]).
+    /// (then default-governed namespaces are admitted without a cell at all).
+    overflow: Option<NamespaceCells>,
+    /// Ceiling on the number of distinct namespace cells (see [`MAX_NAMESPACE_CELLS`]).
     max_cells: usize,
 }
 
-impl TenantRateLimiter {
+impl NamespaceRateLimiter {
     /// Build a limiter from a static local policy.
     pub fn new(policy: RateLimitPolicy) -> Self {
-        Self::with_max_cells(policy, MAX_TENANT_CELLS)
+        Self::with_max_cells(policy, MAX_NAMESPACE_CELLS)
     }
 
     /// Build a limiter with an explicit cardinality cap (see
-    /// [`MAX_TENANT_CELLS`]); [`new`](Self::new) uses the default.
+    /// [`MAX_NAMESPACE_CELLS`]); [`new`](Self::new) uses the default.
     ///
     /// Overrides are pre-created so each is honored regardless of arrival order
     /// and never lost to the cap, and a shared overflow cell is prepared when
@@ -112,13 +112,13 @@ impl TenantRateLimiter {
         for (name, limits) in &policy.overrides {
             if !limits.is_empty() {
                 cells.insert(
-                    TenantId::named(name.clone()),
-                    TenantCells::from_limits(limits),
+                    NamespaceId::named(name.clone()),
+                    NamespaceCells::from_limits(limits),
                 );
             }
         }
         let overflow =
-            (!policy.default.is_empty()).then(|| TenantCells::from_limits(&policy.default));
+            (!policy.default.is_empty()).then(|| NamespaceCells::from_limits(&policy.default));
         Self {
             policy,
             origin: Instant::now(),
@@ -139,13 +139,13 @@ impl TenantRateLimiter {
     }
 
     /// Charge one read request expected to return `read_bytes` bytes against
-    /// `tenant`, returning [`Throttled`] if it would exceed a configured limit.
-    pub fn admit(&self, tenant: &TenantId, read_bytes: u64) -> Result<(), Throttled> {
+    /// `namespace`, returning [`Throttled`] if it would exceed a configured limit.
+    pub fn admit(&self, namespace: &NamespaceId, read_bytes: u64) -> Result<(), Throttled> {
         // Skip the clock read entirely when the feature is off.
         if !self.policy.enabled {
             return Ok(());
         }
-        self.admit_at(tenant, read_bytes, self.now_nanos())
+        self.admit_at(namespace, read_bytes, self.now_nanos())
     }
 
     /// Time-injected core of [`admit`](Self::admit).
@@ -155,25 +155,25 @@ impl TenantRateLimiter {
     /// makes the limiter more conservative under overload.
     fn admit_at(
         &self,
-        tenant: &TenantId,
+        namespace: &NamespaceId,
         read_bytes: u64,
         now_nanos: u64,
     ) -> Result<(), Throttled> {
         if !self.policy.enabled {
             return Ok(());
         }
-        let default = tenant.is_unattributed().then(TenantId::default);
-        let tenant = default.as_ref().unwrap_or(tenant);
-        // Fast path: a warm tenant (an override or a previously-seen
-        // default-governed tenant) is charged in place under a shared read lock,
-        // so admits for different tenants never block each other and the
-        // same-tenant case is a single atomic CAS with no allocation or clone.
-        if let Some(cells) = self.cells.read().unwrap().get(tenant) {
+        let default = namespace.is_unattributed().then(NamespaceId::default);
+        let namespace = default.as_ref().unwrap_or(namespace);
+        // Fast path: a warm namespace (an override or a previously-seen
+        // default-governed namespace) is charged in place under a shared read lock,
+        // so admits for different namespaces never block each other and the
+        // same-namespace case is a single atomic CAS with no allocation or clone.
+        if let Some(cells) = self.cells.read().unwrap().get(namespace) {
             return cells.charge(read_bytes, now_nanos);
         }
-        // Unseen tenant. If nothing limits it, admit without allocating a cell;
+        // Unseen namespace. If nothing limits it, admit without allocating a cell;
         // this also keeps an empty default from ever growing the map.
-        let limits = self.policy.limits_for(tenant);
+        let limits = self.policy.limits_for(namespace);
         if limits.is_empty() {
             return Ok(());
         }
@@ -182,13 +182,13 @@ impl TenantRateLimiter {
         // unauthenticated map cannot grow without bound.
         let mut map = self.cells.write().unwrap();
         // Re-check under the write lock: another thread may have inserted.
-        if let Some(cells) = map.get(tenant) {
+        if let Some(cells) = map.get(namespace) {
             return cells.charge(read_bytes, now_nanos);
         }
         if map.len() < self.max_cells {
             return map
-                .entry(tenant.clone())
-                .or_insert_with(|| TenantCells::from_limits(&limits))
+                .entry(namespace.clone())
+                .or_insert_with(|| NamespaceCells::from_limits(&limits))
                 .charge(read_bytes, now_nanos);
         }
         drop(map);
@@ -229,42 +229,44 @@ mod tests {
 
     #[test]
     fn disabled_admits_everything() {
-        let limiter = TenantRateLimiter::disabled();
+        let limiter = NamespaceRateLimiter::disabled();
         for _ in 0..1000 {
-            assert!(limiter.admit(&TenantId::named("a"), u64::MAX).is_ok());
+            assert!(limiter.admit(&NamespaceId::named("a"), u64::MAX).is_ok());
         }
     }
 
     #[test]
     fn read_iops_admits_a_burst_then_throttles() {
         // rate 10, burst_ratio 1.0 => 10 units of burst.
-        let limiter = TenantRateLimiter::new(iops_policy(10, 1.0));
-        let tenant = TenantId::named("a");
+        let limiter = NamespaceRateLimiter::new(iops_policy(10, 1.0));
+        let namespace = NamespaceId::named("a");
         for _ in 0..10 {
-            assert!(limiter.admit_at(&tenant, 0, 0).is_ok());
+            assert!(limiter.admit_at(&namespace, 0, 0).is_ok());
         }
-        let throttled = limiter.admit_at(&tenant, 0, 0).unwrap_err();
+        let throttled = limiter.admit_at(&namespace, 0, 0).unwrap_err();
         assert_eq!(throttled.metric, RateMetric::ReadIops);
         assert_eq!(throttled.retry_after, Duration::from_millis(100));
     }
 
     #[test]
-    fn tenants_are_limited_independently() {
+    fn namespaces_are_limited_independently() {
         // rate 1, burst_ratio 1.0 => one request then pacing.
-        let limiter = TenantRateLimiter::new(iops_policy(1, 1.0));
-        assert!(limiter.admit_at(&TenantId::named("a"), 0, 0).is_ok());
-        // A different tenant has its own fresh burst.
-        assert!(limiter.admit_at(&TenantId::named("b"), 0, 0).is_ok());
-        // ...but the first tenant is now paced.
-        assert!(limiter.admit_at(&TenantId::named("a"), 0, 0).is_err());
+        let limiter = NamespaceRateLimiter::new(iops_policy(1, 1.0));
+        assert!(limiter.admit_at(&NamespaceId::named("a"), 0, 0).is_ok());
+        // A different namespace has its own fresh burst.
+        assert!(limiter.admit_at(&NamespaceId::named("b"), 0, 0).is_ok());
+        // ...but the first namespace is now paced.
+        assert!(limiter.admit_at(&NamespaceId::named("a"), 0, 0).is_err());
     }
 
     #[test]
     fn unattributed_uses_the_default_limit() {
-        let limiter = TenantRateLimiter::new(iops_policy(1, 1.0));
-        assert!(limiter.admit_at(&TenantId::unattributed(), 0, 0).is_ok());
-        assert!(limiter.admit_at(&TenantId::unattributed(), 0, 0).is_err());
-        assert!(limiter.admit_at(&TenantId::default(), 0, 0).is_err());
+        let limiter = NamespaceRateLimiter::new(iops_policy(1, 1.0));
+        assert!(limiter.admit_at(&NamespaceId::unattributed(), 0, 0).is_ok());
+        assert!(limiter
+            .admit_at(&NamespaceId::unattributed(), 0, 0)
+            .is_err());
+        assert!(limiter.admit_at(&NamespaceId::default(), 0, 0).is_err());
     }
 
     #[test]
@@ -277,15 +279,15 @@ mod tests {
                 read_throughput: None,
             },
         );
-        let limiter = TenantRateLimiter::new(policy);
-        // The default tenant is paced after one request...
-        assert!(limiter.admit_at(&TenantId::named("a"), 0, 0).is_ok());
-        assert!(limiter.admit_at(&TenantId::named("a"), 0, 0).is_err());
+        let limiter = NamespaceRateLimiter::new(policy);
+        // The default namespace is paced after one request...
+        assert!(limiter.admit_at(&NamespaceId::named("a"), 0, 0).is_ok());
+        assert!(limiter.admit_at(&NamespaceId::named("a"), 0, 0).is_err());
         // ...while the override grants a larger burst.
         for _ in 0..10 {
-            assert!(limiter.admit_at(&TenantId::named("vip"), 0, 0).is_ok());
+            assert!(limiter.admit_at(&NamespaceId::named("vip"), 0, 0).is_ok());
         }
-        assert!(limiter.admit_at(&TenantId::named("vip"), 0, 0).is_err());
+        assert!(limiter.admit_at(&NamespaceId::named("vip"), 0, 0).is_err());
     }
 
     #[test]
@@ -298,12 +300,12 @@ mod tests {
             },
             overrides: HashMap::new(),
         };
-        let limiter = TenantRateLimiter::new(policy);
-        let tenant = TenantId::named("a");
+        let limiter = NamespaceRateLimiter::new(policy);
+        let namespace = NamespaceId::named("a");
         // One request draining the whole burst is admitted...
-        assert!(limiter.admit_at(&tenant, 1_000_000, 0).is_ok());
+        assert!(limiter.admit_at(&namespace, 1_000_000, 0).is_ok());
         // ...the next byte is throttled on throughput, not iops.
-        let throttled = limiter.admit_at(&tenant, 1, 0).unwrap_err();
+        let throttled = limiter.admit_at(&namespace, 1, 0).unwrap_err();
         assert_eq!(throttled.metric, RateMetric::ReadThroughput);
     }
 
@@ -312,15 +314,15 @@ mod tests {
         // Capability: at read_iops rate 1000/s (burst 1000), offer 10x the rate
         // across a simulated second and confirm the admitted count is the burst
         // plus one second of the sustained rate (~2000), not the 10_000 offered.
-        let limiter = TenantRateLimiter::new(iops_policy(1000, 1.0));
-        let tenant = TenantId::named("a");
+        let limiter = NamespaceRateLimiter::new(iops_policy(1000, 1.0));
+        let namespace = NamespaceId::named("a");
         let offered = 10_000u64;
         let mut admitted = 0u64;
         // 1000 steps of 1ms across ~1s; 10 requests offered per step.
         for step in 0..1000u64 {
             let now = step * 1_000_000; // ns
             for _ in 0..10 {
-                if limiter.admit_at(&tenant, 0, now).is_ok() {
+                if limiter.admit_at(&namespace, 0, now).is_ok() {
                     admitted += 1;
                 }
             }
@@ -337,7 +339,7 @@ mod tests {
         );
     }
 
-    // Build an iops-only override for a single tenant tier.
+    // Build an iops-only override for a single namespace tier.
     fn iops_override(rate: u64, burst_ratio: f64) -> MetricLimits {
         MetricLimits {
             read_iops: Some(RateLimit::new(rate, burst_ratio).unwrap()),
@@ -346,11 +348,11 @@ mod tests {
     }
 
     #[test]
-    fn caps_each_tenant_independently_under_concurrent_overload() {
-        // Multi-tenant capability: three tenants with *different* read_iops
+    fn caps_each_namespace_independently_under_concurrent_overload() {
+        // Multi-namespace capability: three namespaces with *different* read_iops
         // limits all offer far more than their share at every simulated instant.
-        // Each must be capped at its own rate — a greedy tenant never borrows
-        // another's budget, and a small tenant is not dragged up by a large one.
+        // Each must be capped at its own rate — a greedy namespace never borrows
+        // another's budget, and a small namespace is not dragged up by a large one.
         let mut policy = iops_policy(1000, 1.0); // "a" falls back to this default
         policy
             .overrides
@@ -358,38 +360,38 @@ mod tests {
         policy
             .overrides
             .insert("tiny".to_string(), iops_override(100, 1.0));
-        let limiter = TenantRateLimiter::new(policy);
+        let limiter = NamespaceRateLimiter::new(policy);
 
-        // (tenant, configured rate/s).
-        let tenants = [
-            (TenantId::named("a"), 1000u64),
-            (TenantId::named("vip"), 5000),
-            (TenantId::named("tiny"), 100),
+        // (namespace, configured rate/s).
+        let namespaces = [
+            (NamespaceId::named("a"), 1000u64),
+            (NamespaceId::named("vip"), 5000),
+            (NamespaceId::named("tiny"), 100),
         ];
         let mut admitted = [0u64; 3];
-        // 1000 steps of 1ms across ~1s. At every step *each* tenant offers 20
+        // 1000 steps of 1ms across ~1s. At every step *each* namespace offers 20
         // requests (>> even vip's per-ms share), so all three are overloaded at
         // the same instants — the interleaving models simultaneous callers.
-        let offered_per_tenant = 1000u64 * 20;
+        let offered_per_namespace = 1000u64 * 20;
         for step in 0..1000u64 {
             let now = step * 1_000_000; // ns
-            for (i, (tenant, _)) in tenants.iter().enumerate() {
+            for (i, (namespace, _)) in namespaces.iter().enumerate() {
                 for _ in 0..20 {
-                    if limiter.admit_at(tenant, 0, now).is_ok() {
+                    if limiter.admit_at(namespace, 0, now).is_ok() {
                         admitted[i] += 1;
                     }
                 }
             }
         }
 
-        for (i, (tenant, rate)) in tenants.iter().enumerate() {
-            // Each tenant is capped near burst (1x rate) + one second of its own
+        for (i, (namespace, rate)) in namespaces.iter().enumerate() {
+            // Each namespace is capped near burst (1x rate) + one second of its own
             // rate (1x rate) = ~2x rate, independent of the others.
             let expected = 2 * rate;
             let (lo, hi) = (expected * 9 / 10, expected * 11 / 10);
             assert!(
                 (lo..=hi).contains(&admitted[i]),
-                "tenant {tenant} admitted {} of {offered_per_tenant} offered, \
+                "namespace {namespace} admitted {} of {offered_per_namespace} offered, \
                  expected ~{expected} ({lo}..={hi})",
                 admitted[i],
             );
@@ -397,25 +399,25 @@ mod tests {
     }
 
     #[test]
-    fn isolates_tenant_rates_under_real_thread_contention() {
+    fn isolates_namespace_rates_under_real_thread_contention() {
         // Same guarantee, but under genuine concurrency: one OS thread per
-        // tenant hammers the *shared* limiter with its own id for a fixed
+        // namespace hammers the *shared* limiter with its own id for a fixed
         // window. This exercises the lock-free cells under contention and
-        // confirms each tenant is throttled near its own rate — nowhere near the
+        // confirms each namespace is throttled near its own rate — nowhere near the
         // millions of calls each thread actually offers.
         let mut policy = iops_policy(2000, 1.0);
         policy
             .overrides
             .insert("vip".to_string(), iops_override(8000, 1.0));
-        let limiter = std::sync::Arc::new(TenantRateLimiter::new(policy));
+        let limiter = std::sync::Arc::new(NamespaceRateLimiter::new(policy));
 
         let window = Duration::from_millis(300);
-        let tenants = [("a", 2000u64), ("vip", 8000u64)];
-        let handles: Vec<_> = tenants
+        let namespaces = [("a", 2000u64), ("vip", 8000u64)];
+        let handles: Vec<_> = namespaces
             .iter()
             .map(|&(name, rate)| {
                 let limiter = std::sync::Arc::clone(&limiter);
-                let tenant = TenantId::named(name);
+                let namespace = NamespaceId::named(name);
                 std::thread::spawn(move || {
                     let start = Instant::now();
                     let mut admitted = 0u64;
@@ -423,7 +425,7 @@ mod tests {
                     // only what the limiter lets through.
                     while start.elapsed() < window {
                         for _ in 0..64 {
-                            if limiter.admit(&tenant, 0).is_ok() {
+                            if limiter.admit(&namespace, 0).is_ok() {
                                 admitted += 1;
                             }
                         }
@@ -454,7 +456,7 @@ mod tests {
         }
 
         // Isolation is also visible in the ratio: both tiers ran the same
-        // window, so the 8000 tenant admits ~4x the 2000 tenant (burst and rate
+        // window, so the 8000 namespace admits ~4x the 2000 namespace (burst and rate
         // both scale with the tier), never the same amount.
         let a = results.iter().find(|r| r.0 == 2000).unwrap().1;
         let vip = results.iter().find(|r| r.0 == 8000).unwrap().1;
@@ -467,16 +469,16 @@ mod tests {
     #[test]
     fn empty_limits_admit_without_allocating_a_cell() {
         // Enabled, but nothing configured (empty default, no overrides): every
-        // tenant is admitted and no cell is ever created, so distinct tenant
+        // namespace is admitted and no cell is ever created, so distinct namespace
         // names cannot grow worker memory.
-        let limiter = TenantRateLimiter::new(RateLimitPolicy {
+        let limiter = NamespaceRateLimiter::new(RateLimitPolicy {
             enabled: true,
             default: MetricLimits::default(),
             overrides: HashMap::new(),
         });
         for i in 0..1000 {
             assert!(limiter
-                .admit_at(&TenantId::named(format!("t{i}")), 0, 0)
+                .admit_at(&NamespaceId::named(format!("t{i}")), 0, 0)
                 .is_ok());
         }
         assert_eq!(limiter.cell_count(), 0);
@@ -484,27 +486,27 @@ mod tests {
 
     #[test]
     fn bounds_cardinality_and_overflows_to_a_shared_cell() {
-        // A non-empty default with a tiny cap: only `max_cells` distinct tenants
-        // get their own cell; further tenants share the overflow cell, so the
+        // A non-empty default with a tiny cap: only `max_cells` distinct namespaces
+        // get their own cell; further namespaces share the overflow cell, so the
         // unauthenticated map cannot grow past the cap.
-        let limiter = TenantRateLimiter::with_max_cells(iops_policy(1, 1.0), 2);
-        // Two distinct tenants each get a dedicated cell (fresh burst each).
-        assert!(limiter.admit_at(&TenantId::named("t0"), 0, 0).is_ok());
-        assert!(limiter.admit_at(&TenantId::named("t1"), 0, 0).is_ok());
+        let limiter = NamespaceRateLimiter::with_max_cells(iops_policy(1, 1.0), 2);
+        // Two distinct namespaces each get a dedicated cell (fresh burst each).
+        assert!(limiter.admit_at(&NamespaceId::named("t0"), 0, 0).is_ok());
+        assert!(limiter.admit_at(&NamespaceId::named("t1"), 0, 0).is_ok());
         assert_eq!(limiter.cell_count(), 2);
-        // A third distinct tenant does not grow the map — it shares the overflow
+        // A third distinct namespace does not grow the map — it shares the overflow
         // cell, and is admitted on the overflow cell's own fresh burst...
-        assert!(limiter.admit_at(&TenantId::named("t2"), 0, 0).is_ok());
+        assert!(limiter.admit_at(&NamespaceId::named("t2"), 0, 0).is_ok());
         assert_eq!(limiter.cell_count(), 2);
-        // ...while a fourth overflow tenant is throttled, because it shares that
+        // ...while a fourth overflow namespace is throttled, because it shares that
         // now-drained overflow cell (rate 1) rather than getting its own burst.
-        assert!(limiter.admit_at(&TenantId::named("t3"), 0, 0).is_err());
+        assert!(limiter.admit_at(&NamespaceId::named("t3"), 0, 0).is_err());
         assert_eq!(limiter.cell_count(), 2);
     }
 
     #[test]
     fn overrides_are_pre_created_and_exempt_from_the_cap() {
-        // With the cap already reached by dynamic tenants, a configured override
+        // With the cap already reached by dynamic namespaces, a configured override
         // is still honored (it was pre-created), not shunted to the overflow.
         let mut policy = iops_policy(1, 1.0);
         policy.overrides.insert(
@@ -515,16 +517,16 @@ mod tests {
             },
         );
         // Cap of 1, already consumed by the pre-created override cell.
-        let limiter = TenantRateLimiter::with_max_cells(policy, 1);
+        let limiter = NamespaceRateLimiter::with_max_cells(policy, 1);
         assert_eq!(limiter.cell_count(), 1);
-        // A dynamic default tenant is already over the cap, so it shares the
+        // A dynamic default namespace is already over the cap, so it shares the
         // overflow cell rather than getting its own (the map does not grow)...
-        assert!(limiter.admit_at(&TenantId::named("t0"), 0, 0).is_ok());
+        assert!(limiter.admit_at(&NamespaceId::named("t0"), 0, 0).is_ok());
         assert_eq!(limiter.cell_count(), 1);
         // ...while the override keeps its full rate-10 burst on its own cell.
         for _ in 0..10 {
-            assert!(limiter.admit_at(&TenantId::named("vip"), 0, 0).is_ok());
+            assert!(limiter.admit_at(&NamespaceId::named("vip"), 0, 0).is_ok());
         }
-        assert!(limiter.admit_at(&TenantId::named("vip"), 0, 0).is_err());
+        assert!(limiter.admit_at(&NamespaceId::named("vip"), 0, 0).is_err());
     }
 }

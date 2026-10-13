@@ -8,9 +8,9 @@ use std::time::{Duration, Instant};
 mod async_eviction;
 mod background;
 mod load;
+mod namespaces;
 mod ownership_gc;
 mod stale_gc;
-mod tenants;
 pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]
@@ -31,7 +31,7 @@ use talon_transport::{codec, ControlMessage, ObjectEntry, MAX_CONTROL_PAYLOAD_LE
 use crate::data_error::CacheMiss;
 use crate::{
     miss::touched_pages, BlockIndex, CacheUnit, InFlightLoads, LoadKey, Lru, MemoryInsert,
-    MemoryStore, PagedBlockStore, TenantRateLimiter, WholeBlockStore, WorkerMetrics,
+    MemoryStore, NamespaceRateLimiter, PagedBlockStore, WholeBlockStore, WorkerMetrics,
 };
 
 /// Default lifetime of a cached resolved object version.
@@ -92,9 +92,9 @@ pub struct WorkerRuntime {
     /// Latest control-plane observation, shared by runtime clones.
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
-    tenant: talon_core::TenantId,
-    tenants: Option<Arc<tenants::TenantRuntimes>>,
-    tenant_parent: std::sync::Weak<tenants::TenantRuntimes>,
+    namespace: talon_core::NamespaceId,
+    namespaces: Option<Arc<namespaces::NamespaceRuntimes>>,
+    namespace_parent: std::sync::Weak<namespaces::NamespaceRuntimes>,
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
     l1: Arc<MemoryStore>,
@@ -131,8 +131,8 @@ pub struct WorkerRuntime {
     /// a backend `HEAD` per request (issue #163).
     version_cache: Arc<Mutex<HashMap<ObjectId, CachedVersion>>>,
     version_ttl: Duration,
-    /// Worker-global per-tenant rate limiter; disabled unless configured.
-    rate_limiter: Arc<TenantRateLimiter>,
+    /// Worker-global per-namespace rate limiter; disabled unless configured.
+    rate_limiter: Arc<NamespaceRateLimiter>,
     page_lifecycle: Arc<PageLifecycle>,
     page_clock: Arc<AccessClock>,
     page_gc_config: PageGcConfig,
@@ -151,7 +151,8 @@ struct MembershipSnapshot {
     members: Vec<talon_transport::ZonedNodeInfo>,
     valid_until: Instant,
     generation: u64,
-    scan_limit: u64,
+    // Each namespace has an independent admission revision sequence.
+    scan_limits: Arc<HashMap<String, u64>>,
 }
 
 impl WorkerRuntime {
@@ -211,13 +212,13 @@ impl WorkerRuntime {
             l1_page_size_bytes,
         ));
         metrics.set_l1_capacity(l1_capacity_bytes);
-        metrics.update_l1_residency(0, 0);
+        // Residency gauges may already include other namespaces sharing these metrics.
         Self {
             membership: Arc::new(Mutex::new(None)),
             membership_changed: tokio::sync::watch::channel(()).0,
-            tenant: talon_core::TenantId::default(),
-            tenants: None,
-            tenant_parent: std::sync::Weak::new(),
+            namespace: talon_core::NamespaceId::default(),
+            namespaces: None,
+            namespace_parent: std::sync::Weak::new(),
             l1,
             page_cleanup: Arc::new(tokio::sync::Mutex::new(
                 crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
@@ -232,14 +233,14 @@ impl WorkerRuntime {
             backend,
             configured_backend: None,
             block_size,
-            page_gc_metrics: PageGcMetrics::new(&metrics.registry),
+            page_gc_metrics: PageGcMetrics::new(&metrics.registry, talon_core::DEFAULT_NAMESPACE),
             metrics,
             lru,
             capacity_bytes,
             paged_miss_run_concurrency: DEFAULT_PAGED_MISS_RUN_CONCURRENCY,
             version_cache: Arc::new(Mutex::new(HashMap::new())),
             version_ttl: DEFAULT_VERSION_TTL,
-            rate_limiter: Arc::new(TenantRateLimiter::disabled()),
+            rate_limiter: Arc::new(NamespaceRateLimiter::disabled()),
             page_lifecycle: Arc::new(PageLifecycle::new()),
             page_clock: Arc::new(AccessClock::new()),
             page_gc_config: PageGcConfig::default(),
@@ -300,24 +301,40 @@ impl WorkerRuntime {
                     || held
                         .as_ref()
                         .is_some_and(|old| Instant::now() >= old.valid_until);
-                let (generation, scan_limit) = if changed {
+                let (generation, scan_limits) = if changed {
                     (
                         held.as_ref().map_or(1, |old| {
                             old.generation
                                 .checked_add(1)
                                 .expect("membership generation exhausted")
                         }),
-                        self.lru.block_scan_ceiling(),
+                        Arc::new(if let Some(registry) = self.registry() {
+                            registry
+                                .snapshot()
+                                .iter()
+                                .map(|worker| {
+                                    (
+                                        worker.namespace.effective_name().to_owned(),
+                                        worker.lru.block_scan_ceiling(),
+                                    )
+                                })
+                                .collect()
+                        } else {
+                            HashMap::from([(
+                                self.namespace.effective_name().to_owned(),
+                                self.lru.block_scan_ceiling(),
+                            )])
+                        }),
                     )
                 } else {
                     let old = held.as_ref().expect("unchanged membership");
-                    (old.generation, old.scan_limit)
+                    (old.generation, old.scan_limits.clone())
                 };
                 *held = Some(Arc::new(MembershipSnapshot {
                     members,
                     valid_until,
                     generation,
-                    scan_limit,
+                    scan_limits,
                 }));
                 drop(held);
                 if wake {
@@ -379,15 +396,15 @@ impl WorkerRuntime {
         self
     }
 
-    /// Attach a per-tenant rate limiter. Without this the runtime admits every
+    /// Attach a per-namespace rate limiter. Without this the runtime admits every
     /// request (the limiter is disabled).
-    pub fn with_rate_limiter(mut self, limiter: Arc<TenantRateLimiter>) -> Self {
+    pub fn with_rate_limiter(mut self, limiter: Arc<NamespaceRateLimiter>) -> Self {
         self.rate_limiter = limiter;
         self
     }
 
-    /// The worker's per-tenant rate limiter.
-    pub fn rate_limiter(&self) -> &TenantRateLimiter {
+    /// The worker's per-namespace rate limiter.
+    pub fn rate_limiter(&self) -> &NamespaceRateLimiter {
         &self.rate_limiter
     }
 
@@ -1775,12 +1792,8 @@ impl WorkerRuntime {
     fn refresh_l1_metrics(&self) {
         let (pages, bytes) = self
             .registry()
-            .map(|r| {
-                r.snapshot().iter().fold((0, 0), |(pages, bytes), w| {
-                    (pages + w.l1.len() as u64, bytes + w.l1.resident_bytes())
-                })
-            })
-            .unwrap_or((self.l1.len() as u64, self.l1.resident_bytes()));
+            .map(|r| r.l1_budget.residency())
+            .unwrap_or_else(|| (self.l1.len() as u64, self.l1.resident_bytes()));
         self.metrics.update_l1_residency(pages, bytes);
     }
 
@@ -2098,10 +2111,10 @@ impl WorkerRuntime {
         }
         if let Some(registry) = self.registry() {
             let mut workers = registry.snapshot();
-            // Prefer reclaiming from the admitting tenant. Its new unit is
+            // Prefer reclaiming from the admitting namespace. Its new unit is
             // pinned until publication completes, so pressure must also be
-            // able to reclaim idle units belonging to other tenants.
-            workers.sort_by_key(|worker| worker.tenant != self.tenant);
+            // able to reclaim idle units belonging to other namespaces.
+            workers.sort_by_key(|worker| worker.namespace != self.namespace);
             for worker in &workers {
                 let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
                 if total <= self.capacity_bytes {

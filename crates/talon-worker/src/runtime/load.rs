@@ -884,13 +884,13 @@ mod tests {
                     .len(),
                 8
             );
-            for tenant in [false, true] {
+            for namespace in [false, true] {
                 let request = talon_transport::VersionedRangeRequest {
                     request: RangeRequest {
                         object: ObjectId::new(
                             talon_core::Backend::S3,
                             "bucket",
-                            format!("cold-{tenant}"),
+                            format!("cold-{namespace}"),
                         ),
                         offset: 1,
                         len: 20,
@@ -898,11 +898,11 @@ mod tests {
                     version: Version::new("v1"),
                     object_len: 21,
                 };
-                let frame = if tenant {
-                    talon_transport::data::encode_versioned_tenant_request(
+                let frame = if namespace {
+                    talon_transport::data::encode_versioned_namespace_request(
                         8,
-                        &talon_transport::TenantScopedVersionedRange {
-                            tenant: talon_core::TenantId::default(),
+                        &talon_transport::NamespaceScopedVersionedRange {
+                            namespace: talon_core::NamespaceId::default(),
                             request,
                         },
                     )

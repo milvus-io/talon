@@ -282,9 +282,9 @@ fn vectors() -> Vec<Vector> {
         ),
     });
     for (name, source) in [
-        ("v3.range.tenant", "data.range_request"),
-        ("v3.range.context_tenant", "v2.range.context"),
-        ("v3.load.tenant", "control.load_block"),
+        ("v3.range.namespace", "data.range_request"),
+        ("v3.range.context_namespace", "v2.range.context"),
+        ("v3.load.namespace", "control.load_block"),
     ] {
         let mut bytes = result
             .iter()
@@ -292,11 +292,14 @@ fn vectors() -> Vec<Vector> {
             .unwrap()
             .bytes
             .clone();
-        talon_transport::envelope::encode_tenant(&mut bytes, &talon_core::TenantId::named("acme"))
-            .unwrap();
+        talon_transport::envelope::encode_namespace(
+            &mut bytes,
+            &talon_core::NamespaceId::named("acme"),
+        )
+        .unwrap();
         result.push(Vector {
             name,
-            note: "v3 requires tenant acme; original business payload unchanged",
+            note: "v3 requires namespace acme; original business payload unchanged",
             bytes,
         });
     }

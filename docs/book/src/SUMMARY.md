@@ -42,8 +42,8 @@
 # Reference
 
 - [Configuration reference](./reference/configuration.md)
-- [Tenant cache isolation](./reference/tenant-cache-isolation.md)
-- [Namespace authorization policy](./reference/namespace-policy.md)
+- [Namespace cache isolation](./reference/namespace-cache-isolation.md)
+- [Object namespace authorization policy](./reference/namespace-policy.md)
 - [REST API reference](./reference/rest-api.md)
 - [Wire protocol reference](./reference/wire-protocol.md)
 - [Object-store gateway compatibility](./reference/object-store-gateway-compatibility.md)
@@ -56,8 +56,8 @@
 - [Retained membership and rolling upgrades](./explanation/worker-rolling-upgrade.md)
 - [Background maintenance and eviction](./explanation/async-eviction.md)
 - [Data-plane runtime: choosing io_uring](./explanation/data-plane-runtime.md)
-- [Eventual global tenant rate limits](./explanation/eventual-global-tenant-rate-limits.md)
-- [Real-time tenant traffic observability](./explanation/tenant-traffic-observability.md)
+- [Eventual global namespace rate limits](./explanation/eventual-global-namespace-rate-limits.md)
+- [Real-time namespace traffic observability](./explanation/namespace-traffic-observability.md)
 - [ADR 0001: Management-plane HA](./explanation/adr-0001-management-plane-ha.md)
 - [ADR 0002: Write-cache durability](./explanation/adr-0002-write-cache-durability.md)
 - [ADR 0003: Optional metadata store](./explanation/adr-0003-optional-metadata-store.md)

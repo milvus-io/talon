@@ -132,10 +132,10 @@ async fn v2_stat_cold_hit_cache_only_and_v1_on_same_connection() {
         };
         let mut request = match index {
             0 => data::encode_versioned_request(2, &versioned).unwrap(),
-            1 => data::encode_versioned_tenant_request(
+            1 => data::encode_versioned_namespace_request(
                 2,
-                &data::TenantScopedVersionedRange {
-                    tenant: talon_core::TenantId::default(),
+                &data::NamespaceScopedVersionedRange {
+                    namespace: talon_core::NamespaceId::default(),
                     request: versioned,
                 },
             )

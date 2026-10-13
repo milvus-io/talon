@@ -10,20 +10,20 @@ pub mod control_identity;
 pub mod error;
 pub mod key;
 pub mod metrics;
+pub mod namespace;
 pub mod namespace_policy;
 pub mod node;
 pub mod placement;
 pub mod rate_limit;
 pub mod status;
 pub mod store;
-pub mod tenant;
 pub mod trace;
 
 pub use backend::{BackendStore, ListPage, ListedObject, ObjectStat};
 pub use block::{page_len, BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{
     azure_sas_from_env, gcs_bearer_from_env, parse_bool_value, s3_secret_key_from_env,
-    s3_session_token_from_env, ConfigVar, FuseConfig, FuseConfigPatch, Patch, TenantCacheConfig,
+    s3_session_token_from_env, ConfigVar, FuseConfig, FuseConfigPatch, NamespaceCacheConfig, Patch,
     WorkerConfig, WorkerConfigPatch, FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA,
 };
 pub use control_identity::{
@@ -32,7 +32,10 @@ pub use control_identity::{
 pub use error::{Error, Result};
 pub use key::{Backend, BlockId, ObjectId, PageIndex, Version, UNCHECKED_VERSION};
 pub use metrics::{Counter, Gauge, Histogram, Metrics};
-pub use namespace_policy::{NamespacePolicy, ObjectNamespace};
+pub use namespace::{
+    NamespaceContext, NamespaceId, NamespaceIdError, DEFAULT_NAMESPACE, MAX_NAMESPACE_ID_BYTES,
+};
+pub use namespace_policy::{ObjectNamespace, ObjectNamespacePolicy};
 pub use node::{NodeId, NodeInfo, NodeRole};
 pub use placement::{cache_membership_epoch, rank_cache_workers, CachePlacementTable};
 pub use rate_limit::{
@@ -44,7 +47,6 @@ pub use status::{
     MAX_STATUS_LABEL_VALUE_BYTES, NODE_STATUS_SCHEMA_VERSION, NODE_ZONE_LABEL,
 };
 pub use store::{BlockHandle, ObjectStore};
-pub use tenant::{TenantContext, TenantId, TenantIdError, DEFAULT_TENANT, MAX_TENANT_ID_BYTES};
 pub use trace::{init_tracing, RequestId};
 
 pub mod worker_membership;

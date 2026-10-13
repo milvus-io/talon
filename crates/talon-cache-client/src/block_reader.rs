@@ -17,7 +17,7 @@ use crate::membership_fixture;
 
 use std::sync::Arc;
 
-use talon_core::{BlockId, ObjectId, TenantContext, Version};
+use talon_core::{BlockId, NamespaceContext, ObjectId, Version};
 
 use crate::coordinator_client::{CoordinatorClient, CoordinatorError};
 use crate::membership_cache::{MembershipCache, MembershipSnapshot};
@@ -103,7 +103,7 @@ pub struct FileView<'a> {
 /// Orchestrates local block placement and worker reads with caching.
 #[derive(Clone)]
 pub struct BlockReader {
-    pub(crate) tenant: talon_core::TenantId,
+    pub(crate) namespace: talon_core::NamespaceId,
     coordinator: CoordinatorClient,
     cache: Arc<PlacementCache>,
     /// Maximum number of ranked logical workers attempted per block read.
@@ -142,7 +142,7 @@ impl BlockReader {
             cache.clone(),
         ));
         Self {
-            tenant: talon_core::TenantId::default(),
+            namespace: talon_core::NamespaceId::default(),
             coordinator,
             cache,
             replicas_k: replicas_k.max(1),
@@ -156,21 +156,21 @@ impl BlockReader {
         }
     }
 
-    /// Tenant selected for all operations through this reader.
-    pub fn tenant(&self) -> &talon_core::TenantId {
-        &self.tenant
+    /// Namespace selected for all operations through this reader.
+    pub fn namespace(&self) -> &talon_core::NamespaceId {
+        &self.namespace
     }
 
     /// Create a per-request handle for reads, admissions and prewarm. Placement keys
     /// and membership may be shared because they are independent of tenancy.
     pub fn request(
         &self,
-        tenant: &talon_core::TenantId,
-    ) -> Result<Self, talon_core::TenantIdError> {
-        tenant.validate()?;
+        namespace: &talon_core::NamespaceId,
+    ) -> Result<Self, talon_core::NamespaceIdError> {
+        namespace.validate()?;
         let mut request = self.clone();
-        request.tenant = tenant.normalized();
-        request.coordinator = self.coordinator.request(tenant)?;
+        request.namespace = namespace.normalized();
+        request.coordinator = self.coordinator.request(namespace)?;
         Ok(request)
     }
 
@@ -260,8 +260,8 @@ impl BlockReader {
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
                 Ok(worker) => worker
-                    .request(&self.tenant)
-                    .expect("validated request tenant"),
+                    .request(&self.namespace)
+                    .expect("validated request namespace"),
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;
@@ -311,8 +311,8 @@ impl BlockReader {
         let worker = snapshot
             .owner(block)
             .map_err(cache_block_error)?
-            .request(&self.tenant)
-            .expect("validated request tenant");
+            .request(&self.namespace)
+            .expect("validated request namespace");
         worker
             .admit_cached_block(block, object_len, body)
             .await
@@ -358,7 +358,7 @@ impl BlockReader {
             offset_in_block,
             dst,
             OriginReadMode::Current,
-            self.tenant.context().expect("validated tenant"),
+            self.namespace.context().expect("validated namespace"),
         )
         .await
     }
@@ -380,7 +380,7 @@ impl BlockReader {
             offset_in_block,
             dst,
             object_len,
-            self.tenant.context().expect("validated tenant"),
+            self.namespace.context().expect("validated namespace"),
         )
         .await
     }
@@ -392,14 +392,14 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
         object_len: u64,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<usize, BlockReadError> {
         self.read_block_into_with_mode(
             block,
             offset_in_block,
             dst,
             OriginReadMode::ExactVersion(object_len),
-            tenant,
+            namespace,
         )
         .await
     }
@@ -410,7 +410,7 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
         mode: OriginReadMode,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
@@ -431,8 +431,8 @@ impl BlockReader {
             let result = match mode {
                 OriginReadMode::Current => {
                     worker
-                        .request(&self.tenant)
-                        .expect("validated tenant")
+                        .request(&self.namespace)
+                        .expect("validated namespace")
                         .fetch_range_into(&block.object, offset, dst)
                         .await
                 }
@@ -444,7 +444,7 @@ impl BlockReader {
                             offset,
                             dst,
                             object_len,
-                            tenant,
+                            namespace,
                         )
                         .await
                 }
@@ -505,8 +505,8 @@ impl BlockReader {
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
                 Ok(worker) => worker
-                    .request(&self.tenant)
-                    .expect("validated request tenant"),
+                    .request(&self.namespace)
+                    .expect("validated request namespace"),
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;
@@ -688,7 +688,7 @@ fn cache_block_error(error: BlockReadError) -> CacheReadError {
     }
 }
 
-/// Candidate fallback cannot hide authoritative errors or evade tenant limits.
+/// Candidate fallback cannot hide authoritative errors or evade namespace limits.
 fn replica_retryable(error: &WorkerError) -> bool {
     match error {
         WorkerError::Remote(error) => !matches!(

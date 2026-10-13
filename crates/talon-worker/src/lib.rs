@@ -52,7 +52,7 @@ pub use memory_store::{MemoryInsert, MemoryPageKey, MemoryStore};
 pub use miss::{touched_pages, Admission, InFlightGuard, InFlightLoads, LoadKey};
 pub use observability::{serve_admin, WorkerMetrics, WorkerObservability, WorkerReadiness};
 pub use paged_store::PagedBlockStore;
-pub use rate_limit::{TenantRateLimiter, Throttled};
+pub use rate_limit::{NamespaceRateLimiter, Throttled};
 pub use runtime::{ServeOutcome, WorkerRuntime};
 pub use sendfile::{
     send_file_range, send_header_and_file_range, send_header_and_file_ranges, DEFAULT_CHUNK,

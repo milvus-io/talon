@@ -1,15 +1,15 @@
-# Eventual Global Tenant Rate Limits
+# Eventual Global Namespace Rate Limits
 
 ## Status
 
 Design proposal. This document describes a high-throughput, eventually
-consistent tenant rate-limiting mode. It intentionally does **not** provide a
+consistent namespace rate-limiting mode. It intentionally does **not** provide a
 strict, never-exceed global limit.
 
 ## Problem
 
-A Talon cluster may serve requests for many tenants from many workers. A noisy
-tenant must not be able to consume all request processing capacity, client
+A Talon cluster may serve requests for many namespaces from many workers. A noisy
+namespace must not be able to consume all request processing capacity, client
 egress bandwidth, or object-store origin bandwidth. The policy must apply to
 the aggregate of all workers, rather than independently permitting the full
 limit on every worker.
@@ -24,7 +24,7 @@ owner-published state snapshots.
 ## Contract
 
 This mode is a bounded, eventually consistent limit. It is appropriate for
-tenant fairness and noisy-neighbour protection, not for a contractual hard
+namespace fairness and noisy-neighbour protection, not for a contractual hard
 cap on billable origin egress.
 
 For a metric with target rate `R`, configured global burst `B`, `N` active
@@ -45,7 +45,7 @@ lease mode instead.
 Each independently limited resource has a key:
 
 ```
-RateKey = (tenant_id, metric, policy_generation)
+RateKey = (namespace_id, metric, policy_generation)
 ```
 
 Initially, metrics are:
@@ -58,7 +58,7 @@ Initially, metrics are:
 
 Every Talon worker runs a QoS peer service. A consistent-hash ring over the
 worker membership selects one logical owner for each `RateKey`. There is no
-fixed central limiter: different tenants and metrics distribute across the
+fixed central limiter: different namespaces and metrics distribute across the
 peer fleet. The owner is authoritative only for its current in-memory view of
 the key.
 
@@ -69,13 +69,13 @@ persist buckets.
 
 ## Policy distribution and owner bootstrap
 
-The coordinator is the authoritative control-plane source for tenant rate
+The coordinator is the authoritative control-plane source for namespace rate
 *policy*, distinct from an owner's ephemeral bucket state. It stores or fronts
 a durable, versioned policy record such as:
 
 ```
-TenantRatePolicy {
-  tenant_id,
+NamespaceRatePolicy {
+  namespace_id,
   metric,
   generation,
   target_rate,
@@ -90,7 +90,7 @@ short-TTL polling. Workers keep a local, versioned policy cache, so request
 admission never reads the coordinator. `policy_generation` in `RateKey`
 selects an immutable cached policy version; a policy update creates a new
 generation rather than changing the meaning of an existing key. A worker must
-not admit work for an unknown generation: it queues within the tenant bound or
+not admit work for an unknown generation: it queues within the namespace bound or
 rejects until it has obtained the policy. This makes a control-plane outage
 restrict traffic instead of silently applying a permissive default.
 
@@ -111,19 +111,25 @@ the contract still applies.
 
 ## Hot path
 
-Authentication resolves a request to a non-forgeable `TenantContext` before
-it reaches the worker. The worker uses that tenant identity for all QoS
-decisions.
+A request carries a validated `NamespaceContext` selected by the caller or
+service configuration. Omitted names resolve to `default`; the namespace is
+not authenticated and is not a non-forgeable business identity. The worker
+uses it to select the cache scope and namespace QoS policy. See
+[Namespace cache isolation](../reference/namespace-cache-isolation.md).
+
+This proposal limits traffic within each declared namespace. Enforcing a
+business tenant's total limit across several namespaces would require a
+separate trusted quota identity and mapping.
 
 The hot path never contacts the rate owner.
 
 1. A request consumes one unit from the local `read_iops` view. If no unit is
-   available, it waits in the bounded tenant queue or receives a rate-limit
+   available, it waits in the bounded namespace queue or receives a rate-limit
    response when its deadline expires.
 2. A response is split into bounded transfer chunks. Each chunk consumes bytes
    from the local `client_egress_bytes` view before it is submitted.
 3. The chunk is still served through `sendfile`; splitting the transfer only
-   gives the scheduler points at which to switch tenants.
+   gives the scheduler points at which to switch namespaces.
 4. A cache miss additionally consumes local `origin_read_bytes` capacity and
    a bounded origin-loader concurrency slot before it is started.
 
@@ -180,7 +186,7 @@ RateSnapshot {
 
 Unlike a broadcast to every cluster member, Talon should send snapshots only
 to workers that reported this key recently. A worker keeps an active-reporter
-lease for a short interval at the owner. This limits fan-out for tenant keys
+lease for a short interval at the owner. This limits fan-out for namespace keys
 that are used by only a subset of the fleet.
 
 A worker does not overwrite its local state with `remaining` directly. Its
@@ -232,7 +238,7 @@ excess envelope visible in telemetry:
 sync interval:                 2--5 ms
 usage-report threshold:        32 IOPS or 64 KiB
 snapshot TTL:                  10--20 ms
-tenant queue bound:            1,024 requests
+namespace queue bound:         1,024 requests
 egress scheduling chunk:       256 KiB--1 MiB
 ```
 
@@ -243,7 +249,7 @@ delay, active reporter count, stale-view rejections, and estimated excess.
 
 - A strict, never-exceed cluster-wide rate cap.
 - Persistent quota accounting or billing-grade origin usage.
-- Per-tenant physical NVMe IOPS accounting. The initial controls are request,
+- Per-namespace physical NVMe IOPS accounting. The initial controls are request,
   client egress, and origin traffic; Linux page cache and `sendfile` make
   exact physical-device attribution a different problem.
 

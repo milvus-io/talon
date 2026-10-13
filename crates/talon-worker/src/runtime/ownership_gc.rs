@@ -66,7 +66,13 @@ impl OwnershipGc {
         let range = if view.generation != self.completed_generation {
             // Topology changes supersede any pending supplemental pass.
             self.supplement = None;
-            0..view.scan_limit
+            // Namespaces first created after publication start at an empty
+            // boundary; their admissions belong to the hourly supplement.
+            0..view
+                .scan_limits
+                .get(worker.namespace.effective_name())
+                .copied()
+                .unwrap_or(0)
         } else {
             if self.supplement.is_none() {
                 let limit = worker.lru.ownership_admission_ceiling();
@@ -304,6 +310,148 @@ mod tests {
             .filter(|id| table.primary(id).unwrap().id.0 == owner)
             .nth(offset)
             .unwrap()
+    }
+
+    fn namespace_runtime(
+        root: &std::path::Path,
+        paged: bool,
+    ) -> (Arc<WorkerRuntime>, MembershipFixture) {
+        let mut fixture = MembershipFixture::new();
+        fixture.config.block_size = 32;
+        fixture.config.l2_page_size_bytes = if paged { 16 } else { 0 };
+        fixture.config.l1_page_size_bytes = 16;
+        fixture.config.l1_capacity_bytes = 0;
+        fixture.config.page_tti_hours = 0;
+        fixture.config.backend = Some("s3".into());
+        let lock = Arc::new(crate::page_access_store::CacheRootLock::acquire(root).unwrap());
+        let worker = Arc::new(
+            WorkerRuntime::open_namespaces(
+                &fixture.config,
+                lock,
+                Arc::new(Origin::default()),
+                WorkerMetrics::new(0),
+            )
+            .unwrap(),
+        );
+        (worker, fixture)
+    }
+
+    #[tokio::test]
+    async fn namespaces_share_membership_but_keep_independent_ownership_boundaries() {
+        for paged in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, fixture) = namespace_runtime(root.path(), paged);
+            let named = worker
+                .for_namespace(&talon_core::NamespaceId::named("analytics"))
+                .await
+                .unwrap();
+            let owned = placed("a", 0);
+            let unowned = placed("b", 0);
+            fill(&worker, &unowned, paged).await;
+            fill(&named, &owned, paged).await;
+            fill(&named, &unowned, paged).await;
+            fixture.publish(&worker);
+            let original = worker.membership_snapshot().unwrap();
+            assert!(Arc::ptr_eq(
+                &original,
+                &named.membership_snapshot().unwrap()
+            ));
+            assert_ne!(
+                original.scan_limits["default"],
+                original.scan_limits["analytics"]
+            );
+            let late_fill = placed("b", 1);
+            fill(&named, &late_fill, paged).await;
+            worker.update_membership(None, Instant::now()).unwrap();
+            assert!(named.membership_snapshot().is_none());
+            let mut default_gc = OwnershipGc::new(&fixture.config);
+            let mut named_gc = OwnershipGc::new(&fixture.config);
+            named_gc.run_round(&named).await;
+            assert!(named.index.get(&unowned).is_some());
+            fixture.publish(&worker);
+            assert_eq!(
+                named.membership_snapshot().unwrap().scan_limits,
+                original.scan_limits
+            );
+            default_gc.run_round(&worker).await;
+            named_gc.run_round(&named).await;
+            assert!(worker.index.is_empty());
+            assert!(named.index.get(&unowned).is_none());
+            assert!(named.index.get(&owned).is_some());
+            assert!(named.index.get(&late_fill).is_some());
+            let late = worker
+                .for_namespace(&talon_core::NamespaceId::named("late"))
+                .await
+                .unwrap();
+            assert!(late.membership_snapshot().is_some());
+            fill(&late, &unowned, paged).await;
+            let mut late_gc = OwnershipGc::new(&fixture.config);
+            late_gc.run_round(&late).await;
+            assert!(late.index.get(&unowned).is_some());
+            named_gc.next_supplement = tokio::time::Instant::now();
+            late_gc.next_supplement = tokio::time::Instant::now();
+            named_gc.run_round(&named).await;
+            late_gc.run_round(&late).await;
+            assert!(named.index.get(&late_fill).is_none());
+            assert!(named.index.get(&owned).is_some());
+            assert!(late.index.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn background_ownership_gc_includes_existing_and_new_namespaces() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let named = worker
+            .for_namespace(&talon_core::NamespaceId::named("analytics"))
+            .await
+            .unwrap();
+        let unowned = placed("b", 0);
+        fill(&named, &unowned, false).await;
+        fixture.publish(&worker);
+        let service = super::super::WorkerBackground::start(worker.clone(), &fixture.config);
+        let completed = worker.metrics.registry.counter(
+            "talon_worker_background_task_completed_total",
+            "Completed background batches by task.",
+            talon_core::metrics::labels(&[("task", "ownership_gc")]),
+        );
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while completed.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(named.index.is_empty());
+        let before = completed.get();
+        let late = worker
+            .for_namespace(&talon_core::NamespaceId::named("late"))
+            .await
+            .unwrap();
+        fill(&late, &unowned, false).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while completed.get() == before {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            late.index.get(&unowned).is_some(),
+            "post-observation fills wait for the supplement"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::pause();
+        tokio::time::advance(SUPPLEMENT_INTERVAL + Duration::from_secs(1)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !late.index.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        service.shutdown().await;
     }
 
     #[tokio::test]
@@ -647,7 +795,7 @@ mod tests {
                     Some(Arc::new(MembershipSnapshot {
                         members: vec![],
                         generation: 1,
-                        scan_limit: 0,
+                        scan_limits: Arc::default(),
                         valid_until: Instant::now() + Duration::from_millis(20),
                     })),
                 ),
@@ -844,7 +992,7 @@ mod tests {
         );
         let recovered = r.membership_snapshot().unwrap();
         assert_eq!(recovered.generation, original.generation);
-        assert_eq!(recovered.scan_limit, original.scan_limit);
+        assert_eq!(recovered.scan_limits, original.scan_limits);
         drop(reader);
         gc.run_round(&r).await;
         assert!(r.index.get(&old).is_none());

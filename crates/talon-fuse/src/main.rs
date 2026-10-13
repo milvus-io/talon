@@ -81,6 +81,7 @@ impl Args {
     /// Assemble the highest-precedence (CLI) config patch from parsed flags.
     fn to_patch(&self) -> FuseConfigPatch {
         FuseConfigPatch {
+            namespace_id: None,
             mountpoint: self.mountpoint.clone(),
             coordinator: self.coordinator.clone(),
             namespace_prefix: self.namespace_prefix.clone(),
@@ -122,6 +123,7 @@ async fn run() -> anyhow::Result<()> {
     let cfg = FuseConfig::resolve(file, env, args.to_patch())?;
 
     tracing::info!(
+        namespace_id = %cfg.namespace_id,
         mountpoint = %cfg.mountpoint.display(),
         coordinator = %cfg.coordinator,
         namespace_prefix = %cfg.namespace_prefix,
@@ -132,11 +134,8 @@ async fn run() -> anyhow::Result<()> {
     );
 
     // Read-path components, shared by the metadata and data callbacks.
-    let tenant = talon_core::TenantId::named(
-        std::env::var("TALON_FUSE_TENANT_ID").unwrap_or_else(|_| "default".into()),
-    );
-    tenant.validate()?;
-    let coordinator = CoordinatorClient::new(cfg.coordinator.clone()).request(&tenant)?;
+    let namespace = talon_core::NamespaceId::named(&cfg.namespace_id);
+    let coordinator = CoordinatorClient::new(cfg.coordinator.clone()).request(&namespace)?;
     let cache = Arc::new(PlacementCache::new(cfg.placement_ttl_ms));
     // Zone affinity (ADR 0006): env-only for the mount — the FUSE client
     // typically runs outside Kubernetes, so there is no node-label lookup.
@@ -156,7 +155,7 @@ async fn run() -> anyhow::Result<()> {
         );
     }
     let reader = BlockReader::new(coordinator.clone(), cache, 1)
-        .request(&tenant)?
+        .request(&namespace)?
         .with_zone_affinity(
             zone,
             zone_affinity,

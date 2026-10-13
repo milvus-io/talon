@@ -31,18 +31,18 @@ impl EvictionCycle {
                 self.active = true;
             }
             if self.active {
-                for tenant in &workers {
-                    let target = ((tenant.lru.total_bytes() as u128 * self.low as u128)
+                for namespace in &workers {
+                    let target = ((namespace.lru.total_bytes() as u128 * self.low as u128)
                         / total.max(1) as u128) as u64;
-                    let lru = tenant.lru.clone();
-                    let scan = tenant.page_gc_config.scan_batch_size;
-                    let deletes = tenant.page_gc_config.delete_batch_size;
+                    let lru = namespace.lru.clone();
+                    let scan = namespace.page_gc_config.scan_batch_size;
+                    let deletes = namespace.page_gc_config.delete_batch_size;
                     let units = tokio::task::spawn_blocking(move || {
                         lru.candidates_to_fit_bounded(target, &Default::default(), scan, deletes)
                     })
                     .await
                     .expect("eviction scan panicked");
-                    tenant.unlink_units_to_target(units, 1, target).await;
+                    namespace.unlink_units_to_target(units, 1, target).await;
                 }
                 self.active = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>() > self.low;
             }

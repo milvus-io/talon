@@ -1,6 +1,6 @@
 //! Client-side file prewarm using the read path's cached membership and Maglev table.
 
-use talon_core::TenantContext;
+use talon_core::NamespaceContext;
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -155,15 +155,15 @@ impl BlockReader {
     /// share eight active block requests. Dropping this future stops dispatch;
     /// workers may finish already accepted requests.
     pub async fn load(&self, file: &FileView<'_>, _now_ms: u64) -> Result<LoadResult, LoadError> {
-        self.load_with_context(file, self.tenant.context().expect("validated tenant"))
+        self.load_with_context(file, self.namespace.context().expect("validated namespace"))
             .await
     }
 
-    /// Prewarm using a borrowed request tenant and this reader's shared budgets.
+    /// Prewarm using a borrowed request namespace and this reader's shared budgets.
     pub async fn load_with_context(
         &self,
         file: &FileView<'_>,
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<LoadResult, LoadError> {
         let LoadResult { blocks, .. } = validate_file(file)?;
         if blocks == 0 {
@@ -193,7 +193,7 @@ impl BlockReader {
                     let block = &segment.block;
                     self.with_load_owner(block, topology, |client| async move {
                         client
-                            .load_block_with_context(block, u64::from(segment.len), tenant)
+                            .load_block_with_context(block, u64::from(segment.len), namespace)
                             .await
                             .map_err(|source| LoadError::Worker {
                                 worker: client.addr().into(),
@@ -236,15 +236,18 @@ impl BlockReader {
         files: &[FileView<'_>],
         _now_ms: u64,
     ) -> Result<Vec<LoadResult>, LoadError> {
-        self.batch_load_with_context(files, self.tenant.context().expect("validated tenant"))
-            .await
+        self.batch_load_with_context(
+            files,
+            self.namespace.context().expect("validated namespace"),
+        )
+        .await
     }
 
-    /// Prewarm a batch with a borrowed tenant, without making tenant-specific client copies.
+    /// Prewarm a batch with a borrowed namespace, without making namespace-specific client copies.
     pub async fn batch_load_with_context(
         &self,
         files: &[FileView<'_>],
-        tenant: TenantContext<'_>,
+        namespace: NamespaceContext<'_>,
     ) -> Result<Vec<LoadResult>, LoadError> {
         let results = files
             .iter()
@@ -358,7 +361,7 @@ impl BlockReader {
                                     topology,
                                     |client| async move {
                                         client
-                                            .batch_load_with_context(blocks, tenant)
+                                            .batch_load_with_context(blocks, namespace)
                                             .await
                                             .map(|failures| (client.addr().to_owned(), failures))
                                             .map_err(|source| LoadError::WorkerBatch {

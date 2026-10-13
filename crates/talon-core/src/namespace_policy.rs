@@ -1,4 +1,4 @@
-//! Static namespace authorization policy for privileged control-plane traffic.
+//! Static object namespace authorization policy for privileged control-plane traffic.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -124,9 +124,9 @@ impl<'de> Deserialize<'de> for ObjectNamespace {
     }
 }
 
-/// Operator-owned namespace grants indexed by stable worker node ID.
+/// Operator-owned object namespace grants indexed by stable worker node ID.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NamespacePolicy {
+pub struct ObjectNamespacePolicy {
     workers: HashMap<String, WorkerPolicy>,
 }
 
@@ -154,7 +154,7 @@ struct WorkerPolicy {
     grants: Vec<ObjectNamespace>,
 }
 
-impl NamespacePolicy {
+impl ObjectNamespacePolicy {
     /// Parse and validate a versioned TOML policy document.
     pub fn from_toml(value: &str) -> Result<Self> {
         let raw: PolicyFile = toml::from_str(value)
@@ -271,7 +271,7 @@ mod tests {
 
     #[test]
     fn policy_is_worker_scoped_and_fail_closed() {
-        let policy = NamespacePolicy::from_toml(
+        let policy = ObjectNamespacePolicy::from_toml(
             "version = 1\n\
              [[workers]]\n\
              node_id = \"worker-a\"\n\
@@ -288,8 +288,8 @@ mod tests {
 
     #[test]
     fn policy_rejects_unknown_versions_and_duplicate_workers() {
-        assert!(NamespacePolicy::from_toml("version = 2").is_err());
-        assert!(NamespacePolicy::from_toml(
+        assert!(ObjectNamespacePolicy::from_toml("version = 2").is_err());
+        assert!(ObjectNamespacePolicy::from_toml(
             "version = 1\n\
              [[workers]]\nnode_id = \"same\"\n\
              [[workers]]\nnode_id = \"same\"\n"
@@ -299,7 +299,7 @@ mod tests {
 
     #[test]
     fn policy_rejects_an_empty_control_address() {
-        assert!(NamespacePolicy::from_toml(
+        assert!(ObjectNamespacePolicy::from_toml(
             "version = 1\n\
              [[workers]]\n\
              node_id = \"worker-a\"\n\
@@ -320,10 +320,10 @@ mod tests {
             "version = 1\n[[workers]]\nnode_id = \"worker-a\"\ngrants = [\"s3/data\"]\n",
         )
         .unwrap();
-        let policy = NamespacePolicy::from_file(&path).unwrap();
+        let policy = ObjectNamespacePolicy::from_file(&path).unwrap();
         std::fs::remove_file(&path).unwrap();
 
         assert!(policy.authorizes("worker-a", &"s3/data/models".parse().unwrap()));
-        assert!(NamespacePolicy::from_file(&path).is_err());
+        assert!(ObjectNamespacePolicy::from_file(&path).is_err());
     }
 }

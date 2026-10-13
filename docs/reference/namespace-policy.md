@@ -1,8 +1,13 @@
-# Namespace authorization policy
+# Object namespace authorization policy
 
 Coordinators and workers load the same operator-owned TOML file through
 `namespace_policy_path` or the corresponding environment variable. The file is
 read and validated at process startup.
+
+`ObjectNamespacePolicy` authorizes source-object ranges represented by
+`ObjectNamespace`. It is independent of the caller-selected cache
+`NamespaceId` and the worker's `[namespaces.NAME]` cache settings. Selecting a
+cache namespace does not grant access to an object range.
 
 ```toml
 version = 1

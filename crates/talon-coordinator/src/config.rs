@@ -4,8 +4,8 @@ use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 use talon_core::{
-    ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, NamespacePolicy, ObjectNamespace, Patch,
-    MAX_STATUS_FIELD_BYTES,
+    ConfigVar, ControlTlsConfig, ControlTlsConfigPatch, ObjectNamespace, ObjectNamespacePolicy,
+    Patch, MAX_STATUS_FIELD_BYTES,
 };
 
 #[cfg(feature = "kubernetes")]
@@ -58,7 +58,7 @@ pub struct CoordinatorConfig {
     /// Optional mTLS material for the privileged coordinator-worker channel.
     pub control_tls: Option<ControlTlsConfig>,
     /// Operator-owned worker grants loaded from mounted static policy data.
-    pub namespace_policy: Option<NamespacePolicy>,
+    pub namespace_policy: Option<ObjectNamespacePolicy>,
     /// Shared-state and lease settings.
     pub state: ClusterStateConfig,
     /// etcd backend connection settings, required when `state.backend` is etcd.
@@ -156,7 +156,7 @@ pub struct CoordinatorConfigPatch {
     pub node_id: Option<String>,
     /// Optional `[control_tls]` block.
     pub control_tls: Option<ControlTlsConfigPatch>,
-    /// Path to a static namespace authorization policy.
+    /// Path to a static object namespace authorization policy.
     pub namespace_policy_path: Option<PathBuf>,
     /// Shared-state backend selector.
     pub state_backend: Option<StateBackend>,
@@ -355,7 +355,7 @@ pub const COORDINATOR_ENV_SCHEMA: &[ConfigVar] = &[
         default: None,
         cli: false,
         secret: false,
-        help: "Mounted static namespace authorization policy (TOML).",
+        help: "Mounted static object namespace authorization policy (TOML).",
     },
     ConfigVar {
         env: "TALON_COORDINATOR_STATE_BACKEND",
@@ -678,7 +678,7 @@ impl CoordinatorConfig {
         let namespace_policy = merged
             .namespace_policy_path
             .as_deref()
-            .map(NamespacePolicy::from_file)
+            .map(ObjectNamespacePolicy::from_file)
             .transpose()?;
 
         // Fold backend blocks with their env/CLI scalar overrides. The block may
@@ -943,7 +943,7 @@ mod tests {
         assert!(!config.authorizes_worker_namespace("worker-a", &target));
 
         config.namespace_policy = Some(
-            NamespacePolicy::from_toml(
+            ObjectNamespacePolicy::from_toml(
                 "version = 1\n\
                  [[workers]]\n\
                  node_id = \"worker-a\"\n\

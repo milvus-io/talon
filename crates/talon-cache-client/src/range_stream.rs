@@ -52,10 +52,10 @@ pub enum CacheReadError {
     /// A legacy worker returned only an unclassified string.
     #[error("unclassified legacy worker failure: {0}")]
     Unknown(String),
-    /// The tenant exceeded its rate limit; the caller should back off and
+    /// The namespace exceeded its rate limit; the caller should back off and
     /// retry. Never origin-fallback-eligible — falling back would evade the
     /// limit.
-    #[error("tenant rate limit exceeded: {0}")]
+    #[error("namespace rate limit exceeded: {0}")]
     RateLimited(String),
 }
 
