@@ -316,14 +316,15 @@ impl WorkerRuntime {
         self.unlink_stale_block_for(candidate, None).await;
     }
 
-    /// Ownership supplies a fresh deadline after paying deletion credits.
+    /// Ownership supplies the observed placement after paying deletion credits.
     pub(super) async fn unlink_stale_block_for(
         &self,
         candidate: crate::eviction::StaleBlockCandidate,
-        ownership_deadline: Option<Instant>,
+        membership: Option<Arc<super::MembershipSnapshot>>,
     ) {
         let runtime = self.clone();
         self.page_mutations.run(async move {
+            let ownership_deadline = membership.as_ref().map(|view| view.valid_until);
             let reason = if ownership_deadline.is_some() { 4 } else { 3 };
             let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return; };
             let _permit = permit.expect("page GC semaphore closed");
@@ -340,7 +341,8 @@ impl WorkerRuntime {
                 let Some(claim) = state.claim_all_pages() else { return; };
                 // A reader may have completed while the pages were being closed.
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
-                if ownership_deadline.is_some_and(|at| Instant::now() >= at) { return; }
+                if membership.as_ref().is_some_and(|view|
+                    Instant::now() >= view.valid_until || !runtime.membership_is_current(view)) { return; }
                 let id = &candidate.block;
                 let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
                 let pages = claim.len();

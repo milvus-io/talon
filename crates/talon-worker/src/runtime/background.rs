@@ -10,13 +10,9 @@ pub struct WorkerBackground {
     worker: Arc<WorkerRuntime>,
 }
 impl WorkerBackground {
-    /// Start maintenance using validated configuration and the Coordinator TLS channel.
+    /// Start maintenance using validated configuration.
     /// Ownership cleanup requires the resolved persistent identity in `config.node_id`.
-    pub fn start(
-        worker: Arc<WorkerRuntime>,
-        config: &WorkerConfig,
-        channel: Option<talon_transport::control_tls::ControlTlsChannel>,
-    ) -> Self {
+    pub fn start(worker: Arc<WorkerRuntime>, config: &WorkerConfig) -> Self {
         let mut background = (*worker).clone();
         background.background_budget = Some(BackgroundBudget::new(config));
         background.page_gc_config.scan_batch_size = background
@@ -69,7 +65,7 @@ impl WorkerBackground {
                 3600
             });
             let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
-                config, channel,
+                config,
             )));
             let w = worker.clone();
             scheduler.register("stale_gc", period, move || {

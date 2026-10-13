@@ -705,10 +705,10 @@ async fn run() -> anyhow::Result<()> {
         control_tls.clone(),
         Arc::clone(&observability),
         Duration::from_millis(cfg.heartbeat_interval_ms),
+        (cfg.ownership_gc_interval_secs > 0).then(|| worker.clone()),
     );
 
-    let background =
-        talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg, control_tls.clone());
+    let background = talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg);
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
     tokio::pin!(data);
@@ -927,49 +927,101 @@ fn spawn_control_plane(
     channel: Option<ControlTlsChannel>,
     observability: Arc<WorkerObservability>,
     heartbeat_interval: Duration,
+    membership: Option<Arc<WorkerRuntime>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(heartbeat_interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let mut last_successful_heartbeat = None;
-        let failure_grace = heartbeat_interval
-            .saturating_mul(CONTROL_FAILURE_GRACE_INTERVALS)
-            .min(MAX_CONTROL_FAILURE_GRACE);
-        loop {
-            ticker.tick().await;
-
-            let proposed = ControlMessage::NodeStatusHeartbeat {
-                status: Box::new(observability.status_for_heartbeat()),
-            };
-            let report = tokio::time::timeout(
-                CONTROL_OPERATION_TIMEOUT,
-                instance_report(&coordinator, channel.as_ref(), &proposed),
-            )
-            .await;
-            match report {
-                Ok(Ok((accepted, serving))) => {
-                    observability
-                        .readiness()
-                        .set_control_registered(accepted && serving);
-                    if accepted && serving {
-                        last_successful_heartbeat = Some(Instant::now());
-                        observability.metrics().record_heartbeat_success();
-                    } else {
+        let heartbeat = async {
+            let mut ticker = tokio::time::interval(heartbeat_interval);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            let mut last_successful_heartbeat = None;
+            let failure_grace = heartbeat_interval
+                .saturating_mul(CONTROL_FAILURE_GRACE_INTERVALS)
+                .min(MAX_CONTROL_FAILURE_GRACE);
+            loop {
+                ticker.tick().await;
+                let proposed = ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(observability.status_for_heartbeat()),
+                };
+                let report = tokio::time::timeout(
+                    CONTROL_OPERATION_TIMEOUT,
+                    instance_report(&coordinator, channel.as_ref(), &proposed),
+                )
+                .await;
+                match report {
+                    Ok(Ok((accepted, serving))) => {
+                        observability
+                            .readiness()
+                            .set_control_registered(accepted && serving);
+                        if accepted && serving {
+                            last_successful_heartbeat = Some(Instant::now());
+                            observability.metrics().record_heartbeat_success();
+                        } else {
+                            observability.metrics().record_heartbeat_failure();
+                        }
+                    }
+                    result => {
                         observability.metrics().record_heartbeat_failure();
+                        retain_readiness_after_control_failure(
+                            &observability,
+                            last_successful_heartbeat,
+                            failure_grace,
+                        );
+                        tracing::warn!(?result, "worker instance heartbeat failed; retrying");
                     }
                 }
-                result => {
-                    observability.metrics().record_heartbeat_failure();
-                    retain_readiness_after_control_failure(
-                        &observability,
-                        last_successful_heartbeat,
-                        failure_grace,
-                    );
-                    tracing::warn!(?result, "worker instance heartbeat failed; retrying");
+            }
+        };
+        let refresh = async {
+            if let Some(worker) = &membership {
+                let mut ticker = tokio::time::interval(heartbeat_interval);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                loop {
+                    ticker.tick().await;
+                    let observed = Instant::now();
+                    let result = tokio::time::timeout(CONTROL_OPERATION_TIMEOUT, async {
+                        if let Some(channel) = &channel {
+                            query_membership(channel.connect(&coordinator).await?.stream).await
+                        } else {
+                            query_membership(TcpStream::connect(&coordinator).await?).await
+                        }
+                    })
+                    .await;
+                    match result {
+                        Ok(Ok(view)) => {
+                            if let Err(error) = worker.update_membership(Some(view), observed) {
+                                tracing::warn!(%error, "invalid worker membership; deferring ownership cleanup");
+                            }
+                        }
+                        error => {
+                            worker
+                                .update_membership(None, observed)
+                                .expect("clear membership");
+                            tracing::warn!(
+                                ?error,
+                                "worker membership refresh failed; deferring ownership cleanup"
+                            );
+                        }
+                    }
                 }
             }
-        }
+        };
+        // Independent loops in the existing control task: a stalled membership
+        // request must not delay heartbeats or change their readiness result.
+        tokio::join!(heartbeat, refresh);
     })
+}
+
+async fn query_membership<S: AsyncRead + AsyncWrite + Unpin>(
+    mut stream: S,
+) -> anyhow::Result<talon_core::worker_membership::WorkerDiscovery> {
+    stream
+        .write_all(&codec::encode(0, &ControlMessage::MembershipQuery {})?)
+        .await?;
+    stream.flush().await?;
+    match read_control(&mut stream).await? {
+        Some(ControlMessage::MembershipList { view }) => Ok(view),
+        other => anyhow::bail!("expected retained worker membership, got {other:?}"),
+    }
 }
 
 async fn instance_report(
@@ -1316,6 +1368,248 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_membership_rejects_errors_and_unexpected_replies() {
+        for reply in [
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some("not ready".into()),
+            },
+            ControlMessage::MembershipQuery {},
+        ] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let responder = tokio::spawn(async move {
+                assert_eq!(
+                    read_control(&mut server).await.unwrap(),
+                    Some(ControlMessage::MembershipQuery {})
+                );
+                server
+                    .write_all(&codec::encode(0, &reply).unwrap())
+                    .await
+                    .unwrap();
+            });
+            assert!(query_membership(client).await.is_err());
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn stalled_membership_does_not_delay_heartbeats() {
+        use std::sync::atomic::Ordering;
+        let (worker, observability, _, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = listener.local_addr().unwrap().to_string();
+        let heartbeats = Arc::new(AtomicUsize::new(0));
+        let queries = Arc::new(AtomicUsize::new(0));
+        let server = tokio::spawn({
+            let heartbeats = heartbeats.clone();
+            let queries = queries.clone();
+            async move {
+                let mut withheld = Vec::new();
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    match read_control(&mut stream).await.unwrap().unwrap() {
+                        ControlMessage::MembershipQuery {} => {
+                            queries.fetch_add(1, Ordering::Relaxed);
+                            withheld.push(stream);
+                        }
+                        ControlMessage::NodeStatusHeartbeat { .. } => {
+                            stream
+                                .write_all(
+                                    &codec::encode(
+                                        0,
+                                        &ControlMessage::NodeStatusAck {
+                                            accepted: true,
+                                            serving: true,
+                                            detail: None,
+                                        },
+                                    )
+                                    .unwrap(),
+                                )
+                                .await
+                                .unwrap();
+                            heartbeats.fetch_add(1, Ordering::Relaxed);
+                        }
+                        other => panic!("unexpected control request: {other:?}"),
+                    }
+                }
+            }
+        });
+        let control = spawn_control_plane(
+            coordinator,
+            None,
+            observability.clone(),
+            Duration::from_millis(20),
+            Some(worker),
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while heartbeats.load(Ordering::Relaxed) < 4 || queries.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            queries.load(Ordering::Relaxed),
+            1,
+            "only one refresh in flight"
+        );
+        assert!(observability.is_ready());
+        control.abort();
+        server.abort();
+        let _ = control.await;
+        let _ = server.await;
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
+    async fn heartbeat_task_refreshes_membership_independently_of_gc() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use talon_core::worker_membership::{MemberRegistry, WorkerDiscovery, WorkerMember};
+        let (worker, observability, node, root) = test_worker();
+        observability.readiness().set_backend_ready(true);
+        observability.readiness().set_store_ready(true);
+        let nodes = [
+            node.clone(),
+            NodeInfo {
+                id: NodeId::new("other"),
+                address: String::new(),
+                role: NodeRole::Worker,
+            },
+        ];
+        let view = WorkerDiscovery::retained(
+            &MemberRegistry {
+                members: nodes
+                    .iter()
+                    .map(|n| WorkerMember {
+                        worker_id: n.id.0.clone(),
+                        zone: None,
+                        retired: false,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            &[],
+        );
+        let placement = talon_core::CachePlacementTable::new(&nodes);
+        let block = (0..1000)
+            .map(|i| {
+                talon_core::BlockId::new(
+                    ObjectId::new(Backend::S3, "bucket", format!("key-{i}")),
+                    0,
+                    8,
+                    Version::new("v1"),
+                )
+            })
+            .find(|id| placement.primary(id).unwrap().id != node.id)
+            .unwrap();
+        worker
+            .admit_cached_block(
+                &talon_transport::data::CachedBlockPutRequest {
+                    block,
+                    object_len: 8,
+                    body_len: 8,
+                },
+                Bytes::from_static(&[1; 8]),
+            )
+            .await
+            .unwrap();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = listener.local_addr().unwrap().to_string();
+        let queries = Arc::new(AtomicUsize::new(0));
+        let fail = Arc::new(AtomicBool::new(false));
+        let server = tokio::spawn({
+            let queries = queries.clone();
+            let fail = fail.clone();
+            async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let reply = match read_control(&mut stream).await.unwrap().unwrap() {
+                        ControlMessage::NodeStatusHeartbeat { .. } => {
+                            ControlMessage::NodeStatusAck {
+                                accepted: true,
+                                serving: true,
+                                detail: None,
+                            }
+                        }
+                        ControlMessage::MembershipQuery {} => {
+                            queries.fetch_add(1, Ordering::Relaxed);
+                            if fail.load(Ordering::Relaxed) {
+                                ControlMessage::Ack {
+                                    ok: false,
+                                    detail: None,
+                                }
+                            } else {
+                                ControlMessage::MembershipList { view: view.clone() }
+                            }
+                        }
+                        other => panic!("unexpected control request: {other:?}"),
+                    };
+                    stream
+                        .write_all(&codec::encode(0, &reply).unwrap())
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let control = spawn_control_plane(
+            coordinator,
+            None,
+            observability.clone(),
+            Duration::from_millis(10),
+            Some(worker.clone()),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queries.load(Ordering::Relaxed) < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(worker.resident_bytes(), 8, "refresh runs without GC");
+        let background = talon_worker::runtime::WorkerBackground::start(
+            worker.clone(),
+            &WorkerConfig {
+                node_id: Some(node.id.0),
+                ownership_gc_interval_secs: 1,
+                stale_gc_enabled: false,
+                ..Default::default()
+            },
+        );
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while worker.resident_bytes() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        fail.store(true, Ordering::Relaxed);
+        let next = queries.load(Ordering::Relaxed) + 2;
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while queries.load(Ordering::Relaxed) < next {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            observability.is_ready(),
+            "membership failures do not reject accepted heartbeats"
+        );
+        assert!(!observability
+            .metrics()
+            .render()
+            .contains("talon_worker_control_heartbeat_total{result=\"failure\"} 1"));
+        background.shutdown().await;
+        control.abort();
+        server.abort();
+        let _ = control.await;
+        let _ = server.await;
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[tokio::test]
     async fn control_plane_waits_for_instance_acceptance() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let coordinator = listener.local_addr().unwrap();
@@ -1349,6 +1643,7 @@ mod tests {
             None,
             observability.clone(),
             Duration::from_secs(60),
+            None,
         );
         let message = tokio::time::timeout(Duration::from_secs(2), status_received)
             .await
@@ -1492,6 +1787,7 @@ mod tests {
             None,
             Arc::clone(&observability),
             Duration::from_secs(60),
+            None,
         );
 
         tokio::time::timeout(Duration::from_secs(2), async {

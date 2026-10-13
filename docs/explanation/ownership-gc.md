@@ -4,9 +4,10 @@ Workers can reclaim clean local cache blocks outside their placement candidates.
 This extends `DESIGN.md` section 3 (Worker storage). Ownership is a predicate in
 the existing `StaleGc` block scan, alongside backend deletion. Both predicates
 share one cursor, pending queue, round boundary, scheduler registration and
-whole-block deletion transaction. Membership queries and placement checks live
-directly in `runtime/stale_gc.rs`; there is no separate ownership-GC module, service
-or block index.
+whole-block deletion transaction. The existing Worker control-plane task refreshes
+membership and publishes a shared snapshot. `StaleGc` consumes that snapshot for
+placement checks; it owns no sockets, TLS channel or discovery client. There is
+no separate ownership-GC module, service or block index.
 Origin objects, staging and WAL data are outside its scope.
 
 ## Configuration
@@ -43,18 +44,28 @@ these candidates is subject to cleanup.
 
 ## Scan and membership
 
-Each batch obtains fresh `MembershipQuery` data from the Coordinator. Placement
-uses retained logical Workers, including offline and conflicted instances, and
-excludes retired members. Response ordering, addresses and instance availability
-do not affect placement. There is no additional Worker stability timer.
+When ownership cleanup is enabled, the existing heartbeat control task refreshes
+retained membership using `MembershipQuery` at `heartbeat_interval_ms`. Heartbeats
+and membership requests run in independently paced loops, each with a three-second
+request timeout. A slow or failed membership query does not delay heartbeats or
+change their readiness result. TLS and connection handling stay in the control
+plane. Disabling ownership cleanup also disables membership refresh.
 
-A membership change between rounds resets the ownership watermark. A change
-during a round, invalid membership, missing local Worker, or query failure pauses
-ownership for the rest of that round and resets its watermark. Backend checks
-can continue. The next round requires another successful membership query;
-last-good membership never authorizes deletion after a failed query. Coordinator
-upgrade must precede enabling cleanup: retained membership queries must also be
-allowed on its authenticated Worker listener. No wire schema changes are needed.
+The publisher validates and canonicalizes retained logical Workers, including
+offline and conflicted instances, and excludes retired members. Response ordering,
+addresses and instance availability do not affect placement. Every snapshot expires
+at query start plus the Coordinator's `valid_for_ms`; network time consumes its
+validity. Query failure or invalid data revokes the last snapshot. If the publisher
+stops, expiry prevents indefinite reuse. There is no additional stability timer.
+
+Each GC batch reads the current local snapshot. A membership change between rounds
+resets the ownership watermark. A change during a round, missing/expired snapshot,
+or missing local Worker pauses ownership for the rest of that round and resets
+its watermark. Backend checks can continue. The next round again reads the local
+snapshot; GC never triggers or waits for discovery, including at startup before
+any snapshot is available. Coordinator upgrade must precede enabling cleanup:
+retained membership queries must also be allowed on its authenticated Worker
+listener. No wire schema changes are needed.
 
 The shared scanner checks ownership before applying backend idle and HEAD
 filters. Misplaced blocks do not require 24-hour idleness or a HEAD. Remaining
@@ -72,8 +83,9 @@ it alive indefinitely.
 With backend checks disabled, stable membership and no new/deferred blocks need
 O(1) local scan work. With backend checks enabled, the existing cold-block scan
 still runs, skipping ownership calculations before its watermark. Membership
-transfer and canonicalization cost O(N log N); placement tables rebuild only on
-membership changes. Deferring a block costs O(log B), reusing existing O(B)
+transfer and canonicalization cost O(N log N) in the control plane; GC reuses the
+same snapshot between publications and rebuilds placement tables only on membership
+changes. Deferring a block costs O(log B), reusing existing O(B)
 block metadata. The task does not clone the complete resident index or scan disk.
 
 ## Reclamation and protection
@@ -83,17 +95,16 @@ admission revision, block activity and pins under the mutation gate, then claims
 all resident pages. Any active reader defers the entire block. Successful removal
 retires all files, L1 entries, lifecycle metadata, index entries and accounting.
 Failed deletion retains conservative accounting and releases page claims. Failed
-ownership cleanup waits for fresh membership next round; TTI does not replay it.
+ownership cleanup requires a valid snapshot next round; TTI does not replay it.
 
-Ownership charges deletion credits before final authorization. If rate waiting
-exhausts the fresh snapshot's authorization window, it queries membership again
-and requires the same placement. This lets blocks larger than one second's rate
-budget make progress without deleting on an old observation. Subsequent I/O,
-page-GC semaphore and block-gate waits have an authorization deadline of at most
-one second from query start, capped by the membership response validity;
-expiry defers the block. The mutation rechecks the deadline before unlinking.
+Ownership charges deletion credits before final authorization, then reads the latest
+published snapshot and requires unchanged placement. This allows a background
+refresh to renew validity while a large block waits for deletion-rate credits.
+Subsequent I/O, page-GC semaphore and block-gate waits are bounded by that snapshot's
+expiry. Under the mutation gate, the reclaimer checks both expiry and the latest
+published placement before unlinking; a revoked or changed view defers the block.
 An already-started unlink completes its owned accounting transaction even if its
-caller is cancelled or the deadline subsequently expires.
+caller is cancelled or the snapshot subsequently expires or changes.
 
 Polling cannot detect every membership transition, and membership can change
 immediately after an observation. Cleanup is a cache policy, not a distributed
@@ -112,7 +123,9 @@ drain: an admitted round and its mutations finish before the scheduler joins.
 Regression tests cover shared scans, bounded round continuation, stable ownership
 watermarks, new admissions, membership changes/failures, independent backend
 checks, top-k/zone retention, whole/paged cleanup, whole-block reader/pin protection,
-rate-wait reauthorization, and expiration behind disk permits or mutation gates.
+background refresh independent of GC, heartbeat progress during stalled discovery,
+rate-wait snapshot renewal, and expiration or changed membership behind disk permits
+or mutation gates.
 The existing stale-block tests cover concurrent reads/fills, unlink failures,
 cancellation, HEAD cooldown and request bounds. These are local correctness
 checks, not production throughput or latency acceptance.

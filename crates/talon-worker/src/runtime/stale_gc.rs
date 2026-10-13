@@ -1,12 +1,13 @@
 //! One bounded block scan for backend-deleted and misplaced cache entries.
-use super::WorkerRuntime;
+use super::{MembershipSnapshot, WorkerRuntime};
 use crate::eviction::{access_millis, StaleBlockCandidate};
+use std::sync::Arc;
 use std::{
     collections::{HashMap, VecDeque},
-    time::{Duration, Instant},
+    time::Duration,
 };
-use talon_core::{BlockId, CachePlacementTable, Error, NodeId, NodeRole, WorkerConfig};
-use talon_transport::{control_tls::ControlTlsChannel, ZonedNodeInfo};
+use talon_core::{BlockId, CachePlacementTable, Error, NodeId, WorkerConfig};
+use talon_transport::ZonedNodeInfo;
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
@@ -16,13 +17,11 @@ pub(super) struct StaleGc {
     pending: VecDeque<StaleBlockCandidate>,
     backend_enabled: bool,
     worker: Option<NodeId>,
-    membership_valid_until: Instant,
+    membership: Option<Arc<MembershipSnapshot>>,
     members: Vec<ZonedNodeInfo>,
     global_placement: Option<CachePlacementTable>,
     local_placement: Option<CachePlacementTable>,
     replicas: usize,
-    coordinator: String,
-    channel: Option<ControlTlsChannel>,
     ownership_watermark: u64,
     ownership_active: bool,
     limits: Option<(usize, usize)>,
@@ -35,13 +34,11 @@ impl Default for StaleGc {
             pending: VecDeque::new(),
             backend_enabled: true,
             worker: None,
-            membership_valid_until: Instant::now(),
+            membership: None,
             members: Vec::new(),
             global_placement: None,
             local_placement: None,
             replicas: 1,
-            coordinator: String::new(),
-            channel: None,
             ownership_watermark: 0,
             ownership_active: false,
             limits: None,
@@ -50,7 +47,7 @@ impl Default for StaleGc {
 }
 
 impl StaleGc {
-    pub(super) fn new(config: &WorkerConfig, channel: Option<ControlTlsChannel>) -> Self {
+    pub(super) fn new(config: &WorkerConfig) -> Self {
         let enabled = config.ownership_gc_interval_secs > 0;
         let worker = enabled.then(|| {
             NodeId::new(
@@ -63,9 +60,7 @@ impl StaleGc {
         Self {
             backend_enabled: config.stale_gc_enabled,
             worker,
-            channel,
             replicas: config.ownership_gc_replicas,
-            coordinator: config.coordinator.clone(),
             limits: enabled.then_some((
                 config.ownership_gc_scan_batch_size,
                 config.ownership_gc_delete_batch_size,
@@ -74,35 +69,30 @@ impl StaleGc {
         }
     }
 
-    /// Refresh before every batch. False means placement changed and an active
-    /// round must stop ownership reclamation until its next scan.
-    async fn refresh_membership(&mut self) -> anyhow::Result<bool> {
-        let started = Instant::now();
-        let (nodes, valid_for) = tokio::time::timeout(Duration::from_secs(3), async {
-            if let Some(channel) = &self.channel {
-                ownership_membership(channel.connect(&self.coordinator).await?.stream).await
-            } else {
-                ownership_membership(tokio::net::TcpStream::connect(&self.coordinator).await?).await
-            }
-        })
-        .await??;
-        self.membership_valid_until = started + valid_for.min(Duration::from_secs(1));
-        anyhow::ensure!(
-            Instant::now() < self.membership_valid_until,
-            "expired ownership observation"
-        );
-        self.observe_membership(nodes)
+    /// Consume the latest local snapshot; no network or refresh work belongs to GC.
+    fn read_membership(&mut self, worker: &WorkerRuntime) -> anyhow::Result<bool> {
+        let snapshot = worker
+            .membership_snapshot()
+            .ok_or_else(|| anyhow::anyhow!("membership unavailable or expired"))?;
+        let unchanged = if self
+            .membership
+            .as_ref()
+            .is_some_and(|old| Arc::ptr_eq(old, &snapshot))
+        {
+            true
+        } else {
+            self.observe_membership(snapshot.members.clone())?
+        };
+        self.membership = Some(snapshot);
+        Ok(unchanged)
     }
 
-    fn observe_membership(&mut self, mut members: Vec<ZonedNodeInfo>) -> anyhow::Result<bool> {
-        members.retain(|n| n.info.role == NodeRole::Worker);
-        members.sort_unstable_by(|a, b| a.info.id.0.cmp(&b.info.id.0));
+    fn observe_membership(&mut self, members: Vec<ZonedNodeInfo>) -> anyhow::Result<bool> {
         anyhow::ensure!(
-            !members.windows(2).any(|w| w[0].info.id == w[1].info.id)
-                && members
-                    .iter()
-                    .any(|n| Some(&n.info.id) == self.worker.as_ref()),
-            "invalid ownership membership"
+            members
+                .iter()
+                .any(|n| Some(&n.info.id) == self.worker.as_ref()),
+            "local worker missing from membership"
         );
         if self.global_placement.is_some() && self.members == members {
             return Ok(true);
@@ -178,7 +168,7 @@ impl StaleGc {
             self.ownership_active = self.worker.is_some();
         }
         if self.ownership_active {
-            match self.refresh_membership().await {
+            match self.read_membership(worker) {
                 Ok(true) => {}
                 Ok(false) if starting => self.ownership_watermark = 0,
                 result => {
@@ -187,7 +177,6 @@ impl StaleGc {
                 }
             }
         }
-        let mut ownership_deadline = self.membership_valid_until;
         if starting {
             self.cursor = (
                 if self.backend_enabled {
@@ -239,24 +228,21 @@ impl StaleGc {
             }
         }
         if !misplaced.is_empty() {
-            // Charge every page, including blocks larger than the batch target.
-            // Rate waiting precedes final membership authorization; a large block
-            // must not permanently lose its one-second authorization while pacing.
+            // Pay deletion credits first, then consume the latest snapshot again.
+            // A refresh during pacing may extend validity, but must not change placement.
             if let Some(budget) = &worker.background_budget {
                 for candidate in &misplaced {
                     budget.delete_units(candidate.units as u64).await;
                 }
             }
-            if Instant::now() >= ownership_deadline {
-                if matches!(self.refresh_membership().await, Ok(true)) {
-                    ownership_deadline = self.membership_valid_until;
-                } else {
-                    self.pause_ownership();
-                }
+            if !matches!(self.read_membership(worker), Ok(true)) {
+                self.pause_ownership();
             }
             if self.ownership_active {
+                let membership = self.membership.as_ref().expect("validated membership");
                 for candidate in misplaced {
-                    if Instant::now() >= ownership_deadline {
+                    if !worker.membership_is_current(membership) {
+                        self.pause_ownership();
                         break;
                     }
                     worker
@@ -264,7 +250,7 @@ impl StaleGc {
                         .ownership_attempted
                         .add(candidate.units as u64);
                     worker
-                        .unlink_stale_block_for(candidate, Some(ownership_deadline))
+                        .unlink_stale_block_for(candidate, Some(membership.clone()))
                         .await;
                 }
             }
@@ -321,48 +307,9 @@ impl StaleGc {
     }
 }
 
-async fn ownership_membership<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
-    mut stream: S,
-) -> anyhow::Result<(Vec<ZonedNodeInfo>, Duration)> {
-    use talon_transport::{codec, ControlMessage};
-    use tokio::io::AsyncWriteExt;
-    stream
-        .write_all(&codec::encode(0, &ControlMessage::MembershipQuery {})?)
-        .await?;
-    stream.flush().await?;
-    match crate::tokio_conn::read_control(&mut stream).await? {
-        Some(ControlMessage::MembershipList { view }) => {
-            anyhow::ensure!(view.valid_for_ms > 0, "expired ownership membership");
-            let registry = talon_core::worker_membership::MemberRegistry {
-                members: view.workers.into_iter().map(|w| w.member).collect(),
-                ..Default::default()
-            };
-            registry.validate().map_err(anyhow::Error::msg)?;
-            // Placement uses retained logical members, including offline/conflicted
-            // instances. Addresses and process liveness must not move ownership.
-            let nodes = registry
-                .members
-                .into_iter()
-                .filter(|m| !m.retired)
-                .map(|m| ZonedNodeInfo {
-                    info: talon_core::NodeInfo {
-                        id: NodeId::new(m.worker_id),
-                        address: String::new(),
-                        role: NodeRole::Worker,
-                    },
-                    zone: m.zone,
-                })
-                .collect();
-            Ok((nodes, Duration::from_millis(view.valid_for_ms)))
-        }
-        other => anyhow::bail!("ownership GC requires retained membership: {other:?}"),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tokio_conn::read_control;
     use crate::{
         BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
     };
@@ -371,10 +318,9 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
-    use talon_core::NodeInfo;
+    use std::time::Instant;
     use talon_core::{Backend, BackendStore, BlockId, ObjectId, ObjectStat, PageIndex, Version};
-    use talon_transport::{codec, ControlMessage};
-    use tokio::io::AsyncWriteExt;
+    use talon_core::{NodeInfo, NodeRole};
 
     #[derive(Default)]
     struct Origin {
@@ -771,7 +717,7 @@ mod tests {
     async fn stale_gc_scheduler_counts_rounds_and_waits_configured_interval() {
         for ownership_enabled in [false, true] {
             let server = if ownership_enabled {
-                Some(MembershipServer::start().await)
+                Some(MembershipFixture::new())
             } else {
                 None
             };
@@ -781,16 +727,17 @@ mod tests {
                 for n in 0..2 {
                     fill(&r, &placed("a", n), false).await;
                 }
+                server.publish(&r);
                 let mut config = server.config.clone();
                 config.ownership_gc_interval_secs = 7200;
                 config.background_scan_batch_size = 1;
                 (
-                    super::super::WorkerBackground::start(r.clone(), &config, None),
+                    super::super::WorkerBackground::start(r.clone(), &config),
                     7200,
                 )
             } else {
                 (
-                    super::super::WorkerBackground::start(r.clone(), &Default::default(), None),
+                    super::super::WorkerBackground::start(r.clone(), &Default::default()),
                     3600,
                 )
             };
@@ -806,9 +753,9 @@ mod tests {
             })
             .await
             .unwrap();
-            if let Some(server) = &server {
+            if server.is_some() {
                 assert_eq!(
-                    server.calls.load(Ordering::Relaxed),
+                    r.page_gc_metrics.ownership_checked.get(),
                     2,
                     "both batches belong to one invocation"
                 );
@@ -935,78 +882,42 @@ mod tests {
         assert_eq!(r.lru.total_bytes(), 0);
         assert!(!r.paged.as_ref().unwrap().dir_for(&block(0)).exists());
     }
-    struct MembershipServer {
-        members: Arc<std::sync::Mutex<Option<Vec<&'static str>>>>,
-        calls: Arc<AtomicUsize>,
+    struct MembershipFixture {
+        members: std::sync::Mutex<Option<Vec<&'static str>>>,
         config: WorkerConfig,
-        task: tokio::task::JoinHandle<()>,
     }
-    impl Drop for MembershipServer {
-        fn drop(&mut self) {
-            self.task.abort();
-        }
-    }
-    impl MembershipServer {
-        async fn start() -> Self {
-            use talon_core::worker_membership::{MemberRegistry, WorkerDiscovery, WorkerMember};
-            use talon_transport::{codec, ControlMessage};
-            use tokio::io::AsyncWriteExt;
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let config = WorkerConfig {
-                coordinator: listener.local_addr().unwrap().to_string(),
-                node_id: Some("a".into()),
-                ownership_gc_interval_secs: 3600,
-                stale_gc_enabled: false,
-                ..Default::default()
-            };
-            let members = Arc::new(std::sync::Mutex::new(Some(vec!["a", "b"])));
-            let calls = Arc::new(AtomicUsize::new(0));
-            let (snapshot, seen) = (members.clone(), calls.clone());
-            let task = tokio::spawn(async move {
-                loop {
-                    let (mut stream, _) = listener.accept().await.unwrap();
-                    assert_eq!(
-                        crate::tokio_conn::read_control(&mut stream).await.unwrap(),
-                        Some(ControlMessage::MembershipQuery {})
-                    );
-                    seen.fetch_add(1, Ordering::Relaxed);
-                    let reply = match snapshot.lock().unwrap().clone() {
-                        Some(members) => ControlMessage::MembershipList {
-                            view: WorkerDiscovery::retained(
-                                &MemberRegistry {
-                                    members: members
-                                        .into_iter()
-                                        .map(|id| WorkerMember {
-                                            worker_id: id.into(),
-                                            zone: None,
-                                            retired: false,
-                                        })
-                                        .collect(),
-                                    ..Default::default()
-                                },
-                                &[],
-                            ),
-                        },
-                        None => ControlMessage::Ack {
-                            ok: false,
-                            detail: None,
-                        },
-                    };
-                    stream
-                        .write_all(&codec::encode(0, &reply).unwrap())
-                        .await
-                        .unwrap();
-                }
-            });
+    impl MembershipFixture {
+        fn new() -> Self {
             Self {
-                members,
-                calls,
-                config,
-                task,
+                members: std::sync::Mutex::new(Some(vec!["a", "b"])),
+                config: WorkerConfig {
+                    node_id: Some("a".into()),
+                    ownership_gc_interval_secs: 3600,
+                    stale_gc_enabled: false,
+                    ..Default::default()
+                },
             }
         }
-        fn gc(&self) -> StaleGc {
-            StaleGc::new(&self.config, None)
+        fn publish(&self, worker: &WorkerRuntime) {
+            let view = self.members.lock().unwrap().as_ref().map(|ids| {
+                discovery(
+                    &ids.iter()
+                        .map(|id| ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new(*id),
+                                address: String::new(),
+                                role: NodeRole::Worker,
+                            },
+                            zone: None,
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            });
+            worker.update_membership(view, Instant::now()).unwrap();
+        }
+        fn gc(&self, worker: &WorkerRuntime) -> StaleGc {
+            self.publish(worker);
+            StaleGc::new(&self.config)
         }
     }
     fn placed(owner: &str, offset: usize) -> BlockId {
@@ -1026,7 +937,7 @@ mod tests {
     #[tokio::test]
     async fn one_scan_checks_ownership_before_cold_backend_filter() {
         for paged in [false, true] {
-            let mut server = MembershipServer::start().await;
+            let mut server = MembershipFixture::new();
             server.config.stale_gc_enabled = true;
             let root = tempfile::tempdir().unwrap();
             let origin = Arc::new(Origin::default());
@@ -1036,7 +947,7 @@ mod tests {
             let owned = placed("a", 0);
             fill(&r, &misplaced, paged).await;
             fill(&r, &owned, paged).await;
-            let mut gc = server.gc();
+            let mut gc = server.gc(&r);
             gc.tick_at(&r, access_millis()).await;
             assert!(r.index.get(&misplaced).is_none());
             assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
@@ -1044,7 +955,6 @@ mod tests {
             gc.tick_at(&r, cold_now()).await;
             assert!(r.index.get(&owned).is_none());
             assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
-            assert_eq!(server.calls.load(Ordering::Relaxed), 2);
             assert_eq!(r.resident_bytes(), 0);
             assert_eq!(r.l1.resident_bytes(), 0);
         }
@@ -1052,14 +962,14 @@ mod tests {
 
     #[tokio::test]
     async fn shared_queue_preserves_incremental_ownership_and_finite_rounds() {
-        let server = MembershipServer::start().await;
+        let server = MembershipFixture::new();
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
         let mut r = runtime(root.path(), false, origin.clone());
         r.page_gc_config.scan_batch_size = 1;
         fill(&r, &placed("a", 0), false).await;
         fill(&r, &placed("a", 1), false).await;
-        let mut gc = server.gc();
+        let mut gc = server.gc(&r);
         gc.tick_at(&r, access_millis()).await;
         assert!(!gc.round_complete());
         let ceiling = gc.cursor.1;
@@ -1087,7 +997,7 @@ mod tests {
     #[tokio::test]
     async fn membership_change_or_failure_pauses_ownership_until_next_round() {
         for failed in [false, true] {
-            let server = MembershipServer::start().await;
+            let server = MembershipFixture::new();
             *server.members.lock().unwrap() = Some(vec!["a"]);
             let root = tempfile::tempdir().unwrap();
             let mut r = runtime(root.path(), false, Arc::new(Origin::default()));
@@ -1095,14 +1005,16 @@ mod tests {
             for n in 0..2 {
                 fill(&r, &placed("b", n), false).await;
             }
-            let mut gc = server.gc();
+            let mut gc = server.gc(&r);
             gc.tick_at(&r, access_millis()).await;
             assert!(!gc.round_complete());
             *server.members.lock().unwrap() = if failed { None } else { Some(vec!["a", "b"]) };
+            server.publish(&r);
             gc.tick_at(&r, access_millis()).await;
             assert!(gc.round_complete());
             assert_eq!(r.index.len(), 2);
             *server.members.lock().unwrap() = Some(vec!["a", "b"]);
+            server.publish(&r);
             gc.run_round(&r).await;
             assert!(r.index.is_empty());
         }
@@ -1110,14 +1022,14 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_reader_and_pin_defer_entire_block_to_next_round() {
-        let server = MembershipServer::start().await;
+        let server = MembershipFixture::new();
         let root = tempfile::tempdir().unwrap();
         let r = runtime(root.path(), true, Arc::new(Origin::default()));
         let id = placed("b", 0);
         fill(&r, &id, true).await;
         let state = r.page_lifecycle.block(&id);
         let reader = state.acquire(PageIndex(0)).unwrap();
-        let mut gc = server.gc();
+        let mut gc = server.gc(&r);
         gc.run_round(&r).await;
         assert_eq!(r.index.page_count(), 2);
         drop(reader);
@@ -1136,14 +1048,14 @@ mod tests {
 
     #[tokio::test]
     async fn failed_membership_does_not_disable_backend_deletion() {
-        let mut server = MembershipServer::start().await;
+        let mut server = MembershipFixture::new();
         server.config.stale_gc_enabled = true;
         *server.members.lock().unwrap() = None;
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
         let r = runtime(root.path(), false, origin.clone());
         fill(&r, &placed("b", 0), false).await;
-        server.gc().tick_at(&r, cold_now()).await;
+        server.gc(&r).tick_at(&r, cold_now()).await;
         assert!(r.index.is_empty());
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
     }
@@ -1186,7 +1098,10 @@ mod tests {
                 Duration::from_secs(1),
                 r.unlink_stale_block_for(
                     candidate,
-                    Some(Instant::now() + Duration::from_millis(20)),
+                    Some(Arc::new(MembershipSnapshot {
+                        members: vec![],
+                        valid_until: Instant::now() + Duration::from_millis(20),
+                    })),
                 ),
             )
             .await
@@ -1200,7 +1115,7 @@ mod tests {
 
     #[tokio::test]
     async fn ownership_unlink_failure_requires_fresh_membership_on_retry() {
-        let server = MembershipServer::start().await;
+        let server = MembershipFixture::new();
         let root = tempfile::tempdir().unwrap();
         let r = runtime(root.path(), true, Arc::new(Origin::default()));
         let id = placed("b", 0);
@@ -1209,7 +1124,7 @@ mod tests {
         let saved = dir.with_extension("saved");
         std::fs::rename(&dir, &saved).unwrap();
         std::fs::write(&dir, b"not a directory").unwrap();
-        let mut gc = server.gc();
+        let mut gc = server.gc(&r);
         gc.run_round(&r).await;
         assert_eq!(r.resident_bytes(), 32);
         let state = r.page_lifecycle.block(&id);
@@ -1221,17 +1136,19 @@ mod tests {
         r.gc_once().await;
         assert_eq!(r.resident_bytes(), 32);
         *server.members.lock().unwrap() = None;
+        server.publish(&r);
         gc.run_round(&r).await;
         assert_eq!(r.resident_bytes(), 32);
         *server.members.lock().unwrap() = Some(vec!["a", "b"]);
+        server.publish(&r);
         gc.run_round(&r).await;
         assert!(r.index.is_empty());
     }
 
     #[tokio::test]
-    async fn rate_wait_refreshes_membership_before_whole_block_deletion() {
+    async fn rate_wait_consumes_new_snapshot_before_whole_block_deletion() {
         for changed in [false, true] {
-            let server = MembershipServer::start().await;
+            let server = MembershipFixture::new();
             let root = tempfile::tempdir().unwrap();
             let mut r = runtime(root.path(), true, Arc::new(Origin::default()));
             let id = placed("b", 0);
@@ -1246,23 +1163,27 @@ mod tests {
                 background_delete_max_per_sec: 1,
                 ..Default::default()
             }));
-            let mut gc = server.gc();
+            let mut gc = server.gc(&r);
+            // Expire the initial observation during rate waiting. The independent
+            // publisher supplies a replacement; GC only consumes it.
+            let initial = r.membership_snapshot().unwrap();
+            *r.membership.lock().unwrap() = Some(Arc::new(MembershipSnapshot {
+                members: initial.members.clone(),
+                valid_until: Instant::now() + Duration::from_millis(200),
+            }));
             let run = gc.run_round(&r);
             let disturbance = async {
+                tokio::time::sleep(Duration::from_millis(300)).await;
                 if changed {
-                    while server.calls.load(Ordering::Relaxed) == 0 {
-                        tokio::task::yield_now().await;
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
                     *server.members.lock().unwrap() = Some(vec!["a"]);
                 }
+                server.publish(&r);
             };
             tokio::time::timeout(Duration::from_secs(5), async {
                 tokio::join!(run, disturbance);
             })
             .await
             .unwrap();
-            assert!(server.calls.load(Ordering::Relaxed) >= 2);
             assert_eq!(r.index.is_empty(), !changed);
         }
     }
@@ -1297,33 +1218,89 @@ mod tests {
         )
     }
     #[tokio::test]
-    async fn ownership_membership_rejects_errors_and_unexpected_replies() {
-        for reply in [
-            ControlMessage::Ack {
-                ok: false,
-                detail: Some("not ready".into()),
-            },
-            ControlMessage::MembershipQuery {},
-        ] {
-            let (client, mut server) = tokio::io::duplex(4096);
-            let responder = tokio::spawn(async move {
-                assert_eq!(
-                    read_control(&mut server).await.unwrap(),
-                    Some(ControlMessage::MembershipQuery {})
-                );
-                server
-                    .write_all(&codec::encode(0, &reply).unwrap())
-                    .await
-                    .unwrap();
-            });
-            assert!(ownership_membership(client).await.is_err());
-            responder.await.unwrap();
+    async fn missing_expired_or_invalid_snapshots_never_authorize_ownership() {
+        let fixture = MembershipFixture::new();
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), false, Arc::new(Origin::default()));
+        let id = placed("b", 0);
+        fill(&r, &id, false).await;
+        let mut gc = StaleGc::new(&fixture.config);
+        gc.run_round(&r).await;
+        assert_eq!(r.resident_bytes(), 32, "startup has no membership");
+        fixture.publish(&r);
+        let snapshot = r.membership_snapshot().unwrap();
+        *r.membership.lock().unwrap() = Some(Arc::new(MembershipSnapshot {
+            members: snapshot.members.clone(),
+            valid_until: Instant::now(),
+        }));
+        gc.run_round(&r).await;
+        assert_eq!(
+            r.resident_bytes(),
+            32,
+            "stopped publisher cannot extend validity"
+        );
+        for expired in [false, true] {
+            fixture.publish(&r);
+            let mut invalid = discovery(&members());
+            if expired {
+                invalid.valid_for_ms = 1;
+            } else {
+                invalid.workers.push(invalid.workers[0].clone());
+            }
+            assert!(r
+                .update_membership(Some(invalid), Instant::now() - Duration::from_secs(1))
+                .is_err());
+            assert!(
+                r.membership_snapshot().is_none(),
+                "invalid publication revokes old view"
+            );
+            gc.run_round(&r).await;
+            assert_eq!(r.resident_bytes(), 32);
         }
+        fixture.publish(&r);
+        gc.run_round(&r).await;
+        assert_eq!(r.resident_bytes(), 0);
     }
 
     #[tokio::test]
-    async fn membership_uses_logical_ids_and_zones_across_instance_changes() {
+    async fn membership_changes_behind_mutation_gate_retain_whole_block() {
+        for unavailable in [false, true] {
+            let fixture = MembershipFixture::new();
+            let root = tempfile::tempdir().unwrap();
+            let r = runtime(root.path(), true, Arc::new(Origin::default()));
+            let id = placed("b", 0);
+            fill(&r, &id, true).await;
+            let state = r.page_lifecycle.block(&id);
+            let gate = state.gate.lock().await;
+            let mut gc = fixture.gc(&r);
+            let run = gc.run_round(&r);
+            let change = async {
+                while r.page_mutations.active_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+                *fixture.members.lock().unwrap() = if unavailable { None } else { Some(vec!["a"]) };
+                fixture.publish(&r);
+                drop(gate);
+            };
+            tokio::time::timeout(Duration::from_secs(2), async {
+                tokio::join!(run, change);
+            })
+            .await
+            .unwrap();
+            assert_eq!(r.resident_bytes(), 32);
+            assert_eq!(r.index.page_count(), 2);
+            assert!(
+                state.acquire(PageIndex(0)).is_some(),
+                "claims reopen on changed membership"
+            );
+        }
+    }
+
+    #[test]
+    fn membership_uses_logical_ids_and_zones_across_instance_changes() {
         use talon_core::worker_membership::*;
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), false, Arc::new(Origin::default()));
         let mut view = discovery(&members());
         let mut snapshots = Vec::new();
         for state in [
@@ -1335,23 +1312,11 @@ mod tests {
             },
         ] {
             view.workers[0].state = state;
-            let (client, mut server) = tokio::io::duplex(4096);
-            let reply = ControlMessage::MembershipList { view: view.clone() };
-            let responder = tokio::spawn(async move {
-                read_control(&mut server).await.unwrap().unwrap();
-                server
-                    .write_all(&codec::encode(0, &reply).unwrap())
-                    .await
-                    .unwrap();
-            });
-            snapshots.push(ownership_membership(client).await.unwrap());
-            responder.await.unwrap();
+            r.update_membership(Some(view.clone()), Instant::now())
+                .unwrap();
+            snapshots.push(r.membership_snapshot().unwrap().members.clone());
         }
-        assert_eq!(
-            snapshots[0].0.len(),
-            3,
-            "offline members still own placement"
-        );
+        assert_eq!(snapshots[0].len(), 3, "offline members still own placement");
         assert_eq!(snapshots[0], snapshots[1]);
         assert_eq!(snapshots[1], snapshots[2]);
     }
@@ -1363,15 +1328,22 @@ mod tests {
             ownership_gc_interval_secs: 3600,
             ..Default::default()
         };
-        let mut gc = StaleGc::new(&config, None);
-        assert!(!gc.observe_membership(members()).unwrap());
-        let mut reordered = members();
-        reordered.reverse();
-        assert!(gc.observe_membership(reordered).unwrap());
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), false, Arc::new(Origin::default()));
+        let mut gc = StaleGc::new(&config);
+        r.update_membership(Some(discovery(&members())), Instant::now())
+            .unwrap();
+        assert!(!gc.read_membership(&r).unwrap());
+        let mut reordered = discovery(&members());
+        reordered.workers.reverse();
+        r.update_membership(Some(reordered), Instant::now())
+            .unwrap();
+        assert!(gc.read_membership(&r).unwrap());
         let mut duplicate = members();
         duplicate.push(duplicate[0].clone());
         for invalid in [Vec::new(), members()[1..].to_vec(), duplicate] {
-            assert!(gc.observe_membership(invalid).is_err());
+            let published = r.update_membership(Some(discovery(&invalid)), Instant::now());
+            assert!(published.is_err() || gc.read_membership(&r).is_err());
         }
         let table =
             CachePlacementTable::new(&members().into_iter().map(|n| n.info).collect::<Vec<_>>());

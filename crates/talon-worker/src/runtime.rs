@@ -87,6 +87,8 @@ pub enum ServeOutcome {
 /// Shared state required to serve instrumented data-plane range requests.
 #[derive(Clone)]
 pub struct WorkerRuntime {
+    /// Latest control-plane observation, shared by runtime clones.
+    membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
     l1: Arc<MemoryStore>,
@@ -135,6 +137,12 @@ pub struct WorkerRuntime {
     page_scan: Arc<tokio::sync::Mutex<()>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
+}
+
+/// Placement data published by the control plane; GC never performs discovery.
+struct MembershipSnapshot {
+    members: Vec<talon_transport::ZonedNodeInfo>,
+    valid_until: Instant,
 }
 
 impl WorkerRuntime {
@@ -196,6 +204,7 @@ impl WorkerRuntime {
         metrics.set_l1_capacity(l1_capacity_bytes);
         metrics.update_l1_residency(0, 0);
         Self {
+            membership: Arc::new(Mutex::new(None)),
             l1,
             page_cleanup: Arc::new(tokio::sync::Mutex::new(
                 crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
@@ -227,6 +236,68 @@ impl WorkerRuntime {
             page_scan: Arc::new(tokio::sync::Mutex::new(())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
         }
+    }
+
+    /// Publish retained membership from the control-plane refresh task.
+    ///
+    /// `observed` is the query start time, so network time consumes validity.
+    /// Missing or invalid observations revoke the previous snapshot. Consumers
+    /// also check expiry if the publisher stops without reporting a failure.
+    pub fn update_membership(
+        &self,
+        view: Option<talon_core::worker_membership::WorkerDiscovery>,
+        observed: Instant,
+    ) -> anyhow::Result<()> {
+        let snapshot = (|| {
+            let Some(view) = view else {
+                return Ok(None);
+            };
+            let valid_until = observed
+                .checked_add(Duration::from_millis(view.valid_for_ms))
+                .ok_or_else(|| anyhow::anyhow!("invalid membership validity"))?;
+            anyhow::ensure!(Instant::now() < valid_until, "expired membership");
+            let registry = talon_core::worker_membership::MemberRegistry {
+                members: view.workers.into_iter().map(|w| w.member).collect(),
+                ..Default::default()
+            };
+            registry.validate().map_err(anyhow::Error::msg)?;
+            // Instance health and addresses must not move logical ownership.
+            let mut members: Vec<_> = registry
+                .members
+                .into_iter()
+                .filter(|m| !m.retired)
+                .map(|m| talon_transport::ZonedNodeInfo {
+                    info: talon_core::NodeInfo {
+                        id: talon_core::NodeId::new(m.worker_id),
+                        address: String::new(),
+                        role: talon_core::NodeRole::Worker,
+                    },
+                    zone: m.zone,
+                })
+                .collect();
+            members.sort_unstable_by(|a, b| a.info.id.0.cmp(&b.info.id.0));
+            Ok(Some(Arc::new(MembershipSnapshot {
+                members,
+                valid_until,
+            })))
+        })();
+        *self.membership.lock().unwrap() = snapshot.as_ref().ok().cloned().flatten();
+        snapshot.map(|_| ())
+    }
+
+    fn membership_snapshot(&self) -> Option<Arc<MembershipSnapshot>> {
+        self.membership
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|snapshot| Instant::now() < snapshot.valid_until)
+            .cloned()
+    }
+
+    fn membership_is_current(&self, expected: &Arc<MembershipSnapshot>) -> bool {
+        self.membership_snapshot().is_some_and(|current| {
+            Arc::ptr_eq(&current, expected) || current.members == expected.members
+        })
     }
 
     /// Enable paged L2: cache individual pages instead of whole blocks.

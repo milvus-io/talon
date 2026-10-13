@@ -156,8 +156,9 @@ Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable backend-deletion checks.
 The same scan includes optional [ownership cleanup](ownership-gc.md).
 `ownership_gc_interval_secs` defaults to `0` (disabled); enabling it sets the
 shared round interval. Both predicates share one cursor and whole-block reclaimer.
-Ownership is checked first using fresh Coordinator placement, without an idle-age
-or HEAD requirement. Disabling both predicates removes the task.
+Ownership is checked first using the valid membership snapshot published by the
+Worker control-plane task, without an idle-age or HEAD requirement. GC does not
+perform membership communication. Disabling both predicates removes the task.
 
 For backend-deletion checks, only blocks idle for **more than 24 hours** are eligible. Reads and admissions
 refresh a process-local, monotonic block timestamp, shared by all of its pages.
