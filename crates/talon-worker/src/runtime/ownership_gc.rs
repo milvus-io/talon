@@ -399,6 +399,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn namespace_restart_respects_ownership_replica_retention() {
+        let nodes = members();
+        let table = CachePlacementTable::new(
+            &nodes
+                .iter()
+                .map(|node| node.info.clone())
+                .collect::<Vec<_>>(),
+        );
+        let id = (0..10000)
+            .map(block)
+            .find(|id| table.primary(id).unwrap().id.0 != "a")
+            .unwrap();
+        for paged in [false, true] {
+            for replicas in [1, 3] {
+                let root = tempfile::tempdir().unwrap();
+                let (worker, mut fixture) = namespace_runtime(root.path(), paged);
+                fixture.config.ownership_gc_replicas = replicas;
+                let named = worker
+                    .for_namespace(&talon_core::NamespaceId::named("analytics"))
+                    .await
+                    .unwrap();
+                fill(&worker, &id, paged).await;
+                fill(&named, &id, paged).await;
+                drop(named);
+                drop(worker);
+
+                let lock = Arc::new(
+                    crate::page_access_store::CacheRootLock::acquire(root.path()).unwrap(),
+                );
+                let restarted = Arc::new(
+                    WorkerRuntime::open_namespaces(
+                        &fixture.config,
+                        lock,
+                        Arc::new(Origin::default()),
+                        WorkerMetrics::new(0),
+                    )
+                    .unwrap(),
+                );
+                restarted
+                    .update_membership(Some(discovery(&nodes)), Instant::now())
+                    .unwrap();
+                for namespace in restarted.namespace_runtimes() {
+                    assert!(namespace.index.get(&id).is_some(), "L2 must recover first");
+                    let mut gc = OwnershipGc::new(&fixture.config);
+                    gc.run_round(&namespace).await;
+                    assert_eq!(
+                        namespace.index.get(&id).is_some(),
+                        replicas == 3,
+                        "startup GC must retain every configured placement candidate"
+                    );
+                    let on_disk = if let Some(paged) = &namespace.paged {
+                        paged.scan().unwrap()
+                    } else {
+                        namespace.store.scan().unwrap()
+                    };
+                    assert_eq!(on_disk.len(), usize::from(replicas == 3));
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn background_ownership_gc_includes_existing_and_new_namespaces() {
         let root = tempfile::tempdir().unwrap();
         let (worker, fixture) = namespace_runtime(root.path(), false);
