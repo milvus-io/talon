@@ -50,13 +50,16 @@ impl Default for StaleGc {
 }
 
 impl StaleGc {
-    pub(super) fn new(
-        config: &WorkerConfig,
-        ownership: Option<(NodeId, Option<ControlTlsChannel>)>,
-    ) -> Self {
-        let enabled = ownership.is_some();
-        let (worker, channel) =
-            ownership.map_or((None, None), |(node, channel)| (Some(node), channel));
+    pub(super) fn new(config: &WorkerConfig, channel: Option<ControlTlsChannel>) -> Self {
+        let enabled = config.ownership_gc_interval_secs > 0;
+        let worker = enabled.then(|| {
+            NodeId::new(
+                config
+                    .node_id
+                    .clone()
+                    .expect("ownership cleanup requires a resolved worker identity"),
+            )
+        });
         Self {
             backend_enabled: config.stale_gc_enabled,
             worker,
@@ -782,17 +785,12 @@ mod tests {
                 config.ownership_gc_interval_secs = 7200;
                 config.background_scan_batch_size = 1;
                 (
-                    super::super::WorkerBackground::start_with_ownership(
-                        r.clone(),
-                        &config,
-                        NodeId::new("a"),
-                        None,
-                    ),
+                    super::super::WorkerBackground::start(r.clone(), &config, None),
                     7200,
                 )
             } else {
                 (
-                    super::super::WorkerBackground::start(r.clone(), &Default::default()),
+                    super::super::WorkerBackground::start(r.clone(), &Default::default(), None),
                     3600,
                 )
             };
@@ -956,6 +954,7 @@ mod tests {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let config = WorkerConfig {
                 coordinator: listener.local_addr().unwrap().to_string(),
+                node_id: Some("a".into()),
                 ownership_gc_interval_secs: 3600,
                 stale_gc_enabled: false,
                 ..Default::default()
@@ -1007,7 +1006,7 @@ mod tests {
             }
         }
         fn gc(&self) -> StaleGc {
-            StaleGc::new(&self.config, Some((NodeId::new("a"), None)))
+            StaleGc::new(&self.config, None)
         }
     }
     fn placed(owner: &str, offset: usize) -> BlockId {
@@ -1359,7 +1358,12 @@ mod tests {
 
     #[test]
     fn validates_membership_and_retains_global_and_zone_candidates() {
-        let mut gc = StaleGc::new(&WorkerConfig::default(), Some((NodeId::new("a"), None)));
+        let config = WorkerConfig {
+            node_id: Some("a".into()),
+            ownership_gc_interval_secs: 3600,
+            ..Default::default()
+        };
+        let mut gc = StaleGc::new(&config, None);
         assert!(!gc.observe_membership(members()).unwrap());
         let mut reordered = members();
         reordered.reverse();

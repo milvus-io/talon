@@ -337,7 +337,7 @@ mod tests {
             async_eviction_check_interval_minutes: 1,
             ..Default::default()
         };
-        let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+        let service = crate::runtime::WorkerBackground::start(r.clone(), &config, None);
         tokio::time::timeout(Duration::from_secs(2), async {
             while r.resident_bytes() > 128 {
                 tokio::task::yield_now().await;
@@ -371,7 +371,8 @@ mod tests {
         tokio::time::resume();
         tokio::task::yield_now().await;
         assert_eq!(r.resident_bytes(), 144);
-        let disabled = crate::runtime::WorkerBackground::start(r.clone(), &WorkerConfig::default());
+        let disabled =
+            crate::runtime::WorkerBackground::start(r.clone(), &WorkerConfig::default(), None);
         tokio::time::sleep(Duration::from_millis(20)).await;
         assert_eq!(r.resident_bytes(), 144);
         disabled.shutdown().await;
@@ -395,7 +396,7 @@ mod tests {
                 background_task_concurrency: 4,
                 ..Default::default()
             };
-            let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+            let service = crate::runtime::WorkerBackground::start(r.clone(), &config, None);
             tokio::time::timeout(Duration::from_secs(2), async {
                 while r.page_mutations.active_count() == 0 {
                     tokio::task::yield_now().await;

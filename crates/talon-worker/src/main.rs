@@ -707,12 +707,8 @@ async fn run() -> anyhow::Result<()> {
         Duration::from_millis(cfg.heartbeat_interval_ms),
     );
 
-    let background = talon_worker::runtime::WorkerBackground::start_with_ownership(
-        worker.clone(),
-        &cfg,
-        node.id.clone(),
-        control_tls.clone(),
-    );
+    let background =
+        talon_worker::runtime::WorkerBackground::start(worker.clone(), &cfg, control_tls.clone());
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let data = serve_data_plane(cfg.clone(), worker, observability.clone(), stop.clone());
     tokio::pin!(data);

@@ -450,8 +450,11 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
     r.serve_range(&request(0, 16)).await.unwrap();
     let r = Arc::new(r);
     r.page_clock.set(10101);
-    let service =
-        crate::runtime::WorkerBackground::start(r.clone(), &talon_core::WorkerConfig::default());
+    let service = crate::runtime::WorkerBackground::start(
+        r.clone(),
+        &talon_core::WorkerConfig::default(),
+        None,
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while r.resident_bytes() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -812,7 +815,7 @@ async fn file_cleanup_runs_independently_of_gc_interval() {
         background_delete_max_per_sec: 0,
         ..Default::default()
     };
-    let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
+    let service = crate::runtime::WorkerBackground::start(r.clone(), &config, None);
     // Wait for both startup passes, so removing a newly created orphan requires
     // a later cleanup invocation while GC is still waiting for its next interval.
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -894,8 +897,11 @@ async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots()
     r.page_cleanup.lock().await.fail_deletes = false;
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
-    let service =
-        crate::runtime::WorkerBackground::start(r.clone(), &talon_core::WorkerConfig::default());
+    let service = crate::runtime::WorkerBackground::start(
+        r.clone(),
+        &talon_core::WorkerConfig::default(),
+        None,
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while dir.join("access.meta.tmp.crashed").exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;
@@ -940,8 +946,11 @@ async fn orphan_cleanup_covers_unindexed_directories_with_paged_reads_disabled()
     let mut r = r;
     r.page_gc_config.interval_ms = 1;
     let r = Arc::new(r);
-    let service =
-        crate::runtime::WorkerBackground::start(r.clone(), &talon_core::WorkerConfig::default());
+    let service = crate::runtime::WorkerBackground::start(
+        r.clone(),
+        &talon_core::WorkerConfig::default(),
+        None,
+    );
     tokio::time::timeout(Duration::from_secs(2), async {
         while dir.exists() {
             tokio::time::sleep(Duration::from_millis(1)).await;

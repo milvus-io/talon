@@ -10,28 +10,12 @@ pub struct WorkerBackground {
     worker: Arc<WorkerRuntime>,
 }
 impl WorkerBackground {
-    /// Start maintenance using validated configuration and one shared resource budget.
-    pub fn start(worker: Arc<WorkerRuntime>, config: &WorkerConfig) -> Self {
-        Self::start_inner(worker, config, None)
-    }
-
-    /// Include ownership cleanup on the same scheduler and disk budget.
-    pub fn start_with_ownership(
+    /// Start maintenance using validated configuration and the Coordinator TLS channel.
+    /// Ownership cleanup requires the resolved persistent identity in `config.node_id`.
+    pub fn start(
         worker: Arc<WorkerRuntime>,
         config: &WorkerConfig,
-        node: talon_core::NodeId,
         channel: Option<talon_transport::control_tls::ControlTlsChannel>,
-    ) -> Self {
-        Self::start_inner(worker, config, Some((node, channel)))
-    }
-
-    fn start_inner(
-        worker: Arc<WorkerRuntime>,
-        config: &WorkerConfig,
-        ownership: Option<(
-            talon_core::NodeId,
-            Option<talon_transport::control_tls::ControlTlsChannel>,
-        )>,
     ) -> Self {
         let mut background = (*worker).clone();
         background.background_budget = Some(BackgroundBudget::new(config));
@@ -78,15 +62,14 @@ impl WorkerBackground {
                 }
             });
         }
-        let ownership = ownership.filter(|_| config.ownership_gc_interval_secs > 0);
-        if config.stale_gc_enabled || ownership.is_some() {
-            let period = Duration::from_secs(if ownership.is_some() {
+        if config.stale_gc_enabled || config.ownership_gc_interval_secs > 0 {
+            let period = Duration::from_secs(if config.ownership_gc_interval_secs > 0 {
                 config.ownership_gc_interval_secs
             } else {
                 3600
             });
             let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
-                config, ownership,
+                config, channel,
             )));
             let w = worker.clone();
             scheduler.register("stale_gc", period, move || {
