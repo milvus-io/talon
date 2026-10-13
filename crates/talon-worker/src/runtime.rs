@@ -7,8 +7,6 @@ use std::time::{Duration, Instant};
 
 mod async_eviction;
 mod background;
-#[cfg(test)]
-mod gc_test_support;
 mod load;
 mod ownership_gc;
 mod stale_gc;
@@ -302,7 +300,7 @@ impl WorkerRuntime {
                                 .checked_add(1)
                                 .expect("membership generation exhausted")
                         }),
-                        self.lru.stale_scan_ceiling(),
+                        self.lru.block_scan_ceiling(),
                     )
                 } else {
                     let old = held.as_ref().expect("unchanged membership");

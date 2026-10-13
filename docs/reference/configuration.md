@@ -498,22 +498,6 @@ Number of placement candidates to retain; must cover every reader replica count.
 - **Default:** `1`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
-### `ownership_gc_scan_batch_size`
-
-Maximum blocks scanned per ownership-GC batch.
-
-- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE`
-- **Default:** `1024`
-- **CLI flag:** not settable via CLI (config file or environment only)
-
-### `ownership_gc_delete_batch_size`
-
-Maximum block candidates per ownership-GC batch.
-
-- **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE`
-- **Default:** `1024`
-- **CLI flag:** not settable via CLI (config file or environment only)
-
 ### `page_tti_hours`
 
 Page time to idle in hours; 0 disables idle expiration.

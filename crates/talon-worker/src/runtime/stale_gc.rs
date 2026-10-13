@@ -1,6 +1,6 @@
-//! Reclaim cold cache blocks after authoritative backend NotFound.
+//! Reclaim cold local cache entries only after an authoritative backend NotFound.
 use super::WorkerRuntime;
-use crate::eviction::{access_millis, StaleBlockCandidate};
+use crate::eviction::access_millis;
 use std::{
     collections::{HashMap, VecDeque},
     time::Duration,
@@ -10,60 +10,57 @@ use talon_core::Error;
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
-pub(super) struct StaleGc;
+#[derive(Default)]
+pub(super) struct StaleGc {
+    cursor: (u64, u64),
+    pending: VecDeque<crate::eviction::StaleBlockCandidate>,
+}
+
 impl StaleGc {
+    /// Complete one bounded queue generation; the scheduler supplies the hourly delay.
     pub(super) async fn run_round(worker: &WorkerRuntime) {
-        Self::run_round_at(worker, access_millis()).await;
+        Self::default().run_round_at(worker, access_millis()).await;
     }
 
-    async fn run_round_at(worker: &WorkerRuntime, now: u64) {
-        let mut cursor = (0, worker.lru.stale_scan_ceiling());
-        let mut pending = VecDeque::new();
-        let limits = (
-            worker.page_gc_config.scan_batch_size.min(4096),
-            worker.page_gc_config.delete_batch_size,
-        );
-        while cursor.0 < cursor.1 || !pending.is_empty() {
-            if pending.is_empty() {
-                let lru = worker.lru.clone();
-                let scanned = tokio::task::spawn_blocking(move || {
-                    let candidates = lru.scan_stale_blocks(&mut cursor, now, DAY_MS, limits, false);
-                    (cursor, candidates)
-                })
-                .await
-                .expect("stale GC scan panicked");
-                cursor = scanned.0;
-                pending = scanned.1.into();
+    async fn run_round_at(&mut self, worker: &WorkerRuntime, now: u64) {
+        loop {
+            self.tick_at(worker, now).await;
+            if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
+                break;
             }
-            Self::reclaim_backend_deleted(worker, &mut pending, now).await;
-            if cursor.0 < cursor.1 || !pending.is_empty() {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
+            // Pace batches within this round without repeatedly scanning the cache
+            // between hourly rounds. Newly admitted units wait for the next round.
+            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
-    /// Drain at most one backend HEAD batch; callers pace any remaining work.
-    async fn reclaim_backend_deleted(
-        worker: &WorkerRuntime,
-        pending: &mut VecDeque<StaleBlockCandidate>,
-        now: u64,
-    ) {
-        // Backend work is bounded independently of local disk pacing. Warm blocks
-        // and successful checks within 24 hours never issue a HEAD.
+    async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) {
+        if self.pending.is_empty() {
+            let lru = worker.lru.clone();
+            let mut cursor = self.cursor;
+            let scan = worker.page_gc_config.scan_batch_size.min(4096);
+            let deletes = worker.page_gc_config.delete_batch_size;
+            let (cursor, candidates) = tokio::task::spawn_blocking(move || {
+                let candidates = lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
+                (cursor, candidates)
+            })
+            .await
+            .expect("stale GC scan panicked");
+            self.cursor = cursor;
+            self.pending = candidates.into();
+        }
+        // Bound backend work separately from the shared *local disk* budget.
+        // Neither transient errors nor NotFound are cached across batches.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut checked = HashMap::new();
-        while let Some(candidate) = pending.front() {
-            if now.saturating_sub(candidate.last_access) <= DAY_MS {
-                pending.pop_front();
-                continue;
-            }
+        while let Some(candidate) = self.pending.front() {
             let object = &candidate.block.object;
             if !checked.contains_key(object)
                 && (checked.len() >= MAX_HEADS || tokio::time::Instant::now() >= deadline)
             {
                 break;
             }
-            let candidate = pending.pop_front().expect("pending candidate");
+            let candidate = self.pending.pop_front().expect("pending candidate");
             if !worker.lru.stale_candidate_is_current(&candidate) {
                 continue;
             }
@@ -91,6 +88,8 @@ impl StaleGc {
                 missing
             };
             if missing {
+                // Admission revisions, block activity and pins are rechecked under
+                // the mutation gate; I/O failures retain resident accounting.
                 worker.unlink_stale_block(candidate).await;
             }
         }
@@ -99,13 +98,93 @@ impl StaleGc {
 
 #[cfg(test)]
 mod tests {
-
-    use super::super::gc_test_support::*;
     use super::*;
-    use crate::CacheUnit;
+    use crate::{
+        BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
+    };
     use bytes::Bytes;
-    use std::sync::{atomic::Ordering, Arc};
-    use talon_core::{Backend, ObjectId, PageIndex};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
+    };
+    use talon_core::{Backend, BackendStore, BlockId, ObjectId, ObjectStat, PageIndex, Version};
+
+    #[derive(Default)]
+    struct Origin {
+        calls: AtomicUsize,
+        mode: AtomicUsize, // 0 missing, 1 exists, 2 forbidden, 3 timeout
+        hold: AtomicBool,
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+    #[async_trait::async_trait]
+    impl BackendStore for Origin {
+        async fn fetch_range(&self, _: &ObjectId, _: u64, _: u64) -> talon_core::Result<Bytes> {
+            panic!("GC must not fetch data")
+        }
+        async fn head(&self, object: &ObjectId) -> talon_core::Result<ObjectStat> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            self.entered.notify_one();
+            if self.hold.load(Ordering::Relaxed) {
+                self.release.notified().await;
+            }
+            match self.mode.load(Ordering::Relaxed) {
+                0 => Err(Error::NotFound(object.to_path())),
+                1 => Ok(ObjectStat {
+                    len: 32,
+                    version: Version::new("new-version"),
+                }),
+                2 => Err(Error::Backend("403 Forbidden".into())),
+                _ => std::future::pending().await,
+            }
+        }
+    }
+    fn block(n: u64) -> BlockId {
+        BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", "key"),
+            n * 32,
+            32,
+            Version::new("v1"),
+        )
+    }
+    fn runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
+        let store = WholeBlockStore::open(root.join("whole")).unwrap();
+        let index = Arc::new(BlockIndex::new());
+        for meta in store.scan().unwrap() {
+            index.commit(meta);
+        }
+        let r = WorkerRuntime::new(
+            store,
+            index,
+            Arc::new(InFlightLoads::new()),
+            origin,
+            32,
+            0,
+            WorkerMetrics::new(0),
+        );
+        if paged {
+            r.with_paged_store(PagedBlockStore::open(root.join("paged"), 16).unwrap())
+        } else {
+            r
+        }
+    }
+    async fn fill(r: &WorkerRuntime, id: &BlockId, paged: bool) {
+        if paged {
+            for page in 0..2 {
+                r.commit_fetched_page(id, PageIndex(page), 32, Bytes::from_static(&[1; 16]))
+                    .await
+                    .unwrap();
+            }
+        } else {
+            r.commit_cached_block(id, Bytes::from_static(&[1; 32]))
+                .await
+                .unwrap();
+        }
+    }
+    fn cold_now() -> u64 {
+        access_millis() + DAY_MS + 1
+    }
+
     #[tokio::test]
     async fn stale_gc_filters_warm_entries_then_removes_both_cache_forms() {
         for paged in [false, true] {
@@ -114,9 +193,10 @@ mod tests {
             let r = runtime(root.path(), paged, origin.clone());
             fill(&r, &block(0), paged).await;
             fill(&r, &block(1), paged).await;
-            StaleGc::run_round_at(&r, access_millis()).await;
+            let mut gc = StaleGc::default();
+            gc.tick_at(&r, access_millis()).await;
             assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
-            StaleGc::run_round_at(&r, cold_now()).await;
+            gc.tick_at(&r, cold_now()).await;
             assert_eq!(
                 origin.calls.load(Ordering::Relaxed),
                 1,
@@ -141,17 +221,22 @@ mod tests {
             r.page_gc_config.delete_batch_size = 1;
             fill(&r, &block(0), paged).await;
             fill(&r, &block(1), paged).await;
+            let mut gc = StaleGc::default();
             let now = cold_now();
-            StaleGc::run_round_at(&r, now).await;
+            gc.tick_at(&r, now).await;
             origin.mode.store(0, Ordering::Relaxed);
-            StaleGc::run_round_at(&r, now + DAY_MS - 1).await;
+            for _ in 0..8 {
+                gc.tick_at(&r, now + DAY_MS - 1).await;
+            }
             assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
             assert_eq!(
                 r.resident_bytes(),
                 64,
                 "a version change alone is not deletion"
             );
-            StaleGc::run_round_at(&r, now + DAY_MS).await;
+            for _ in 0..8 {
+                gc.tick_at(&r, now + DAY_MS).await;
+            }
             assert_eq!(r.resident_bytes(), 0);
         }
     }
@@ -164,12 +249,13 @@ mod tests {
             origin.mode.store(2, Ordering::Relaxed);
             let r = runtime(root.path(), paged, origin.clone());
             fill(&r, &block(0), paged).await;
+            let mut gc = StaleGc::default();
             let now = cold_now();
-            StaleGc::run_round_at(&r, now).await;
+            gc.tick_at(&r, now).await;
             assert_eq!(r.resident_bytes(), 32);
             origin.mode.store(0, Ordering::Relaxed);
             for _ in 0..2 {
-                StaleGc::run_round_at(&r, now).await;
+                gc.tick_at(&r, now).await;
             }
             assert_eq!(r.resident_bytes(), 0);
             assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
@@ -186,7 +272,7 @@ mod tests {
         let task = tokio::spawn({
             let r = r.clone();
             async move {
-                StaleGc::run_round_at(&r, cold_now()).await;
+                StaleGc::default().tick_at(&r, cold_now()).await;
             }
         });
         origin.entered.notified().await;
@@ -208,7 +294,7 @@ mod tests {
             let task = tokio::spawn({
                 let r = r.clone();
                 async move {
-                    StaleGc::run_round_at(&r, cold_now()).await;
+                    StaleGc::default().tick_at(&r, cold_now()).await;
                 }
             });
             origin.entered.notified().await;
@@ -240,7 +326,8 @@ mod tests {
         // A file where the block directory should be makes remove_dir_all fail
         // deterministically, including when the test runs as root.
         std::fs::write(&dir, b"not a directory").unwrap();
-        StaleGc::run_round_at(&r, cold_now()).await;
+        let mut gc = StaleGc::default();
+        gc.tick_at(&r, cold_now()).await;
         assert_eq!(r.resident_bytes(), 32);
         assert_eq!(r.lru.total_bytes(), 32);
         let state = r.page_lifecycle.block(&block(0));
@@ -260,7 +347,7 @@ mod tests {
             "TTI GC cannot retry an old NotFound"
         );
         for _ in 0..2 {
-            StaleGc::run_round_at(&r, cold_now()).await;
+            gc.tick_at(&r, cold_now()).await;
         }
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         assert_eq!(r.resident_bytes(), 32);
@@ -282,16 +369,21 @@ mod tests {
                 CacheUnit::Whole(block(0))
             };
             let pin = r.lru.pin_guard(unit).unwrap();
+            let mut gc = StaleGc::default();
             let now = cold_now();
-            StaleGc::run_round_at(&r, now).await;
-            assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+            gc.tick_at(&r, now).await;
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(r.resident_bytes(), 64);
+            gc.tick_at(&r, now).await;
             assert_eq!(
                 r.resident_bytes(),
                 32,
                 "one candidate reclaims a complete block"
             );
             drop(pin);
-            StaleGc::run_round_at(&r, now).await;
+            for _ in 0..8 {
+                gc.tick_at(&r, now).await;
+            }
             assert_eq!(r.resident_bytes(), 0);
         }
     }
@@ -306,7 +398,7 @@ mod tests {
         let task = tokio::spawn({
             let r = r.clone();
             async move {
-                StaleGc::run_round_at(&r, cold_now()).await;
+                StaleGc::default().tick_at(&r, cold_now()).await;
             }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -338,21 +430,11 @@ mod tests {
             id.object = ObjectId::new(Backend::S3, "bucket", format!("key-{n}"));
             fill(&r, &id, false).await;
         }
-        let now = cold_now();
-        let mut pending = r
-            .lru
-            .scan_stale_blocks(
-                &mut (0, r.lru.stale_scan_ceiling()),
-                now,
-                DAY_MS,
-                (4096, 4096),
-                false,
-            )
-            .into();
-        StaleGc::reclaim_backend_deleted(&r, &mut pending, now).await;
+        let mut gc = StaleGc::default();
+        gc.tick_at(&r, cold_now()).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), MAX_HEADS);
         assert_eq!(r.resident_bytes(), 40 * 32);
-        StaleGc::reclaim_backend_deleted(&r, &mut pending, now).await;
+        gc.tick_at(&r, cold_now()).await;
         assert_eq!(
             origin.calls.load(Ordering::Relaxed),
             40,
@@ -373,20 +455,11 @@ mod tests {
         let mut id = block(1);
         id.object = ObjectId::new(Backend::S3, "bucket", "key-0");
         fill(&r, &id, false).await;
+        let mut gc = StaleGc::default();
         let now = cold_now();
-        let mut pending = r
-            .lru
-            .scan_stale_blocks(
-                &mut (0, r.lru.stale_scan_ceiling()),
-                now,
-                DAY_MS,
-                (4096, 4096),
-                false,
-            )
-            .into();
-        StaleGc::reclaim_backend_deleted(&r, &mut pending, now).await;
+        gc.tick_at(&r, now).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), MAX_HEADS);
-        StaleGc::reclaim_backend_deleted(&r, &mut pending, now + 1).await;
+        gc.tick_at(&r, now + 1).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 33);
         assert_eq!(r.resident_bytes(), 34 * 32);
     }
@@ -408,7 +481,7 @@ mod tests {
             let task = tokio::spawn({
                 let r = r.clone();
                 async move {
-                    StaleGc::run_round_at(&r, cold_now()).await;
+                    StaleGc::default().run_round_at(&r, cold_now()).await;
                 }
             });
             origin.entered.notified().await;
@@ -428,6 +501,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_gc_scheduler_waits_an_hour_between_complete_rounds() {
+        let root = tempfile::tempdir().unwrap();
+        let r = Arc::new(runtime(root.path(), false, Arc::new(Origin::default())));
+        let service = super::super::WorkerBackground::start(r.clone(), &Default::default());
+        let completed = r.metrics.registry.counter(
+            "talon_worker_background_task_completed_total",
+            "Completed background batches by task.",
+            talon_core::metrics::labels(&[("task", "stale_gc")]),
+        );
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while completed.get() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Let the scheduler record the completion time before advancing its clock.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(3599)).await;
+        tokio::time::resume();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(
+            completed.get(),
+            1,
+            "no repeated scan during the hourly wait"
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while completed.get() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        service.shutdown().await;
+        assert_eq!(completed.get(), 2);
+    }
+    #[tokio::test]
     async fn stale_gc_busy_page_defers_the_entire_block_and_releases_partial_claims() {
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
@@ -435,8 +549,9 @@ mod tests {
         fill(&r, &block(0), true).await;
         let state = r.page_lifecycle.block(&block(0));
         let reader = state.acquire(PageIndex(1)).unwrap();
+        let mut gc = StaleGc::default();
         let now = cold_now();
-        StaleGc::run_round_at(&r, now).await;
+        gc.tick_at(&r, now).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
         assert_eq!(r.resident_bytes(), 32);
         assert!(
@@ -451,7 +566,7 @@ mod tests {
             .join("0.page")
             .exists());
         drop(reader);
-        StaleGc::run_round_at(&r, now).await;
+        gc.tick_at(&r, now).await;
         assert_eq!(r.resident_bytes(), 0);
         assert!(state.acquire(PageIndex(0)).is_none());
         assert!(!r.paged.as_ref().unwrap().dir_for(&block(0)).exists());
@@ -469,7 +584,7 @@ mod tests {
         let task = tokio::spawn({
             let r = r.clone();
             async move {
-                StaleGc::run_round_at(&r, cold_now()).await;
+                StaleGc::default().tick_at(&r, cold_now()).await;
             }
         });
         origin.entered.notified().await;
@@ -500,7 +615,7 @@ mod tests {
         let task = tokio::spawn({
             let r = r.clone();
             async move {
-                StaleGc::run_round_at(&r, cold_now()).await;
+                StaleGc::default().tick_at(&r, cold_now()).await;
             }
         });
         tokio::time::timeout(Duration::from_secs(2), async {
@@ -522,17 +637,5 @@ mod tests {
         assert_eq!(r.resident_bytes(), 0);
         assert_eq!(r.lru.total_bytes(), 0);
         assert!(!r.paged.as_ref().unwrap().dir_for(&block(0)).exists());
-    }
-    #[tokio::test]
-    async fn failed_membership_does_not_disable_backend_deletion() {
-        let root = tempfile::tempdir().unwrap();
-        let origin = Arc::new(Origin::default());
-        let r = runtime(root.path(), false, origin.clone());
-        fill(&r, &block(0), false).await;
-        r.update_membership(None, std::time::Instant::now())
-            .unwrap();
-        StaleGc::run_round_at(&r, cold_now()).await;
-        assert!(r.index.is_empty());
-        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
     }
 }

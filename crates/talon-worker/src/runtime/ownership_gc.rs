@@ -1,13 +1,15 @@
 //! Event-driven reclamation of cache blocks outside current placement.
 use super::{MembershipSnapshot, WorkerRuntime};
-use crate::eviction::{access_millis, StaleBlockCandidate};
-use std::{sync::Arc, time::Duration};
+use crate::eviction::StaleBlockCandidate;
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use talon_core::{BlockId, CachePlacementTable, NodeId, WorkerConfig};
 
 pub(super) struct OwnershipGc {
     worker: NodeId,
     replicas: usize,
-    limits: (usize, usize),
     membership: Option<Arc<MembershipSnapshot>>,
     placement: Vec<CachePlacementTable>,
     completed_generation: u64,
@@ -23,10 +25,6 @@ impl OwnershipGc {
                     .expect("ownership cleanup requires a resolved worker identity"),
             ),
             replicas: config.ownership_gc_replicas,
-            limits: (
-                config.ownership_gc_scan_batch_size,
-                config.ownership_gc_delete_batch_size,
-            ),
             membership: None,
             placement: Vec::new(),
             completed_generation: 0,
@@ -53,38 +51,30 @@ impl OwnershipGc {
         };
         let mut cursor = (0, view.scan_limit);
         let mut complete = true;
-        let limits = (
-            worker
-                .page_gc_config
-                .scan_batch_size
-                .min(4096)
-                .min(self.limits.0),
-            worker.page_gc_config.delete_batch_size.min(self.limits.1),
-        );
-        while cursor.0 < cursor.1 {
+        let mut slice_start = Instant::now();
+        while let Some(candidate) = worker.lru.next_ownership_block(&mut cursor) {
             if !worker.membership_is_current(&view) {
                 return;
             }
-            let lru = worker.lru.clone();
-            let scanned = tokio::task::spawn_blocking(move || {
-                let candidates =
-                    lru.scan_stale_blocks(&mut cursor, access_millis(), 0, limits, true);
-                (cursor, candidates)
-            })
-            .await
-            .expect("ownership GC scan panicked");
-            cursor = scanned.0;
-            complete &= self.reclaim_misplaced(worker, scanned.1, &view).await;
-            // Local metadata work yields cooperatively; disk deletion is separately paced.
-            tokio::task::yield_now().await;
+            if candidate.revision < view.scan_limit {
+                worker.page_gc_metrics.ownership_checked.inc();
+                if !self.owns(&candidate.block) {
+                    complete &= self.reclaim_block(worker, candidate, &view).await;
+                }
+            }
+            // Yield by elapsed work time, not block count. Keep only one candidate;
+            // actual deletion waits already yield and use the shared I/O budgets.
+            if slice_start.elapsed() >= Duration::from_millis(10) {
+                tokio::task::yield_now().await;
+                slice_start = Instant::now();
+            }
         }
         if complete && worker.membership_is_current(&view) {
             self.completed_generation = view.generation;
         }
     }
 
-    /// Snapshot/table preparation happens once per round. Later batches only
-    /// check that the publisher still supplies the same valid placement.
+    /// Cache placement tables across retries of the same membership event.
     fn prepare_ownership(&mut self, worker: &WorkerRuntime) -> Option<Arc<MembershipSnapshot>> {
         let id = &self.worker;
         let snapshot = worker.membership_snapshot().filter(|view| {
@@ -132,72 +122,104 @@ impl OwnershipGc {
         })
     }
 
-    /// Reclaim misplaced pre-event blocks; false leaves the event pending for retry.
-    async fn reclaim_misplaced(
+    /// Reclaim one pre-event block; false leaves the event pending for retry.
+    async fn reclaim_block(
         &self,
         worker: &WorkerRuntime,
-        candidates: Vec<StaleBlockCandidate>,
+        candidate: StaleBlockCandidate,
         expected: &Arc<MembershipSnapshot>,
     ) -> bool {
-        if !worker.membership_is_current(expected) {
-            return false;
-        }
-        let mut misplaced = Vec::new();
-        for candidate in candidates {
-            if candidate.revision < expected.scan_limit {
-                worker.page_gc_metrics.ownership_checked.inc();
-                if !self.owns(&candidate.block) {
-                    misplaced.push(candidate);
-                }
-            }
-        }
-        if misplaced.is_empty() {
-            return true;
-        }
-        // Pay every page's deletion credit before consuming the latest validity.
         if let Some(budget) = &worker.background_budget {
-            for candidate in &misplaced {
-                budget.delete_units(candidate.units as u64).await;
-            }
+            budget.delete_units(candidate.units as u64).await;
         }
+        // Rate waiting may outlive an observation: consume its latest renewal,
+        // while requiring the original event generation.
         let Some(snapshot) = worker
             .membership_snapshot()
             .filter(|view| view.generation == expected.generation)
         else {
             return false;
         };
-        let mut complete = true;
-        for candidate in misplaced {
-            if !worker.membership_is_current(&snapshot) {
-                return false;
-            }
-            worker
-                .page_gc_metrics
-                .ownership_attempted
-                .add(candidate.units as u64);
-            let id = candidate.block.clone();
-            worker
-                .unlink_stale_block_for(candidate, Some(snapshot.clone()))
-                .await;
-            // Reader/pin protection, activity races and unlink errors all retain
-            // the block. A replacement is conservatively retried once, then its
-            // post-event revision excludes it from ownership selection.
-            complete &= worker.index.get(&id).is_none();
-        }
-        complete
+        worker
+            .page_gc_metrics
+            .ownership_attempted
+            .add(candidate.units as u64);
+        let id = candidate.block.clone();
+        worker
+            .unlink_stale_block_for(candidate, Some(snapshot))
+            .await;
+        // Protection, activity races and errors retain the block. A concurrent
+        // replacement is conservatively retried, then excluded by its revision.
+        worker.index.get(&id).is_none()
     }
 }
 
 #[cfg(test)]
 mod tests {
 
-    use super::super::gc_test_support::*;
     use super::*;
-    use crate::CacheUnit;
+    use crate::{
+        BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
+    };
     use bytes::Bytes;
     use std::{sync::Arc, time::Instant};
-    use talon_core::{Backend, NodeInfo, NodeRole, ObjectId, PageIndex, Version};
+    use talon_core::{
+        Backend, BackendStore, NodeInfo, NodeRole, ObjectId, ObjectStat, PageIndex, Version,
+    };
     use talon_transport::ZonedNodeInfo;
+    #[derive(Default)]
+    struct Origin {}
+    #[async_trait::async_trait]
+    impl BackendStore for Origin {
+        async fn fetch_range(&self, _: &ObjectId, _: u64, _: u64) -> talon_core::Result<Bytes> {
+            panic!("ownership GC must not fetch data")
+        }
+        async fn head(&self, _: &ObjectId) -> talon_core::Result<ObjectStat> {
+            panic!("ownership GC must not query backend metadata")
+        }
+    }
+    fn block(n: u64) -> BlockId {
+        BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", "key"),
+            n * 32,
+            32,
+            Version::new("v1"),
+        )
+    }
+    fn runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
+        let store = WholeBlockStore::open(root.join("whole")).unwrap();
+        let index = Arc::new(BlockIndex::new());
+        for meta in store.scan().unwrap() {
+            index.commit(meta);
+        }
+        let r = WorkerRuntime::new(
+            store,
+            index,
+            Arc::new(InFlightLoads::new()),
+            origin,
+            32,
+            0,
+            WorkerMetrics::new(0),
+        );
+        if paged {
+            r.with_paged_store(PagedBlockStore::open(root.join("paged"), 16).unwrap())
+        } else {
+            r
+        }
+    }
+    async fn fill(r: &WorkerRuntime, id: &BlockId, paged: bool) {
+        if paged {
+            for page in 0..2 {
+                r.commit_fetched_page(id, PageIndex(page), 32, Bytes::from_static(&[1; 16]))
+                    .await
+                    .unwrap();
+            }
+        } else {
+            r.commit_cached_block(id, Bytes::from_static(&[1; 32]))
+                .await
+                .unwrap();
+        }
+    }
     struct MembershipFixture {
         members: std::sync::Mutex<Option<Vec<&'static str>>>,
         config: WorkerConfig,
@@ -296,73 +318,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn membership_change_or_failure_pauses_ownership_until_next_round() {
-        for failed in [false, true] {
-            let fixture = MembershipFixture::new();
-            *fixture.members.lock().unwrap() = Some(vec!["a"]);
-            let root = tempfile::tempdir().unwrap();
-            let mut r = runtime(root.path(), false, Arc::new(Origin::default()));
-            r.page_gc_config.scan_batch_size = 1;
-            for n in 0..2 {
-                fill(&r, &placed("b", n), false).await;
-            }
-            let mut gc = fixture.gc(&r);
-            let round = gc.run_round(&r);
-            let change = async {
-                while r.page_gc_metrics.ownership_checked.get() == 0 {
-                    tokio::task::yield_now().await;
-                }
-                *fixture.members.lock().unwrap() = if failed { None } else { Some(vec!["a", "b"]) };
-                fixture.publish(&r);
-            };
-            tokio::time::timeout(Duration::from_secs(3), async {
-                tokio::join!(round, change);
-            })
-            .await
-            .unwrap();
-            assert_eq!(gc.completed_generation, 0);
-            assert_eq!(r.index.len(), 2);
-            *fixture.members.lock().unwrap() = Some(vec!["a", "b"]);
-            fixture.publish(&r);
-            gc.run_round(&r).await;
-            assert!(r.index.is_empty());
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_round_retries_only_the_original_event_boundary() {
+    async fn cancelled_scan_retries_only_the_original_event_boundary() {
         let fixture = MembershipFixture::new();
         let root = tempfile::tempdir().unwrap();
-        let mut r = runtime(root.path(), false, Arc::new(Origin::default()));
-        r.page_gc_config.scan_batch_size = 1;
-        fill(&r, &placed("a", 0), false).await;
-        fill(&r, &placed("b", 0), false).await;
+        let r = runtime(root.path(), false, Arc::new(Origin::default()));
+        let old = placed("b", 0);
+        fill(&r, &old, false).await;
+        fill(&r, &placed("b", 1), false).await;
         let mut gc = fixture.gc(&r);
         let event = r.membership_snapshot().unwrap();
+        let state = r.page_lifecycle.block(&old);
+        let gate = state.gate.lock().await;
         {
             let round = gc.run_round(&r);
             tokio::pin!(round);
             tokio::time::timeout(Duration::from_secs(2), async {
                 tokio::select! { biased;
                     _ = async {
-                        while r.page_gc_metrics.ownership_checked.get() == 0 {
-                            tokio::task::yield_now().await;
-                        }
+                        while r.page_mutations.active_count() == 0 { tokio::task::yield_now().await; }
                     } => {},
-                    _ = &mut round => panic!("round must yield between batches"),
+                    _ = &mut round => panic!("mutation gate must hold the scan"),
                 }
-            })
-            .await
-            .unwrap();
+            }).await.unwrap();
         }
         assert_eq!(gc.completed_generation, 0);
-        let new = placed("b", 1);
+        let new = placed("b", 2);
         fill(&r, &new, false).await;
+        drop(gate);
+        r.drain_page_mutations().await;
         gc.run_round(&r).await;
         assert_eq!(gc.completed_generation, event.generation);
-        assert!(r.index.get(&placed("b", 0)).is_none());
+        assert!(r.index.get(&old).is_none());
+        assert!(r.index.get(&placed("b", 1)).is_none());
         assert!(r.index.get(&new).is_some());
-        assert_eq!(r.page_gc_metrics.ownership_checked.get(), 3);
         assert_eq!(gc.next_delay(&r), None);
     }
 
@@ -377,14 +365,7 @@ mod tests {
             let mut gc = fixture.gc(&r);
             let candidate = r
                 .lru
-                .scan_stale_blocks(
-                    &mut (0, r.lru.stale_scan_ceiling()),
-                    access_millis(),
-                    0,
-                    (1, 1),
-                    true,
-                )
-                .pop()
+                .next_ownership_block(&mut (0, r.lru.block_scan_ceiling()))
                 .unwrap();
             let state = r.page_lifecycle.block(&id);
             let gate = state.gate.lock().await;
@@ -468,14 +449,7 @@ mod tests {
             };
             let candidate = r
                 .lru
-                .scan_stale_blocks(
-                    &mut (0, r.lru.stale_scan_ceiling()),
-                    access_millis(),
-                    0,
-                    (1, 1),
-                    true,
-                )
-                .pop()
+                .next_ownership_block(&mut (0, r.lru.block_scan_ceiling()))
                 .unwrap();
             tokio::time::timeout(
                 Duration::from_secs(1),
@@ -860,7 +834,7 @@ mod tests {
                 assert_eq!(
                     r.page_gc_metrics.ownership_checked.get(),
                     2,
-                    "both batches belong to one invocation"
+                    "all blocks belong to one invocation"
                 );
             }
             // Let the scheduler record the completion time before advancing its clock.

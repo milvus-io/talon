@@ -110,7 +110,7 @@ pub(crate) struct StaleBlockCandidate {
     pub block: BlockId,
     pub units: usize,
     pub revision: u64,
-    pub last_access: u64,
+    last_access: u64,
 }
 
 struct BlockActivity {
@@ -521,7 +521,6 @@ impl Lru {
 
     /// Visit each block once, regardless of its number of cached pages. The
     /// admission-ordered block queue is separate from the capacity eviction hand.
-    #[cfg(test)]
     pub(crate) fn stale_gc_candidates(
         &self,
         cursor: &mut (u64, u64),
@@ -530,22 +529,10 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
-        if cursor.0 >= cursor.1 {
-            *cursor = (0, self.stale_scan_ceiling());
-        }
-        self.scan_stale_blocks(cursor, now, age, (scan_budget, delete_budget), false)
-    }
-
-    pub(crate) fn scan_stale_blocks(
-        &self,
-        cursor: &mut (u64, u64),
-        now: u64,
-        age: u64,
-        limits: (usize, usize),
-        ownership: bool,
-    ) -> Vec<StaleBlockCandidate> {
-        let (scan_budget, delete_budget) = limits;
         let mut out = Vec::new();
+        if cursor.0 >= cursor.1 {
+            *cursor = (0, self.inner.lock().unwrap().clock);
+        }
         for _ in 0..scan_budget {
             let g = self.inner.lock().unwrap();
             let Some((&position, block)) = g.block_queue.range(cursor.0..cursor.1).next() else {
@@ -556,10 +543,9 @@ impl Lru {
             let activity = &g.block_access[block];
             let access = activity.access.load(Ordering::Relaxed);
             let verified = g.object_checks[&block.object].1;
-            if !ownership
-                && (activity.pins != 0
-                    || now.saturating_sub(access) <= age
-                    || verified.is_some_and(|at| now.saturating_sub(at) < age))
+            if activity.pins != 0
+                || now.saturating_sub(access) <= age
+                || verified.is_some_and(|at| now.saturating_sub(at) < age)
             {
                 continue;
             }
@@ -576,7 +562,25 @@ impl Lru {
         out
     }
 
-    pub(crate) fn stale_scan_ceiling(&self) -> u64 {
+    /// Advance one block in a fixed admission prefix, without backend policy or
+    /// a candidate buffer. The caller checks revision and placement after unlocking.
+    pub(crate) fn next_ownership_block(
+        &self,
+        cursor: &mut (u64, u64),
+    ) -> Option<StaleBlockCandidate> {
+        let g = self.inner.lock().unwrap();
+        let (&position, block) = g.block_queue.range(cursor.0..cursor.1).next()?;
+        cursor.0 = position + 1;
+        let activity = &g.block_access[block];
+        Some(StaleBlockCandidate {
+            block: block.clone(),
+            units: activity.units,
+            revision: activity.revision,
+            last_access: activity.access.load(Ordering::Relaxed),
+        })
+    }
+
+    pub(crate) fn block_scan_ceiling(&self) -> u64 {
         self.inner.lock().unwrap().clock
     }
 

@@ -11,8 +11,6 @@ Origin objects, staging and WAL data are outside its scope.
 ```toml
 ownership_gc_enabled = true
 ownership_gc_replicas = 1
-ownership_gc_scan_batch_size = 1024
-ownership_gc_delete_batch_size = 1024
 ```
 
 Ownership cleanup defaults to disabled. Enabling it registers `ownership_gc` for
@@ -20,12 +18,11 @@ logical membership changes. `stale_gc_enabled` independently enables backend
 object deletion checks, which retain their one-hour delay after each completed
 backend round. Each setting controls its own task.
 
-The batch settings cap blocks scanned and block candidates selected, further
-bounded by page-GC and worker-wide background limits. Scans never exceed 4096
-blocks per batch. A paged block is one candidate, but every resident page consumes
-deletion-rate credit. All fields support uppercase `TALON_WORKER_` environment
-variables overriding TOML. Changes require restart; replica count and batch sizes
-must be positive.
+Ownership scans continuously through the event boundary, with no block-count
+batch setting or page-GC scan cap. It holds one candidate at a time. Every resident
+page still consumes deletion-rate credit. Both fields support uppercase
+`TALON_WORKER_` environment variables overriding TOML. Changes require restart;
+replica count must be positive.
 
 Set `ownership_gc_replicas` to at least the largest candidate count used by any
 reader or load planner. The Worker retains the union of global and local-zone
@@ -81,15 +78,17 @@ scan cursors. Ownership never issues backend requests; stale GC never consumes
 membership. They share only the resident block index, deletion budgets and guarded
 whole-block mutation.
 
-`OwnershipGc::run_round` keeps its cursor and candidates local. Its persistent
+`OwnershipGc::run_round` keeps its cursor and current candidate local. Its persistent
 state is configuration, cached placement snapshot/tables, and the last converged
 generation. Maglev tables rebuild only when placement changes. Each eligible block
 is hashed and checked against those tables. No ownership/hash cache is added to
 block metadata or reads. Membership canonicalization costs O(N log N); scans use
 the resident index without cloning the full index or walking cache directories.
 
-Ownership processes bounded batches and yields between them, with no fixed
-one-second scan delay. Actual deletions consume shared page/disk credits; pending
+Ownership streams blocks without candidate vectors or per-batch blocking-task
+dispatch. It cooperatively yields after about 10 ms of elapsed work, with no fixed
+sleep or block-count limit. Each block rechecks membership. Actual deletions consume
+shared page/disk credits; pending
 protected blocks retry after one second. The event scheduler coalesces changes
 received during active work. Once converged, ownership waits for a membership
 event without occupying a task slot.

@@ -185,8 +185,6 @@ impl Args {
             paged_miss_run_concurrency: None,
             ownership_gc_enabled: None,
             ownership_gc_replicas: None,
-            ownership_gc_scan_batch_size: None,
-            ownership_gc_delete_batch_size: None,
             load_inflight_bytes: None,
             page_tti_hours: None,
             page_access_checkpoint_interval_minutes: None,
