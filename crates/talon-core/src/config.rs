@@ -2471,8 +2471,23 @@ mod tests {
         .unwrap();
         assert_eq!(file.stale_gc_head_max_per_sec, Some(200));
         assert_eq!(file.stale_gc_head_concurrency, Some(8));
-        let mut config = WorkerConfig::default();
-        config.stale_gc_head_concurrency = 0;
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            "TALON_WORKER_STALE_GC_HEAD_MAX_PER_SEC" => Some("16".into()),
+            "TALON_WORKER_STALE_GC_HEAD_CONCURRENCY" => Some("2".into()),
+            _ => None,
+        })
+        .unwrap();
+        let resolved =
+            WorkerConfig::resolve(file.clone(), env.clone(), Default::default()).unwrap();
+        assert_eq!(resolved.stale_gc_head_max_per_sec, 16);
+        assert_eq!(resolved.stale_gc_head_concurrency, 2);
+        let overridden = WorkerConfig::resolve(file.clone(), env, file).unwrap();
+        assert_eq!(overridden.stale_gc_head_max_per_sec, 200);
+        assert_eq!(overridden.stale_gc_head_concurrency, 8);
+        let mut config = WorkerConfig {
+            stale_gc_head_concurrency: 0,
+            ..Default::default()
+        };
         assert!(config.validate().is_err());
         config.stale_gc_head_concurrency = 4;
         config.stale_gc_head_max_per_sec = 0;
