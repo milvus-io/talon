@@ -119,6 +119,14 @@ impl WorkerRuntime {
 
     /// Complete one disk cleanup pass, including when page TTI or paged reads are disabled.
     pub async fn cleanup_page_files_once(&self) -> crate::page_gc::CleanupReport {
+        self.cleanup_page_files_batch(usize::MAX, usize::MAX).await
+    }
+
+    pub(crate) async fn cleanup_page_files_batch(
+        &self,
+        scans: usize,
+        deletes: usize,
+    ) -> crate::page_gc::CleanupReport {
         let runtime = self.clone();
         let permit = self
             .page_gc_io
@@ -136,8 +144,8 @@ impl WorkerRuntime {
                     .await
                     .run_batch_with_budget(
                         &runtime.page_lifecycle,
-                        usize::MAX,
-                        usize::MAX,
+                        scans,
+                        deletes,
                         runtime.background_budget.as_deref(),
                     )
                     .await;
@@ -180,18 +188,40 @@ impl WorkerRuntime {
 
     /// Complete one TTI scan and its deletion attempts, independent of batch limits.
     pub async fn gc_once(&self) -> GcReport {
-        let Ok(_scan) = self.page_scan.try_lock() else {
-            return GcReport::default();
-        };
+        let mut cursor = self.page_scan.lock().await;
+        *cursor = ScanCursor::default();
+        let mut report = GcReport::default();
+        loop {
+            let batch = self.gc_batch(&mut cursor).await;
+            report.checked += batch.checked;
+            report.reclaimed += batch.reclaimed;
+            report.bytes += batch.bytes;
+            if batch.completed_scan {
+                report.completed_scan = true;
+                return report;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    pub(crate) async fn gc_next_batch(&self) -> GcReport {
+        let mut cursor = self.page_scan.lock().await;
+        self.gc_batch(&mut cursor).await
+    }
+
+    async fn gc_batch(&self, cursor: &mut ScanCursor) -> GcReport {
         let started = Instant::now();
         let lifecycle = self.page_lifecycle.clone();
         let tti = (self.page_gc_config.tti_ms > 0).then_some(self.page_gc_config.tti_ms);
         let now = self.page_clock.now();
-        let (candidates, stats) = tokio::task::spawn_blocking(move || {
-            lifecycle.scan(&mut ScanCursor::default(), usize::MAX, now, tti, usize::MAX)
+        let mut scan = std::mem::take(cursor);
+        let (scan, candidates, stats) = tokio::task::spawn_blocking(move || {
+            let (candidates, stats) = lifecycle.scan(&mut scan, 4096, now, tti, 64);
+            (scan, candidates, stats)
         })
         .await
         .expect("page scanner panicked");
+        *cursor = scan;
         self.page_gc_metrics.scanned.add(stats.checked as u64);
         let mut report = GcReport {
             checked: stats.checked,
@@ -312,6 +342,7 @@ impl WorkerRuntime {
 
     /// Retire an entire stale block in one owned mutation. Page count affects
     /// disk pacing, never which subset of the block is selected for eviction.
+    #[cfg(test)]
     pub(super) async fn unlink_stale_block(&self, candidate: crate::eviction::StaleBlockCandidate) {
         self.unlink_stale_block_for(candidate, None).await;
     }
@@ -322,13 +353,30 @@ impl WorkerRuntime {
         candidate: crate::eviction::StaleBlockCandidate,
         membership: Option<Arc<super::MembershipSnapshot>>,
     ) {
+        self.unlink_stale_block_inner(candidate, membership, false)
+            .await;
+    }
+
+    pub(super) async fn unlink_stale_block_prepaid(
+        &self,
+        candidate: crate::eviction::StaleBlockCandidate,
+    ) {
+        self.unlink_stale_block_inner(candidate, None, true).await;
+    }
+
+    async fn unlink_stale_block_inner(
+        &self,
+        candidate: crate::eviction::StaleBlockCandidate,
+        membership: Option<Arc<super::MembershipSnapshot>>,
+        prepaid: bool,
+    ) {
         let runtime = self.clone();
         self.page_mutations.run(async move {
             let ownership_deadline = membership.as_ref().map(|view| view.valid_until);
             let reason = if ownership_deadline.is_some() { 4 } else { 3 };
             let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return; };
             let _permit = permit.expect("page GC semaphore closed");
-            if ownership_deadline.is_none() {
+            if ownership_deadline.is_none() && !prepaid {
                 if let Some(budget) = &runtime.background_budget {
                     budget.delete_units(candidate.units as u64).await;
                 }
@@ -399,7 +447,7 @@ impl WorkerRuntime {
                 (unit, page)
             })
             .collect();
-        for (unit, candidate) in candidates {
+        let work = futures::stream::iter(candidates.into_iter().map(|(unit, candidate)| async move {
             let retired = match &unit.unit {
                 CacheUnit::Page(id, _) | CacheUnit::Whole(id) => id.clone(),
             };
@@ -452,7 +500,14 @@ impl WorkerRuntime {
                 }
             }
             self.page_lifecycle.retire_empty(&retired);
-        }
+        }));
+        let concurrency = if reason == 1 {
+            self.page_gc_config.io_concurrency
+        } else {
+            1
+        };
+        let mut work = work.buffer_unordered(concurrency);
+        while work.next().await.is_some() {}
     }
 
     /// Explicit flush (including shutdown). Normal background work advances one

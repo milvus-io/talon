@@ -108,6 +108,37 @@ async fn gc_scans_all_pages_despite_batch_limits_and_restarts_from_the_beginning
 }
 
 #[tokio::test]
+async fn scheduled_page_scan_keeps_a_cursor_and_bounded_candidates() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 100);
+    r.page_clock.set(10000);
+    let state = r.page_lifecycle.block(&id());
+    for page in 0..10000 {
+        state.register(PageIndex(page), Some(10000), 10000, false);
+    }
+    let first = r.gc_next_batch().await;
+    assert!(!first.completed_scan);
+    assert!(first.checked <= 4096);
+    let mut checked = first.checked;
+    loop {
+        let report = r.gc_next_batch().await;
+        checked += report.checked;
+        if report.completed_scan {
+            break;
+        }
+    }
+    assert_eq!(
+        checked, 10000,
+        "a continuation must resume, not rescan the prefix"
+    );
+    let (candidates, stats) =
+        r.page_lifecycle
+            .scan(&mut ScanCursor::default(), 4096, 20000, Some(100), 64);
+    assert_eq!(candidates.len(), 64);
+    assert!(!stats.completed);
+}
+
+#[tokio::test]
 async fn disabled_tti_hits_leave_access_and_dirtiness_unchanged() {
     for l1 in [false, true] {
         let root = tempfile::tempdir().unwrap();

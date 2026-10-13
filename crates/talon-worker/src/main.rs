@@ -177,6 +177,8 @@ impl Args {
             background_delete_max_per_sec: None,
             async_eviction_enabled: None,
             stale_gc_enabled: None,
+            stale_gc_head_max_per_sec: None,
+            stale_gc_head_concurrency: None,
             async_eviction_high_watermark: None,
             async_eviction_low_watermark: None,
             async_eviction_check_interval_minutes: None,

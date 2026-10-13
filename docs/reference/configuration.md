@@ -426,6 +426,22 @@ Check blocks idle over 24 hours for deleted backend objects; cache successful ch
 - **Default:** `true`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `stale_gc_head_concurrency`
+
+Maximum concurrent backend HEAD checks in stale GC.
+
+- **Environment variable:** `TALON_WORKER_STALE_GC_HEAD_CONCURRENCY`
+- **Default:** `4`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `stale_gc_head_max_per_sec`
+
+Backend HEAD requests per second for stale GC; zero disables throttling.
+
+- **Environment variable:** `TALON_WORKER_STALE_GC_HEAD_MAX_PER_SEC`
+- **Default:** `32`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `async_eviction_enabled`
 
 Enable background eviction at cache occupancy watermarks.

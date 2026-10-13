@@ -140,7 +140,7 @@ pub struct WorkerRuntime {
     page_mutations: Arc<Mutations>,
     page_gc_io: Arc<tokio::sync::Semaphore>,
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
-    page_scan: Arc<tokio::sync::Mutex<()>>,
+    page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
 }
@@ -247,7 +247,7 @@ impl WorkerRuntime {
             page_mutations: Arc::new(Mutations::default()),
             page_gc_io: Arc::new(tokio::sync::Semaphore::new(4)),
             background_budget: None,
-            page_scan: Arc::new(tokio::sync::Mutex::new(())),
+            page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
         }
     }

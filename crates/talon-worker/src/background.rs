@@ -70,6 +70,16 @@ impl BackgroundScheduler {
         });
     }
 
+    /// Run one bounded slice. Pending work chooses a short continuation delay;
+    /// a completed round chooses its idle interval. Neither delay holds a slot.
+    pub fn register_adaptive<F, Fut>(&mut self, name: &'static str, retry: Duration, run: F)
+    where
+        F: FnMut() -> Fut + Send + 'static,
+        Fut: Future<Output = Option<Duration>> + Send + 'static,
+    {
+        self.register_work(name, retry, None, run);
+    }
+
     /// Register event-driven work. Initial admission observes any event published
     /// before subscription. Return a delay only for pending retry or periodic work;
     /// `None` sleeps until the next event without occupying a task slot.
@@ -264,12 +274,12 @@ impl Drop for BackgroundHandle {
 
 /// A shared, paced reservation clock. Charges precede work; idle time does not
 /// accumulate burst credit. Cancellation may waste credit but cannot exceed the rate.
-struct Rate {
+pub(crate) struct Rate {
     per_second: u64,
     next: Mutex<std::time::Instant>,
 }
 impl Rate {
-    fn new(per_second: u64) -> Self {
+    pub(crate) fn new(per_second: u64) -> Self {
         Self {
             per_second,
             next: Mutex::new(std::time::Instant::now()),
@@ -284,7 +294,7 @@ impl Rate {
             + Duration::from_secs_f64(units as f64 / self.per_second as f64);
         Some(*next)
     }
-    async fn charge(&self, units: u64) {
+    pub(crate) async fn charge(&self, units: u64) {
         if let Some(at) = self.reserve(units) {
             tokio::time::sleep_until(at.into()).await;
         }
@@ -337,6 +347,19 @@ impl BackgroundBudget {
             remaining -= batch;
         }
     }
+    /// Acquire at most 100 ms of work for a resumable whole-block deletion.
+    /// Callers retain paid credits across scheduler slices, never while holding
+    /// a directory or block mutation lock.
+    pub(crate) async fn delete_slice(&self, remaining: u64) -> u64 {
+        let units = if self.deletes.per_second == 0 {
+            remaining
+        } else {
+            remaining.min((self.deletes.per_second / 10).max(1))
+        };
+        self.delete_units(units).await;
+        units
+    }
+
     /// Await before each bounded read/write chunk.
     pub async fn bytes(&self, bytes: usize) {
         self.bytes.charge(bytes as u64).await;

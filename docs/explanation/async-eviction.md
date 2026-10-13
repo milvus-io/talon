@@ -39,19 +39,19 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
   checkpoint write chunk; pacing never occupies a blocking-pool thread. Cleanup
   and checkpoint filesystem operations use asynchronous APIs, while snapshot
   encoding and synchronous temporary-file operations run in short blocking jobs.
-  The admitted mutation retains its I/O slot and required directory/shard gates
-  across waits to preserve serialization and cancellation safety.
-- **TTI GC (`tti_gc`)** completes a full in-memory scan and all selected deletion attempts
-  per invocation, then waits `page_gc_interval_minutes` (default 10 minutes). It ignores
-  scan/deletion batch limits, but retains disk concurrency and deletion rate limits.
-  Candidates are collected before deletion, so candidate memory grows with the
-  number of eligible pages. Pages added behind the cursor may wait for the next pass.
+  Owned mutations retain I/O permits until their disk and metadata work finishes.
+  Orphan deletion credits are acquired before directory locking and revalidation.
+- **TTI GC (`tti_gc`)** completes a logical scan and all selected deletion attempts,
+  then waits `page_gc_interval_minutes` (default 10 minutes). Each scheduler slice
+  examines at most 4096 entries and retains at most 64 candidates, then releases
+  its task slot and immediately resumes pending work. The full pass is independent
+  of configured batch limits. Pages added behind the cursor may wait for the next pass.
   This task also retries failed capacity/superseded page deletions and cleans up
   empty page directories, so it continues running when TTI is disabled. The
   scheduler task label is now `tti_gc` (previously `page_gc`); update queries
   filtering the background-task metrics by that label. Existing `page_gc_*`
   configuration names and shared page-reclamation metrics remain unchanged.
-- **File cleanup** completes a full disk traversal per invocation, then waits
+- **File cleanup** completes a full disk traversal in resumable slices, then waits
   `file_cleanup_interval_hours` (default one hour), independently of TTI GC. Startup
   recovery still completes a pass before serving requests. Directory iteration
   streams entries without collecting a global file list; deletion concurrency,
@@ -61,9 +61,8 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
 - **Batch sizes** cap scanned entries and deletion candidates for watermark
   eviction and stale GC. The legacy `page_gc_scan_batch_size` and
   `page_gc_delete_batch_size` settings also apply to both tasks; the
-  smaller limit wins for backend-deletion checks. Ownership cleanup uses its own
-  batch sizes capped by the shared background limits. Neither TTI GC nor file cleanup is truncated by these
-  limits. Checkpoints retain their atomic one-shard transaction, bounded by the
+  smaller limit wins. Neither TTI GC nor file cleanup truncates a logical pass
+  at these limits. Ownership cleanup does not use these configuration limits. Checkpoints retain their atomic one-shard transaction, bounded by the
   existing 64 MiB format limit.
 - **Disk throughput** meters application data bytes before each checkpoint write
   chunk (at most 64 KiB), using one shared rate clock with no idle burst credit.
@@ -122,7 +121,10 @@ TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK=0.75
 TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES=1
 ```
 
-Defaults are disabled, high `0.9`, low `0.8`, and `1` minute between batches.
+Defaults are disabled, high `0.9`, low `0.8`, and `1` minute between idle checks.
+While an active cycle makes progress, its next slice runs immediately. A cycle
+blocked by recent accesses, pins or errors retries after one second. Independent
+victims are unlinked with bounded concurrency and the shared deletion budget.
 Watermarks must satisfy `0 < low < high < 1`; the interval must be positive.
 See the generated [configuration reference](../reference/configuration.md#async_eviction_enabled).
 
@@ -215,3 +217,14 @@ entries. Restart conservatively starts a fresh 24-hour idle window, including fo
 recovered cache files. This is eventual space reclamation: hot blocks remain
 cached, and deletion discovery is delayed by idle age, positive-check cooldown,
 and scan progress. It does not change read-path version semantics.
+
+## Stale-object checks
+
+Stale GC preserves the hourly delay between completed rounds, idle age over 24
+hours and positive HEAD cooldown of 24 hours. Warm scans immediately continue
+without per-batch sleeps. Backend HEAD traffic has an independent paced budget:
+`stale_gc_head_max_per_sec` (default 32, zero unlimited) and
+`stale_gc_head_concurrency` (default 4). Each HEAD has its own five-second timeout;
+local deletion waits do not consume that timeout. Only NotFound authorizes
+removal, and pins/activity are revalidated before unlink. Large-block deletion
+credits accumulate across scheduler slices without holding I/O permits.

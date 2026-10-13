@@ -151,6 +151,10 @@ pub struct WorkerConfig {
     pub async_eviction_enabled: bool,
     /// Reclaim idle cache entries whose backend object no longer exists.
     pub stale_gc_enabled: bool,
+    /// Maximum concurrent backend HEAD checks in stale GC.
+    pub stale_gc_head_concurrency: usize,
+    /// Backend HEAD requests per second for stale GC; zero disables throttling.
+    pub stale_gc_head_max_per_sec: u64,
     /// Start background eviction at this fraction of capacity_bytes.
     pub async_eviction_high_watermark: f64,
     /// Stop background eviction at or below this fraction of capacity_bytes.
@@ -379,6 +383,8 @@ impl Default for WorkerConfig {
             background_delete_max_per_sec: 1024,
             async_eviction_enabled: false,
             stale_gc_enabled: true,
+            stale_gc_head_concurrency: 4,
+            stale_gc_head_max_per_sec: 32,
             async_eviction_high_watermark: 0.9,
             async_eviction_low_watermark: 0.8,
             async_eviction_check_interval_minutes: 1,
@@ -469,6 +475,10 @@ pub struct WorkerConfigPatch {
     pub async_eviction_enabled: Option<bool>,
     /// Override for [`WorkerConfig::stale_gc_enabled`].
     pub stale_gc_enabled: Option<bool>,
+    /// Override for [`WorkerConfig::stale_gc_head_concurrency`].
+    pub stale_gc_head_concurrency: Option<usize>,
+    /// Override for [`WorkerConfig::stale_gc_head_max_per_sec`].
+    pub stale_gc_head_max_per_sec: Option<u64>,
     /// Override for [`WorkerConfig::async_eviction_high_watermark`].
     pub async_eviction_high_watermark: Option<f64>,
     /// Override for [`WorkerConfig::async_eviction_low_watermark`].
@@ -580,6 +590,12 @@ impl Patch for WorkerConfigPatch {
                 .or(base.background_delete_max_per_sec),
             async_eviction_enabled: self.async_eviction_enabled.or(base.async_eviction_enabled),
             stale_gc_enabled: self.stale_gc_enabled.or(base.stale_gc_enabled),
+            stale_gc_head_concurrency: self
+                .stale_gc_head_concurrency
+                .or(base.stale_gc_head_concurrency),
+            stale_gc_head_max_per_sec: self
+                .stale_gc_head_max_per_sec
+                .or(base.stale_gc_head_max_per_sec),
             async_eviction_high_watermark: self
                 .async_eviction_high_watermark
                 .or(base.async_eviction_high_watermark),
@@ -788,6 +804,8 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC", key: "background_io_max_mb_per_sec", default: Some("8"), cli: false, secret: false, help: "Shared background disk read/write MB/s (decimal); zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC", key: "background_delete_max_per_sec", default: Some("1024"), cli: false, secret: false, help: "Shared background deletion work items per second; zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_STALE_GC_ENABLED", key: "stale_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Check blocks idle over 24 hours for deleted backend objects; cache successful checks for 24 hours." },
+    ConfigVar { env: "TALON_WORKER_STALE_GC_HEAD_CONCURRENCY", key: "stale_gc_head_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent backend HEAD checks in stale GC." },
+    ConfigVar { env: "TALON_WORKER_STALE_GC_HEAD_MAX_PER_SEC", key: "stale_gc_head_max_per_sec", default: Some("32"), cli: false, secret: false, help: "Backend HEAD requests per second for stale GC; zero disables throttling." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("false"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK", key: "async_eviction_high_watermark", default: Some("0.9"), cli: false, secret: false, help: "Start background eviction at this fraction of capacity_bytes." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK", key: "async_eviction_low_watermark", default: Some("0.8"), cli: false, secret: false, help: "Stop background eviction at or below this fraction of capacity_bytes." },
@@ -1042,6 +1060,8 @@ pub(crate) mod worker_env {
     pub const BACKGROUND_DELETE_BATCH_SIZE: &str = "TALON_WORKER_BACKGROUND_DELETE_BATCH_SIZE";
     pub const BACKGROUND_IO_MAX_MB_PER_SEC: &str = "TALON_WORKER_BACKGROUND_IO_MAX_MB_PER_SEC";
     pub const BACKGROUND_DELETE_MAX_PER_SEC: &str = "TALON_WORKER_BACKGROUND_DELETE_MAX_PER_SEC";
+    pub const STALE_GC_HEAD_MAX_PER_SEC: &str = "TALON_WORKER_STALE_GC_HEAD_MAX_PER_SEC";
+    pub const STALE_GC_HEAD_CONCURRENCY: &str = "TALON_WORKER_STALE_GC_HEAD_CONCURRENCY";
     pub const STALE_GC_ENABLED: &str = "TALON_WORKER_STALE_GC_ENABLED";
     pub const ASYNC_EVICTION_ENABLED: &str = "TALON_WORKER_ASYNC_EVICTION_ENABLED";
     pub const ASYNC_EVICTION_HIGH_WATERMARK: &str = "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK";
@@ -1181,6 +1201,12 @@ impl WorkerConfigPatch {
                 .transpose()?,
             background_delete_max_per_sec: get(worker_env::BACKGROUND_DELETE_MAX_PER_SEC)
                 .map(|v| parse_u64(v, worker_env::BACKGROUND_DELETE_MAX_PER_SEC))
+                .transpose()?,
+            stale_gc_head_max_per_sec: get(worker_env::STALE_GC_HEAD_MAX_PER_SEC)
+                .map(|v| parse_u64(v, worker_env::STALE_GC_HEAD_MAX_PER_SEC))
+                .transpose()?,
+            stale_gc_head_concurrency: get(worker_env::STALE_GC_HEAD_CONCURRENCY)
+                .map(|v| parse_usize(v, worker_env::STALE_GC_HEAD_CONCURRENCY))
                 .transpose()?,
             stale_gc_enabled: get(worker_env::STALE_GC_ENABLED)
                 .map(|v| parse_bool(v, worker_env::STALE_GC_ENABLED))
@@ -1352,6 +1378,12 @@ impl WorkerConfig {
                 .background_delete_max_per_sec
                 .unwrap_or(d.background_delete_max_per_sec),
             stale_gc_enabled: merged.stale_gc_enabled.unwrap_or(d.stale_gc_enabled),
+            stale_gc_head_concurrency: merged
+                .stale_gc_head_concurrency
+                .unwrap_or(d.stale_gc_head_concurrency),
+            stale_gc_head_max_per_sec: merged
+                .stale_gc_head_max_per_sec
+                .unwrap_or(d.stale_gc_head_max_per_sec),
             async_eviction_enabled: merged
                 .async_eviction_enabled
                 .unwrap_or(d.async_eviction_enabled),
@@ -1527,6 +1559,11 @@ impl WorkerConfig {
         }
         if self.block_size == 0 {
             return Err(Error::Other("block_size must be > 0".into()));
+        }
+        if self.stale_gc_head_concurrency == 0 || self.stale_gc_head_concurrency > 1024 {
+            return Err(Error::Other(
+                "stale_gc_head_concurrency must be in 1..=1024".into(),
+            ));
         }
         if self.ownership_gc_replicas == 0 {
             return Err(Error::Other(
@@ -2424,6 +2461,22 @@ mod tests {
             WorkerConfigPatch::default()
         )
         .is_err());
+    }
+
+    #[test]
+    fn stale_head_limits_layer_and_validate() {
+        let file = WorkerConfigPatch::from_toml(
+            "stale_gc_head_max_per_sec = 200\nstale_gc_head_concurrency = 8",
+        )
+        .unwrap();
+        assert_eq!(file.stale_gc_head_max_per_sec, Some(200));
+        assert_eq!(file.stale_gc_head_concurrency, Some(8));
+        let mut config = WorkerConfig::default();
+        config.stale_gc_head_concurrency = 0;
+        assert!(config.validate().is_err());
+        config.stale_gc_head_concurrency = 4;
+        config.stale_gc_head_max_per_sec = 0;
+        assert!(config.validate().is_ok());
     }
 
     #[test]

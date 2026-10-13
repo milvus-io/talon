@@ -1,45 +1,108 @@
 //! Reclaim cold local cache entries only after an authoritative backend NotFound.
 use super::WorkerRuntime;
 use crate::eviction::access_millis;
+use futures::StreamExt;
 use std::{
     collections::{HashMap, VecDeque},
+    sync::Arc,
     time::Duration,
 };
-use talon_core::Error;
+use talon_core::{Error, ObjectId, WorkerConfig};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
-#[derive(Default)]
 pub(super) struct StaleGc {
     cursor: (u64, u64),
     pending: VecDeque<crate::eviction::StaleBlockCandidate>,
+    round_now: Option<u64>,
+    missing: VecDeque<(crate::eviction::StaleBlockCandidate, u64)>,
+    heads: Arc<crate::background::Rate>,
+    concurrency: usize,
 }
-
+impl Default for StaleGc {
+    fn default() -> Self {
+        Self::new(&WorkerConfig::default())
+    }
+}
 impl StaleGc {
-    /// Complete one bounded queue generation; the scheduler supplies the hourly delay.
-    pub(super) async fn run_round(worker: &WorkerRuntime) {
-        Self::default().run_round_at(worker, access_millis()).await;
+    pub(super) fn new(config: &WorkerConfig) -> Self {
+        Self::with_head_rate(config, Arc::new(crate::background::Rate::new(config.stale_gc_head_max_per_sec)))
     }
 
+    pub(super) fn with_head_rate(config: &WorkerConfig, heads: Arc<crate::background::Rate>) -> Self {
+        Self {
+            cursor: (0, 0),
+            pending: VecDeque::new(),
+            round_now: None,
+            missing: VecDeque::new(),
+            heads,
+            concurrency: config.stale_gc_head_concurrency,
+        }
+    }
+
+    pub(super) async fn run_slice(&mut self, worker: &WorkerRuntime) -> Option<Duration> {
+        let now = *self.round_now.get_or_insert_with(access_millis);
+        if self.missing.is_empty() {
+            self.check_batch(worker, now).await;
+        }
+        self.delete_slice(worker).await;
+        let done =
+            self.cursor.0 >= self.cursor.1 && self.pending.is_empty() && self.missing.is_empty();
+        if done {
+            self.round_now = None;
+        }
+        Some(if done {
+            Duration::from_secs(3600)
+        } else {
+            Duration::ZERO
+        })
+    }
+
+    #[cfg(test)]
     async fn run_round_at(&mut self, worker: &WorkerRuntime, now: u64) {
         loop {
             self.tick_at(worker, now).await;
             if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
                 break;
             }
-            // Pace batches within this round without repeatedly scanning the cache
-            // between hourly rounds. Newly admitted units wait for the next round.
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
         }
     }
 
+    #[cfg(test)]
     async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) {
+        self.check_batch(worker, now).await;
+        while !self.missing.is_empty() {
+            self.delete_slice(worker).await;
+        }
+    }
+
+    async fn delete_slice(&mut self, worker: &WorkerRuntime) {
+        let Some((candidate, paid)) = self.missing.front_mut() else {
+            return;
+        };
+        if !worker.lru.stale_candidate_is_current(candidate) {
+            self.missing.pop_front();
+            return;
+        }
+        if let Some(budget) = &worker.background_budget {
+            *paid += budget.delete_slice(candidate.units as u64 - *paid).await;
+        } else {
+            *paid = candidate.units as u64;
+        }
+        if *paid == candidate.units as u64 {
+            let (candidate, _) = self.missing.pop_front().unwrap();
+            worker.unlink_stale_block_prepaid(candidate).await;
+        }
+    }
+
+    async fn check_batch(&mut self, worker: &WorkerRuntime, now: u64) {
         if self.pending.is_empty() {
             let lru = worker.lru.clone();
             let mut cursor = self.cursor;
             let scan = worker.page_gc_config.scan_batch_size.min(4096);
-            let deletes = worker.page_gc_config.delete_batch_size;
+            let deletes = worker.page_gc_config.delete_batch_size.min(256);
             let (cursor, candidates) = tokio::task::spawn_blocking(move || {
                 let candidates = lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
                 (cursor, candidates)
@@ -49,49 +112,56 @@ impl StaleGc {
             self.cursor = cursor;
             self.pending = candidates.into();
         }
-        // Bound backend work separately from the shared *local disk* budget.
-        // Neither transient errors nor NotFound are cached across batches.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        let mut checked = HashMap::new();
+        let mut groups: HashMap<ObjectId, Vec<crate::eviction::StaleBlockCandidate>> =
+            HashMap::new();
         while let Some(candidate) = self.pending.front() {
-            let object = &candidate.block.object;
-            if !checked.contains_key(object)
-                && (checked.len() >= MAX_HEADS || tokio::time::Instant::now() >= deadline)
-            {
+            if !groups.contains_key(&candidate.block.object) && groups.len() == MAX_HEADS {
                 break;
             }
-            let candidate = self.pending.pop_front().expect("pending candidate");
-            if !worker.lru.stale_candidate_is_current(&candidate) {
-                continue;
+            let candidate = self.pending.pop_front().unwrap();
+            if worker.lru.stale_candidate_is_current(&candidate)
+                && worker
+                    .lru
+                    .stale_check_due(&candidate.block.object, now, DAY_MS)
+            {
+                groups
+                    .entry(candidate.block.object.clone())
+                    .or_default()
+                    .push(candidate);
             }
-            let object = &candidate.block.object;
-            if !worker.lru.stale_check_due(object, now, DAY_MS) {
-                continue;
-            }
-            let missing = if let Some(missing) = checked.get(object) {
-                *missing
-            } else {
-                let missing =
-                    match tokio::time::timeout_at(deadline, worker.backend.head(object)).await {
-                        Ok(Ok(_)) => {
-                            worker.lru.stale_verified(object, now.max(access_millis()));
-                            false
-                        }
-                        Ok(Err(Error::NotFound(_))) => true,
-                        Ok(Err(error)) => {
-                            tracing::debug!(%error, "stale GC HEAD failed; retaining cache");
-                            false
-                        }
-                        Err(_) => break,
-                    };
-                checked.insert(object.clone(), missing);
-                missing
-            };
-            if missing {
-                // Admission revisions, block activity and pins are rechecked under
-                // the mutation gate; I/O failures retain resident accounting.
-                worker.unlink_stale_block(candidate).await;
-            }
+        }
+        let heads = &self.heads;
+        let work =
+            futures::stream::iter(groups.into_iter().map(|(object, candidates)| async move {
+                // Origin QPS is independent of local disk pacing and scan slicing.
+                heads.charge(1).await;
+                let missing = match tokio::time::timeout(
+                    Duration::from_secs(5),
+                    worker.backend.head(&object),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        worker.lru.stale_verified(&object, now.max(access_millis()));
+                        false
+                    }
+                    Ok(Err(Error::NotFound(_))) => true,
+                    Ok(Err(error)) => {
+                        tracing::debug!(%error, "stale GC HEAD failed; retaining cache");
+                        false
+                    }
+                    Err(_) => false,
+                };
+                if missing {
+                    candidates
+                } else {
+                    Vec::new()
+                }
+            }));
+        let mut work = work.buffer_unordered(self.concurrency);
+        while let Some(candidates) = work.next().await {
+            self.missing
+                .extend(candidates.into_iter().map(|candidate| (candidate, 0)));
         }
     }
 }
@@ -183,6 +253,22 @@ mod tests {
     }
     fn cold_now() -> u64 {
         access_millis() + DAY_MS + 1
+    }
+
+    #[tokio::test]
+    async fn warm_scan_continuations_have_no_head_pacing_delay() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        let mut r = runtime(root.path(), false, origin.clone());
+        r.page_gc_config.scan_batch_size = 1;
+        for n in 0..3 {
+            fill(&r, &block(n), false).await;
+        }
+        let mut gc = StaleGc::default();
+        assert_eq!(gc.run_slice(&r).await, Some(Duration::ZERO));
+        assert_eq!(gc.run_slice(&r).await, Some(Duration::ZERO));
+        while gc.run_slice(&r).await == Some(Duration::ZERO) {}
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
