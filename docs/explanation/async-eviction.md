@@ -174,9 +174,9 @@ five-second backend-work deadline per batch. Unprocessed candidates carry over
 to the next batch in the same round so slow objects cannot starve the remainder.
 Batches within a round have a one-second delay after completion; this is pacing,
 not the interval between full scans. Local deletion waits can extend a batch
-beyond the HEAD deadline. Each batch releases its background task slot before the
-continuation delay, allowing other maintenance to run.
-The `stale_gc` task metrics now count batches, rather than complete scan rounds.
+beyond the HEAD deadline. The task keeps its background scheduler slot throughout
+the round, including continuation delays. The `stale_gc` task metrics count
+complete scan rounds.
 The existing disk concurrency and deletion rate budgets apply to unlinks, not
 HEAD traffic. A whole-block removal charges deletion work for all resident pages,
 even though they are removed together as a directory.

@@ -12,7 +12,7 @@ use tokio::{
     time::Instant,
 };
 
-type Work = Pin<Box<dyn Future<Output = Duration> + Send>>;
+type Work = Pin<Box<dyn Future<Output = ()> + Send>>;
 struct Task {
     name: &'static str,
     period: Duration,
@@ -58,22 +58,6 @@ impl BackgroundScheduler {
     where
         F: FnMut() -> Fut + Send + 'static,
         Fut: Future<Output = ()> + Send + 'static,
-    {
-        self.register_with_delay(name, period, move || {
-            let work = run();
-            async move {
-                work.await;
-                period
-            }
-        });
-    }
-
-    /// Register bounded batches that choose their next delay after completion.
-    /// `period` is the fallback delay after a panic or an invalid returned delay.
-    pub fn register_with_delay<F, Fut>(&mut self, name: &'static str, period: Duration, mut run: F)
-    where
-        F: FnMut() -> Fut + Send + 'static,
-        Fut: Future<Output = Duration> + Send + 'static,
     {
         assert!(!period.is_zero() && Instant::now().checked_add(period).is_some());
         assert!(!self.tasks.iter().any(|task| task.name == name));
@@ -142,23 +126,18 @@ impl BackgroundScheduler {
                         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| (task.run)()));
                     let name = task.name;
                     let metrics = task.metrics.clone();
-                    let fallback = task.period;
                     active.push(async move {
                         let start = Instant::now();
                         if let Some(m) = &metrics {
                             m.active.set(1.0);
                         }
-                        let result = match future {
-                            Ok(future) => std::panic::AssertUnwindSafe(future).catch_unwind().await,
-                            Err(error) => Err(error),
+                        let ok = match future {
+                            Ok(future) => std::panic::AssertUnwindSafe(future)
+                                .catch_unwind()
+                                .await
+                                .is_ok(),
+                            Err(_) => false,
                         };
-                        let ok = result.is_ok();
-                        let delay = result
-                            .ok()
-                            .filter(|delay| {
-                                !delay.is_zero() && Instant::now().checked_add(*delay).is_some()
-                            })
-                            .unwrap_or(fallback);
                         if let Some(m) = &metrics {
                             m.active.set(0.0);
                             m.completed.inc();
@@ -173,7 +152,7 @@ impl BackgroundScheduler {
                                 "background task panicked; retrying after its interval"
                             );
                         }
-                        (i, delay)
+                        i
                     });
                 }
             }
@@ -188,9 +167,9 @@ impl BackgroundScheduler {
             };
             tokio::select! { biased;
                 _ = stopped.changed() => break,
-                Some((i, delay)) = active.next(), if !active.is_empty() => {
+                Some(i) = active.next(), if !active.is_empty() => {
                     self.tasks[i].running = false;
-                    self.tasks[i].next = Instant::now() + delay;
+                    self.tasks[i].next = Instant::now() + self.tasks[i].period;
                 }
                 _ = async { match next { Some(at) => tokio::time::sleep_until(at).await, None => std::future::pending().await } } => {}
             }
@@ -412,35 +391,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-    }
-
-    #[tokio::test(start_paused = true)]
-    async fn continuation_releases_slot_and_shutdown_cancels_next_batch() {
-        let mut scheduler = BackgroundScheduler::new(1);
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        let batches = tx.clone();
-        scheduler.register_with_delay("ownership", Duration::from_secs(3600), move || {
-            let tx = batches.clone();
-            async move {
-                tx.send("batch").unwrap();
-                Duration::from_secs(1)
-            }
-        });
-        scheduler.register("other", Duration::from_secs(3600), move || {
-            let tx = tx.clone();
-            async move {
-                tx.send("other").unwrap();
-            }
-        });
-        let handle = scheduler.start();
-        assert_eq!(rx.recv().await.unwrap(), "batch");
-        assert_eq!(rx.recv().await.unwrap(), "other");
-        tokio::time::advance(Duration::from_secs(1)).await;
-        assert_eq!(rx.recv().await.unwrap(), "batch");
-        handle.begin_shutdown();
-        handle.shutdown().await;
-        tokio::time::advance(Duration::from_secs(3600)).await;
-        assert!(rx.recv().await.is_none());
     }
 
     #[tokio::test]

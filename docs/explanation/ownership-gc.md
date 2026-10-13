@@ -22,8 +22,9 @@ The interval defaults to `0`, disabling ownership cleanup. When enabled, it sets
 the **shared stale-GC round interval**, including backend checks if enabled.
 Without ownership cleanup, backend rounds retain their one-hour interval.
 The first round starts immediately; subsequent rounds wait the interval after
-the previous round finishes. Continuation batches wait one second and release
-the scheduler slot. There is no nested policy scheduler.
+the previous round finishes. Within a round, `StaleGc` processes bounded batches
+with a one-second delay. The existing fixed-delay scheduler sees one invocation
+per complete round; the task slot remains occupied until the round ends.
 
 `stale_gc_enabled` independently enables backend-deletion checks. Disabling it
 leaves ownership cleanup available; disabling both removes the task. The scan
@@ -105,7 +106,8 @@ retains the data. Logical retirement does not add a separate grace period.
 `talon_worker_ownership_gc_attempted_total` counts selected cache units.
 Paged reclamation uses `reason="ownership"` in existing page/byte counters;
 whole-file removal uses the general eviction counter. Scheduler task `stale_gc`
-counts batches. Shutdown uses the existing maintenance and owned-mutation drain.
+counts complete rounds. Shutdown uses the existing maintenance and owned-mutation
+drain: an admitted round and its mutations finish before the scheduler joins.
 
 Regression tests cover shared scans, bounded round continuation, stable ownership
 watermarks, new admissions, membership changes/failures, independent backend

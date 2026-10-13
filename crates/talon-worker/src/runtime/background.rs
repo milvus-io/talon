@@ -78,6 +78,23 @@ impl WorkerBackground {
                 }
             });
         }
+        let ownership = ownership.filter(|_| config.ownership_gc_interval_secs > 0);
+        if config.stale_gc_enabled || ownership.is_some() {
+            let period = Duration::from_secs(if ownership.is_some() {
+                config.ownership_gc_interval_secs
+            } else {
+                3600
+            });
+            let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
+                config, ownership,
+            )));
+            let w = worker.clone();
+            scheduler.register("stale_gc", period, move || {
+                let w = w.clone();
+                let gc = gc.clone();
+                async move { gc.lock().await.run_round(&w).await }
+            });
+        }
         if config.async_eviction_enabled && worker.capacity_bytes > 0 {
             let cycle = Arc::new(tokio::sync::Mutex::new(EvictionCycle::new(
                 worker.capacity_bytes,
@@ -95,18 +112,6 @@ impl WorkerBackground {
                     }
                 },
             );
-        }
-        let ownership = ownership.filter(|_| config.ownership_gc_interval_secs > 0);
-        if config.stale_gc_enabled || ownership.is_some() {
-            let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
-                config, ownership,
-            )));
-            let w = worker.clone();
-            scheduler.register_with_delay("stale_gc", Duration::from_secs(3600), move || {
-                let w = w.clone();
-                let gc = gc.clone();
-                async move { gc.lock().await.run_batch(&w).await }
-            });
         }
         Self {
             scheduler: scheduler.start(),

@@ -13,7 +13,6 @@ const MAX_HEADS: usize = 32;
 
 pub(super) struct StaleGc {
     cursor: (u64, u64),
-    round_time: Option<u64>,
     pending: VecDeque<StaleBlockCandidate>,
     backend_enabled: bool,
     worker: Option<NodeId>,
@@ -26,7 +25,6 @@ pub(super) struct StaleGc {
     channel: Option<ControlTlsChannel>,
     ownership_watermark: u64,
     ownership_active: bool,
-    interval: Duration,
     limits: Option<(usize, usize)>,
 }
 
@@ -34,7 +32,6 @@ impl Default for StaleGc {
     fn default() -> Self {
         Self {
             cursor: (0, 0),
-            round_time: None,
             pending: VecDeque::new(),
             backend_enabled: true,
             worker: None,
@@ -47,7 +44,6 @@ impl Default for StaleGc {
             channel: None,
             ownership_watermark: 0,
             ownership_active: false,
-            interval: Duration::from_secs(3600),
             limits: None,
         }
     }
@@ -67,11 +63,6 @@ impl StaleGc {
             channel,
             replicas: config.ownership_gc_replicas,
             coordinator: config.coordinator.clone(),
-            interval: Duration::from_secs(if enabled {
-                config.ownership_gc_interval_secs
-            } else {
-                3600
-            }),
             limits: enabled.then_some((
                 config.ownership_gc_scan_batch_size,
                 config.ownership_gc_delete_batch_size,
@@ -154,23 +145,19 @@ impl StaleGc {
             })
     }
 
-    /// The scheduler owns the only clock: one-second batches, then one round interval.
-    pub(super) async fn run_batch(&mut self, worker: &WorkerRuntime) -> Duration {
-        let now = *self.round_time.get_or_insert_with(access_millis);
-        self.tick_at(worker, now).await;
-        if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
-            self.round_time = None;
-            self.interval
-        } else {
-            Duration::from_secs(1)
-        }
+    /// Complete one bounded queue generation; the scheduler supplies the round interval.
+    pub(super) async fn run_round(&mut self, worker: &WorkerRuntime) {
+        self.run_round_at(worker, access_millis()).await;
     }
 
-    #[cfg(test)]
+    fn round_complete(&self) -> bool {
+        self.cursor.0 >= self.cursor.1 && self.pending.is_empty()
+    }
+
     async fn run_round_at(&mut self, worker: &WorkerRuntime, now: u64) {
         loop {
             self.tick_at(worker, now).await;
-            if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
+            if self.round_complete() {
                 break;
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
@@ -183,7 +170,7 @@ impl StaleGc {
     }
 
     async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) {
-        let starting = self.cursor.0 >= self.cursor.1 && self.pending.is_empty();
+        let starting = self.round_complete();
         if starting {
             self.ownership_active = self.worker.is_some();
         }
@@ -325,7 +312,7 @@ impl StaleGc {
                 worker.unlink_stale_block(candidate).await;
             }
         }
-        if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() && self.ownership_active {
+        if self.round_complete() && self.ownership_active {
             self.ownership_watermark = self.cursor.1;
         }
     }
@@ -778,45 +765,80 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_gc_scheduler_waits_an_hour_between_complete_rounds() {
-        let root = tempfile::tempdir().unwrap();
-        let r = Arc::new(runtime(root.path(), false, Arc::new(Origin::default())));
-        let service = super::super::WorkerBackground::start(r.clone(), &Default::default());
-        let completed = r.metrics.registry.counter(
-            "talon_worker_background_task_completed_total",
-            "Completed background batches by task.",
-            talon_core::metrics::labels(&[("task", "stale_gc")]),
-        );
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while completed.get() == 0 {
-                tokio::task::yield_now().await;
+    async fn stale_gc_scheduler_counts_rounds_and_waits_configured_interval() {
+        for ownership_enabled in [false, true] {
+            let server = if ownership_enabled {
+                Some(MembershipServer::start().await)
+            } else {
+                None
+            };
+            let root = tempfile::tempdir().unwrap();
+            let r = Arc::new(runtime(root.path(), false, Arc::new(Origin::default())));
+            let (service, interval) = if let Some(server) = &server {
+                for n in 0..2 {
+                    fill(&r, &placed("a", n), false).await;
+                }
+                let mut config = server.config.clone();
+                config.ownership_gc_interval_secs = 7200;
+                config.background_scan_batch_size = 1;
+                (
+                    super::super::WorkerBackground::start_with_ownership(
+                        r.clone(),
+                        &config,
+                        NodeId::new("a"),
+                        None,
+                    ),
+                    7200,
+                )
+            } else {
+                (
+                    super::super::WorkerBackground::start(r.clone(), &Default::default()),
+                    3600,
+                )
+            };
+            let completed = r.metrics.registry.counter(
+                "talon_worker_background_task_completed_total",
+                "Completed background batches by task.",
+                talon_core::metrics::labels(&[("task", "stale_gc")]),
+            );
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while completed.get() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            if let Some(server) = &server {
+                assert_eq!(
+                    server.calls.load(Ordering::Relaxed),
+                    2,
+                    "both batches belong to one invocation"
+                );
             }
-        })
-        .await
-        .unwrap();
-        // Let the scheduler record the completion time before advancing its clock.
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(3599)).await;
-        tokio::time::resume();
-        tokio::time::sleep(Duration::from_millis(5)).await;
-        assert_eq!(
-            completed.get(),
-            1,
-            "no repeated scan during the hourly wait"
-        );
-        tokio::time::pause();
-        tokio::time::advance(Duration::from_secs(2)).await;
-        tokio::time::resume();
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while completed.get() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        service.shutdown().await;
-        assert_eq!(completed.get(), 2);
+            // Let the scheduler record the completion time before advancing its clock.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(interval - 1)).await;
+            tokio::time::resume();
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            assert_eq!(
+                completed.get(),
+                1,
+                "no repeated scan during the configured round interval"
+            );
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(2)).await;
+            tokio::time::resume();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while completed.get() < 2 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .unwrap();
+            service.shutdown().await;
+            assert_eq!(completed.get(), 2);
+        }
     }
     #[tokio::test]
     async fn stale_gc_busy_page_defers_the_entire_block_and_releases_partial_claims() {
@@ -1039,22 +1061,25 @@ mod tests {
         fill(&r, &placed("a", 0), false).await;
         fill(&r, &placed("a", 1), false).await;
         let mut gc = server.gc();
-        assert_eq!(gc.run_batch(&r).await, Duration::from_secs(1));
+        gc.tick_at(&r, access_millis()).await;
+        assert!(!gc.round_complete());
         let ceiling = gc.cursor.1;
         fill(&r, &placed("b", 0), false).await;
-        assert_eq!(gc.run_batch(&r).await, Duration::from_secs(3600));
+        gc.tick_at(&r, access_millis()).await;
+        assert!(gc.round_complete());
         assert_eq!(gc.cursor.1, ceiling);
         assert!(r.index.get(&placed("b", 0)).is_some());
-        assert_eq!(gc.run_batch(&r).await, Duration::from_secs(3600));
+        gc.tick_at(&r, access_millis()).await;
+        assert!(gc.round_complete());
         assert!(r.index.get(&placed("b", 0)).is_none());
         // No rescanning of stable owned blocks. The only residual queue range
         // is the now-removed deferred block; afterwards start equals end.
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert_eq!(gc.cursor.0, gc.ownership_watermark);
         assert_eq!(gc.cursor.0, r.lru.stale_scan_ceiling());
         let cursor = gc.cursor;
         let checks = r.page_gc_metrics.ownership_checked.get();
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert_eq!(gc.cursor, cursor);
         assert_eq!(r.page_gc_metrics.ownership_checked.get(), checks);
         assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
@@ -1072,12 +1097,14 @@ mod tests {
                 fill(&r, &placed("b", n), false).await;
             }
             let mut gc = server.gc();
-            assert_eq!(gc.run_batch(&r).await, Duration::from_secs(1));
+            gc.tick_at(&r, access_millis()).await;
+            assert!(!gc.round_complete());
             *server.members.lock().unwrap() = if failed { None } else { Some(vec!["a", "b"]) };
-            assert_eq!(gc.run_batch(&r).await, Duration::from_secs(3600));
+            gc.tick_at(&r, access_millis()).await;
+            assert!(gc.round_complete());
             assert_eq!(r.index.len(), 2);
             *server.members.lock().unwrap() = Some(vec!["a", "b"]);
-            while gc.run_batch(&r).await != Duration::from_secs(3600) {}
+            gc.run_round(&r).await;
             assert!(r.index.is_empty());
         }
     }
@@ -1092,17 +1119,17 @@ mod tests {
         let state = r.page_lifecycle.block(&id);
         let reader = state.acquire(PageIndex(0)).unwrap();
         let mut gc = server.gc();
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert_eq!(r.index.page_count(), 2);
         drop(reader);
         let pin = r
             .lru
             .pin_guard(CacheUnit::Page(id.clone(), PageIndex(1)))
             .unwrap();
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert_eq!(r.index.page_count(), 2);
         drop(pin);
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert!(r.index.is_empty());
         assert!(state.acquire(PageIndex(0)).is_none());
         assert_eq!(r.resident_bytes(), 0);
@@ -1184,7 +1211,7 @@ mod tests {
         std::fs::rename(&dir, &saved).unwrap();
         std::fs::write(&dir, b"not a directory").unwrap();
         let mut gc = server.gc();
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert_eq!(r.resident_bytes(), 32);
         let state = r.page_lifecycle.block(&id);
         for page in 0..2 {
@@ -1195,10 +1222,10 @@ mod tests {
         r.gc_once().await;
         assert_eq!(r.resident_bytes(), 32);
         *server.members.lock().unwrap() = None;
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert_eq!(r.resident_bytes(), 32);
         *server.members.lock().unwrap() = Some(vec!["a", "b"]);
-        gc.run_batch(&r).await;
+        gc.run_round(&r).await;
         assert!(r.index.is_empty());
     }
 
@@ -1221,7 +1248,7 @@ mod tests {
                 ..Default::default()
             }));
             let mut gc = server.gc();
-            let run = gc.run_batch(&r);
+            let run = gc.run_round(&r);
             let disturbance = async {
                 if changed {
                     while server.calls.load(Ordering::Relaxed) == 0 {
