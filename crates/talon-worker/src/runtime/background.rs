@@ -98,18 +98,16 @@ impl WorkerBackground {
         }
         let ownership = ownership
             .filter(|_| config.ownership_gc_interval_secs > 0)
-            .map(|(node, channel)| {
-                super::ownership_gc::OwnershipService::new(node, &worker, config, channel)
-            });
+            .map(|(node, channel)| super::ownership_gc::Ownership::new(node, config, channel));
         if config.stale_gc_enabled || ownership.is_some() {
-            let service = Arc::new(tokio::sync::Mutex::new(
-                super::stale_gc::StaleGcService::new(config.stale_gc_enabled, ownership),
-            ));
+            let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
+                config, ownership,
+            )));
             let w = worker.clone();
             scheduler.register_with_delay("stale_gc", Duration::from_secs(3600), move || {
                 let w = w.clone();
-                let service = service.clone();
-                async move { service.lock().await.run_batch(&w).await }
+                let gc = gc.clone();
+                async move { gc.lock().await.run_batch(&w).await }
             });
         }
         Self {

@@ -11,7 +11,7 @@
 //! one. This is deliberately simple for v1; a sharded map can replace it later
 //! if the lock becomes hot.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
 use crate::eviction::{AccessHandle, CacheUnit};
@@ -42,35 +42,9 @@ pub struct BlockIndex {
 struct Inner {
     map: HashMap<BlockId, IndexedBlock>,
     resident_bytes: u64,
-    ownership: Option<OwnershipIndex>,
-}
-
-#[derive(Default)]
-struct OwnershipIndex {
-    next: u64,
-    ordered: BTreeMap<u64, BlockId>,
-}
-
-impl Inner {
-    fn ownership_dirty(&mut self, id: &BlockId) {
-        let Some(scan) = &mut self.ownership else {
-            return;
-        };
-        let Some(entry) = self.map.get_mut(id) else {
-            return;
-        };
-        scan.ordered.remove(&entry.ownership_slot);
-        scan.next = scan
-            .next
-            .checked_add(1)
-            .expect("ownership sequence exhausted");
-        entry.ownership_slot = scan.next;
-        scan.ordered.insert(scan.next, id.clone());
-    }
 }
 
 struct IndexedBlock {
-    ownership_slot: u64,
     meta: BlockMeta,
     // Sparse: allocating a token for every possible page would dwarf residency
     // metadata when each large block has only one or two cached pages.
@@ -86,67 +60,12 @@ impl From<BlockMeta> for IndexedBlock {
     fn from(meta: BlockMeta) -> Self {
         Self {
             meta,
-            ownership_slot: 0,
             access: HashMap::new(),
         }
     }
 }
 
 impl BlockIndex {
-    /// Enable the optional admission index once, before serving requests.
-    pub(crate) fn enable_ownership_scan(&self) {
-        let mut g = self.inner.write().unwrap();
-        if g.ownership.is_some() {
-            return;
-        }
-        let mut scan = OwnershipIndex::default();
-        for (id, entry) in &mut g.map {
-            scan.next = scan
-                .next
-                .checked_add(1)
-                .expect("ownership sequence exhausted");
-            entry.ownership_slot = scan.next;
-            scan.ordered.insert(scan.next, id.clone());
-        }
-        g.ownership = Some(scan);
-    }
-
-    pub(crate) fn ownership_ceiling(&self) -> u64 {
-        self.inner
-            .read()
-            .unwrap()
-            .ownership
-            .as_ref()
-            .map_or(0, |s| s.next)
-    }
-
-    /// Bounded, ordered enumeration; a completed stable pass is an O(1) check.
-    pub(crate) fn ownership_batch(
-        &self,
-        after: u64,
-        ceiling: u64,
-        limit: usize,
-    ) -> Vec<(u64, BlockId)> {
-        if after >= ceiling {
-            return Vec::new();
-        }
-        let g = self.inner.read().unwrap();
-        g.ownership
-            .as_ref()
-            .map(|scan| {
-                scan.ordered
-                    .range((after + 1)..=ceiling)
-                    .take(limit)
-                    .map(|(&seq, id)| (seq, id.clone()))
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
-    pub(crate) fn defer_ownership(&self, id: &BlockId) {
-        self.inner.write().unwrap().ownership_dirty(id);
-    }
-
     /// Page protection is acquired through the existing index/token lookup.
     /// No block lifecycle lock or second page-table lookup is needed. The single
     /// page case keeps its guard inline and does not allocate a vector buffer.
@@ -338,16 +257,11 @@ impl BlockIndex {
     /// *resident* bytes — a paged block only charges for its present pages.
     pub fn commit(&self, meta: BlockMeta) {
         let mut g = self.inner.write().unwrap();
-        let id = meta.id.clone();
         let added = meta.resident_bytes();
         if let Some(prev) = g.map.insert(meta.id.clone(), meta.into()) {
-            if let Some(scan) = &mut g.ownership {
-                scan.ordered.remove(&prev.ownership_slot);
-            }
             g.resident_bytes = g.resident_bytes.saturating_sub(prev.meta.resident_bytes());
         }
         g.resident_bytes = g.resident_bytes.saturating_add(added);
-        g.ownership_dirty(&id);
     }
 
     /// Insert a paged block with an empty presence bitmap, unless one is already
@@ -369,7 +283,7 @@ impl BlockIndex {
         g.map.insert(
             id.clone(),
             BlockMeta {
-                id: id.clone(),
+                id,
                 form: BlockForm::Paged {
                     page_size,
                     present: PresentBitmap::new(page_count),
@@ -378,7 +292,6 @@ impl BlockIndex {
             }
             .into(),
         );
-        g.ownership_dirty(&id);
         // A fresh paged entry has no present pages, so it adds no resident bytes.
         true
     }
@@ -403,7 +316,6 @@ impl BlockIndex {
         present.set(page);
         let bytes = talon_core::page_len(meta.len, *page_size, page);
         g.resident_bytes = g.resident_bytes.saturating_add(bytes);
-        g.ownership_dirty(id);
         true
     }
 
@@ -458,12 +370,7 @@ impl BlockIndex {
     /// Byte accounting is decremented by the removed block's resident bytes.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut g = self.inner.write().unwrap();
-        let removed = g.map.remove(id).map(|entry| {
-            if let Some(scan) = &mut g.ownership {
-                scan.ordered.remove(&entry.ownership_slot);
-            }
-            entry.meta
-        });
+        let removed = g.map.remove(id).map(|entry| entry.meta);
         if let Some(meta) = &removed {
             g.resident_bytes = g.resident_bytes.saturating_sub(meta.resident_bytes());
         }
@@ -476,44 +383,6 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use talon_core::{Backend, ObjectId, Version};
-
-    #[test]
-    fn ownership_index_is_optional_bounded_and_tracks_paged_admissions() {
-        let index = BlockIndex::new();
-        let id = block(0);
-        index.init_paged(id.clone(), 16, 64);
-        assert_eq!(index.ownership_ceiling(), 0);
-        index.enable_ownership_scan();
-        let first = index.ownership_ceiling();
-        assert_eq!(index.ownership_batch(0, first, 1).len(), 1);
-        assert!(index.ownership_batch(first, first, 1).is_empty());
-        index.mark_page(&id, PageIndex(0));
-        let next = index.ownership_ceiling();
-        assert!(next > first);
-        assert_eq!(index.ownership_batch(first, next, 1).len(), 1);
-        // A duplicate page does not make new work; retries never grow the queue.
-        index.mark_page(&id, PageIndex(0));
-        assert_eq!(index.ownership_ceiling(), next);
-        for _ in 0..100 {
-            index.defer_ownership(&id);
-        }
-        assert_eq!(
-            index
-                .inner
-                .read()
-                .unwrap()
-                .ownership
-                .as_ref()
-                .unwrap()
-                .ordered
-                .len(),
-            1
-        );
-        index.remove(&id);
-        assert!(index
-            .ownership_batch(0, index.ownership_ceiling(), 1)
-            .is_empty());
-    }
 
     fn block(n: u64) -> BlockId {
         BlockId::new(

@@ -149,16 +149,17 @@ unit conversion, and environment-variable migration, see [Page TTI](page-tti.md#
 
 `stale_gc_enabled = true` (the default) enables the backend-deletion policy in
 `stale_gc`. The first round is eligible at startup; after a complete round finishes,
-this policy waits **one hour** before starting another. Rounds never overlap.
+it waits **one hour** before starting another, unless ownership cleanup configures
+the shared interval below. Rounds never overlap.
 Set `TALON_WORKER_STALE_GC_ENABLED=false` to disable backend-deletion checks.
 
-The same task also hosts optional [ownership cleanup](ownership-gc.md), controlled
-independently by `ownership_gc_interval_secs` (default `0`, disabled). Ownership
-cleanup checks fresh Coordinator placement without an idle-age or backend HEAD
-requirement. The task picks the oldest due policy for each invocation; both keep
-their own scan cursors and round intervals. Disabling both removes the task.
+The same scan includes optional [ownership cleanup](ownership-gc.md).
+`ownership_gc_interval_secs` defaults to `0` (disabled); enabling it sets the
+shared round interval. Both predicates share one cursor and whole-block reclaimer.
+Ownership is checked first using fresh Coordinator placement, without an idle-age
+or HEAD requirement. Disabling both predicates removes the task.
 
-Only blocks idle for **more than 24 hours** are eligible. Reads and admissions
+For backend-deletion checks, only blocks idle for **more than 24 hours** are eligible. Reads and admissions
 refresh a process-local, monotonic block timestamp, shared by all of its pages.
 The task walks resident metadata, without scanning cache directories or listing
 the backend. Each round traverses one fixed queue generation in batches. Each
@@ -174,7 +175,7 @@ to the next batch in the same round so slow objects cannot starve the remainder.
 Batches within a round have a one-second delay after completion; this is pacing,
 not the interval between full scans. Local deletion waits can extend a batch
 beyond the HEAD deadline. Each batch releases its background task slot before the
-continuation delay, allowing other maintenance and the ownership policy to run.
+continuation delay, allowing other maintenance to run.
 The `stale_gc` task metrics now count batches, rather than complete scan rounds.
 The existing disk concurrency and deletion rate budgets apply to unlinks, not
 HEAD traffic. A whole-block removal charges deletion work for all resident pages,

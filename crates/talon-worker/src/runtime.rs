@@ -10,7 +10,7 @@ mod background;
 mod load;
 mod stale_gc;
 pub use background::WorkerBackground;
-pub mod ownership_gc;
+mod ownership_gc;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;

@@ -170,13 +170,13 @@ pub struct WorkerConfig {
     /// once. This bounds a fragmented block's fan-out to the backend and local
     /// cache while still overlapping unrelated misses.
     pub paged_miss_run_concurrency: usize,
-    /// Ownership GC scan-round interval in seconds; 0 disables ownership cleanup.
+    /// Shared stale-GC round interval when ownership is enabled; 0 disables ownership cleanup.
     pub ownership_gc_interval_secs: u64,
     /// Number of placement candidates to retain; must cover every reader replica count.
     pub ownership_gc_replicas: usize,
-    /// Maximum blocks checked per ownership GC tick.
+    /// Maximum blocks scanned per shared stale-GC batch when ownership is enabled.
     pub ownership_gc_scan_batch_size: usize,
-    /// Maximum cache units attempted per ownership GC tick.
+    /// Maximum block candidates per shared stale-GC batch when ownership is enabled.
     pub ownership_gc_delete_batch_size: usize,
     /// Worker-wide LOAD payload bytes reserved through cache commit (default 1 GiB).
     pub load_inflight_bytes: u64,
@@ -784,10 +784,10 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS", key: "ownership_gc_interval_secs", default: Some("0"), cli: false, secret: false, help: "Ownership GC scan-round interval in seconds; 0 disables ownership cleanup." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS", key: "ownership_gc_interval_secs", default: Some("0"), cli: false, secret: false, help: "Shared stale-GC round interval when ownership is enabled; 0 disables ownership cleanup." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE", key: "ownership_gc_scan_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum blocks checked per ownership GC tick." },
-    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE", key: "ownership_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum cache units attempted per ownership GC tick." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE", key: "ownership_gc_scan_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum blocks scanned per shared stale-GC batch when ownership is enabled." },
+    ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE", key: "ownership_gc_delete_batch_size", default: Some("1024"), cli: false, secret: false, help: "Maximum block candidates per shared stale-GC batch when ownership is enabled." },
     ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
     ConfigVar { env: "TALON_WORKER_PAGE_ACCESS_CHECKPOINT_INTERVAL_MINUTES", key: "page_access_checkpoint_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Dirty page access checkpoint interval in minutes." },
     ConfigVar { env: "TALON_WORKER_PAGE_GC_INTERVAL_MINUTES", key: "page_gc_interval_minutes", default: Some("10"), cli: false, secret: false, help: "Delay between complete page GC passes in minutes." },

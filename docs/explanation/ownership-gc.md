@@ -1,9 +1,11 @@
 # Cache ownership cleanup in stale GC
 
-Workers can periodically reclaim clean local cache entries that no longer belong
-to their placement candidates. This extends `DESIGN.md` section 3 (Worker storage)
-and runs as a policy within the shared `stale_gc` service. This feature does not move data between Workers,
-delete origin objects, or touch staging/WAL data.
+Workers can reclaim clean local cache blocks outside their placement candidates.
+This extends `DESIGN.md` section 3 (Worker storage). Ownership is a predicate in
+the existing `StaleGc` block scan, alongside backend deletion. Both predicates
+share one cursor, pending queue, round boundary, scheduler registration and
+whole-block deletion transaction. No separate service or block index is added.
+Origin objects, staging and WAL data are outside its scope.
 
 ## Configuration
 
@@ -14,121 +16,99 @@ ownership_gc_scan_batch_size = 1024
 ownership_gc_delete_batch_size = 1024
 ```
 
-The interval defaults to `0` (disabled). Other defaults are shown above. Every
-field supports its uppercase `TALON_WORKER_` environment variable; environment
-values override TOML. Changes require a Worker restart. Batch limits and replica
-count must be positive. The example schedules one round per hour. The first
-round starts immediately; subsequent rounds wait the configured interval after
-the previous round finishes. `stale_gc_enabled` controls backend-deletion checks;
-`ownership_gc_interval_secs` independently controls ownership cleanup. Disabling
-either policy leaves the other enabled policy running in the same scheduler task.
+The interval defaults to `0`, disabling ownership cleanup. When enabled, it sets
+the **shared stale-GC round interval**, including backend checks if enabled.
+Without ownership cleanup, backend rounds retain their one-hour interval.
+The first round starts immediately; subsequent rounds wait the interval after
+the previous round finishes. Continuation batches wait one second and release
+the scheduler slot. There is no nested policy scheduler.
 
-Set `ownership_gc_replicas` to **at least the largest candidate count used by any
-reader or load planner**. It is a retention policy, not a replication command.
-The Worker retains candidates from both the global placement table and its own
-zone's table. This supports mixed global and zone-affine readers conservatively;
-it can deliberately retain extra cache. There is no automatic negotiation of
-reader replica counts. Arbitrary explicit prewarming on non-candidate Workers
-is subject to cleanup too.
+`stale_gc_enabled` independently enables backend-deletion checks. Disabling it
+leaves ownership cleanup available; disabling both removes the task. The scan
+and deletion settings above cap blocks scanned and block candidates per shared
+batch. They are further capped by the page-GC and worker-wide background limits,
+and scans never exceed 4096 blocks. A paged block counts as one candidate;
+**every resident page still consumes deletion-rate credit** before reclamation.
+All fields support uppercase `TALON_WORKER_` environment variables, overriding
+TOML. Changes require restart; batch sizes and replica count must be positive.
 
-## Membership and availability
+Set `ownership_gc_replicas` to at least the largest candidate count used by any
+reader or load planner. The Worker retains the union of global and local-zone
+top-k candidates, conservatively supporting mixed global and zone-affine readers.
+There is no automatic replica-count negotiation. Explicit prewarming outside
+these candidates is subject to cleanup.
 
-Each round fetches `MembershipQuery` from the Coordinator. Placement uses the
-retained logical membership, including offline and conflicted Workers, and excludes
-retired members. Process restarts and address changes do not change placement or
-trigger a full cache scan. There is no separate Worker stability timer. Once a
-scheduled round sees an authoritative membership change, it checks ownership
-using that view.
+## Scan and membership
 
-Every continuation batch fetches membership again. If it differs during an
-active round, the Worker ends that round and waits for the next scheduled run.
-Logical Worker IDs and zones participate in equality; response order, addresses,
-and instance availability do not.
-This stops partially executed rounds from continuing across observed disturbances.
-Polling cannot detect transitions entirely between observations, and cleanup does
-not add protection for Workers explicitly retired from logical membership.
+Each batch obtains fresh `MembershipQuery` data from the Coordinator. Placement
+uses retained logical Workers, including offline and conflicted instances, and
+excludes retired members. Response ordering, addresses and instance availability
+do not affect placement. There is no additional Worker stability timer.
 
-Query failures, unsupported replies, empty membership, duplicate IDs, or absence
-of this Worker end the current round. Last-good membership is never used for
-deletion after a failed query. The Coordinator must support
-retained membership; on secured deployments it must also allow that read on its
-authenticated Worker listener. Upgrade Coordinators before enabling this feature.
-No wire schema change is required.
+A membership change between rounds resets the ownership watermark. A change
+during a round, invalid membership, missing local Worker, or query failure pauses
+ownership for the rest of that round and resets its watermark. Backend checks
+can continue. The next round requires another successful membership query;
+last-good membership never authorizes deletion after a failed query. Coordinator
+upgrade must precede enabling cleanup: retained membership queries must also be
+allowed on its authenticated Worker listener. No wire schema changes are needed.
 
-Each fresh observation authorizes at most one bounded batch with a one-second
-execution budget. Waiting for deletion rate, disk permits, page GC permits, or
-block gates is bounded by this deadline; mutations recheck it before unlinking.
-An already-started unlink may finish after the budget, including its
-index/accounting transaction. Each continuation batch obtains another membership
-snapshot.
-Membership can change immediately after any observation; this is a conservative
-cache policy, not a distributed ownership transaction. It requires no peer-copy
-confirmation because cached bytes remain recoverable from the origin.
+The shared scanner checks ownership before applying backend idle and HEAD
+filters. Misplaced blocks do not require 24-hour idleness or a HEAD. Remaining
+blocks need more than 24 hours of idleness and authoritative backend `NotFound`,
+with the existing positive-check cooldown and bounded HEAD work.
 
-## Cost and progress
+Ownership remembers a scalar checked-through watermark in the existing
+admission-ordered block queue. With unchanged membership, already checked owned
+blocks need no placement computation. Deferred misplaced blocks move beyond the
+frozen round boundary in that same queue; new blocks already enter it on admission.
+No ownership bookkeeping is added to cache hits or page fills. A full round has a
+finite admission boundary, so concurrent fills and protected blocks cannot keep
+it alive indefinitely.
 
-When enabled, startup constructs an in-memory ordered admission index with one
-entry per resident block. New blocks and newly materialized pages mark their
-block for inspection. Cache hits do not update this index. A membership change
-resets the scan cursor; otherwise only admissions and unfinished deletions after
-the cursor are examined. Removed blocks leave no queued metadata behind.
+With backend checks disabled, stable membership and no new/deferred blocks need
+O(1) local scan work. With backend checks enabled, the existing cold-block scan
+still runs, skipping ownership calculations before its watermark. Membership
+transfer and canonicalization cost O(N log N); placement tables rebuild only on
+membership changes. Deferring a block costs O(log B), reusing existing O(B)
+block metadata. The task does not clone the complete resident index or scan disk.
 
-For B cached blocks and N Workers:
+## Reclamation and protection
 
-- Once a pass is complete, stable membership with no new admissions or pending
-  deletions performs an **O(1) local scan-watermark check**, independent of B.
-- Membership polling still transfers O(N) information and canonicalizes it in
-  O(N log N). The whole task is not O(1) in cluster size. Maglev tables are rebuilt
-  only when membership changes.
-- Enabled admission bookkeeping costs O(log B) per new cache unit, with O(B)
-  additional metadata, including a copy of each BlockId. Disabled Workers do not
-  allocate this ordered index. No placement computation is added to cache hits.
-- Actual scans enumerate at most the configured block budget in chunks of 64;
-  they never clone the full block index or walk the disk tree. Ownership hashes
-  are computed per block, not per page. Page enumeration is ordered and bounded.
-- Deletion attempts are bounded separately by cache-unit count and sequential.
-  Continuation batches are paced at one second, independently of the configured
-  hourly round interval. Each round freezes its admission watermark and each
-  partial block freezes its page upper bound, so concurrent fills cannot extend
-  the round indefinitely. Each batch releases its scheduler slot before the
-  continuation delay. Scan/delete batch sizes are capped by the corresponding
-  `background_*_batch_size` settings. All deletions share the background disk
-  concurrency and deletion rate budget; paged deletions also share the page GC I/O
-  semaphore. Larger caches can trade cleanup latency for lower foreground I/O
-  interference. Physical release can lag unlink while readers hold open FDs.
+Both reasons use the same whole-block mutation. Before deleting, it rechecks
+admission revision, block activity and pins under the mutation gate, then claims
+all resident pages. Any active reader defers the entire block. Successful removal
+retires all files, L1 entries, lifecycle metadata, index entries and accounting.
+Failed deletion retains conservative accounting and releases page claims. Failed
+ownership cleanup waits for fresh membership next round; TTI does not replay it.
 
-Read protections, policy pins, concurrent admissions and deletion failures can
-defer reclamation. Partial blocks resume from a page cursor within the same round;
-protected/failed pages and new admissions after the round watermark wait for the
-next scheduled round. Admission and retry entries coalesce per block,
-so sustained failures cannot create an unbounded retry queue. Ownership unlink
-failures never become ordinary TTI retries: only a new authorized ownership batch
-may retry them. Normal TTI/capacity policies remain independent.
+Ownership charges deletion credits before final authorization. If rate waiting
+exhausts the fresh snapshot's authorization window, it queries membership again
+and requires the same placement. This lets blocks larger than one second's rate
+budget make progress without deleting on an old observation. Subsequent I/O,
+page-GC semaphore and block-gate waits have an authorization deadline of at most
+one second from query start, capped by the membership response validity;
+expiry defers the block. The mutation rechecks the deadline before unlinking.
+An already-started unlink completes its owned accounting transaction even if its
+caller is cancelled or the deadline subsequently expires.
 
-Ownership cleanup runs under task `stale_gc` in `WorkerBackground`, so global task
-concurrency and per-task metrics include it. Shutdown stops admission of new
-batches, finishes an active batch and its owned mutations, then flushes access
-metadata under the existing Worker drain deadline. The two policies have separate
-round clocks and cursors; an ongoing backend round does not require ownership
-cleanup to wait for the full round. Scheduler completion metrics count batches.
-
-Unlike backend-deletion cleanup, ownership cleanup does not require 24 hours of
-idle time or issue HEAD requests. It checks ownership per block, then reclaims
-unprotected pages in bounded batches; protected pages can remain for the next
-round. Backend-deletion cleanup continues to claim and retire an entire block.
+Polling cannot detect every membership transition, and membership can change
+immediately after an observation. Cleanup is a cache policy, not a distributed
+ownership transaction, and needs no peer-copy confirmation because the origin
+retains the data. Logical retirement does not add a separate grace period.
 
 ## Observation and validation
 
-`talon_worker_ownership_gc_checked_total` counts blocks examined;
+`talon_worker_ownership_gc_checked_total` counts ownership block checks;
 `talon_worker_ownership_gc_attempted_total` counts selected cache units.
-Page reclamation adds `reason="ownership"` to the existing
-`talon_worker_page_gc_reclaimed_total` and reclaimed-byte counters. Whole-block
-deletions use the existing general eviction counter. Query failures are logged
-and pause cleanup. Compare filesystem usage separately from logical residency.
+Paged reclamation uses `reason="ownership"` in existing page/byte counters;
+whole-file removal uses the general eviction counter. Scheduler task `stale_gc`
+counts batches. Shutdown uses the existing maintenance and owned-mutation drain.
 
-Regression coverage includes stable no-op ticks, incremental admissions,
-membership changes between/during rounds, query failure state, missing/duplicate members,
-top-k and zone retention, whole/paged deletion, hourly scheduling with bounded
-batch continuation, finite rounds under concurrent admissions, reader
-protection, unlink failures and expiration while waiting for mutation gates.
-These tests do not establish production CPU/latency or disk throughput numbers.
+Regression tests cover shared scans, bounded round continuation, stable ownership
+watermarks, new admissions, membership changes/failures, independent backend
+checks, top-k/zone retention, whole/paged cleanup, whole-block reader/pin protection,
+rate-wait reauthorization, and expiration behind disk permits or mutation gates.
+The existing stale-block tests cover concurrent reads/fills, unlink failures,
+cancellation, HEAD cooldown and request bounds. These are local correctness
+checks, not production throughput or latency acceptance.

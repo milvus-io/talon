@@ -1,30 +1,69 @@
-//! Reclaim cold local cache entries only after an authoritative backend NotFound.
-use super::WorkerRuntime;
-use crate::eviction::access_millis;
+//! One bounded block scan for backend-deleted and misplaced cache entries.
+use super::{ownership_gc::Ownership, WorkerRuntime};
+use crate::eviction::{access_millis, StaleBlockCandidate};
 use std::{
     collections::{HashMap, VecDeque},
-    time::Duration,
+    time::{Duration, Instant},
 };
-use talon_core::Error;
+use talon_core::{Error, WorkerConfig};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
 
-#[derive(Default)]
 pub(super) struct StaleGc {
     cursor: (u64, u64),
     round_time: Option<u64>,
-    pending: VecDeque<crate::eviction::StaleBlockCandidate>,
+    pending: VecDeque<StaleBlockCandidate>,
+    backend_enabled: bool,
+    ownership: Option<Ownership>,
+    ownership_watermark: u64,
+    ownership_active: bool,
+    interval: Duration,
+    limits: Option<(usize, usize)>,
+}
+
+impl Default for StaleGc {
+    fn default() -> Self {
+        Self {
+            cursor: (0, 0),
+            round_time: None,
+            pending: VecDeque::new(),
+            backend_enabled: true,
+            ownership: None,
+            ownership_watermark: 0,
+            ownership_active: false,
+            interval: Duration::from_secs(3600),
+            limits: None,
+        }
+    }
 }
 
 impl StaleGc {
-    /// Preserve the round's age cutoff and admission ceiling across scheduler batches.
-    async fn run_batch(&mut self, worker: &WorkerRuntime) -> Duration {
+    pub(super) fn new(config: &WorkerConfig, ownership: Option<Ownership>) -> Self {
+        let enabled = ownership.is_some();
+        Self {
+            backend_enabled: config.stale_gc_enabled,
+            ownership,
+            interval: Duration::from_secs(if enabled {
+                config.ownership_gc_interval_secs
+            } else {
+                3600
+            }),
+            limits: enabled.then_some((
+                config.ownership_gc_scan_batch_size,
+                config.ownership_gc_delete_batch_size,
+            )),
+            ..Self::default()
+        }
+    }
+
+    /// The scheduler owns the only clock: one-second batches, then one round interval.
+    pub(super) async fn run_batch(&mut self, worker: &WorkerRuntime) -> Duration {
         let now = *self.round_time.get_or_insert_with(access_millis);
         self.tick_at(worker, now).await;
         if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
             self.round_time = None;
-            Duration::from_secs(3600)
+            self.interval
         } else {
             Duration::from_secs(1)
         }
@@ -37,20 +76,66 @@ impl StaleGc {
             if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() {
                 break;
             }
-            // Pace batches within this round without repeatedly scanning the cache
-            // between hourly rounds. Newly admitted units wait for the next round.
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
 
+    fn pause_ownership(&mut self) {
+        self.ownership_active = false;
+        self.ownership_watermark = 0;
+    }
+
     async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) {
+        let starting = self.cursor.0 >= self.cursor.1 && self.pending.is_empty();
+        if starting {
+            self.ownership_active = self.ownership.is_some();
+        }
+        if self.ownership_active {
+            match self
+                .ownership
+                .as_mut()
+                .expect("enabled ownership")
+                .refresh()
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) if starting => self.ownership_watermark = 0,
+                result => {
+                    tracing::warn!(?result, "stale GC ownership view unavailable or changed; deferring ownership until next round");
+                    self.pause_ownership();
+                }
+            }
+        }
+        let mut ownership_deadline = self
+            .ownership
+            .as_ref()
+            .map_or_else(Instant::now, |policy| policy.valid_until);
+        if starting {
+            self.cursor = (
+                if self.backend_enabled {
+                    0
+                } else {
+                    self.ownership_watermark
+                },
+                worker.lru.stale_scan_ceiling(),
+            );
+        }
+        if !self.backend_enabled && !self.ownership_active {
+            self.pending.clear();
+            self.cursor.0 = self.cursor.1;
+            return;
+        }
         if self.pending.is_empty() {
             let lru = worker.lru.clone();
             let mut cursor = self.cursor;
-            let scan = worker.page_gc_config.scan_batch_size.min(4096);
-            let deletes = worker.page_gc_config.delete_batch_size;
+            let (scan, deletes) = self.limits.unwrap_or((usize::MAX, usize::MAX));
+            let limits = (
+                worker.page_gc_config.scan_batch_size.min(4096).min(scan),
+                worker.page_gc_config.delete_batch_size.min(deletes),
+            );
+            let ownership = self.ownership_active;
             let (cursor, candidates) = tokio::task::spawn_blocking(move || {
-                let candidates = lru.stale_gc_candidates(&mut cursor, now, DAY_MS, scan, deletes);
+                let candidates = lru.scan_stale_blocks(&mut cursor, now, DAY_MS, limits, ownership);
                 (cursor, candidates)
             })
             .await
@@ -58,11 +143,76 @@ impl StaleGc {
             self.cursor = cursor;
             self.pending = candidates.into();
         }
-        // Bound backend work separately from the shared *local disk* budget.
-        // Neither transient errors nor NotFound are cached across batches.
+        // Ownership is checked before the cold/HEAD filter. Reuse the same queue
+        // for deferred blocks, after the frozen boundary, so retries cannot
+        // extend this round or need another per-block index.
+        let mut misplaced = Vec::new();
+        if self.ownership_active {
+            let ownership = self.ownership.as_ref().expect("enabled ownership");
+            self.pending.retain(|candidate| {
+                if candidate.position < self.ownership_watermark {
+                    return true;
+                }
+                worker.page_gc_metrics.ownership_checked.inc();
+                if ownership.owns(&candidate.block) {
+                    return true;
+                }
+                worker.lru.defer_stale_block(&candidate.block);
+                misplaced.push(candidate.clone());
+                false
+            });
+        }
+        if !misplaced.is_empty() {
+            // Charge every page, including blocks larger than the batch target.
+            // Rate waiting precedes final membership authorization; a large block
+            // must not permanently lose its one-second authorization while pacing.
+            if let Some(budget) = &worker.background_budget {
+                for candidate in &misplaced {
+                    budget.delete_units(candidate.units as u64).await;
+                }
+            }
+            if Instant::now() >= ownership_deadline {
+                if matches!(
+                    self.ownership
+                        .as_mut()
+                        .expect("enabled ownership")
+                        .refresh()
+                        .await,
+                    Ok(true)
+                ) {
+                    ownership_deadline = self
+                        .ownership
+                        .as_ref()
+                        .expect("enabled ownership")
+                        .valid_until;
+                } else {
+                    self.pause_ownership();
+                }
+            }
+            if self.ownership_active {
+                for candidate in misplaced {
+                    if Instant::now() >= ownership_deadline {
+                        break;
+                    }
+                    worker
+                        .page_gc_metrics
+                        .ownership_attempted
+                        .add(candidate.units as u64);
+                    worker
+                        .unlink_stale_block_for(candidate, Some(ownership_deadline))
+                        .await;
+                }
+            }
+        }
+        // Backend work is bounded independently of local disk pacing. Warm blocks
+        // and successful checks within 24 hours never issue a HEAD.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let mut checked = HashMap::new();
         while let Some(candidate) = self.pending.front() {
+            if !self.backend_enabled || now.saturating_sub(candidate.last_access) <= DAY_MS {
+                self.pending.pop_front();
+                continue;
+            }
             let object = &candidate.block.object;
             if !checked.contains_key(object)
                 && (checked.len() >= MAX_HEADS || tokio::time::Instant::now() >= deadline)
@@ -97,69 +247,12 @@ impl StaleGc {
                 missing
             };
             if missing {
-                // Admission revisions, block activity and pins are rechecked under
-                // the mutation gate; I/O failures retain resident accounting.
                 worker.unlink_stale_block(candidate).await;
             }
         }
-    }
-}
-
-/// One scheduler registration for independent backend and ownership policies.
-/// A waiting policy releases the shared task slot; each keeps its own round clock.
-pub(super) struct StaleGcService {
-    backend: Option<StaleGc>,
-    backend_next: tokio::time::Instant,
-    ownership: Option<super::ownership_gc::OwnershipService>,
-    ownership_next: tokio::time::Instant,
-}
-impl StaleGcService {
-    pub(super) fn new(
-        backend_enabled: bool,
-        ownership: Option<super::ownership_gc::OwnershipService>,
-    ) -> Self {
-        Self {
-            backend: backend_enabled.then(StaleGc::default),
-            backend_next: tokio::time::Instant::now(),
-            ownership,
-            ownership_next: tokio::time::Instant::now(),
+        if self.cursor.0 >= self.cursor.1 && self.pending.is_empty() && self.ownership_active {
+            self.ownership_watermark = self.cursor.1;
         }
-    }
-
-    pub(super) async fn run_batch(&mut self, worker: &WorkerRuntime) -> Duration {
-        let now = tokio::time::Instant::now();
-        // Admit one policy per invocation. Oldest-due first prevents a long
-        // backend scan from postponing every ownership batch until round end.
-        let ownership_due = self.ownership.is_some() && self.ownership_next <= now;
-        let backend_due = self.backend.is_some() && self.backend_next <= now;
-        if ownership_due && (!backend_due || self.ownership_next <= self.backend_next) {
-            let delay = self
-                .ownership
-                .as_mut()
-                .expect("enabled ownership policy")
-                .run_batch(worker)
-                .await;
-            self.ownership_next = tokio::time::Instant::now() + delay;
-        } else if backend_due {
-            let delay = self
-                .backend
-                .as_mut()
-                .expect("enabled backend policy")
-                .run_batch(worker)
-                .await;
-            self.backend_next = tokio::time::Instant::now() + delay;
-        }
-        let next = self
-            .backend
-            .as_ref()
-            .map(|_| self.backend_next)
-            .into_iter()
-            .chain(self.ownership.as_ref().map(|_| self.ownership_next))
-            .min();
-        next.map_or(Duration::from_secs(3600), |at| {
-            at.saturating_duration_since(tokio::time::Instant::now())
-                .max(Duration::from_millis(1))
-        })
     }
 }
 
@@ -250,71 +343,6 @@ mod tests {
     }
     fn cold_now() -> u64 {
         access_millis() + DAY_MS + 1
-    }
-
-    #[tokio::test]
-    async fn stale_service_interleaves_ownership_with_backend_round_batches() {
-        use talon_core::worker_membership::{MemberRegistry, WorkerDiscovery, WorkerMember};
-        use talon_core::{NodeId, WorkerConfig};
-        use talon_transport::{codec, ControlMessage};
-        use tokio::{io::AsyncWriteExt, net::TcpListener};
-        let root = tempfile::tempdir().unwrap();
-        let origin = Arc::new(Origin::default());
-        origin.mode.store(2, Ordering::Relaxed);
-        let mut r = runtime(root.path(), false, origin.clone());
-        r.page_gc_config.scan_batch_size = 1;
-        for n in 0..3 {
-            fill(&r, &block(n), false).await;
-        }
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let cfg = WorkerConfig {
-            coordinator: listener.local_addr().unwrap().to_string(),
-            ownership_gc_interval_secs: 3600,
-            ..Default::default()
-        };
-        let query = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            assert_eq!(
-                crate::tokio_conn::read_control(&mut stream).await.unwrap(),
-                Some(ControlMessage::MembershipQuery {})
-            );
-            let view = WorkerDiscovery::retained(
-                &MemberRegistry {
-                    members: vec![WorkerMember {
-                        worker_id: "a".into(),
-                        zone: None,
-                        retired: false,
-                    }],
-                    ..Default::default()
-                },
-                &[],
-            );
-            stream
-                .write_all(&codec::encode(0, &ControlMessage::MembershipList { view }).unwrap())
-                .await
-                .unwrap();
-        });
-        let ownership =
-            super::super::ownership_gc::OwnershipService::new(NodeId::new("a"), &r, &cfg, None);
-        let mut service = StaleGcService::new(true, Some(ownership));
-        service.backend.as_mut().unwrap().round_time = Some(cold_now());
-        service.backend_next = tokio::time::Instant::now() - Duration::from_secs(1);
-        service.run_batch(&r).await;
-        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
-        assert!(service.backend.as_ref().unwrap().round_time.is_some());
-        // Ownership is due before the next backend batch, even though its round
-        // is unfinished. The sole logical member retains all three blocks.
-        service.run_batch(&r).await;
-        tokio::time::timeout(Duration::from_secs(1), query)
-            .await
-            .unwrap()
-            .unwrap();
-        assert!(service.ownership_next > tokio::time::Instant::now() + Duration::from_secs(3599));
-        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
-        service.backend_next = tokio::time::Instant::now();
-        service.run_batch(&r).await;
-        assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(r.resident_bytes(), 96);
     }
 
     #[tokio::test]
@@ -769,5 +797,337 @@ mod tests {
         assert_eq!(r.resident_bytes(), 0);
         assert_eq!(r.lru.total_bytes(), 0);
         assert!(!r.paged.as_ref().unwrap().dir_for(&block(0)).exists());
+    }
+    struct MembershipServer {
+        members: Arc<std::sync::Mutex<Option<Vec<&'static str>>>>,
+        calls: Arc<AtomicUsize>,
+        config: WorkerConfig,
+        task: tokio::task::JoinHandle<()>,
+    }
+    impl Drop for MembershipServer {
+        fn drop(&mut self) {
+            self.task.abort();
+        }
+    }
+    impl MembershipServer {
+        async fn start() -> Self {
+            use talon_core::worker_membership::{MemberRegistry, WorkerDiscovery, WorkerMember};
+            use talon_transport::{codec, ControlMessage};
+            use tokio::io::AsyncWriteExt;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let config = WorkerConfig {
+                coordinator: listener.local_addr().unwrap().to_string(),
+                ownership_gc_interval_secs: 3600,
+                stale_gc_enabled: false,
+                ..Default::default()
+            };
+            let members = Arc::new(std::sync::Mutex::new(Some(vec!["a", "b"])));
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (snapshot, seen) = (members.clone(), calls.clone());
+            let task = tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    assert_eq!(
+                        crate::tokio_conn::read_control(&mut stream).await.unwrap(),
+                        Some(ControlMessage::MembershipQuery {})
+                    );
+                    seen.fetch_add(1, Ordering::Relaxed);
+                    let reply = match snapshot.lock().unwrap().clone() {
+                        Some(members) => ControlMessage::MembershipList {
+                            view: WorkerDiscovery::retained(
+                                &MemberRegistry {
+                                    members: members
+                                        .into_iter()
+                                        .map(|id| WorkerMember {
+                                            worker_id: id.into(),
+                                            zone: None,
+                                            retired: false,
+                                        })
+                                        .collect(),
+                                    ..Default::default()
+                                },
+                                &[],
+                            ),
+                        },
+                        None => ControlMessage::Ack {
+                            ok: false,
+                            detail: None,
+                        },
+                    };
+                    stream
+                        .write_all(&codec::encode(0, &reply).unwrap())
+                        .await
+                        .unwrap();
+                }
+            });
+            Self {
+                members,
+                calls,
+                config,
+                task,
+            }
+        }
+        fn gc(&self) -> StaleGc {
+            StaleGc::new(
+                &self.config,
+                Some(Ownership::new(
+                    talon_core::NodeId::new("a"),
+                    &self.config,
+                    None,
+                )),
+            )
+        }
+    }
+    fn placed(owner: &str, offset: usize) -> BlockId {
+        let nodes = ["a", "b"].map(|id| talon_core::NodeInfo {
+            id: talon_core::NodeId::new(id),
+            address: String::new(),
+            role: talon_core::NodeRole::Worker,
+        });
+        let table = talon_core::CachePlacementTable::new(&nodes);
+        (0..10000)
+            .map(block)
+            .filter(|id| table.primary(id).unwrap().id.0 == owner)
+            .nth(offset)
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn one_scan_checks_ownership_before_cold_backend_filter() {
+        for paged in [false, true] {
+            let mut server = MembershipServer::start().await;
+            server.config.stale_gc_enabled = true;
+            let root = tempfile::tempdir().unwrap();
+            let origin = Arc::new(Origin::default());
+            let mut r = runtime(root.path(), paged, origin.clone());
+            r.page_gc_config.scan_batch_size = 1;
+            let misplaced = placed("b", 0);
+            let owned = placed("a", 0);
+            fill(&r, &misplaced, paged).await;
+            fill(&r, &owned, paged).await;
+            let mut gc = server.gc();
+            gc.tick_at(&r, access_millis()).await;
+            assert!(r.index.get(&misplaced).is_none());
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+            assert!(gc.cursor.0 < gc.cursor.1);
+            gc.tick_at(&r, cold_now()).await;
+            assert!(r.index.get(&owned).is_none());
+            assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(server.calls.load(Ordering::Relaxed), 2);
+            assert_eq!(r.resident_bytes(), 0);
+            assert_eq!(r.l1.resident_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_queue_preserves_incremental_ownership_and_finite_rounds() {
+        let server = MembershipServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        let mut r = runtime(root.path(), false, origin.clone());
+        r.page_gc_config.scan_batch_size = 1;
+        fill(&r, &placed("a", 0), false).await;
+        fill(&r, &placed("a", 1), false).await;
+        let mut gc = server.gc();
+        assert_eq!(gc.run_batch(&r).await, Duration::from_secs(1));
+        let ceiling = gc.cursor.1;
+        fill(&r, &placed("b", 0), false).await;
+        assert_eq!(gc.run_batch(&r).await, Duration::from_secs(3600));
+        assert_eq!(gc.cursor.1, ceiling);
+        assert!(r.index.get(&placed("b", 0)).is_some());
+        assert_eq!(gc.run_batch(&r).await, Duration::from_secs(3600));
+        assert!(r.index.get(&placed("b", 0)).is_none());
+        // No rescanning of stable owned blocks. The only residual queue range
+        // is the now-removed deferred block; afterwards start equals end.
+        gc.run_batch(&r).await;
+        assert_eq!(gc.cursor.0, gc.ownership_watermark);
+        assert_eq!(gc.cursor.0, r.lru.stale_scan_ceiling());
+        let cursor = gc.cursor;
+        let checks = r.page_gc_metrics.ownership_checked.get();
+        gc.run_batch(&r).await;
+        assert_eq!(gc.cursor, cursor);
+        assert_eq!(r.page_gc_metrics.ownership_checked.get(), checks);
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn membership_change_or_failure_pauses_ownership_until_next_round() {
+        for failed in [false, true] {
+            let server = MembershipServer::start().await;
+            *server.members.lock().unwrap() = Some(vec!["a"]);
+            let root = tempfile::tempdir().unwrap();
+            let mut r = runtime(root.path(), false, Arc::new(Origin::default()));
+            r.page_gc_config.scan_batch_size = 1;
+            for n in 0..2 {
+                fill(&r, &placed("b", n), false).await;
+            }
+            let mut gc = server.gc();
+            assert_eq!(gc.run_batch(&r).await, Duration::from_secs(1));
+            *server.members.lock().unwrap() = if failed { None } else { Some(vec!["a", "b"]) };
+            assert_eq!(gc.run_batch(&r).await, Duration::from_secs(3600));
+            assert_eq!(r.index.len(), 2);
+            *server.members.lock().unwrap() = Some(vec!["a", "b"]);
+            while gc.run_batch(&r).await != Duration::from_secs(3600) {}
+            assert!(r.index.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_reader_and_pin_defer_entire_block_to_next_round() {
+        let server = MembershipServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), true, Arc::new(Origin::default()));
+        let id = placed("b", 0);
+        fill(&r, &id, true).await;
+        let state = r.page_lifecycle.block(&id);
+        let reader = state.acquire(PageIndex(0)).unwrap();
+        let mut gc = server.gc();
+        gc.run_batch(&r).await;
+        assert_eq!(r.index.page_count(), 2);
+        drop(reader);
+        let pin = r
+            .lru
+            .pin_guard(CacheUnit::Page(id.clone(), PageIndex(1)))
+            .unwrap();
+        gc.run_batch(&r).await;
+        assert_eq!(r.index.page_count(), 2);
+        drop(pin);
+        gc.run_batch(&r).await;
+        assert!(r.index.is_empty());
+        assert!(state.acquire(PageIndex(0)).is_none());
+        assert_eq!(r.resident_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn failed_membership_does_not_disable_backend_deletion() {
+        let mut server = MembershipServer::start().await;
+        server.config.stale_gc_enabled = true;
+        *server.members.lock().unwrap() = None;
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        let r = runtime(root.path(), false, origin.clone());
+        fill(&r, &placed("b", 0), false).await;
+        server.gc().tick_at(&r, cold_now()).await;
+        assert!(r.index.is_empty());
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn ownership_deadline_bounds_io_and_gate_waits() {
+        for gate_wait in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut r = runtime(root.path(), true, Arc::new(Origin::default()));
+            let id = placed("b", 0);
+            fill(&r, &id, true).await;
+            let budget = crate::background::BackgroundBudget::new(&WorkerConfig {
+                background_io_concurrency: 1,
+                ..Default::default()
+            });
+            let held_io = if gate_wait {
+                None
+            } else {
+                Some(budget.io().await)
+            };
+            r.background_budget = Some(budget);
+            let state = r.page_lifecycle.block(&id);
+            let held_gate = if gate_wait {
+                Some(state.gate.lock().await)
+            } else {
+                None
+            };
+            let candidate = r
+                .lru
+                .scan_stale_blocks(
+                    &mut (0, r.lru.stale_scan_ceiling()),
+                    access_millis(),
+                    DAY_MS,
+                    (1, 1),
+                    true,
+                )
+                .pop()
+                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                r.unlink_stale_block_for(
+                    candidate,
+                    Some(Instant::now() + Duration::from_millis(20)),
+                ),
+            )
+            .await
+            .unwrap();
+            assert_eq!(r.page_mutations.active_count(), 0);
+            assert_eq!(r.index.page_count(), 2);
+            drop(held_gate);
+            drop(held_io);
+        }
+    }
+
+    #[tokio::test]
+    async fn ownership_unlink_failure_requires_fresh_membership_on_retry() {
+        let server = MembershipServer::start().await;
+        let root = tempfile::tempdir().unwrap();
+        let r = runtime(root.path(), true, Arc::new(Origin::default()));
+        let id = placed("b", 0);
+        fill(&r, &id, true).await;
+        let dir = r.paged.as_ref().unwrap().dir_for(&id);
+        let saved = dir.with_extension("saved");
+        std::fs::rename(&dir, &saved).unwrap();
+        std::fs::write(&dir, b"not a directory").unwrap();
+        let mut gc = server.gc();
+        gc.run_batch(&r).await;
+        assert_eq!(r.resident_bytes(), 32);
+        let state = r.page_lifecycle.block(&id);
+        for page in 0..2 {
+            assert!(state.acquire(PageIndex(page)).is_some());
+        }
+        std::fs::remove_file(&dir).unwrap();
+        std::fs::rename(&saved, &dir).unwrap();
+        r.gc_once().await;
+        assert_eq!(r.resident_bytes(), 32);
+        *server.members.lock().unwrap() = None;
+        gc.run_batch(&r).await;
+        assert_eq!(r.resident_bytes(), 32);
+        *server.members.lock().unwrap() = Some(vec!["a", "b"]);
+        gc.run_batch(&r).await;
+        assert!(r.index.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rate_wait_refreshes_membership_before_whole_block_deletion() {
+        for changed in [false, true] {
+            let server = MembershipServer::start().await;
+            let root = tempfile::tempdir().unwrap();
+            let mut r = runtime(root.path(), true, Arc::new(Origin::default()));
+            let id = placed("b", 0);
+            // More pages than one second of credits: progress requires a new
+            // observation after waiting, and a changed view must prevent deletion.
+            for p in 0..3 {
+                r.commit_fetched_page(&id, PageIndex(p), 64, Bytes::from_static(&[1; 16]))
+                    .await
+                    .unwrap();
+            }
+            r.background_budget = Some(crate::background::BackgroundBudget::new(&WorkerConfig {
+                background_delete_max_per_sec: 1,
+                ..Default::default()
+            }));
+            let mut gc = server.gc();
+            let run = gc.run_batch(&r);
+            let disturbance = async {
+                if changed {
+                    while server.calls.load(Ordering::Relaxed) == 0 {
+                        tokio::task::yield_now().await;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    *server.members.lock().unwrap() = Some(vec!["a"]);
+                }
+            };
+            tokio::time::timeout(Duration::from_secs(5), async {
+                tokio::join!(run, disturbance);
+            })
+            .await
+            .unwrap();
+            assert!(server.calls.load(Ordering::Relaxed) >= 2);
+            assert_eq!(r.index.is_empty(), !changed);
+        }
     }
 }

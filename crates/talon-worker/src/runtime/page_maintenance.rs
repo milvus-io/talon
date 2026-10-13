@@ -229,7 +229,7 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
     ) -> Option<u64> {
-        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes, None)
+        self.evict_page_candidate_to_target(candidate, reason, self.capacity_bytes)
             .await
     }
 
@@ -238,21 +238,15 @@ impl WorkerRuntime {
         candidate: GcCandidate,
         reason: usize,
         target: u64,
-        deadline: Option<Instant>,
     ) -> Option<u64> {
         let runtime = self.clone();
-        let permit = before_deadline(deadline, self.page_gc_io.clone().acquire_owned())
-            .await?
-            .ok()?;
+        let permit = self.page_gc_io.clone().acquire_owned().await.ok()?;
         self.page_mutations.run(async move {
             let _permit = permit;
-            before_deadline(deadline, runtime.background_delete()).await?;
-            let _background_io = before_deadline(deadline, runtime.background_io()).await?;
+            runtime.background_delete().await;
+            let _background_io = runtime.background_io().await;
             let block = &candidate.block;
-            let _gate = if let Some(deadline) = deadline {
-                tokio::time::timeout_at(deadline.into(), block.gate.lock()).await.ok()?
-            } else { block.gate.lock().await };
-            if deadline.is_some_and(|d| Instant::now() >= d) { return None; }
+            let _gate = block.gate.lock().await;
             if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= target) { return None; }
             let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
@@ -319,21 +313,34 @@ impl WorkerRuntime {
     /// Retire an entire stale block in one owned mutation. Page count affects
     /// disk pacing, never which subset of the block is selected for eviction.
     pub(super) async fn unlink_stale_block(&self, candidate: crate::eviction::StaleBlockCandidate) {
+        self.unlink_stale_block_for(candidate, None).await;
+    }
+
+    /// Ownership supplies a fresh deadline after paying deletion credits.
+    pub(super) async fn unlink_stale_block_for(
+        &self,
+        candidate: crate::eviction::StaleBlockCandidate,
+        ownership_deadline: Option<Instant>,
+    ) {
         let runtime = self.clone();
         self.page_mutations.run(async move {
-            let _permit = runtime.page_gc_io.clone().acquire_owned().await
-                .expect("page GC semaphore closed");
-            if let Some(budget) = &runtime.background_budget {
-                budget.delete_units(candidate.units as u64).await;
+            let reason = if ownership_deadline.is_some() { 4 } else { 3 };
+            let Some(permit) = before_deadline(ownership_deadline, runtime.page_gc_io.clone().acquire_owned()).await else { return; };
+            let _permit = permit.expect("page GC semaphore closed");
+            if ownership_deadline.is_none() {
+                if let Some(budget) = &runtime.background_budget {
+                    budget.delete_units(candidate.units as u64).await;
+                }
             }
-            let _background_io = runtime.background_io().await;
+            let Some(_background_io) = before_deadline(ownership_deadline, runtime.background_io()).await else { return; };
             let state = runtime.page_lifecycle.block(&candidate.block);
             {
-                let _gate = state.gate.lock().await;
+                let Some(_gate) = before_deadline(ownership_deadline, state.gate.lock()).await else { return; };
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
                 let Some(claim) = state.claim_all_pages() else { return; };
                 // A reader may have completed while the pages were being closed.
                 if !runtime.lru.stale_candidate_is_current(&candidate) { return; }
+                if ownership_deadline.is_some_and(|at| Instant::now() >= at) { return; }
                 let id = &candidate.block;
                 let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
                 let pages = claim.len();
@@ -355,8 +362,8 @@ impl WorkerRuntime {
                 claim.finish(runtime.page_clock.now());
                 runtime.metrics.record_eviction();
                 if pages > 0 {
-                    runtime.page_gc_metrics.deleted[3].add(pages as u64);
-                    runtime.page_gc_metrics.bytes[3].add(bytes);
+                    runtime.page_gc_metrics.deleted[reason].add(pages as u64);
+                    runtime.page_gc_metrics.bytes[reason].add(bytes);
                 }
             }
             runtime.page_lifecycle.retire_empty(&candidate.block);
@@ -379,16 +386,6 @@ impl WorkerRuntime {
         reason: usize,
         target: u64,
     ) {
-        self.unlink_units_before(units, reason, target, None).await;
-    }
-
-    pub(super) async fn unlink_units_before(
-        &self,
-        units: Vec<crate::eviction::EvictionCandidate>,
-        reason: usize,
-        target: u64,
-        deadline: Option<Instant>,
-    ) {
         // Capture generations before the first await, not after earlier deletions finish.
         let candidates: Vec<_> = units
             .into_iter()
@@ -401,9 +398,6 @@ impl WorkerRuntime {
             })
             .collect();
         for (unit, candidate) in candidates {
-            if deadline.is_some_and(|d| Instant::now() >= d) {
-                break;
-            }
             let retired = match &unit.unit {
                 CacheUnit::Page(id, _) | CacheUnit::Whole(id) => id.clone(),
             };
@@ -411,8 +405,7 @@ impl WorkerRuntime {
                 CacheUnit::Page(_, _) => {
                     if self.lru.candidate_is_current(&unit) {
                         if let Some(c) = candidate {
-                            self.evict_page_candidate_to_target(c, reason, target, deadline)
-                                .await;
+                            self.evict_page_candidate_to_target(c, reason, target).await;
                         }
                     }
                 }
@@ -421,15 +414,9 @@ impl WorkerRuntime {
                     let runtime = self.clone();
                     self.page_mutations
                         .run(async move {
-                            if before_deadline(deadline, runtime.background_delete()).await.is_none() { return; }
-                            let Some(_background_io) = before_deadline(deadline, runtime.background_io()).await else { return; };
-                            let _gate = if let Some(deadline) = deadline {
-                                match tokio::time::timeout_at(deadline.into(), state.gate.lock()).await {
-                                    Ok(gate) => gate,
-                                    Err(_) => return,
-                                }
-                            } else { state.gate.lock().await };
-                            if deadline.is_some_and(|d| Instant::now() >= d) { return; }
+                            runtime.background_delete().await;
+                            let _background_io = runtime.background_io().await;
+                            let _gate = state.gate.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
                                     || runtime.lru.total_bytes() <= target)
@@ -637,14 +624,14 @@ impl WorkerRuntime {
     }
 }
 
-// Only use this before starting disk mutations: an admitted unlink must finish
-// its accounting transaction even if its membership observation expires.
 async fn before_deadline<F: std::future::Future>(
     deadline: Option<Instant>,
     work: F,
 ) -> Option<F::Output> {
     match deadline {
-        Some(at) => tokio::time::timeout_at(at.into(), work).await.ok(),
+        Some(at) => tokio::time::timeout_at(tokio::time::Instant::from_std(at), work)
+            .await
+            .ok(),
         None => Some(work.await),
     }
 }

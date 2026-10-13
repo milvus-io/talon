@@ -406,14 +406,7 @@ impl BlockState {
                 e.handle
                     .state
                     .fetch_update(Ordering::AcqRel, Ordering::Relaxed, |old| {
-                        // Ownership retries must return to the ownership scanner: ordinary
-                        // page GC has no current membership with which to authorize them.
-                        let retry = if reason == 4 {
-                            0
-                        } else {
-                            (reason as u64 + 1) << RETRY_SHIFT
-                        };
-                        Some((old & !(CLOSED | RETRY)) | retry)
+                        Some((old & !(CLOSED | RETRY)) | ((reason as u64 + 1) << RETRY_SHIFT))
                     })
                     .unwrap();
             }

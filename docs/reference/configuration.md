@@ -484,7 +484,7 @@ L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.
 
 ### `ownership_gc_interval_secs`
 
-Ownership GC scan-round interval in seconds; 0 disables ownership cleanup.
+Shared stale-GC round interval when ownership is enabled; 0 disables ownership cleanup.
 
 - **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_INTERVAL_SECS`
 - **Default:** `0`
@@ -500,7 +500,7 @@ Number of placement candidates to retain; must cover every reader replica count.
 
 ### `ownership_gc_scan_batch_size`
 
-Maximum blocks checked per ownership GC tick.
+Maximum blocks scanned per shared stale-GC batch when ownership is enabled.
 
 - **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_SCAN_BATCH_SIZE`
 - **Default:** `1024`
@@ -508,7 +508,7 @@ Maximum blocks checked per ownership GC tick.
 
 ### `ownership_gc_delete_batch_size`
 
-Maximum cache units attempted per ownership GC tick.
+Maximum block candidates per shared stale-GC batch when ownership is enabled.
 
 - **Environment variable:** `TALON_WORKER_OWNERSHIP_GC_DELETE_BATCH_SIZE`
 - **Default:** `1024`

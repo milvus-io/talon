@@ -110,7 +110,8 @@ pub(crate) struct StaleBlockCandidate {
     pub block: BlockId,
     pub units: usize,
     revision: u64,
-    last_access: u64,
+    pub last_access: u64,
+    pub position: u64,
 }
 
 struct BlockActivity {
@@ -521,6 +522,7 @@ impl Lru {
 
     /// Visit each block once, regardless of its number of cached pages. The
     /// admission-ordered block queue is separate from the capacity eviction hand.
+    #[cfg(test)]
     pub(crate) fn stale_gc_candidates(
         &self,
         cursor: &mut (u64, u64),
@@ -529,10 +531,22 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
-        let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
-            *cursor = (0, self.inner.lock().unwrap().clock);
+            *cursor = (0, self.stale_scan_ceiling());
         }
+        self.scan_stale_blocks(cursor, now, age, (scan_budget, delete_budget), false)
+    }
+
+    pub(crate) fn scan_stale_blocks(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        limits: (usize, usize),
+        ownership: bool,
+    ) -> Vec<StaleBlockCandidate> {
+        let (scan_budget, delete_budget) = limits;
+        let mut out = Vec::new();
         for _ in 0..scan_budget {
             let g = self.inner.lock().unwrap();
             let Some((&position, block)) = g.block_queue.range(cursor.0..cursor.1).next() else {
@@ -543,9 +557,10 @@ impl Lru {
             let activity = &g.block_access[block];
             let access = activity.access.load(Ordering::Relaxed);
             let verified = g.object_checks[&block.object].1;
-            if activity.pins != 0
-                || now.saturating_sub(access) <= age
-                || verified.is_some_and(|at| now.saturating_sub(at) < age)
+            if !ownership
+                && (activity.pins != 0
+                    || now.saturating_sub(access) <= age
+                    || verified.is_some_and(|at| now.saturating_sub(at) < age))
             {
                 continue;
             }
@@ -554,12 +569,31 @@ impl Lru {
                 units: activity.units,
                 revision: activity.revision,
                 last_access: access,
+                position,
             });
             if out.len() >= delete_budget {
                 break;
             }
         }
         out
+    }
+
+    /// Reuse the admission queue for deferred ownership work, outside this
+    /// round's frozen boundary. There is no second per-block index.
+    pub(crate) fn defer_stale_block(&self, block: &BlockId) {
+        let mut g = self.inner.lock().unwrap();
+        let position = g.clock;
+        let Some(activity) = g.block_access.get_mut(block) else {
+            return;
+        };
+        let old = std::mem::replace(&mut activity.position, position);
+        g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
+        g.block_queue.remove(&old);
+        g.block_queue.insert(position, block.clone());
+    }
+
+    pub(crate) fn stale_scan_ceiling(&self) -> u64 {
+        self.inner.lock().unwrap().clock
     }
 
     pub(crate) fn stale_candidate_is_current(&self, candidate: &StaleBlockCandidate) -> bool {
@@ -608,15 +642,6 @@ impl Lru {
         if let Some(check) = self.inner.lock().unwrap().object_checks.get_mut(object) {
             check.1 = Some(now);
         }
-    }
-
-    /// Snapshot a bounded set of units selected by the ownership scanner.
-    pub(crate) fn ownership_candidates(&self, units: Vec<CacheUnit>) -> Vec<EvictionCandidate> {
-        let mut g = self.inner.lock().unwrap();
-        units
-            .into_iter()
-            .filter_map(|unit| g.entries.contains_key(&unit).then(|| g.snapshot(unit)))
-            .collect()
     }
 
     /// Recheck with the block mutation gate held. Commits also pin under that gate.
