@@ -20,6 +20,27 @@ pub struct ConnectionAdmission {
 }
 
 impl ConnectionAdmission {
+    /// Size the shared budget from the actual number of data-plane threads.
+    /// Reject invalid capacities before constructing the underlying semaphore.
+    pub fn for_threads(
+        threads: usize,
+        connections_per_thread: usize,
+        metrics: WorkerMetrics,
+    ) -> anyhow::Result<Self> {
+        let capacity = threads
+            .checked_mul(connections_per_thread)
+            .filter(|&n| n > 0 && n <= tokio::sync::Semaphore::MAX_PERMITS)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "invalid data-plane connection capacity: {threads} threads * \
+                     data_plane_connections_per_thread={connections_per_thread}; \
+                     total must be in 1..={}",
+                    tokio::sync::Semaphore::MAX_PERMITS
+                )
+            })?;
+        Ok(Self::new(capacity, metrics))
+    }
+
     /// Create one admission budget and publish its configured capacity.
     pub fn new(capacity: usize, metrics: WorkerMetrics) -> Self {
         let limit = ConnectionLimit::new(capacity);
@@ -46,6 +67,57 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn default_budget_scales_with_threads_and_updates_metric() {
+        let per_thread = talon_core::WorkerConfig::default().data_plane_connections_per_thread;
+        for (threads, expected) in [(1, 8192), (16, 131072)] {
+            let metrics = WorkerMetrics::new(0);
+            let admission =
+                ConnectionAdmission::for_threads(threads, per_thread, metrics.clone()).unwrap();
+            assert_eq!(admission.limit.available(), expected);
+            assert!(metrics
+                .render()
+                .contains(&format!("talon_worker_connection_capacity {expected}\n")));
+        }
+    }
+
+    #[test]
+    fn invalid_scaled_budgets_return_errors_instead_of_panicking() {
+        let max = tokio::sync::Semaphore::MAX_PERMITS;
+        for (threads, per_thread) in [(0, 8192), (1, 0), (usize::MAX, 2), (1, max + 1), (2, max)] {
+            assert!(
+                ConnectionAdmission::for_threads(threads, per_thread, WorkerMetrics::new(0))
+                    .is_err()
+            );
+        }
+        assert!(ConnectionAdmission::for_threads(1, max, WorkerMetrics::new(0)).is_ok());
+    }
+
+    #[tokio::test]
+    async fn scaled_budget_remains_shared_across_acceptors() {
+        let metrics = WorkerMetrics::new(0);
+        let first = ConnectionAdmission::for_threads(2, 3, metrics.clone()).unwrap();
+        let second = first.clone();
+        let mut held = Vec::new();
+        for _ in 0..3 {
+            held.push(first.acquire().await);
+            held.push(second.acquire().await);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), first.acquire())
+                .await
+                .is_err()
+        );
+        assert!(metrics
+            .render()
+            .contains("talon_worker_connection_admission_saturated_total 1\n"));
+        drop(held.pop());
+        let _replacement = tokio::time::timeout(Duration::from_secs(1), second.acquire())
+            .await
+            .expect("releasing a connection restores shared capacity");
+        assert_eq!(first.limit.available(), 0);
+    }
 
     #[tokio::test]
     async fn cancelled_permit_holder_releases_capacity() {

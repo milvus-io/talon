@@ -642,6 +642,14 @@ io_uring rings for the data plane; 0 = one per core. Falls back to Tokio if io_u
 - **Default:** `0 (one ring per core)`
 - **CLI flag:** `--data-plane-rings`
 
+### `data_plane_connections_per_thread`
+
+Worker-global connection budget per data-plane thread. Total capacity is this value times the resolved io_uring ring count, or the Tokio worker-thread count on fallback. Includes idle connections; must be greater than zero.
+
+- **Environment variable:** `TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD`
+- **Default:** `8192`
+- **CLI flag:** `--data-plane-connections-per-thread`
+
 ### `s3_region`
 
 S3 region (required when backend=s3).

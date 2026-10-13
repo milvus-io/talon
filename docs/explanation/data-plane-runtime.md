@@ -25,6 +25,39 @@ The layers are deliberately decoupled. Layer 2 depends on no runtime types —
 `send_file_range` and `splice_to_file` take `&impl AsRawFd` — which is what made
 the runtime experiment below possible without touching the zero-copy path at all.
 
+### Connection capacity
+
+The worker shares one connection budget across its data-plane threads:
+
+```text
+total connection capacity = data-plane threads × data_plane_connections_per_thread
+```
+
+`data_plane_connections_per_thread` defaults to **8192**. On Monoio, the thread
+count is the resolved number of io_uring rings: `data_plane_rings = 0` uses the
+automatic CPU-aware count, while an explicit count is used directly. On the
+Tokio fallback, it is the actual Tokio runtime worker-thread count. For example,
+16 rings provide a shared capacity of **131072** connections, not a separate
+8192-connection limit on each ring.
+
+Configure the per-thread contribution in TOML, through
+`TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD`, or with
+`--data-plane-connections-per-thread` (CLI overrides environment, then TOML):
+
+```toml
+data_plane_rings = 16
+data_plane_connections_per_thread = 8192
+```
+
+Both data-plane implementations reserve a permit before accepting a socket and
+retain it until the connection closes. Idle accepted connections and listeners
+waiting in `accept` consume permits too. Excess connections wait in the kernel
+listen backlog. `talon_worker_connection_capacity` reports the computed total;
+`talon_worker_connection_admission_saturated_total` counts admissions that must
+wait. The budget bounds connection lifetimes, not just active requests. A zero
+per-thread budget or a total exceeding the semaphore's supported capacity is
+rejected.
+
 ### Why sendfile runs off the reactor
 
 `sendfile` and `splice` are **blocking** syscalls. They can block on socket

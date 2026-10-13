@@ -52,11 +52,6 @@ use tokio::net::{TcpListener, TcpStream};
 const CONTROL_OPERATION_TIMEOUT: Duration = Duration::from_secs(3);
 const CONTROL_TLS_RELOAD_INTERVAL: Duration = Duration::from_secs(5);
 
-/// Worker-global budget for accepted data-plane connections. Both server paths
-/// acquire before `accept`, so excess peers remain in the kernel backlog instead
-/// of consuming a worker FD or task (issues #111 and #568).
-const MAX_DATA_PLANE_CONNECTIONS: usize = 1024;
-
 /// Bridges the backend retry decorator to the worker's metrics registry.
 ///
 /// `talon-backend` deliberately knows nothing about the worker's registry, so it
@@ -149,6 +144,10 @@ struct Args {
     /// set TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 to pin it explicitly.
     #[arg(long)]
     data_plane_rings: Option<usize>,
+    /// Connections per data-plane thread (default 8192). The worker-global
+    /// budget scales with the resolved ring count, or Tokio worker threads.
+    #[arg(long)]
+    data_plane_connections_per_thread: Option<usize>,
 }
 
 impl Args {
@@ -166,6 +165,7 @@ impl Args {
             heartbeat_interval_ms: self.heartbeat_interval_ms,
             block_size: self.block_size,
             data_plane_rings: self.data_plane_rings,
+            data_plane_connections_per_thread: self.data_plane_connections_per_thread,
             cache_dirs: None,
             capacity_bytes: None,
             background_task_concurrency: None,
@@ -788,14 +788,18 @@ async fn serve_data_plane(
              data plane. Performance will be lower under high connection counts."
         );
     }
-    let connection_admission =
-        ConnectionAdmission::new(MAX_DATA_PLANE_CONNECTIONS, observability.metrics().clone());
     #[cfg(target_os = "linux")]
     if !force_tokio && uring_available {
         let rings = talon_worker::uring_serve::resolve_ring_count(cfg.data_plane_rings);
+        let connection_admission = ConnectionAdmission::for_threads(
+            rings,
+            cfg.data_plane_connections_per_thread,
+            observability.metrics().clone(),
+        )?;
         tracing::info!(
             listen = %cfg.listen,
             rings,
+            connections_per_thread = cfg.data_plane_connections_per_thread,
             "worker serving data plane on io_uring rings"
         );
         // `serve` blocks until the ring threads exit, and it must run off the
@@ -804,7 +808,7 @@ async fn serve_data_plane(
         let addr = cfg.listen.clone();
         // Every SO_REUSEPORT listener shares this worker-global budget. `serve`
         // acquires it before accept, matching the Tokio fallback and ensuring the
-        // 1024 cap covers accepted socket FDs and their tasks (#568).
+        // scaled cap covers accepted socket FDs and their tasks (#568).
         let handler =
             uring_conn::RingConnHandler::new(Arc::clone(&worker), Arc::clone(&observability));
         let tokio_handle = tokio::runtime::Handle::current();
@@ -822,8 +826,19 @@ async fn serve_data_plane(
         return joined;
     }
 
+    let threads = tokio::runtime::Handle::current().metrics().num_workers();
+    let connection_admission = ConnectionAdmission::for_threads(
+        threads,
+        cfg.data_plane_connections_per_thread,
+        observability.metrics().clone(),
+    )?;
     let listener = TcpListener::bind(&cfg.listen).await?;
-    tracing::info!(listen = %cfg.listen, "worker serving data plane");
+    tracing::info!(
+        listen = %cfg.listen,
+        threads,
+        connections_per_thread = cfg.data_plane_connections_per_thread,
+        "worker serving data plane on Tokio"
+    );
     serve_tokio_data_plane(listener, worker, observability, connection_admission).await
 }
 
@@ -1140,6 +1155,22 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn connection_budget_cli_overrides_environment() {
+        let args = Args::try_parse_from([
+            "talon-worker",
+            "--data-plane-connections-per-thread",
+            "16384",
+        ])
+        .unwrap();
+        let env = WorkerConfigPatch {
+            data_plane_connections_per_thread: Some(4096),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig::resolve(Default::default(), env, args.into_patch()).unwrap();
+        assert_eq!(cfg.data_plane_connections_per_thread, 16384);
+    }
 
     fn coordinator_identity(cluster_id: &str, node_id: &str) -> WorkloadIdentity {
         WorkloadIdentity::new(

@@ -255,6 +255,11 @@ pub struct WorkerConfig {
     /// `data_plane_rings = 1` with `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` to
     /// pin the legacy path explicitly.
     pub data_plane_rings: usize,
+    /// Contribution of each data-plane thread to the worker-global connection
+    /// budget. Defaults to 8192. Multiplied by the resolved Monoio ring count,
+    /// or by the Tokio runtime worker-thread count on the fallback path.
+    /// Idle accepted connections also consume this budget.
+    pub data_plane_connections_per_thread: usize,
     /// Static per-tenant rate-limit policy. Disabled unless a `[rate_limits]`
     /// table sets `enabled = true`. This is the local, single-worker stage of
     /// the eventual-global-tenant-rate-limits design.
@@ -352,6 +357,7 @@ impl Default for WorkerConfig {
             s3_path_style: None,
             gcs_endpoint: None,
             data_plane_rings: 0,
+            data_plane_connections_per_thread: 8192,
             rate_limits: RateLimitPolicy::default(),
         }
     }
@@ -468,6 +474,8 @@ pub struct WorkerConfigPatch {
     pub gcs_endpoint: Option<String>,
     /// Override for [`WorkerConfig::data_plane_rings`].
     pub data_plane_rings: Option<usize>,
+    /// Override for [`WorkerConfig::data_plane_connections_per_thread`].
+    pub data_plane_connections_per_thread: Option<usize>,
     /// Optional `[rate_limits]` table: the per-tenant rate-limit policy.
     pub rate_limits: Option<RateLimitPolicy>,
 }
@@ -565,6 +573,9 @@ impl Patch for WorkerConfigPatch {
             s3_path_style: self.s3_path_style.or(base.s3_path_style),
             gcs_endpoint: self.gcs_endpoint.or(base.gcs_endpoint),
             data_plane_rings: self.data_plane_rings.or(base.data_plane_rings),
+            data_plane_connections_per_thread: self
+                .data_plane_connections_per_thread
+                .or(base.data_plane_connections_per_thread),
             rate_limits: self.rate_limits.or(base.rate_limits),
         }
     }
@@ -856,6 +867,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         help: "io_uring rings for the data plane; 0 = one per core. Falls back to Tokio if io_uring is unavailable.",
     },
     ConfigVar {
+        env: "TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD",
+        key: "data_plane_connections_per_thread",
+        default: Some("8192"),
+        cli: true,
+        secret: false,
+        help: "Worker-global connection budget per data-plane thread. Total capacity is this value times the resolved io_uring ring count, or the Tokio worker-thread count on fallback. Includes idle connections; must be greater than zero.",
+    },
+    ConfigVar {
         env: "TALON_WORKER_S3_REGION",
         key: "s3_region",
         default: None,
@@ -983,6 +1002,8 @@ pub(crate) mod worker_env {
     pub const BACKEND_TIMEOUT_FLOOR_MS: &str = "TALON_WORKER_BACKEND_TIMEOUT_FLOOR_MS";
     pub const BACKEND_MIN_THROUGHPUT_BYTES: &str = "TALON_WORKER_BACKEND_MIN_THROUGHPUT_BYTES";
     pub const DATA_PLANE_RINGS: &str = "TALON_WORKER_DATA_PLANE_RINGS";
+    pub const DATA_PLANE_CONNECTIONS_PER_THREAD: &str =
+        "TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD";
     pub const S3_REGION: &str = "TALON_WORKER_S3_REGION";
     pub const S3_ENDPOINT: &str = "TALON_WORKER_S3_ENDPOINT";
     pub const S3_ACCESS_KEY_ID: &str = "TALON_WORKER_S3_ACCESS_KEY_ID";
@@ -1158,6 +1179,9 @@ impl WorkerConfigPatch {
             data_plane_rings: get(worker_env::DATA_PLANE_RINGS)
                 .map(|v| parse_usize(v, worker_env::DATA_PLANE_RINGS))
                 .transpose()?,
+            data_plane_connections_per_thread: get(worker_env::DATA_PLANE_CONNECTIONS_PER_THREAD)
+                .map(|v| parse_usize(v, worker_env::DATA_PLANE_CONNECTIONS_PER_THREAD))
+                .transpose()?,
             backend_throughput_bytes: get(worker_env::BACKEND_THROUGHPUT_BYTES)
                 .map(|v| parse_u64(v, worker_env::BACKEND_THROUGHPUT_BYTES))
                 .transpose()?,
@@ -1306,6 +1330,9 @@ impl WorkerConfig {
                 .backend_min_throughput_bytes
                 .or(d.backend_min_throughput_bytes),
             data_plane_rings: merged.data_plane_rings.unwrap_or(d.data_plane_rings),
+            data_plane_connections_per_thread: merged
+                .data_plane_connections_per_thread
+                .unwrap_or(d.data_plane_connections_per_thread),
             rate_limits: merged.rate_limits.unwrap_or(d.rate_limits),
         };
         cfg.validate()?;
@@ -1407,6 +1434,10 @@ impl WorkerConfig {
             return Err(Error::Other("block_size must be > 0".into()));
         }
         for (name, value) in [
+            (
+                "data_plane_connections_per_thread",
+                self.data_plane_connections_per_thread,
+            ),
             (
                 "background_task_concurrency",
                 self.background_task_concurrency,
@@ -2026,6 +2057,61 @@ mod tests {
     #[test]
     fn defaults_are_valid() {
         WorkerConfig::default().validate().unwrap();
+    }
+
+    #[test]
+    fn connection_budget_layers_and_validation() {
+        assert_eq!(
+            WorkerConfig::default().data_plane_connections_per_thread,
+            8192
+        );
+        let file =
+            WorkerConfigPatch::from_toml("data_plane_connections_per_thread = 2048").unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD").then(|| "4096".to_owned())
+        })
+        .unwrap();
+        for (env, cli, expected) in [
+            (
+                WorkerConfigPatch::default(),
+                WorkerConfigPatch::default(),
+                2048,
+            ),
+            (env.clone(), WorkerConfigPatch::default(), 4096),
+            (
+                env,
+                WorkerConfigPatch {
+                    data_plane_connections_per_thread: Some(16384),
+                    ..Default::default()
+                },
+                16384,
+            ),
+        ] {
+            assert_eq!(
+                WorkerConfig::resolve(file.clone(), env, cli)
+                    .unwrap()
+                    .data_plane_connections_per_thread,
+                expected
+            );
+        }
+        for value in [0, usize::MAX] {
+            let config = WorkerConfig {
+                data_plane_connections_per_thread: value,
+                ..Default::default()
+            };
+            assert!(config
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("data_plane_connections_per_thread"));
+        }
+        let error = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD").then(|| "invalid".to_owned())
+        })
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("TALON_WORKER_DATA_PLANE_CONNECTIONS_PER_THREAD"));
     }
 
     #[test]
