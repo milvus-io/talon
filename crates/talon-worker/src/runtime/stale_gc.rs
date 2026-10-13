@@ -19,6 +19,7 @@ pub(super) struct StaleGc {
     missing: VecDeque<(crate::eviction::StaleBlockCandidate, u64)>,
     heads: Arc<crate::background::Rate>,
     concurrency: usize,
+    head_batch: usize,
 }
 impl Default for StaleGc {
     fn default() -> Self {
@@ -38,6 +39,13 @@ impl StaleGc {
             missing: VecDeque::new(),
             heads,
             concurrency: config.stale_gc_head_concurrency,
+            head_batch: config.stale_gc_head_concurrency.min(MAX_HEADS).min(
+                if config.stale_gc_head_max_per_sec == 0 {
+                    MAX_HEADS
+                } else {
+                    config.stale_gc_head_max_per_sec.min(MAX_HEADS as u64) as usize
+                },
+            ),
         }
     }
 
@@ -115,7 +123,7 @@ impl StaleGc {
         let mut groups: HashMap<ObjectId, Vec<crate::eviction::StaleBlockCandidate>> =
             HashMap::new();
         while let Some(candidate) = self.pending.front() {
-            if !groups.contains_key(&candidate.block.object) && groups.len() == MAX_HEADS {
+            if !groups.contains_key(&candidate.block.object) && groups.len() == self.head_batch {
                 break;
             }
             let candidate = self.pending.pop_front().unwrap();
@@ -349,6 +357,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn timed_out_slice_releases_after_one_head_wave() {
+        let root = tempfile::tempdir().unwrap();
+        let origin = Arc::new(Origin::default());
+        origin.mode.store(3, Ordering::Relaxed);
+        let r = Arc::new(runtime(root.path(), false, origin.clone()));
+        for n in 0..12 {
+            let mut id = block(0);
+            id.object = ObjectId::new(Backend::S3, "bucket", format!("object-{n}"));
+            fill(&r, &id, false).await;
+        }
+        let mut gc = StaleGc::new(&WorkerConfig {
+            stale_gc_head_concurrency: 2,
+            stale_gc_head_max_per_sec: 0,
+            ..Default::default()
+        });
+        gc.round_now = Some(cold_now());
+        let task = tokio::spawn({
+            let r = r.clone();
+            async move {
+                let delay = gc.run_slice(&r).await;
+                (gc, delay)
+            }
+        });
+        origin.entered.notified().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(6)).await;
+        let (gc, delay) = task.await.unwrap();
+        tokio::time::resume();
+        assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(gc.pending.len(), 10);
+        assert_eq!(delay, Some(Duration::ZERO));
+        assert_eq!(r.resident_bytes(), 12 * 32);
+        let slow = StaleGc::new(&WorkerConfig {
+            stale_gc_head_max_per_sec: 1,
+            ..Default::default()
+        });
+        assert_eq!(
+            slow.head_batch, 1,
+            "at most one second of rate waiting per slice"
+        );
+    }
+
+    #[tokio::test]
     async fn stale_gc_head_timeout_is_bounded_and_non_destructive() {
         let root = tempfile::tempdir().unwrap();
         let origin = Arc::new(Origin::default());
@@ -516,7 +567,10 @@ mod tests {
             id.object = ObjectId::new(Backend::S3, "bucket", format!("key-{n}"));
             fill(&r, &id, false).await;
         }
-        let mut gc = StaleGc::default();
+        let mut gc = StaleGc::new(&WorkerConfig {
+            stale_gc_head_concurrency: MAX_HEADS,
+            ..Default::default()
+        });
         gc.tick_at(&r, cold_now()).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), MAX_HEADS);
         assert_eq!(r.resident_bytes(), 40 * 32);
@@ -541,7 +595,10 @@ mod tests {
         let mut id = block(1);
         id.object = ObjectId::new(Backend::S3, "bucket", "key-0");
         fill(&r, &id, false).await;
-        let mut gc = StaleGc::default();
+        let mut gc = StaleGc::new(&WorkerConfig {
+            stale_gc_head_concurrency: MAX_HEADS,
+            ..Default::default()
+        });
         let now = cold_now();
         gc.tick_at(&r, now).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), MAX_HEADS);

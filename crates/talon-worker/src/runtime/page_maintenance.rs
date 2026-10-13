@@ -244,10 +244,14 @@ impl WorkerRuntime {
                 report.bytes += bytes;
             }
         }
-        self.page_gc_metrics
-            .scan_duration
-            .set(started.elapsed().as_secs_f64());
-        self.page_gc_metrics.retries.set(stats.retries as f64);
+        if let Some((seconds, retries)) = cursor.record_batch(
+            started.elapsed().as_secs_f64(),
+            stats.retries,
+            stats.completed,
+        ) {
+            self.page_gc_metrics.scan_duration.set(seconds);
+            self.page_gc_metrics.retries.set(retries as f64);
+        }
         self.page_gc_metrics
             .batch_duration
             .observe(started.elapsed().as_secs_f64());

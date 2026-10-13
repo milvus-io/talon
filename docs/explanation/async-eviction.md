@@ -178,14 +178,11 @@ counts as one candidate regardless of how many pages it contains.
 A cursor resumes the admission-ordered block index, independently of the
 capacity-eviction queue. Blocks admitted during a round wait for the next round.
 
-The worker issues serial HEAD requests, capped at 32 distinct objects and a
-five-second backend-work deadline per batch. Unprocessed candidates carry over
-to the next batch in the same round so slow objects cannot starve the remainder.
-Batches within a round have a one-second delay after completion; this is pacing,
-not the interval between full scans. Local deletion waits can extend a batch
-beyond the HEAD deadline. The task keeps its background scheduler slot throughout
-the round, including continuation delays. The `stale_gc` task metrics count
-complete scan rounds.
+Each scheduler slice issues at most one concurrent wave of HEAD requests,
+bounded by the configured concurrency, 32 distinct objects, and one second of
+HEAD rate credits. Each request has a five-second backend timeout. Unprocessed
+candidates carry over to the next slice, which immediately becomes eligible.
+The scheduler slot is released between slices; task metrics count slices.
 The existing disk concurrency and deletion rate budgets apply to unlinks, not
 HEAD traffic. A whole-block removal charges deletion work for all resident pages,
 even though they are removed together as a directory.

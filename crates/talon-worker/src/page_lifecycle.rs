@@ -502,6 +502,25 @@ pub(crate) struct ScanCursor {
     block: u64,
     page: u64,
     ceiling: Option<u64>,
+    scan_seconds: f64,
+    scan_retries: usize,
+}
+impl ScanCursor {
+    pub fn record_batch(
+        &mut self,
+        seconds: f64,
+        retries: usize,
+        complete: bool,
+    ) -> Option<(f64, usize)> {
+        self.scan_seconds += seconds;
+        self.scan_retries += retries;
+        complete.then(|| {
+            (
+                std::mem::take(&mut self.scan_seconds),
+                std::mem::take(&mut self.scan_retries),
+            )
+        })
+    }
 }
 #[derive(Default)]
 pub(crate) struct ScanReport {
@@ -755,6 +774,13 @@ impl PageLifecycle {
 mod tests {
     use super::*;
     use talon_core::{Backend, ObjectId, Version};
+    #[test]
+    fn scan_metrics_accumulate_until_the_round_completes() {
+        let mut cursor = ScanCursor::default();
+        assert_eq!(cursor.record_batch(1.0, 7, false), None);
+        assert_eq!(cursor.record_batch(2.0, 0, true), Some((3.0, 7)));
+        assert_eq!(cursor.record_batch(0.5, 0, true), Some((0.5, 0)));
+    }
     pub(super) fn id() -> BlockId {
         BlockId {
             object: ObjectId::new(Backend::S3, "bucket", "key"),
