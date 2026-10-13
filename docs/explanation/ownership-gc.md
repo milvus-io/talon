@@ -4,7 +4,9 @@ Workers can reclaim clean local cache blocks outside their placement candidates.
 This extends `DESIGN.md` section 3 (Worker storage). Ownership is a predicate in
 the existing `StaleGc` block scan, alongside backend deletion. Both predicates
 share one cursor, pending queue, round boundary, scheduler registration and
-whole-block deletion transaction. No separate service or block index is added.
+whole-block deletion transaction. Membership queries and placement checks live
+directly in `runtime/stale_gc.rs`; there is no separate ownership-GC module, service
+or block index.
 Origin objects, staging and WAL data are outside its scope.
 
 ## Configuration

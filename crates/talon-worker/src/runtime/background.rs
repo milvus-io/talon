@@ -96,9 +96,7 @@ impl WorkerBackground {
                 },
             );
         }
-        let ownership = ownership
-            .filter(|_| config.ownership_gc_interval_secs > 0)
-            .map(|(node, channel)| super::ownership_gc::Ownership::new(node, config, channel));
+        let ownership = ownership.filter(|_| config.ownership_gc_interval_secs > 0);
         if config.stale_gc_enabled || ownership.is_some() {
             let gc = Arc::new(tokio::sync::Mutex::new(super::stale_gc::StaleGc::new(
                 config, ownership,

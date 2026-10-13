@@ -1,11 +1,12 @@
 //! One bounded block scan for backend-deleted and misplaced cache entries.
-use super::{ownership_gc::Ownership, WorkerRuntime};
+use super::WorkerRuntime;
 use crate::eviction::{access_millis, StaleBlockCandidate};
 use std::{
     collections::{HashMap, VecDeque},
     time::{Duration, Instant},
 };
-use talon_core::{Error, WorkerConfig};
+use talon_core::{BlockId, CachePlacementTable, Error, NodeId, NodeRole, WorkerConfig};
+use talon_transport::{control_tls::ControlTlsChannel, ZonedNodeInfo};
 
 const DAY_MS: u64 = 24 * 60 * 60 * 1000;
 const MAX_HEADS: usize = 32;
@@ -15,7 +16,14 @@ pub(super) struct StaleGc {
     round_time: Option<u64>,
     pending: VecDeque<StaleBlockCandidate>,
     backend_enabled: bool,
-    ownership: Option<Ownership>,
+    worker: Option<NodeId>,
+    membership_valid_until: Instant,
+    members: Vec<ZonedNodeInfo>,
+    global_placement: Option<CachePlacementTable>,
+    local_placement: Option<CachePlacementTable>,
+    replicas: usize,
+    coordinator: String,
+    channel: Option<ControlTlsChannel>,
     ownership_watermark: u64,
     ownership_active: bool,
     interval: Duration,
@@ -29,7 +37,14 @@ impl Default for StaleGc {
             round_time: None,
             pending: VecDeque::new(),
             backend_enabled: true,
-            ownership: None,
+            worker: None,
+            membership_valid_until: Instant::now(),
+            members: Vec::new(),
+            global_placement: None,
+            local_placement: None,
+            replicas: 1,
+            coordinator: String::new(),
+            channel: None,
             ownership_watermark: 0,
             ownership_active: false,
             interval: Duration::from_secs(3600),
@@ -39,11 +54,19 @@ impl Default for StaleGc {
 }
 
 impl StaleGc {
-    pub(super) fn new(config: &WorkerConfig, ownership: Option<Ownership>) -> Self {
+    pub(super) fn new(
+        config: &WorkerConfig,
+        ownership: Option<(NodeId, Option<ControlTlsChannel>)>,
+    ) -> Self {
         let enabled = ownership.is_some();
+        let (worker, channel) =
+            ownership.map_or((None, None), |(node, channel)| (Some(node), channel));
         Self {
             backend_enabled: config.stale_gc_enabled,
-            ownership,
+            worker,
+            channel,
+            replicas: config.ownership_gc_replicas,
+            coordinator: config.coordinator.clone(),
             interval: Duration::from_secs(if enabled {
                 config.ownership_gc_interval_secs
             } else {
@@ -55,6 +78,80 @@ impl StaleGc {
             )),
             ..Self::default()
         }
+    }
+
+    /// Refresh before every batch. False means placement changed and an active
+    /// round must stop ownership reclamation until its next scan.
+    async fn refresh_membership(&mut self) -> anyhow::Result<bool> {
+        let started = Instant::now();
+        let (nodes, valid_for) = tokio::time::timeout(Duration::from_secs(3), async {
+            if let Some(channel) = &self.channel {
+                ownership_membership(channel.connect(&self.coordinator).await?.stream).await
+            } else {
+                ownership_membership(tokio::net::TcpStream::connect(&self.coordinator).await?).await
+            }
+        })
+        .await??;
+        self.membership_valid_until = started + valid_for.min(Duration::from_secs(1));
+        anyhow::ensure!(
+            Instant::now() < self.membership_valid_until,
+            "expired ownership observation"
+        );
+        self.observe_membership(nodes)
+    }
+
+    fn observe_membership(&mut self, mut members: Vec<ZonedNodeInfo>) -> anyhow::Result<bool> {
+        members.retain(|n| n.info.role == NodeRole::Worker);
+        members.sort_unstable_by(|a, b| a.info.id.0.cmp(&b.info.id.0));
+        anyhow::ensure!(
+            !members.windows(2).any(|w| w[0].info.id == w[1].info.id)
+                && members
+                    .iter()
+                    .any(|n| Some(&n.info.id) == self.worker.as_ref()),
+            "invalid ownership membership"
+        );
+        if self.global_placement.is_some() && self.members == members {
+            return Ok(true);
+        }
+        self.members = members;
+        self.local_placement = None;
+        let nodes: Vec<_> = self.members.iter().map(|n| n.info.clone()).collect();
+        if let Some(zone) = self
+            .members
+            .iter()
+            .find(|n| Some(&n.info.id) == self.worker.as_ref())
+            .and_then(|n| n.zone.as_ref())
+        {
+            let local: Vec<_> = self
+                .members
+                .iter()
+                .filter(|n| n.zone.as_ref() == Some(zone))
+                .map(|n| n.info.clone())
+                .collect();
+            if local.len() != nodes.len() {
+                self.local_placement = Some(CachePlacementTable::new(&local));
+            }
+        }
+        self.global_placement = Some(CachePlacementTable::new(&nodes));
+        Ok(false)
+    }
+
+    fn owns(&self, block: &BlockId) -> bool {
+        self.global_placement
+            .iter()
+            .chain(self.local_placement.iter())
+            .any(|table| {
+                if self.replicas == 1 {
+                    table
+                        .primary(block)
+                        .is_some_and(|n| Some(&n.id) == self.worker.as_ref())
+                } else {
+                    table
+                        .rank(block, self.replicas)
+                        .iter()
+                        .any(|n| Some(&n.id) == self.worker.as_ref())
+                }
+            })
     }
 
     /// The scheduler owns the only clock: one-second batches, then one round interval.
@@ -88,16 +185,10 @@ impl StaleGc {
     async fn tick_at(&mut self, worker: &WorkerRuntime, now: u64) {
         let starting = self.cursor.0 >= self.cursor.1 && self.pending.is_empty();
         if starting {
-            self.ownership_active = self.ownership.is_some();
+            self.ownership_active = self.worker.is_some();
         }
         if self.ownership_active {
-            match self
-                .ownership
-                .as_mut()
-                .expect("enabled ownership")
-                .refresh()
-                .await
-            {
+            match self.refresh_membership().await {
                 Ok(true) => {}
                 Ok(false) if starting => self.ownership_watermark = 0,
                 result => {
@@ -106,10 +197,7 @@ impl StaleGc {
                 }
             }
         }
-        let mut ownership_deadline = self
-            .ownership
-            .as_ref()
-            .map_or_else(Instant::now, |policy| policy.valid_until);
+        let mut ownership_deadline = self.membership_valid_until;
         if starting {
             self.cursor = (
                 if self.backend_enabled {
@@ -148,19 +236,17 @@ impl StaleGc {
         // extend this round or need another per-block index.
         let mut misplaced = Vec::new();
         if self.ownership_active {
-            let ownership = self.ownership.as_ref().expect("enabled ownership");
-            self.pending.retain(|candidate| {
-                if candidate.position < self.ownership_watermark {
-                    return true;
+            for candidate in std::mem::take(&mut self.pending) {
+                if candidate.position >= self.ownership_watermark {
+                    worker.page_gc_metrics.ownership_checked.inc();
+                    if !self.owns(&candidate.block) {
+                        worker.lru.defer_stale_block(&candidate.block);
+                        misplaced.push(candidate);
+                        continue;
+                    }
                 }
-                worker.page_gc_metrics.ownership_checked.inc();
-                if ownership.owns(&candidate.block) {
-                    return true;
-                }
-                worker.lru.defer_stale_block(&candidate.block);
-                misplaced.push(candidate.clone());
-                false
-            });
+                self.pending.push_back(candidate);
+            }
         }
         if !misplaced.is_empty() {
             // Charge every page, including blocks larger than the batch target.
@@ -172,19 +258,8 @@ impl StaleGc {
                 }
             }
             if Instant::now() >= ownership_deadline {
-                if matches!(
-                    self.ownership
-                        .as_mut()
-                        .expect("enabled ownership")
-                        .refresh()
-                        .await,
-                    Ok(true)
-                ) {
-                    ownership_deadline = self
-                        .ownership
-                        .as_ref()
-                        .expect("enabled ownership")
-                        .valid_until;
+                if matches!(self.refresh_membership().await, Ok(true)) {
+                    ownership_deadline = self.membership_valid_until;
                 } else {
                     self.pause_ownership();
                 }
@@ -256,9 +331,48 @@ impl StaleGc {
     }
 }
 
+async fn ownership_membership<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    mut stream: S,
+) -> anyhow::Result<(Vec<ZonedNodeInfo>, Duration)> {
+    use talon_transport::{codec, ControlMessage};
+    use tokio::io::AsyncWriteExt;
+    stream
+        .write_all(&codec::encode(0, &ControlMessage::MembershipQuery {})?)
+        .await?;
+    stream.flush().await?;
+    match crate::tokio_conn::read_control(&mut stream).await? {
+        Some(ControlMessage::MembershipList { view }) => {
+            anyhow::ensure!(view.valid_for_ms > 0, "expired ownership membership");
+            let registry = talon_core::worker_membership::MemberRegistry {
+                members: view.workers.into_iter().map(|w| w.member).collect(),
+                ..Default::default()
+            };
+            registry.validate().map_err(anyhow::Error::msg)?;
+            // Placement uses retained logical members, including offline/conflicted
+            // instances. Addresses and process liveness must not move ownership.
+            let nodes = registry
+                .members
+                .into_iter()
+                .filter(|m| !m.retired)
+                .map(|m| ZonedNodeInfo {
+                    info: talon_core::NodeInfo {
+                        id: NodeId::new(m.worker_id),
+                        address: String::new(),
+                        role: NodeRole::Worker,
+                    },
+                    zone: m.zone,
+                })
+                .collect();
+            Ok((nodes, Duration::from_millis(view.valid_for_ms)))
+        }
+        other => anyhow::bail!("ownership GC requires retained membership: {other:?}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tokio_conn::read_control;
     use crate::{
         BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
     };
@@ -267,7 +381,10 @@ mod tests {
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     };
+    use talon_core::NodeInfo;
     use talon_core::{Backend, BackendStore, BlockId, ObjectId, ObjectStat, PageIndex, Version};
+    use talon_transport::{codec, ControlMessage};
+    use tokio::io::AsyncWriteExt;
 
     #[derive(Default)]
     struct Origin {
@@ -868,14 +985,7 @@ mod tests {
             }
         }
         fn gc(&self) -> StaleGc {
-            StaleGc::new(
-                &self.config,
-                Some(Ownership::new(
-                    talon_core::NodeId::new("a"),
-                    &self.config,
-                    None,
-                )),
-            )
+            StaleGc::new(&self.config, Some((NodeId::new("a"), None)))
         }
     }
     fn placed(owner: &str, offset: usize) -> BlockId {
@@ -1129,5 +1239,129 @@ mod tests {
             assert!(server.calls.load(Ordering::Relaxed) >= 2);
             assert_eq!(r.index.is_empty(), !changed);
         }
+    }
+    fn members() -> Vec<ZonedNodeInfo> {
+        ["a", "b", "c"]
+            .into_iter()
+            .map(|id| ZonedNodeInfo {
+                info: NodeInfo {
+                    id: NodeId::new(id),
+                    address: String::new(),
+                    role: NodeRole::Worker,
+                },
+                zone: None,
+            })
+            .collect()
+    }
+    fn discovery(nodes: &[ZonedNodeInfo]) -> talon_core::worker_membership::WorkerDiscovery {
+        use talon_core::worker_membership::*;
+        WorkerDiscovery::retained(
+            &MemberRegistry {
+                members: nodes
+                    .iter()
+                    .map(|n| WorkerMember {
+                        worker_id: n.info.id.0.clone(),
+                        zone: n.zone.clone(),
+                        retired: false,
+                    })
+                    .collect(),
+                ..Default::default()
+            },
+            &[],
+        )
+    }
+    #[tokio::test]
+    async fn ownership_membership_rejects_errors_and_unexpected_replies() {
+        for reply in [
+            ControlMessage::Ack {
+                ok: false,
+                detail: Some("not ready".into()),
+            },
+            ControlMessage::MembershipQuery {},
+        ] {
+            let (client, mut server) = tokio::io::duplex(4096);
+            let responder = tokio::spawn(async move {
+                assert_eq!(
+                    read_control(&mut server).await.unwrap(),
+                    Some(ControlMessage::MembershipQuery {})
+                );
+                server
+                    .write_all(&codec::encode(0, &reply).unwrap())
+                    .await
+                    .unwrap();
+            });
+            assert!(ownership_membership(client).await.is_err());
+            responder.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn membership_uses_logical_ids_and_zones_across_instance_changes() {
+        use talon_core::worker_membership::*;
+        let mut view = discovery(&members());
+        let mut snapshots = Vec::new();
+        for state in [
+            InstanceState::Offline,
+            InstanceState::Conflict,
+            InstanceState::Serving {
+                instance_id: "new-process".into(),
+                address: "new-address:7001".into(),
+            },
+        ] {
+            view.workers[0].state = state;
+            let (client, mut server) = tokio::io::duplex(4096);
+            let reply = ControlMessage::MembershipList { view: view.clone() };
+            let responder = tokio::spawn(async move {
+                read_control(&mut server).await.unwrap().unwrap();
+                server
+                    .write_all(&codec::encode(0, &reply).unwrap())
+                    .await
+                    .unwrap();
+            });
+            snapshots.push(ownership_membership(client).await.unwrap());
+            responder.await.unwrap();
+        }
+        assert_eq!(
+            snapshots[0].0.len(),
+            3,
+            "offline members still own placement"
+        );
+        assert_eq!(snapshots[0], snapshots[1]);
+        assert_eq!(snapshots[1], snapshots[2]);
+    }
+
+    #[test]
+    fn validates_membership_and_retains_global_and_zone_candidates() {
+        let mut gc = StaleGc::new(&WorkerConfig::default(), Some((NodeId::new("a"), None)));
+        assert!(!gc.observe_membership(members()).unwrap());
+        let mut reordered = members();
+        reordered.reverse();
+        assert!(gc.observe_membership(reordered).unwrap());
+        let mut duplicate = members();
+        duplicate.push(duplicate[0].clone());
+        for invalid in [Vec::new(), members()[1..].to_vec(), duplicate] {
+            assert!(gc.observe_membership(invalid).is_err());
+        }
+        let table =
+            CachePlacementTable::new(&members().into_iter().map(|n| n.info).collect::<Vec<_>>());
+        let id = (0..10000)
+            .map(|n| {
+                BlockId::new(
+                    ObjectId::new(Backend::S3, "b", n.to_string()),
+                    0,
+                    256,
+                    Version::new("v1"),
+                )
+            })
+            .find(|id| table.primary(id).unwrap().id.0 == "b")
+            .unwrap();
+        assert!(!gc.owns(&id));
+        gc.replicas = 3;
+        assert!(gc.owns(&id));
+        gc.replicas = 1;
+        let mut zoned = members();
+        zoned[0].zone = Some("zone-a".into());
+        assert!(!gc.observe_membership(zoned).unwrap());
+        assert!(gc.owns(&id));
     }
 }
