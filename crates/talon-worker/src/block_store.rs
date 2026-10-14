@@ -80,12 +80,17 @@ where
 
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
+    uring: Option<talon_uring::Executor>,
     root: PathBuf,
     fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
 impl WholeBlockStore {
+    pub fn with_uring(mut self, executor: Option<talon_uring::Executor>) -> Self {
+        self.uring = executor;
+        self
+    }
     /// Retain the root lease through detached blocking disk mutations.
     pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
         self.root_lock = Some(lock);
@@ -104,6 +109,7 @@ impl WholeBlockStore {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
+            uring: None,
             root_lock: None,
             root,
             fd_cache,
@@ -302,6 +308,22 @@ impl ObjectStore for WholeBlockStore {
             form: BlockForm::Whole,
             len: value.len() as u64,
         };
+        if let Some(executor) = &self.uring {
+            let root_lock = self.root_lock.clone();
+            let fds = self.fd_cache.clone();
+            let encoded = serde_json::to_vec(&meta)
+                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
+            return executor.run(move || async move {
+                let _root_lock = root_lock;
+                talon_uring::atomic_write(&path, value).await?;
+                fds.invalidate(&path);
+                // Match the existing whole-block commit's best-effort sidecar.
+                if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {
+                    tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
+                }
+                Ok(())
+            }).await?;
+        }
         // The write + fsync of a whole block is blocking disk I/O; keep it off
         // the reactor thread (issue #115).
         let commit_path = path.clone();

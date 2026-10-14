@@ -18,6 +18,8 @@ pub mod delay;
 pub mod endpoint;
 pub mod gcs;
 pub mod http;
+#[cfg(feature = "uring")]
+pub mod monoio_client;
 mod query_auth;
 pub mod reqwest_client;
 pub mod retry;
@@ -26,6 +28,15 @@ pub mod sigv4;
 pub mod workload_identity;
 pub mod xml;
 pub mod zone;
+
+// Timers wake the runtime driving the request. Tokio remains the portable
+// implementation when native origin I/O is not compiled in.
+mod time {
+    #[cfg(feature = "uring")]
+    pub use talon_uring::{sleep, timeout};
+    #[cfg(not(feature = "uring"))]
+    pub use tokio::time::{sleep, timeout};
+}
 
 pub use azure::{AzureBackend, AzureConfig};
 pub use credentials::{

@@ -9,6 +9,7 @@ use talon_core::{NamespaceId, WorkerConfig, DEFAULT_NAMESPACE};
 const MAX_NAMESPACES: usize = 4096;
 
 pub(super) struct NamespaceRuntimes {
+    uring: Option<talon_uring::Executor>,
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
     workers: RwLock<BTreeMap<String, Arc<WorkerRuntime>>>,
@@ -64,7 +65,8 @@ impl NamespaceRuntimes {
             Err(error) => return Err(error.into()),
         }
         let store = WholeBlockStore::open_with_fd_cache(&root, self.whole_fds.clone())?
-            .with_root_lock(self.root_lock.clone());
+            .with_root_lock(self.root_lock.clone())
+            .with_uring(self.uring.clone());
         let index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
             checked_dir(&root.join("paged"))?;
@@ -74,7 +76,8 @@ impl NamespaceRuntimes {
                     config.l2_page_size_bytes as u32,
                     self.page_fds.clone(),
                 )?
-                .with_root_lock(self.root_lock.clone()),
+                .with_root_lock(self.root_lock.clone())
+                .with_uring(self.uring.clone()),
             )
         } else {
             None
@@ -101,6 +104,7 @@ impl NamespaceRuntimes {
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
+        worker.page_mutations = Arc::new(Mutations::new(self.uring.is_some()));
         worker.page_gc_metrics =
             PageGcMetrics::new(&self.metrics.registry, namespace.effective_name());
         worker.l1 = Arc::new(MemoryStore::with_shared_budget(
@@ -217,8 +221,19 @@ impl WorkerRuntime {
         backend: Arc<dyn BackendStore>,
         metrics: WorkerMetrics,
     ) -> anyhow::Result<Self> {
+        Self::open_namespaces_with_uring(config, root_lock, backend, metrics, None)
+    }
+
+    pub fn open_namespaces_with_uring(
+        config: &WorkerConfig,
+        root_lock: Arc<CacheRootLock>,
+        backend: Arc<dyn BackendStore>,
+        metrics: WorkerMetrics,
+        uring: Option<talon_uring::Executor>,
+    ) -> anyhow::Result<Self> {
         config.validate()?;
         let registry = Arc::new(NamespaceRuntimes {
+            uring,
             membership: Arc::new(Mutex::new(None)),
             membership_changed: tokio::sync::watch::channel(()).0,
             workers: RwLock::new(BTreeMap::new()),

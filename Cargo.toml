@@ -2,6 +2,7 @@
 resolver = "2"
 exclude = [".patched-deps/monoio"]
 members = [
+    "crates/talon-uring",
     "crates/talon-telemetry",
     "crates/talon-core",
     "crates/talon-cache-client",
@@ -27,6 +28,7 @@ repository = "https://github.com/talon/talon"
 rust-version = "1.80"
 
 [workspace.dependencies]
+talon-uring = { path = "crates/talon-uring" }
 talon-telemetry = { path = "crates/talon-telemetry" }
 talon-core = { path = "crates/talon-core" }
 talon-cache-client = { path = "crates/talon-cache-client" }

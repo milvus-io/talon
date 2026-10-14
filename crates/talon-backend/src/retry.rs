@@ -282,7 +282,7 @@ impl HttpClient for RetryingHttpClient {
                 // observes the timeout reason before the inner future is dropped.
                 let attempt_future = operation.scope(self.inner.execute(req.clone()));
                 tokio::pin!(attempt_future);
-                let outcome = tokio::time::timeout(timeout, attempt_future.as_mut()).await;
+                let outcome = crate::time::timeout(timeout, attempt_future.as_mut()).await;
                 operation.outcome(match &outcome {
                     Err(_) => "timeout",
                     Ok(Err(_)) => "error",
@@ -335,7 +335,7 @@ impl HttpClient for RetryingHttpClient {
                     "internal",
                     talon_telemetry::TraceParent::Inherit,
                 );
-                backoff.scope(tokio::time::sleep(delay)).await;
+                backoff.scope(crate::time::sleep(delay)).await;
                 backoff.outcome("success");
             }
             attempt += 1;
@@ -349,7 +349,7 @@ impl HttpClient for RetryingHttpClient {
         len: u64,
     ) -> Result<HttpResponse, String> {
         let timeout = self.config.attempt_timeout(len);
-        match tokio::time::timeout(timeout, self.inner.execute_body(req, body, len)).await {
+        match crate::time::timeout(timeout, self.inner.execute_body(req, body, len)).await {
             Ok(result) => result,
             Err(_) => {
                 if let Some(observer) = &self.observer {

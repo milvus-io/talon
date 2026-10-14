@@ -495,8 +495,29 @@ async fn run() -> anyhow::Result<()> {
     // Retry is innermost so each attempt gets its own injected latency, which is
     // what the lab is modeling; wrapping the other way would make the whole
     // retry ladder share a single delay and understate the cost of a retry.
+    let origin_uring = match std::env::var("TALON_WORKER_ORIGIN_IO")
+        .as_deref()
+        .unwrap_or("tokio")
+    {
+        "tokio" => None,
+        "uring" => Some(talon_uring::Executor::new("talon-origin-uring", 128)?),
+        _ => anyhow::bail!("TALON_WORKER_ORIGIN_IO must be tokio or uring"),
+    };
+    tracing::info!(
+        origin_io = if origin_uring.is_some() {
+            "uring"
+        } else {
+            "tokio"
+        },
+        "origin download and cache commit engine"
+    );
     let http: Arc<dyn talon_backend::http::HttpClient> = {
-        let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(ReqwestClient::new());
+        let base: Arc<dyn talon_backend::http::HttpClient> = match &origin_uring {
+            Some(executor) => Arc::new(talon_backend::monoio_client::MonoioClient::new(
+                executor.clone(),
+            )),
+            None => Arc::new(ReqwestClient::new()),
+        };
 
         // Seed from the node identity so each worker's jitter is distinct yet
         // reproducible across restarts. Shared by both decorators.
@@ -578,11 +599,12 @@ async fn run() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let runtime = WorkerRuntime::open_namespaces(
+    let runtime = WorkerRuntime::open_namespaces_with_uring(
         &cfg,
         cache_root_lock,
         backend,
         observability.metrics().clone(),
+        origin_uring,
     )?;
     let worker = Arc::new(runtime);
     observability.attach_namespace_runtime(&worker);

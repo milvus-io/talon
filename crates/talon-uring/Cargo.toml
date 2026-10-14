@@ -1,0 +1,17 @@
+[package]
+name = "talon-uring"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Bounded native io_uring execution for origin I/O"
+
+[dependencies]
+monoio = { workspace = true, features = ["mkdirat", "renameat", "unlinkat"] }
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
+flume = "0.11"
+
+[dev-dependencies]
+tempfile.workspace = true
