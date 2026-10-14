@@ -140,6 +140,41 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
+        if target.contains("/large-") {
+            let object_len: usize = target.rsplit("/large-").next().unwrap().parse().unwrap();
+            let range = request
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("range: bytes=")
+                        .map(str::to_owned)
+                })
+                .unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let start: usize = start.parse().unwrap();
+            let end: usize = end.parse::<usize>().unwrap().min(object_len - 1);
+            let body: Vec<u8> = (start..=end).map(|i| (i % 251) as u8).collect();
+            let chunked = target.contains("chunked");
+            let framing = if chunked {
+                "Transfer-Encoding: chunked".to_owned()
+            } else {
+                format!("Content-Length: {}", body.len())
+            };
+            let mut response = format!("HTTP/1.1 206 Partial Content\r\n{framing}\r\nContent-Range: bytes {start}-{end}/{object_len}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n").into_bytes();
+            if chunked {
+                for piece in body.chunks(777) {
+                    response.extend_from_slice(format!("{:x};test=1\r\n", piece.len()).as_bytes());
+                    response.extend_from_slice(piece);
+                    response.extend_from_slice(b"\r\n");
+                }
+                response.extend_from_slice(b"0\r\nX-Test: trailer\r\n\r\n");
+            } else {
+                response.extend_from_slice(&body);
+            }
+            stream.write_all(&response).await.unwrap();
+            let _ = stream.shutdown().await;
+            return;
+        }
         let keepalive = target.starts_with("/keepalive");
         let response = if target.contains("/retry") && attempt == 0 {
             "HTTP/1.1 503 Slow Down\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
@@ -690,4 +725,84 @@ async fn native_origin_rejects_non_ring_callers() {
         error.contains("requires an existing Monoio ring"),
         "{error}"
     );
+}
+
+#[test]
+#[ignore = "requires native io_uring and O_DIRECT; checks fixed/chunked plaintext/TLS allocations"]
+fn aligned_http_bodies_and_paged_commits_preserve_payload() {
+    on_native_ring(async {
+        for tls in [false, true] {
+            let origin = Origin::start(tls).await;
+            let client = origin.client();
+            let scheme = if tls { "https" } else { "http" };
+            for chunked in [false, true] {
+                let kind = if chunked { "chunked" } else { "fixed" };
+                for len in [4095, 4096, 8192, 12289] {
+                    let response = client
+                        .execute(HttpRequest::new(
+                            Method::Get,
+                            format!("{scheme}://{}/{kind}/large-{len}", origin.address),
+                            vec![("Range".into(), format!("bytes=0-{}", len - 1))],
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.body.as_ptr() as usize % 4096, 0);
+                    let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                    assert_eq!(response.body, expected);
+                }
+                for page_size in [0, 4096] {
+                    let root = tempfile::tempdir().unwrap();
+                    let config = WorkerConfig {
+                        block_size: 16384,
+                        capacity_bytes: 131072,
+                        l1_capacity_bytes: 0,
+                        l2_page_size_bytes: page_size,
+                        backend: Some("s3".into()),
+                        page_tti_hours: 0,
+                        ..Default::default()
+                    };
+                    let backend = origin.backend(tls);
+                    let open = || {
+                        WorkerRuntime::open_namespaces_with_uring(
+                            &config,
+                            Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
+                            backend.clone(),
+                            WorkerMetrics::new(131072),
+                            true,
+                        )
+                        .unwrap()
+                    };
+                    let runtime = open();
+                    for len in [8192, 12289] {
+                        let block = BlockId::new(
+                            ObjectId::new(Backend::S3, kind, format!("large-{len}")),
+                            0,
+                            16384,
+                            Version::new("v1"),
+                        );
+                        runtime.load_block(&block, len).await.unwrap();
+                        let request = CachedRangeRequest {
+                            object: block.object,
+                            version: block.version,
+                            offset: 0,
+                            len,
+                        };
+                        let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                        assert_eq!(runtime.serve_cached(&request).await.unwrap(), expected);
+                    }
+                    drop(runtime);
+                    let recovered = open();
+                    let count = origin.requests.load(Ordering::SeqCst);
+                    let request = CachedRangeRequest {
+                        object: ObjectId::new(Backend::S3, kind, "large-12289"),
+                        version: Version::new("v1"),
+                        offset: 0,
+                        len: 12289,
+                    };
+                    assert_eq!(recovered.serve_cached(&request).await.unwrap().len(), 12289);
+                    assert_eq!(origin.requests.load(Ordering::SeqCst), count);
+                }
+            }
+        }
+    });
 }

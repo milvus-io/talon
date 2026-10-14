@@ -155,6 +155,13 @@ crossing threads, not shared state within a ring. It does still reach Tokio
 internally (`block_store` uses `spawn_blocking`, the miss path uses Tokio
 timers), so ring threads enter a Tokio handle: coexistence, as predicted.
 
+An opt-in native origin/cache engine now extends this path through HTTP(S),
+LOAD commits, resident byte reads and cold descriptor opens. It retains buffered
+sendfile/splice reads and uses Direct I/O only for fully aligned payload files,
+without a body-to-alignment-buffer copy. TLS still uses buffered rustls. See
+[the experiment design and validation](docs/explanation/monoio-origin-io.md) for
+execution ownership, cancellation, compatibility and remaining Tokio paths.
+
 Still on Tokio: `fuse::worker_client`, the client side of the same protocol.
 The wire format is plain framed TCP, so a Tokio client interoperates with a
 ring server unchanged — porting it is a client-side optimization, not a

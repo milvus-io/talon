@@ -345,7 +345,7 @@ impl ObjectStore for WholeBlockStore {
                 .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
             return talon_uring::spawn_local(async move {
                 let _root_lock = root_lock;
-                talon_uring::atomic_write(&path, value).await?;
+                talon_uring::atomic_write_payload(&path, value).await?;
                 fds.invalidate(&path);
                 // Match the existing whole-block commit's best-effort sidecar.
                 if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {

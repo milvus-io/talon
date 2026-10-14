@@ -138,7 +138,7 @@ impl PagedBlockStore {
                     Err(error) => return Err(error.into()),
                 }
                 let path = disk.page_path(&id, page);
-                talon_uring::atomic_write(&path, value).await?;
+                talon_uring::atomic_write_payload(&path, value).await?;
                 disk.fd_cache.invalidate(&path);
                 Ok(())
             })
@@ -377,7 +377,7 @@ impl PagedBlockStore {
             let fds = self.fd_cache.clone();
             return talon_uring::spawn_local(async move {
                 let _root_lock = root_lock;
-                talon_uring::atomic_write(&path, value).await?;
+                talon_uring::atomic_write_payload(&path, value).await?;
                 fds.invalidate(&path);
                 Ok(())
             })

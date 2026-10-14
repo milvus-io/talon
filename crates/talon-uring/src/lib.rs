@@ -1,6 +1,8 @@
 //! Native cache I/O and task ownership on the caller's existing Monoio ring.
 use std::{io, path::Path};
 
+mod aligned;
+pub use aligned::{AlignedBuf, DIRECT_ALIGNMENT};
 mod read;
 pub use read::{open_read, read_file};
 
@@ -10,6 +12,21 @@ pub use local::{on_ring, require_ring, sleep, spawn_cancellable, spawn_local, ti
 /// Publish an immutable cache file. Must run on a native io_uring runtime.
 /// Both payload and metadata use native open/write/fsync/rename operations.
 pub async fn atomic_write(path: &Path, bytes: bytes::Bytes) -> io::Result<()> {
+    atomic_write_inner(path, bytes, false).await
+}
+
+/// Commit a payload without an alignment copy. Only nonempty, fully aligned
+/// files/buffers use O_DIRECT. Small/unaligned files and unaligned external
+/// admissions use buffered I/O for the entire file, with no padding/truncate.
+pub async fn atomic_write_payload(path: &Path, bytes: bytes::Bytes) -> io::Result<()> {
+    let direct = !bytes.is_empty()
+        && bytes.len() % DIRECT_ALIGNMENT == 0
+        && bytes.as_ptr() as usize % DIRECT_ALIGNMENT == 0;
+    atomic_write_inner(path, bytes, direct).await
+}
+
+async fn atomic_write_inner(path: &Path, bytes: bytes::Bytes, direct: bool) -> io::Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let parent = path
@@ -27,6 +44,7 @@ pub async fn atomic_write(path: &Path, bytes: bytes::Bytes) -> io::Result<()> {
         match monoio::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(if direct { libc::O_DIRECT } else { 0 })
             .open(&staged)
             .await
         {

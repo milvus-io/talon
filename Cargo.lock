@@ -1625,8 +1625,6 @@ dependencies = [
 [[package]]
 name = "monoio-rustls"
 version = "0.4.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e31f422825bd7fb19957af6eaf89d7234ba143fcc0e515f5a2f526e332d1875"
 dependencies = [
  "bytes",
  "monoio",
@@ -2823,7 +2821,9 @@ dependencies = [
  "futures",
  "hmac",
  "http",
+ "libc",
  "monoio",
+ "monoio-codec",
  "monoio-http",
  "monoio-rustls",
  "opentelemetry",
@@ -3092,6 +3092,7 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "futures",
+ "libc",
  "monoio",
  "tempfile",
  "tokio",

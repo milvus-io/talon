@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = [".patched-deps/monoio"]
+exclude = [".patched-deps/monoio", ".patched-deps/monoio-rustls"]
 members = [
     "crates/talon-uring",
     "crates/talon-telemetry",
@@ -96,3 +96,6 @@ monoio = { path = ".patched-deps/monoio" }
 
 [patch.crates-io.monoio-http]
 path = ".patched-deps/monoio-http"
+
+[patch.crates-io.monoio-rustls]
+path = ".patched-deps/monoio-rustls"

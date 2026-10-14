@@ -1869,13 +1869,15 @@ impl WorkerRuntime {
                         if paged {
                             drop(gate);
                             let size = runtime.paged_page_size().expect("paged state");
-                            for (page, chunk) in bytes.chunks(size as usize).enumerate() {
+                            for (page, start) in (0..bytes.len()).step_by(size as usize).enumerate()
+                            {
+                                let end = (start + size as usize).min(bytes.len());
                                 runtime
                                     .commit_fetched_page(
                                         &id,
                                         PageIndex(page as u32),
                                         len,
-                                        bytes::Bytes::copy_from_slice(chunk),
+                                        bytes.slice(start..end),
                                     )
                                     .await?;
                             }
