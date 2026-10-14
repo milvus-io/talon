@@ -257,7 +257,7 @@ impl SliceSchedule {
     fn ready(&self, name: &str) -> bool {
         self.next
             .get(name)
-            .is_none_or(|next| *next <= Instant::now())
+            .map_or(true, |next| *next <= Instant::now())
     }
     fn defer(&mut self, name: &str, delay: Duration) {
         self.next.insert(name.to_owned(), Instant::now() + delay);
