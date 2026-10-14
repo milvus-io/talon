@@ -251,19 +251,20 @@ fn due(last: &Mutex<HashMap<String, Instant>>, worker: &WorkerRuntime, millis: u
 // A namespace that finishes early must stay idle while another continues scanning.
 #[derive(Default)]
 struct SliceSchedule {
-    next: HashMap<String, Instant>,
+    next: HashMap<String, tokio::time::Instant>,
 }
 impl SliceSchedule {
     fn ready(&self, name: &str) -> bool {
         self.next
             .get(name)
-            .map_or(true, |next| *next <= Instant::now())
+            .map_or(true, |next| *next <= tokio::time::Instant::now())
     }
     fn defer(&mut self, name: &str, delay: Duration) {
-        self.next.insert(name.to_owned(), Instant::now() + delay);
+        self.next
+            .insert(name.to_owned(), tokio::time::Instant::now() + delay);
     }
     fn delay(&self, idle: Duration) -> Duration {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now();
         self.next
             .values()
             .map(|next| next.saturating_duration_since(now))
@@ -275,8 +276,8 @@ impl SliceSchedule {
 mod tests {
     use super::*;
 
-    #[test]
-    fn namespace_slices_continue_without_rescanning_completed_namespaces() {
+    #[tokio::test(start_paused = true)]
+    async fn namespace_slices_continue_without_rescanning_completed_namespaces() {
         let mut schedule = SliceSchedule::default();
         let idle = Duration::from_secs(3600);
         assert!(schedule.ready("new"));
@@ -286,6 +287,10 @@ mod tests {
         assert!(schedule.ready("scanning"));
         assert_eq!(schedule.delay(idle), Duration::ZERO);
         schedule.defer("scanning", idle);
-        assert!(schedule.delay(idle) > Duration::from_secs(3590));
+        assert_eq!(schedule.delay(idle), idle);
+        tokio::time::advance(idle).await;
+        assert!(schedule.ready("finished"));
+        assert!(schedule.ready("scanning"));
+        assert_eq!(schedule.delay(idle), Duration::ZERO);
     }
 }
