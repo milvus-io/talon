@@ -77,6 +77,14 @@ impl Origin {
         version: Option<&'static rustls::SupportedProtocolVersion>,
         fragment: Option<usize>,
     ) -> Self {
+        Self::start_controlled(tls, version, fragment, None).await
+    }
+    async fn start_controlled(
+        tls: bool,
+        version: Option<&'static rustls::SupportedProtocolVersion>,
+        fragment: Option<usize>,
+        mut control: Option<IdleControl>,
+    ) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
             .unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
@@ -105,14 +113,23 @@ impl Origin {
         let accepted = connections.clone();
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
+                socket.set_nodelay(true).unwrap();
                 accepted.fetch_add(1, Ordering::SeqCst);
                 let acceptor = acceptor.clone();
                 let count = count.clone();
+                let control = control.take();
                 tokio::spawn(async move {
                     if tls {
                         if let Ok(stream) = acceptor.accept(socket).await {
-                            respond(stream, count).await;
+                            if let Some(control) = control {
+                                controlled_idle(IdleStream::Tls(Box::new(stream)), count, control)
+                                    .await;
+                            } else {
+                                respond(stream, count).await;
+                            }
                         }
+                    } else if let Some(control) = control {
+                        controlled_idle(IdleStream::Plain(socket), count, control).await;
                     } else {
                         respond(socket, count).await;
                     }
@@ -146,6 +163,205 @@ impl Origin {
             self.client(),
         ))
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IdleAction {
+    Fin,
+    Reset,
+    CloseNotify,
+    KeyUpdate,
+    PartialRecord,
+}
+
+struct IdleControl {
+    action: IdleAction,
+    start: tokio::sync::oneshot::Receiver<()>,
+    observed: tokio::sync::oneshot::Sender<()>,
+}
+
+trait TestIo: AsyncRead + AsyncWrite + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Unpin> TestIo for T {}
+
+enum IdleStream {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+impl IdleStream {
+    fn io(&mut self) -> &mut (dyn TestIo + Send) {
+        match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => stream.as_mut(),
+        }
+    }
+    fn socket(&self) -> &tokio::net::TcpStream {
+        match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => stream.get_ref().0,
+        }
+    }
+}
+
+async fn controlled_idle(mut stream: IdleStream, count: Arc<AtomicUsize>, control: IdleControl) {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(stream.io().read_u8().await.unwrap());
+    }
+    count.fetch_add(1, Ordering::SeqCst);
+    stream
+        .io()
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabcdefgh")
+        .await
+        .unwrap();
+    stream.io().flush().await.unwrap();
+    control.start.await.unwrap();
+    match control.action {
+        IdleAction::Fin => stream.io().shutdown().await.unwrap(),
+        IdleAction::Reset => {
+            #[allow(deprecated)]
+            stream
+                .socket()
+                .set_linger(Some(std::time::Duration::ZERO))
+                .unwrap();
+            drop(stream);
+            let _ = control.observed.send(());
+            return;
+        }
+        IdleAction::CloseNotify => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            tls.get_mut().1.send_close_notify();
+            // Flush only the TLS alert; leave TCP open so this specifically
+            // proves the monitor processes TLS close_notify, not just FIN.
+            tls.flush().await.unwrap();
+        }
+        IdleAction::KeyUpdate => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            tls.get_mut().1.refresh_traffic_keys().unwrap();
+            tls.flush().await.unwrap();
+            // Drive the reciprocal update while no HTTP request is pending.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), tls.read_u8())
+                    .await
+                    .is_err()
+            );
+            let _ = control.observed.send(());
+            respond(stream.io(), count).await;
+            return;
+        }
+        IdleAction::PartialRecord => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            // Stall halfway through a TLS record header. Checkout must abandon
+            // this in-flight idle read instead of reusing its damaged state.
+            tls.get_mut().0.write_all(&[23, 3, 3]).await.unwrap();
+            let _ = control.observed.send(());
+            let mut byte = [0];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tls.get_mut().0.read(&mut byte),
+            )
+            .await;
+            return;
+        }
+    }
+    let mut byte = [0];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.io().read(&mut byte),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(read, Ok(0)) || read.is_err(),
+        "monitor must close without sending a request"
+    );
+    let _ = control.observed.send(());
+}
+
+#[test]
+#[ignore = "requires native io_uring; checks idle EOF and TLS control records"]
+fn idle_origin_connections_observe_close_and_preserve_tls_control_records() {
+    on_native_ring(async {
+        for version in [
+            None,
+            Some(&rustls::version::TLS12),
+            Some(&rustls::version::TLS13),
+        ] {
+            let tls = version.is_some();
+            let mut actions = vec![IdleAction::Fin, IdleAction::Reset];
+            if tls {
+                actions.extend([IdleAction::CloseNotify, IdleAction::PartialRecord]);
+            }
+            if version == Some(&rustls::version::TLS13) {
+                actions.push(IdleAction::KeyUpdate);
+            }
+            for action in actions {
+                let (start, ready) = tokio::sync::oneshot::channel();
+                let (observed, wait) = tokio::sync::oneshot::channel();
+                let origin = Origin::start_controlled(
+                    tls,
+                    version,
+                    None,
+                    Some(IdleControl {
+                        action,
+                        start: ready,
+                        observed,
+                    }),
+                )
+                .await;
+                let client = origin.client();
+                let request = HttpRequest::new(
+                    Method::Get,
+                    format!(
+                        "{}://{}/keepalive",
+                        if tls { "https" } else { "http" },
+                        origin.address
+                    ),
+                    vec![],
+                );
+                assert_eq!(
+                    client.execute(request.clone()).await.unwrap().body,
+                    "abcdefgh"
+                );
+                start.send(()).unwrap();
+                // For FIN/close_notify the server waits for the client's close
+                // before acknowledging: no next request can trigger detection.
+                tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(action, IdleAction::PartialRecord | IdleAction::Reset) {
+                    // These events have no protocol acknowledgement. Allow the
+                    // packet to arrive and the idle monitor to start processing;
+                    // a close arriving after checkout remains a request error.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.execute(request),
+                )
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{version:?} {action:?}: {error}"));
+                assert_eq!(response.body, "abcdefgh", "{version:?} {action:?}");
+                assert_eq!(origin.requests.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    origin.connections.load(Ordering::SeqCst),
+                    if matches!(action, IdleAction::KeyUpdate) {
+                        1
+                    } else {
+                        2
+                    },
+                    "{version:?} {action:?}"
+                );
+            }
+        }
+    });
 }
 
 async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<AtomicUsize>) {

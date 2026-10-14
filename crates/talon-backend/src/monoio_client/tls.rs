@@ -38,6 +38,34 @@ fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Er
 }
 
 impl TlsStream {
+    pub(super) fn socket(&self) -> &TcpStream {
+        &self.socket
+    }
+
+    pub(super) fn can_idle(&self) -> bool {
+        self.plaintext.is_empty() && !self.closed
+    }
+
+    /// Process idle TLS traffic through rustls (tickets, KeyUpdate, alerts),
+    /// rather than treating every readable socket as a dead connection.
+    /// Cancellation is only safe if the caller drops this entire stream.
+    pub(super) async fn read_idle(&mut self) -> io::Result<()> {
+        if !self.can_idle() {
+            return Err(invalid(
+                "unexpected application data or closure on idle TLS",
+            ));
+        }
+        self.discard_consumed();
+        self.receive_record().await?;
+        self.advance(false).await?;
+        if !self.can_idle() {
+            return Err(invalid(
+                "unexpected application data or closure on idle TLS",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) async fn connect(
         socket: TcpStream,
         config: Arc<rustls::ClientConfig>,
