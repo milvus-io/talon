@@ -61,11 +61,11 @@ between publication and delayed GC startup.
 
 A complete pass marks the generation converged only after all selected misplaced
 blocks are gone and the generation remains valid. Reader/pin protection, activity
-races and unlink failure leave the event pending. Retrying after one second scans
-the same bounded old prefix; it may recheck retained owned blocks while converging,
-but uses no retry index or per-block ownership state. Cancellation discards local
-progress and retries the original event boundary. Once converged, new writes do
-not immediately wake ownership; the supplemental check handles them later.
+races and unlink failure leave the event pending. Retrying after one second visits
+only protected or failed blocks, using their ownership queue positions as retry
+keys. The cursor and selected candidate survive cancellation; already checked
+owned blocks are not rescanned. Once converged, new writes do not immediately wake
+ownership; the supplemental check handles them later.
 
 A newer event supersedes the old generation, including A -> B -> A changes observed
 by the publisher between GC invocations. Missing, expired or self-excluding membership
@@ -86,13 +86,24 @@ time in resident-cache size; normal membership validation still depends on the
 number of Workers. Reads and capacity-policy rotations do not advance this marker.
 
 When admissions exist, a supplemental pass captures a fixed new upper boundary
-and traverses the existing in-memory block index. Only blocks whose latest
-admission revision lies between the completed and new boundaries are hashed and
-checked against the cached placement tables. The traversal visits blocks, not
-individual pages; unchanged residents are not rehashed. Existing blocks must also
-be visited because a later page fill changes their revision without moving their
-original index position. There is no disk-directory scan or additional per-block
-index, and admission adds only one scalar assignment under its existing lock.
+and traverses only that range of the in-memory ownership index. Only blocks whose
+latest admission revision is below the new boundary are hashed and checked
+against the cached placement tables. Unchanged residents are not revisited and
+there is no disk-directory scan.
+
+The ownership index retains one entry per resident block. Each page admission
+updates the block revision for deletion safety, but repeated admissions coalesce
+at the same queue position until ownership observes the block. Observation marks
+the notification consumed under the same lock used by admission. The next fill
+moves the existing entry to a new position, reusing its BlockId; subsequent fills
+again update only the revision. Observed entries remain indexed for full scans on
+membership changes. Removing the last resident unit removes the entry too.
+
+Queue position and admission revision are deliberately separate. If a coalesced
+block has a post-boundary fill, the scanner moves its entry to the latest revision
+and leaves it pending for a later pass. This preserves the fixed event boundary
+without moving the index for every page. Protected retries use queue positions,
+while deletion still validates the latest revision, activity and pins.
 
 Supplemental passes use the same yielding, deletion budgets and protection checks
 as event passes. Reader/pin protection and unlink failure retry the fixed bounds
@@ -101,8 +112,8 @@ bounds. Admissions during the pass are deferred to the next hourly pass, includi
 page fills into older blocks. A new membership generation supersedes a pending
 supplemental pass and checks the new event's entire prefix immediately. Hourly
 timing restarts on completion; invalid or self-excluding membership pauses work.
-No timer waits occupy a background task slot. Continued admissions can cause an
-index traversal each hour, so this is not constant-time cleanup under write load.
+No timer waits occupy a background task slot. Continued admissions require work
+proportional to notified blocks, so cleanup under write load is not constant time.
 
 ## Independent tasks and bounded work
 
@@ -111,17 +122,18 @@ scan cursors. Ownership never issues backend requests; stale GC never consumes
 membership. They share only the resident block index, deletion budgets and guarded
 whole-block mutation.
 
-`OwnershipGc::run_round` keeps its cursor and current candidate local. Its persistent
-state is configuration, cached placement snapshot/tables, the last converged
-generation/admission boundary, and a supplemental deadline and optional fixed range.
-Maglev tables rebuild only when placement changes. Each eligible block
-is hashed and checked against those tables. No ownership/hash cache is added to
-block metadata or reads. Membership canonicalization costs O(N log N); scans use
-the resident index without cloning the full index or walking cache directories.
+Ownership retains the active pass cursor, retry keys and current candidate across
+scheduler slices and cancellation, along with its configuration, cached placement
+tables, last converged generation/admission boundary and supplemental deadline.
+Maglev tables rebuild only when placement changes. Each eligible block is hashed
+and checked against those tables. Reads do not update ownership notifications.
+Membership canonicalization costs O(N log N); scans use the resident index without
+cloning the full index or walking cache directories.
 
 Ownership streams blocks without candidate vectors or per-batch blocking-task
-dispatch. It cooperatively yields after about 10 ms of elapsed work, with no fixed
-sleep or block-count limit. Each block rechecks membership. Actual deletions consume
+dispatch. Each slice visits at most 64 entries and yields after about 10 ms of
+elapsed work, resuming unfinished scans without an interval sleep. Each block
+rechecks membership. Actual deletions consume
 shared page/disk credits; pending
 protected blocks retry after one second. The event scheduler coalesces changes
 received during active work. Once converged, ownership waits for a membership

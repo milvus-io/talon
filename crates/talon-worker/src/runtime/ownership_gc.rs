@@ -32,7 +32,8 @@ struct OwnershipPass {
     retry_cursor: u64,
     retries: BTreeSet<u64>,
     // Publish before awaiting so cancellation cannot lose a selected block.
-    attempt: Option<(StaleBlockCandidate, u64)>,
+    // Queue position, observed block, and deletion credits already paid.
+    attempt: Option<(u64, StaleBlockCandidate, u64)>,
 }
 
 impl OwnershipGc {
@@ -145,33 +146,40 @@ impl OwnershipGc {
             let pass = self.pass.as_mut().unwrap();
             if pass.attempt.is_none() {
                 let next = if pass.scanning {
-                    worker.lru.next_ownership_block(&mut pass.cursor)
+                    worker
+                        .lru
+                        .next_ownership_block(&mut pass.cursor, pass.range.end)
                 } else {
-                    let Some(revision) = pass.retries.range(pass.retry_cursor..).next().copied()
+                    let Some(position) = pass.retries.range(pass.retry_cursor..).next().copied()
                     else {
                         self.finish_round(&view);
                         return;
                     };
-                    pass.retry_cursor = revision + 1;
+                    pass.retry_cursor = position + 1;
                     // A newer admission or independent deletion retires the old retry.
                     let candidate = worker
                         .lru
-                        .next_ownership_block(&mut (revision, revision + 1));
+                        .next_ownership_block(&mut (position, position + 1), pass.range.end);
                     if candidate.is_none() {
-                        pass.retries.remove(&revision);
+                        pass.retries.remove(&position);
                         continue;
                     }
                     candidate
                 };
-                let Some(candidate) = next else {
+                let Some((position, candidate)) = next else {
                     pass.scanning = false;
                     self.finish_round(&view);
                     return;
                 };
+                if candidate.revision >= pass.range.end {
+                    // Coalesced post-boundary fills were moved to a later pass.
+                    pass.retries.remove(&position);
+                    continue;
+                }
                 worker.page_gc_metrics.ownership_checked.inc();
-                pass.attempt = Some((candidate, 0));
+                pass.attempt = Some((position, candidate, 0));
             }
-            let (candidate, paid) = self
+            let (position, candidate, paid) = self
                 .pass
                 .as_ref()
                 .unwrap()
@@ -187,7 +195,7 @@ impl OwnershipGc {
                 } else {
                     if let Some(budget) = &worker.background_budget {
                         let credits = budget.delete_slice(candidate.units as u64 - paid).await;
-                        self.pass.as_mut().unwrap().attempt.as_mut().unwrap().1 += credits;
+                        self.pass.as_mut().unwrap().attempt.as_mut().unwrap().2 += credits;
                         if paid + credits < candidate.units as u64 {
                             return;
                         }
@@ -197,9 +205,9 @@ impl OwnershipGc {
             let pass = self.pass.as_mut().unwrap();
             pass.attempt = None;
             if success {
-                pass.retries.remove(&candidate.revision);
+                pass.retries.remove(&position);
             } else {
-                pass.retries.insert(candidate.revision);
+                pass.retries.insert(position);
             }
             if started.elapsed() >= Duration::from_millis(10) {
                 return;
@@ -677,25 +685,32 @@ mod tests {
 
     #[tokio::test]
     async fn protected_retry_does_not_rescan_owned_blocks() {
-        let fixture = MembershipFixture::new();
-        let root = tempfile::tempdir().unwrap();
-        let r = runtime(root.path(), false, Arc::new(Origin::default()));
-        for offset in 0..20 {
-            fill(&r, &placed("a", offset), false).await;
+        for paged in [false, true] {
+            let fixture = MembershipFixture::new();
+            let root = tempfile::tempdir().unwrap();
+            let r = runtime(root.path(), paged, Arc::new(Origin::default()));
+            for offset in 0..20 {
+                fill(&r, &placed("a", offset), paged).await;
+            }
+            let outside = placed("b", 0);
+            fill(&r, &outside, paged).await;
+            let unit = if paged {
+                CacheUnit::Page(outside.clone(), PageIndex(0))
+            } else {
+                CacheUnit::Whole(outside.clone())
+            };
+            let pin = r.lru.pin_guard(unit).unwrap();
+            let mut gc = fixture.gc(&r);
+            gc.run_round(&r).await;
+            let checked = r.page_gc_metrics.ownership_checked.get();
+            assert_eq!(checked, 21);
+            gc.run_round(&r).await;
+            assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked + 1);
+            drop(pin);
+            gc.run_round(&r).await;
+            assert!(r.index.get(&outside).is_none());
+            assert_eq!(r.index.len(), 20);
         }
-        let outside = placed("b", 0);
-        fill(&r, &outside, false).await;
-        let pin = r.lru.pin_guard(CacheUnit::Whole(outside.clone())).unwrap();
-        let mut gc = fixture.gc(&r);
-        gc.run_round(&r).await;
-        let checked = r.page_gc_metrics.ownership_checked.get();
-        assert_eq!(checked, 21);
-        gc.run_round(&r).await;
-        assert_eq!(r.page_gc_metrics.ownership_checked.get(), checked + 1);
-        drop(pin);
-        gc.run_round(&r).await;
-        assert!(r.index.get(&outside).is_none());
-        assert_eq!(r.index.len(), 20);
     }
 
     #[tokio::test]
@@ -890,8 +905,12 @@ mod tests {
             let mut gc = fixture.gc(&r);
             let candidate = r
                 .lru
-                .next_ownership_block(&mut (0, r.lru.block_scan_ceiling()))
-                .unwrap();
+                .next_ownership_block(
+                    &mut (0, r.lru.block_scan_ceiling()),
+                    r.lru.block_scan_ceiling(),
+                )
+                .unwrap()
+                .1;
             let state = r.page_lifecycle.block(&id);
             let gate = state.gate.lock().await;
             // Both policies already selected the same block; hold commit until
@@ -974,8 +993,12 @@ mod tests {
             };
             let candidate = r
                 .lru
-                .next_ownership_block(&mut (0, r.lru.block_scan_ceiling()))
-                .unwrap();
+                .next_ownership_block(
+                    &mut (0, r.lru.block_scan_ceiling()),
+                    r.lru.block_scan_ceiling(),
+                )
+                .unwrap()
+                .1;
             tokio::time::timeout(
                 Duration::from_secs(1),
                 r.unlink_stale_block_for(

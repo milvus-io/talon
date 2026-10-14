@@ -118,6 +118,9 @@ struct BlockActivity {
     pins: usize,
     position: u64,
     revision: u64,
+    // One notification coalesces admissions until ownership observes the block.
+    ownership_position: u64,
+    ownership_pending: bool,
     access: Arc<AtomicU64>,
 }
 
@@ -202,8 +205,8 @@ impl Inner {
         activity.pins -= entry.pins as usize;
         if activity.units == 0 {
             let position = activity.position;
-            let revision = activity.revision;
-            self.ownership_queue.remove(&revision);
+            let ownership_position = activity.ownership_position;
+            self.ownership_queue.remove(&ownership_position);
             self.block_access.remove(block);
             self.block_queue.remove(&position);
         }
@@ -291,11 +294,17 @@ impl Lru {
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
         g.admission_ceiling = g.clock;
-        if let Some(activity) = g.block_access.get(unit.block()) {
-            let previous = activity.revision;
-            g.ownership_queue.remove(&previous);
+        if let Some(activity) = g.block_access.get_mut(unit.block()) {
+            if !activity.ownership_pending {
+                let previous = activity.ownership_position;
+                activity.ownership_position = position;
+                activity.ownership_pending = true;
+                let block = g.ownership_queue.remove(&previous).expect("queued block");
+                g.ownership_queue.insert(position, block);
+            }
+        } else {
+            g.ownership_queue.insert(position, unit.block().clone());
         }
-        g.ownership_queue.insert(position, unit.block().clone());
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
             e.bytes = bytes;
@@ -326,6 +335,8 @@ impl Lru {
                     pins: 0,
                     position,
                     revision: position,
+                    ownership_position: position,
+                    ownership_pending: true,
                     access: Arc::new(AtomicU64::new(access_millis())),
                 },
             );
@@ -575,22 +586,44 @@ impl Lru {
         out
     }
 
-    /// Advance one block in a fixed admission prefix, without backend policy or
-    /// a candidate buffer. The caller checks revision and placement after unlocking.
+    /// Observe one coalesced notification. The queue key is independent of the
+    /// latest admission revision, and is also the stable key for protected retries.
+    /// Entries remain indexed after observation so membership events can scan all
+    /// residents; the next admission moves an observed entry back to the tail.
+    ///
+    /// A post-boundary fill defers the entire block, moving its notification to
+    /// the latest revision without consuming it. The caller must skip the returned
+    /// candidate when its revision is at or beyond `admission_limit`. Returning it
+    /// rather than looping here keeps each scheduler slice bounded even if every
+    /// block in the prefix has received a post-boundary fill.
     pub(crate) fn next_ownership_block(
         &self,
         cursor: &mut (u64, u64),
-    ) -> Option<StaleBlockCandidate> {
-        let g = self.inner.lock().unwrap();
+        admission_limit: u64,
+    ) -> Option<(u64, StaleBlockCandidate)> {
+        let mut g = self.inner.lock().unwrap();
         let (&position, block) = g.ownership_queue.range(cursor.0..cursor.1).next()?;
         cursor.0 = position + 1;
-        let activity = &g.block_access[block];
-        Some(StaleBlockCandidate {
-            block: block.clone(),
+        let block = block.clone();
+        let activity = g.block_access.get_mut(&block).expect("tracked block");
+        let revision = activity.revision;
+        if revision >= admission_limit {
+            activity.ownership_position = revision;
+            activity.ownership_pending = true;
+        } else {
+            activity.ownership_pending = false;
+        }
+        let candidate = StaleBlockCandidate {
+            block,
             units: activity.units,
-            revision: activity.revision,
+            revision,
             last_access: activity.access.load(Ordering::Relaxed),
-        })
+        };
+        if revision >= admission_limit && position != revision {
+            let block = g.ownership_queue.remove(&position).expect("queued block");
+            g.ownership_queue.insert(revision, block);
+        }
+        Some((position, candidate))
     }
 
     pub(crate) fn block_scan_ceiling(&self) -> u64 {
@@ -784,6 +817,106 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn ownership_admissions_coalesce_until_observed_and_rearm_after_observation() {
+        let lru = Lru::new();
+        let block = blk(1);
+        for page in 0..16 {
+            lru.insert(CacheUnit::Page(block.clone(), PageIndex(page)), 4096);
+        }
+        {
+            let g = lru.inner.lock().unwrap();
+            assert_eq!(g.ownership_queue.len(), 1);
+            let activity = &g.block_access[&block];
+            assert_eq!(activity.ownership_position, 0);
+            assert_eq!(activity.revision, 15);
+        }
+        let limit = lru.ownership_admission_ceiling();
+        let (position, candidate) = lru.next_ownership_block(&mut (0, limit), limit).unwrap();
+        assert_eq!(candidate.units, 16);
+        assert!(lru.stale_candidate_is_current(&candidate));
+        // A protected retry looks up the queue position, not the latest revision.
+        assert_eq!(
+            lru.next_ownership_block(&mut (position, position + 1), limit)
+                .unwrap()
+                .1
+                .revision,
+            candidate.revision
+        );
+        for page in 16..32 {
+            lru.insert(CacheUnit::Page(block.clone(), PageIndex(page)), 4096);
+        }
+        assert!(!lru.stale_candidate_is_current(&candidate));
+        assert!(lru
+            .next_ownership_block(&mut (position, position + 1), limit)
+            .is_none());
+        let next_limit = lru.ownership_admission_ceiling();
+        let (next_position, candidate) = lru
+            .next_ownership_block(&mut (limit, next_limit), next_limit)
+            .unwrap();
+        assert_eq!(next_position, limit);
+        assert_eq!(candidate.units, 32);
+        assert_eq!(candidate.revision, next_limit - 1);
+        // Retain observed entries for a later full membership sweep.
+        assert!(lru
+            .next_ownership_block(&mut (0, next_limit), next_limit)
+            .is_some());
+    }
+
+    #[test]
+    fn ownership_coalesced_post_boundary_fill_moves_to_next_pass() {
+        let lru = Lru::new();
+        let block = blk(1);
+        lru.insert(CacheUnit::Page(block.clone(), PageIndex(0)), 4096);
+        lru.insert(whole(2), 4096);
+        let limit = lru.ownership_admission_ceiling();
+        lru.insert(CacheUnit::Page(block.clone(), PageIndex(1)), 4096);
+        lru.insert(CacheUnit::Page(block.clone(), PageIndex(2)), 4096);
+        let mut cursor = (0, limit);
+        let (_, deferred) = lru.next_ownership_block(&mut cursor, limit).unwrap();
+        assert!(deferred.revision >= limit);
+        assert_eq!(
+            lru.next_ownership_block(&mut cursor, limit)
+                .unwrap()
+                .1
+                .block,
+            blk(2)
+        );
+        assert!(lru.next_ownership_block(&mut cursor, limit).is_none());
+        // A further fill must stay coalesced with the deferred notification.
+        lru.insert(CacheUnit::Page(block.clone(), PageIndex(3)), 4096);
+        let next_limit = lru.ownership_admission_ceiling();
+        let (position, candidate) = lru
+            .next_ownership_block(&mut (limit, next_limit), next_limit)
+            .unwrap();
+        assert_eq!(position, deferred.revision);
+        assert_eq!(candidate.block, block);
+        assert_eq!(candidate.units, 4);
+        assert!(lru.stale_candidate_is_current(&candidate));
+    }
+
+    #[test]
+    fn ownership_removal_and_recreation_retire_coalesced_notification() {
+        let lru = Lru::new();
+        let block = blk(1);
+        for page in 0..16 {
+            lru.insert(CacheUnit::Page(block.clone(), PageIndex(page)), 4096);
+        }
+        let limit = lru.ownership_admission_ceiling();
+        lru.remove_block(&block);
+        assert!(lru.inner.lock().unwrap().ownership_queue.is_empty());
+        lru.insert(CacheUnit::Page(block.clone(), PageIndex(0)), 4096);
+        assert!(lru.next_ownership_block(&mut (0, limit), limit).is_none());
+        let next_limit = lru.ownership_admission_ceiling();
+        assert_eq!(
+            lru.next_ownership_block(&mut (limit, next_limit), next_limit)
+                .unwrap()
+                .1
+                .block,
+            block
+        );
     }
 
     #[test]
