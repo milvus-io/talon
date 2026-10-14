@@ -440,6 +440,9 @@ impl WorkerRuntime {
         reason: usize,
         target: u64,
     ) {
+        if units.is_empty() {
+            return;
+        }
         // Capture generations before the first await, not after earlier deletions finish.
         let candidates: Vec<_> = units
             .into_iter()
