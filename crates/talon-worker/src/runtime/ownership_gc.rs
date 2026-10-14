@@ -108,7 +108,11 @@ impl OwnershipGc {
             let range = if view.generation != self.completed_generation {
                 self.supplement = None;
                 // Each namespace retains its own publication boundary.
-                0..view.scan_limits.get(worker.namespace.effective_name()).copied().unwrap_or(0)
+                0..view
+                    .scan_limits
+                    .get(worker.namespace.effective_name())
+                    .copied()
+                    .unwrap_or(0)
             } else {
                 let limit = worker.lru.ownership_admission_ceiling();
                 if limit <= self.completed_limit {
