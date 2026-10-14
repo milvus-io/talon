@@ -682,7 +682,10 @@ impl WorkerRuntime {
                     })
                     .flatten();
                 if let Some((first_guard, guards)) = state {
-                    match paged.get_range(&block, offset_in_block, request.len) {
+                    match paged
+                        .get_range_async(&block, offset_in_block, request.len)
+                        .await
+                    {
                         Ok(handles) if !handles.is_empty() => {
                             let served: u64 = handles.iter().map(|h| h.len).sum();
                             // Only take the fast path when the handles cover the

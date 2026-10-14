@@ -49,8 +49,14 @@ pub(crate) struct CachedFd {
 /// the cost of a miss is exactly the old behaviour — one `openat` — so a
 /// precise LRU is not worth the extra bookkeeping on this path.
 pub(crate) struct FdCache {
-    shards: Vec<Mutex<HashMap<PathBuf, CachedFd>>>,
+    shards: Vec<Mutex<Shard>>,
     per_shard: usize,
+}
+
+#[derive(Default)]
+struct Shard {
+    entries: HashMap<PathBuf, CachedFd>,
+    generation: u64,
 }
 
 impl FdCache {
@@ -72,7 +78,7 @@ impl FdCache {
     pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap().len())
+            .map(|shard| shard.lock().unwrap().entries.len())
             .sum()
     }
 
@@ -83,13 +89,13 @@ impl FdCache {
     pub(crate) fn with_capacity(per_shard: usize) -> Self {
         Self {
             shards: (0..FD_CACHE_SHARDS)
-                .map(|_| Mutex::new(HashMap::new()))
+                .map(|_| Mutex::new(Shard::default()))
                 .collect(),
             per_shard,
         }
     }
 
-    fn shard_for(&self, path: &Path) -> &Mutex<HashMap<PathBuf, CachedFd>> {
+    fn shard_for(&self, path: &Path) -> &Mutex<Shard> {
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         &self.shards[(hasher.finish() as usize) % FD_CACHE_SHARDS]
@@ -98,18 +104,56 @@ impl FdCache {
     pub(crate) fn get(&self, path: &Path) -> Option<CachedFd> {
         let shard = self.shard_for(path);
         let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        guard.get(path).cloned()
+        guard.entries.get(path).cloned()
     }
 
     pub(crate) fn insert(&self, path: PathBuf, entry: CachedFd) {
         let shard = self.shard_for(&path);
         let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.len() >= self.per_shard && !guard.contains_key(&path) {
-            if let Some(victim) = guard.keys().next().cloned() {
-                guard.remove(&victim);
+        if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
+            if let Some(victim) = guard.entries.keys().next().cloned() {
+                guard.entries.remove(&victim);
             }
         }
-        guard.insert(path, entry);
+        guard.entries.insert(path, entry);
+    }
+
+    /// Open cold descriptors asynchronously. Invalidation during open/stat must
+    /// not allow a superseded inode to be inserted after the writer's rename.
+    pub(crate) async fn open_native(&self, path: PathBuf) -> std::io::Result<CachedFd> {
+        talon_uring::require_ring()?;
+        let generation = {
+            let guard = self
+                .shard_for(&path)
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(hit) = guard.entries.get(&path) {
+                return Ok(hit.clone());
+            }
+            guard.generation
+        };
+        let open_path = path.clone();
+        let (fd, len) =
+            talon_uring::spawn_cancellable(async move { talon_uring::open_read(&open_path).await })
+                .await
+                .map_err(|e| std::io::Error::other(format!("ring open task stopped: {e}")))??;
+        let entry = CachedFd {
+            fd: Arc::new(fd),
+            len,
+        };
+        let mut guard = self
+            .shard_for(&path)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.generation == generation {
+            if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
+                if let Some(victim) = guard.entries.keys().next().cloned() {
+                    guard.entries.remove(&victim);
+                }
+            }
+            guard.entries.insert(path, entry.clone());
+        }
+        Ok(entry)
     }
 
     /// Drop any cached descriptor for `path`.
@@ -121,7 +165,8 @@ impl FdCache {
     pub(crate) fn invalidate(&self, path: &Path) {
         let shard = self.shard_for(path);
         let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-        guard.remove(path);
+        guard.generation = guard.generation.wrapping_add(1);
+        guard.entries.remove(path);
     }
 
     /// Drop every cached descriptor whose path lies under `dir`.
@@ -131,7 +176,8 @@ impl FdCache {
     pub(crate) fn invalidate_prefix(&self, dir: &Path) {
         for shard in &self.shards {
             let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
-            guard.retain(|path, _| !path.starts_with(dir));
+            guard.generation = guard.generation.wrapping_add(1);
+            guard.entries.retain(|path, _| !path.starts_with(dir));
         }
     }
 }
@@ -191,7 +237,7 @@ mod tests {
             cache.insert(path.clone(), write(&path, b"x"));
         }
         for shard in &cache.shards {
-            assert!(shard.lock().unwrap().len() <= 2);
+            assert!(shard.lock().unwrap().entries.len() <= 2);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
