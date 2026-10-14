@@ -78,18 +78,28 @@ into `.patched-deps/monoio-http`. Offline builds can additionally pass
 `--monoio-http-archive /path/to/monoio-http-0.3.12.crate`.
 Remove this patch when an upstream release drops or updates the unused dependency.
 
-## Monoio rustls header consumption
+## Rustls borrowed plaintext delivery
 
-The native origin transport also patches monoio-rustls 0.4.0. The additional
-`read_until_delimiter` method consumes only framing bytes from rustls's plaintext
-reader, leaving the body available for a read into Talon's final aligned buffer.
-It retains the original stream and its TLS/network buffers; no connection state
-is extracted or discarded. EOF and framing limits return errors. This does not
-remove rustls's plaintext-to-application copy and does not enable kTLS.
+The native origin transport patches rustls 0.23.46 with an opt-in client method,
+`process_tls_records_in_place`. The upstream unbuffered API still copies accepted
+application plaintext into `received_plaintext`. This extension records its
+input-relative range instead, then returns a borrowed view through `ReadTraffic`.
+It preserves the existing record authentication and protocol-state handlers;
+`take_received_plaintext` is reached only after those checks. Range capture is
+scoped to a single protocol processing call. No raw pointer is dereferenced by
+the patch, and buffered clients and the original unbuffered method are unchanged.
 
-The same preparation script verifies the release checksum and applies
-`patches/monoio-rustls-0.4.0.patch`. The generated directory is
-`.patched-deps/monoio-rustls`; upstream license files are preserved. Offline
-preparation accepts `--rustls-archive /path/to/monoio-rustls-0.4.0.crate` alongside
-`--archive` for Monoio. Remove the extension when upstream provides an equivalent
-bounded delimiter read that does not prefetch plaintext body into another buffer.
+Talon retains the input allocation until the plaintext view is consumed, and
+transfers owned input/output to Monoio through I/O completion, including after
+cancellation. It does not enable monoio-rustls `unsafe_io`. The previous
+monoio-rustls delimiter extension is no longer needed. Payload copy and alignment
+limits are described in `docs/explanation/monoio-origin-io.md`.
+
+The preparation script verifies the rustls release SHA-256
+`48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf`
+and applies `patches/rustls-0.23.46.patch` to `.patched-deps/rustls`, preserving
+upstream license files. Offline preparation accepts
+`--rustls-archive /path/to/rustls-0.23.46.crate` alongside `--archive` for Monoio.
+Remove this extension when upstream offers equivalent borrowed plaintext delivery.
+`crates/talon-worker/tests/unbuffered_tls.rs` checks pointer containment, six
+AEAD suites, key updates, fragmented messages, and ciphertext authentication.

@@ -13,7 +13,6 @@ monoio = { workspace = true, optional = true }
 monoio-codec = { version = "=0.3.4", optional = true }
 libc = { workspace = true, optional = true }
 monoio-http = { version = "=0.3.12", optional = true }
-monoio-rustls = { version = "=0.4.0", optional = true }
 rustls = { workspace = true, optional = true }
 webpki-roots = { version = "0.26", optional = true }
 http = { version = "1", optional = true }
@@ -42,5 +41,5 @@ tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "test-util", "time"] }
 
 [features]
-uring = ["dep:monoio-codec", "dep:libc", "dep:talon-uring", "dep:monoio", "dep:monoio-http", "dep:monoio-rustls", "dep:rustls", "dep:webpki-roots", "dep:http"]
+uring = ["dep:monoio-codec", "dep:libc", "dep:talon-uring", "dep:monoio", "dep:monoio-http", "dep:rustls", "dep:webpki-roots", "dep:http"]
 telemetry = ["talon-telemetry/export"]

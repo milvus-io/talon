@@ -70,20 +70,29 @@ impl Drop for Origin {
 }
 impl Origin {
     async fn start(tls: bool) -> Self {
+        Self::start_fragmented(tls, None, None).await
+    }
+    async fn start_fragmented(
+        tls: bool,
+        version: Option<&'static rustls::SupportedProtocolVersion>,
+        fragment: Option<usize>,
+    ) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
             .unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
+        let versions = version.map_or_else(|| rustls::DEFAULT_VERSIONS.to_vec(), |v| vec![v]);
+        let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&versions)
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![cert.cert.der().clone()], key.into())
             .unwrap();
+        server.max_fragment_size = fragment;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
         let client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&versions)
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -152,7 +161,16 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
         let attempt = count.fetch_add(1, Ordering::SeqCst);
         let request = String::from_utf8(request).unwrap();
         let target = request.split_whitespace().nth(1).unwrap();
-        if target.starts_with("/stall") {
+        if target == "/stall" {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
+            return;
+        }
+        if target.contains("/stall-body") {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\npartial")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
             return;
         }
@@ -882,6 +900,61 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                     }
                 }
             }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring; fragmented TLS 1.2/1.3 application records"]
+fn fragmented_tls_records_and_body_cancellation() {
+    on_native_ring(async {
+        let probe_root = tempfile::tempdir().unwrap();
+        let alignment = talon_uring::DirectIoAlignment::probe(probe_root.path()).unwrap();
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let origin = Origin::start_fragmented(true, Some(version), Some(256)).await;
+            let client = origin.client();
+            for kind in ["fixed", "chunked"] {
+                for len in [65536, 65539] {
+                    let body = talon_uring::Download::capture(Some(alignment), async {
+                        Ok::<_, String>(
+                            client
+                                .execute(HttpRequest::new(
+                                    Method::Get,
+                                    format!("https://{}/{kind}/large-{len}", origin.address),
+                                    vec![("Range".into(), format!("bytes=0-{}", len - 1))],
+                                ))
+                                .await?
+                                .body,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(body.as_ptr() as usize % alignment.memory(), 0);
+                    assert_eq!(body.len(), len);
+                    assert!(body.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+                }
+            }
+            for _ in 0..8 {
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(30),
+                    client.execute(HttpRequest::new(
+                        Method::Get,
+                        format!("https://{}/stall-body", origin.address),
+                        vec![]
+                    ))
+                )
+                .await
+                .is_err());
+            }
+            let response = client
+                .execute(HttpRequest::new(
+                    Method::Get,
+                    format!("https://{}/keepalive", origin.address),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.body, "abcdefgh");
         }
     });
 }

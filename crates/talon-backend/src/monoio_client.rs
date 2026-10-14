@@ -5,6 +5,7 @@ use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 use async_trait::async_trait;
 use monoio::io::sink::SinkExt;
 mod body;
+mod tls;
 use body::OriginIo;
 use monoio_http::{
     common::body::{FixedBody, HttpBody},
@@ -18,7 +19,7 @@ use std::{
 
 enum Connection {
     Plain(monoio::net::TcpStream),
-    Tls(Box<monoio_rustls::ClientTlsStream<monoio::net::TcpStream>>),
+    Tls(Box<tls::TlsStream>),
 }
 struct Idle {
     owner: Weak<rustls::ClientConfig>,
@@ -141,12 +142,11 @@ impl MonoioClient {
                         if https {
                             let name = rustls::pki_types::ServerName::try_from(host)
                                 .map_err(|_| "invalid TLS server name")?;
-                            let stream = monoio_rustls::TlsConnector::from(tls.clone())
-                                .connect(name, stream)
+                            let stream = tls::TlsStream::connect(stream, tls.clone(), name)
                                 .await
                                 .map_err(|_| {
-                                    "origin TLS handshake/certificate verification failed"
-                                })?;
+                                "origin TLS handshake/certificate verification failed"
+                            })?;
                             Ok::<_, &str>(Connection::Tls(Box::new(stream)))
                         } else {
                             Ok(Connection::Plain(stream))

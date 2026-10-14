@@ -40,7 +40,7 @@ engine adds no operation-count admission limit. READ misses retain their
 existing policy; they do not acquire the LOAD payload budget.
 
 Network I/O uses `monoio-http` HTTP/1.1
-codecs and `monoio-rustls` 0.4 with rustls 0.23. TLS verifies certificate chains
+codecs and a native adapter for rustls 0.23's unbuffered API. TLS verifies certificate chains
 and hostnames against WebPKI trust roots. Idle connections stay on their own
 ring, isolated by authority and trust configuration, capped at 64 per ring and
 reused for up to 90 seconds. Only complete responses return to the pool.
@@ -72,13 +72,13 @@ HTTP Range bodies are received into a single allocation whose start satisfies
 the target store's memory alignment. Its capacity includes the write-aligned
 length plus address-alignment slack. Receive windows expose only the logical
 body length; the extra tail is zero-initialized in that same allocation.
-Headers are consumed separately: the Monoio rustls extension consumes
-only header lines from its plaintext reader, leaving body bytes for the final
-receive buffer. Plain HTTP uses nonblocking socket peeks to locate framing and
+Headers are consumed separately from borrowed TLS plaintext, leaving body
+bytes for the final receive buffer. Plain HTTP uses nonblocking socket peeks to locate framing and
 then consumes exactly that framing; peeks can include a small body prefix.
 Known-length chunked Range responses fill successive windows of the same
-allocation rather than assembling copied chunks. Non-Range chunked APIs retain
-the growable-body implementation.
+allocation rather than assembling copied chunks. Non-Range chunked APIs read
+into a growable allocation directly; resizing that allocation can still move
+previous bytes when the unknown response size exceeds its capacity.
 
 A request-scoped download context carries the target alignment through the
 existing backend APIs. The HTTP client explicitly retains it across its native
@@ -125,15 +125,42 @@ Both configured namespaces and namespaces created on demand use this execution
 policy. Whole-block sidecar failures retain the existing best-effort behavior;
 paged commits require a sidecar before publishing their page.
 
+## TLS buffer lifetime
+
+The adapter transfers its input allocation into Monoio socket operations. Rustls
+is called only after completion. It borrows accepted plaintext from that same
+allocation, and the adapter consumes the view before discarding/reusing input.
+A cancelled future drops its socket/session, but the kernel operation retains
+its input allocation until completion; no `unsafe_io` borrowed kernel buffer is
+used. Failed or cancelled connections never return to the pool.
+
+The rustls extension preserves the existing decrypt/authentication and protocol
+state handlers. Only the opt-in client's accepted application-data delivery
+changes from an internal Vec queue to an input-buffer range. Buffered clients
+and the original unbuffered entry point retain their behavior. TLS 1.2/1.3,
+session tickets, and key updates continue through rustls's original state
+machine. No key extraction, custom cryptography, or kTLS is involved.
+
+Records are read with a header read followed by a payload read. This avoids
+compacting application ciphertext across receives but adds completion overhead;
+measure it against the prior adapter before claiming a throughput improvement.
+Only fragmented handshake input may be compacted. Input is capped at 256 KiB,
+with each ciphertext record capped at 18,432 bytes before rustls validation.
+
 ## Scope and limitations
 
 - This changes the I/O engine, **not** the complete-Range buffering contract.
-  It is not streaming download-to-disk or end-to-end zero-copy. Rustls still
-  decrypts in userspace and copies plaintext into the application's receive
-  buffer. The safe monoio-rustls adapter also copies received ciphertext from
-  its owned socket buffer into rustls. This removes the extra body assembly/
-  alignment copy, not TLS's copies, and does not establish a lower total copy
-  count than reqwest/tokio-rustls.
+  It is not streaming download-to-disk or end-to-end zero-copy. The TLS adapter
+  receives into an owned buffer, authenticates/decrypts in place, and borrows
+  plaintext using the opt-in rustls patch. It removes the ciphertext adapter
+  copy and internal plaintext-queue copy. One user-space payload copy remains:
+  authenticated plaintext goes directly into the final aligned HTTP body
+  allocation. This simultaneously removes framing and assembles records/chunks;
+  there is no additional body-assembly or alignment copy. TLS record offsets,
+  HTTP framing, contiguous `Bytes`, and direct-write alignment prevent simply
+  handing arbitrary borrowed record slices to the existing cache interface.
+  Handshake processing, request encryption, and small framing/metadata buffers
+  still move bytes; this is a payload-path claim, not a process-wide copy count.
   Direct payload writes bypass the data page cache; buffered writes populate it.
   Reads deliberately retain buffered descriptors and file-to-socket splice,
   so subsequent reads may populate page cache even after a direct write.
@@ -162,12 +189,18 @@ permitted. A denied ring initialization fails these tests; it is never counted
 as a passing fallback run.
 
 ```sh
+cargo test -p talon-worker --test unbuffered_tls --locked
 cargo test -p talon-uring --tests --locked -- --ignored --nocapture
 cargo test -p talon-worker --test uring_origin --locked -- --ignored --nocapture
 ```
 
-Tests cover alignment and pointer preservation through Bytes ownership/slices,
-direct-write page-cache residency, padded file lengths versus logical lengths,
+The rustls regression checks input/decoded-payload pointer containment for six
+TLS 1.2/1.3 AEAD suites, fragmented records, post-handshake key updates, and
+rejection of tampered ciphertext before delivering plaintext. Native HTTPS
+tests cover small TLS records, 64 KiB+ fixed/chunked bodies and repeated body-read
+cancellation. Tests also cover alignment and pointer preservation through Bytes
+ownership/slices, direct-write page-cache residency, padded file lengths versus
+logical lengths,
 fixed/chunked HTTP and HTTPS payloads, and ring-local cancellation/draining, concurrent directory creation,
 staging collision preservation, failed rename cleanup, HTTP/HTTPS and certificate rejection, connection reuse,
 chunked/truncated responses, cancelled HTTP attempts, S3 If-Match Range LOAD,
