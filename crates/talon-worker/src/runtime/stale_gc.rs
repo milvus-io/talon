@@ -28,10 +28,18 @@ impl Default for StaleGc {
 }
 impl StaleGc {
     pub(super) fn new(config: &WorkerConfig) -> Self {
-        Self::with_head_rate(config, Arc::new(crate::background::Rate::new(config.stale_gc_head_max_per_sec)))
+        Self::with_head_rate(
+            config,
+            Arc::new(crate::background::Rate::new(
+                config.stale_gc_head_max_per_sec,
+            )),
+        )
     }
 
-    pub(super) fn with_head_rate(config: &WorkerConfig, heads: Arc<crate::background::Rate>) -> Self {
+    pub(super) fn with_head_rate(
+        config: &WorkerConfig,
+        heads: Arc<crate::background::Rate>,
+    ) -> Self {
         Self {
             cursor: (0, 0),
             pending: VecDeque::new(),

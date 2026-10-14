@@ -52,11 +52,14 @@ impl WorkerBackground {
                     let name = namespace.namespace().effective_name();
                     if schedule.ready(name) {
                         let complete = namespace.gc_next_batch().await.completed_scan;
-                        schedule.defer(name, if complete {
-                            Duration::from_millis(namespace.page_gc_config.interval_ms)
-                        } else {
-                            Duration::ZERO
-                        });
+                        schedule.defer(
+                            name,
+                            if complete {
+                                Duration::from_millis(namespace.page_gc_config.interval_ms)
+                            } else {
+                                Duration::ZERO
+                            },
+                        );
                     }
                 }
                 Some(schedule.delay(period))
@@ -73,8 +76,18 @@ impl WorkerBackground {
                 for namespace in w.namespace_runtimes() {
                     let name = namespace.namespace().effective_name();
                     if schedule.ready(name) {
-                        let complete = namespace.cleanup_page_files_batch(4096, 64).await.completed_scan;
-                        schedule.defer(name, if complete { cleanup_period } else { Duration::ZERO });
+                        let complete = namespace
+                            .cleanup_page_files_batch(4096, 64)
+                            .await
+                            .completed_scan;
+                        schedule.defer(
+                            name,
+                            if complete {
+                                cleanup_period
+                            } else {
+                                Duration::ZERO
+                            },
+                        );
                     }
                 }
                 Some(schedule.delay(cleanup_period))
@@ -121,9 +134,14 @@ impl WorkerBackground {
         }
         if config.stale_gc_enabled {
             let w = worker.clone();
-            let states = Arc::new(tokio::sync::Mutex::new((SliceSchedule::default(), HashMap::new())));
+            let states = Arc::new(tokio::sync::Mutex::new((
+                SliceSchedule::default(),
+                HashMap::new(),
+            )));
             let config = config.clone();
-            let heads = Arc::new(crate::background::Rate::new(config.stale_gc_head_max_per_sec));
+            let heads = Arc::new(crate::background::Rate::new(
+                config.stale_gc_head_max_per_sec,
+            ));
             scheduler.register_adaptive("stale_gc", Duration::from_secs(3600), move || {
                 let w = w.clone();
                 let states = states.clone();
@@ -138,7 +156,10 @@ impl WorkerBackground {
                             let gc = collectors.entry(name.to_owned()).or_insert_with(|| {
                                 super::stale_gc::StaleGc::with_head_rate(&config, heads.clone())
                             });
-                            let delay = gc.run_slice(&namespace).await.unwrap_or(Duration::from_secs(3600));
+                            let delay = gc
+                                .run_slice(&namespace)
+                                .await
+                                .unwrap_or(Duration::from_secs(3600));
                             schedule.defer(name, delay);
                         }
                     }
@@ -234,14 +255,19 @@ struct SliceSchedule {
 }
 impl SliceSchedule {
     fn ready(&self, name: &str) -> bool {
-        self.next.get(name).is_none_or(|next| *next <= Instant::now())
+        self.next
+            .get(name)
+            .is_none_or(|next| *next <= Instant::now())
     }
     fn defer(&mut self, name: &str, delay: Duration) {
         self.next.insert(name.to_owned(), Instant::now() + delay);
     }
     fn delay(&self, idle: Duration) -> Duration {
         let now = Instant::now();
-        self.next.values().map(|next| next.saturating_duration_since(now)).fold(idle, Duration::min)
+        self.next
+            .values()
+            .map(|next| next.saturating_duration_since(now))
+            .fold(idle, Duration::min)
     }
 }
 

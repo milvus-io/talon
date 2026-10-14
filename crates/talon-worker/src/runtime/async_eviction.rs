@@ -36,6 +36,7 @@ impl EvictionCycle {
     }
 
     pub(super) async fn tick(&mut self, worker: &WorkerRuntime) {
+        self.progressed = false;
         if let Some(registry) = worker.registry() {
             let workers = registry.snapshot();
             let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
@@ -64,12 +65,13 @@ impl EvictionCycle {
                     .expect("eviction scan panicked");
                     namespace.unlink_units_to_target(units, 1, target).await;
                 }
-                self.active = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>() > self.low;
+                let remaining = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>();
+                self.progressed = remaining < total;
+                self.active = remaining > self.low;
             }
             return;
         }
         let bytes = worker.lru.total_bytes();
-        self.progressed = false;
         if bytes <= self.low {
             self.active = false;
         } else if bytes >= self.high {
@@ -250,6 +252,15 @@ mod tests {
                 "pins prevent reaching the global low watermark of 112"
             );
             assert_eq!(namespaces[8].resident_bytes(), 0);
+            assert_eq!(
+                cycle.next_delay(Duration::from_secs(60)),
+                Some(Duration::ZERO)
+            );
+            cycle.tick(&worker).await;
+            assert_eq!(
+                cycle.next_delay(Duration::from_secs(60)),
+                Some(Duration::from_secs(1))
+            );
             drop(pins);
             cycle.tick(&worker).await;
             assert_eq!(
