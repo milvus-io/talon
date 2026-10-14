@@ -105,14 +105,31 @@ struct ShardWork {
     pending: Mutex<BTreeSet<u64>>,
 }
 
-#[derive(Default)]
 pub(crate) struct BlockWork {
     shard: Arc<ShardWork>,
     slot: u64,
     retired: AtomicBool,
+    dirty_since: AtomicU64,
+}
+impl Default for BlockWork {
+    fn default() -> Self {
+        Self {
+            shard: Arc::default(),
+            slot: 0,
+            retired: AtomicBool::new(false),
+            dirty_since: AtomicU64::new(UNKNOWN),
+        }
+    }
 }
 impl BlockWork {
     fn dirty(&self, now: u64) {
+        // Coalesce different pages of an already dirty block without taking the
+        // shard lock. An RMW (not a load/skip) orders this publication against
+        // checkpoint's reset before it samples pages. Older timestamps still
+        // update the summary, notably when failed checkpoints restore dirtiness.
+        if self.dirty_since.fetch_min(now, Ordering::Release) <= now {
+            return;
+        }
         let mut dirty = self.shard.dirty.lock().unwrap();
         if self.retired.load(Ordering::Relaxed) {
             return;
@@ -134,7 +151,12 @@ impl BlockWork {
         self.shard.pending.lock().unwrap().remove(&self.slot);
     }
     pub fn checkpoint(self: &Arc<Self>) -> BlockCheckpoint {
-        let since = self.shard.dirty.lock().unwrap().remove(&self.slot);
+        let mut dirty = self.shard.dirty.lock().unwrap();
+        let since = dirty.remove(&self.slot);
+        self.dirty_since.swap(UNKNOWN, Ordering::AcqRel);
+        // A publisher waiting for this lock can conservatively reinsert an old
+        // summary. That may cause an extra checkpoint, but cannot lose a touch.
+        drop(dirty);
         BlockCheckpoint {
             work: self.clone(),
             since,
@@ -204,7 +226,7 @@ impl PageState {
                 Ok(_) => {
                     // Always a release RMW: a checkpoint consuming this marker
                     // must also see this timestamp. Only the first dirty touch
-                    // per page/checkpoint updates the shard summary.
+                    // per page/checkpoint notifies the coalesced block summary.
                     if self.dirty_since.fetch_min(now, Ordering::Release) == UNKNOWN {
                         self.work.dirty(now);
                     }
@@ -685,6 +707,7 @@ impl PageLifecycle {
                     shard: self.work[disk_shard(id)].clone(),
                     slot: n,
                     retired: AtomicBool::new(false),
+                    dirty_since: AtomicU64::new(UNKNOWN),
                 }),
                 ..Default::default()
             }),
@@ -1195,6 +1218,106 @@ mod tests {
             clean.checked, 0,
             "successful reads retire cancelled retries"
         );
+    }
+
+    #[test]
+    fn dirty_block_reads_do_not_wait_for_the_shard_summary_lock() {
+        let life = PageLifecycle::new();
+        let block = life.block(&id());
+        let handles: Vec<_> = (0..256)
+            .map(|page| block.register(PageIndex(page), Some(10), 10, false))
+            .collect();
+        handles[0]
+            .acquire()
+            .unwrap()
+            .record_access_and_release(Some(20));
+        let work = block.inner.lock().unwrap().work.clone();
+        let held = work.shard.dirty.lock().unwrap();
+        let completed = std::thread::scope(|scope| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            scope.spawn(move || {
+                for handle in handles {
+                    handle
+                        .acquire()
+                        .unwrap()
+                        .record_access_and_release(Some(30));
+                }
+                tx.send(()).unwrap();
+            });
+            let completed = rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+            // Always release before joining, including a regression's timeout.
+            drop(held);
+            completed
+        });
+        assert!(
+            completed,
+            "other pages of a dirty block waited for the shard lock"
+        );
+        assert_eq!(life.dirty_summary(), (1, Some(20)));
+    }
+
+    #[test]
+    fn failed_checkpoint_restores_older_block_summary_after_a_new_touch() {
+        let life = PageLifecycle::new();
+        let block = life.block(&id());
+        let handle = block.register(PageIndex(0), Some(10), 10, false);
+        let work = block.inner.lock().unwrap().work.clone();
+        handle
+            .acquire()
+            .unwrap()
+            .record_access_and_release(Some(20));
+        let summary = work.checkpoint();
+        let page = PageCheckpoint::new(0, &handle);
+        handle
+            .acquire()
+            .unwrap()
+            .record_access_and_release(Some(30));
+        assert_eq!(life.dirty_summary(), (1, Some(30)));
+        drop(page);
+        drop(summary);
+        assert_eq!(life.dirty_summary(), (1, Some(20)));
+        let summary = work.checkpoint();
+        let page = PageCheckpoint::new(0, &handle);
+        assert_eq!(page.access, Some(30));
+        page.commit();
+        summary.commit();
+        assert_eq!(life.dirty_summary(), (0, None));
+    }
+
+    #[test]
+    fn coalesced_block_touch_racing_checkpoint_is_captured_or_stays_scheduled() {
+        for _ in 0..128 {
+            let life = PageLifecycle::new();
+            let block = life.block(&id());
+            let first = block.register(PageIndex(0), Some(10), 10, false);
+            let second = block.register(PageIndex(1), Some(10), 10, false);
+            first.acquire().unwrap().record_access_and_release(Some(20));
+            let work = block.inner.lock().unwrap().work.clone();
+            let barrier = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let reader = scope.spawn(|| {
+                    barrier.wait();
+                    second
+                        .acquire()
+                        .unwrap()
+                        .record_access_and_release(Some(30));
+                });
+                barrier.wait();
+                let summary = work.checkpoint();
+                PageCheckpoint::new(0, &first).commit();
+                let page = PageCheckpoint::new(1, &second);
+                let captured = page.access == Some(30);
+                page.commit();
+                summary.commit();
+                reader.join().unwrap();
+                assert!(captured || life.dirty_summary().0 == 1);
+            });
+            let summary = work.checkpoint();
+            PageCheckpoint::new(0, &first).commit();
+            PageCheckpoint::new(1, &second).commit();
+            summary.commit();
+            assert_eq!(life.dirty_summary(), (0, None));
+        }
     }
 
     #[test]
