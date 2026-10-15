@@ -69,7 +69,8 @@ paged commits require a sidecar before publishing their page.
   connections need no DNS lookup. Startup scanning, first-time dynamic namespace
   initialization, maintenance, resident cache reads and control RPCs retain their
   existing implementations. Foreground capacity eviction can still reach blocking
-  filesystem operations and Tokio timers. Streamed uploads retain reqwest.
+  filesystem operations and Tokio timers. MonoioClient does not support streamed
+  request bodies or file uploads: `execute_body` and `execute_file` return errors.
 - The experimental HTTP transport uses HTTP/1.1 directly. It does not implement
   HTTP/2, proxy environment variables, automatic redirects, or EOF-delimited
   response bodies. Configure the final object-store endpoint. Bodies must have

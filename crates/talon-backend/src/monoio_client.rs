@@ -1,7 +1,7 @@
 //! Experimental HTTP/1.1 origin transport. TCP and TLS use Monoio on a strict
-//! caller-owned io_uring ring. DNS stays on Tokio's resolver. Upload streaming retains
-//! the existing reqwest implementation; downloaded object bodies never use it.
-use crate::http::{HttpClient, HttpRequest, HttpRequestBody, HttpResponse, Method};
+//! caller-owned io_uring ring. DNS stays on Tokio's resolver. Streaming request
+//! bodies and file uploads are unsupported and use the HttpClient default errors.
+use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 use async_trait::async_trait;
 use bytes::BytesMut;
 use monoio::io::{sink::SinkExt, stream::Stream, AsyncReadRent, AsyncWriteRent, Split};
@@ -11,7 +11,6 @@ use monoio_http::{
 };
 use std::{
     cell::RefCell,
-    path::Path,
     sync::{Arc, Weak},
     time::{Duration, Instant},
 };
@@ -34,7 +33,6 @@ thread_local! {
 
 pub struct MonoioClient {
     tls: Arc<rustls::ClientConfig>,
-    uploads: crate::ReqwestClient,
 }
 
 impl Default for MonoioClient {
@@ -64,11 +62,10 @@ impl MonoioClient {
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         Self {
             tls: Arc::new(tls),
-            uploads: crate::ReqwestClient::new(),
         }
     }
 
-    async fn download(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+    async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse, String> {
         talon_uring::require_ring().map_err(|e| e.to_string())?;
         // Parse without normalizing the signed path/query. Never include the
         // URL, authorization header, or SAS token in a transport error.
@@ -324,7 +321,7 @@ impl HttpClient for MonoioClient {
         operation.text("talon.http.attempt_boundary", "monoio.execute");
         let result = operation
             .scope(async {
-                talon_uring::timeout(Duration::from_secs(300), self.download(request))
+                talon_uring::timeout(Duration::from_secs(300), self.send_request(request))
                     .await
                     .map_err(|_| "origin request timed out".to_owned())?
             })
@@ -335,22 +332,5 @@ impl HttpClient for MonoioClient {
         }
         operation.outcome(if result.is_ok() { "success" } else { "error" });
         result
-    }
-
-    async fn execute_file(
-        &self,
-        request: HttpRequest,
-        path: &Path,
-        len: u64,
-    ) -> Result<HttpResponse, String> {
-        self.uploads.execute_file(request, path, len).await
-    }
-    async fn execute_body(
-        &self,
-        request: HttpRequest,
-        body: HttpRequestBody,
-        len: u64,
-    ) -> Result<HttpResponse, String> {
-        self.uploads.execute_body(request, body, len).await
     }
 }
