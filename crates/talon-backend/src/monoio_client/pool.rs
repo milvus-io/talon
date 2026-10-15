@@ -61,6 +61,9 @@ pub(super) fn put(owner: &Arc<rustls::ClientConfig>, authority: String, connecti
     if matches!(&connection, Connection::Tls(stream) if !stream.can_idle()) {
         return;
     }
+    if matches!(&connection, Connection::Ktls(stream) if !stream.can_idle()) {
+        return;
+    }
     IDLE.with(|pool| {
         let mut pool = pool.borrow_mut();
         retain_live(&mut pool);
@@ -87,7 +90,15 @@ impl Connection {
         match self {
             Self::Plain(socket) => socket,
             Self::Tls(stream) => stream.socket(),
+            Self::Ktls(stream) => stream.socket(),
         }
+    }
+
+    fn quiet(&self) -> bool {
+        if matches!(self, Self::Ktls(stream) if !stream.tcp_quiet()) {
+            return false;
+        }
+        socket_quiet(self.socket())
     }
 
     async fn read_idle(&mut self) -> io::Result<()> {
@@ -96,6 +107,7 @@ impl Connection {
             // EOF, an error, or unexpected data; none permits reuse.
             Self::Plain(_) => Err(io::ErrorKind::UnexpectedEof.into()),
             Self::Tls(stream) => stream.read_idle().await,
+            Self::Ktls(stream) => stream.read_idle().await,
         }
     }
 }
@@ -115,7 +127,7 @@ async fn monitor(
                     // such a connection. TLS control records are normally
                     // handled below; a checkout racing them conservatively
                     // opens another connection rather than waiting on a peer.
-                    if socket_quiet(connection.socket()) {
+                    if connection.quiet() {
                         let _ = request.send(connection);
                     }
                 }

@@ -38,6 +38,40 @@ fn invalid(error: impl Into<Box<dyn std::error::Error + Send + Sync>>) -> io::Er
 }
 
 impl TlsStream {
+    pub(super) fn protocol(
+        &self,
+    ) -> (
+        Option<rustls::ProtocolVersion>,
+        Option<rustls::SupportedCipherSuite>,
+    ) {
+        (
+            self.session.protocol_version(),
+            self.session.negotiated_cipher_suite(),
+        )
+    }
+
+    pub(super) fn into_kernel(
+        self,
+    ) -> io::Result<(
+        TcpStream,
+        rustls::ExtractedSecrets,
+        rustls::kernel::KernelConnection<rustls::client::ClientConnectionData>,
+    )> {
+        if self.used != 0
+            || self.discard != 0
+            || !self.plaintext.is_empty()
+            || !self.outgoing.is_empty()
+            || self.closed
+        {
+            return Err(invalid("TLS handoff is not at an empty record boundary"));
+        }
+        let (secrets, session) = self
+            .session
+            .dangerous_into_kernel_connection()
+            .map_err(invalid)?;
+        Ok((self.socket, secrets, session))
+    }
+
     pub(super) fn socket(&self) -> &TcpStream {
         &self.socket
     }

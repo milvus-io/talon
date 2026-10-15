@@ -131,3 +131,37 @@
          self.conn
              .core
              .common_state
+--- a/src/client/client_conn.rs
++++ b/src/client/client_conn.rs
+@@ -413,6 +413,31 @@
+         &self.provider
+     }
+ 
++    /// Clone this configuration, retaining only the listed cipher suites and
++    /// their already enabled protocol versions. Trust, client authentication,
++    /// ECH and other caller settings are preserved; disabled versions and
++    /// suites can never be re-enabled. Returns an error for an empty result.
++    pub fn with_restricted_cipher_suites(&self, suites: &[CipherSuite]) -> Result<Self, Error> {
++        let mut provider = (*self.provider).clone();
++        provider.cipher_suites.retain(|suite| {
++            self.versions.contains(suite.version().version) && suites.contains(&suite.suite())
++        });
++        if provider.cipher_suites.is_empty() {
++            return Err(Error::General("no enabled cipher suites remain".into()));
++        }
++        let versions: Vec<_> = versions::ALL_VERSIONS
++            .iter()
++            .copied()
++            .filter(|version| {
++                provider.cipher_suites.iter().any(|suite| suite.version() == *version)
++            })
++            .collect();
++        let mut config = self.clone();
++        config.versions = versions::EnabledVersions::new(&versions);
++        config.provider = Arc::new(provider);
++        Ok(config)
++    }
++
+     /// Access configuration options whose use is dangerous and requires
+     /// extra care.
+     pub fn dangerous(&mut self) -> danger::DangerousClientConfig<'_> {

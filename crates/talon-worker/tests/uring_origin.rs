@@ -28,7 +28,7 @@ use std::sync::{
 };
 use talon_backend::{
     http::{HttpClient, HttpRequest, Method},
-    monoio_client::MonoioClient,
+    monoio_client::{KernelTlsCapabilities, MonoioClient, TlsMode, TlsVersion},
     S3Backend, S3Config, S3Credentials,
 };
 use talon_core::{Backend, BlockId, NamespaceId, ObjectId, Version, WorkerConfig};
@@ -59,6 +59,9 @@ fn on_native_ring(work: impl std::future::Future<Output = ()>) {
 struct Origin {
     address: std::net::SocketAddr,
     tls: Arc<rustls::ClientConfig>,
+    tls_unrestricted: Arc<rustls::ClientConfig>,
+    capabilities: KernelTlsCapabilities,
+    negotiated: Arc<AtomicUsize>,
     requests: Arc<AtomicUsize>,
     connections: Arc<AtomicUsize>,
     task: tokio::task::JoinHandle<()>,
@@ -83,12 +86,26 @@ impl Origin {
         tls: bool,
         version: Option<&'static rustls::SupportedProtocolVersion>,
         fragment: Option<usize>,
+        control: Option<IdleControl>,
+    ) -> Self {
+        Self::start_suite(tls, version, fragment, control, None, None).await
+    }
+    async fn start_suite(
+        tls: bool,
+        version: Option<&'static rustls::SupportedProtocolVersion>,
+        fragment: Option<usize>,
         mut control: Option<IdleControl>,
+        suite: Option<rustls::SupportedCipherSuite>,
+        body_updates: Option<bool>,
     ) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
             .unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut provider = rustls::crypto::ring::default_provider();
+        if let Some(suite) = suite {
+            provider.cipher_suites = vec![suite];
+        }
+        let provider = Arc::new(provider);
         let versions = version.map_or_else(|| rustls::DEFAULT_VERSIONS.to_vec(), |v| vec![v]);
         let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&versions)
@@ -99,6 +116,19 @@ impl Origin {
         server.max_fragment_size = fragment;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
+        let tls_unrestricted = Arc::new(
+            rustls::ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::ring::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots.clone())
+            .with_no_client_auth(),
+        );
+
+        let capabilities = KernelTlsCapabilities::probe().await.unwrap();
+        let negotiated = Arc::new(AtomicUsize::new(0));
+        let negotiated_version = negotiated.clone();
         let client = rustls::ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&versions)
             .unwrap()
@@ -118,10 +148,17 @@ impl Origin {
                 let acceptor = acceptor.clone();
                 let count = count.clone();
                 let control = control.take();
+                let negotiated = negotiated_version.clone();
                 tokio::spawn(async move {
                     if tls {
                         if let Ok(stream) = acceptor.accept(socket).await {
-                            if let Some(control) = control {
+                            negotiated.store(
+                                u16::from(stream.get_ref().1.protocol_version().unwrap()) as usize,
+                                Ordering::SeqCst,
+                            );
+                            if let Some(always) = body_updates {
+                                respond_with_key_update(stream, count, always).await;
+                            } else if let Some(control) = control {
                                 controlled_idle(IdleStream::Tls(Box::new(stream)), count, control)
                                     .await;
                             } else {
@@ -139,13 +176,16 @@ impl Origin {
         Self {
             address,
             tls: Arc::new(client),
+            tls_unrestricted,
+            capabilities,
+            negotiated,
             requests,
             connections,
             task,
         }
     }
     fn client(&self) -> Arc<MonoioClient> {
-        Arc::new(MonoioClient::with_tls_config(self.tls.clone()))
+        Arc::new(MonoioClient::with_tls_config(self.tls.clone()).with_tls_mode(TlsMode::Rustls))
     }
     fn backend(&self, tls: bool) -> Arc<S3Backend> {
         Arc::new(S3Backend::new(
@@ -172,7 +212,9 @@ enum IdleAction {
     Reset,
     CloseNotify,
     KeyUpdate,
+    KeyUpdateReconnect,
     PartialRecord,
+    TamperedRecord,
 }
 
 struct IdleControl {
@@ -253,6 +295,25 @@ async fn controlled_idle(mut stream: IdleStream, count: Arc<AtomicUsize>, contro
             let _ = control.observed.send(());
             respond(stream.io(), count).await;
             return;
+        }
+        IdleAction::KeyUpdateReconnect => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            tls.get_mut().1.refresh_traffic_keys().unwrap();
+            tls.flush().await.unwrap();
+            // The common tail waits for the client's close before signaling.
+        }
+        IdleAction::TamperedRecord => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            std::io::Write::write_all(&mut tls.get_mut().1.writer(), b"unauthenticated payload")
+                .unwrap();
+            let mut encrypted = Vec::new();
+            tls.get_mut().1.write_tls(&mut encrypted).unwrap();
+            *encrypted.last_mut().unwrap() ^= 1;
+            tls.get_mut().0.write_all(&encrypted).await.unwrap();
         }
         IdleAction::PartialRecord => {
             let IdleStream::Tls(tls) = &mut stream else {
@@ -340,81 +401,149 @@ fn ring_shutdown_closes_idle_origin_connections() {
 #[ignore = "requires native io_uring; checks idle EOF and TLS control records"]
 fn idle_origin_connections_observe_close_and_preserve_tls_control_records() {
     on_native_ring(async {
-        for version in [
-            None,
-            Some(&rustls::version::TLS12),
-            Some(&rustls::version::TLS13),
-        ] {
-            let tls = version.is_some();
-            let mut actions = vec![IdleAction::Fin, IdleAction::Reset];
-            if tls {
-                actions.extend([IdleAction::CloseNotify, IdleAction::PartialRecord]);
-            }
-            if version == Some(&rustls::version::TLS13) {
-                actions.push(IdleAction::KeyUpdate);
-            }
-            for action in actions {
-                let (start, ready) = tokio::sync::oneshot::channel();
-                let (observed, wait) = tokio::sync::oneshot::channel();
-                let origin = Origin::start_controlled(
-                    tls,
-                    version,
-                    None,
-                    Some(IdleControl {
-                        action,
-                        start: ready,
-                        observed,
-                    }),
-                )
-                .await;
-                let client = origin.client();
-                let request = HttpRequest::new(
-                    Method::Get,
-                    format!(
-                        "{}://{}/keepalive",
-                        if tls { "https" } else { "http" },
-                        origin.address
-                    ),
-                    vec![],
-                );
-                assert_eq!(
-                    client.execute(request.clone()).await.unwrap().body,
-                    "abcdefgh"
-                );
-                start.send(()).unwrap();
-                // For FIN/close_notify the server waits for the client's close
-                // before acknowledging: no next request can trigger detection.
-                tokio::time::timeout(std::time::Duration::from_secs(3), wait)
-                    .await
-                    .unwrap()
-                    .unwrap();
-                if matches!(action, IdleAction::PartialRecord | IdleAction::Reset) {
-                    // These events have no protocol acknowledgement. Allow the
-                    // packet to arrive and the idle monitor to start processing;
-                    // a close arriving after checkout remains a request error.
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-                let response = tokio::time::timeout(
-                    std::time::Duration::from_secs(2),
-                    client.execute(request),
-                )
+        check_idle_connections(
+            TlsMode::Rustls,
+            &[
+                None,
+                Some(&rustls::version::TLS12),
+                Some(&rustls::version::TLS13),
+            ],
+        )
+        .await;
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring and kTLS TLS 1.2"]
+fn uring_ktls_idle_close_cancellation_and_tampered_record() {
+    on_native_ring(async {
+        check_idle_connections(TlsMode::Ktls, &[Some(&rustls::version::TLS12)]).await;
+    });
+}
+
+async fn check_idle_connections(
+    mode: TlsMode,
+    versions: &[Option<&'static rustls::SupportedProtocolVersion>],
+) {
+    for &version in versions {
+        let tls = version.is_some();
+        let mut actions = vec![IdleAction::Fin, IdleAction::Reset];
+        if tls {
+            actions.extend([
+                IdleAction::CloseNotify,
+                IdleAction::PartialRecord,
+                IdleAction::TamperedRecord,
+            ]);
+        }
+        if version == Some(&rustls::version::TLS13) {
+            actions.push(if mode == TlsMode::Ktls {
+                IdleAction::KeyUpdateReconnect
+            } else {
+                IdleAction::KeyUpdate
+            });
+        }
+        for action in actions {
+            let (start, ready) = tokio::sync::oneshot::channel();
+            let (observed, wait) = tokio::sync::oneshot::channel();
+            let origin = Origin::start_controlled(
+                tls,
+                version,
+                None,
+                Some(IdleControl {
+                    action,
+                    start: ready,
+                    observed,
+                }),
+            )
+            .await;
+            let client = MonoioClient::with_tls_config(origin.tls.clone())
+                .with_kernel_tls_capabilities(origin.capabilities.clone())
+                .with_tls_mode(mode);
+            let request = HttpRequest::new(
+                Method::Get,
+                format!(
+                    "{}://{}/keepalive",
+                    if tls { "https" } else { "http" },
+                    origin.address
+                ),
+                vec![],
+            );
+            assert_eq!(
+                client.execute(request.clone()).await.unwrap().body,
+                "abcdefgh"
+            );
+            start.send(()).unwrap();
+            // For FIN/close_notify the server waits for the client's close
+            // before acknowledging: no next request can trigger detection.
+            tokio::time::timeout(std::time::Duration::from_secs(3), wait)
                 .await
                 .unwrap()
-                .unwrap_or_else(|error| panic!("{version:?} {action:?}: {error}"));
-                assert_eq!(response.body, "abcdefgh", "{version:?} {action:?}");
-                assert_eq!(origin.requests.load(Ordering::SeqCst), 2);
-                assert_eq!(
-                    origin.connections.load(Ordering::SeqCst),
-                    if matches!(action, IdleAction::KeyUpdate) {
-                        1
-                    } else {
-                        2
-                    },
-                    "{version:?} {action:?}"
-                );
+                .unwrap();
+            if matches!(action, IdleAction::PartialRecord | IdleAction::Reset) {
+                // These events have no protocol acknowledgement. Allow the
+                // packet to arrive and the idle monitor to start processing;
+                // a close arriving after checkout remains a request error.
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
+            let response =
+                tokio::time::timeout(std::time::Duration::from_secs(2), client.execute(request))
+                    .await
+                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{version:?} {action:?}: {error}"));
+            assert_eq!(response.body, "abcdefgh", "{version:?} {action:?}");
+            assert_eq!(origin.requests.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                origin.connections.load(Ordering::SeqCst),
+                if matches!(action, IdleAction::KeyUpdate) {
+                    1
+                } else {
+                    2
+                },
+                "{version:?} {action:?}"
+            );
         }
-    });
+    }
+}
+
+// Send an authenticated KeyUpdate halfway through a response. The prefix is
+// deliberately different from the normal body, exposing accidental assembly
+// across attempts. On old kernels the client must close and start over.
+async fn respond_with_key_update(
+    mut stream: tokio_rustls::server::TlsStream<tokio::net::TcpStream>,
+    count: Arc<AtomicUsize>,
+    always: bool,
+) {
+    if !always && count.load(Ordering::SeqCst) != 0 {
+        respond(stream, count).await;
+        return;
+    }
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        let Ok(byte) = stream.read_u8().await else {
+            return;
+        };
+        request.push(byte);
+    }
+    count.fetch_add(1, Ordering::SeqCst);
+    if stream
+        .write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Length: 65536\r\n\r\n")
+        .await
+        .is_err()
+    {
+        return;
+    }
+    if stream.write_all(&vec![b'X'; 16384]).await.is_err() {
+        return;
+    }
+    if stream.flush().await.is_err() {
+        return;
+    }
+    stream.get_mut().1.refresh_traffic_keys().unwrap();
+    if stream.flush().await.is_err() {
+        return;
+    }
+    let _ = stream.write_all(&vec![b'Y'; 49152]).await;
+    let _ = stream.flush().await;
 }
 
 async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<AtomicUsize>) {
@@ -454,6 +583,16 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
             stream.flush().await.unwrap();
             continue;
         }
+        if target == "/forbidden" {
+            stream
+                .write_all(
+                    b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
+            return;
+        }
         if target == "/stall" {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
             return;
@@ -466,12 +605,6 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
             stream.flush().await.unwrap();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
             return;
-        }
-        if target.starts_with("/concurrent") {
-            // No request may finish until more than the old 128 slots are active.
-            while count.load(Ordering::SeqCst) < 129 {
-                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-            }
         }
         if target.contains("/large-") {
             let object_len: usize = target.rsplit("/large-").next().unwrap().parse().unwrap();
@@ -508,6 +641,11 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
             stream.write_all(&response).await.unwrap();
             let _ = stream.shutdown().await;
             return;
+        }
+        if target.starts_with("/concurrent") {
+            while count.load(Ordering::SeqCst) < 129 {
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
         }
         let keepalive = target.starts_with("/keepalive");
         let response = if target.contains("/retry") && attempt == 0 {
@@ -741,11 +879,11 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
     });
 }
 
-/// The worker's Tokio runtime is entered but NEVER driven. Only the existing
-/// data-plane rings can complete LOAD; no fallback origin runtime exists.
+/// The worker's Tokio scheduler is never driven and its blocking pool is blocked.
+/// The existing data-plane rings alone complete LOAD and READ.
 #[test]
 #[ignore = "requires native io_uring; proves complete wire LOAD stays on its ring"]
-fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
+fn wire_load_and_read_run_without_tokio_scheduler_or_blocking_pool() {
     use std::{
         io::{Read, Write},
         time::Duration,
@@ -1022,47 +1160,6 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
 }
 
 #[test]
-#[ignore = "requires native io_uring; regression for the removed executor limit"]
-fn origin_requests_are_not_capped_at_128() {
-    on_native_ring(async {
-        let origin = Origin::start(true).await;
-        let client = origin.client();
-        let request = HttpRequest::new(
-            Method::Get,
-            format!("https://127.0.0.1:{}/concurrent", origin.address.port()),
-            vec![],
-        );
-        let requests = (0..129).map(|_| client.execute(request.clone()));
-        let responses = monoio::time::timeout(
-            std::time::Duration::from_secs(10),
-            futures::future::join_all(requests),
-        )
-        .await
-        .unwrap();
-        for response in responses {
-            assert_eq!(response.unwrap().body, "abcdefgh");
-        }
-        assert_eq!(origin.requests.load(Ordering::SeqCst), 129);
-    });
-}
-
-#[tokio::test]
-async fn native_origin_rejects_non_ring_callers() {
-    let error = MonoioClient::new()
-        .execute(HttpRequest::new(
-            Method::Get,
-            "https://127.0.0.1:1/".into(),
-            vec![],
-        ))
-        .await
-        .unwrap_err();
-    assert!(
-        error.contains("requires an existing Monoio ring"),
-        "{error}"
-    );
-}
-
-#[test]
 #[ignore = "requires native io_uring and O_DIRECT; checks fixed/chunked plaintext/TLS allocations"]
 fn aligned_http_bodies_and_paged_commits_preserve_payload() {
     on_native_ring(async {
@@ -1282,4 +1379,438 @@ fn small_client_tls_fragments_preserve_put_bodies() {
             }
         }
     });
+}
+
+#[test]
+#[ignore = "requires native io_uring; works with or without kernel TLS"]
+fn uring_ktls_auto_preserves_tls_and_rejects_untrusted_certificates() {
+    on_native_ring(async {
+        use rustls::crypto::ring::cipher_suite::*;
+        for (version, suite) in [
+            (
+                &rustls::version::TLS12,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ),
+            (
+                &rustls::version::TLS12,
+                TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ),
+            (&rustls::version::TLS13, TLS13_AES_128_GCM_SHA256),
+            (&rustls::version::TLS13, TLS13_AES_256_GCM_SHA384),
+            (&rustls::version::TLS13, TLS13_CHACHA20_POLY1305_SHA256),
+        ] {
+            let origin =
+                Origin::start_suite(true, Some(version), None, None, Some(suite), None).await;
+
+            let client = MonoioClient::with_tls_config(origin.tls.clone())
+                .with_kernel_tls_capabilities(origin.capabilities.clone());
+            let request = HttpRequest::new(
+                Method::Get,
+                format!("https://{}/keepalive", origin.address),
+                vec![],
+            );
+            for _ in 0..3 {
+                assert_eq!(
+                    client.execute(request.clone()).await.unwrap().body,
+                    "abcdefgh"
+                );
+            }
+            assert_eq!(
+                origin.connections.load(Ordering::SeqCst),
+                1,
+                "probe must preserve the authenticated connection"
+            );
+            let untrusted =
+                MonoioClient::new().with_kernel_tls_capabilities(origin.capabilities.clone());
+            assert!(untrusted
+                .execute(request)
+                .await
+                .unwrap_err()
+                .contains("certificate"));
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring and Linux kTLS AES-GCM TLS 1.2"]
+fn uring_ktls_required_receives_directly_and_commits_cache() {
+    on_native_ring(async {
+        use rustls::crypto::ring::cipher_suite::*;
+        for suite in [
+            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        ] {
+            let origin = Origin::start_suite(
+                true,
+                Some(&rustls::version::TLS12),
+                Some(256),
+                None,
+                Some(suite),
+                None,
+            )
+            .await;
+
+            let client = MonoioClient::with_tls_config(origin.tls.clone())
+                .with_kernel_tls_capabilities(origin.capabilities.clone())
+                .with_tls_mode(TlsMode::Ktls);
+            let root = tempfile::tempdir().unwrap();
+            let alignment = talon_uring::DirectIoAlignment::probe(root.path()).unwrap();
+            for kind in ["fixed", "chunked"] {
+                for len in [4095, 4096, 65536, 65539] {
+                    let payload = talon_uring::Download::capture(Some(alignment), async {
+                        Ok::<_, String>(
+                            client
+                                .execute(HttpRequest::new(
+                                    Method::Get,
+                                    format!("https://{}/{kind}/large-{len}", origin.address),
+                                    vec![("Range".into(), format!("bytes=0-{}", len - 1))],
+                                ))
+                                .await?
+                                .body,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(payload.as_ptr() as usize % alignment.memory(), 0);
+                    let expected: Vec<_> = (0..len).map(|i| (i % 251) as u8).collect();
+                    assert_eq!(&payload[..], expected);
+                    let path = root.path().join(format!("{kind}-{len}"));
+                    let target = path.clone();
+                    talon_uring::atomic_write_payload(&target, payload, alignment)
+                        .await
+                        .unwrap();
+                    let stored = std::fs::read(path).unwrap();
+                    assert_eq!(stored.len(), alignment.round_len(len).unwrap());
+                    assert_eq!(&stored[..len], expected);
+                    assert!(stored[len..].iter().all(|byte| *byte == 0));
+                }
+            }
+            assert!(client
+                .execute(HttpRequest::new(
+                    Method::Get,
+                    format!("https://{}/truncated", origin.address),
+                    vec![]
+                ))
+                .await
+                .is_err());
+            for _ in 0..4 {
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(30),
+                    client.execute(HttpRequest::new(
+                        Method::Get,
+                        format!("https://{}/stall-body", origin.address),
+                        vec![]
+                    ))
+                )
+                .await
+                .is_err());
+            }
+            let request = HttpRequest::new(
+                Method::Get,
+                format!("https://{}/keepalive", origin.address),
+                vec![],
+            );
+            let before = origin.connections.load(Ordering::SeqCst);
+            for _ in 0..3 {
+                assert_eq!(
+                    client.execute(request.clone()).await.unwrap().body,
+                    "abcdefgh"
+                );
+            }
+            assert_eq!(origin.connections.load(Ordering::SeqCst), before + 1);
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring and kTLS TLS 1.3 key replacement (newer kernels)"]
+fn uring_ktls_tls13_key_update() {
+    on_native_ring(async {
+        let (start, ready) = tokio::sync::oneshot::channel();
+        let (observed, wait) = tokio::sync::oneshot::channel();
+        let origin = Origin::start_controlled(
+            true,
+            Some(&rustls::version::TLS13),
+            None,
+            Some(IdleControl {
+                action: IdleAction::KeyUpdate,
+                start: ready,
+                observed,
+            }),
+        )
+        .await;
+        let client = MonoioClient::with_tls_config(origin.tls.clone())
+            .with_kernel_tls_capabilities(origin.capabilities.clone())
+            .with_tls_mode(TlsMode::Ktls);
+        let request = HttpRequest::new(
+            Method::Get,
+            format!("https://{}/keepalive", origin.address),
+            vec![],
+        );
+        assert_eq!(
+            client.execute(request.clone()).await.unwrap().body,
+            "abcdefgh"
+        );
+        start.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(client.execute(request).await.unwrap().body, "abcdefgh");
+        assert_eq!(origin.connections.load(Ordering::SeqCst), 1);
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring; verifies startup snapshot and version policy"]
+fn uring_tls_startup_policy_and_endpoint_floor() {
+    on_native_ring(async {
+        let origin = Origin::start(true).await;
+        let endpoint = format!("https://{}", origin.address);
+        let request = HttpRequest::new(Method::Get, format!("{endpoint}/keepalive"), vec![]);
+        let client = MonoioClient::with_tls_config(origin.tls.clone())
+            .with_kernel_tls_capabilities(origin.capabilities.clone());
+        for _ in 0..3 {
+            assert_eq!(
+                client.execute(request.clone()).await.unwrap().body,
+                "abcdefgh"
+            );
+        }
+        assert_eq!(origin.connections.load(Ordering::SeqCst), 1);
+        if let Ok(expected) = std::env::var("TALON_TEST_EXPECT_AUTO_TLS") {
+            let expected = match expected.as_str() {
+                "1.2" => 0x303,
+                "1.3" => 0x304,
+                _ => panic!("invalid expected version"),
+            };
+            assert_eq!(origin.negotiated.load(Ordering::SeqCst), expected);
+        }
+        let before_connections = origin.connections.load(Ordering::SeqCst);
+        let before_requests = origin.requests.load(Ordering::SeqCst);
+        let untrusted =
+            MonoioClient::new().with_kernel_tls_capabilities(origin.capabilities.clone());
+        assert!(untrusted
+            .execute(request.clone())
+            .await
+            .unwrap_err()
+            .contains("certificate"));
+        assert_eq!(
+            origin.connections.load(Ordering::SeqCst),
+            before_connections + 1
+        );
+        assert_eq!(origin.requests.load(Ordering::SeqCst), before_requests);
+        // Unknown/unavailable kernel capabilities use normal highest-version TLS.
+        let fallback = MonoioClient::with_tls_config(origin.tls.clone());
+        assert_eq!(
+            fallback.execute(request.clone()).await.unwrap().body,
+            "abcdefgh"
+        );
+        assert_eq!(origin.negotiated.load(Ordering::SeqCst), 0x304);
+
+        // The endpoint floor survives auto selection and isolates connection pools.
+        let minimum = MonoioClient::with_tls_config(origin.tls.clone())
+            .with_kernel_tls_capabilities(origin.capabilities.clone())
+            .with_endpoint_tls_min_version(&endpoint, TlsVersion::Tls13)
+            .unwrap();
+        assert_eq!(minimum.execute(request).await.unwrap().body, "abcdefgh");
+        assert_eq!(origin.negotiated.load(Ordering::SeqCst), 0x304);
+
+        // A policy-level HTTP denial is returned as-is, never renegotiated/replayed.
+        let before = origin.requests.load(Ordering::SeqCst);
+        let response = client
+            .execute(HttpRequest::new(
+                Method::Get,
+                format!("{endpoint}/forbidden"),
+                vec![],
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status, 403);
+        assert_eq!(origin.requests.load(Ordering::SeqCst), before + 1);
+
+        // A TLS 1.3-only peer rejects a TLS 1.2 preference on older kTLS kernels.
+        // Auto must retry with normal allowed versions before sending HTTP once.
+        let only13 = Origin::start_fragmented(true, Some(&rustls::version::TLS13), None).await;
+        let client = MonoioClient::with_tls_config(only13.tls_unrestricted.clone())
+            .with_kernel_tls_capabilities(only13.capabilities.clone());
+        assert_eq!(
+            client
+                .execute(HttpRequest::new(
+                    Method::Get,
+                    format!("https://{}/keepalive", only13.address),
+                    vec![]
+                ))
+                .await
+                .unwrap()
+                .body,
+            "abcdefgh"
+        );
+        assert_eq!(only13.negotiated.load(Ordering::SeqCst), 0x304);
+        assert_eq!(only13.requests.load(Ordering::SeqCst), 1);
+        if std::env::var("TALON_TEST_EXPECT_AUTO_TLS").as_deref() == Ok("1.2") {
+            assert_eq!(only13.connections.load(Ordering::SeqCst), 2);
+        }
+
+        let only12 = Origin::start_fragmented(true, Some(&rustls::version::TLS12), None).await;
+        let client = MonoioClient::with_tls_config(only12.tls_unrestricted.clone())
+            .with_kernel_tls_capabilities(only12.capabilities.clone())
+            .with_tls_min_version(TlsVersion::Tls13)
+            .with_endpoint_tls_min_version(
+                &format!("https://{}", only12.address),
+                TlsVersion::Tls12,
+            )
+            .unwrap();
+        assert!(client
+            .execute(HttpRequest::new(
+                Method::Get,
+                format!("https://{}/keepalive", only12.address),
+                vec![]
+            ))
+            .await
+            .is_err());
+        assert_eq!(only12.requests.load(Ordering::SeqCst), 0);
+        assert_eq!(only12.negotiated.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring and public AWS S3 network access; no credentials"]
+fn uring_live_s3_tls_policy() {
+    on_native_ring(async {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("talon_backend=debug")
+            .try_init();
+
+        let capabilities = KernelTlsCapabilities::probe().await.unwrap();
+        for minimum in [TlsVersion::Tls12, TlsVersion::Tls13] {
+            let client = MonoioClient::new()
+                .with_kernel_tls_capabilities(capabilities.clone())
+                .with_tls_min_version(minimum);
+            let response = client
+                .execute(HttpRequest::new(
+                    Method::Head,
+                    "https://s3.us-east-1.amazonaws.com/".into(),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+            assert!(
+                (200..500).contains(&response.status),
+                "unexpected S3 status {}",
+                response.status
+            );
+            eprintln!(
+                "S3 unsigned HEAD: minimum={minimum:?} status={}",
+                response.status
+            );
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires kTLS TLS 1.3 without key replacement, e.g. validation Linux 6.2"]
+fn uring_ktls_tls13_reconnect_without_key_update() {
+    on_native_ring(async {
+        check_idle_connections(TlsMode::Ktls, &[Some(&rustls::version::TLS13)]).await;
+        for (always, method) in [
+            (false, Method::Get),
+            (true, Method::Get),
+            (false, Method::Post),
+        ] {
+            let origin = Origin::start_suite(
+                true,
+                Some(&rustls::version::TLS13),
+                None,
+                None,
+                None,
+                Some(always),
+            )
+            .await;
+
+            let client = MonoioClient::with_tls_config(origin.tls.clone())
+                .with_kernel_tls_capabilities(origin.capabilities.clone())
+                .with_tls_mode(TlsMode::Ktls); // A rustls reconnect must not satisfy this test.
+            let root = tempfile::tempdir().unwrap();
+            let alignment = talon_uring::DirectIoAlignment::probe(root.path()).unwrap();
+            let result = talon_uring::Download::capture(Some(alignment), async {
+                Ok::<_, String>(
+                    client
+                        .execute(HttpRequest::new(
+                            method,
+                            format!("https://{}/fixed/large-65536", origin.address),
+                            vec![("Range".into(), "bytes=0-65535".into())],
+                        ))
+                        .await?
+                        .body,
+                )
+            })
+            .await;
+            if !always && matches!(method, Method::Get) {
+                let payload = result.unwrap();
+                let expected: Vec<_> = (0..65536).map(|i| (i % 251) as u8).collect();
+                assert_eq!(&payload[..], expected);
+                assert_eq!(payload.as_ptr() as usize % alignment.memory(), 0);
+                let path = root.path().join("reconnected");
+                let target = path.clone();
+                talon_uring::atomic_write_payload(&target, payload, alignment)
+                    .await
+                    .unwrap();
+                let stored = std::fs::read(path).unwrap();
+                assert_eq!(stored.len(), alignment.round_len(expected.len()).unwrap());
+                assert_eq!(&stored[..expected.len()], expected);
+                assert!(stored[expected.len()..].iter().all(|byte| *byte == 0));
+            } else {
+                assert!(
+                    result.is_err(),
+                    "repeated KeyUpdate/non-idempotent request must fail"
+                );
+            }
+            let attempts = if matches!(method, Method::Get) { 2 } else { 1 };
+            assert_eq!(origin.requests.load(Ordering::SeqCst), attempts);
+            assert_eq!(origin.connections.load(Ordering::SeqCst), attempts);
+            assert_eq!(origin.negotiated.load(Ordering::SeqCst), 0x304);
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring; regression for the removed executor limit"]
+fn origin_requests_are_not_capped_at_128() {
+    on_native_ring(async {
+        let origin = Origin::start(true).await;
+        let client = origin.client();
+        let request = HttpRequest::new(
+            Method::Get,
+            format!("https://127.0.0.1:{}/concurrent", origin.address.port()),
+            vec![],
+        );
+        let requests = (0..129).map(|_| client.execute(request.clone()));
+        let responses = monoio::time::timeout(
+            std::time::Duration::from_secs(10),
+            futures::future::join_all(requests),
+        )
+        .await
+        .unwrap();
+        for response in responses {
+            assert_eq!(response.unwrap().body, "abcdefgh");
+        }
+        assert_eq!(origin.requests.load(Ordering::SeqCst), 129);
+    });
+}
+
+#[tokio::test]
+async fn native_origin_rejects_non_ring_callers() {
+    let error = MonoioClient::new()
+        .execute(HttpRequest::new(
+            Method::Get,
+            "https://127.0.0.1:1/".into(),
+            vec![],
+        ))
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("requires an existing Monoio ring"),
+        "{error}"
+    );
 }

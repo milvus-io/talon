@@ -510,13 +510,76 @@ async fn run() -> anyhow::Result<()> {
         let available = false;
         validate_origin_runtime(force_tokio_data_plane(), available)?;
     }
+    use talon_backend::monoio_client::{KernelTlsCapabilities, TlsMode, TlsVersion};
+    let origin_tls = match std::env::var("TALON_WORKER_ORIGIN_TLS")
+        .as_deref()
+        .unwrap_or("auto")
+    {
+        "auto" => TlsMode::Auto,
+        "rustls" => TlsMode::Rustls,
+        "ktls" if origin_uring => TlsMode::Ktls,
+        "ktls" => anyhow::bail!("kTLS requires TALON_WORKER_ORIGIN_IO=uring"),
+        _ => anyhow::bail!("TALON_WORKER_ORIGIN_TLS must be auto, rustls, or ktls"),
+    };
+    let ktls_no_pad = match std::env::var("TALON_WORKER_KTLS_RX_NO_PAD")
+        .as_deref()
+        .unwrap_or("0")
+    {
+        "0" => false,
+        "1" => true,
+        _ => anyhow::bail!("TALON_WORKER_KTLS_RX_NO_PAD must be 0 or 1"),
+    };
+    let minimum_tls: TlsVersion = std::env::var("TALON_WORKER_ORIGIN_TLS_MIN_VERSION")
+        .unwrap_or_else(|_| "1.2".into())
+        .parse()
+        .map_err(anyhow::Error::msg)?;
+    let endpoint_minimums: std::collections::BTreeMap<String, String> = serde_json::from_str(
+        &std::env::var("TALON_WORKER_ORIGIN_TLS_ENDPOINT_MIN_VERSIONS")
+            .unwrap_or_else(|_| "{}".into()),
+    )?;
+    if !origin_uring && (minimum_tls != TlsVersion::Tls12 || !endpoint_minimums.is_empty()) {
+        anyhow::bail!("origin TLS minimum version policy requires TALON_WORKER_ORIGIN_IO=uring");
+    }
+    // Complete the machine probe before publishing the client or serving traffic.
+    let capabilities = match origin_uring {
+        true if origin_tls != TlsMode::Rustls => KernelTlsCapabilities::probe().await?,
+        _ => KernelTlsCapabilities::default(),
+    };
+    if origin_tls == TlsMode::Ktls && capabilities.is_empty() {
+        anyhow::bail!("kernel TLS TX/RX capability probe failed; strict kTLS is unavailable");
+    }
     tracing::info!(
-        origin_io = if origin_uring { "uring" } else { "tokio" },
+        ?capabilities,
+        ?minimum_tls,
+        "origin TLS startup capabilities"
+    );
+    tracing::info!(
+        origin_tls = ?origin_tls,
+        origin_io = if origin_uring {
+            "uring"
+        } else {
+            "tokio"
+        },
         "origin download and cache commit engine"
     );
     let http: Arc<dyn talon_backend::http::HttpClient> = {
         let base: Arc<dyn talon_backend::http::HttpClient> = match origin_uring {
-            true => Arc::new(talon_backend::monoio_client::MonoioClient::new()),
+            true => {
+                let mut client = talon_backend::monoio_client::MonoioClient::new()
+                    .with_tls_mode(origin_tls)
+                    .with_ktls_no_pad(ktls_no_pad)
+                    .with_kernel_tls_capabilities(capabilities)
+                    .with_tls_min_version(minimum_tls);
+                for (endpoint, minimum) in endpoint_minimums {
+                    client = client
+                        .with_endpoint_tls_min_version(
+                            &endpoint,
+                            minimum.parse().map_err(anyhow::Error::msg)?,
+                        )
+                        .map_err(anyhow::Error::msg)?;
+                }
+                Arc::new(client)
+            }
             false => Arc::new(ReqwestClient::new()),
         };
 
