@@ -3139,7 +3139,6 @@ name = "talon-uring"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "flume",
  "futures",
  "monoio",
  "tempfile",

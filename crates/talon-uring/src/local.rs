@@ -43,6 +43,31 @@ pub fn on_ring() -> bool {
     CURRENT.with(|current| current.borrow().is_some())
 }
 
+/// Reject native I/O outside the worker's existing ring; never create a runtime.
+pub fn require_ring() -> std::io::Result<()> {
+    if on_ring() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(
+            "native I/O requires an existing Monoio ring",
+        ))
+    }
+}
+
+/// Bridge a ring-owned !Send future to a Send result without moving its I/O.
+/// Dropping the receiver cancels the work, unlike detached disk mutations.
+pub fn spawn_cancellable<F: Future + 'static>(work: F) -> oneshot::Receiver<F::Output> {
+    let (mut result, wait) = oneshot::channel();
+    spawn_local(async move {
+        tokio::select! {
+            biased;
+            _ = result.closed() => {},
+            value = work => { let _ = result.send(value); }
+        }
+    });
+    wait
+}
+
 /// Detach a task from its caller, retaining it in the ring's shutdown drain.
 /// Call only within a LocalRing scope. Awaiting the returned channel never
 /// migrates the task; dropping it does not cancel accepted mutations.

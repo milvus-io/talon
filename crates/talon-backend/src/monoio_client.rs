@@ -1,5 +1,5 @@
 //! Experimental HTTP/1.1 origin transport. TCP and TLS use Monoio on a strict
-//! io_uring executor. DNS stays on Tokio's resolver. Upload streaming retains
+//! caller-owned io_uring ring. DNS stays on Tokio's resolver. Upload streaming retains
 //! the existing reqwest implementation; downloaded object bodies never use it.
 use crate::http::{HttpClient, HttpRequest, HttpRequestBody, HttpResponse, Method};
 use async_trait::async_trait;
@@ -27,19 +27,24 @@ struct Idle {
     connection: Connection,
 }
 thread_local! {
-    // Ring-local sockets must never cross executor threads. Bound idle FDs
+    // Ring-local sockets must never cross ring threads. Bound idle FDs
     // across all authorities, and isolate pools by TLS/trust configuration.
     static IDLE: RefCell<Vec<Idle>> = const { RefCell::new(Vec::new()) };
 }
 
 pub struct MonoioClient {
-    executor: talon_uring::Executor,
     tls: Arc<rustls::ClientConfig>,
     uploads: crate::ReqwestClient,
 }
 
+impl Default for MonoioClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MonoioClient {
-    pub fn new(executor: talon_uring::Executor) -> Self {
+    pub fn new() -> Self {
         let roots =
             rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         let config = rustls::ClientConfig::builder_with_provider(Arc::new(
@@ -49,25 +54,22 @@ impl MonoioClient {
         .expect("ring TLS protocols")
         .with_root_certificates(roots)
         .with_no_client_auth();
-        Self::with_tls_config(executor, Arc::new(config))
+        Self::with_tls_config(Arc::new(config))
     }
 
     /// Explicit trust configuration, also used by local HTTPS integration tests.
-    pub fn with_tls_config(
-        executor: talon_uring::Executor,
-        tls: Arc<rustls::ClientConfig>,
-    ) -> Self {
+    pub fn with_tls_config(tls: Arc<rustls::ClientConfig>) -> Self {
         let mut tls = (*tls).clone();
         // This experiment implements HTTP/1.1, so never negotiate h2.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
         Self {
-            executor,
             tls: Arc::new(tls),
             uploads: crate::ReqwestClient::new(),
         }
     }
 
     async fn download(&self, request: HttpRequest) -> Result<HttpResponse, String> {
+        talon_uring::require_ring().map_err(|e| e.to_string())?;
         // Parse without normalizing the signed path/query. Never include the
         // URL, authorization header, or SAS token in a transport error.
         let uri: http::Uri = request.url.parse().map_err(|_| "invalid origin URI")?;
@@ -84,102 +86,100 @@ impl MonoioClient {
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
         let tls = self.tls.clone();
         let tokio = tokio::runtime::Handle::current();
-        self.executor
-            .run_cancellable(move || async move {
-                let operation = async {
-                    let authority = format!(
-                        "{}://{}",
-                        uri.scheme_str().unwrap(),
-                        uri.authority().unwrap()
-                    );
-                    let pooled = IDLE.with(|pool| {
-                        let mut pool = pool.borrow_mut();
-                        pool.retain(|entry| {
-                            entry.owner.strong_count() > 0
-                                && entry.since.elapsed() < Duration::from_secs(90)
-                        });
-                        let index = pool.iter().position(|entry| {
-                            entry.authority == authority
-                                && entry.owner.ptr_eq(&Arc::downgrade(&tls))
-                        })?;
-                        Some(pool.swap_remove(index).connection)
+        talon_uring::spawn_cancellable(async move {
+            let operation = async {
+                let authority = format!(
+                    "{}://{}",
+                    uri.scheme_str().unwrap(),
+                    uri.authority().unwrap()
+                );
+                let pooled = IDLE.with(|pool| {
+                    let mut pool = pool.borrow_mut();
+                    pool.retain(|entry| {
+                        entry.owner.strong_count() > 0
+                            && entry.since.elapsed() < Duration::from_secs(90)
                     });
-                    let mut connection = if let Some(connection) = pooled {
-                        connection
-                    } else {
-                        monoio::time::timeout(Duration::from_secs(10), async {
-                            // DNS can block in libc; resolve on Tokio's resolver before
-                            // opening the payload socket on this ring.
-                            let addresses = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                                vec![std::net::SocketAddr::new(ip, port)]
-                            } else {
-                                let lookup = host.clone();
-                                tokio
-                                    .spawn(async move {
-                                        tokio::net::lookup_host((lookup.as_str(), port))
-                                            .await
-                                            .map(|it| it.collect::<Vec<_>>())
-                                    })
-                                    .await
-                                    .map_err(|_| "origin resolver stopped")?
-                                    .map_err(|_| "origin DNS lookup failed")?
-                            };
-                            let mut socket = None;
-                            for address in addresses {
-                                match monoio::net::TcpStream::connect(address).await {
-                                    Ok(stream) => {
-                                        socket = Some(stream);
-                                        break;
-                                    }
-                                    Err(_) => continue,
+                    let index = pool.iter().position(|entry| {
+                        entry.authority == authority && entry.owner.ptr_eq(&Arc::downgrade(&tls))
+                    })?;
+                    Some(pool.swap_remove(index).connection)
+                });
+                let mut connection = if let Some(connection) = pooled {
+                    connection
+                } else {
+                    monoio::time::timeout(Duration::from_secs(10), async {
+                        // DNS can block in libc; resolve on Tokio's resolver before
+                        // opening the payload socket on this ring.
+                        let addresses = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                            vec![std::net::SocketAddr::new(ip, port)]
+                        } else {
+                            let lookup = host.clone();
+                            tokio
+                                .spawn(async move {
+                                    tokio::net::lookup_host((lookup.as_str(), port))
+                                        .await
+                                        .map(|it| it.collect::<Vec<_>>())
+                                })
+                                .await
+                                .map_err(|_| "origin resolver stopped")?
+                                .map_err(|_| "origin DNS lookup failed")?
+                        };
+                        let mut socket = None;
+                        for address in addresses {
+                            match monoio::net::TcpStream::connect(address).await {
+                                Ok(stream) => {
+                                    socket = Some(stream);
+                                    break;
                                 }
+                                Err(_) => continue,
                             }
-                            let stream = socket.ok_or("origin TCP connect failed")?;
-                            stream
-                                .set_nodelay(true)
-                                .map_err(|_| "origin TCP configuration failed")?;
-                            if https {
-                                let name = rustls::pki_types::ServerName::try_from(host)
-                                    .map_err(|_| "invalid TLS server name")?;
-                                let stream = monoio_rustls::TlsConnector::from(tls.clone())
-                                    .connect(name, stream)
-                                    .await
-                                    .map_err(|_| {
-                                        "origin TLS handshake/certificate verification failed"
-                                    })?;
-                                Ok::<_, &str>(Connection::Tls(ClientCodec::new(stream)))
-                            } else {
-                                Ok(Connection::Plain(ClientCodec::new(stream)))
-                            }
-                        })
-                        .await
-                        .map_err(|_| "origin connect timed out")??
-                    };
-                    let (response, reusable) = match &mut connection {
-                        Connection::Plain(codec) => exchange(codec, uri, request).await?,
-                        Connection::Tls(codec) => exchange(codec, uri, request).await?,
-                    };
-                    if reusable {
-                        IDLE.with(|pool| {
-                            let mut pool = pool.borrow_mut();
-                            if pool.len() < 64 {
-                                pool.push(Idle {
-                                    owner: Arc::downgrade(&tls),
-                                    authority,
-                                    since: Instant::now(),
-                                    connection,
-                                });
-                            }
-                        });
-                    }
-                    Ok(response)
-                };
-                monoio::time::timeout(Duration::from_secs(300), operation)
+                        }
+                        let stream = socket.ok_or("origin TCP connect failed")?;
+                        stream
+                            .set_nodelay(true)
+                            .map_err(|_| "origin TCP configuration failed")?;
+                        if https {
+                            let name = rustls::pki_types::ServerName::try_from(host)
+                                .map_err(|_| "invalid TLS server name")?;
+                            let stream = monoio_rustls::TlsConnector::from(tls.clone())
+                                .connect(name, stream)
+                                .await
+                                .map_err(|_| {
+                                    "origin TLS handshake/certificate verification failed"
+                                })?;
+                            Ok::<_, &str>(Connection::Tls(ClientCodec::new(stream)))
+                        } else {
+                            Ok(Connection::Plain(ClientCodec::new(stream)))
+                        }
+                    })
                     .await
-                    .map_err(|_| "origin io_uring request timed out".to_owned())?
-            })
-            .await
-            .map_err(|e| format!("origin io_uring executor: {e}"))?
+                    .map_err(|_| "origin connect timed out")??
+                };
+                let (response, reusable) = match &mut connection {
+                    Connection::Plain(codec) => exchange(codec, uri, request).await?,
+                    Connection::Tls(codec) => exchange(codec, uri, request).await?,
+                };
+                if reusable {
+                    IDLE.with(|pool| {
+                        let mut pool = pool.borrow_mut();
+                        if pool.len() < 64 {
+                            pool.push(Idle {
+                                owner: Arc::downgrade(&tls),
+                                authority,
+                                since: Instant::now(),
+                                connection,
+                            });
+                        }
+                    });
+                }
+                Ok(response)
+            };
+            monoio::time::timeout(Duration::from_secs(300), operation)
+                .await
+                .map_err(|_| "origin io_uring request timed out".to_owned())?
+        })
+        .await
+        .map_err(|e| format!("origin ring task stopped: {e}"))?
     }
 }
 
