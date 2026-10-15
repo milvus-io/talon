@@ -1,0 +1,90 @@
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -117,9 +117,6 @@
+ version = "0.3.0"
+ optional = true
+ 
+-[dependencies.monoio-rustls]
+-version = "0.3.0"
+-
+ [dependencies.multer]
+ version = "3.0.0"
+ optional = true
+--- a/src/h2/hpack/header.rs
++++ b/src/h2/hpack/header.rs
+@@ -121,7 +121,7 @@
+     }
+ 
+     /// Returns the header name
+-    pub fn name(&self) -> Name {
++    pub fn name(&self) -> Name<'_> {
+         match *self {
+             Header::Field { ref name, .. } => Name::Field(name),
+             Header::Authority(..) => Name::Authority,
+--- a/src/h2/proto/streams/store.rs
++++ b/src/h2/proto/streams/store.rs
+@@ -71,7 +71,7 @@
+ }
+ 
+ pub(super) trait Resolve {
+-    fn resolve(&mut self, key: Key) -> Ptr;
++    fn resolve(&mut self, key: Key) -> Ptr<'_>;
+ }
+ 
+ // ===== impl Store =====
+@@ -84,7 +84,7 @@
+         }
+     }
+ 
+-    pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr> {
++    pub fn find_mut(&mut self, id: &StreamId) -> Option<Ptr<'_>> {
+         let index = match self.ids.get(id) {
+             Some(key) => *key,
+             None => return None,
+@@ -99,7 +99,7 @@
+         })
+     }
+ 
+-    pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr {
++    pub fn insert(&mut self, id: StreamId, val: Stream) -> Ptr<'_> {
+         let index = SlabIndex(self.slab.insert(val) as u32);
+         assert!(self.ids.insert(id, index).is_none());
+ 
+@@ -112,7 +112,7 @@
+         }
+     }
+ 
+-    pub fn find_entry(&mut self, id: StreamId) -> Entry {
++    pub fn find_entry(&mut self, id: StreamId) -> Entry<'_> {
+         use self::indexmap::map::Entry::*;
+ 
+         match self.ids.entry(id) {
+@@ -169,7 +169,7 @@
+ }
+ 
+ impl Resolve for Store {
+-    fn resolve(&mut self, key: Key) -> Ptr {
++    fn resolve(&mut self, key: Key) -> Ptr<'_> {
+         Ptr { key, store: self }
+     }
+ }
+@@ -362,7 +362,7 @@
+ }
+ 
+ impl<'a> Resolve for Ptr<'a> {
+-    fn resolve(&mut self, key: Key) -> Ptr {
++    fn resolve(&mut self, key: Key) -> Ptr<'_> {
+         Ptr {
+             key,
+             store: &mut *self.store,
+--- a/src/h2/proto/streams/streams.rs
++++ b/src/h2/proto/streams/streams.rs
+@@ -918,7 +918,7 @@
+ where
+     P: Peer,
+ {
+-    pub fn as_dyn(&self) -> DynStreams<B> {
++    pub fn as_dyn(&self) -> DynStreams<'_, B> {
+         let Self {
+             inner,
+             send_buffer,

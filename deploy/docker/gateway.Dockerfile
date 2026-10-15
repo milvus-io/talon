@@ -22,7 +22,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=planner /src/recipe.json recipe.json
 # Reuse the verified and patched release prepared in the planner stage.
-COPY --from=planner /src/.patched-deps/monoio .patched-deps/monoio
+COPY --from=planner /src/.patched-deps .patched-deps
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
     --package talon-gateway
 COPY . .

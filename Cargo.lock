@@ -1037,7 +1037,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "log",
- "rustls 0.23.45",
+ "rustls",
  "rustls-native-certs",
  "tokio",
  "tokio-rustls",
@@ -1354,7 +1354,7 @@ dependencies = [
  "k8s-openapi",
  "kube-core",
  "pem",
- "rustls 0.23.45",
+ "rustls",
  "rustls-pemfile",
  "secrecy",
  "serde",
@@ -1583,8 +1583,6 @@ dependencies = [
 [[package]]
 name = "monoio-http"
 version = "0.3.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ff36c863e7bdb03358cda0d3df26a86382176a89d819d2ae652265695a55be96"
 dependencies = [
  "bytes",
  "fnv",
@@ -1597,7 +1595,6 @@ dependencies = [
  "monoio",
  "monoio-codec",
  "monoio-compat",
- "monoio-rustls 0.3.0",
  "service-async",
  "slab",
  "smallvec",
@@ -1627,19 +1624,6 @@ dependencies = [
 
 [[package]]
 name = "monoio-rustls"
-version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2cf89f9d9a47ee9e2d93c2bc4aeeb40240b19c0575f8f784a45bcf7e2d98aded"
-dependencies = [
- "bytes",
- "monoio",
- "monoio-io-wrapper",
- "rustls 0.21.12",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "monoio-rustls"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e31f422825bd7fb19957af6eaf89d7234ba143fcc0e515f5a2f526e332d1875"
@@ -1647,7 +1631,7 @@ dependencies = [
  "bytes",
  "monoio",
  "monoio-io-wrapper",
- "rustls 0.23.45",
+ "rustls",
  "thiserror 1.0.69",
 ]
 
@@ -2181,7 +2165,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls",
  "socket2 0.6.5",
  "thiserror 2.0.19",
  "tokio",
@@ -2202,7 +2186,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.45",
+ "rustls",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.19",
@@ -2382,7 +2366,7 @@ dependencies = [
  "percent-encoding",
  "pin-project-lite",
  "quinn",
- "rustls 0.23.45",
+ "rustls",
  "rustls-native-certs",
  "rustls-pki-types",
  "serde",
@@ -2444,27 +2428,15 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.21.12"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f56a14d1f48b391359b22f731fd4bd7e43c97f3c50eee276f3aa09c94784d3e"
-dependencies = [
- "log",
- "ring",
- "rustls-webpki 0.101.7",
- "sct",
-]
-
-[[package]]
-name = "rustls"
-version = "0.23.45"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.15",
+ "rustls-webpki",
  "subtle",
  "zeroize",
 ]
@@ -2498,16 +2470,6 @@ checksum = "764899a24af3980067ee14bc143654f297b22eaebfe3c7b6b211920a5a59b046"
 dependencies = [
  "web-time",
  "zeroize",
-]
-
-[[package]]
-name = "rustls-webpki"
-version = "0.101.7"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8b6275d1ee7a1cd780b64aca7726599a1dbc893b1e64144529e55c3c2f745765"
-dependencies = [
- "ring",
- "untrusted",
 ]
 
 [[package]]
@@ -2553,16 +2515,6 @@ name = "scopeguard"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
-
-[[package]]
-name = "sct"
-version = "0.7.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da046153aa2352493d6cb7da4b6e5c0c057d8a1d0a9aa8560baffdd945acd414"
-dependencies = [
- "ring",
- "untrusted",
-]
 
 [[package]]
 name = "secrecy"
@@ -2873,11 +2825,11 @@ dependencies = [
  "http",
  "monoio",
  "monoio-http",
- "monoio-rustls 0.4.0",
+ "monoio-rustls",
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest",
- "rustls 0.23.45",
+ "rustls",
  "serde_json",
  "sha2",
  "talon-core",
@@ -3029,7 +2981,7 @@ dependencies = [
  "opentelemetry_sdk",
  "percent-encoding",
  "reqwest",
- "rustls 0.23.45",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",
@@ -3120,8 +3072,8 @@ dependencies = [
  "base64",
  "bincode",
  "monoio",
- "rustls 0.23.45",
- "rustls-webpki 0.103.15",
+ "rustls",
+ "rustls-webpki",
  "serde",
  "serde_json",
  "talon-core",
@@ -3163,7 +3115,7 @@ dependencies = [
  "prost 0.14.4",
  "prost-build",
  "rcgen",
- "rustls 0.23.45",
+ "rustls",
  "serde",
  "serde_json",
  "talon-backend",
@@ -3367,7 +3319,7 @@ version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
- "rustls 0.23.45",
+ "rustls",
  "tokio",
 ]
 
