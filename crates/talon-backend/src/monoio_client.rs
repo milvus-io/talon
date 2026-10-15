@@ -60,9 +60,7 @@ impl MonoioClient {
         let mut tls = (*tls).clone();
         // This experiment implements HTTP/1.1, so never negotiate h2.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self {
-            tls: Arc::new(tls),
-        }
+        Self { tls: Arc::new(tls) }
     }
 
     async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse, String> {
