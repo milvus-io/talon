@@ -191,6 +191,18 @@ impl BlockReader {
         self
     }
 
+    /// Opt into bounded cross-zone read retries after local candidates fail.
+    /// Does not change LOAD ownership or bypass terminal errors.
+    pub fn with_zone_fallback(mut self, enabled: bool) -> Self {
+        self.membership = Arc::new(
+            self.membership
+                .empty_with_same_policy()
+                .with_zone_fallback(enabled),
+        );
+        self.configure_discovery();
+        self
+    }
+
     fn configure_discovery(&mut self) {
         if Arc::strong_count(&self.discovery_refresh) == 1 {
             self.discovery_refresh
@@ -236,8 +248,16 @@ impl BlockReader {
             .membership_snapshot()
             .await
             .map_err(cache_block_error)?;
+        if snapshot.affinity_fallback {
+            self.zone_observer.affinity_fallback();
+        }
         let mut last = BlockReadError::NoOwners;
-        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
+        let mut fallback_recorded = snapshot.affinity_fallback;
+        for (target, candidate, remote) in snapshot.candidates(block, self.replicas_k) {
+            if remote && !fallback_recorded {
+                self.zone_observer.affinity_fallback();
+                fallback_recorded = true;
+            }
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -366,7 +386,12 @@ impl BlockReader {
         }
         let offset = block.offset + u64::from(offset_in_block);
         let mut last = BlockReadError::NoOwners;
-        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
+        let mut fallback_recorded = snapshot.affinity_fallback;
+        for (target, candidate, remote) in snapshot.candidates(block, self.replicas_k) {
+            if remote && !fallback_recorded {
+                self.zone_observer.affinity_fallback();
+                fallback_recorded = true;
+            }
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -444,7 +469,12 @@ impl BlockReader {
         }
         let offset = block.offset + u64::from(offset_in_block);
         let mut last = BlockReadError::NoOwners;
-        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
+        let mut fallback_recorded = snapshot.affinity_fallback;
+        for (target, candidate, remote) in snapshot.candidates(block, self.replicas_k) {
+            if remote && !fallback_recorded {
+                self.zone_observer.affinity_fallback();
+                fallback_recorded = true;
+            }
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -1284,6 +1314,54 @@ mod tests {
         );
         assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 1);
         assert_eq!(observer.cross.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn cross_zone_retry_is_opt_in_bounded_and_preserves_terminal_errors() {
+        for api in READ_APIS {
+            for enabled in [false, true] {
+                for code in [
+                    DataErrorCode::Unavailable,
+                    DataErrorCode::Timeout,
+                    DataErrorCode::VersionMismatch,
+                    DataErrorCode::RateLimited,
+                    DataErrorCode::Origin,
+                    DataErrorCode::NotFound,
+                ] {
+                    let local = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let remote = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let a = spawn_worker_error(
+                        local.clone(),
+                        encode_typed_error(0, code, "local failure"),
+                    )
+                    .await;
+                    let b = mock_worker(remote.clone()).await;
+                    let coordinator = mock_zoned_coordinator(a, b).await;
+                    let observer = Arc::new(CountingZoneObserver::default());
+                    let reader = BlockReader::new(
+                        CoordinatorClient::new(coordinator),
+                        Arc::new(PlacementCache::new(500)),
+                        1,
+                    )
+                    .with_zone_affinity(Some("az-a".into()), true, observer.clone())
+                    .with_zone_fallback(enabled);
+                    let result = read_via(&reader, api).await;
+                    let fallback = enabled
+                        && matches!(code, DataErrorCode::Unavailable | DataErrorCode::Timeout);
+                    assert_eq!(result.is_ok(), fallback, "{api:?} {code:?}");
+                    if fallback {
+                        assert_eq!(result.unwrap(), (7..39).collect::<Vec<u8>>());
+                    }
+                    assert_eq!(local.load(Ordering::SeqCst), 1);
+                    assert_eq!(remote.load(Ordering::SeqCst), u32::from(fallback));
+                    assert_eq!(
+                        observer.fallbacks.load(Ordering::SeqCst),
+                        u32::from(fallback)
+                    );
+                    assert_eq!(observer.cross.load(Ordering::SeqCst), u32::from(fallback));
+                }
+            }
+        }
     }
 
     #[tokio::test]

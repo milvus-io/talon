@@ -42,9 +42,7 @@ impl talon_cache_client::ZoneReadObserver for LoggingZoneObserver {
                 .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
-            tracing::warn!(
-                "zone affinity fell back to full membership: no same-zone workers reachable"
-            );
+            tracing::warn!("zone affinity used global placement or cross-zone read retries");
         }
     }
 }
@@ -144,6 +142,12 @@ async fn run() -> anyhow::Result<()> {
             anyhow::anyhow!("TALON_ZONE_AFFINITY must be true or false, got {value:?}")
         })?,
     };
+    let zone_fallback = match env("TALON_ZONE_FALLBACK") {
+        None => false,
+        Some(value) => talon_core::parse_bool_value(&value).ok_or_else(|| {
+            anyhow::anyhow!("TALON_ZONE_FALLBACK must be true or false, got {value:?}")
+        })?,
+    };
     if zone_affinity || zone.is_some() {
         tracing::info!(
             zone = zone.as_deref().unwrap_or("unknown"),
@@ -151,11 +155,13 @@ async fn run() -> anyhow::Result<()> {
             "zone affinity configuration"
         );
     }
-    let reader = BlockReader::new(coordinator.clone(), cache, 1).with_zone_affinity(
-        zone,
-        zone_affinity,
-        Arc::new(LoggingZoneObserver::default()),
-    );
+    let reader = BlockReader::new(coordinator.clone(), cache, 1)
+        .with_zone_affinity(
+            zone,
+            zone_affinity,
+            Arc::new(LoggingZoneObserver::default()),
+        )
+        .with_zone_fallback(zone_fallback);
 
     // Populate the namespace before mounting. A listing failure is fatal: an
     // apparently healthy mount with an empty tree hides backend/configuration

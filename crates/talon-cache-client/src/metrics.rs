@@ -144,8 +144,8 @@ pub trait ZoneReadObserver: Send + Sync {
         let _ = (matched, bytes);
     }
 
-    /// Zone affinity was requested but the same-zone worker set was empty, so
-    /// this placement resolution used the full membership.
+    /// A read used global placement because its zone was unknown or absent,
+    /// or entered the opt-in cross-zone retry stage after local failures.
     fn affinity_fallback(&self) {}
 }
 
