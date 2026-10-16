@@ -82,3 +82,12 @@ try:
 except talon.BatchLoadError as error:
     retry_requests = [requests[f.index] for f in error.failed_files]
 ```
+
+## Availability zones
+
+Client construction reads `TALON_ZONE`, `TALON_ZONE_AFFINITY` and
+`TALON_ZONE_FALLBACK` through the shared Rust SDK. Both switches default to
+`false`; invalid booleans raise `ValueError`. Inject the actual pod zone before
+creating the client; SDKs do not query Kubernetes. Affinity selects same-zone
+logical members. Read fallback optionally tries a nonlocal owner after a
+retryable local failure. LOAD and BatchLoad stay on their original primary.
