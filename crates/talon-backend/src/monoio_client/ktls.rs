@@ -12,6 +12,7 @@ use zeroize::Zeroizing;
 const SOL_TLS: i32 = 282;
 const TLS_TX: i32 = 1;
 const TLS_RX: i32 = 2;
+const TLS_RX_EXPECT_NO_PAD: i32 = 4;
 const MAX_CONTROL: usize = 65536;
 // Close well before AES-GCM's 2^24.5 record confidentiality limit. The kernel's
 // sequence counter includes empty/control records, unlike a body-byte counter.
@@ -87,6 +88,8 @@ pub(super) async fn probe(version: u16, cipher: u16, size: usize) -> (bool, bool
         if version != 0x304 {
             return Ok::<_, io::Error>((true, false));
         }
+        // TLS 1.3 offload always includes direct-decryption support.
+        set(&socket, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &1_i32.to_ne_bytes())?;
         dummy[if cipher == 54 { 16 } else { 12 }] = 1;
         let rekey = set(&socket, SOL_TLS, TLS_TX, &dummy)
             .and_then(|()| set(&socket, SOL_TLS, TLS_RX, &dummy))
@@ -125,7 +128,6 @@ pub(super) struct KtlsStream {
 impl KtlsStream {
     pub(super) async fn connect(
         tls: super::tls::TlsStream,
-        no_pad: bool,
         rekey_supported: bool,
     ) -> io::Result<Self> {
         let (socket, secrets, session) = tls.into_kernel()?;
@@ -147,8 +149,8 @@ impl KtlsStream {
         set(&socket, libc::IPPROTO_TCP, libc::TCP_ULP, b"tls\0")?;
         set(&socket, SOL_TLS, TLS_TX, &tx)?;
         set(&socket, SOL_TLS, TLS_RX, &rx)?;
-        if no_pad && version == 0x304 {
-            set(&socket, SOL_TLS, 4, &1_i32.to_ne_bytes())?; // TLS_RX_EXPECT_NO_PAD
+        if version == 0x304 {
+            set(&socket, SOL_TLS, TLS_RX_EXPECT_NO_PAD, &1_i32.to_ne_bytes())?;
         }
         let stream = Self {
             socket,

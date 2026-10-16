@@ -1,12 +1,14 @@
 # Experimental Monoio origin and cache I/O
 
-Set `TALON_WORKER_ORIGIN_IO=uring` to use native io_uring for Worker origin
-HTTP(S) downloads and whole-block/page cache commits. The default remains
-`tokio`. Unknown values and io_uring initialization failures stop startup;
+Worker origin HTTP(S) downloads and whole-block/page cache commits use native
+Monoio/io_uring by default (`TALON_WORKER_ORIGIN_IO=uring`), with automatic
+kTLS selection (`TALON_WORKER_ORIGIN_TLS=auto`). Set
+`TALON_WORKER_ORIGIN_IO=tokio` to use the legacy origin/cache path.
+Unknown values and io_uring initialization failures stop startup in `uring` mode;
 the experiment never silently switches to an epoll or blocking implementation.
 
 ```sh
-TALON_WORKER_ORIGIN_IO=uring target/release/talon-worker
+target/release/talon-worker
 ```
 
 The existing Worker configuration, credentials, namespace policy and cache
@@ -23,6 +25,7 @@ Before serving traffic, the worker runs six bounded loopback probes with dummy
 keys: TLS 1.2/1.3 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305. These use the
 existing Tokio startup runtime, without creating a Monoio runtime or thread.
 Each probe records TX/RX installation and traffic-key replacement separately.
+TLS 1.3 installation also requires `TLS_RX_EXPECT_NO_PAD` support.
 TLS 1.3 remains eligible even when replacement is unsupported. The immutable
 snapshot is shared across all origin rings. No request performs capability probes. This detects backports without guessing
 from `uname`; unsupported/failed probes disable the corresponding combination.
@@ -32,7 +35,7 @@ restricts offered ciphers to those supported by the snapshot and caller config:
 
 | Kernel capability and allowed versions | Preferred handshake/record layer |
 | --- | --- |
-| Basic TLS 1.3 TX/RX | TLS 1.3 + kTLS |
+| TLS 1.3 TX/RX with `TLS_RX_EXPECT_NO_PAD` | TLS 1.3 + kTLS |
 | TLS 1.2 only | TLS 1.2 + kTLS |
 | None, or policy excludes all offloadable combinations | Normal highest allowed version + rustls |
 
@@ -78,7 +81,7 @@ strict mode. Startup logs show the snapshot; debug logs show actual negotiation
 and record-layer selection (`RUST_LOG=talon_backend=debug`). Standalone users of
 `MonoioClient` must call `KernelTlsCapabilities::probe` during initialization and
 install the result with `with_kernel_tls_capabilities`; an unprobed client uses
-rustls in auto mode. This does not change the separate `ORIGIN_IO=tokio` default.
+rustls in auto mode. Setting `ORIGIN_IO=tokio` uses the separate reqwest path.
 
 In kTLS mode, owned io_uring `recvmsg` operations put application plaintext
 straight into the final aligned HTTP body allocation. Owned ancillary storage,
@@ -94,10 +97,14 @@ rustls's prior XOR-derived handshake nonces; it does not restart the old nonce.
 
 This removes the remaining **user-space body copy** from the kTLS payload path,
 not every kernel copy. Small receives and HTTP/TLS boundary misalignment can
-still require kernel buffering. For a trusted TLS 1.3 origin known not to pad,
-`TALON_WORKER_KTLS_RX_NO_PAD=1` opts into the kernel's direct-decryption hint;
-it defaults to `0`. The hint is independent of basic kTLS support and is never
-enabled automatically. See the [kernel TLS interface](https://docs.kernel.org/networking/tls.html).
+still require kernel buffering. TLS 1.3 kTLS always enables the kernel's
+`TLS_RX_EXPECT_NO_PAD` direct-decryption hint; there is no separate switch.
+TLS 1.2 does not use this option. A kernel that cannot enable the hint is
+excluded from TLS 1.3 offload by the startup probe; the existing auto/strict
+selection and minimum-version policy still apply. Configured origins are
+expected to send unpadded application records: padded or control records are
+decrypted again into a kernel buffer, adding work rather than breaking TLS
+correctness. See the [kernel TLS interface](https://docs.kernel.org/networking/tls.html).
 
 Linux 6.2 has basic kTLS but cannot replace installed traffic keys. On the
 validation machine, auto therefore uses TLS 1.3 kTLS and reconnects when a

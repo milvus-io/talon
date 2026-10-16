@@ -35,7 +35,6 @@ pub enum TlsMode {
 pub struct MonoioClient {
     tls: Arc<rustls::ClientConfig>,
     tls_mode: TlsMode,
-    ktls_no_pad: bool,
     capabilities: KernelTlsCapabilities,
     minimum_tls: TlsVersion,
     endpoint_minimums: HashMap<String, TlsVersion>,
@@ -70,7 +69,6 @@ impl MonoioClient {
         Self {
             tls: Arc::new(tls),
             tls_mode: TlsMode::Auto,
-            ktls_no_pad: false,
             capabilities: KernelTlsCapabilities::default(),
             minimum_tls: TlsVersion::default(),
             endpoint_minimums: HashMap::new(),
@@ -83,13 +81,6 @@ impl MonoioClient {
         let mut tls = (*self.tls).clone();
         tls.enable_secret_extraction = mode != TlsMode::Rustls;
         self.tls = Arc::new(tls); // Also isolates the pool from the prior mode.
-        self
-    }
-
-    /// TLS 1.3 only: opt in for trusted origins known to send unpadded records.
-    pub fn with_ktls_no_pad(mut self, enabled: bool) -> Self {
-        self.ktls_no_pad = enabled;
-        self.tls = Arc::new((*self.tls).clone());
         self
     }
 
@@ -148,7 +139,6 @@ impl MonoioClient {
                 .unwrap_or_default(),
         );
         let capabilities = self.capabilities.clone();
-        let no_pad = self.ktls_no_pad;
         let tokio = tokio::runtime::Handle::current();
         talon_uring::spawn_cancellable(async move {
                 let operation = async {
@@ -222,7 +212,7 @@ impl MonoioClient {
                                     tracing::debug!(protocol = ?stream.protocol(), origin_tls = if use_kernel { "ktls" } else { "rustls" }, "origin TLS negotiated");
                                     if !use_kernel { break Ok(Connection::Tls(Box::new(stream))); }
                                     let rekey_supported = stream.protocol().1.is_some_and(|suite| capabilities.supports_key_update(suite));
-                                    match ktls::KtlsStream::connect(stream, no_pad, rekey_supported).await {
+                                    match ktls::KtlsStream::connect(stream, rekey_supported).await {
                                         Ok(stream) => {
                                             tracing::debug!(origin_tls = "ktls", "origin TLS record layer selected");
                                             break Ok(Connection::Ktls(Box::new(stream)));

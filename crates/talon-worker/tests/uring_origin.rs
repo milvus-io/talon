@@ -1432,24 +1432,29 @@ fn uring_ktls_auto_preserves_tls_and_rejects_untrusted_certificates() {
 }
 
 #[test]
-#[ignore = "requires native io_uring and Linux kTLS AES-GCM TLS 1.2"]
+#[ignore = "requires native io_uring and kTLS TLS 1.2/1.3 with TLS_RX_EXPECT_NO_PAD"]
 fn uring_ktls_required_receives_directly_and_commits_cache() {
     on_native_ring(async {
         use rustls::crypto::ring::cipher_suite::*;
-        for suite in [
-            TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
-            TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
-            TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+        for (version, suite) in [
+            (
+                &rustls::version::TLS12,
+                TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+            ),
+            (
+                &rustls::version::TLS12,
+                TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+            ),
+            (
+                &rustls::version::TLS12,
+                TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256,
+            ),
+            (&rustls::version::TLS13, TLS13_AES_128_GCM_SHA256),
+            (&rustls::version::TLS13, TLS13_AES_256_GCM_SHA384),
+            (&rustls::version::TLS13, TLS13_CHACHA20_POLY1305_SHA256),
         ] {
-            let origin = Origin::start_suite(
-                true,
-                Some(&rustls::version::TLS12),
-                Some(256),
-                None,
-                Some(suite),
-                None,
-            )
-            .await;
+            let origin =
+                Origin::start_suite(true, Some(version), Some(256), None, Some(suite), None).await;
 
             let client = MonoioClient::with_tls_config(origin.tls.clone())
                 .with_kernel_tls_capabilities(origin.capabilities.clone())

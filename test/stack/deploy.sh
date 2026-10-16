@@ -290,6 +290,7 @@ deploy_talon() {
     TALON_WORKER_S3_ACCESS_KEY_ID="$MINIO_ACCESS_KEY" \
     TALON_WORKER_S3_SECRET_ACCESS_KEY="$MINIO_SECRET_KEY" \
     TALON_WORKER_S3_PATH_STYLE=true \
+    TALON_WORKER_ORIGIN_IO=tokio \
     TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 >/dev/null
 
   # The old pods can still be ready immediately after set env. Wait for the

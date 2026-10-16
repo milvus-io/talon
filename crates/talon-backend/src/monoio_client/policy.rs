@@ -32,8 +32,9 @@ pub struct KernelTlsCapabilities {
 
 impl KernelTlsCapabilities {
     /// Call once during startup, before publishing the HTTP client/listeners.
-    /// Each of six bounded startup probes checks TX/RX installation and,
-    /// separately, key replacement. Failure does not disable basic TLS 1.3.
+    /// Each of six bounded startup probes checks TX/RX installation (including
+    /// TLS_RX_EXPECT_NO_PAD for TLS 1.3) and, separately, key replacement.
+    /// Key-replacement failure does not disable TLS 1.3 offload.
     pub async fn probe() -> io::Result<Self> {
         let mut capabilities = Self::default();
         for version in [0x304, 0x303] {

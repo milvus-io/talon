@@ -85,8 +85,8 @@ Three planes:
 Each `coordinator` / `worker` / `client` process splits I/O into two layers: one
 for control and protocol scheduling, one for bulk data movement. **Layer 2 is
 built and runtime-neutral.** Layer 1 on the **worker data plane** runs on a
-thread-per-core io_uring runtime by default, falling back to Tokio where
-io_uring is unavailable; every other plane stays on Tokio deliberately (see
+thread-per-core io_uring runtime by default. With `TALON_WORKER_ORIGIN_IO=tokio`,
+it can fall back to Tokio where io_uring is unavailable; every other plane stays on Tokio deliberately (see
 *Runtime split*).
 
 ### Layer 1 — control & protocol scheduling
@@ -101,8 +101,9 @@ runtime.
 probes io_uring and io-wq limit registration at startup and, when available, serves on N rings — one per core
 by default — each pinned and binding the listen address with `SO_REUSEPORT`.
 When the probe fails (older kernel, restrictive seccomp, some container
-runtimes) it falls back to the Tokio accept loop and logs the fallback, so the
-default is safe everywhere without a version check.
+runtimes), the default native origin engine rejects startup. Setting
+`TALON_WORKER_ORIGIN_IO=tokio` permits fallback to the Tokio accept loop;
+the capability probe and fallback are logged without relying on a version check.
 
 **Control plane and coordinator: Tokio.** `coordinator/main.rs` runs a
 multi-threaded Tokio accept loop, as do the admin/UI/metrics endpoints. These
@@ -155,15 +156,18 @@ crossing threads, not shared state within a ring. It does still reach Tokio
 internally (`block_store` uses `spawn_blocking`, the miss path uses Tokio
 timers), so ring threads enter a Tokio handle: coexistence, as predicted.
 
-An opt-in native origin/cache engine now extends this path through HTTP(S),
+The default native origin/cache engine extends this path through HTTP(S),
 LOAD commits, resident byte reads and cold descriptor opens. It retains buffered
 sendfile/splice reads and probes the cache filesystem's Direct I/O alignment
 at initialization. Native downloads retain aligned tail padding in their receive
 allocation and on disk, while sidecars and block metadata retain logical lengths.
 Data-file residency and eviction charge measured allocated disk bytes
 (`st_blocks * 512`), rebuilt from files at startup.
-This requires no body-to-alignment-buffer copy or truncate. TLS still uses
-buffered rustls. See
+This requires no body-to-alignment-buffer copy or truncate. TLS defaults to
+`auto`: rustls authenticates the origin, then the record layer uses kTLS when
+startup capabilities and TLS policy allow it, otherwise unbuffered rustls.
+TLS 1.3 kTLS always enables `TLS_RX_EXPECT_NO_PAD`, checked during startup.
+See
 [the experiment design and validation](docs/explanation/monoio-origin-io.md) for
 execution ownership, cancellation, compatibility and remaining Tokio paths.
 

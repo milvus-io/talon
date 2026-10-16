@@ -201,6 +201,7 @@ def main():
                "TALON_WORKER_L2_PAGE_SIZE_BYTES": str(args.page_size), "TALON_WORKER_HEARTBEAT_INTERVAL_MS": str(HEARTBEAT_MS),
                "TALON_WORKER_AZURE_ACCOUNT": "test", "TALON_WORKER_AZURE_SAS": "test",
                "TALON_WORKER_AZURE_ENDPOINT": f"http://127.0.0.1:{origin.server_port}",
+               "TALON_WORKER_ORIGIN_IO": "tokio" if args.runtime == "tokio" else "uring",
                "TALON_WORKER_FORCE_TOKIO_DATA_PLANE": "1" if args.runtime == "tokio" else "0"}
         if identity is not None:
             env["TALON_WORKER_NODE_ID"] = identity
