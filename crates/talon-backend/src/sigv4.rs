@@ -314,8 +314,118 @@ pub fn sign_request_with_payload_hash(
     req.headers.push(("authorization".into(), authorization));
 }
 
+/// Sign an XML API request with Google's HMAC V4 variant. The URL must already
+/// contain the escaped resource path that will be sent on the wire.
+/// `payload_hash` lets streaming uploads select GCS's `UNSIGNED-PAYLOAD` mode.
+pub(crate) fn sign_gcs_request(
+    req: &mut HttpRequest,
+    creds: &crate::gcs::GcsHmacCredentials,
+    date: &AmzDate,
+    payload_hash: Option<&str>,
+) {
+    let payload_hash = payload_hash
+        .map(str::to_string)
+        .unwrap_or_else(|| sha256_hex(&req.body));
+    let (host, path, query) = split_url(&req.url);
+    req.headers.retain(|(name, _)| {
+        !matches!(
+            name.to_ascii_lowercase().as_str(),
+            "host" | "x-goog-date" | "x-goog-content-sha256" | "authorization"
+        )
+    });
+    req.headers.extend([
+        ("host".into(), host),
+        ("x-goog-date".into(), date.datetime.clone()),
+        ("x-goog-content-sha256".into(), payload_hash.clone()),
+    ]);
+    // Sign every supplied header, including all x-goog-* preconditions. GCS
+    // requires duplicate values to be joined in their original wire order.
+    let mut signed = std::collections::BTreeMap::<String, String>::new();
+    for (name, value) in &req.headers {
+        let value = normalize_header_value(value);
+        signed
+            .entry(name.to_ascii_lowercase())
+            .and_modify(|existing| {
+                existing.push(',');
+                existing.push_str(&value);
+            })
+            .or_insert(value);
+    }
+    let signed_headers = signed
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers = signed
+        .iter()
+        .map(|(name, value)| format!("{name}:{value}\n"))
+        .collect::<String>();
+    let canonical_request = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        method_str(req.method),
+        path,
+        canonical_query(&query),
+        canonical_headers,
+        signed_headers,
+        payload_hash
+    );
+    let scope = format!("{}/auto/storage/goog4_request", date.date);
+    let string_to_sign = format!(
+        "GOOG4-HMAC-SHA256\n{}\n{}\n{}",
+        date.datetime,
+        scope,
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let k_date = hmac(
+        format!("GOOG4{}", creds.secret_access_key).as_bytes(),
+        date.date.as_bytes(),
+    );
+    let k_region = hmac(&k_date, b"auto");
+    let k_service = hmac(&k_region, b"storage");
+    let k_signing = hmac(&k_service, b"goog4_request");
+    let signature = to_hex(&hmac(&k_signing, string_to_sign.as_bytes()));
+    req.headers.push(("authorization".into(), format!(
+        "GOOG4-HMAC-SHA256 Credential={}/{scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        creds.access_key_id
+    )));
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gcs_hmac_matches_independent_signature_vector() {
+        let credentials = crate::gcs::GcsHmacCredentials {
+            access_key_id: "test-access".into(),
+            secret_access_key: "test-secret".into(),
+        };
+        let date = AmzDate {
+            datetime: "20261016T010203Z".into(),
+            date: "20261016".into(),
+        };
+        let mut request = HttpRequest::with_body(
+            Method::Put,
+            "https://storage.googleapis.com/my-bucket/data/a%20b%2B%25%3F.bin?z=last%2Fvalue&a=first".into(),
+            vec![
+                ("Content-Length".into(), "7".into()),
+                ("x-goog-if-generation-match".into(), "42".into()),
+                ("X-Goog-Meta-Reviewer".into(), " jane ".into()),
+                ("x-goog-meta-reviewer".into(), "john".into()),
+            ],
+            bytes::Bytes::from_static(b"payload"),
+        );
+        sign_gcs_request(&mut request, &credentials, &date, None);
+        // Independently calculated with Python hashlib/hmac from the literal
+        // canonical request; catches path double-encoding and missing conditions.
+        assert_eq!(request.header("authorization"), Some(concat!(
+            "GOOG4-HMAC-SHA256 Credential=test-access/20261016/auto/storage/goog4_request, ",
+            "SignedHeaders=content-length;host;x-goog-content-sha256;x-goog-date;",
+            "x-goog-if-generation-match;x-goog-meta-reviewer, Signature=0598f07d8e6d15a4056fe433a95bfad4c675655cd9ca3ec1042444f98c021a52"
+        )));
+        let first = request.clone();
+        sign_gcs_request(&mut request, &credentials, &date, None);
+        assert_eq!(request, first);
+    }
+
     /// SigV4 requires the canonical query sorted by encoded key. An unsorted
     /// query produces a signature AWS rejects with a 403 that reads like a
     /// credentials failure, so this is worth pinning.

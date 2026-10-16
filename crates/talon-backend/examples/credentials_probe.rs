@@ -17,8 +17,9 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use talon_backend::{
-    resolve_azure_bearer, resolve_gcs_bearer, resolve_s3_credentials, AzureBackend, AzureConfig,
-    CredentialsObserver, GcsBackend, GcsConfig, HttpClient, ReqwestClient, S3Backend, S3Config,
+    resolve_azure_credentials, resolve_gcs_credentials, resolve_s3_credentials, AzureBackend,
+    AzureConfig, CredentialsObserver, GcsBackend, GcsConfig, HttpClient, ReqwestClient, S3Backend,
+    S3Config,
 };
 use talon_core::{Backend, BackendStore, Error, ObjectId};
 
@@ -103,8 +104,17 @@ async fn main() {
     let key = arg("--key").unwrap_or_else(|| "talon-credentials-probe/absent".to_string());
     let code = match mode.as_str() {
         "s3" => {
+            let access_key = std::env::var("AWS_ACCESS_KEY_ID").ok();
+            let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").ok();
+            let keys = (access_key.is_some() || secret_key.is_some()).then(|| {
+                talon_backend::S3Credentials {
+                    access_key_id: access_key.unwrap_or_default(),
+                    secret_access_key: secret_key.unwrap_or_default(),
+                    session_token: std::env::var("AWS_SESSION_TOKEN").ok(),
+                }
+            });
             let resolved = match resolve_s3_credentials(
-                None,
+                keys,
                 selector.as_deref(),
                 Arc::clone(&http),
                 observer,
@@ -154,68 +164,22 @@ async fn main() {
             }
         }
         "gcs" => {
-            let resolved =
-                match resolve_gcs_bearer(None, selector.as_deref(), Arc::clone(&http), observer)
-                    .await
-                {
-                    Ok(resolved) => resolved,
-                    Err(error) => {
-                        println!("credential resolution failed: {error}");
-                        std::process::exit(1);
-                    }
-                };
-            println!(
-                "credential acquisition succeeded; source: {}",
-                resolved.source
-            );
-            match resolved.provider.current() {
-                Some(token) => println!("bearer token: {}", redacted(&token)),
-                None => println!("bearer token: absent (unauthenticated)"),
-            }
-            match arg("--bucket") {
-                Some(bucket) => {
-                    let backend = GcsBackend::with_bearer_provider(
-                        GcsConfig::default(),
-                        resolved.provider,
-                        http,
-                    );
-                    probe(&backend, Backend::Gcs, &bucket, &key).await
+            let access_key = std::env::var("TALON_WORKER_GCS_ACCESS_KEY_ID").ok();
+            let secret_key = std::env::var("TALON_WORKER_GCS_SECRET_ACCESS_KEY").ok();
+            let keys = (access_key.is_some() || secret_key.is_some()).then(|| {
+                talon_backend::GcsHmacCredentials {
+                    access_key_id: access_key.unwrap_or_default(),
+                    secret_access_key: secret_key.unwrap_or_default(),
                 }
-                None => 0,
-            }
-        }
-        "azure" => {
-            if selector.as_deref() == Some("broker") {
-                let account = arg("--account").unwrap_or_else(|| {
-                    println!("broker Azure requires --account");
-                    std::process::exit(1);
-                });
-                let sas = match talon_backend::resolve_azure_broker_sas(
-                    &account,
-                    Arc::clone(&http),
-                    observer,
-                )
-                .await
-                {
-                    Ok(sas) => sas,
-                    Err(error) => {
-                        println!("credential resolution failed: {error}");
-                        std::process::exit(1);
-                    }
-                };
-                println!("credential acquisition succeeded; source: broker");
-                println!("SAS token: {}", redacted(sas.current().expose_secret()));
-                let code = match arg("--container") {
-                    Some(container) => {
-                        let backend =
-                            AzureBackend::with_sas_provider(AzureConfig::new(&account), sas, http);
-                        probe(&backend, Backend::Azure, &container, &key).await
-                    }
-                    None => 0,
-                };
-                std::process::exit(code);
-            }
-            let resolved = match resolve_azure_bearer(Arc::clone(&http), observer).await {
+            });
+            let resolved = match resolve_gcs_credentials(
+                keys,
+                selector.as_deref(),
+                Arc::clone(&http),
+                observer,
+            )
+            .await
+            {
                 Ok(resolved) => resolved,
                 Err(error) => {
                     println!("credential resolution failed: {error}");
@@ -226,13 +190,61 @@ async fn main() {
                 "credential acquisition succeeded; source: {}",
                 resolved.source
             );
-            match resolved.provider.current() {
-                Some(token) => println!("bearer token: {}", redacted(&token)),
-                None => println!("bearer token: absent"),
+            match &resolved.provider {
+                talon_backend::GcsCredentials::Bearer(provider) => {
+                    if let Some(token) = provider.current() {
+                        println!("bearer token: {}", redacted(&token));
+                    }
+                }
+                talon_backend::GcsCredentials::Hmac(_) => println!("HMAC credentials: present"),
             }
-            match (arg("--account"), arg("--container")) {
-                (Some(account), Some(container)) => {
-                    let backend = AzureBackend::with_bearer_provider(
+            match arg("--bucket") {
+                Some(bucket) => {
+                    let backend =
+                        GcsBackend::with_credentials(GcsConfig::default(), resolved.provider, http);
+                    probe(&backend, Backend::Gcs, &bucket, &key).await
+                }
+                None => 0,
+            }
+        }
+        "azure" => {
+            let account = arg("--account").unwrap_or_default();
+            let key_credential = std::env::var("TALON_WORKER_AZURE_SHARED_KEY").ok();
+            let resolved = match resolve_azure_credentials(
+                &account,
+                key_credential,
+                selector.as_deref(),
+                Arc::clone(&http),
+                observer,
+            )
+            .await
+            {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    println!("credential resolution failed: {error}");
+                    std::process::exit(1);
+                }
+            };
+            println!(
+                "credential acquisition succeeded; source: {}",
+                resolved.source
+            );
+            match &resolved.provider {
+                talon_backend::AzureCredentials::SharedKey(_) => println!("account key: present"),
+                talon_backend::AzureCredentials::Sas(_) => println!("fixed SAS: present"),
+                talon_backend::AzureCredentials::BrokerSas(provider) => println!(
+                    "SAS token: {}",
+                    redacted(provider.current().expose_secret())
+                ),
+                talon_backend::AzureCredentials::Bearer(provider) => {
+                    if let Some(token) = provider.current() {
+                        println!("bearer token: {}", redacted(&token));
+                    }
+                }
+            }
+            match arg("--container") {
+                Some(container) if !account.is_empty() => {
+                    let backend = AzureBackend::with_credentials(
                         AzureConfig::new(&account),
                         resolved.provider,
                         http,

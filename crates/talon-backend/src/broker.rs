@@ -229,7 +229,9 @@ pub async fn resolve_azure_broker_sas_with_env(
 mod tests {
     use super::*;
     use crate::credentials::NoopObserver;
-    use crate::workload_identity::{resolve_gcs_bearer_with_env, resolve_s3_credentials_with_env};
+    use crate::workload_identity::{
+        resolve_gcs_credentials_with_env, resolve_s3_credentials_with_env,
+    };
     use crate::{
         AzureBackend, AzureConfig, GcsBackend, GcsConfig, HttpResponse, S3Backend, S3Config,
     };
@@ -459,16 +461,19 @@ mod tests {
             credentials("", "oauth-token", "2099-01-01T00:00:00Z"),
         )]);
         let request = serde_json::json!({"csp":"gcp","gcpServiceAccountEmail":"reader@example.iam.gserviceaccount.com"});
-        let resolved = ok(resolve_gcs_bearer_with_env(
+        let resolved = ok(resolve_gcs_credentials_with_env(
             &env(request),
-            Some("static-token".into()),
+            Some(crate::GcsHmacCredentials {
+                access_key_id: "unused-key".into(),
+                secret_access_key: "unused-secret".into(),
+            }),
             Some("broker"),
             http.clone(),
             Arc::new(NoopObserver),
         )
         .await);
         let backend =
-            GcsBackend::with_bearer_provider(GcsConfig::default(), resolved.provider, http.clone());
+            GcsBackend::with_credentials(GcsConfig::default(), resolved.provider, http.clone());
         let _ = backend
             .head(&ObjectId::new(Backend::Gcs, "bucket", "key"))
             .await;
