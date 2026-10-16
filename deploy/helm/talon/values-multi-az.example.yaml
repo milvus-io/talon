@@ -1,0 +1,17 @@
+# Replace zones, image tag, storage class and credentials for your cluster.
+image:
+  tag: replace-with-tested-multi-az-image
+coordinator:
+  backend: kubernetes
+  replicas: 3
+worker:
+  replicas: 6
+  persistence:
+    enabled: true
+    storageClass: talon-local
+multiAz:
+  enabled: true
+  zones: [zone-a, zone-b, zone-c]
+  clientServiceAccounts:
+    - name: talon-gateway
+      namespace: talon

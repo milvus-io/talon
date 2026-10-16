@@ -56,6 +56,13 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "talon.selectorLabels" (dict "component" "worker") | nindent 14 }}
+        {{- if .Values.multiAz.enabled }}
+        {{- include "talon.zoneSpread" (dict "root" . "component" "worker") | nindent 8 }}
+        {{- end }}
+      {{- if .Values.multiAz.enabled }}
+      affinity:
+        {{- include "talon.zoneNodeAffinity" . | nindent 8 }}
+      {{- end }}
       {{- if not .Values.worker.persistence.enabled }}
       volumes:
         - name: cache
@@ -78,6 +85,12 @@ spec:
             - name: admin
               containerPort: 8001
           env:
+            {{- if .Values.multiAz.enabled }}
+            - name: TALON_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            {{- end }}
             - name: TALON_WORKER_CLUSTER_ID
               value: {{ .Values.coordinator.clusterId | quote }}
             - name: TALON_WORKER_ADVERTISE_ADDR

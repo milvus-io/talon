@@ -1,5 +1,13 @@
+# Application-owned sidecar. Apply in the same namespace as Talon, or adapt
+# the coordinator DNS and node-zone RBAC subject namespace together.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: talon-gateway
+---
 # Loopback-only Azure Blob gateway sidecar template. The application container
-# uses http://127.0.0.1:8080/<account>. Do not add a Service before #446.
+# uses http://127.0.0.1:8080/<account>. Do not expose this development-mode
+# template through a Service; configure production authentication separately.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -13,7 +21,7 @@ kind: Deployment
 metadata:
   name: application-with-talon-azure
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: application-with-talon-azure
@@ -22,6 +30,14 @@ spec:
       labels:
         app: application-with-talon-azure
     spec:
+      serviceAccountName: talon-gateway
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: application-with-talon-azure
       containers:
         - name: application
           image: replace-with-your-application
@@ -40,7 +56,7 @@ spec:
             - name: TALON_GATEWAY_PATH_STYLE
               value: "true"
             - name: TALON_COORDINATOR_ADDR
-              value: talon-coordinator:7411
+              value: talon-coordinator:7000
             - name: TALON_GATEWAY_AZURE_ACCOUNT
               value: replace-account
             - name: TALON_GATEWAY_AZURE_SHARED_KEY
@@ -50,8 +66,12 @@ spec:
                   key: account-key
             # Zone-aware cache reads (ADR 0006): the gateway resolves its zone
             # from this node's label, which needs the talon-node-zone-reader
-            # ClusterRole (rbac.yaml) bound to this Pod's ServiceAccount — or
+            # ClusterRole (node-zone-rbac.yaml) bound to this Pod's ServiceAccount — or
             # set TALON_ZONE directly. Opt in with TALON_ZONE_AFFINITY=true.
+            - name: TALON_ZONE_AFFINITY
+              value: "true"
+            - name: TALON_ZONE_FALLBACK
+              value: "false"
             - name: TALON_NODE_NAME
               valueFrom:
                 fieldRef:
