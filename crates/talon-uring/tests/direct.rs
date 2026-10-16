@@ -48,18 +48,21 @@ fn probed_direct_writes_pad_in_place_without_populating_page_cache() {
         let input = expected.clone();
         let path = root.path().join(len.to_string());
         let target = path.clone();
-        ring.block_on(async move {
-            let buffer = talon_uring::AlignedBuf::new(len, alignment).unwrap();
-            let address = buffer.as_ref().as_ptr();
-            let (result, buffer) = input.as_slice().read_exact(buffer).await;
-            result.unwrap();
-            let bytes = buffer.freeze(len);
-            if len > 0 {
-                assert_eq!(bytes.as_ptr(), address);
-            }
-            talon_uring::atomic_write_payload(&target, bytes, alignment).await
-        })
-        .unwrap();
+        let allocated = ring
+            .block_on(async move {
+                let buffer = talon_uring::AlignedBuf::new(len, alignment).unwrap();
+                let address = buffer.as_ref().as_ptr();
+                let (result, buffer) = input.as_slice().read_exact(buffer).await;
+                result.unwrap();
+                let bytes = buffer.freeze(len);
+                if len > 0 {
+                    assert_eq!(bytes.as_ptr(), address);
+                }
+                talon_uring::atomic_write_payload(&target, bytes, alignment).await
+            })
+            .unwrap();
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(allocated, std::fs::metadata(&path).unwrap().blocks() * 512);
         let stored_len = alignment.round_len(len).unwrap();
         assert_eq!(std::fs::metadata(&path).unwrap().len(), stored_len as u64);
         let expected_resident = 0;

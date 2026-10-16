@@ -325,8 +325,8 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             8,
-            1024,
-            WorkerMetrics::new(1024),
+            1024 * disk_unit(),
+            WorkerMetrics::new(1024 * disk_unit()),
         );
         if paged {
             runtime = runtime

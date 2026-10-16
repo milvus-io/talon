@@ -84,3 +84,14 @@ runbook, #90), one anchor per alert.
 ## OpenTelemetry
 
 Optional Collector/Tempo assets live in `otel/`. See the [tracing runbook](../../docs/how-to/opentelemetry.md) for build features, SDK initialization, endpoint capabilities, export health and rollout/rollback. The existing Prometheus metrics and dashboards retain their definitions.
+
+## Worker storage capacity
+
+`talon_worker_resident_bytes` measures allocated disk bytes (`st_blocks * 512`)
+of indexed cache data files across namespaces. It includes tail padding and
+filesystem block rounding. Worker status and foreground/background eviction use
+the same accounting. Logical block lengths and L1 payload accounting are separate.
+Sidecars, checkpoints, directories, temporary/orphan files and unlinked files
+held by readers are excluded; this metric is not filesystem-wide disk usage.
+Reserve additional disk headroom when setting `capacity_bytes`, especially for
+small pages. The existing capacity saturation rule uses this allocated-byte cost.

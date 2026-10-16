@@ -56,10 +56,11 @@ fn request(offset: u64, len: u64) -> RangeRequest {
     }
 }
 fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
+    let capacity = capacity.div_ceil(16) * disk_unit();
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
-    for meta in paged.scan().unwrap() {
-        index.commit(meta);
+    for entry in paged.scan_allocated().unwrap() {
+        index.commit_allocated(entry.meta, entry.allocated);
     }
     WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),
@@ -245,8 +246,8 @@ async fn tti_strict_boundary_and_l1_l2_access_refresh_only_touched_page() {
         assert_eq!(collect_all(&r).await, 16);
         assert!(!r.paged.as_ref().unwrap().has_page(&id(), PageIndex(0)));
         assert!(r.paged.as_ref().unwrap().has_page(&id(), PageIndex(1)));
-        assert_eq!(r.lru.total_bytes(), 16);
-        assert_eq!(r.resident_bytes(), 16);
+        assert_eq!(r.lru.total_bytes(), disk_unit());
+        assert_eq!(r.logical_resident_bytes(), 16);
         assert!(!r.l1.contains_page(&id(), PageIndex(0)));
     }
 }
@@ -275,7 +276,7 @@ async fn sendfile_refresh_and_open_handle_survives_gc() {
             &(i as u8 * 16..i as u8 * 16 + 16).collect::<Vec<_>>()
         );
     }
-    assert_eq!(r.resident_bytes(), 0);
+    assert_eq!(r.logical_resident_bytes(), 0);
 }
 
 #[tokio::test]
@@ -306,9 +307,9 @@ async fn restart_and_failback_never_renew_missing_or_old_access() {
     // A second worker on a different disk starts cold and can fetch independently.
     let other = tempfile::tempdir().unwrap();
     let failover = runtime(other.path(), false, 0, 100);
-    assert_eq!(failover.resident_bytes(), 0);
+    assert_eq!(failover.logical_resident_bytes(), 0);
     failover.serve_range(&request(0, 1)).await.unwrap();
-    assert_eq!(failover.resident_bytes(), 16);
+    assert_eq!(failover.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -367,8 +368,8 @@ async fn unlink_failure_keeps_accounting_and_later_touch_cancels_retry() {
     std::fs::create_dir(&path).unwrap();
     r.page_clock.set(10101);
     assert_eq!(collect_all(&r).await, 0);
-    assert_eq!(r.resident_bytes(), 16);
-    assert_eq!(r.lru.total_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
+    assert_eq!(r.lru.total_bytes(), disk_unit());
     r.serve_range(&request(0, 1)).await.unwrap(); // L1 renews after failed unlink.
     assert_eq!(collect_all(&r).await, 0);
     std::fs::remove_dir(&path).unwrap();
@@ -415,10 +416,10 @@ async fn read_pin_blocks_tti_and_capacity_until_resource_is_obtained() {
     assert_eq!(collect_all(&r).await, 0);
     r.capacity_bytes = 1;
     r.enforce_capacity().await;
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
     drop(read);
     r.enforce_capacity().await;
-    assert_eq!(r.resident_bytes(), 0);
+    assert_eq!(r.logical_resident_bytes(), 0);
     assert_eq!(collect_all(&r).await, 0);
     assert_eq!(r.lru.total_bytes(), 0);
 }
@@ -438,7 +439,7 @@ async fn full_gc_ignores_deletion_batch_limit_and_preserves_concurrent_sibling_c
     assert_eq!(data.unwrap().len(), 16);
     assert!(r.paged.as_ref().unwrap().has_page(&id(), PageIndex(3)));
     assert_eq!(r.resident_bytes(), r.lru.total_bytes());
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -466,8 +467,8 @@ async fn cancelling_request_cannot_split_commit_transaction() {
     drop(gate);
     r.drain_page_mutations().await;
     assert!(r.paged.as_ref().unwrap().has_page(&id(), PageIndex(0)));
-    assert_eq!(r.resident_bytes(), 16);
-    assert_eq!(r.lru.total_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
+    assert_eq!(r.lru.total_bytes(), disk_unit());
 }
 
 #[tokio::test]
@@ -484,8 +485,8 @@ async fn full_admission_over_partial_pages_preserves_form_and_covers_body() {
         len: 256,
     };
     assert_eq!(r.serve_cached(&cached).await.unwrap(), body);
-    assert_eq!(r.resident_bytes(), 256);
-    assert_eq!(r.lru.total_bytes(), 256);
+    assert_eq!(r.logical_resident_bytes(), 256);
+    assert_eq!(r.lru.total_bytes(), 16 * disk_unit());
 }
 
 #[tokio::test]
@@ -505,7 +506,7 @@ async fn background_service_collects_without_requests_and_shutdown_checkpoints()
         },
     );
     tokio::time::timeout(Duration::from_secs(2), async {
-        while r.resident_bytes() != 0 {
+        while r.logical_resident_bytes() != 0 {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
     })
@@ -659,7 +660,7 @@ async fn stale_gc_candidate_cannot_unlink_a_recommitted_page() {
     r.page_clock.set(20000); // New instance is old enough too; token identity still matters.
     assert_eq!(r.evict_page_candidate(stale, 0).await, None);
     assert!(r.paged.as_ref().unwrap().has_page(&id(), PageIndex(0)));
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -690,10 +691,10 @@ async fn capacity_should_skip_protected_page_and_choose_another() {
     r.serve_range(&request(0, 48)).await.unwrap();
     let state = r.page_lifecycle.get(&id()).unwrap();
     let _read = state.acquire(PageIndex(0)).unwrap();
-    r.capacity_bytes = 32;
+    r.capacity_bytes = 2 * disk_unit();
     r.enforce_capacity().await;
     assert!(
-        r.resident_bytes() <= 32,
+        r.resident_bytes() <= 2 * disk_unit(),
         "capacity enforcement stopped at an ineligible oldest page despite other victims"
     );
 }
@@ -720,7 +721,7 @@ async fn cancelled_admission_must_finish_capacity_enforcement() {
     drop(gate);
     r.drain_page_mutations().await;
     assert!(
-        r.resident_bytes() <= 16,
+        r.resident_bytes() <= disk_unit(),
         "detached admission exceeds capacity after requester cancellation"
     );
 }
@@ -738,16 +739,16 @@ async fn stale_whole_capacity_candidate_must_recheck_pressure() {
     r.commit_cached_block(&b, Bytes::from_static(&[2; 16]))
         .await
         .unwrap();
-    r.capacity_bytes = 16;
-    let pending = r.lru.candidates_to_fit(16, &HashSet::new());
+    r.capacity_bytes = disk_unit();
+    let pending = r.lru.candidates_to_fit(disk_unit(), &HashSet::new());
     assert_eq!(pending.len(), 1);
     // Another request has already relieved pressure by evicting B.
     r.unlink_units(r.lru.block_candidates(&b), 1).await;
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
     let _pin = r.lru.pin_guard(CacheUnit::Whole(a.clone())).unwrap();
     r.unlink_units(pending, 1).await;
     assert_eq!(
-        r.resident_bytes(),
+        r.logical_resident_bytes(),
         16,
         "stale candidate deletes pinned A after capacity is already satisfied"
     );
@@ -766,11 +767,11 @@ async fn whole_candidates_recheck_pins_and_recommits_under_pressure() {
     r.commit_cached_block(&b, Bytes::from_static(&[2; 16]))
         .await
         .unwrap();
-    r.capacity_bytes = 16;
-    let stale = r.lru.candidates_to_fit(16, &HashSet::new());
+    r.capacity_bytes = disk_unit();
+    let stale = r.lru.candidates_to_fit(disk_unit(), &HashSet::new());
     let pin = r.lru.pin_guard(CacheUnit::Whole(a.clone())).unwrap();
     r.unlink_units(stale.clone(), 1).await;
-    assert_eq!(r.resident_bytes(), 32);
+    assert_eq!(r.logical_resident_bytes(), 32);
     drop(pin);
     // Keep pressure handling out of this recommit so the stale candidate is
     // tested while the cache is still over capacity.
@@ -778,9 +779,9 @@ async fn whole_candidates_recheck_pins_and_recommits_under_pressure() {
     r.commit_cached_block(&a, Bytes::from_static(&[1; 16]))
         .await
         .unwrap();
-    r.capacity_bytes = 16;
+    r.capacity_bytes = disk_unit();
     r.unlink_units(stale, 1).await;
-    assert_eq!(r.resident_bytes(), 32);
+    assert_eq!(r.logical_resident_bytes(), 32);
     assert!(r.cached_block_range(&a, 0, 16).await.unwrap().is_some());
 }
 
@@ -815,8 +816,8 @@ async fn cancelled_whole_admission_finishes_capacity_and_paged_fallback() {
         let _ = task.await;
         drop(gate);
         r.drain_page_mutations().await;
-        assert_eq!(r.resident_bytes(), 16);
-        assert_eq!(r.lru.total_bytes(), 16);
+        assert_eq!(r.logical_resident_bytes(), 16);
+        assert_eq!(r.lru.total_bytes(), disk_unit());
         if paged {
             assert!(r.paged.as_ref().unwrap().has_page(&target, PageIndex(1)));
         } else {
@@ -837,16 +838,16 @@ async fn capacity_retries_other_victims_after_unlink_failure() {
     let path = r.paged.as_ref().unwrap().dir_for(&id()).join("0.page");
     std::fs::remove_file(&path).unwrap();
     std::fs::create_dir(&path).unwrap();
-    r.capacity_bytes = 32;
+    r.capacity_bytes = 2 * disk_unit();
     r.enforce_capacity().await;
-    assert_eq!(r.resident_bytes(), 32);
-    assert_eq!(r.lru.total_bytes(), 32);
+    assert_eq!(r.logical_resident_bytes(), 32);
+    assert_eq!(r.lru.total_bytes(), 2 * disk_unit());
     // If no candidate can be unlinked, the pass must still terminate.
     r.capacity_bytes = 1;
     tokio::time::timeout(Duration::from_secs(2), r.enforce_capacity())
         .await
         .unwrap();
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -902,7 +903,7 @@ async fn file_cleanup_runs_independently_of_gc_interval() {
     .unwrap();
     service.shutdown().await;
     assert_eq!(r.page_gc_metrics.scanned.get(), 0);
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -928,7 +929,7 @@ async fn file_cleanup_completes_a_full_pass_despite_batch_limits() {
     assert!(report.completed_scan);
     assert_eq!(report.removed, 1);
     assert!(!next.exists());
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -971,7 +972,7 @@ async fn orphan_cleanup_retries_with_tti_disabled_and_preserves_live_snapshots()
         std::fs::read(dir.join("access.meta")).unwrap(),
         b"existing checkpoint"
     );
-    assert_eq!(r.resident_bytes(), 16);
+    assert_eq!(r.logical_resident_bytes(), 16);
 }
 
 #[tokio::test]
@@ -1116,7 +1117,7 @@ fn orphan_cleanup_recovers_sigkill_at_checkpoint_boundaries() {
                 let dir = paged.dir_for(&id());
                 if stage == "last_page_unlink" {
                     assert!(!dir.exists());
-                    assert_eq!(r.resident_bytes(), 0);
+                    assert_eq!(r.logical_resident_bytes(), 0);
                     continue;
                 }
                 assert!(dir.join("0.page").exists());

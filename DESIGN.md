@@ -159,7 +159,9 @@ An opt-in native origin/cache engine now extends this path through HTTP(S),
 LOAD commits, resident byte reads and cold descriptor opens. It retains buffered
 sendfile/splice reads and probes the cache filesystem's Direct I/O alignment
 at initialization. Native downloads retain aligned tail padding in their receive
-allocation and on disk, while sidecars and indexing retain logical lengths.
+allocation and on disk, while sidecars and block metadata retain logical lengths.
+Data-file residency and eviction charge measured allocated disk bytes
+(`st_blocks * 512`), rebuilt from files at startup.
 This requires no body-to-alignment-buffer copy or truncate. TLS still uses
 buffered rustls. See
 [the experiment design and validation](docs/explanation/monoio-origin-io.md) for

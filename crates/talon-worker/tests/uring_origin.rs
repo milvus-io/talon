@@ -1,4 +1,26 @@
 //! Native ring acceptance tests. Run explicitly on an io_uring-capable host.
+fn allocated_data_bytes(root: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                allocated_data_bytes(&path)
+            } else if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("blk" | "page")
+            ) {
+                meta.blocks() * 512
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 use bytes::Bytes;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -330,7 +352,7 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
             let root = tempfile::tempdir().unwrap();
             let config = WorkerConfig {
                 block_size: 8,
-                capacity_bytes: 1024,
+                capacity_bytes: 1024 * 1024,
                 l1_capacity_bytes: 0,
                 l2_page_size_bytes: page_size,
                 backend: Some("s3".into()),
@@ -344,7 +366,7 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
                         &config,
                         Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                         backend.clone(),
-                        WorkerMetrics::new(1024),
+                        WorkerMetrics::new(config.capacity_bytes),
                         true,
                     )
                     .unwrap(),
@@ -507,7 +529,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
         let root = tempfile::tempdir().unwrap();
         let config = WorkerConfig {
             block_size: 8,
-            capacity_bytes: 1024,
+            capacity_bytes: 1024 * 1024,
             l1_capacity_bytes: l1_capacity,
             l1_page_size_bytes: 4,
             l2_page_size_bytes: page_size,
@@ -520,7 +542,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
                 &config,
                 Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                 backend,
-                WorkerMetrics::new(1024),
+                WorkerMetrics::new(config.capacity_bytes),
                 true,
             )
             .unwrap(),
@@ -534,7 +556,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
                     role: NodeRole::Worker,
                 },
                 "127.0.0.1:2".into(),
-                1024,
+                config.capacity_bytes,
                 Arc::new(BlockIndex::new()),
                 Arc::new(InFlightLoads::new()),
             )
@@ -620,7 +642,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
                 other => panic!("unexpected LOAD result: {other:?}"),
             }
         }
-        assert_eq!(worker.resident_bytes(), 16);
+        assert_eq!(worker.resident_bytes(), allocated_data_bytes(root.path()));
         assert_eq!(
             origin.requests.load(Ordering::SeqCst),
             3,
@@ -804,7 +826,7 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                         let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
                         assert_eq!(runtime.serve_cached(&request).await.unwrap(), expected);
                     }
-                    assert_eq!(runtime.resident_bytes(), 8192 + 12289);
+                    assert_eq!(runtime.resident_bytes(), allocated_data_bytes(root.path()));
                     fn check_files(dir: &std::path::Path, alignment: usize) -> usize {
                         let mut count = 0;
                         for entry in std::fs::read_dir(dir).unwrap() {
@@ -832,7 +854,10 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                     );
                     drop(runtime);
                     let recovered = open();
-                    assert_eq!(recovered.resident_bytes(), 8192 + 12289);
+                    assert_eq!(
+                        recovered.resident_bytes(),
+                        allocated_data_bytes(root.path())
+                    );
                     let count = origin.requests.load(Ordering::SeqCst);
                     let request = CachedRangeRequest {
                         object: ObjectId::new(Backend::S3, kind, "large-12289"),

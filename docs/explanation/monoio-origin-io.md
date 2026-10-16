@@ -91,10 +91,26 @@ pointer registry, extra executor or payload copy is involved.
 
 Native payload writes round their length up to the probed write alignment using
 the same backing allocation. Tail padding stays on disk: no truncate or buffered
-tail rewrite. Business `Bytes`, sidecars, the block index and existing capacity
-accounting retain logical lengths. L1 page fills use their known logical page
+tail rewrite. Business `Bytes`, sidecars and block metadata retain logical
+lengths. L1 page fills use their known logical page
 length; range serving uses the requested window. Valid source ranges remain the
 caller's responsibility; padding adds no source-EOF validation.
+
+Storage accounting measures each data file's `st_blocks * 512` after sync and
+before publication, independently of its logical or padded file length. The
+index and LRU charge these allocated bytes; `talon_worker_resident_bytes`,
+Worker status/heartbeat snapshots, foreground capacity enforcement and background
+high/low watermarks use this same cost. Replacements update the cost, failed
+unlinks retain it, and successful removal subtracts it. Startup scans rebuild
+allocation costs from the actual data files; sidecars do not persist these costs.
+Metric scrapes read in-memory counters without scanning or statting files.
+
+This is allocated space attributed to indexed data files, including direct-I/O
+padding and filesystem block rounding. It excludes sidecars, access checkpoints,
+directories, staging/orphan files and deleted files still held by open readers.
+It is not total filesystem usage. Capacity settings that previously fit many
+small logical pages may now fit fewer pages; reserve space outside the configured
+cache capacity for these excluded costs. L1 accounting remains payload bytes.
 
 Aligned full pages and the final short page can use direct writes. An interior
 slice cannot use following payload bytes as padding. External admissions without

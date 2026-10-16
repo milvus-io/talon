@@ -100,6 +100,7 @@ impl EvictionCycle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::runtime::disk_unit;
     use crate::{
         BlockIndex, CacheUnit, InFlightLoads, PagedBlockStore, WholeBlockStore, WorkerMetrics,
     };
@@ -119,10 +120,11 @@ mod tests {
     }
 
     fn runtime(root: &Path, paged: bool, capacity: u64) -> WorkerRuntime {
+        let capacity = capacity.div_ceil(16) * disk_unit();
         let store = WholeBlockStore::open(root.join("whole")).unwrap();
         let index = Arc::new(BlockIndex::new());
-        for meta in store.scan().unwrap() {
-            index.commit(meta);
+        for entry in store.scan_allocated().unwrap() {
+            index.commit_allocated(entry.meta, entry.allocated);
         }
         let r = WorkerRuntime::new(
             store,
@@ -176,7 +178,7 @@ mod tests {
     ) -> (Arc<WorkerRuntime>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
         let config = WorkerConfig {
             block_size: 16,
-            capacity_bytes: 160,
+            capacity_bytes: 10 * disk_unit(),
             l2_page_size_bytes: if paged { 16 } else { 0 },
             page_tti_hours: 0,
             backend: Some("s3".into()),
@@ -211,12 +213,12 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let (worker, config, namespaces) = filled_namespaces(root.path(), paged, 0.8).await;
             let resident = || namespaces.iter().map(|w| w.resident_bytes()).sum::<u64>();
-            assert_eq!(resident(), 144);
+            assert_eq!(resident(), 9 * disk_unit());
             let mut cycle = EvictionCycle::new(config.capacity_bytes, &config);
             cycle.tick(&worker).await;
             assert_eq!(
                 resident(),
-                128,
+                8 * disk_unit(),
                 "only one of the nine cache units must be evicted"
             );
             assert_eq!(
@@ -227,7 +229,7 @@ mod tests {
             cycle.tick(&worker).await;
             assert_eq!(
                 resident(),
-                128,
+                8 * disk_unit(),
                 "a completed cycle must leave other namespaces intact"
             );
         }
@@ -246,10 +248,10 @@ mod tests {
                 .collect();
             let mut cycle = EvictionCycle::new(config.capacity_bytes, &config);
             cycle.tick(&worker).await;
-            assert_eq!(resident(), 128);
+            assert_eq!(resident(), 8 * disk_unit());
             assert!(
                 cycle.active,
-                "pins prevent reaching the global low watermark of 112"
+                "pins prevent reaching the global low watermark of seven units"
             );
             assert_eq!(namespaces[8].resident_bytes(), 0);
             assert_eq!(
@@ -265,8 +267,8 @@ mod tests {
             cycle.tick(&worker).await;
             assert_eq!(
                 resident(),
-                112,
-                "resume below high=144 and reclaim only one more unit"
+                7 * disk_unit(),
+                "resume below the high watermark and reclaim only one more unit"
             );
             assert!(!cycle.active);
         }
@@ -289,18 +291,18 @@ mod tests {
                 async_eviction_low_watermark: 0.2,
                 ..Default::default()
             };
-            let mut cycle = EvictionCycle::new(160, &config);
+            let mut cycle = EvictionCycle::new(10 * disk_unit(), &config);
             for _ in 0..9 {
                 cycle.tick(&r).await;
                 assert_eq!(
                     r.resident_bytes(),
-                    144,
+                    9 * disk_unit(),
                     "one scan step only clears one reference bit"
                 );
             }
             for remaining in (2..9).rev() {
                 cycle.tick(&r).await;
-                assert_eq!(r.resident_bytes(), remaining * 16);
+                assert_eq!(r.resident_bytes(), remaining * disk_unit());
             }
             assert!(!cycle.active);
         }
@@ -327,13 +329,15 @@ mod tests {
             let worker = r.clone();
             let started = std::time::Instant::now();
             let task = tokio::spawn(async move {
-                EvictionCycle::new(48, &config).tick(&worker).await;
+                EvictionCycle::new(3 * disk_unit(), &config)
+                    .tick(&worker)
+                    .await;
             });
             tokio::time::sleep(Duration::from_millis(50)).await;
             assert!(!task.is_finished());
             assert_eq!(
                 r.resident_bytes(),
-                48,
+                3 * disk_unit(),
                 "no unlink while the shared disk slot is occupied"
             );
             drop(slot);
@@ -341,7 +345,7 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(r.resident_bytes(), 16);
+            assert_eq!(r.resident_bytes(), disk_unit());
             assert!(started.elapsed() >= Duration::from_millis(80));
         }
     }
@@ -365,7 +369,9 @@ mod tests {
             let r = Arc::new(r);
             let worker = r.clone();
             let task = tokio::spawn(async move {
-                EvictionCycle::new(32, &config).tick(&worker).await;
+                EvictionCycle::new(2 * disk_unit(), &config)
+                    .tick(&worker)
+                    .await;
             });
             tokio::time::timeout(Duration::from_secs(2), async {
                 while budget.available_io() != 0 {
@@ -382,10 +388,10 @@ mod tests {
             assert!(tokio::time::timeout(Duration::from_millis(20), budget.io())
                 .await
                 .is_err());
-            assert_eq!(r.resident_bytes(), 32);
+            assert_eq!(r.resident_bytes(), 2 * disk_unit());
             drop(gate);
             r.drain_page_mutations().await;
-            assert_eq!(r.resident_bytes(), 16);
+            assert_eq!(r.resident_bytes(), disk_unit());
             let _slot = tokio::time::timeout(Duration::from_secs(1), budget.io())
                 .await
                 .unwrap();
@@ -398,7 +404,7 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let r = runtime(root.path(), paged, 160);
             let mut cycle = EvictionCycle::new(
-                160,
+                10 * disk_unit(),
                 &WorkerConfig {
                     ownership_gc_enabled: false,
                     ..Default::default()
@@ -408,21 +414,21 @@ mod tests {
                 fill(&r, n, paged).await;
             }
             cycle.tick(&r).await;
-            assert_eq!(r.resident_bytes(), 128);
+            assert_eq!(r.resident_bytes(), 8 * disk_unit());
             fill(&r, 8, paged).await;
             assert_eq!(
                 r.resident_bytes(),
-                144,
+                9 * disk_unit(),
                 "admission below capacity must not wait for watermark reclamation"
             );
             cycle.tick(&r).await;
-            assert_eq!(r.resident_bytes(), 128);
-            assert_eq!(r.lru.total_bytes(), 128);
+            assert_eq!(r.resident_bytes(), 8 * disk_unit());
+            assert_eq!(r.lru.total_bytes(), 8 * disk_unit());
             assert!(!cycle.active);
             cycle.tick(&r).await;
             assert_eq!(
                 r.resident_bytes(),
-                128,
+                8 * disk_unit(),
                 "no repeated eviction at the low watermark"
             );
         }
@@ -443,15 +449,15 @@ mod tests {
                 async_eviction_low_watermark: 0.7,
                 ..Default::default()
             };
-            let mut cycle = EvictionCycle::new(160, &config);
+            let mut cycle = EvictionCycle::new(10 * disk_unit(), &config);
             tokio::time::timeout(Duration::from_secs(2), cycle.tick(&r))
                 .await
                 .unwrap();
-            assert_eq!(r.resident_bytes(), 128);
+            assert_eq!(r.resident_bytes(), 8 * disk_unit());
             assert!(cycle.active, "stay active between high=144 and low=112");
             drop(pins);
             cycle.tick(&r).await;
-            assert_eq!(r.resident_bytes(), 112);
+            assert_eq!(r.resident_bytes(), 7 * disk_unit());
             assert!(!cycle.active);
         }
     }
@@ -469,12 +475,12 @@ mod tests {
             async_eviction_low_watermark: 0.25,
             ..Default::default()
         };
-        let mut cycle = EvictionCycle::new(32, &config);
+        let mut cycle = EvictionCycle::new(2 * disk_unit(), &config);
         tokio::time::timeout(Duration::from_secs(2), cycle.tick(&r))
             .await
             .unwrap();
-        assert_eq!(r.resident_bytes(), 16);
-        assert_eq!(r.lru.total_bytes(), 16);
+        assert_eq!(r.resident_bytes(), disk_unit());
+        assert_eq!(r.lru.total_bytes(), disk_unit());
         assert!(cycle.active);
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, [1; 16]).unwrap();
@@ -501,7 +507,7 @@ mod tests {
         };
         let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
         tokio::time::timeout(Duration::from_secs(3), async {
-            while r.resident_bytes() > 32 {
+            while r.resident_bytes() > 2 * disk_unit() {
                 tokio::task::yield_now().await;
             }
         })
@@ -527,7 +533,7 @@ mod tests {
         };
         let service = crate::runtime::WorkerBackground::start(r.clone(), &config);
         tokio::time::timeout(Duration::from_secs(2), async {
-            while r.resident_bytes() > 128 {
+            while r.resident_bytes() > 8 * disk_unit() {
                 tokio::task::yield_now().await;
             }
         })
@@ -540,12 +546,16 @@ mod tests {
         tokio::time::advance(Duration::from_secs(59)).await;
         tokio::time::resume();
         tokio::task::yield_now().await;
-        assert_eq!(r.resident_bytes(), 144, "configured interval uses minutes");
+        assert_eq!(
+            r.resident_bytes(),
+            9 * disk_unit(),
+            "configured interval uses minutes"
+        );
         tokio::time::pause();
         tokio::time::advance(Duration::from_secs(2)).await;
         tokio::time::resume();
         tokio::time::timeout(Duration::from_secs(2), async {
-            while r.resident_bytes() > 128 {
+            while r.resident_bytes() > 8 * disk_unit() {
                 tokio::task::yield_now().await;
             }
         })
@@ -558,7 +568,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(61)).await;
         tokio::time::resume();
         tokio::task::yield_now().await;
-        assert_eq!(r.resident_bytes(), 144);
+        assert_eq!(r.resident_bytes(), 9 * disk_unit());
         let disabled = crate::runtime::WorkerBackground::start(
             r.clone(),
             &WorkerConfig {
@@ -567,12 +577,12 @@ mod tests {
             },
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
-        assert_eq!(r.resident_bytes(), 144);
+        assert_eq!(r.resident_bytes(), 9 * disk_unit());
         disabled.shutdown().await;
         // The foreground fallback still enforces the hard cap.
         fill(&r, 11, false).await;
         fill(&r, 12, false).await;
-        assert_eq!(r.resident_bytes(), 160);
+        assert_eq!(r.resident_bytes(), 10 * disk_unit());
     }
 
     #[tokio::test]
@@ -601,14 +611,18 @@ mod tests {
             let shutdown = tokio::spawn(service.shutdown());
             tokio::time::sleep(Duration::from_millis(20)).await;
             assert!(!shutdown.is_finished(), "shutdown retains owned disk work");
-            assert_eq!(r.resident_bytes(), 32, "blocked unlink remains accounted");
+            assert_eq!(
+                r.resident_bytes(),
+                2 * disk_unit(),
+                "blocked unlink remains accounted"
+            );
             drop(gate);
             tokio::time::timeout(Duration::from_secs(2), shutdown)
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(r.resident_bytes(), 16);
-            assert_eq!(r.lru.total_bytes(), 16);
+            assert_eq!(r.resident_bytes(), disk_unit());
+            assert_eq!(r.lru.total_bytes(), disk_unit());
         }
     }
 
@@ -620,12 +634,14 @@ mod tests {
             for n in 0..3 {
                 fill(&r, n, paged).await;
             }
-            let pending = r.lru.candidates_to_fit(32, &Default::default());
+            let pending = r
+                .lru
+                .candidates_to_fit(2 * disk_unit(), &Default::default());
             assert_eq!(pending.len(), 1);
             // Independent GC has already brought usage to the background target.
             r.unlink_units(r.lru.block_candidates(&block(2)), 2).await;
-            r.unlink_units_to_target(pending, 1, 32).await;
-            assert_eq!(r.resident_bytes(), 32);
+            r.unlink_units_to_target(pending, 1, 2 * disk_unit()).await;
+            assert_eq!(r.resident_bytes(), 2 * disk_unit());
         }
     }
 }

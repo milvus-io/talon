@@ -341,8 +341,8 @@ mod tests {
     fn runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
         let store = WholeBlockStore::open(root.join("whole")).unwrap();
         let index = Arc::new(BlockIndex::new());
-        for meta in store.scan().unwrap() {
-            index.commit(meta);
+        for entry in store.scan_allocated().unwrap() {
+            index.commit_allocated(entry.meta, entry.allocated);
         }
         let r = WorkerRuntime::new(
             store,
@@ -927,7 +927,7 @@ mod tests {
             .unwrap();
             assert!(r.index.is_empty());
             assert_eq!(r.lru.total_bytes(), 0);
-            assert_eq!(r.resident_bytes(), 0);
+            assert_eq!(r.logical_resident_bytes(), 0);
             assert_eq!(r.l1.resident_bytes(), 0);
             assert!(r
                 .metrics
@@ -965,7 +965,7 @@ mod tests {
         gc.run_round(&r).await;
         assert!(r.index.is_empty());
         assert!(state.acquire(PageIndex(0)).is_none());
-        assert_eq!(r.resident_bytes(), 0);
+        assert_eq!(r.logical_resident_bytes(), 0);
     }
 
     #[tokio::test]
@@ -1033,7 +1033,7 @@ mod tests {
         std::fs::write(&dir, b"not a directory").unwrap();
         let mut gc = fixture.gc(&r);
         gc.run_round(&r).await;
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
         let state = r.page_lifecycle.block(&id);
         for page in 0..2 {
             assert!(state.acquire(PageIndex(page)).is_some());
@@ -1041,11 +1041,11 @@ mod tests {
         std::fs::remove_file(&dir).unwrap();
         std::fs::rename(&saved, &dir).unwrap();
         r.gc_once().await;
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
         *fixture.members.lock().unwrap() = None;
         fixture.publish(&r);
         gc.run_round(&r).await;
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
         *fixture.members.lock().unwrap() = Some(vec!["a", "b"]);
         fixture.publish(&r);
         gc.run_round(&r).await;
@@ -1133,7 +1133,7 @@ mod tests {
         fill(&r, &id, false).await;
         let mut gc = OwnershipGc::new(&fixture.config);
         gc.run_round(&r).await;
-        assert_eq!(r.resident_bytes(), 32, "startup has no membership");
+        assert_eq!(r.logical_resident_bytes(), 32, "startup has no membership");
         fixture.publish(&r);
         let snapshot = r.membership_snapshot().unwrap();
         *r.membership.lock().unwrap() = Some(Arc::new(MembershipSnapshot {
@@ -1142,7 +1142,7 @@ mod tests {
         }));
         gc.run_round(&r).await;
         assert_eq!(
-            r.resident_bytes(),
+            r.logical_resident_bytes(),
             32,
             "stopped publisher cannot extend validity"
         );
@@ -1162,11 +1162,11 @@ mod tests {
                 "invalid publication revokes old view"
             );
             gc.run_round(&r).await;
-            assert_eq!(r.resident_bytes(), 32);
+            assert_eq!(r.logical_resident_bytes(), 32);
         }
         fixture.publish(&r);
         gc.run_round(&r).await;
-        assert_eq!(r.resident_bytes(), 0);
+        assert_eq!(r.logical_resident_bytes(), 0);
     }
 
     #[tokio::test]
@@ -1245,7 +1245,7 @@ mod tests {
             })
             .await
             .unwrap();
-            assert_eq!(r.resident_bytes(), 32);
+            assert_eq!(r.logical_resident_bytes(), 32);
             assert_eq!(r.index.page_count(), 2);
             assert!(
                 state.acquire(PageIndex(0)).is_some(),
