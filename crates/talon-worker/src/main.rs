@@ -1488,6 +1488,8 @@ mod tests {
             )
             .await
             .unwrap();
+        let allocated_before_refresh = worker.resident_bytes();
+        assert!(allocated_before_refresh > 0);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let coordinator = listener.local_addr().unwrap().to_string();
         let queries = Arc::new(AtomicUsize::new(0));
@@ -1540,7 +1542,11 @@ mod tests {
         })
         .await
         .unwrap();
-        assert_eq!(worker.resident_bytes(), 8, "refresh runs without GC");
+        assert_eq!(
+            worker.resident_bytes(),
+            allocated_before_refresh,
+            "refresh runs without GC"
+        );
         let background = talon_worker::runtime::WorkerBackground::start(
             worker.clone(),
             &WorkerConfig {

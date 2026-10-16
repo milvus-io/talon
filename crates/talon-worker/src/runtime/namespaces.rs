@@ -66,7 +66,7 @@ impl NamespaceRuntimes {
         }
         let store = WholeBlockStore::open_with_fd_cache(&root, self.whole_fds.clone())?
             .with_root_lock(self.root_lock.clone())
-            .with_uring(self.uring);
+            .with_uring(self.uring)?;
         let index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
             checked_dir(&root.join("paged"))?;
@@ -77,18 +77,14 @@ impl NamespaceRuntimes {
                     self.page_fds.clone(),
                 )?
                 .with_root_lock(self.root_lock.clone())
-                .with_uring(self.uring),
+                .with_uring(self.uring)?,
             )
         } else {
             None
         };
-        for meta in store.scan()? {
-            index.commit(meta);
-        }
+        store.restore_index(&index)?;
         if let Some(paged) = &paged {
-            for meta in paged.scan()? {
-                index.commit(meta);
-            }
+            paged.restore_index(&index)?;
         }
         let mut worker = WorkerRuntime::new_with_l1(
             store,
@@ -437,7 +433,7 @@ mod tests {
     fn config() -> WorkerConfig {
         WorkerConfig {
             block_size: 16,
-            capacity_bytes: 1024,
+            capacity_bytes: 1024 * disk_unit(),
             l1_capacity_bytes: 0,
             l2_page_size_bytes: 4,
             backend: Some("s3".into()),
@@ -473,6 +469,106 @@ mod tests {
             .serve_versioned(&request(), &Version::new("v1"), 64)
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn allocated_residency_survives_replacement_recovery_and_namespace_aggregation() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config();
+        let body = Bytes::from_static(b"short-tail-13");
+        let id = block(16);
+        let root = open(dir.path(), &cfg, Arc::default());
+        let whole = root
+            .for_namespace(&NamespaceId::named("whole"))
+            .await
+            .unwrap();
+        let paged = root
+            .for_namespace(&NamespaceId::named("paged"))
+            .await
+            .unwrap();
+        let mut expected_whole = 0;
+        let mut expected_paged = 0;
+        for _ in 0..2 {
+            whole.commit_cached_block(&id, body.clone()).await.unwrap();
+            let handle = whole.store.get_block(&id).await.unwrap();
+            expected_whole = std::fs::File::from(handle.fd.try_clone().unwrap())
+                .metadata()
+                .unwrap()
+                .blocks()
+                * 512;
+            expected_paged = 0;
+            for (page, chunk) in body.chunks(4).enumerate() {
+                paged
+                    .commit_fetched_page(
+                        &id,
+                        PageIndex(page as u32),
+                        body.len() as u64,
+                        Bytes::copy_from_slice(chunk),
+                    )
+                    .await
+                    .unwrap();
+                let path = paged
+                    .paged
+                    .as_ref()
+                    .unwrap()
+                    .dir_for(&id)
+                    .join(format!("{page}.page"));
+                expected_paged += std::fs::metadata(path).unwrap().blocks() * 512;
+            }
+            assert_eq!(whole.resident_bytes(), expected_whole);
+            assert_eq!(paged.resident_bytes(), expected_paged);
+            assert_eq!(whole.lru.total_bytes(), expected_whole);
+            assert_eq!(paged.lru.total_bytes(), expected_paged);
+            assert_eq!(whole.index.get(&id).unwrap().len, body.len() as u64);
+            assert_eq!(paged.index.get(&id).unwrap().len, body.len() as u64);
+        }
+        let obs = crate::WorkerObservability::new(
+            "test".into(),
+            talon_core::NodeInfo {
+                id: talon_core::NodeId::new("worker"),
+                address: "127.0.0.1:0".into(),
+                role: talon_core::NodeRole::Worker,
+            },
+            "127.0.0.1:0".into(),
+            cfg.capacity_bytes,
+            root.index.clone(),
+            root.inflight.clone(),
+        )
+        .unwrap();
+        obs.attach_namespace_runtime(&root);
+        let total = expected_whole + expected_paged;
+        assert_eq!(obs.status().metrics.resident_bytes, total);
+        assert!(obs
+            .metrics()
+            .render()
+            .contains(&format!("talon_worker_resident_bytes {total}\n")));
+        drop((obs, whole, paged, root));
+        let root = open(dir.path(), &cfg, Arc::default());
+        let whole = root
+            .for_namespace(&NamespaceId::named("whole"))
+            .await
+            .unwrap();
+        let paged = root
+            .for_namespace(&NamespaceId::named("paged"))
+            .await
+            .unwrap();
+        assert_eq!(whole.resident_bytes(), expected_whole);
+        assert_eq!(paged.resident_bytes(), expected_paged);
+        assert_eq!(whole.lru.total_bytes(), expected_whole);
+        assert_eq!(paged.lru.total_bytes(), expected_paged);
+        let tail = paged.paged.as_ref().unwrap().dir_for(&id).join("3.page");
+        let tail_bytes = std::fs::metadata(tail).unwrap().blocks() * 512;
+        whole.unlink_units(whole.lru.block_candidates(&id), 2).await;
+        paged.unlink_units(paged.lru.block_candidates(&id), 2).await;
+        assert!(
+            tail_bytes > 1,
+            "short tail still allocates a filesystem block"
+        );
+        assert_eq!(whole.resident_bytes(), 0);
+        assert_eq!(paged.resident_bytes(), 0);
+        assert_eq!(whole.lru.total_bytes(), 0);
+        assert_eq!(paged.lru.total_bytes(), 0);
     }
 
     #[tokio::test]
@@ -756,7 +852,7 @@ mod tests {
         for paged in [false, true] {
             let dir = tempfile::tempdir().unwrap();
             let mut cfg = config();
-            cfg.capacity_bytes = 16;
+            cfg.capacity_bytes = 4 * disk_unit();
             if !paged {
                 cfg.l2_page_size_bytes = 0;
             }
@@ -941,15 +1037,15 @@ mod tests {
             worker.page_clock.set(10_000);
             read(worker).await;
         }
-        assert_eq!(short.resident_bytes(), 4);
-        assert_eq!(long.resident_bytes(), 8);
+        assert_eq!(short.logical_resident_bytes(), 4);
+        assert_eq!(long.logical_resident_bytes(), 8);
         for worker in [&short, &long] {
             worker.page_clock.set(10_000 + 3_600_001);
         }
         assert_eq!(short.gc_once().await.bytes, 4);
         assert_eq!(long.gc_once().await.bytes, 0);
         assert_eq!(short.block_count(), 0);
-        assert_eq!(long.resident_bytes(), 8);
+        assert_eq!(long.logical_resident_bytes(), 8);
         assert!(long.load_block(&block(32), 32).await.is_err());
         long.load_block(&block(16), 16).await.unwrap();
     }

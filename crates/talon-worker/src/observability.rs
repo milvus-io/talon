@@ -247,7 +247,7 @@ impl WorkerMetrics {
         );
         let resident_bytes = registry.gauge(
             "talon_worker_resident_bytes",
-            "Bytes currently resident in the worker cache.",
+            "Allocated disk bytes of indexed cache data files (st_blocks * 512); excludes metadata and temporary files.",
             BTreeMap::new(),
         );
         let l1_pages = registry.gauge(

@@ -146,7 +146,6 @@ async fn run(args: &Args) -> anyhow::Result<()> {
             "unexpected hit or duplicate fetch"
         );
         ensure!(index.page_count() == u64::from(end), "missing cached page");
-        ensure!(worker.resident_bytes() == u64::from(end) * u64::from(args.page_bytes));
         println!(
             "{}",
             serde_json::json!({
@@ -159,17 +158,16 @@ async fn run(args: &Args) -> anyhow::Result<()> {
                 "p50_ms": latencies[latencies.len() / 2] * 1000.0,
                 "p99_ms": latencies[((latencies.len() * 99) / 100).min(latencies.len() - 1)] * 1000.0,
                 "backend_fetches": origin.fetches.load(Ordering::Relaxed),
-                "resident_pages": index.page_count(), "errors": 0,
+                "resident_pages": index.page_count(),
+                "allocated_data_bytes": worker.resident_bytes(), "errors": 0,
             })
         );
     }
     // Validate disk state independently of the live index, outside timing.
     let recovered = BlockIndex::new();
-    for meta in PagedBlockStore::open(&paged_root, args.page_bytes)?.scan()? {
-        recovered.commit(meta);
-    }
+    PagedBlockStore::open(&paged_root, args.page_bytes)?.restore_index(&recovered)?;
     ensure!(recovered.page_count() == u64::from(args.pages));
-    ensure!(recovered.resident_bytes() == object_bytes);
+    ensure!(recovered.resident_bytes() == worker.resident_bytes());
     drop(worker);
     root.close()?;
     println!(

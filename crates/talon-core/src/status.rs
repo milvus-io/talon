@@ -72,7 +72,7 @@ pub struct NodeMetricsSnapshot {
     pub block_count: u64,
     /// Materialized pages currently indexed by a worker.
     pub page_count: u64,
-    /// Bytes currently resident on a worker.
+    /// Allocated disk bytes of indexed worker cache data files; excludes sidecars.
     pub resident_bytes: u64,
     /// Configured worker cache capacity in bytes.
     pub capacity_bytes: u64,

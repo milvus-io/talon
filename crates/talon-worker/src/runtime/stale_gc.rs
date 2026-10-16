@@ -236,8 +236,8 @@ mod tests {
     fn runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
         let store = WholeBlockStore::open(root.join("whole")).unwrap();
         let index = Arc::new(BlockIndex::new());
-        for meta in store.scan().unwrap() {
-            index.commit(meta);
+        for entry in store.scan_allocated().unwrap() {
+            index.commit_allocated(entry.meta, entry.allocated);
         }
         let r = WorkerRuntime::new(
             store,
@@ -304,12 +304,12 @@ mod tests {
                 1,
                 "one HEAD per object per batch"
             );
-            assert_eq!(r.resident_bytes(), 0);
+            assert_eq!(r.logical_resident_bytes(), 0);
             assert_eq!(r.lru.total_bytes(), 0);
             assert!(r.index.get(&block(0)).is_none());
             assert!(r.index.get(&block(1)).is_none());
             let recovered = runtime(root.path(), paged, origin);
-            assert_eq!(recovered.resident_bytes(), 0);
+            assert_eq!(recovered.logical_resident_bytes(), 0);
         }
     }
 
@@ -332,14 +332,14 @@ mod tests {
             }
             assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
             assert_eq!(
-                r.resident_bytes(),
+                r.logical_resident_bytes(),
                 64,
                 "a version change alone is not deletion"
             );
             for _ in 0..8 {
                 gc.tick_at(&r, now + DAY_MS).await;
             }
-            assert_eq!(r.resident_bytes(), 0);
+            assert_eq!(r.logical_resident_bytes(), 0);
         }
     }
 
@@ -354,12 +354,12 @@ mod tests {
             let mut gc = StaleGc::default();
             let now = cold_now();
             gc.tick_at(&r, now).await;
-            assert_eq!(r.resident_bytes(), 32);
+            assert_eq!(r.logical_resident_bytes(), 32);
             origin.mode.store(0, Ordering::Relaxed);
             for _ in 0..2 {
                 gc.tick_at(&r, now).await;
             }
-            assert_eq!(r.resident_bytes(), 0);
+            assert_eq!(r.logical_resident_bytes(), 0);
             assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         }
     }
@@ -396,7 +396,7 @@ mod tests {
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
         assert_eq!(gc.pending.len(), 10);
         assert_eq!(delay, Some(Duration::ZERO));
-        assert_eq!(r.resident_bytes(), 12 * 32);
+        assert_eq!(r.logical_resident_bytes(), 12 * 32);
         let slow = StaleGc::new(&WorkerConfig {
             stale_gc_head_max_per_sec: 1,
             ..Default::default()
@@ -425,7 +425,7 @@ mod tests {
         tokio::time::advance(Duration::from_secs(6)).await;
         task.await.unwrap();
         tokio::time::resume();
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
     }
 
     #[tokio::test]
@@ -455,7 +455,7 @@ mod tests {
             }
             origin.release.notify_one();
             task.await.unwrap();
-            assert_eq!(r.resident_bytes(), 32);
+            assert_eq!(r.logical_resident_bytes(), 32);
         }
     }
 
@@ -473,8 +473,8 @@ mod tests {
         std::fs::write(&dir, b"not a directory").unwrap();
         let mut gc = StaleGc::default();
         gc.tick_at(&r, cold_now()).await;
-        assert_eq!(r.resident_bytes(), 32);
-        assert_eq!(r.lru.total_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
+        assert_eq!(r.lru.total_bytes(), r.resident_bytes());
         let state = r.page_lifecycle.block(&block(0));
         for page in 0..2 {
             assert!(
@@ -487,7 +487,7 @@ mod tests {
         origin.mode.store(1, Ordering::Relaxed);
         r.gc_once().await;
         assert_eq!(
-            r.resident_bytes(),
+            r.logical_resident_bytes(),
             32,
             "TTI GC cannot retry an old NotFound"
         );
@@ -495,7 +495,7 @@ mod tests {
             gc.tick_at(&r, cold_now()).await;
         }
         assert_eq!(origin.calls.load(Ordering::Relaxed), 2);
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
     }
 
     #[tokio::test]
@@ -518,10 +518,10 @@ mod tests {
             let now = cold_now();
             gc.tick_at(&r, now).await;
             assert_eq!(origin.calls.load(Ordering::Relaxed), 0);
-            assert_eq!(r.resident_bytes(), 64);
+            assert_eq!(r.logical_resident_bytes(), 64);
             gc.tick_at(&r, now).await;
             assert_eq!(
-                r.resident_bytes(),
+                r.logical_resident_bytes(),
                 32,
                 "one candidate reclaims a complete block"
             );
@@ -529,7 +529,7 @@ mod tests {
             for _ in 0..8 {
                 gc.tick_at(&r, now).await;
             }
-            assert_eq!(r.resident_bytes(), 0);
+            assert_eq!(r.logical_resident_bytes(), 0);
         }
     }
     #[tokio::test]
@@ -561,7 +561,7 @@ mod tests {
         );
         drop(gate);
         task.await.unwrap();
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
     }
 
     #[tokio::test]
@@ -581,7 +581,7 @@ mod tests {
         });
         gc.tick_at(&r, cold_now()).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), MAX_HEADS);
-        assert_eq!(r.resident_bytes(), 40 * 32);
+        assert_eq!(r.logical_resident_bytes(), 40 * 32);
         gc.tick_at(&r, cold_now()).await;
         assert_eq!(
             origin.calls.load(Ordering::Relaxed),
@@ -612,7 +612,7 @@ mod tests {
         assert_eq!(origin.calls.load(Ordering::Relaxed), MAX_HEADS);
         gc.tick_at(&r, now + 1).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 33);
-        assert_eq!(r.resident_bytes(), 34 * 32);
+        assert_eq!(r.logical_resident_bytes(), 34 * 32);
     }
     #[tokio::test]
     async fn stale_gc_round_drains_batches_without_rescanning_or_chasing_new_entries() {
@@ -647,7 +647,7 @@ mod tests {
                 .unwrap();
             assert_eq!(origin.calls.load(Ordering::Relaxed), 40,
                 "drain the scan/HEAD batches exactly once, retaining the round's original upper bound");
-            assert_eq!(r.resident_bytes(), 41 * 32);
+            assert_eq!(r.logical_resident_bytes(), 41 * 32);
         }
     }
 
@@ -710,7 +710,7 @@ mod tests {
         let now = cold_now();
         gc.tick_at(&r, now).await;
         assert_eq!(origin.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(r.resident_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
         assert!(
             state.acquire(PageIndex(0)).is_some(),
             "page 0's claim must roll back if page 1 is busy"
@@ -724,7 +724,7 @@ mod tests {
             .exists());
         drop(reader);
         gc.tick_at(&r, now).await;
-        assert_eq!(r.resident_bytes(), 0);
+        assert_eq!(r.logical_resident_bytes(), 0);
         assert!(state.acquire(PageIndex(0)).is_none());
         assert!(!r.paged.as_ref().unwrap().dir_for(&block(0)).exists());
     }
@@ -750,8 +750,8 @@ mod tests {
             .unwrap();
         origin.release.notify_one();
         task.await.unwrap();
-        assert_eq!(r.resident_bytes(), 32);
-        assert_eq!(r.lru.total_bytes(), 32);
+        assert_eq!(r.logical_resident_bytes(), 32);
+        assert_eq!(r.lru.total_bytes(), r.resident_bytes());
     }
 
     #[tokio::test]
@@ -785,13 +785,13 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert_eq!(
-            r.resident_bytes(),
+            r.logical_resident_bytes(),
             32,
             "shared I/O budget holds back the entire block"
         );
         drop(slot);
         r.drain_page_mutations().await;
-        assert_eq!(r.resident_bytes(), 0);
+        assert_eq!(r.logical_resident_bytes(), 0);
         assert_eq!(r.lru.total_bytes(), 0);
         assert!(!r.paged.as_ref().unwrap().dir_for(&block(0)).exists());
     }

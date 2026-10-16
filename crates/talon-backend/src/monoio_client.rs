@@ -3,11 +3,12 @@
 //! bodies and file uploads are unsupported and use the HttpClient default errors.
 use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 use async_trait::async_trait;
-use bytes::BytesMut;
-use monoio::io::{sink::SinkExt, stream::Stream, AsyncReadRent, AsyncWriteRent, Split};
+use monoio::io::sink::SinkExt;
+mod body;
+use body::OriginIo;
 use monoio_http::{
-    common::body::{Body, FixedBody, HttpBody},
-    h1::codec::ClientCodec,
+    common::body::{FixedBody, HttpBody},
+    h1::codec::encoder::GenericEncoder,
 };
 use std::{
     cell::RefCell,
@@ -16,8 +17,8 @@ use std::{
 };
 
 enum Connection {
-    Plain(ClientCodec<monoio::net::TcpStream>),
-    Tls(ClientCodec<monoio_rustls::ClientTlsStream<monoio::net::TcpStream>>),
+    Plain(monoio::net::TcpStream),
+    Tls(Box<monoio_rustls::ClientTlsStream<monoio::net::TcpStream>>),
 }
 struct Idle {
     owner: Weak<rustls::ClientConfig>,
@@ -80,6 +81,10 @@ impl MonoioClient {
             .to_owned();
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
         let tls = self.tls.clone();
+        let download = talon_uring::Download::current();
+        if let Some(download) = &download {
+            download.reset();
+        }
         let tokio = tokio::runtime::Handle::current();
         talon_uring::spawn_cancellable(async move {
             let operation = async {
@@ -142,17 +147,21 @@ impl MonoioClient {
                                 .map_err(|_| {
                                     "origin TLS handshake/certificate verification failed"
                                 })?;
-                            Ok::<_, &str>(Connection::Tls(ClientCodec::new(stream)))
+                            Ok::<_, &str>(Connection::Tls(Box::new(stream)))
                         } else {
-                            Ok(Connection::Plain(ClientCodec::new(stream)))
+                            Ok(Connection::Plain(stream))
                         }
                     })
                     .await
                     .map_err(|_| "origin connect timed out")??
                 };
                 let (response, reusable) = match &mut connection {
-                    Connection::Plain(codec) => exchange(codec, uri, request).await?,
-                    Connection::Tls(codec) => exchange(codec, uri, request).await?,
+                    Connection::Plain(codec) => {
+                        exchange(codec, uri, request, download.as_ref()).await?
+                    }
+                    Connection::Tls(codec) => {
+                        exchange(codec.as_mut(), uri, request, download.as_ref()).await?
+                    }
                 };
                 if reusable {
                     IDLE.with(|pool| {
@@ -178,11 +187,21 @@ impl MonoioClient {
     }
 }
 
-async fn exchange<IO: AsyncReadRent + AsyncWriteRent + Split>(
-    codec: &mut ClientCodec<IO>,
+async fn exchange<IO: OriginIo>(
+    io: &mut IO,
     uri: http::Uri,
     request: HttpRequest,
+    download: Option<&talon_uring::Download>,
 ) -> Result<(HttpResponse, bool), String> {
+    let range_bound = request.headers.iter().find_map(|(name, value)| {
+        if !name.eq_ignore_ascii_case("range") && !name.eq_ignore_ascii_case("x-ms-range") {
+            return None;
+        }
+        let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
+        let start: usize = start.parse().ok()?;
+        let end: usize = end.parse().ok()?;
+        end.checked_sub(start)?.checked_add(1)
+    });
     let method = match request.method {
         Method::Get => http::Method::GET,
         Method::Head => http::Method::HEAD,
@@ -215,29 +234,23 @@ async fn exchange<IO: AsyncReadRent + AsyncWriteRent + Split>(
     let request = builder
         .body(HttpBody::fixed_body(Some(request.body)))
         .map_err(|_| "invalid origin request")?;
-    codec
+    GenericEncoder::new(&mut *io)
         .send_and_flush(request)
         .await
         .map_err(|_| "origin HTTP write failed")?;
     // Informational responses carry no payload. Bound the number of interim heads.
     let mut response = None;
     for _ in 0..16 {
-        let next = codec
-            .next()
-            .await
-            .ok_or("origin closed before response")?
-            .map_err(|_| "invalid origin HTTP response")?;
-        if !next.status().is_informational() {
+        let next = body::head(io).await?;
+        if !next.status.is_informational() {
             response = Some(next);
             break;
         }
-        if next.status() == http::StatusCode::SWITCHING_PROTOCOLS {
+        if next.status == http::StatusCode::SWITCHING_PROTOCOLS {
             return Err("origin protocol upgrade is unsupported".into());
         }
     }
-    let (parts, decoder) = response
-        .ok_or("too many origin informational responses")?
-        .into_parts();
+    let parts = response.ok_or("too many origin informational responses")?;
     let no_body = head
         || parts.status == http::StatusCode::NO_CONTENT
         || parts.status == http::StatusCode::NOT_MODIFIED;
@@ -260,21 +273,20 @@ async fn exchange<IO: AsyncReadRent + AsyncWriteRent + Split>(
     {
         return Err("origin response requires Content-Length or chunked framing".into());
     }
-    let mut chunks = Vec::new();
-    if !no_body {
-        let mut body = decoder.with_io(&mut *codec);
-        while let Some(chunk) = body.next_data().await {
-            chunks.push(chunk.map_err(|_| "origin HTTP body truncated or invalid")?);
-        }
-    }
-    let body = if chunks.len() == 1 {
-        chunks.pop().unwrap()
+    let body = if no_body {
+        bytes::Bytes::new()
     } else {
-        let mut joined = BytesMut::new();
-        for chunk in chunks {
-            joined.extend_from_slice(&chunk);
-        }
-        joined.freeze()
+        body::payload(
+            io,
+            &parts.headers,
+            if parts.status.is_success() {
+                range_bound
+            } else {
+                None
+            },
+            download,
+        )
+        .await?
     };
     // HEAD has different body semantics from the generic native decoder; use
     // a fresh connection next time. Errors/cancellation always drop the codec.

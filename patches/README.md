@@ -77,3 +77,19 @@ The same preparation script verifies and patches the pinned monoio-http archive
 into `.patched-deps/monoio-http`. Offline builds can additionally pass
 `--monoio-http-archive /path/to/monoio-http-0.3.12.crate`.
 Remove this patch when an upstream release drops or updates the unused dependency.
+
+## Monoio rustls header consumption
+
+The native origin transport also patches monoio-rustls 0.4.0. The additional
+`read_until_delimiter` method consumes only framing bytes from rustls's plaintext
+reader, leaving the body available for a read into Talon's final aligned buffer.
+It retains the original stream and its TLS/network buffers; no connection state
+is extracted or discarded. EOF and framing limits return errors. This does not
+remove rustls's plaintext-to-application copy and does not enable kTLS.
+
+The same preparation script verifies the release checksum and applies
+`patches/monoio-rustls-0.4.0.patch`. The generated directory is
+`.patched-deps/monoio-rustls`; upstream license files are preserved. Offline
+preparation accepts `--rustls-archive /path/to/monoio-rustls-0.4.0.crate` alongside
+`--archive` for Monoio. Remove the extension when upstream provides an equivalent
+bounded delimiter read that does not prefetch plaintext body into another buffer.

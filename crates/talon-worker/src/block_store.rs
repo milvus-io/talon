@@ -25,7 +25,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,16 +81,123 @@ where
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
     uring: bool,
+    direct_alignment: Option<talon_uring::DirectIoAlignment>,
     root: PathBuf,
     fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
 impl WholeBlockStore {
-    pub fn with_uring(mut self, enabled: bool) -> Self {
+    /// Select native I/O and probe this cache directory before accepting writes.
+    pub fn with_uring(mut self, enabled: bool) -> std::io::Result<Self> {
+        self.direct_alignment = enabled
+            .then(|| talon_uring::DirectIoAlignment::probe(&self.root))
+            .transpose()?;
         self.uring = enabled;
-        self
+        if let Some(alignment) = self.direct_alignment {
+            tracing::info!(root = %self.root.display(), memory_alignment = alignment.memory(), write_alignment = alignment.offset(), "cache direct I/O alignment");
+        }
+        Ok(self)
     }
+    pub(crate) fn direct_alignment(&self) -> Option<talon_uring::DirectIoAlignment> {
+        self.direct_alignment
+    }
+    pub(crate) async fn put_payload(
+        &self,
+        id: &BlockId,
+        value: talon_uring::Payload,
+    ) -> Result<u64> {
+        let path = self.path_for(id);
+        let meta_path = self.meta_path_for(id);
+        let meta = BlockMeta {
+            id: id.clone(),
+            form: BlockForm::Whole,
+            len: value.len() as u64,
+        };
+        if self.uring {
+            talon_uring::require_ring()?;
+            let alignment = self.direct_alignment.expect("native store alignment");
+            let root_lock = self.root_lock.clone();
+            let fds = self.fd_cache.clone();
+            let encoded = serde_json::to_vec(&meta)
+                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
+            return talon_uring::spawn_local(async move {
+                let _root_lock = root_lock;
+                let allocated = talon_uring::atomic_write_payload(&path, value, alignment).await?;
+                fds.invalidate(&path);
+                // Match the existing whole-block commit's best-effort sidecar.
+                if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {
+                    tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
+                }
+                Ok(allocated)
+            }).await.map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
+        }
+        let value = value.into_bytes();
+        // The write + fsync of a whole block is blocking disk I/O; keep it off
+        // the reactor thread (issue #115).
+        let commit_path = path.clone();
+        let root_lock = self.root_lock.clone();
+        let allocated = spawn_blocking_io(move || {
+            let _root_lock = root_lock;
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let pid = std::process::id();
+            // Write to a per-writer-unique temp file then rename, so a present
+            // `.blk` is always complete (crash-atomic commit) AND two concurrent
+            // writers of the same block never truncate each other's staging file
+            // (issue #113). Both writers stage identical content; whichever
+            // renames last wins with a complete file, and the loser's rename is
+            // a harmless overwrite of the same bytes.
+            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = path.with_extension(format!("blk.tmp.{pid}.{seq}"));
+            let allocated = {
+                let mut f = std::fs::File::create(&tmp)?;
+                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
+                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
+                f.metadata()?.blocks() * 512
+            };
+            // Rename our own unique temp into place. If a concurrent writer
+            // already renamed theirs, this atomically replaces it with identical
+            // bytes.
+            if let Err(e) = talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path)) {
+                // Best-effort cleanup of our staging file on failure so a failed
+                // commit never leaks a `.tmp`.
+                let _ = std::fs::remove_file(&tmp);
+                return Err(e.into());
+            }
+            // Write the sidecar (id + form + len) so the index can be rebuilt on
+            // startup (issue #114). Same unique-temp-then-rename discipline. The
+            // block file is already committed; a missing sidecar only costs a
+            // re-fetch of that block after a restart, so a sidecar failure is
+            // logged but does not fail the commit.
+            let encoded = serde_json::to_vec(&meta)
+                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
+            let meta_seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
+            let meta_tmp = meta_path.with_extension(format!("meta.tmp.{pid}.{meta_seq}"));
+            if let Err(error) = (|| -> std::io::Result<()> {
+                let mut f = std::fs::File::create(&meta_tmp)?;
+                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&encoded))?;
+                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
+                talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&meta_tmp, &meta_path))
+            })() {
+                let _ = std::fs::remove_file(&meta_tmp);
+                tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
+            }
+            Ok(allocated)
+        })
+        .await?;
+        // The commit renamed a fresh file over `path`, so it is a NEW inode and
+        // any descriptor cached for the superseded file is stale. Invalidate
+        // AFTER the rename: doing it before would leave a window in which a
+        // concurrent reader re-caches the old inode and then serves its bytes
+        // indefinitely. Readers racing this call either miss (and open the
+        // committed file) or hold a handle on the previous inode, which stays
+        // readable until they finish — the same semantics as before the cache.
+        self.fd_cache.invalidate(&commit_path);
+        Ok(allocated)
+    }
+
     /// Retain the root lease through detached blocking disk mutations.
     pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
         self.root_lock = Some(lock);
@@ -110,6 +217,7 @@ impl WholeBlockStore {
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             uring: false,
+            direct_alignment: None,
             root_lock: None,
             root,
             fd_cache,
@@ -148,6 +256,23 @@ impl WholeBlockStore {
     /// sidecar without a matching `.blk` (or vice versa) is skipped, and a
     /// malformed sidecar is ignored rather than failing the whole scan.
     pub fn scan(&self) -> Result<Vec<BlockMeta>> {
+        Ok(self
+            .scan_allocated()?
+            .into_iter()
+            .map(|entry| entry.meta)
+            .collect())
+    }
+
+    /// Restore indexed logical metadata and measured data-file allocations.
+    /// Intended for startup while the cache directory is exclusively owned.
+    pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
+        for entry in self.scan_allocated()? {
+            index.commit_allocated(entry.meta, entry.allocated);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
         let mut out = Vec::new();
         let shards = match std::fs::read_dir(&self.root) {
             Ok(rd) => rd,
@@ -167,12 +292,21 @@ impl WholeBlockStore {
                     continue;
                 }
                 // Require the matching block file to still be present.
-                if !path.with_extension("blk").exists() {
-                    continue;
-                }
+                let allocated = match std::fs::metadata(path.with_extension("blk")) {
+                    Ok(file) if file.is_file() => file.blocks() * 512,
+                    _ => continue,
+                };
                 match std::fs::read(&path) {
                     Ok(bytes) => match serde_json::from_slice::<BlockMeta>(&bytes) {
-                        Ok(meta) => out.push(meta),
+                        Ok(meta) if matches!(meta.form, BlockForm::Whole) => {
+                            out.push(crate::index::StoredBlock {
+                                meta,
+                                allocated: vec![(None, allocated)],
+                            })
+                        }
+                        Ok(_) => {
+                            tracing::warn!(path = %path.display(), "skipping non-whole block sidecar");
+                        }
                         Err(error) => {
                             tracing::warn!(path = %path.display(), %error, "skipping malformed block sidecar");
                         }
@@ -330,92 +464,7 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn put(&self, id: &BlockId, value: Bytes) -> Result<()> {
-        let path = self.path_for(id);
-        let meta_path = self.meta_path_for(id);
-        let meta = BlockMeta {
-            id: id.clone(),
-            form: BlockForm::Whole,
-            len: value.len() as u64,
-        };
-        if self.uring {
-            talon_uring::require_ring()?;
-            let root_lock = self.root_lock.clone();
-            let fds = self.fd_cache.clone();
-            let encoded = serde_json::to_vec(&meta)
-                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
-            return talon_uring::spawn_local(async move {
-                let _root_lock = root_lock;
-                talon_uring::atomic_write(&path, value).await?;
-                fds.invalidate(&path);
-                // Match the existing whole-block commit's best-effort sidecar.
-                if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {
-                    tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
-                }
-                Ok(())
-            }).await.map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
-        }
-        // The write + fsync of a whole block is blocking disk I/O; keep it off
-        // the reactor thread (issue #115).
-        let commit_path = path.clone();
-        let root_lock = self.root_lock.clone();
-        spawn_blocking_io(move || {
-            let _root_lock = root_lock;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let pid = std::process::id();
-            // Write to a per-writer-unique temp file then rename, so a present
-            // `.blk` is always complete (crash-atomic commit) AND two concurrent
-            // writers of the same block never truncate each other's staging file
-            // (issue #113). Both writers stage identical content; whichever
-            // renames last wins with a complete file, and the loser's rename is
-            // a harmless overwrite of the same bytes.
-            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = path.with_extension(format!("blk.tmp.{pid}.{seq}"));
-            {
-                let mut f = std::fs::File::create(&tmp)?;
-                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
-                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
-            }
-            // Rename our own unique temp into place. If a concurrent writer
-            // already renamed theirs, this atomically replaces it with identical
-            // bytes.
-            if let Err(e) = talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path)) {
-                // Best-effort cleanup of our staging file on failure so a failed
-                // commit never leaks a `.tmp`.
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e.into());
-            }
-            // Write the sidecar (id + form + len) so the index can be rebuilt on
-            // startup (issue #114). Same unique-temp-then-rename discipline. The
-            // block file is already committed; a missing sidecar only costs a
-            // re-fetch of that block after a restart, so a sidecar failure is
-            // logged but does not fail the commit.
-            let encoded = serde_json::to_vec(&meta)
-                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
-            let meta_seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-            let meta_tmp = meta_path.with_extension(format!("meta.tmp.{pid}.{meta_seq}"));
-            if let Err(error) = (|| -> std::io::Result<()> {
-                let mut f = std::fs::File::create(&meta_tmp)?;
-                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&encoded))?;
-                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
-                talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&meta_tmp, &meta_path))
-            })() {
-                let _ = std::fs::remove_file(&meta_tmp);
-                tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
-            }
-            Ok(())
-        })
-        .await?;
-        // The commit renamed a fresh file over `path`, so it is a NEW inode and
-        // any descriptor cached for the superseded file is stale. Invalidate
-        // AFTER the rename: doing it before would leave a window in which a
-        // concurrent reader re-caches the old inode and then serves its bytes
-        // indefinitely. Readers racing this call either miss (and open the
-        // committed file) or hold a handle on the previous inode, which stays
-        // readable until they finish — the same semantics as before the cache.
-        self.fd_cache.invalidate(&commit_path);
-        Ok(())
+        self.put_payload(id, value.into()).await.map(|_| ())
     }
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
@@ -490,6 +539,28 @@ mod tests {
         std::time::SystemTime::now().hash(&mut h);
         std::thread::current().id().hash(&mut h);
         h.finish()
+    }
+
+    #[tokio::test]
+    async fn recovery_measures_allocated_blocks_instead_of_file_length() {
+        let root = tempfile::tempdir().unwrap();
+        let store = WholeBlockStore::open(root.path()).unwrap();
+        let id = block(0);
+        store.put(&id, Bytes::from(vec![0; 6000])).await.unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(store.path_for(&id))
+            .unwrap();
+        file.set_len(6000).unwrap();
+        file.sync_all().unwrap();
+        let allocated = file.metadata().unwrap().blocks() * 512;
+        assert!(allocated < 6000, "fixture is a sparse file");
+        let index = crate::BlockIndex::new();
+        store.restore_index(&index).unwrap();
+        assert_eq!(index.get(&id).unwrap().len, 6000);
+        assert_eq!(index.resident_bytes(), allocated);
+        assert_eq!(index.snapshot_units(), vec![(id, None, allocated)]);
     }
 
     #[tokio::test]
@@ -586,6 +657,21 @@ mod tests {
         // A fresh store over the same root rebuilds the same set (restart).
         let reopened = WholeBlockStore::open(&root).unwrap();
         assert_eq!(reopened.scan().unwrap().len(), 3);
+
+        // A mismatched form cannot supply per-page allocation costs.
+        let mut invalid = metas[0].clone();
+        invalid.form = BlockForm::Paged {
+            page_size: 4,
+            present: talon_core::PresentBitmap::new(1),
+        };
+        std::fs::write(
+            store.meta_path_for(&invalid.id),
+            serde_json::to_vec(&invalid).unwrap(),
+        )
+        .unwrap();
+        let index = crate::BlockIndex::new();
+        reopened.restore_index(&index).unwrap();
+        assert_eq!(index.snapshot_units().len(), 2);
 
         std::fs::remove_dir_all(&root).ok();
     }

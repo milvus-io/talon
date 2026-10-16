@@ -52,8 +52,15 @@ fn materialized_pages(meta: &BlockMeta) -> u64 {
     }
 }
 
+/// Data-file allocation discovered during startup; never persisted in sidecars.
+pub(crate) struct StoredBlock {
+    pub meta: BlockMeta,
+    pub allocated: Vec<(Option<PageIndex>, u64)>,
+}
+
 struct IndexedBlock {
     meta: BlockMeta,
+    allocated: HashMap<Option<PageIndex>, u64>,
     // Sparse: allocating a token for every possible page would dwarf residency
     // metadata when each large block has only one or two cached pages.
     access: HashMap<Option<PageIndex>, IndexedAccess>,
@@ -68,6 +75,7 @@ impl From<BlockMeta> for IndexedBlock {
     fn from(meta: BlockMeta) -> Self {
         Self {
             meta,
+            allocated: HashMap::new(),
             access: HashMap::new(),
         }
     }
@@ -133,9 +141,20 @@ impl BlockIndex {
         self.inner.read().unwrap().map.is_empty()
     }
 
-    /// Total resident bytes across all tracked blocks (for eviction).
+    /// Allocated disk bytes of indexed data files, also charged to eviction.
     pub fn resident_bytes(&self) -> u64 {
         self.inner.read().unwrap().resident_bytes
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_resident_bytes(&self) -> u64 {
+        self.inner
+            .read()
+            .unwrap()
+            .map
+            .values()
+            .map(|entry| entry.meta.resident_bytes())
+            .sum()
     }
 
     /// Number of materialized pages across all paged blocks.
@@ -231,16 +250,12 @@ impl BlockIndex {
         for entry in g.map.values() {
             let meta = &entry.meta;
             match &meta.form {
-                BlockForm::Whole => out.push((meta.id.clone(), None, meta.len)),
-                BlockForm::Paged { page_size, present } => {
+                BlockForm::Whole => out.push((meta.id.clone(), None, entry.allocated[&None])),
+                BlockForm::Paged { present, .. } => {
                     for p in 0..present.len() {
                         let page = PageIndex(p);
                         if present.is_present(page) {
-                            out.push((
-                                meta.id.clone(),
-                                Some(page),
-                                talon_core::page_len(meta.len, *page_size, page),
-                            ));
+                            out.push((meta.id.clone(), Some(page), entry.allocated[&Some(page)]));
                         }
                     }
                 }
@@ -249,28 +264,55 @@ impl BlockIndex {
         out
     }
 
-    /// Commit a fully-materialized block (whole or a complete paged set).
+    /// Commit metadata with measured allocated bytes for each resident data file.
     ///
     /// Called by PUT and by loader completion. Replaces any existing entry;
     /// byte accounting is adjusted by the delta between the old and new entry's
     /// *resident* bytes — a paged block only charges for its present pages.
-    pub fn commit(&self, meta: BlockMeta) {
-        let mut g = self.inner.write().unwrap();
-        let added = meta.resident_bytes();
+    pub fn commit_allocated(
+        &self,
+        meta: BlockMeta,
+        allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
+    ) {
+        let allocated: HashMap<_, _> = allocated.into_iter().collect();
+        let added: u64 = allocated.values().sum();
         let pages = materialized_pages(&meta);
-        if let Some(prev) = g.map.insert(meta.id.clone(), meta.into()) {
-            g.resident_bytes = g.resident_bytes.saturating_sub(prev.meta.resident_bytes());
+        let id = meta.id.clone();
+        let entry = IndexedBlock {
+            meta,
+            allocated,
+            access: HashMap::new(),
+        };
+        let mut g = self.inner.write().unwrap();
+        if let Some(prev) = g.map.insert(id, entry) {
+            g.resident_bytes = g
+                .resident_bytes
+                .saturating_sub(prev.allocated.values().sum());
             g.resident_pages -= materialized_pages(&prev.meta);
         }
         g.resident_bytes = g.resident_bytes.saturating_add(added);
         g.resident_pages += pages;
     }
 
+    // Synthetic index fixtures specify byte costs without creating disk files.
+    #[cfg(test)]
+    pub(crate) fn commit(&self, meta: BlockMeta) {
+        let allocated = match &meta.form {
+            BlockForm::Whole => vec![(None, meta.len)],
+            BlockForm::Paged { page_size, present } => (0..present.len())
+                .map(PageIndex)
+                .filter(|p| present.is_present(*p))
+                .map(|p| (Some(p), talon_core::page_len(meta.len, *page_size, p)))
+                .collect(),
+        };
+        self.commit_allocated(meta, allocated);
+    }
+
     /// Insert a paged block with an empty presence bitmap, unless one is already
     /// tracked.
     ///
     /// Used when a paged load begins: pages are then filled in with
-    /// [`mark_page`](Self::mark_page). `len` is the block's logical length.
+    /// [`mark_page_allocated`](Self::mark_page_allocated). `len` is the block's logical length.
     /// Idempotent by design — a second concurrent page miss on the same block
     /// must not reset the bitmap and lose the pages the first one materialized.
     /// Returns `true` if a new entry was created.
@@ -298,28 +340,37 @@ impl BlockIndex {
         true
     }
 
-    /// Mark a page present on an existing paged block, charging its bytes.
+    /// Publish a page and its measured allocation, replacing any prior cost.
     ///
     /// Returns `true` if the block exists, is paged, and the page went from
     /// absent to present; `false` otherwise (whole blocks, unknown blocks, and
     /// already-present pages), so byte accounting is never double-counted.
-    pub fn mark_page(&self, id: &BlockId, page: PageIndex) -> bool {
+    pub fn mark_page_allocated(&self, id: &BlockId, page: PageIndex, allocated: u64) -> bool {
         let mut g = self.inner.write().unwrap();
         let Some(entry) = g.map.get_mut(id) else {
             return false;
         };
-        let meta = &mut entry.meta;
-        let BlockForm::Paged { page_size, present } = &mut meta.form else {
+        let BlockForm::Paged { present, .. } = &mut entry.meta.form else {
             return false;
         };
-        if page.0 >= present.len() || present.is_present(page) {
+        if page.0 >= present.len() {
             return false;
         }
+        let fresh = !present.is_present(page);
         present.set(page);
-        let bytes = talon_core::page_len(meta.len, *page_size, page);
-        g.resident_bytes = g.resident_bytes.saturating_add(bytes);
-        g.resident_pages += 1;
-        true
+        let old = entry.allocated.insert(Some(page), allocated).unwrap_or(0);
+        g.resident_bytes = g
+            .resident_bytes
+            .saturating_sub(old)
+            .saturating_add(allocated);
+        g.resident_pages += u64::from(fresh);
+        fresh
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_page(&self, id: &BlockId, page: PageIndex) -> bool {
+        let allocated = self.get(id).map_or(0, |meta| meta.page_len(page));
+        self.mark_page_allocated(id, page, allocated)
     }
 
     /// Mark a page absent on a paged block, refunding its bytes.
@@ -332,7 +383,7 @@ impl BlockIndex {
             return false;
         };
         let meta = &mut entry.meta;
-        let BlockForm::Paged { page_size, present } = &mut meta.form else {
+        let BlockForm::Paged { present, .. } = &mut meta.form else {
             return false;
         };
         if !present.is_present(page) {
@@ -343,7 +394,7 @@ impl BlockIndex {
         if entry.access.capacity() > 32 && entry.access.len() < entry.access.capacity() / 4 {
             entry.access.shrink_to(entry.access.len() * 2);
         }
-        let bytes = talon_core::page_len(meta.len, *page_size, page);
+        let bytes = entry.allocated.remove(&Some(page)).unwrap_or(0);
         g.resident_bytes = g.resident_bytes.saturating_sub(bytes);
         g.resident_pages -= 1;
         true
@@ -374,12 +425,12 @@ impl BlockIndex {
     /// Byte accounting is decremented by the removed block's resident bytes.
     pub fn remove(&self, id: &BlockId) -> Option<BlockMeta> {
         let mut g = self.inner.write().unwrap();
-        let removed = g.map.remove(id).map(|entry| entry.meta);
-        if let Some(meta) = &removed {
-            g.resident_bytes = g.resident_bytes.saturating_sub(meta.resident_bytes());
-            g.resident_pages -= materialized_pages(meta);
-        }
-        removed
+        let removed = g.map.remove(id)?;
+        g.resident_bytes = g
+            .resident_bytes
+            .saturating_sub(removed.allocated.values().sum());
+        g.resident_pages -= materialized_pages(&removed.meta);
+        Some(removed.meta)
     }
 }
 
@@ -404,6 +455,29 @@ mod tests {
             form: BlockForm::Whole,
             len,
         }
+    }
+
+    #[test]
+    fn allocation_cost_is_independent_of_logical_length_and_replacement() {
+        let index = BlockIndex::new();
+        let id = block(1);
+        index.commit_allocated(whole_meta(id.clone(), 6000), [(None, 8192)]);
+        assert_eq!(index.resident_bytes(), 8192);
+        assert_eq!(index.get(&id).unwrap().len, 6000);
+        // Sparse replacement: a nonempty logical file may have no allocated blocks.
+        index.commit_allocated(whole_meta(id.clone(), 6000), [(None, 0)]);
+        assert_eq!(index.resident_bytes(), 0);
+        index.remove(&id);
+        index.init_paged(id.clone(), 512, 600);
+        assert!(index.mark_page_allocated(&id, PageIndex(0), 4096));
+        assert!(index.mark_page_allocated(&id, PageIndex(1), 8192));
+        assert_eq!(index.resident_bytes(), 12288);
+        assert!(!index.mark_page_allocated(&id, PageIndex(1), 4096));
+        assert_eq!(index.resident_bytes(), 8192);
+        index.clear_page(&id, PageIndex(1));
+        assert_eq!(index.resident_bytes(), 4096);
+        index.remove(&id);
+        assert_eq!(index.resident_bytes(), 0);
     }
 
     #[test]

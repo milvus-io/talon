@@ -27,7 +27,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::os::fd::OwnedFd;
-use std::os::unix::fs::FileExt;
+use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -83,6 +83,7 @@ where
 /// A local, file-backed store for paged blocks (per-page files).
 pub struct PagedBlockStore {
     uring: bool,
+    direct_alignment: Option<talon_uring::DirectIoAlignment>,
     root: PathBuf,
     page_size: u32,
     /// Open `.page` descriptors, so a warm cross-page read does not pay one
@@ -98,9 +99,19 @@ pub struct PagedBlockStore {
 }
 
 impl PagedBlockStore {
-    pub fn with_uring(mut self, enabled: bool) -> Self {
+    /// Select native I/O and probe this cache directory before accepting writes.
+    pub fn with_uring(mut self, enabled: bool) -> std::io::Result<Self> {
+        self.direct_alignment = enabled
+            .then(|| talon_uring::DirectIoAlignment::probe(&self.root))
+            .transpose()?;
         self.uring = enabled;
-        self
+        if let Some(alignment) = self.direct_alignment {
+            tracing::info!(root = %self.root.display(), memory_alignment = alignment.memory(), write_alignment = alignment.offset(), "cache direct I/O alignment");
+        }
+        Ok(self)
+    }
+    pub(crate) fn direct_alignment(&self) -> Option<talon_uring::DirectIoAlignment> {
+        self.direct_alignment
     }
 
     /// Commit sidecar and page with the same ownership boundary on either engine.
@@ -111,6 +122,18 @@ impl PagedBlockStore {
         block_len: u64,
         value: Bytes,
     ) -> Result<()> {
+        self.commit_page_payload(id, page, block_len, value.into())
+            .await
+            .map(|_| ())
+    }
+
+    pub(crate) async fn commit_page_payload(
+        self: &Arc<Self>,
+        id: &BlockId,
+        page: PageIndex,
+        block_len: u64,
+        value: talon_uring::Payload,
+    ) -> Result<u64> {
         let disk = self.clone();
         let id = id.clone();
         if self.uring {
@@ -138,16 +161,21 @@ impl PagedBlockStore {
                     Err(error) => return Err(error.into()),
                 }
                 let path = disk.page_path(&id, page);
-                talon_uring::atomic_write(&path, value).await?;
+                let allocated = talon_uring::atomic_write_payload(
+                    &path,
+                    value,
+                    disk.direct_alignment.expect("native store alignment"),
+                )
+                .await?;
                 disk.fd_cache.invalidate(&path);
-                Ok(())
+                Ok(allocated)
             })
             .await
             .map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
         }
         spawn_blocking_io(move || {
             disk.write_sidecar(&id, block_len)?;
-            disk.put_page(&id, page, value)
+            disk.put_page_allocated(&id, page, value.into_bytes())
         })
         .await
     }
@@ -175,6 +203,7 @@ impl PagedBlockStore {
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             uring: false,
+            direct_alignment: None,
             root_lock: None,
             root,
             page_size,
@@ -264,6 +293,23 @@ impl PagedBlockStore {
     /// A block directory without a readable sidecar is skipped (its pages are
     /// unaddressable), as is one with no page files at all.
     pub fn scan(&self) -> Result<Vec<BlockMeta>> {
+        Ok(self
+            .scan_allocated()?
+            .into_iter()
+            .map(|entry| entry.meta)
+            .collect())
+    }
+
+    /// Restore indexed logical metadata and measured data-file allocations.
+    /// Intended for startup while the cache directory is exclusively owned.
+    pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
+        for entry in self.scan_allocated()? {
+            index.commit_allocated(entry.meta, entry.allocated);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
         let mut out = Vec::new();
         let shards = match std::fs::read_dir(&self.root) {
             Ok(rd) => rd,
@@ -310,6 +356,8 @@ impl PagedBlockStore {
                 let Ok(pages) = std::fs::read_dir(&dir) else {
                     continue;
                 };
+                let mut allocated = Vec::new();
+                *present = PresentBitmap::new(meta.id.page_count(*page_size));
                 for page_file in pages.flatten() {
                     let path = page_file.path();
                     if path.extension().and_then(|e| e.to_str()) != Some("page") {
@@ -319,11 +367,19 @@ impl PagedBlockStore {
                         continue;
                     };
                     if let Ok(index) = stem.parse::<u32>() {
+                        if index >= present.len() || present.is_present(PageIndex(index)) {
+                            continue;
+                        }
+                        let file = page_file.metadata()?;
+                        if !file.is_file() {
+                            continue;
+                        }
                         present.set(PageIndex(index));
+                        allocated.push((Some(PageIndex(index)), file.blocks() * 512));
                     }
                 }
                 if present.count() > 0 {
-                    out.push(meta);
+                    out.push(crate::index::StoredBlock { meta, allocated });
                 }
             }
         }
@@ -341,23 +397,29 @@ impl PagedBlockStore {
     /// writers of the same page cannot clobber each other's staging file and
     /// commit a torn page (issue #113).
     pub fn put_page(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<()> {
+        self.put_page_allocated(id, page, value).map(|_| ())
+    }
+
+    fn put_page_allocated(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<u64> {
         let dir = self.dir_for(id);
         std::fs::create_dir_all(&dir)?;
         let path = self.page_path(id, page);
         let pid = std::process::id();
         let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = dir.join(format!("{}.page.tmp.{pid}.{seq}", page.0));
-        match (|| -> std::io::Result<()> {
+        match (|| -> std::io::Result<u64> {
             let mut f = std::fs::File::create(&tmp)?;
             talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
             talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
-            talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path))
+            let allocated = f.metadata()?.blocks() * 512;
+            talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path))?;
+            Ok(allocated)
         })() {
-            Ok(()) => {
+            Ok(allocated) => {
                 // The rename swapped in a new inode; drop any descriptor still
                 // pointing at the old one so reads cannot serve stale bytes.
                 self.fd_cache.invalidate(&path);
-                Ok(())
+                Ok(allocated)
             }
             Err(e) => {
                 let _ = std::fs::remove_file(&tmp);
@@ -375,9 +437,10 @@ impl PagedBlockStore {
         if self.uring {
             talon_uring::require_ring()?;
             let fds = self.fd_cache.clone();
+            let alignment = self.direct_alignment.expect("native store alignment");
             return talon_uring::spawn_local(async move {
                 let _root_lock = root_lock;
-                talon_uring::atomic_write(&path, value).await?;
+                talon_uring::atomic_write_payload(&path, value.into(), alignment).await?;
                 fds.invalidate(&path);
                 Ok(())
             })
@@ -414,13 +477,14 @@ impl PagedBlockStore {
     ///
     /// Returns [`Error::NotFound`] if the page is absent, so the caller can
     /// trigger a page-level miss.
-    pub async fn get_page_bytes(&self, id: &BlockId, page: PageIndex) -> Result<Bytes> {
+    /// `len` is the logical page length, excluding any physical tail padding.
+    pub async fn get_page_bytes(&self, id: &BlockId, page: PageIndex, len: u64) -> Result<Bytes> {
         let path = self.page_path(id, page);
         let label = format!("{id} page {}", page.0);
         if self.uring {
             talon_uring::require_ring()?;
             return talon_uring::spawn_cancellable(async move {
-                talon_uring::read_file(&path, None)
+                talon_uring::read_file(&path, Some((0, len)))
                     .await
                     .map_err(|error| crate::block_store::cache_read_error(error, label))
             })
@@ -429,7 +493,6 @@ impl PagedBlockStore {
         }
         spawn_blocking_io(move || match std::fs::File::open(&path) {
             Ok(f) => {
-                let len = f.metadata()?.len();
                 let size = usize::try_from(len)
                     .map_err(|_| Error::Other(format!("page length {len} exceeds usize")))?;
                 let mut buffer = vec![0_u8; size];

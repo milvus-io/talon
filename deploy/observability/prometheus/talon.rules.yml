@@ -56,7 +56,7 @@ groups:
             sum by (cluster, instance, job, le) (rate(talon_worker_request_duration_seconds_bucket[5m]))
           )
 
-      # Capacity saturation: resident bytes as a fraction of configured capacity.
+      # Capacity saturation: allocated data-file bytes / configured cache capacity.
       # clamp_min guards a worker that reports 0 capacity before its first
       # capacity update (division by zero -> +Inf would trip the alert falsely).
       - record: instance_job:talon_worker_capacity:saturation

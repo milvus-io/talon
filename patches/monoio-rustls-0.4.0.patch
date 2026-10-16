@@ -1,0 +1,43 @@
+--- a/src/stream.rs
++++ b/src/stream.rs
+@@ -178,6 +178,40 @@
+         }
+ 
+         Ok((rdlen, wrlen))
++    }
++
++    /// Read through a delimiter without copying following plaintext out of TLS.
++    /// This lets an HTTP consumer receive headers separately and place the body
++    /// directly in its final owned buffer. The limit includes existing output.
++    pub async fn read_until_delimiter(
++        &mut self,
++        delimiter: u8,
++        output: &mut Vec<u8>,
++        limit: usize,
++    ) -> io::Result<()> {
++        use std::io::BufRead;
++        loop {
++            let mut reader = self.session.reader();
++            match reader.fill_buf() {
++                Ok([]) => return Err(io::ErrorKind::UnexpectedEof.into()),
++                Ok(chunk) => {
++                    let end = chunk.iter().position(|byte| *byte == delimiter);
++                    let take = end.map_or(chunk.len(), |end| end + 1);
++                    if take > limit.saturating_sub(output.len()) {
++                        return Err(io::Error::new(io::ErrorKind::InvalidData, "TLS line limit"));
++                    }
++                    output.extend_from_slice(&chunk[..take]);
++                    reader.consume(take);
++                    if end.is_some() { return Ok(()); }
++                }
++                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
++                    if self.read_io(false).await? == 0 {
++                        return Err(io::ErrorKind::UnexpectedEof.into());
++                    }
++                }
++                Err(error) => return Err(error),
++            }
++        }
+     }
+ 
+     pub(crate) async fn read_inner<T: monoio::buf::IoBufMut>(

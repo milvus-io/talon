@@ -325,8 +325,8 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             8,
-            1024,
-            WorkerMetrics::new(1024),
+            1024 * disk_unit(),
+            WorkerMetrics::new(1024 * disk_unit()),
         );
         if paged {
             runtime = runtime
@@ -555,7 +555,7 @@ mod tests {
         assert_eq!(runtime.page_mutations.active_count(), 0);
         assert_eq!(runtime.inflight_loads(), 0);
         assert!(runtime
-            .cached_page(&block(8), PageIndex(0))
+            .cached_page(&block(8), PageIndex(0), 8)
             .await
             .unwrap()
             .is_some());

@@ -611,7 +611,10 @@ impl WorkerRuntime {
                         if to <= from {
                             continue;
                         }
-                        let bytes = self.cached_page(&block, page).await?.ok_or(CacheMiss)?;
+                        let bytes = self
+                            .cached_page(&block, page, meta.len)
+                            .await?
+                            .ok_or(CacheMiss)?;
                         piece.extend_from_slice(&slice(&bytes, from - page_start, to - from)?);
                     }
                     self.metrics.record_cache_hit();
@@ -1103,7 +1106,7 @@ impl WorkerRuntime {
         // or a page another request is already loading breaks the run: fetching
         // across either would redownload resident/in-flight data.
         for (slot, page) in pages.iter().copied().enumerate() {
-            if let Some(bytes) = self.cached_page(block, page).await? {
+            if let Some(bytes) = self.cached_page(block, page, block_len).await? {
                 if !leader_run.is_empty() {
                     leader_runs.push(std::mem::take(&mut leader_run));
                 }
@@ -1176,7 +1179,7 @@ impl WorkerRuntime {
         for (slot, page, flight) in followers {
             let key = LoadKey::Page(block.clone(), page);
             talon_telemetry::wait_for(&flight, self.inflight.wait(&key)).await;
-            let entry = match self.cached_page(block, page).await? {
+            let entry = match self.cached_page(block, page, block_len).await? {
                 Some(bytes) => (bytes, true),
                 None => (
                     self.fetch_and_commit_page(request, block, page, block_len)
@@ -1234,6 +1237,7 @@ impl WorkerRuntime {
         &self,
         block: &BlockId,
         page: PageIndex,
+        block_len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
         let Some((access, _)) = self
             .index
@@ -1252,7 +1256,8 @@ impl WorkerRuntime {
             self.metrics.record_l1_miss();
         }
         let paged = self.paged.as_ref().expect("paged store");
-        match paged.get_page_bytes(block, page).await {
+        let len = talon_core::page_len(block_len, paged.page_size(), page);
+        match paged.get_page_bytes(block, page, len).await {
             Ok(bytes) => {
                 self.metrics.record_l2_hit();
                 talon_telemetry::cache_tier("l2");
@@ -1346,11 +1351,14 @@ impl WorkerRuntime {
             let fetched = talon_telemetry::observe(
                 "talon.origin.fetch",
                 "internal",
-                self.backend.fetch_range_if_match(
-                    &request.object,
-                    block.offset + page_start,
-                    want,
-                    (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                talon_uring::Download::capture(
+                    self.paged.as_ref().and_then(|p| p.direct_alignment()),
+                    self.backend.fetch_range_if_match(
+                        &request.object,
+                        block.offset + page_start,
+                        want,
+                        (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                    ),
                 ),
             )
             .await;
@@ -1414,7 +1422,7 @@ impl WorkerRuntime {
                     if !warm_only {
                         talon_telemetry::record("talon.cache.committed_bytes", end as u64);
                     }
-                    committed.push(page_bytes);
+                    committed.push(page_bytes.into_bytes());
                     cursor = end;
                 }
                 // LOAD pages are disjoint leaders. Drain all writes before releasing
@@ -1442,9 +1450,9 @@ impl WorkerRuntime {
         block: &BlockId,
         page: PageIndex,
         block_len: u64,
-        bytes: bytes::Bytes,
+        bytes: impl Into<talon_uring::Payload>,
     ) -> anyhow::Result<()> {
-        self.commit_fetched_page_inner(block, page, block_len, bytes, false)
+        self.commit_fetched_page_inner(block, page, block_len, bytes.into(), false)
             .await
     }
 
@@ -1453,7 +1461,7 @@ impl WorkerRuntime {
         block: &BlockId,
         page: PageIndex,
         block_len: u64,
-        bytes: bytes::Bytes,
+        bytes: talon_uring::Payload,
         warm_only: bool,
     ) -> anyhow::Result<()> {
         let runtime = self.clone();
@@ -1481,7 +1489,9 @@ impl WorkerRuntime {
                         }
                         let paged = runtime.paged.as_ref().expect("paged store").clone();
                         let value = bytes.clone();
-                        paged.commit_page(&id, page, block_len, value).await?;
+                        let allocated = paged
+                            .commit_page_payload(&id, page, block_len, value)
+                            .await?;
                         runtime
                             .index
                             .init_paged(id.clone(), paged.page_size(), block_len);
@@ -1491,13 +1501,13 @@ impl WorkerRuntime {
                             runtime.page_clock.now(),
                             true,
                         );
-                        runtime.index.mark_page(&id, page);
+                        runtime.index.mark_page_allocated(&id, page, allocated);
                         let unit = CacheUnit::Page(id.clone(), page);
-                        let access = runtime.lru.insert(unit.clone(), bytes.len() as u64);
+                        let access = runtime.lru.insert(unit.clone(), allocated);
                         runtime.index.set_access(&unit, access);
                         runtime.index.set_page_state(&id, page, handle);
                         if !warm_only && runtime.l1.is_enabled() {
-                            runtime.admit_l1_page(&id, page, bytes);
+                            runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
                         // Keep pressure handling owned by the worker too: cancellation
                         // must not leave a completed admission above capacity.
@@ -1817,11 +1827,14 @@ impl WorkerRuntime {
             let fetched = talon_telemetry::observe(
                 "talon.origin.fetch",
                 "internal",
-                self.backend.fetch_range_if_match(
-                    &request.object,
-                    block.offset,
-                    self.block_size as u64,
-                    (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                talon_uring::Download::capture(
+                    self.store.direct_alignment(),
+                    self.backend.fetch_range_if_match(
+                        &request.object,
+                        block.offset,
+                        self.block_size as u64,
+                        (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                    ),
                 ),
             )
             .await;
@@ -1839,7 +1852,7 @@ impl WorkerRuntime {
 
             talon_telemetry::record("talon.origin.validated_bytes", bytes.len() as u64);
             self.commit_cached_block(block, bytes.clone()).await?;
-            Ok(bytes)
+            Ok(bytes.into_bytes())
         })
         .await
     }
@@ -1847,8 +1860,9 @@ impl WorkerRuntime {
     async fn commit_cached_block(
         &self,
         block: &BlockId,
-        bytes: bytes::Bytes,
+        bytes: impl Into<talon_uring::Payload>,
     ) -> anyhow::Result<()> {
+        let bytes = bytes.into();
         let len = bytes.len() as u64;
         let runtime = self.clone();
         let id = block.clone();
@@ -1869,28 +1883,33 @@ impl WorkerRuntime {
                         if paged {
                             drop(gate);
                             let size = runtime.paged_page_size().expect("paged state");
-                            for (page, chunk) in bytes.chunks(size as usize).enumerate() {
+                            for (page, start) in (0..bytes.len()).step_by(size as usize).enumerate()
+                            {
+                                let end = (start + size as usize).min(bytes.len());
                                 runtime
                                     .commit_fetched_page(
                                         &id,
                                         PageIndex(page as u32),
                                         len,
-                                        bytes::Bytes::copy_from_slice(chunk),
+                                        bytes.slice(start..end),
                                     )
                                     .await?;
                             }
                             talon_telemetry::record("talon.cache.committed_bytes", len);
                             return Ok::<_, anyhow::Error>(());
                         }
-                        runtime.store.put(&id, bytes).await?;
+                        let allocated = runtime.store.put_payload(&id, bytes).await?;
                         talon_telemetry::record("talon.cache.committed_bytes", len);
-                        runtime.index.commit(BlockMeta {
-                            id: id.clone(),
-                            form: BlockForm::Whole,
-                            len,
-                        });
+                        runtime.index.commit_allocated(
+                            BlockMeta {
+                                id: id.clone(),
+                                form: BlockForm::Whole,
+                                len,
+                            },
+                            [(None, allocated)],
+                        );
                         let unit = CacheUnit::Whole(id.clone());
-                        let access = runtime.lru.insert(unit.clone(), len);
+                        let access = runtime.lru.insert(unit.clone(), allocated);
                         runtime.index.set_access(&unit, access);
                         // Pin before releasing the gate used by candidate validation.
                         let _pin = runtime.lru.pin_guard(unit);
@@ -2150,9 +2169,14 @@ impl WorkerRuntime {
         self.index.len() as u64
     }
 
-    /// Total resident cache bytes across all indexed blocks.
+    /// Allocated disk bytes of indexed cache data files, excluding sidecars.
     pub fn resident_bytes(&self) -> u64 {
         self.index.resident_bytes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_resident_bytes(&self) -> u64 {
+        self.index.logical_resident_bytes()
     }
 
     /// Number of pages resident in L1.
@@ -2249,6 +2273,18 @@ fn is_version_mismatch(error: &anyhow::Error) -> bool {
             cause.downcast_ref::<Error>(),
             Some(Error::VersionMismatch { .. })
         )
+    })
+}
+
+#[cfg(test)]
+fn disk_unit() -> u64 {
+    use std::{io::Write, os::unix::fs::MetadataExt, sync::OnceLock};
+    static UNIT: OnceLock<u64> = OnceLock::new();
+    *UNIT.get_or_init(|| {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(&[0; 16]).unwrap();
+        file.sync_all().unwrap();
+        file.metadata().unwrap().blocks() * 512
     })
 }
 
@@ -2543,7 +2579,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             8,
-            l2_capacity,
+            l2_capacity.div_ceil(8) * disk_unit(),
             l1_capacity,
             l1_page_size,
             metrics,
@@ -2916,8 +2952,8 @@ mod tests {
 
         let store = WholeBlockStore::open(&root).unwrap();
         let index = Arc::new(BlockIndex::new());
-        for meta in store.scan().unwrap() {
-            index.commit(meta);
+        for entry in store.scan_allocated().unwrap() {
+            index.commit_allocated(entry.meta, entry.allocated);
         }
         let restarted = WorkerRuntime::new_with_l1(
             store,
@@ -3043,7 +3079,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             8,
-            1024,
+            2 * disk_unit(),
             16,
             4,
             metrics.clone(),
@@ -3090,7 +3126,7 @@ mod tests {
         assert!(runtime.serve(&request("failure")).await.is_err());
         assert_eq!(runtime.inflight_loads(), 0);
         assert_eq!(runtime.block_count(), 0);
-        assert_eq!(runtime.resident_bytes(), 0);
+        assert_eq!(runtime.logical_resident_bytes(), 0);
         assert_eq!(runtime.l1_page_count(), 0);
         assert_eq!(runtime.l1_resident_bytes(), 0);
         std::fs::remove_dir_all(root).ok();
@@ -4135,7 +4171,7 @@ mod tests {
             assert_eq!(read_handle(cached), b"ijk");
             assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
             assert_eq!(backend.heads.load(Ordering::SeqCst), 0);
-            assert_eq!(runtime.resident_bytes(), 3);
+            assert_eq!(runtime.logical_resident_bytes(), 3);
 
             // Only the exact reserved token bypasses the version comparison.
             for ordinary in ["v1", "__talon_unchecked__ "] {
@@ -4250,7 +4286,7 @@ mod tests {
 
     #[tokio::test]
     async fn capacity_enforcement_evicts_coldest_blocks() {
-        // Each distinct object is one 8-byte block. With a 16-byte cap, reading
+        // Each distinct object is one 8-byte block. With room for two allocated files, reading
         // three distinct objects must leave only two resident: committing the
         // third evicts the coldest block back under capacity (issue #159).
         let root = tmp_root();
@@ -4262,7 +4298,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             Arc::clone(&backend) as Arc<dyn BackendStore>,
             8,
-            16, // capacity: two 8-byte blocks
+            2 * disk_unit(), // capacity: two allocated data files
             metrics.clone(),
         );
 
@@ -4271,13 +4307,13 @@ mod tests {
             offset: 0,
             len: 8,
         };
-        // Read three distinct objects; the working set (24 bytes) exceeds the cap.
+        // Read three distinct objects; their disk allocations exceed the cap.
         for name in ["a", "b", "c"] {
             let _ = runtime.serve_range(&read(name)).await.unwrap();
         }
-        // Only two blocks fit under the 16-byte cap.
+        // Only two allocated files fit under the cap.
         assert_eq!(runtime.block_count(), 2, "cache must stay under capacity");
-        assert!(runtime.resident_bytes() <= 16);
+        assert_eq!(runtime.resident_bytes(), 2 * disk_unit());
         // At least one eviction was recorded.
         assert!(metrics.render().contains("talon_worker_evictions_total 1"));
         std::fs::remove_dir_all(root).ok();
@@ -4421,7 +4457,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             backend,
             block_size,
-            capacity_bytes,
+            capacity_bytes.div_ceil(u64::from(page_size)) * disk_unit(),
             metrics,
         )
         .with_paged_store(PagedBlockStore::open(root.join("paged"), page_size).unwrap())
@@ -4461,8 +4497,8 @@ mod tests {
         // Exactly one page fetched — not the 1 KiB block.
         assert_eq!(backend.ranges(), vec![(5 * 64, 64)]);
         assert_eq!(backend.fetched_bytes(), 64);
-        // Only that page is resident, so capacity accounting charges 64 bytes.
-        assert_eq!(runtime.resident_bytes(), 64);
+        // Only that page is resident; logical payload remains 64 bytes.
+        assert_eq!(runtime.logical_resident_bytes(), 64);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4512,7 +4548,7 @@ mod tests {
 
         assert_eq!(got, expected(64 + 32, 128));
         assert_eq!(backend.ranges(), vec![(64, 192)]);
-        assert_eq!(runtime.resident_bytes(), 3 * 64);
+        assert_eq!(runtime.logical_resident_bytes(), 3 * 64);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4630,7 +4666,7 @@ mod tests {
 
         assert_eq!(got, expected(0, 150));
         assert_eq!(backend.ranges(), vec![(0, 150)]);
-        assert_eq!(runtime.resident_bytes(), 150);
+        assert_eq!(runtime.logical_resident_bytes(), 150);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4654,8 +4690,8 @@ mod tests {
 
         assert_eq!(got, expected(90, 10));
         assert_eq!(backend.ranges(), vec![(64, 36)]);
-        // Only the 36 real bytes are charged, not a full 64-byte page.
-        assert_eq!(runtime.resident_bytes(), 36);
+        // Logical residency excludes padding; capacity charges the allocated file.
+        assert_eq!(runtime.logical_resident_bytes(), 36);
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4688,7 +4724,7 @@ mod tests {
             assert_eq!(got, expected(offset, 8));
         }
         let ranges = backend.ranges();
-        assert_eq!(runtime.resident_bytes(), 128);
+        assert_eq!(runtime.logical_resident_bytes(), 128);
         std::fs::remove_dir_all(root).unwrap();
         assert_eq!(ranges, vec![(0, 64), (64, 64), (128, 64)]);
     }
@@ -4725,7 +4761,11 @@ mod tests {
         // Admitting page 2 must evict page 1, the coldest.
         runtime.serve_range(&req(&object, 128, 8)).await.unwrap();
 
-        assert_eq!(runtime.resident_bytes(), 128, "back under capacity");
+        assert_eq!(
+            runtime.resident_bytes(),
+            2 * disk_unit(),
+            "back under capacity"
+        );
         // The block entry survives: page 0 is still a cache hit.
         let before = backend.ranges().len();
         assert_eq!(
@@ -4790,13 +4830,11 @@ mod tests {
         // Restart: a fresh index rebuilt from the on-disk paged cache.
         let paged = PagedBlockStore::open(root.join("paged"), 64).unwrap();
         let index = Arc::new(BlockIndex::new());
-        let metas = paged.scan().unwrap();
-        assert_eq!(metas.len(), 1, "one paged block on disk");
-        for meta in metas {
-            index.commit(meta);
-        }
+        paged.restore_index(&index).unwrap();
+        assert_eq!(index.len(), 1, "one paged block on disk");
         assert_eq!(index.page_count(), 2, "pages 0 and 2 rebuilt");
-        assert_eq!(index.resident_bytes(), 128);
+        assert_eq!(index.logical_resident_bytes(), 128);
+        assert_eq!(index.resident_bytes(), 2 * disk_unit());
 
         let runtime = WorkerRuntime::new(
             WholeBlockStore::open(root.join("whole")).unwrap(),
@@ -5212,7 +5250,7 @@ mod tests {
         assert_eq!(got, Bytes::from_static(b"bbbbbbbb"));
         // The superseded version's pages were reclaimed, not left resident.
         assert_eq!(runtime.block_count(), 1, "old version dropped");
-        assert_eq!(runtime.resident_bytes(), 8);
+        assert_eq!(runtime.logical_resident_bytes(), 8);
         std::fs::remove_dir_all(root).ok();
     }
 

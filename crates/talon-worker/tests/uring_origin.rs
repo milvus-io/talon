@@ -1,4 +1,26 @@
 //! Native ring acceptance tests. Run explicitly on an io_uring-capable host.
+fn allocated_data_bytes(root: &std::path::Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| {
+            let entry = entry.unwrap();
+            let path = entry.path();
+            let meta = entry.metadata().unwrap();
+            if meta.is_dir() {
+                allocated_data_bytes(&path)
+            } else if matches!(
+                path.extension().and_then(|s| s.to_str()),
+                Some("blk" | "page")
+            ) {
+                meta.blocks() * 512
+            } else {
+                0
+            }
+        })
+        .sum()
+}
+
 use bytes::Bytes;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -140,6 +162,42 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
                 tokio::time::sleep(std::time::Duration::from_millis(1)).await;
             }
         }
+        if target.contains("/large-") {
+            let object_len: usize = target.rsplit("/large-").next().unwrap().parse().unwrap();
+            let range = request
+                .lines()
+                .find_map(|line| {
+                    let line = line.to_ascii_lowercase();
+                    line.strip_prefix("range: bytes=")
+                        .or_else(|| line.strip_prefix("x-ms-range: bytes="))
+                        .map(str::to_owned)
+                })
+                .unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let start: usize = start.parse().unwrap();
+            let end: usize = end.parse::<usize>().unwrap().min(object_len - 1);
+            let body: Vec<u8> = (start..=end).map(|i| (i % 251) as u8).collect();
+            let chunked = target.contains("chunked");
+            let framing = if chunked {
+                "Transfer-Encoding: chunked".to_owned()
+            } else {
+                format!("Content-Length: {}", body.len())
+            };
+            let mut response = format!("HTTP/1.1 206 Partial Content\r\n{framing}\r\nContent-Range: bytes {start}-{end}/{object_len}\r\nETag: \"v1\"\r\nConnection: close\r\n\r\n").into_bytes();
+            if chunked {
+                for piece in body.chunks(777) {
+                    response.extend_from_slice(format!("{:x};test=1\r\n", piece.len()).as_bytes());
+                    response.extend_from_slice(piece);
+                    response.extend_from_slice(b"\r\n");
+                }
+                response.extend_from_slice(b"0\r\nX-Test: trailer\r\n\r\n");
+            } else {
+                response.extend_from_slice(&body);
+            }
+            stream.write_all(&response).await.unwrap();
+            let _ = stream.shutdown().await;
+            return;
+        }
         let keepalive = target.starts_with("/keepalive");
         let response = if target.contains("/retry") && attempt == 0 {
             "HTTP/1.1 503 Slow Down\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_owned()
@@ -159,8 +217,9 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
             let range = request
                 .lines()
                 .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("range: bytes=")
+                    let line = line.to_ascii_lowercase();
+                    line.strip_prefix("range: bytes=")
+                        .or_else(|| line.strip_prefix("x-ms-range: bytes="))
                         .map(str::to_owned)
                 })
                 .unwrap();
@@ -293,7 +352,7 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
             let root = tempfile::tempdir().unwrap();
             let config = WorkerConfig {
                 block_size: 8,
-                capacity_bytes: 1024,
+                capacity_bytes: 1024 * 1024,
                 l1_capacity_bytes: 0,
                 l2_page_size_bytes: page_size,
                 backend: Some("s3".into()),
@@ -307,7 +366,7 @@ fn uring_https_load_whole_paged_namespace_and_recovery() {
                         &config,
                         Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                         backend.clone(),
-                        WorkerMetrics::new(1024),
+                        WorkerMetrics::new(config.capacity_bytes),
                         true,
                     )
                     .unwrap(),
@@ -470,7 +529,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
         let root = tempfile::tempdir().unwrap();
         let config = WorkerConfig {
             block_size: 8,
-            capacity_bytes: 1024,
+            capacity_bytes: 1024 * 1024,
             l1_capacity_bytes: l1_capacity,
             l1_page_size_bytes: 4,
             l2_page_size_bytes: page_size,
@@ -483,7 +542,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
                 &config,
                 Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
                 backend,
-                WorkerMetrics::new(1024),
+                WorkerMetrics::new(config.capacity_bytes),
                 true,
             )
             .unwrap(),
@@ -497,7 +556,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
                     role: NodeRole::Worker,
                 },
                 "127.0.0.1:2".into(),
-                1024,
+                config.capacity_bytes,
                 Arc::new(BlockIndex::new()),
                 Arc::new(InFlightLoads::new()),
             )
@@ -583,7 +642,7 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
                 other => panic!("unexpected LOAD result: {other:?}"),
             }
         }
-        assert_eq!(worker.resident_bytes(), 16);
+        assert_eq!(worker.resident_bytes(), allocated_data_bytes(root.path()));
         assert_eq!(
             origin.requests.load(Ordering::SeqCst),
             3,
@@ -690,4 +749,139 @@ async fn native_origin_rejects_non_ring_callers() {
         error.contains("requires an existing Monoio ring"),
         "{error}"
     );
+}
+
+#[test]
+#[ignore = "requires native io_uring and O_DIRECT; checks fixed/chunked plaintext/TLS allocations"]
+fn aligned_http_bodies_and_paged_commits_preserve_payload() {
+    on_native_ring(async {
+        for tls in [false, true] {
+            let origin = Origin::start(tls).await;
+            let client = origin.client();
+            let probe_root = tempfile::tempdir().unwrap();
+            let alignment = talon_uring::DirectIoAlignment::probe(probe_root.path()).unwrap();
+            let scheme = if tls { "https" } else { "http" };
+            for chunked in [false, true] {
+                let kind = if chunked { "chunked" } else { "fixed" };
+                for range_header in ["Range", "x-ms-range"] {
+                    for len in [4095, 4096, 8192, 12289] {
+                        let response = talon_uring::Download::capture(Some(alignment), async {
+                            Ok::<_, String>(
+                                client
+                                    .execute(HttpRequest::new(
+                                        Method::Get,
+                                        format!("{scheme}://{}/{kind}/large-{len}", origin.address),
+                                        vec![(range_header.into(), format!("bytes=0-{}", len - 1))],
+                                    ))
+                                    .await?
+                                    .body,
+                            )
+                        })
+                        .await
+                        .unwrap();
+                        assert_eq!(response.as_ptr() as usize % alignment.memory(), 0);
+                        let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                        assert_eq!(&response[..], expected);
+                    }
+                }
+                for (page_size, l1_capacity) in [(0, 0), (0, 65536), (4096, 0), (4096, 65536)] {
+                    let root = tempfile::tempdir().unwrap();
+                    let config = WorkerConfig {
+                        block_size: 16384,
+                        capacity_bytes: 131072,
+                        l1_capacity_bytes: l1_capacity,
+                        l1_page_size_bytes: 4096,
+                        l2_page_size_bytes: page_size,
+                        backend: Some("s3".into()),
+                        page_tti_hours: 0,
+                        ..Default::default()
+                    };
+                    let backend = origin.backend(tls);
+                    let open = || {
+                        WorkerRuntime::open_namespaces_with_uring(
+                            &config,
+                            Arc::new(CacheRootLock::acquire(root.path()).unwrap()),
+                            backend.clone(),
+                            WorkerMetrics::new(131072),
+                            true,
+                        )
+                        .unwrap()
+                    };
+                    let runtime = open();
+                    let alignment = talon_uring::DirectIoAlignment::probe(root.path()).unwrap();
+                    for len in [8192, 12289] {
+                        let block = BlockId::new(
+                            ObjectId::new(Backend::S3, kind, format!("large-{len}")),
+                            0,
+                            16384,
+                            Version::new("v1"),
+                        );
+                        runtime.load_block(&block, len).await.unwrap();
+                        let request = CachedRangeRequest {
+                            object: block.object,
+                            version: block.version,
+                            offset: 0,
+                            len,
+                        };
+                        let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                        assert_eq!(runtime.serve_cached(&request).await.unwrap(), expected);
+                    }
+                    assert_eq!(runtime.resident_bytes(), allocated_data_bytes(root.path()));
+                    fn check_files(dir: &std::path::Path, alignment: usize) -> usize {
+                        let mut count = 0;
+                        for entry in std::fs::read_dir(dir).unwrap() {
+                            let path = entry.unwrap().path();
+                            if path.is_dir() {
+                                count += check_files(&path, alignment);
+                            } else if matches!(
+                                path.extension().and_then(|s| s.to_str()),
+                                Some("blk" | "page")
+                            ) {
+                                assert_eq!(
+                                    std::fs::metadata(&path).unwrap().len() % alignment as u64,
+                                    0,
+                                    "{}",
+                                    path.display()
+                                );
+                                count += 1;
+                            }
+                        }
+                        count
+                    }
+                    assert_eq!(
+                        check_files(root.path(), alignment.offset()),
+                        if page_size == 0 { 2 } else { 6 }
+                    );
+                    drop(runtime);
+                    let recovered = open();
+                    assert_eq!(
+                        recovered.resident_bytes(),
+                        allocated_data_bytes(root.path())
+                    );
+                    let count = origin.requests.load(Ordering::SeqCst);
+                    let request = CachedRangeRequest {
+                        object: ObjectId::new(Backend::S3, kind, "large-12289"),
+                        version: Version::new("v1"),
+                        offset: 0,
+                        len: 12289,
+                    };
+                    let expected: Vec<u8> = (0..12289).map(|i| (i % 251) as u8).collect();
+                    assert_eq!(recovered.serve_cached(&request).await.unwrap(), expected);
+                    let tail = CachedRangeRequest {
+                        offset: 12288,
+                        len: 1,
+                        ..request
+                    };
+                    assert_eq!(
+                        recovered.serve_cached(&tail).await.unwrap(),
+                        &expected[12288..]
+                    );
+                    assert_eq!(origin.requests.load(Ordering::SeqCst), count);
+                    if l1_capacity > 0 {
+                        assert_eq!(recovered.l1_resident_bytes(), 12289);
+                    }
+                }
+            }
+        }
+    });
 }
