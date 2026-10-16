@@ -171,8 +171,8 @@ impl BlockReader {
     /// Configure zone-affine placement (ADR 0006).
     ///
     /// With `enabled` and a known `zone`, placement is computed over the
-    /// same-zone worker subset; an empty subset falls back to the full
-    /// membership and reports through `observer`. Served reads are classified
+    /// same-zone worker subset. Unknown zones or absent local members fail
+    /// closed unless `with_zone_fallback(true)` is also selected. Served reads are classified
     /// same/cross/unknown against `zone` regardless of `enabled`, so the
     /// observer also measures the cross-zone baseline before the filter is
     /// turned on.
@@ -183,7 +183,9 @@ impl BlockReader {
         observer: Arc<dyn ZoneReadObserver>,
     ) -> Self {
         self.membership = Arc::new(
-            MembershipCache::new(self.cache.ttl_ms()).with_zone_affinity(zone.clone(), enabled),
+            self.membership
+                .empty_with_same_policy()
+                .with_zone_affinity(zone.clone(), enabled),
         );
         self.configure_discovery();
         self.zone = zone;
@@ -1304,7 +1306,8 @@ mod tests {
                 Some("az-c".into()),
                 true,
                 Arc::clone(&observer) as Arc<dyn crate::metrics::ZoneReadObserver>,
-            );
+            )
+            .with_zone_fallback(true);
 
         reader.read_block(&block(), 0, 16).await.unwrap();
         use std::sync::atomic::Ordering;

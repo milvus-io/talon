@@ -22,8 +22,8 @@ pub struct MembershipSnapshot {
     pub epoch: u64,
     /// Worker zones by dialable address, for read classification.
     pub zones_by_address: Arc<HashMap<String, String>>,
-    /// Zone affinity was requested but no same-zone worker exists, so
-    /// `placement` covers the full membership instead.
+    /// Affinity could not select local members; explicitly enabled read
+    /// fallback covers the full membership instead.
     pub affinity_fallback: bool,
     /// Serving instances keyed by logical worker ID. Missing IDs are offline or conflicted.
     pub instances: Arc<HashMap<String, (String, crate::WorkerClient)>>,
@@ -56,7 +56,7 @@ impl MembershipCache {
 
     /// Configure zone-affine placement (ADR 0006). With `enabled` and a known
     /// `zone`, placement tables are built from the same-zone worker subset;
-    /// an empty subset falls back to the full membership.
+    /// an empty subset fails closed unless cross-zone fallback is enabled.
     pub fn with_zone_affinity(mut self, zone: Option<String>, enabled: bool) -> Self {
         self.zone = zone;
         self.zone_affinity = enabled;
@@ -64,7 +64,8 @@ impl MembershipCache {
     }
 
     /// Allow reads to try nonlocal candidates after local candidates fail.
-    /// Has no effect unless affinity selects a nonempty local member set.
+    /// Has no effect unless affinity is enabled. LOAD remains local even when
+    /// no local member is present.
     pub fn with_zone_fallback(mut self, enabled: bool) -> Self {
         self.zone_fallback = enabled;
         self
@@ -111,15 +112,18 @@ impl MembershipCache {
                         .is_some_and(|z| Some(z) == w.member.zone.as_ref())
             })
             .collect();
-        let affinity_fallback = self.zone_affinity && local.is_empty() && !view.workers.is_empty();
-        let fallback_placement = if self.zone_fallback && !local.is_empty() {
+        let affinity_fallback = self.zone_affinity
+            && self.zone_fallback
+            && local.is_empty()
+            && !view.workers.is_empty();
+        let fallback_placement = if self.zone_affinity && self.zone_fallback {
             match old {
                 Some(old) if old.epoch == view.topology_token => old.fallback_placement.clone(),
                 _ => {
                     let remote: Vec<_> = view
                         .workers
                         .iter()
-                        .filter(|w| w.member.zone != self.zone)
+                        .filter(|w| local.is_empty() || w.member.zone != self.zone)
                         .map(|w| NodeInfo {
                             id: talon_core::NodeId::new(w.member.worker_id.clone()),
                             address: String::new(),
@@ -132,7 +136,7 @@ impl MembershipCache {
         } else {
             None
         };
-        let selected: Vec<_> = if local.is_empty() {
+        let selected: Vec<_> = if !self.zone_affinity {
             view.workers.iter().collect()
         } else {
             local
@@ -358,9 +362,12 @@ mod tests {
     #[test]
     fn affinity_tracks_logical_zones_and_falls_back_only_without_local_members() {
         let pool = crate::ConnectionPool::new();
-        let cache = MembershipCache::new(500).with_zone_affinity(Some("a".into()), true);
+        let cache = MembershipCache::new(500)
+            .with_zone_affinity(Some("a".into()), true)
+            .with_zone_fallback(true);
         let first = cache.replace(view(&[None, None]), Instant::now(), &pool);
-        assert_eq!(first.placement.workers().len(), 2);
+        assert_eq!(first.placement.workers().len(), 0);
+        assert_eq!(first.fallback_placement.as_ref().unwrap().worker_count(), 2);
         assert!(first.affinity_fallback);
         let second = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
         assert_ne!(first.epoch, second.epoch);
@@ -371,8 +378,11 @@ mod tests {
         for (zone, enabled) in [(Some("a".into()), false), (None, true)] {
             let cache = MembershipCache::new(500).with_zone_affinity(zone, enabled);
             let snapshot = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
-            assert_eq!(snapshot.placement.workers().len(), 2);
-            assert_eq!(snapshot.affinity_fallback, enabled);
+            assert_eq!(
+                snapshot.placement.workers().len(),
+                if enabled { 0 } else { 2 }
+            );
+            assert!(!snapshot.affinity_fallback);
         }
     }
 
@@ -410,6 +420,23 @@ mod tests {
         let recovered = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
         assert!(Arc::ptr_eq(&first.placement, &recovered.placement));
         assert_eq!(recovered.owner(&block).unwrap().addr(), "w0:7001");
+        for zone in [None, Some("absent".into())] {
+            let strict = MembershipCache::new(500)
+                .with_zone_affinity(zone, true)
+                .replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+            assert_eq!(strict.placement.worker_count(), 0);
+            assert!(strict.owner(&block).is_err());
+            assert!(!strict.affinity_fallback);
+        }
+        let remote_only = MembershipCache::new(500)
+            .with_zone_affinity(Some("absent".into()), true)
+            .with_zone_fallback(true)
+            .replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+        assert!(
+            remote_only.owner(&block).is_err(),
+            "read fallback cannot enable remote LOAD"
+        );
+        assert_eq!(remote_only.candidates(&block, 1).count(), 1);
         let no_affinity = MembershipCache::new(500).with_zone_fallback(true).replace(
             discovery,
             Instant::now(),

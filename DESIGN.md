@@ -523,8 +523,10 @@ identities, just like the primary table. Recovery returns reads to local owners
 without a topology change. Remote fills are opportunistic and may be reclaimed
 by normal ownership GC; this is not replication or a durable replica guarantee.
 LOAD and BatchLoad keep the local primary and fail rather than warming another
-owner. Unknown reader zones and absent local members use global placement and
-count affinity fallback. All policy switches default off.
+owner. With affinity enabled, unknown reader zones and absent local members
+fail closed by default. Only explicit fallback permits global placement and
+counts that event. All policy switches default off; deployment examples enable
+affinity while keeping cross-zone fallback disabled.
 
 Implementation is organized as a linear stack: core read policy and tests;
 Rust/C/Python configuration; Java configuration and matching semantics;
