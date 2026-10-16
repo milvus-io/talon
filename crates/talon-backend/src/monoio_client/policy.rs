@@ -134,10 +134,13 @@ pub(super) fn endpoint_key(endpoint: &str) -> Result<String, &'static str> {
 }
 
 pub(super) fn authority_key(host: &str, port: u16) -> String {
-    format!(
-        "{}:{port}",
-        host.trim_matches(['[', ']']).to_ascii_lowercase()
-    )
+    let host = host.trim_matches(['[', ']']);
+    // Url canonicalizes configured IP literals, while http::Uri preserves the
+    // request's spelling. Normalize only the policy key, never the signed URL.
+    let host = host
+        .parse::<std::net::IpAddr>()
+        .map_or_else(|_| host.to_ascii_lowercase(), |ip| ip.to_string());
+    format!("{host}:{port}")
 }
 
 pub(super) fn negotiation_rejected(error: &io::Error) -> bool {
@@ -251,6 +254,20 @@ mod tests {
 
     #[test]
     fn endpoint_rules_use_exact_normalized_https_authorities() {
+        for host in ["[0:0:0:0:0:0:0:1]", "[::1]", "[2001:0DB8:0:0:0:0:0:1]"] {
+            let endpoint = format!("https://{host}:8443");
+            let request: http::Uri = format!("{endpoint}/signed%2Fpath?key=value")
+                .parse()
+                .unwrap();
+            assert_eq!(
+                endpoint_key(&endpoint).unwrap(),
+                authority_key(request.host().unwrap(), request.port_u16().unwrap())
+            );
+        }
+        assert_eq!(
+            authority_key("[0:0:0:0:0:0:0:1]", 8443),
+            authority_key("::1", 8443)
+        );
         assert_eq!(
             endpoint_key("https://S3.EXAMPLE.com/").unwrap(),
             authority_key("s3.example.com", 443)

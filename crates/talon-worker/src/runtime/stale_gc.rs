@@ -153,7 +153,7 @@ impl StaleGc {
                 heads.charge(1).await;
                 let missing = match tokio::time::timeout(
                     Duration::from_secs(5),
-                    worker.backend.head(&object),
+                    worker.background_head(&object),
                 )
                 .await
                 {
@@ -233,7 +233,11 @@ mod tests {
             Version::new("v1"),
         )
     }
-    fn runtime(root: &std::path::Path, paged: bool, origin: Arc<Origin>) -> WorkerRuntime {
+    fn runtime(
+        root: &std::path::Path,
+        paged: bool,
+        origin: Arc<dyn BackendStore>,
+    ) -> WorkerRuntime {
         let store = WholeBlockStore::open(root.join("whole")).unwrap();
         let index = Arc::new(BlockIndex::new());
         for entry in store.scan_allocated().unwrap() {
@@ -269,6 +273,173 @@ mod tests {
     }
     fn cold_now() -> u64 {
         access_millis() + DAY_MS + 1
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "requires native io_uring; exercises Tokio GC with a real S3 HTTP backend"]
+    async fn native_stale_gc_uses_existing_rings_and_cancels_http_on_timeout_and_shutdown() {
+        use crate::{ConnectionAdmission, WorkerObservability};
+        use talon_backend::{monoio_client::MonoioClient, S3Backend, S3Config, S3Credentials};
+        use talon_core::{NodeId, NodeInfo, NodeRole};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let status = Arc::new(AtomicUsize::new(403));
+        let response_status = status.clone();
+        let (events, mut observed) = tokio::sync::mpsc::unbounded_channel();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let status = response_status.clone();
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let mut request = Vec::new();
+                    while !request.ends_with(b"\r\n\r\n") {
+                        request.push(socket.read_u8().await.unwrap());
+                    }
+                    assert!(request.starts_with(b"HEAD /bucket/key "));
+                    let status = status.load(Ordering::SeqCst);
+                    events.send("head").unwrap();
+                    match status {
+                        0 => {}, // transport failure, not an authoritative NotFound
+                        1 => {
+                            assert!(socket.read_u8().await.is_err());
+                            events.send("cancelled").unwrap();
+                        },
+                        _ => socket.write_all(format!(
+                            "HTTP/1.1 {status} Response\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        ).as_bytes()).await.unwrap(),
+                    }
+                });
+            }
+        });
+        let backend = Arc::new(S3Backend::new(
+            S3Config {
+                endpoint,
+                region: "us-east-1".into(),
+                path_style: true,
+                tls: false,
+            },
+            S3Credentials {
+                access_key_id: "test".into(),
+                secret_access_key: "test".into(),
+                session_token: None,
+            },
+            Arc::new(MonoioClient::new()),
+        ));
+        let root = tempfile::tempdir().unwrap();
+        let mut worker = runtime(root.path(), false, backend);
+        worker.background_heads = Some(super::super::origin_head::OriginHeads::new(2));
+        fill(&worker, &block(0), false).await;
+        let worker = Arc::new(worker);
+        let obs = Arc::new(
+            WorkerObservability::new(
+                "test".into(),
+                NodeInfo {
+                    id: NodeId::new("worker"),
+                    address: "127.0.0.1:0".into(),
+                    role: NodeRole::Worker,
+                },
+                "127.0.0.1:0".into(),
+                1024,
+                worker.index.clone(),
+                worker.inflight.clone(),
+            )
+            .unwrap(),
+        );
+        let handler = crate::uring_conn::RingConnHandler::new(worker.clone(), obs);
+        let stop = Arc::new(AtomicBool::new(false));
+        // Stop even if an assertion unwinds, so a failed test cannot leave rings running.
+        struct Stop(Arc<AtomicBool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+        let _stop = Stop(stop.clone());
+        let stop_rings = stop.clone();
+        let tokio = tokio::runtime::Handle::current();
+        let rings = tokio::task::spawn_blocking(move || {
+            crate::uring_serve::serve_with_shutdown(
+                "127.0.0.1:0".into(),
+                2,
+                ConnectionAdmission::new(8, WorkerMetrics::new(0)),
+                handler,
+                tokio,
+                stop_rings,
+            )
+        });
+        assert!(!talon_uring::on_ring());
+        for code in [403, 0] {
+            status.store(code, Ordering::SeqCst);
+            let mut gc = StaleGc::default();
+            tokio::time::timeout(Duration::from_secs(3), gc.run_round_at(&worker, cold_now()))
+                .await
+                .unwrap();
+            assert_eq!(observed.recv().await, Some("head"));
+            assert_eq!(worker.logical_resident_bytes(), 32);
+        }
+        status.store(1, Ordering::SeqCst);
+        {
+            let mut gc = StaleGc::default();
+            let work = gc.run_round_at(&worker, cold_now());
+            tokio::pin!(work);
+            tokio::select! {
+                event = observed.recv() => assert_eq!(event, Some("head")),
+                _ = &mut work => panic!("stalled HEAD unexpectedly completed"),
+                _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("HEAD never arrived"),
+            }
+            assert!(tokio::time::timeout(Duration::from_millis(20), work)
+                .await
+                .is_err());
+        }
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .unwrap(),
+            Some("cancelled")
+        );
+        assert_eq!(worker.logical_resident_bytes(), 32);
+
+        status.store(404, Ordering::SeqCst);
+        let mut gc = StaleGc::default();
+        tokio::time::timeout(Duration::from_secs(3), gc.run_round_at(&worker, cold_now()))
+            .await
+            .unwrap();
+        assert_eq!(observed.recv().await, Some("head"));
+        assert_eq!(worker.logical_resident_bytes(), 0);
+        assert!(worker.index.get(&block(0)).is_none());
+        assert!(worker.store.scan_allocated().unwrap().is_empty());
+
+        fill(&worker, &block(0), false).await;
+        status.store(1, Ordering::SeqCst);
+        let mut gc = StaleGc::default();
+        let work = gc.run_round_at(&worker, cold_now());
+        tokio::pin!(work);
+        tokio::select! {
+            event = observed.recv() => assert_eq!(event, Some("head")),
+            _ = &mut work => panic!("stalled HEAD unexpectedly completed"),
+            _ = tokio::time::sleep(Duration::from_secs(3)) => panic!("HEAD never arrived"),
+        }
+        stop.store(true, Ordering::Release);
+        tokio::time::timeout(Duration::from_secs(3), work)
+            .await
+            .unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(3), observed.recv())
+                .await
+                .unwrap(),
+            Some("cancelled")
+        );
+        assert_eq!(worker.logical_resident_bytes(), 32);
+        tokio::time::timeout(Duration::from_secs(3), rings)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        server.abort();
     }
 
     #[tokio::test]

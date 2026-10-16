@@ -18,6 +18,7 @@ pub(super) struct NamespaceRuntimes {
     config: WorkerConfig,
     root_lock: Arc<CacheRootLock>,
     backend: Arc<dyn BackendStore>,
+    background_heads: Option<Arc<origin_head::OriginHeads>>,
     metrics: WorkerMetrics,
     limiter: Arc<NamespaceRateLimiter>,
     load_slots: Arc<tokio::sync::Semaphore>,
@@ -101,6 +102,7 @@ impl NamespaceRuntimes {
         .with_rate_limiter(self.limiter.clone())
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
         worker.page_mutations = Arc::new(Mutations::new(self.uring));
+        worker.background_heads = self.background_heads.clone();
         worker.page_gc_metrics =
             PageGcMetrics::new(&self.metrics.registry, namespace.effective_name());
         worker.l1 = Arc::new(MemoryStore::with_shared_budget(
@@ -238,6 +240,8 @@ impl WorkerRuntime {
             config: config.clone(),
             root_lock,
             backend,
+            background_heads: uring
+                .then(|| origin_head::OriginHeads::new(config.stale_gc_head_concurrency)),
             metrics,
             limiter: Arc::new(NamespaceRateLimiter::new(config.rate_limits.clone())),
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),

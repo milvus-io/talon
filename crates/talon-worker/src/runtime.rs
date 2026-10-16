@@ -9,6 +9,7 @@ mod async_eviction;
 mod background;
 mod load;
 mod namespaces;
+mod origin_head;
 mod ownership_gc;
 mod stale_gc;
 pub use background::WorkerBackground;
@@ -112,6 +113,7 @@ pub struct WorkerRuntime {
     load_bytes: Arc<tokio::sync::Semaphore>,
     load_inflight_bytes: u64,
     backend: Arc<dyn BackendStore>,
+    background_heads: Option<Arc<origin_head::OriginHeads>>,
     /// Backend selected by the worker process. Optional only so unit-test
     /// runtimes that do not exercise backend routing retain their compact
     /// constructors.
@@ -231,6 +233,7 @@ impl WorkerRuntime {
             load_bytes: Arc::new(tokio::sync::Semaphore::new(1 << 30)),
             load_inflight_bytes: 1 << 30,
             backend,
+            background_heads: None,
             configured_backend: None,
             block_size,
             page_gc_metrics: PageGcMetrics::new(&metrics.registry, talon_core::DEFAULT_NAMESPACE),

@@ -94,12 +94,36 @@ impl Origin {
         tls: bool,
         version: Option<&'static rustls::SupportedProtocolVersion>,
         fragment: Option<usize>,
-        mut control: Option<IdleControl>,
+        control: Option<IdleControl>,
         suite: Option<rustls::SupportedCipherSuite>,
         body_updates: Option<bool>,
     ) -> Self {
-        let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
-            .unwrap();
+        Self::start_suite_at(
+            tls,
+            version,
+            fragment,
+            control,
+            suite,
+            body_updates,
+            "127.0.0.1:0",
+        )
+        .await
+    }
+    async fn start_suite_at(
+        tls: bool,
+        version: Option<&'static rustls::SupportedProtocolVersion>,
+        fragment: Option<usize>,
+        mut control: Option<IdleControl>,
+        suite: Option<rustls::SupportedCipherSuite>,
+        body_updates: Option<bool>,
+        bind: &str,
+    ) -> Self {
+        let cert = rcgen::generate_simple_self_signed(vec![
+            "localhost".into(),
+            "127.0.0.1".into(),
+            "::1".into(),
+        ])
+        .unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let mut provider = rustls::crypto::ring::default_provider();
         if let Some(suite) = suite {
@@ -135,7 +159,7 @@ impl Origin {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let listener = tokio::net::TcpListener::bind(bind).await.unwrap();
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(AtomicUsize::new(0));
         let count = requests.clone();
@@ -1676,6 +1700,59 @@ fn uring_tls_startup_policy_and_endpoint_floor() {
             .is_err());
         assert_eq!(only12.requests.load(Ordering::SeqCst), 0);
         assert_eq!(only12.negotiated.load(Ordering::SeqCst), 0);
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring and IPv6 loopback; verifies the endpoint TLS floor on the wire"]
+fn uring_ipv6_endpoint_floor_rejects_tls12_for_both_address_spellings() {
+    on_native_ring(async {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let origin =
+                Origin::start_suite_at(true, Some(version), None, None, None, None, "[::1]:0")
+                    .await;
+            let port = origin.address.port();
+            let endpoint = format!("https://[0:0:0:0:0:0:0:1]:{port}");
+            let unrestricted = MonoioClient::with_tls_config(origin.tls_unrestricted.clone())
+                .with_tls_mode(TlsMode::Rustls);
+            // Establish that the expanded IP, its certificate, and the server
+            // are usable before attributing a rejection to the endpoint policy.
+            assert_eq!(
+                unrestricted
+                    .execute(HttpRequest::new(
+                        Method::Get,
+                        format!("{endpoint}/keepalive"),
+                        vec![],
+                    ))
+                    .await
+                    .unwrap()
+                    .body,
+                "abcdefgh"
+            );
+            let restricted = MonoioClient::with_tls_config(origin.tls_unrestricted.clone())
+                .with_tls_mode(TlsMode::Rustls)
+                .with_endpoint_tls_min_version(&endpoint, TlsVersion::Tls13)
+                .unwrap();
+            let before = origin.requests.load(Ordering::SeqCst);
+            for host in ["[0:0:0:0:0:0:0:1]", "[::1]"] {
+                let response = restricted
+                    .execute(HttpRequest::new(
+                        Method::Get,
+                        format!("https://{host}:{port}/keepalive"),
+                        vec![],
+                    ))
+                    .await;
+                if version == &rustls::version::TLS12 {
+                    assert!(
+                        response.is_err(),
+                        "TLS 1.3 endpoint floor was ignored for {host}"
+                    );
+                    assert_eq!(origin.requests.load(Ordering::SeqCst), before);
+                } else {
+                    assert_eq!(response.unwrap().body, "abcdefgh");
+                }
+            }
+        }
     });
 }
 

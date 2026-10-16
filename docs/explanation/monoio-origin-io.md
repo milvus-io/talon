@@ -53,7 +53,9 @@ export TALON_WORKER_ORIGIN_TLS_ENDPOINT_MIN_VERSIONS='{"https://my-bucket.s3.us-
 
 Rules match an exact HTTPS hostname and effective port, not paths or wildcards;
 use the actual request host for virtual-hosted buckets. The global floor always
-wins over a lower endpoint value. These settings govern native origin downloads,
+wins over a lower endpoint value. IPv6 literals use the same canonical form for
+configuration and request lookup, so expanded and compressed spellings match.
+These settings govern native origin downloads and GC HEADs,
 not reqwest uploads; non-default rules require `ORIGIN_IO=uring`. A bucket policy
 using `s3:TlsVersion` can reject HTTP after a successful handshake: configure its
 minimum explicitly. HTTP 403 never causes automatic TLS renegotiation/replay.
@@ -124,10 +126,20 @@ waiting on them does not dispatch request work to a Tokio scheduler.
 
 The existing data-plane affinity policy pins rings to allowed logical CPUs when
 possible; affinity failure is logged. This does not confine kernel/device work
-to that CPU, or guarantee an exclusive physical core. Origin I/O reuses these
-rings; it creates no additional runtime, thread or
-cross-thread queue. The existing Send interfaces use ring-local tasks and
+to that CPU, or guarantee an exclusive physical core. Foreground origin I/O reuses these
+rings without an additional runtime, thread or cross-thread queue.
+The existing Send interfaces use ring-local tasks and
 completion channels to keep Monoio futures and buffers on their owning thread.
+
+Stale GC remains scheduled on Tokio. With native origin I/O, its HEAD requests
+are submitted to the first ready data-plane ring through a worker-wide bounded
+queue shared by every namespace. Queue capacity follows the existing GC HEAD
+concurrency setting; GC retains its existing concurrency and QPS limits. The
+same backend handles signing, TLS policy and retries. The five-second GC HEAD
+deadline includes startup and queue waits. Cancellation drops the ring-owned
+HTTP future, while shutdown rejects new HEADs and cancels queued/in-flight
+requests before ring teardown. Failed checks retain the cache; only an
+authoritative NotFound permits stale GC reclamation.
 
 LOAD/BatchLoad retain their existing shared payload-byte budget through retries
 and cache publication, plus their existing RPC and scheduling limits. This
@@ -289,6 +301,10 @@ cargo test -p talon-worker --test unbuffered_tls --locked
 cargo test -p talon-uring --tests --locked -- --ignored --nocapture
 cargo test -p talon-worker --test uring_origin --locked -- --ignored --nocapture \
   --skip uring_ktls_required --skip uring_ktls_idle --skip uring_ktls_tls13 --skip uring_live_s3
+# Tokio GC submits real S3 HEADs to existing rings, including cancellation/shutdown:
+cargo test -p talon-worker --lib --locked native_stale_gc_uses_existing_rings -- --ignored
+# IPv6 loopback: both IP spellings enforce the endpoint's TLS floor:
+cargo test -p talon-worker --test uring_origin --locked uring_ipv6_endpoint_floor -- --ignored
 # Also requires kTLS TLS 1.2; no rustls fallback can satisfy these tests:
 cargo test -p talon-worker --test uring_origin --locked uring_ktls_required -- --ignored
 cargo test -p talon-worker --test uring_origin --locked uring_ktls_idle -- --ignored
