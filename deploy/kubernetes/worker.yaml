@@ -92,7 +92,7 @@ spec:
               value: "talon"
             # Lets the worker look up its node's zone label for zone-aware
             # cache reads (ADR 0006); requires the talon-node-zone-reader
-            # ClusterRole in rbac.yaml. TALON_ZONE overrides the lookup.
+            # ClusterRole in node-zone-rbac.yaml. TALON_ZONE overrides the lookup.
             - name: TALON_NODE_NAME
               valueFrom:
                 fieldRef:
