@@ -15,12 +15,15 @@ pub struct MembershipSnapshot {
     /// With zone affinity active this is built from the same-zone subset, so
     /// every ranking downstream stays inside the reader's zone (ADR 0006).
     pub placement: Arc<CachePlacementTable>,
+    /// Optional read-only fallback over members outside the reader's zone.
+    /// LOAD always uses `placement` and never remaps an unavailable primary.
+    pub fallback_placement: Option<Arc<CachePlacementTable>>,
     /// Equality-only topology token, independent of instance availability.
     pub epoch: u64,
     /// Worker zones by dialable address, for read classification.
     pub zones_by_address: Arc<HashMap<String, String>>,
-    /// Zone affinity was requested but no same-zone worker exists, so
-    /// `placement` covers the full membership instead.
+    /// Affinity could not select local members; explicitly enabled read
+    /// fallback covers the full membership instead.
     pub affinity_fallback: bool,
     /// Serving instances keyed by logical worker ID. Missing IDs are offline or conflicted.
     pub instances: Arc<HashMap<String, (String, crate::WorkerClient)>>,
@@ -35,6 +38,7 @@ pub struct MembershipCache {
     zone: Option<String>,
     /// Whether same-zone placement filtering is enabled (default off).
     zone_affinity: bool,
+    zone_fallback: bool,
     entry: RwLock<Option<MembershipSnapshot>>,
 }
 
@@ -45,21 +49,32 @@ impl MembershipCache {
             ttl_ms,
             zone: None,
             zone_affinity: false,
+            zone_fallback: false,
             entry: RwLock::new(None),
         }
     }
 
     /// Configure zone-affine placement (ADR 0006). With `enabled` and a known
     /// `zone`, placement tables are built from the same-zone worker subset;
-    /// an empty subset falls back to the full membership.
+    /// an empty subset fails closed unless cross-zone fallback is enabled.
     pub fn with_zone_affinity(mut self, zone: Option<String>, enabled: bool) -> Self {
         self.zone = zone;
         self.zone_affinity = enabled;
         self
     }
 
+    /// Allow reads to try nonlocal candidates after local candidates fail.
+    /// Has no effect unless affinity is enabled. LOAD remains local even when
+    /// no local member is present.
+    pub fn with_zone_fallback(mut self, enabled: bool) -> Self {
+        self.zone_fallback = enabled;
+        self
+    }
+
     pub(crate) fn empty_with_same_policy(&self) -> Self {
-        Self::new(self.ttl_ms).with_zone_affinity(self.zone.clone(), self.zone_affinity)
+        Self::new(self.ttl_ms)
+            .with_zone_affinity(self.zone.clone(), self.zone_affinity)
+            .with_zone_fallback(self.zone_fallback)
     }
 
     /// Return the snapshot only while its refresh TTL is current.
@@ -98,10 +113,30 @@ impl MembershipCache {
             })
             .collect();
         let affinity_fallback = self.zone_affinity
-            && self.zone.is_some()
+            && self.zone_fallback
             && local.is_empty()
             && !view.workers.is_empty();
-        let selected: Vec<_> = if local.is_empty() {
+        let fallback_placement = if self.zone_affinity && self.zone_fallback {
+            match old {
+                Some(old) if old.epoch == view.topology_token => old.fallback_placement.clone(),
+                _ => {
+                    let remote: Vec<_> = view
+                        .workers
+                        .iter()
+                        .filter(|w| local.is_empty() || w.member.zone != self.zone)
+                        .map(|w| NodeInfo {
+                            id: talon_core::NodeId::new(w.member.worker_id.clone()),
+                            address: String::new(),
+                            role: talon_core::NodeRole::Worker,
+                        })
+                        .collect();
+                    (!remote.is_empty()).then(|| Arc::new(CachePlacementTable::new(&remote)))
+                }
+            }
+        } else {
+            None
+        };
+        let selected: Vec<_> = if !self.zone_affinity {
             view.workers.iter().collect()
         } else {
             local
@@ -144,6 +179,7 @@ impl MembershipCache {
         }
         let snapshot = MembershipSnapshot {
             placement,
+            fallback_placement,
             epoch: view.topology_token,
             zones_by_address: Arc::new(zones),
             affinity_fallback,
@@ -162,15 +198,27 @@ impl MembershipCache {
 
 impl MembershipSnapshot {
     /// Rank logical candidates before resolving their published availability.
-    pub(crate) fn candidates(
-        &self,
-        block: &talon_core::BlockId,
+    pub(crate) fn candidates<'a>(
+        &'a self,
+        block: &'a talon_core::BlockId,
         replicas_k: u8,
-    ) -> impl Iterator<Item = (&str, Result<crate::WorkerClient, crate::WorkerError>)> + '_ {
+    ) -> impl Iterator<
+        Item = (
+            &'a str,
+            Result<crate::WorkerClient, crate::WorkerError>,
+            bool,
+        ),
+    > + 'a {
         self.placement
             .rank(block, usize::from(replicas_k.max(1)))
             .into_iter()
-            .map(|owner| (owner.id.0.as_str(), self.instance(&owner.id.0)))
+            .map(|owner| (owner.id.0.as_str(), self.instance(&owner.id.0), false))
+            .chain(self.fallback_placement.iter().flat_map(move |table| {
+                table
+                    .rank(block, usize::from(replicas_k.max(1)))
+                    .into_iter()
+                    .map(|owner| (owner.id.0.as_str(), self.instance(&owner.id.0), true))
+            }))
     }
 
     pub(crate) fn target_error(
@@ -314,9 +362,12 @@ mod tests {
     #[test]
     fn affinity_tracks_logical_zones_and_falls_back_only_without_local_members() {
         let pool = crate::ConnectionPool::new();
-        let cache = MembershipCache::new(500).with_zone_affinity(Some("a".into()), true);
+        let cache = MembershipCache::new(500)
+            .with_zone_affinity(Some("a".into()), true)
+            .with_zone_fallback(true);
         let first = cache.replace(view(&[None, None]), Instant::now(), &pool);
-        assert_eq!(first.placement.workers().len(), 2);
+        assert_eq!(first.placement.workers().len(), 0);
+        assert_eq!(first.fallback_placement.as_ref().unwrap().worker_count(), 2);
         assert!(first.affinity_fallback);
         let second = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
         assert_ne!(first.epoch, second.epoch);
@@ -327,9 +378,71 @@ mod tests {
         for (zone, enabled) in [(Some("a".into()), false), (None, true)] {
             let cache = MembershipCache::new(500).with_zone_affinity(zone, enabled);
             let snapshot = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
-            assert_eq!(snapshot.placement.workers().len(), 2);
+            assert_eq!(
+                snapshot.placement.workers().len(),
+                if enabled { 0 } else { 2 }
+            );
             assert!(!snapshot.affinity_fallback);
         }
+    }
+
+    #[test]
+    fn cross_zone_candidates_preserve_load_ownership_and_recover_locally() {
+        let pool = crate::ConnectionPool::new();
+        let cache = MembershipCache::new(500)
+            .with_zone_affinity(Some("a".into()), true)
+            .with_zone_fallback(true);
+        let mut discovery = view(&[Some("a"), Some("b")]);
+        let block = talon_core::BlockId::new(
+            talon_core::ObjectId::new(talon_core::Backend::S3, "bucket", "key"),
+            0,
+            64,
+            talon_core::Version::new("v"),
+        );
+        let first = cache.replace(discovery.clone(), Instant::now(), &pool);
+        for state in [InstanceState::Offline, InstanceState::Conflict] {
+            discovery.workers[0].state = state;
+            let snapshot = cache.replace(discovery.clone(), Instant::now(), &pool);
+            assert!(Arc::ptr_eq(&first.placement, &snapshot.placement));
+            assert!(
+                snapshot.owner(&block).is_err(),
+                "LOAD cannot remap the primary"
+            );
+            let candidates: Vec<_> = snapshot.candidates(&block, 1).collect();
+            assert_eq!(candidates.len(), 2);
+            assert_eq!(candidates[0].0, "w0");
+            assert!(candidates[0].1.is_err());
+            assert!(!candidates[0].2);
+            assert_eq!(candidates[1].0, "w1");
+            assert!(candidates[1].1.is_ok());
+            assert!(candidates[1].2);
+        }
+        let recovered = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+        assert!(Arc::ptr_eq(&first.placement, &recovered.placement));
+        assert_eq!(recovered.owner(&block).unwrap().addr(), "w0:7001");
+        for zone in [None, Some("absent".into())] {
+            let strict = MembershipCache::new(500)
+                .with_zone_affinity(zone, true)
+                .replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+            assert_eq!(strict.placement.worker_count(), 0);
+            assert!(strict.owner(&block).is_err());
+            assert!(!strict.affinity_fallback);
+        }
+        let remote_only = MembershipCache::new(500)
+            .with_zone_affinity(Some("absent".into()), true)
+            .with_zone_fallback(true)
+            .replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+        assert!(
+            remote_only.owner(&block).is_err(),
+            "read fallback cannot enable remote LOAD"
+        );
+        assert_eq!(remote_only.candidates(&block, 1).count(), 1);
+        let no_affinity = MembershipCache::new(500).with_zone_fallback(true).replace(
+            discovery,
+            Instant::now(),
+            &pool,
+        );
+        assert!(no_affinity.fallback_placement.is_none());
     }
 
     #[test]
