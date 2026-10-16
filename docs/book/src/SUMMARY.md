@@ -28,6 +28,7 @@
 - [Rolling upgrades](./operations/rolling-upgrade.md)
 - [Cloud backends (S3/GCS/Azure)](./operations/cloud-backends.md)
 - [Zone-aware cache reads](./operations/zone-affinity.md)
+- [Kubernetes 多 AZ 部署](./operations/kubernetes-multi-az.zh-CN.md)
 - [Security hardening](./operations/security.md)
 - [Latency lab](./testing/latency-lab.md)
 - [Object-store gateway deployment](./operations/object-store-gateway.md)
