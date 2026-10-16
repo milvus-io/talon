@@ -1,0 +1,30 @@
+{{- if .Values.multiAz.enabled }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ .Release.Namespace }}-{{ .Release.Name }}-node-zone-reader
+rules:
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ .Release.Namespace }}-{{ .Release.Name }}-node-zone-reader
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ .Release.Namespace }}-{{ .Release.Name }}-node-zone-reader
+subjects:
+  {{- if .Values.worker.enabled }}
+  - kind: ServiceAccount
+    name: {{ .Release.Name }}-worker
+    namespace: {{ .Release.Namespace }}
+  {{- end }}
+  {{- range .Values.multiAz.clientServiceAccounts }}
+  - kind: ServiceAccount
+    name: {{ required "clientServiceAccounts[].name is required" .name | quote }}
+    namespace: {{ required "clientServiceAccounts[].namespace is required" .namespace | quote }}
+  {{- end }}
+{{- end }}

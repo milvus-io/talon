@@ -367,6 +367,21 @@ jobs:
               | python3 scripts/validate_rolling_upgrade_deploy.py
             echo "::endgroup::"
           done
+      - name: Validate multi-AZ scheduling and RBAC for both HA backends
+        run: |
+          for be in kubernetes etcd; do
+            helm lint deploy/helm/talon --strict --kube-version 1.30.0 \
+              -f deploy/helm/talon/values-multi-az.example.yaml --set coordinator.backend="$be"
+            helm template talon deploy/helm/talon --kube-version 1.30.0 -n talon \
+              -f deploy/helm/talon/values-multi-az.example.yaml --set coordinator.backend="$be" \
+              | python3 scripts/validate_multi_az_deploy.py
+          done
+          for args in '--set coordinator.backend=memory' '--set worker.replicas=1' '--kube-version 1.29.0'; do
+            if helm template talon deploy/helm/talon --kube-version 1.30.0 \
+                -f deploy/helm/talon/values-multi-az.example.yaml $args >/dev/null 2>&1; then
+              echo "invalid multi-AZ configuration accepted: $args"; exit 1
+            fi
+          done
       - name: Validate raw rollout manifests
         run: |
           for be in kubernetes etcd; do

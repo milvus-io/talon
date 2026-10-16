@@ -1,4 +1,5 @@
 {{- include "talon.validateBackend" . -}}
+{{- include "talon.validateMultiAz" . -}}
 {{- $isEtcd := eq .Values.coordinator.backend "etcd" -}}
 {{- $isK8s := eq .Values.coordinator.backend "kubernetes" -}}
 {{- $ha := ne .Values.coordinator.backend "memory" -}}
@@ -89,7 +90,13 @@ spec:
           labelSelector:
             matchLabels:
               {{- include "talon.selectorLabels" (dict "component" "coordinator") | nindent 14 }}
+        {{- if .Values.multiAz.enabled }}
+        {{- include "talon.zoneSpread" (dict "root" . "component" "coordinator") | nindent 8 }}
+        {{- end }}
       affinity:
+        {{- if .Values.multiAz.enabled }}
+        {{- include "talon.zoneNodeAffinity" . | nindent 8 }}
+        {{- end }}
         podAntiAffinity:
           preferredDuringSchedulingIgnoredDuringExecution:
             - weight: 100
