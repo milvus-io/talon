@@ -70,6 +70,9 @@ echo "=== conformance vectors ==="
 "$JAVA" -cp "$CLASSES" io.milvus.talon.ConformanceTest || exit 1
 
 echo
+echo "=== availability zones ==="
+"$JAVA" -cp "$CLASSES" io.milvus.talon.ZoneAffinityTest || exit 1
+
 echo "=== retained membership and failure semantics ==="
 "$JAVA" -cp "$CLASSES" io.milvus.talon.RollingUpgradeTest || exit 1
 
