@@ -159,6 +159,15 @@
              #[cfg(all(target_os = "linux", feature = "iouring"))]
              urb,
              #[cfg(feature = "sync")]
+--- a/src/driver/op.rs
++++ b/src/driver/op.rs
+@@ -212,3 +212,6 @@
+         super::CURRENT.with(|inner| inner.cancel_op(self))
+     }
+ }
++
++#[cfg(target_os = "linux")]
++mod tls_msg;
 --- a/src/driver/op/send.rs
 +++ b/src/driver/op/send.rs
 @@ -29,11 +29,25 @@
@@ -293,6 +302,122 @@
 +        ))
 +    }
 +}
+--- /dev/null
++++ b/src/driver/op/tls_msg.rs
+@@ -0,0 +1,113 @@
++//! Owned TLS ancillary data. All buffers and header/iovec storage outlive CQE.
++use std::io;
++use crate::{buf::{IoBuf, IoBufMut}, BufResult};
++use super::{Op, OpAble, super::shared_fd::SharedFd};
++#[cfg(feature = "iouring")]
++use io_uring::{opcode, types};
++#[cfg(any(feature = "legacy", feature = "poll-io"))]
++use crate::driver::ready::Direction;
++
++struct Header {
++    msg: libc::msghdr,
++    iov: libc::iovec,
++    control: [usize; 8],
++}
++impl Header {
++    fn new(ptr: *mut u8, len: usize, record_type: Option<u8>) -> Box<Self> {
++        let mut h = Box::new(Self {
++            msg: unsafe { std::mem::zeroed() },
++            iov: libc::iovec { iov_base: ptr.cast(), iov_len: len },
++            control: [0; 8],
++        });
++        h.msg.msg_iov = &mut h.iov;
++        h.msg.msg_iovlen = 1;
++        h.msg.msg_control = h.control.as_mut_ptr().cast();
++        h.msg.msg_controllen = std::mem::size_of_val(&h.control);
++        if let Some(kind) = record_type {
++            unsafe {
++                h.msg.msg_controllen = libc::CMSG_SPACE(1) as usize;
++                let cmsg = libc::CMSG_FIRSTHDR(&h.msg);
++                (*cmsg).cmsg_level = 282; // SOL_TLS
++                (*cmsg).cmsg_type = 1; // TLS_SET_RECORD_TYPE
++                (*cmsg).cmsg_len = libc::CMSG_LEN(1) as usize;
++                *libc::CMSG_DATA(cmsg) = kind;
++            }
++        }
++        h
++    }
++    fn record_type(&self) -> io::Result<u8> {
++        if self.msg.msg_flags & libc::MSG_CTRUNC != 0 {
++            return Err(io::Error::new(io::ErrorKind::InvalidData, "truncated TLS control message"));
++        }
++        unsafe {
++            let cmsg = libc::CMSG_FIRSTHDR(&self.msg);
++            if cmsg.is_null() { return Ok(23); }
++            if (*cmsg).cmsg_level != 282 || (*cmsg).cmsg_type != 2
++                || (*cmsg).cmsg_len != libc::CMSG_LEN(1) as usize {
++                return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid TLS record type"));
++            }
++            Ok(*libc::CMSG_DATA(cmsg))
++        }
++    }
++}
++
++pub(crate) struct RecvTls<T> { fd: SharedFd, buf: T, header: Box<Header>, flags: i32 }
++impl<T: IoBufMut> Op<RecvTls<T>> {
++    pub(crate) fn recv_tls(fd: SharedFd, mut buf: T, flags: i32) -> io::Result<Self> {
++        // A receive can span TLS records. A record-sized cap leaves too little
++        // space after a partial record, forcing kTLS to decrypt and copy the next.
++        let header = Header::new(buf.write_ptr(), buf.bytes_total(), None);
++        Op::submit_with(RecvTls { fd, buf, header, flags })
++    }
++    pub(crate) async fn wait_tls(self) -> BufResult<(usize, u8, i32), T> {
++        let complete = self.await;
++        let mut data = complete.data;
++        let result = complete.meta.result.and_then(|n| {
++            unsafe { data.buf.set_init(n as usize); }
++            data.header.record_type().map(|kind| (n as usize, kind, data.header.msg.msg_flags))
++        });
++        (result, data.buf)
++    }
++}
++impl<T: IoBufMut> OpAble for RecvTls<T> {
++    #[cfg(feature = "iouring")]
++    fn uring_op(&mut self) -> io_uring::squeue::Entry {
++        opcode::RecvMsg::new(types::Fd(self.fd.raw_fd()), &mut self.header.msg)
++            .flags(self.flags as _).build()
++    }
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_interest(&self) -> Option<(Direction, usize)> {
++        self.fd.registered_index().map(|id| (Direction::Read, id))
++    }
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_call(&mut self) -> io::Result<u32> {
++        crate::syscall_u32!(recvmsg(self.fd.raw_fd(), &mut self.header.msg, self.flags))
++    }
++}
++
++pub(crate) struct SendTls<T> { fd: SharedFd, buf: T, header: Box<Header> }
++impl<T: IoBuf> Op<SendTls<T>> {
++    pub(crate) fn send_tls(fd: SharedFd, buf: T, kind: u8) -> io::Result<Self> {
++        let header = Header::new(buf.read_ptr() as *mut u8, buf.bytes_init(), Some(kind));
++        Op::submit_with(SendTls { fd, buf, header })
++    }
++    pub(crate) async fn wait_tls_send(self) -> BufResult<usize, T> {
++        let complete = self.await;
++        (complete.meta.result.map(|n| n as usize), complete.data.buf)
++    }
++}
++impl<T: IoBuf> OpAble for SendTls<T> {
++    #[cfg(feature = "iouring")]
++    fn uring_op(&mut self) -> io_uring::squeue::Entry {
++        opcode::SendMsg::new(types::Fd(self.fd.raw_fd()), &self.header.msg)
++            .flags(libc::MSG_NOSIGNAL as _).build()
++    }
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_interest(&self) -> Option<(Direction, usize)> {
++        self.fd.registered_index().map(|id| (Direction::Write, id))
++    }
++    #[cfg(any(feature = "legacy", feature = "poll-io"))]
++    fn legacy_call(&mut self) -> io::Result<u32> {
++        crate::syscall_u32!(sendmsg(self.fd.raw_fd(), &self.header.msg, libc::MSG_NOSIGNAL))
++    }
++}
 --- a/src/driver/uring/mod.rs
 +++ b/src/driver/uring/mod.rs
 @@ -92,6 +92,16 @@
@@ -353,6 +478,23 @@
      }
  
      /// Open a TCP connection to a remote host.
+@@ -656,3 +666,16 @@
+         let _ = socket.into_raw_socket();
+     }
+ }
++
++#[cfg(target_os = "linux")]
++impl TcpStream {
++    /// Receive directly into an owned buffer, returning the kTLS record type
++    /// and message flags. Ancillary storage and the FD survive cancellation.
++    pub async fn recv_tls<T: IoBufMut>(&mut self, buf: T, flags: i32) -> BufResult<(usize, u8, i32), T> {
++        Op::recv_tls(self.fd.clone(), buf, flags).unwrap().wait_tls().await
++    }
++    /// Send a TLS control record using owned payload and ancillary storage.
++    pub async fn send_tls<T: IoBuf>(&mut self, buf: T, kind: u8) -> BufResult<usize, T> {
++        Op::send_tls(self.fd.clone(), buf, kind).unwrap().wait_tls_send().await
++    }
++}
 --- a/src/net/unix/pipe.rs
 +++ b/src/net/unix/pipe.rs
 @@ -24,9 +24,9 @@

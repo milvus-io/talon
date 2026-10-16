@@ -259,11 +259,11 @@ pub struct WorkerConfig {
     /// - `0` (the default) means **one ring per available core**.
     /// - `n > 0` runs exactly `n` rings.
     ///
-    /// The worker falls back to the portable Tokio data plane automatically
-    /// when io_uring is unavailable (older kernels, restrictive seccomp, some
-    /// container runtimes), so this default is safe everywhere. Set
-    /// `data_plane_rings = 1` with `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` to
-    /// pin the legacy path explicitly.
+    /// With `TALON_WORKER_ORIGIN_IO=tokio`, the worker falls back to the
+    /// portable Tokio data plane when io_uring is unavailable (older kernels,
+    /// restrictive seccomp, some container runtimes). The default native
+    /// origin path requires io_uring. Also set
+    /// `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` to pin the legacy data plane.
     pub data_plane_rings: usize,
     /// Contribution of each data-plane thread to the worker-global connection
     /// budget. Defaults to 8192. Multiplied by the resolved Monoio ring count,

@@ -132,7 +132,7 @@ run_plane() {
 echo "sweep: conns=$CONNS range=${RANGE}B ${SECONDS_PER}s each after ${WARMUP}s warmup"
 start_coordinator
 run_plane "io_uring" ""
-run_plane "tokio" "TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1"
+run_plane "tokio" "TALON_WORKER_ORIGIN_IO=tokio TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1"
 
 echo
 echo "Logs: $LOG_DIR"

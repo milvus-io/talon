@@ -5,22 +5,39 @@ use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 use async_trait::async_trait;
 use monoio::io::sink::SinkExt;
 mod body;
+mod ktls;
+mod policy;
 mod pool;
+pub use policy::{KernelTlsCapabilities, TlsVersion};
 mod tls;
 use body::OriginIo;
 use monoio_http::{
     common::body::{FixedBody, HttpBody},
     h1::codec::encoder::GenericEncoder,
 };
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 enum Connection {
     Plain(monoio::net::TcpStream),
     Tls(Box<tls::TlsStream>),
+    Ktls(Box<ktls::KtlsStream>),
+}
+
+/// Origin record-layer policy. Auto prefers kTLS using the startup snapshot.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TlsMode {
+    #[default]
+    Auto,
+    Rustls,
+    Ktls,
 }
 
 pub struct MonoioClient {
     tls: Arc<rustls::ClientConfig>,
+    tls_mode: TlsMode,
+    capabilities: KernelTlsCapabilities,
+    minimum_tls: TlsVersion,
+    endpoint_minimums: HashMap<String, TlsVersion>,
 }
 
 impl Default for MonoioClient {
@@ -48,7 +65,49 @@ impl MonoioClient {
         let mut tls = (*tls).clone();
         // This experiment implements HTTP/1.1, so never negotiate h2.
         tls.alpn_protocols = vec![b"http/1.1".to_vec()];
-        Self { tls: Arc::new(tls) }
+        tls.enable_secret_extraction = true;
+        Self {
+            tls: Arc::new(tls),
+            tls_mode: TlsMode::Auto,
+            capabilities: KernelTlsCapabilities::default(),
+            minimum_tls: TlsVersion::default(),
+            endpoint_minimums: HashMap::new(),
+        }
+    }
+
+    /// Select a record layer; kTLS mode fails explicitly if offload is unavailable.
+    pub fn with_tls_mode(mut self, mode: TlsMode) -> Self {
+        self.tls_mode = mode;
+        let mut tls = (*self.tls).clone();
+        tls.enable_secret_extraction = mode != TlsMode::Rustls;
+        self.tls = Arc::new(tls); // Also isolates the pool from the prior mode.
+        self
+    }
+
+    /// Install the snapshot collected once during service startup. No request
+    /// performs capability probing; without a snapshot auto uses rustls.
+    pub fn with_kernel_tls_capabilities(mut self, capabilities: KernelTlsCapabilities) -> Self {
+        self.capabilities = capabilities;
+        self.tls = Arc::new((*self.tls).clone());
+        self
+    }
+
+    pub fn with_tls_min_version(mut self, minimum: TlsVersion) -> Self {
+        self.minimum_tls = minimum;
+        self.tls = Arc::new((*self.tls).clone());
+        self
+    }
+
+    /// Raise the global floor for one HTTPS origin (host and effective port).
+    pub fn with_endpoint_tls_min_version(
+        mut self,
+        endpoint: &str,
+        minimum: TlsVersion,
+    ) -> Result<Self, &'static str> {
+        self.endpoint_minimums
+            .insert(policy::endpoint_key(endpoint)?, minimum);
+        self.tls = Arc::new((*self.tls).clone());
+        Ok(self)
     }
 
     async fn send_request(&self, request: HttpRequest) -> Result<HttpResponse, String> {
@@ -72,84 +131,135 @@ impl MonoioClient {
         if let Some(download) = &download {
             download.reset();
         }
+        let tls_mode = self.tls_mode;
+        let minimum = self.minimum_tls.max(
+            self.endpoint_minimums
+                .get(&policy::authority_key(&host, port))
+                .copied()
+                .unwrap_or_default(),
+        );
+        let capabilities = self.capabilities.clone();
         let tokio = tokio::runtime::Handle::current();
         talon_uring::spawn_cancellable(async move {
-            let operation = async {
-                let authority = format!(
-                    "{}://{}",
-                    uri.scheme_str().unwrap(),
-                    uri.authority().unwrap()
-                );
-                let pooled = pool::take(&tls, &authority).await;
-                let mut connection = if let Some(connection) = pooled {
-                    connection
-                } else {
-                    monoio::time::timeout(Duration::from_secs(10), async {
-                        // DNS can block in libc; resolve on Tokio's resolver before
-                        // opening the payload socket on this ring.
-                        let addresses = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-                            vec![std::net::SocketAddr::new(ip, port)]
+                let operation = async {
+                    let authority = format!(
+                        "{}://{}",
+                        uri.scheme_str().unwrap(),
+                        uri.authority().unwrap()
+                    );
+                    // GET/HEAD responses are fully assembled before returning any
+                    // bytes to the cache. A KeyUpdate reconnect discards that
+                    // incomplete response and replays once on a fresh kTLS socket.
+                    let replayable = matches!(request.method, Method::Get | Method::Head);
+                    let mut replayed_key_update = false;
+                    loop {
+                        let pooled = if replayed_key_update { None } else { pool::take(&tls, &authority).await };
+                        let mut connection = if let Some(connection) = pooled {
+                            connection
                         } else {
-                            let lookup = host.clone();
-                            tokio
-                                .spawn(async move {
-                                    tokio::net::lookup_host((lookup.as_str(), port))
+                            monoio::time::timeout(Duration::from_secs(10), async {
+                                // DNS can block in libc; resolve on Tokio's resolver before
+                                // opening the payload socket on this ring.
+                                let addresses = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+                                    vec![std::net::SocketAddr::new(ip, port)]
+                                } else {
+                                    let lookup = host.clone();
+                                    tokio
+                                        .spawn(async move {
+                                            tokio::net::lookup_host((lookup.as_str(), port))
+                                                .await
+                                                .map(|it| it.collect::<Vec<_>>())
+                                        })
                                         .await
-                                        .map(|it| it.collect::<Vec<_>>())
-                                })
-                                .await
-                                .map_err(|_| "origin resolver stopped")?
-                                .map_err(|_| "origin DNS lookup failed")?
-                        };
-                        let mut socket = None;
-                        for address in addresses {
-                            match monoio::net::TcpStream::connect(address).await {
-                                Ok(stream) => {
-                                    socket = Some(stream);
-                                    break;
+                                        .map_err(|_| "origin resolver stopped")?
+                                        .map_err(|_| "origin DNS lookup failed")?
+                                };
+                                let name = https.then(|| rustls::pki_types::ServerName::try_from(host.clone()))
+                                    .transpose().map_err(|_| "invalid TLS server name".to_owned())?;
+                                // Pure lookups only: all kernel probes finished at startup.
+                                let allowed = if https { policy::minimum(&tls, minimum)? } else { tls.clone() };
+                                let preferred = if https && tls_mode != TlsMode::Rustls {
+                                    capabilities.select(&allowed)
+                                } else { None };
+                                if https && tls_mode == TlsMode::Ktls && preferred.is_none() {
+                                    return Err("origin kTLS unavailable for allowed protocols/ciphers (no matching startup capability)".into());
                                 }
-                                Err(_) => continue,
-                            }
+                                let mut use_kernel = preferred.is_some();
+                                loop {
+                                    let mut socket = None;
+                                    for address in &addresses {
+                                        if let Ok(stream) = monoio::net::TcpStream::connect(*address).await {
+                                            socket = Some(stream);
+                                            break;
+                                        }
+                                    }
+                                    let stream = socket.ok_or("origin TCP connect failed")?;
+                                    stream.set_nodelay(true).map_err(|_| "origin TCP configuration failed")?;
+                                    if !https { break Ok::<_, String>(Connection::Plain(stream)); }
+                                    let config = if use_kernel { preferred.as_ref().unwrap() } else { &allowed };
+                                    let stream = match tls::TlsStream::connect(stream, config.clone(), name.clone().expect("HTTPS name")).await {
+                                        Ok(stream) => stream,
+                                        Err(error) if use_kernel && tls_mode == TlsMode::Auto && policy::negotiation_rejected(&error) => {
+                                            // The peer may require a different version/cipher. Retry
+                                            // once with the original allowed set, never a lower floor.
+                                            // Certificate/authentication failures do not take this path.
+                                            tracing::debug!("origin rejected kTLS-preferred negotiation; reconnecting with rustls");
+                                            use_kernel = false;
+                                            continue;
+                                        }
+                                        Err(_) => return Err("origin TLS handshake/certificate verification failed".into()),
+                                    };
+                                    tracing::debug!(protocol = ?stream.protocol(), origin_tls = if use_kernel { "ktls" } else { "rustls" }, "origin TLS negotiated");
+                                    if !use_kernel { break Ok(Connection::Tls(Box::new(stream))); }
+                                    let rekey_supported = stream.protocol().1.is_some_and(|suite| capabilities.supports_key_update(suite));
+                                    match ktls::KtlsStream::connect(stream, rekey_supported).await {
+                                        Ok(stream) => {
+                                            tracing::debug!(origin_tls = "ktls", "origin TLS record layer selected");
+                                            break Ok(Connection::Ktls(Box::new(stream)));
+                                        }
+                                        Err(error) if tls_mode == TlsMode::Auto => {
+                                            // Handoff may have installed only one direction. Drop
+                                            // it and redo the handshake on a fresh socket. No HTTP
+                                            // bytes have been sent, so this cannot replay a request.
+                                            tracing::debug!(origin_tls = "rustls", reason = %error, "kTLS unavailable; reconnecting with rustls");
+                                            use_kernel = false;
+                                        }
+                                        Err(error) => break Err(format!("origin kTLS setup failed: {error}")),
+                                    }
+                                }
+                            })
+                            .await
+                            .map_err(|_| "origin connect timed out")??
+                        };
+                        let result = match &mut connection {
+                            Connection::Plain(codec) => exchange(codec, uri.clone(), request.clone(), download.as_ref()).await,
+                            Connection::Tls(codec) => exchange(codec.as_mut(), uri.clone(), request.clone(), download.as_ref()).await,
+                            Connection::Ktls(codec) => exchange(codec.as_mut(), uri.clone(), request.clone(), download.as_ref()).await,
+                        };
+                        if result.is_err() && replayable && !replayed_key_update
+                            && matches!(&connection, Connection::Ktls(stream) if stream.needs_key_update_reconnect())
+                        {
+                            // No rustls fallback and no reuse of this socket: the new
+                            // handshake derives fresh keys and uses the same kTLS policy.
+                            drop(connection);
+                            replayed_key_update = true;
+                            tracing::debug!("origin KeyUpdate requires reconnect; replaying GET/HEAD once on fresh kTLS connection");
+                            continue;
                         }
-                        let stream = socket.ok_or("origin TCP connect failed")?;
-                        stream
-                            .set_nodelay(true)
-                            .map_err(|_| "origin TCP configuration failed")?;
-                        if https {
-                            let name = rustls::pki_types::ServerName::try_from(host)
-                                .map_err(|_| "invalid TLS server name")?;
-                            let stream = tls::TlsStream::connect(stream, tls.clone(), name)
-                                .await
-                                .map_err(|_| {
-                                "origin TLS handshake/certificate verification failed"
-                            })?;
-                            Ok::<_, &str>(Connection::Tls(Box::new(stream)))
-                        } else {
-                            Ok(Connection::Plain(stream))
+                        let (response, reusable) = result?;
+                        if reusable {
+                            pool::put(&tls, authority, connection);
                         }
-                    })
+                        return Ok(response);
+                    }
+
+                };
+                monoio::time::timeout(Duration::from_secs(300), operation)
                     .await
-                    .map_err(|_| "origin connect timed out")??
-                };
-                let (response, reusable) = match &mut connection {
-                    Connection::Plain(codec) => {
-                        exchange(codec, uri, request, download.as_ref()).await?
-                    }
-                    Connection::Tls(codec) => {
-                        exchange(codec.as_mut(), uri, request, download.as_ref()).await?
-                    }
-                };
-                if reusable {
-                    pool::put(&tls, authority, connection);
-                }
-                Ok(response)
-            };
-            monoio::time::timeout(Duration::from_secs(300), operation)
-                .await
-                .map_err(|_| "origin io_uring request timed out".to_owned())?
-        })
-        .await
-        .map_err(|e| format!("origin ring task stopped: {e}"))?
+                    .map_err(|_| "origin io_uring request timed out".to_owned())?
+            })
+            .await
+            .map_err(|e| format!("origin ring task stopped: {e}"))?
     }
 }
 

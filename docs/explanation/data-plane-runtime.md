@@ -76,18 +76,22 @@ is what `io_uring` is designed for. It submits and completes operations in
 batches through shared ring buffers rather than one syscall per operation, and a
 thread-per-core design removes cross-thread scheduling from the path entirely.
 
-Talon runs the `io_uring` Layer 1 by default, one ring per core, and falls back
-to a portable Tokio implementation on hosts that cannot use io_uring:
+Talon runs the `io_uring` Layer 1 by default, one ring per core. Origin HTTP(S)
+and cache I/O also default to Monoio/io_uring, with automatic kTLS selection.
+On hosts that cannot use io_uring, set `TALON_WORKER_ORIGIN_IO=tokio` to allow
+the data plane to fall back to its portable Tokio implementation:
 
 ```sh
 talon-worker                        # io_uring, one ring per core (default)
 talon-worker --data-plane-rings 4   # exactly four rings
 
 # Pin the Tokio path explicitly (escape hatch)
-TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 talon-worker
+TALON_WORKER_ORIGIN_IO=tokio TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 talon-worker
 ```
 
-The fallback is a **runtime capability probe**, not a kernel-version check.
+With the Tokio origin path, fallback uses a **runtime capability probe**, not a
+kernel-version check. The default native origin path requires io_uring and
+rejects startup if it is unavailable.
 io_uring needs both a recent enough kernel and permission to use it — the
 `io_uring_disabled` sysctl, a seccomp filter, or a container runtime's default
 profile can each block the syscall on a kernel that nominally supports it. The

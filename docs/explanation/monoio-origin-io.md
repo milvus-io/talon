@@ -1,12 +1,14 @@
 # Experimental Monoio origin and cache I/O
 
-Set `TALON_WORKER_ORIGIN_IO=uring` to use native io_uring for Worker origin
-HTTP(S) downloads and whole-block/page cache commits. The default remains
-`tokio`. Unknown values and io_uring initialization failures stop startup;
+Worker origin HTTP(S) downloads and whole-block/page cache commits use native
+Monoio/io_uring by default (`TALON_WORKER_ORIGIN_IO=uring`), with automatic
+kTLS selection (`TALON_WORKER_ORIGIN_TLS=auto`). Set
+`TALON_WORKER_ORIGIN_IO=tokio` to use the legacy origin/cache path.
+Unknown values and io_uring initialization failures stop startup in `uring` mode;
 the experiment never silently switches to an epoll or blocking implementation.
 
 ```sh
-TALON_WORKER_ORIGIN_IO=uring target/release/talon-worker
+target/release/talon-worker
 ```
 
 The existing Worker configuration, credentials, namespace policy and cache
@@ -15,6 +17,101 @@ may include zero-filled tail padding. Choose the data-plane
 runtime consistently: origin `uring` requires the native Monoio data plane.
 `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` with origin `uring`, or unavailable
 io_uring, is rejected at startup. Non-ring native I/O callers receive an error.
+
+## Automatic kTLS selection
+
+When origin I/O is `uring`, `TALON_WORKER_ORIGIN_TLS=auto` is the default.
+Before serving traffic, the worker runs six bounded loopback probes with dummy
+keys: TLS 1.2/1.3 × AES-128-GCM/AES-256-GCM/ChaCha20-Poly1305. These use the
+existing Tokio startup runtime, without creating a Monoio runtime or thread.
+Each probe records TX/RX installation and traffic-key replacement separately.
+TLS 1.3 installation also requires `TLS_RX_EXPECT_NO_PAD` support.
+TLS 1.3 remains eligible even when replacement is unsupported. The immutable
+snapshot is shared across all origin rings. No request performs capability probes. This detects backports without guessing
+from `uname`; unsupported/failed probes disable the corresponding combination.
+
+Before the TLS handshake, auto chooses the highest offloadable version and
+restricts offered ciphers to those supported by the snapshot and caller config:
+
+| Kernel capability and allowed versions | Preferred handshake/record layer |
+| --- | --- |
+| TLS 1.3 TX/RX with `TLS_RX_EXPECT_NO_PAD` | TLS 1.3 + kTLS |
+| TLS 1.2 only | TLS 1.2 + kTLS |
+| None, or policy excludes all offloadable combinations | Normal highest allowed version + rustls |
+
+Rustls still authenticates the peer. Caller trust roots, client authentication,
+explicit version/cipher restrictions, and other settings survive filtering.
+The narrow `ClientConfig::with_restricted_cipher_suites` patch only removes
+suites/versions; it cannot re-enable caller-disabled algorithms.
+
+`TALON_WORKER_ORIGIN_TLS_MIN_VERSION=1.2` is the default global floor; set it to
+`1.3` to require TLS 1.3. Specific origins may raise that floor with, for example:
+
+```bash
+export TALON_WORKER_ORIGIN_TLS_ENDPOINT_MIN_VERSIONS='{"https://my-bucket.s3.us-east-1.amazonaws.com":"1.3"}'
+```
+
+Rules match an exact HTTPS hostname and effective port, not paths or wildcards;
+use the actual request host for virtual-hosted buckets. The global floor always
+wins over a lower endpoint value. IPv6 literals use the same canonical form for
+configuration and request lookup, so expanded and compressed spellings match.
+These settings govern native origin downloads and GC HEADs,
+not reqwest uploads; non-default rules require `ORIGIN_IO=uring`. A bucket policy
+using `s3:TlsVersion` can reject HTTP after a successful handshake: configure its
+minimum explicitly. HTTP 403 never causes automatic TLS renegotiation/replay.
+
+If the peer explicitly rejects the preferred protocol/cipher negotiation, auto
+reconnects once using the original allowed set and rustls. Certificate failures,
+malformed records and connection resets do not trigger this retry. If actual
+handoff fails after socket state has changed, auto also closes that socket and
+reconnects with rustls before any HTTP bytes are sent. Both paths preserve the
+minimum version; there is no in-place rollback or certificate-check bypass.
+Once application traffic starts, protocol/authentication errors fail the request.
+The specific exception is an authenticated KeyUpdate that cannot be installed:
+close the socket and replay an incomplete GET/HEAD once on a fresh connection,
+using kTLS again with newly negotiated keys. The incomplete body is discarded
+before any cache commit. POST/PUT/DELETE are never replayed by this mechanism;
+a second KeyUpdate failure returns an error. The existing outer retry policy
+can make further bounded attempts. Idle KeyUpdates simply close the connection
+when replacement is unavailable. KeyUpdate does not cause a rustls downgrade or
+an endpoint blacklist. Newer kernels replace keys on the existing connection.
+
+`TALON_WORKER_ORIGIN_TLS=rustls` skips probes and disables offload; `ktls` requires
+it, fails startup if the capability snapshot is empty, and never falls back.
+An endpoint whose allowed versions/ciphers cannot offload fails its request in
+strict mode. Startup logs show the snapshot; debug logs show actual negotiation
+and record-layer selection (`RUST_LOG=talon_backend=debug`). Standalone users of
+`MonoioClient` must call `KernelTlsCapabilities::probe` during initialization and
+install the result with `with_kernel_tls_capabilities`; an unprobed client uses
+rustls in auto mode. Setting `ORIGIN_IO=tokio` uses the separate reqwest path.
+
+In kTLS mode, owned io_uring `recvmsg` operations put application plaintext
+straight into the final aligned HTTP body allocation. Owned ancillary storage,
+iovecs and descriptors survive cancellation through completion. HTTP framing
+uses small peeks followed by exact consumption; peeks can copy a body prefix.
+Control records are bounded and processed separately: rustls retains ticket/key
+scheduling, while the adapter installs derived keys and handles alerts and
+KeyUpdate replies. TCP queue inspection prevents reuse with a partial encrypted
+record that kTLS readiness has not exposed yet. A conservative record-sequence
+budget closes long-lived connections before cipher confidentiality limits.
+TLS 1.2 TX handoff separates Linux's incrementing explicit nonce range from
+rustls's prior XOR-derived handshake nonces; it does not restart the old nonce.
+
+This removes the remaining **user-space body copy** from the kTLS payload path,
+not every kernel copy. Small receives and HTTP/TLS boundary misalignment can
+still require kernel buffering. TLS 1.3 kTLS always enables the kernel's
+`TLS_RX_EXPECT_NO_PAD` direct-decryption hint; there is no separate switch.
+TLS 1.2 does not use this option. A kernel that cannot enable the hint is
+excluded from TLS 1.3 offload by the startup probe; the existing auto/strict
+selection and minimum-version policy still apply. Configured origins are
+expected to send unpadded application records: padded or control records are
+decrypted again into a kernel buffer, adding work rather than breaking TLS
+correctness. See the [kernel TLS interface](https://docs.kernel.org/networking/tls.html).
+
+Linux 6.2 has basic kTLS but cannot replace installed traffic keys. On the
+validation machine, auto therefore uses TLS 1.3 kTLS and reconnects when a
+KeyUpdate arrives. In-place key replacement still requires a newer kernel;
+reconnect success must not be reported as in-place key-update support.
 
 ## Execution and ownership
 
@@ -29,10 +126,20 @@ waiting on them does not dispatch request work to a Tokio scheduler.
 
 The existing data-plane affinity policy pins rings to allowed logical CPUs when
 possible; affinity failure is logged. This does not confine kernel/device work
-to that CPU, or guarantee an exclusive physical core. Origin I/O reuses these
-rings; it creates no additional runtime, thread or
-cross-thread queue. The existing Send interfaces use ring-local tasks and
+to that CPU, or guarantee an exclusive physical core. Foreground origin I/O reuses these
+rings without an additional runtime, thread or cross-thread queue.
+The existing Send interfaces use ring-local tasks and
 completion channels to keep Monoio futures and buffers on their owning thread.
+
+Stale GC remains scheduled on Tokio. With native origin I/O, its HEAD requests
+are submitted to the first ready data-plane ring through a worker-wide bounded
+queue shared by every namespace. Queue capacity follows the existing GC HEAD
+concurrency setting; GC retains its existing concurrency and QPS limits. The
+same backend handles signing, TLS policy and retries. The five-second GC HEAD
+deadline includes startup and queue waits. Cancellation drops the ring-owned
+HTTP future, while shutdown rejects new HEADs and cancels queued/in-flight
+requests before ring teardown. Failed checks retain the cache; only an
+authoritative NotFound permits stale GC reclamation.
 
 LOAD/BatchLoad retain their existing shared payload-byte budget through retries
 and cache publication, plus their existing RPC and scheduling limits. This
@@ -126,7 +233,7 @@ Both configured namespaces and namespaces created on demand use this execution
 policy. Whole-block sidecar failures retain the existing best-effort behavior;
 paged commits require a sidecar before publishing their page.
 
-## TLS buffer lifetime
+## Rustls fallback buffer lifetime
 
 The adapter transfers its input allocation into Monoio socket operations. Rustls
 is called only after completion. It borrows accepted plaintext from that same
@@ -140,7 +247,7 @@ state handlers. Only the opt-in client's accepted application-data delivery
 changes from an internal Vec queue to an input-buffer range. Buffered clients
 and the original unbuffered entry point retain their behavior. TLS 1.2/1.3,
 session tickets, and key updates continue through rustls's original state
-machine. No key extraction, custom cryptography, or kTLS is involved.
+machine. This fallback does not extract keys or use kTLS.
 
 Records are read with a header read followed by a payload read. This avoids
 compacting application ciphertext across receives but adds completion overhead;
@@ -151,7 +258,7 @@ with each ciphertext record capped at 18,432 bytes before rustls validation.
 ## Scope and limitations
 
 - This changes the I/O engine, **not** the complete-Range buffering contract.
-  It is not streaming download-to-disk or end-to-end zero-copy. The TLS adapter
+  It is not streaming download-to-disk or end-to-end zero-copy. The rustls adapter
   receives into an owned buffer, authenticates/decrypts in place, and borrows
   plaintext using the opt-in rustls patch. It removes the ciphertext adapter
   copy and internal plaintext-queue copy. One user-space payload copy remains:
@@ -192,7 +299,20 @@ as a passing fallback run.
 ```sh
 cargo test -p talon-worker --test unbuffered_tls --locked
 cargo test -p talon-uring --tests --locked -- --ignored --nocapture
-cargo test -p talon-worker --test uring_origin --locked -- --ignored --nocapture
+cargo test -p talon-worker --test uring_origin --locked -- --ignored --nocapture \
+  --skip uring_ktls_required --skip uring_ktls_idle --skip uring_ktls_tls13 --skip uring_live_s3
+# Tokio GC submits real S3 HEADs to existing rings, including cancellation/shutdown:
+cargo test -p talon-worker --lib --locked native_stale_gc_uses_existing_rings -- --ignored
+# IPv6 loopback: both IP spellings enforce the endpoint's TLS floor:
+cargo test -p talon-worker --test uring_origin --locked uring_ipv6_endpoint_floor -- --ignored
+# Also requires kTLS TLS 1.2; no rustls fallback can satisfy these tests:
+cargo test -p talon-worker --test uring_origin --locked uring_ktls_required -- --ignored
+cargo test -p talon-worker --test uring_origin --locked uring_ktls_idle -- --ignored
+# TLS 1.3 without key replacement: native reconnect, partial body discard,
+# retry bound, no replay for POST (e.g. validation Linux 6.2):
+cargo test -p talon-worker --test uring_origin --locked uring_ktls_tls13_reconnect_without_key_update -- --ignored
+# Requires TLS 1.3 kernel key replacement; fails explicitly on older kernels:
+cargo test -p talon-worker --test uring_origin --locked uring_ktls_tls13_key_update -- --ignored
 ```
 
 The rustls regression checks input/decoded-payload pointer containment for six
@@ -222,3 +342,27 @@ durability.
 On the local development machine use the prescribed `wt-build` container and
 data-disk mounts. Localhost tests require `NO_PROXY=127.0.0.1,localhost` and
 `no_proxy=127.0.0.1,localhost` when the shell has an HTTP proxy configured.
+
+The kTLS tests additionally cover AES-128/256-GCM and ChaCha20-Poly1305,
+fixed/chunked aligned downloads, direct/buffered cache commits, truncated bodies,
+cancellation, idle close/partial records, tampered ciphertext rejection, and
+automatic fallback without bypassing certificate checks. Separate strict-kTLS
+tests distinguish TLS 1.3 reconnection on old kernels from in-place key
+replacement on newer kernels; rustls fallback cannot satisfy either test.
+These checks do not establish a throughput improvement.
+
+The startup-policy tests check deterministic capability matrices, preservation of
+caller restrictions, endpoint minimums, pool isolation, TLS 1.3-only server
+fallback, and no replay on HTTP 403. Set `TALON_TEST_EXPECT_AUTO_TLS=1.2` or `1.3`
+on a known validation host to assert the actual preferred handshake version.
+The separately ignored `uring_live_s3_tls_policy` test sends unsigned HEADs to
+AWS S3 with default and TLS 1.3 minimum policies; it needs network access but no
+credentials. It validates TLS/HTTP transport, not authenticated object caching.
+
+Validated on the documented Linux 6.2 AWS host: 12 native tests passed, including
+TLS 1.3 kTLS reconnect on idle/mid-body KeyUpdate, partial-response discard,
+retry limits, no POST replay, and cache payload integrity. Unsigned HEADs to
+`s3.us-east-1.amazonaws.com` negotiated TLS 1.3/AES-128-GCM with kTLS for both
+default and TLS 1.3-minimum policies (HTTP 405 from the service root). In-place
+kernel key replacement remains excluded on this host. Local validation passed
+185 backend unit tests and 8 native tests without kernel TLS.

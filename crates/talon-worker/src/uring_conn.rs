@@ -1156,9 +1156,11 @@ impl RingConnHandler {
 
 impl crate::uring_serve::RingHandler for RingConnHandler {
     fn begin_shutdown(&self) {
+        self.worker.stop_background_heads();
         self.observability.begin_shutdown();
     }
     fn listening(&self) {
+        self.worker.start_background_heads();
         self.observability.readiness().set_store_ready(true);
     }
 
