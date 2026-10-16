@@ -89,7 +89,15 @@ pub(super) async fn payload<IO: OriginIo>(
     io: &mut IO,
     headers: &http::HeaderMap,
     bound: Option<usize>,
+    download: Option<&talon_uring::Download>,
 ) -> Result<Bytes, String> {
+    let alignment = download
+        .map(|d| d.alignment())
+        .unwrap_or(talon_uring::DirectIoAlignment::new(1, 1).unwrap());
+    let freeze = |buffer: AlignedBuf, len| match download {
+        Some(download) => download.finish(buffer, len),
+        None => buffer.freeze(len).into_bytes(),
+    };
     if let Some(length) = headers.get(http::header::CONTENT_LENGTH) {
         let len: usize = length
             .to_str()
@@ -99,10 +107,10 @@ pub(super) async fn payload<IO: OriginIo>(
         if bound.is_some_and(|bound| len > bound) {
             return Err("origin body exceeds requested range".into());
         }
-        let buffer = AlignedBuf::new(len).map_err(|e| e.to_string())?;
+        let buffer = AlignedBuf::new(len, alignment).map_err(|e| e.to_string())?;
         let (result, buffer) = io.read_exact(buffer).await;
         result.map_err(|_| "origin HTTP body truncated or invalid")?;
-        return Ok(buffer.freeze(len));
+        return Ok(freeze(buffer, len));
     }
     let encodings: Vec<_> = headers
         .get_all(http::header::TRANSFER_ENCODING)
@@ -118,7 +126,7 @@ pub(super) async fn payload<IO: OriginIo>(
     // Range requests give the capacity in advance, including chunked responses.
     // Chunk boundaries only change where we read into this single allocation.
     let mut buffer = bound
-        .map(AlignedBuf::new)
+        .map(|len| AlignedBuf::new(len, alignment))
         .transpose()
         .map_err(|e| e.to_string())?;
     let mut unbounded = BytesMut::new();
@@ -157,7 +165,7 @@ pub(super) async fn payload<IO: OriginIo>(
                 }
             }
             return Ok(match buffer {
-                Some(buffer) => buffer.freeze(written),
+                Some(buffer) => freeze(buffer, written),
                 None => unbounded.freeze(),
             });
         }

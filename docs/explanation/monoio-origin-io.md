@@ -10,7 +10,8 @@ TALON_WORKER_ORIGIN_IO=uring target/release/talon-worker
 ```
 
 The existing Worker configuration, credentials, namespace policy and cache
-directories apply. This does not change the cache format. Choose the data-plane
+directories apply. Cache sidecars retain logical lengths; native payload files
+may include zero-filled tail padding. Choose the data-plane
 runtime consistently: origin `uring` requires the native Monoio data plane.
 `TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1` with origin `uring`, or unavailable
 io_uring, is rejected at startup. Non-ring native I/O callers receive an error.
@@ -54,8 +55,24 @@ the LOAD reservation and finish the disk/index transaction before releasing it.
 Each data-plane ring drains detached work after stopping connections and before
 dropping its runtime. No fallback executor is created.
 
-HTTP Range bodies are received into a single allocation with a 4 KiB aligned
-start. Headers are consumed separately: the Monoio rustls extension consumes
+When native origin I/O is enabled, each whole/page cache store probes a temporary
+regular file in its directory during initialization, including on-demand
+namespace initialization. `statx(STATX_DIOALIGN)` supplies separate memory-address
+and write-offset/length alignments. Both are logged and retained by the store;
+there is no per-write probe or hardcoded sector size. On older kernels without
+this query, initialization searches power-of-two alignments using actual direct
+writes to the temporary file, checking both offset/length and buffer addresses.
+The search is bounded by the system page/filesystem block size; it verifies that
+successful writes leave no resident file pages with `mincore`. A reported lack
+of direct-I/O support, unsuccessful probe, or buffered fallback fails initialization
+explicitly. This compatibility probe runs only during store initialization.
+The probe assumes ordinary files beneath that store share its I/O requirements.
+
+HTTP Range bodies are received into a single allocation whose start satisfies
+the target store's memory alignment. Its capacity includes the write-aligned
+length plus address-alignment slack. Receive windows expose only the logical
+body length; the extra tail is zero-initialized in that same allocation.
+Headers are consumed separately: the Monoio rustls extension consumes
 only header lines from its plaintext reader, leaving body bytes for the final
 receive buffer. Plain HTTP uses nonblocking socket peeks to locate framing and
 then consumes exactly that framing; peeks can include a small body prefix.
@@ -63,16 +80,28 @@ Known-length chunked Range responses fill successive windows of the same
 allocation rather than assembling copied chunks. Non-Range chunked APIs retain
 the growable-body implementation.
 
-After a complete Range is validated, `Bytes::from_owner` and page slices retain
-that allocation through native open/write/fsync/rename. Payload files use
-`O_DIRECT` only when both their nonzero length and buffer address are multiples
-of 4096. Every other file uses buffered I/O for its entire length: no tail
-reopen, padded write, truncate, or alignment copy. Whole-block mode decides per
-block file; paged mode decides per page file. Ordinary page sizes preserve
-alignment across coalesced downloads. Unaligned external cache admissions or
-slices retain buffered writes. Metadata sidecars always use buffered I/O.
-Filesystems must support 4 KiB direct I/O when selected; failures are reported,
-not silently retried as buffered writes. File synchronization and atomic rename
+A request-scoped download context carries the target alignment through the
+existing backend APIs. The HTTP client explicitly retains it across its native
+ring task. After a complete body is received, the context retains its initialized
+backing allocation while returning the logical `Bytes` view to the backend for
+Range/version validation. Retries release the previous retained response before
+receiving another. The context ends with the fetch, returning a payload owner
+that keeps both views through page slicing and detached disk commits. No global
+pointer registry, extra executor or payload copy is involved.
+
+Native payload writes round their length up to the probed write alignment using
+the same backing allocation. Tail padding stays on disk: no truncate or buffered
+tail rewrite. Business `Bytes`, sidecars, the block index and existing capacity
+accounting retain logical lengths. L1 page fills use their known logical page
+length; range serving uses the requested window. Valid source ranges remain the
+caller's responsibility; padding adds no source-EOF validation.
+
+Aligned full pages and the final short page can use direct writes. An interior
+slice cannot use following payload bytes as padding. External admissions without
+a safe padded owner, or slices with unaligned addresses, retain buffered writes.
+Empty files and metadata sidecars also use buffered I/O. Selected direct I/O
+failures are reported, never silently retried as buffered writes.
+File synchronization and atomic rename
 retain the previous commit semantics. Writes use unique staging files with the
 existing `.tmp.<pid>.<sequence>` naming convention. Published file descriptors
 are invalidated after rename; residency is published by the existing runtime.
@@ -89,7 +118,7 @@ paged commits require a sidecar before publishing their page.
   its owned socket buffer into rustls. This removes the extra body assembly/
   alignment copy, not TLS's copies, and does not establish a lower total copy
   count than reqwest/tokio-rustls.
-  Aligned direct writes bypass the data page cache; other writes populate it.
+  Direct payload writes bypass the data page cache; buffered writes populate it.
   Reads deliberately retain buffered descriptors and file-to-socket splice,
   so subsequent reads may populate page cache even after a direct write.
 - Hostname resolution uses Tokio's resolver; IP literals skip it. Existing
@@ -122,7 +151,7 @@ cargo test -p talon-worker --test uring_origin --locked -- --ignored --nocapture
 ```
 
 Tests cover alignment and pointer preservation through Bytes ownership/slices,
-direct-write page-cache residency versus buffered files, exact file lengths,
+direct-write page-cache residency, padded file lengths versus logical lengths,
 fixed/chunked HTTP and HTTPS payloads, and ring-local cancellation/draining, concurrent directory creation,
 staging collision preservation, failed rename cleanup, HTTP/HTTPS and certificate rejection, connection reuse,
 chunked/truncated responses, cancelled HTTP attempts, S3 If-Match Range LOAD,

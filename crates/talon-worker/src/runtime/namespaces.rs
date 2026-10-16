@@ -66,7 +66,7 @@ impl NamespaceRuntimes {
         }
         let store = WholeBlockStore::open_with_fd_cache(&root, self.whole_fds.clone())?
             .with_root_lock(self.root_lock.clone())
-            .with_uring(self.uring);
+            .with_uring(self.uring)?;
         let index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
             checked_dir(&root.join("paged"))?;
@@ -77,7 +77,7 @@ impl NamespaceRuntimes {
                     self.page_fds.clone(),
                 )?
                 .with_root_lock(self.root_lock.clone())
-                .with_uring(self.uring),
+                .with_uring(self.uring)?,
             )
         } else {
             None

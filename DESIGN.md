@@ -157,8 +157,11 @@ timers), so ring threads enter a Tokio handle: coexistence, as predicted.
 
 An opt-in native origin/cache engine now extends this path through HTTP(S),
 LOAD commits, resident byte reads and cold descriptor opens. It retains buffered
-sendfile/splice reads and uses Direct I/O only for fully aligned payload files,
-without a body-to-alignment-buffer copy. TLS still uses buffered rustls. See
+sendfile/splice reads and probes the cache filesystem's Direct I/O alignment
+at initialization. Native downloads retain aligned tail padding in their receive
+allocation and on disk, while sidecars and indexing retain logical lengths.
+This requires no body-to-alignment-buffer copy or truncate. TLS still uses
+buffered rustls. See
 [the experiment design and validation](docs/explanation/monoio-origin-io.md) for
 execution ownership, cancellation, compatibility and remaining Tokio paths.
 

@@ -11,7 +11,7 @@ monoio = { workspace = true, features = ["mkdirat", "renameat", "unlinkat"] }
 tokio.workspace = true
 bytes.workspace = true
 libc = "0.2"
+tempfile.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
-tempfile.workspace = true

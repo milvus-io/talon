@@ -81,6 +81,10 @@ impl MonoioClient {
             .to_owned();
         let port = uri.port_u16().unwrap_or(if https { 443 } else { 80 });
         let tls = self.tls.clone();
+        let download = talon_uring::Download::current();
+        if let Some(download) = &download {
+            download.reset();
+        }
         let tokio = tokio::runtime::Handle::current();
         talon_uring::spawn_cancellable(async move {
             let operation = async {
@@ -152,8 +156,12 @@ impl MonoioClient {
                     .map_err(|_| "origin connect timed out")??
                 };
                 let (response, reusable) = match &mut connection {
-                    Connection::Plain(codec) => exchange(codec, uri, request).await?,
-                    Connection::Tls(codec) => exchange(codec.as_mut(), uri, request).await?,
+                    Connection::Plain(codec) => {
+                        exchange(codec, uri, request, download.as_ref()).await?
+                    }
+                    Connection::Tls(codec) => {
+                        exchange(codec.as_mut(), uri, request, download.as_ref()).await?
+                    }
                 };
                 if reusable {
                     IDLE.with(|pool| {
@@ -183,9 +191,10 @@ async fn exchange<IO: OriginIo>(
     io: &mut IO,
     uri: http::Uri,
     request: HttpRequest,
+    download: Option<&talon_uring::Download>,
 ) -> Result<(HttpResponse, bool), String> {
     let range_bound = request.headers.iter().find_map(|(name, value)| {
-        if !name.eq_ignore_ascii_case("range") {
+        if !name.eq_ignore_ascii_case("range") && !name.eq_ignore_ascii_case("x-ms-range") {
             return None;
         }
         let (start, end) = value.strip_prefix("bytes=")?.split_once('-')?;
@@ -275,6 +284,7 @@ async fn exchange<IO: OriginIo>(
             } else {
                 None
             },
+            download,
         )
         .await?
     };

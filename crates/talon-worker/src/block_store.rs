@@ -81,16 +81,60 @@ where
 /// A local, file-backed store for whole blocks.
 pub struct WholeBlockStore {
     uring: bool,
+    direct_alignment: Option<talon_uring::DirectIoAlignment>,
     root: PathBuf,
     fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
 impl WholeBlockStore {
-    pub fn with_uring(mut self, enabled: bool) -> Self {
+    /// Select native I/O and probe this cache directory before accepting writes.
+    pub fn with_uring(mut self, enabled: bool) -> std::io::Result<Self> {
+        self.direct_alignment = enabled
+            .then(|| talon_uring::DirectIoAlignment::probe(&self.root))
+            .transpose()?;
         self.uring = enabled;
-        self
+        if let Some(alignment) = self.direct_alignment {
+            tracing::info!(root = %self.root.display(), memory_alignment = alignment.memory(), write_alignment = alignment.offset(), "cache direct I/O alignment");
+        }
+        Ok(self)
     }
+    pub(crate) fn direct_alignment(&self) -> Option<talon_uring::DirectIoAlignment> {
+        self.direct_alignment
+    }
+    pub(crate) async fn put_payload(
+        &self,
+        id: &BlockId,
+        value: talon_uring::Payload,
+    ) -> Result<()> {
+        let path = self.path_for(id);
+        let meta_path = self.meta_path_for(id);
+        let meta = BlockMeta {
+            id: id.clone(),
+            form: BlockForm::Whole,
+            len: value.len() as u64,
+        };
+        if self.uring {
+            talon_uring::require_ring()?;
+            let alignment = self.direct_alignment.expect("native store alignment");
+            let root_lock = self.root_lock.clone();
+            let fds = self.fd_cache.clone();
+            let encoded = serde_json::to_vec(&meta)
+                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
+            return talon_uring::spawn_local(async move {
+                let _root_lock = root_lock;
+                talon_uring::atomic_write_payload(&path, value, alignment).await?;
+                fds.invalidate(&path);
+                // Match the existing whole-block commit's best-effort sidecar.
+                if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {
+                    tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
+                }
+                Ok(())
+            }).await.map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
+        }
+        self.put(id, value.into_bytes()).await
+    }
+
     /// Retain the root lease through detached blocking disk mutations.
     pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
         self.root_lock = Some(lock);
@@ -110,6 +154,7 @@ impl WholeBlockStore {
         std::fs::create_dir_all(&root)?;
         Ok(Self {
             uring: false,
+            direct_alignment: None,
             root_lock: None,
             root,
             fd_cache,
@@ -330,6 +375,9 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn put(&self, id: &BlockId, value: Bytes) -> Result<()> {
+        if self.uring {
+            return self.put_payload(id, value.into()).await;
+        }
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
         let meta = BlockMeta {
@@ -337,23 +385,6 @@ impl ObjectStore for WholeBlockStore {
             form: BlockForm::Whole,
             len: value.len() as u64,
         };
-        if self.uring {
-            talon_uring::require_ring()?;
-            let root_lock = self.root_lock.clone();
-            let fds = self.fd_cache.clone();
-            let encoded = serde_json::to_vec(&meta)
-                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
-            return talon_uring::spawn_local(async move {
-                let _root_lock = root_lock;
-                talon_uring::atomic_write_payload(&path, value).await?;
-                fds.invalidate(&path);
-                // Match the existing whole-block commit's best-effort sidecar.
-                if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {
-                    tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
-                }
-                Ok(())
-            }).await.map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
-        }
         // The write + fsync of a whole block is blocking disk I/O; keep it off
         // the reactor thread (issue #115).
         let commit_path = path.clone();

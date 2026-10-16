@@ -145,8 +145,9 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
             let range = request
                 .lines()
                 .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("range: bytes=")
+                    let line = line.to_ascii_lowercase();
+                    line.strip_prefix("range: bytes=")
+                        .or_else(|| line.strip_prefix("x-ms-range: bytes="))
                         .map(str::to_owned)
                 })
                 .unwrap();
@@ -194,8 +195,9 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
             let range = request
                 .lines()
                 .find_map(|line| {
-                    line.to_ascii_lowercase()
-                        .strip_prefix("range: bytes=")
+                    let line = line.to_ascii_lowercase();
+                    line.strip_prefix("range: bytes=")
+                        .or_else(|| line.strip_prefix("x-ms-range: bytes="))
                         .map(str::to_owned)
                 })
                 .unwrap();
@@ -734,28 +736,39 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
         for tls in [false, true] {
             let origin = Origin::start(tls).await;
             let client = origin.client();
+            let probe_root = tempfile::tempdir().unwrap();
+            let alignment = talon_uring::DirectIoAlignment::probe(probe_root.path()).unwrap();
             let scheme = if tls { "https" } else { "http" };
             for chunked in [false, true] {
                 let kind = if chunked { "chunked" } else { "fixed" };
-                for len in [4095, 4096, 8192, 12289] {
-                    let response = client
-                        .execute(HttpRequest::new(
-                            Method::Get,
-                            format!("{scheme}://{}/{kind}/large-{len}", origin.address),
-                            vec![("Range".into(), format!("bytes=0-{}", len - 1))],
-                        ))
+                for range_header in ["Range", "x-ms-range"] {
+                    for len in [4095, 4096, 8192, 12289] {
+                        let response = talon_uring::Download::capture(Some(alignment), async {
+                            Ok::<_, String>(
+                                client
+                                    .execute(HttpRequest::new(
+                                        Method::Get,
+                                        format!("{scheme}://{}/{kind}/large-{len}", origin.address),
+                                        vec![(range_header.into(), format!("bytes=0-{}", len - 1))],
+                                    ))
+                                    .await?
+                                    .body,
+                            )
+                        })
                         .await
                         .unwrap();
-                    assert_eq!(response.body.as_ptr() as usize % 4096, 0);
-                    let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
-                    assert_eq!(response.body, expected);
+                        assert_eq!(response.as_ptr() as usize % alignment.memory(), 0);
+                        let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+                        assert_eq!(&response[..], expected);
+                    }
                 }
-                for page_size in [0, 4096] {
+                for (page_size, l1_capacity) in [(0, 0), (0, 65536), (4096, 0), (4096, 65536)] {
                     let root = tempfile::tempdir().unwrap();
                     let config = WorkerConfig {
                         block_size: 16384,
                         capacity_bytes: 131072,
-                        l1_capacity_bytes: 0,
+                        l1_capacity_bytes: l1_capacity,
+                        l1_page_size_bytes: 4096,
                         l2_page_size_bytes: page_size,
                         backend: Some("s3".into()),
                         page_tti_hours: 0,
@@ -773,6 +786,7 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                         .unwrap()
                     };
                     let runtime = open();
+                    let alignment = talon_uring::DirectIoAlignment::probe(root.path()).unwrap();
                     for len in [8192, 12289] {
                         let block = BlockId::new(
                             ObjectId::new(Backend::S3, kind, format!("large-{len}")),
@@ -790,8 +804,35 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                         let expected: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
                         assert_eq!(runtime.serve_cached(&request).await.unwrap(), expected);
                     }
+                    assert_eq!(runtime.resident_bytes(), 8192 + 12289);
+                    fn check_files(dir: &std::path::Path, alignment: usize) -> usize {
+                        let mut count = 0;
+                        for entry in std::fs::read_dir(dir).unwrap() {
+                            let path = entry.unwrap().path();
+                            if path.is_dir() {
+                                count += check_files(&path, alignment);
+                            } else if matches!(
+                                path.extension().and_then(|s| s.to_str()),
+                                Some("blk" | "page")
+                            ) {
+                                assert_eq!(
+                                    std::fs::metadata(&path).unwrap().len() % alignment as u64,
+                                    0,
+                                    "{}",
+                                    path.display()
+                                );
+                                count += 1;
+                            }
+                        }
+                        count
+                    }
+                    assert_eq!(
+                        check_files(root.path(), alignment.offset()),
+                        if page_size == 0 { 2 } else { 6 }
+                    );
                     drop(runtime);
                     let recovered = open();
+                    assert_eq!(recovered.resident_bytes(), 8192 + 12289);
                     let count = origin.requests.load(Ordering::SeqCst);
                     let request = CachedRangeRequest {
                         object: ObjectId::new(Backend::S3, kind, "large-12289"),
@@ -799,8 +840,21 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                         offset: 0,
                         len: 12289,
                     };
-                    assert_eq!(recovered.serve_cached(&request).await.unwrap().len(), 12289);
+                    let expected: Vec<u8> = (0..12289).map(|i| (i % 251) as u8).collect();
+                    assert_eq!(recovered.serve_cached(&request).await.unwrap(), expected);
+                    let tail = CachedRangeRequest {
+                        offset: 12288,
+                        len: 1,
+                        ..request
+                    };
+                    assert_eq!(
+                        recovered.serve_cached(&tail).await.unwrap(),
+                        &expected[12288..]
+                    );
                     assert_eq!(origin.requests.load(Ordering::SeqCst), count);
+                    if l1_capacity > 0 {
+                        assert_eq!(recovered.l1_resident_bytes(), 12289);
+                    }
                 }
             }
         }

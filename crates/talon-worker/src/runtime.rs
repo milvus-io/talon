@@ -611,7 +611,10 @@ impl WorkerRuntime {
                         if to <= from {
                             continue;
                         }
-                        let bytes = self.cached_page(&block, page).await?.ok_or(CacheMiss)?;
+                        let bytes = self
+                            .cached_page(&block, page, meta.len)
+                            .await?
+                            .ok_or(CacheMiss)?;
                         piece.extend_from_slice(&slice(&bytes, from - page_start, to - from)?);
                     }
                     self.metrics.record_cache_hit();
@@ -1103,7 +1106,7 @@ impl WorkerRuntime {
         // or a page another request is already loading breaks the run: fetching
         // across either would redownload resident/in-flight data.
         for (slot, page) in pages.iter().copied().enumerate() {
-            if let Some(bytes) = self.cached_page(block, page).await? {
+            if let Some(bytes) = self.cached_page(block, page, block_len).await? {
                 if !leader_run.is_empty() {
                     leader_runs.push(std::mem::take(&mut leader_run));
                 }
@@ -1176,7 +1179,7 @@ impl WorkerRuntime {
         for (slot, page, flight) in followers {
             let key = LoadKey::Page(block.clone(), page);
             talon_telemetry::wait_for(&flight, self.inflight.wait(&key)).await;
-            let entry = match self.cached_page(block, page).await? {
+            let entry = match self.cached_page(block, page, block_len).await? {
                 Some(bytes) => (bytes, true),
                 None => (
                     self.fetch_and_commit_page(request, block, page, block_len)
@@ -1234,6 +1237,7 @@ impl WorkerRuntime {
         &self,
         block: &BlockId,
         page: PageIndex,
+        block_len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
         let Some((access, _)) = self
             .index
@@ -1252,7 +1256,8 @@ impl WorkerRuntime {
             self.metrics.record_l1_miss();
         }
         let paged = self.paged.as_ref().expect("paged store");
-        match paged.get_page_bytes(block, page).await {
+        let len = talon_core::page_len(block_len, paged.page_size(), page);
+        match paged.get_page_bytes(block, page, len).await {
             Ok(bytes) => {
                 self.metrics.record_l2_hit();
                 talon_telemetry::cache_tier("l2");
@@ -1346,11 +1351,14 @@ impl WorkerRuntime {
             let fetched = talon_telemetry::observe(
                 "talon.origin.fetch",
                 "internal",
-                self.backend.fetch_range_if_match(
-                    &request.object,
-                    block.offset + page_start,
-                    want,
-                    (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                talon_uring::Download::capture(
+                    self.paged.as_ref().and_then(|p| p.direct_alignment()),
+                    self.backend.fetch_range_if_match(
+                        &request.object,
+                        block.offset + page_start,
+                        want,
+                        (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                    ),
                 ),
             )
             .await;
@@ -1414,7 +1422,7 @@ impl WorkerRuntime {
                     if !warm_only {
                         talon_telemetry::record("talon.cache.committed_bytes", end as u64);
                     }
-                    committed.push(page_bytes);
+                    committed.push(page_bytes.into_bytes());
                     cursor = end;
                 }
                 // LOAD pages are disjoint leaders. Drain all writes before releasing
@@ -1442,9 +1450,9 @@ impl WorkerRuntime {
         block: &BlockId,
         page: PageIndex,
         block_len: u64,
-        bytes: bytes::Bytes,
+        bytes: impl Into<talon_uring::Payload>,
     ) -> anyhow::Result<()> {
-        self.commit_fetched_page_inner(block, page, block_len, bytes, false)
+        self.commit_fetched_page_inner(block, page, block_len, bytes.into(), false)
             .await
     }
 
@@ -1453,7 +1461,7 @@ impl WorkerRuntime {
         block: &BlockId,
         page: PageIndex,
         block_len: u64,
-        bytes: bytes::Bytes,
+        bytes: talon_uring::Payload,
         warm_only: bool,
     ) -> anyhow::Result<()> {
         let runtime = self.clone();
@@ -1481,7 +1489,9 @@ impl WorkerRuntime {
                         }
                         let paged = runtime.paged.as_ref().expect("paged store").clone();
                         let value = bytes.clone();
-                        paged.commit_page(&id, page, block_len, value).await?;
+                        paged
+                            .commit_page_payload(&id, page, block_len, value)
+                            .await?;
                         runtime
                             .index
                             .init_paged(id.clone(), paged.page_size(), block_len);
@@ -1497,7 +1507,7 @@ impl WorkerRuntime {
                         runtime.index.set_access(&unit, access);
                         runtime.index.set_page_state(&id, page, handle);
                         if !warm_only && runtime.l1.is_enabled() {
-                            runtime.admit_l1_page(&id, page, bytes);
+                            runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
                         // Keep pressure handling owned by the worker too: cancellation
                         // must not leave a completed admission above capacity.
@@ -1817,11 +1827,14 @@ impl WorkerRuntime {
             let fetched = talon_telemetry::observe(
                 "talon.origin.fetch",
                 "internal",
-                self.backend.fetch_range_if_match(
-                    &request.object,
-                    block.offset,
-                    self.block_size as u64,
-                    (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                talon_uring::Download::capture(
+                    self.store.direct_alignment(),
+                    self.backend.fetch_range_if_match(
+                        &request.object,
+                        block.offset,
+                        self.block_size as u64,
+                        (block.version.as_str() != UNCHECKED_VERSION).then_some(&block.version),
+                    ),
                 ),
             )
             .await;
@@ -1839,7 +1852,7 @@ impl WorkerRuntime {
 
             talon_telemetry::record("talon.origin.validated_bytes", bytes.len() as u64);
             self.commit_cached_block(block, bytes.clone()).await?;
-            Ok(bytes)
+            Ok(bytes.into_bytes())
         })
         .await
     }
@@ -1847,8 +1860,9 @@ impl WorkerRuntime {
     async fn commit_cached_block(
         &self,
         block: &BlockId,
-        bytes: bytes::Bytes,
+        bytes: impl Into<talon_uring::Payload>,
     ) -> anyhow::Result<()> {
+        let bytes = bytes.into();
         let len = bytes.len() as u64;
         let runtime = self.clone();
         let id = block.clone();
@@ -1884,7 +1898,7 @@ impl WorkerRuntime {
                             talon_telemetry::record("talon.cache.committed_bytes", len);
                             return Ok::<_, anyhow::Error>(());
                         }
-                        runtime.store.put(&id, bytes).await?;
+                        runtime.store.put_payload(&id, bytes).await?;
                         talon_telemetry::record("talon.cache.committed_bytes", len);
                         runtime.index.commit(BlockMeta {
                             id: id.clone(),

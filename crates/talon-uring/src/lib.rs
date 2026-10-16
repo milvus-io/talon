@@ -2,7 +2,9 @@
 use std::{io, path::Path};
 
 mod aligned;
-pub use aligned::{AlignedBuf, DIRECT_ALIGNMENT};
+pub use aligned::{AlignedBuf, Download, Payload};
+mod direct;
+pub use direct::DirectIoAlignment;
 mod read;
 pub use read::{open_read, read_file};
 
@@ -15,14 +17,18 @@ pub async fn atomic_write(path: &Path, bytes: bytes::Bytes) -> io::Result<()> {
     atomic_write_inner(path, bytes, false).await
 }
 
-/// Commit a payload without an alignment copy. Only nonempty, fully aligned
-/// files/buffers use O_DIRECT. Small/unaligned files and unaligned external
-/// admissions use buffered I/O for the entire file, with no padding/truncate.
-pub async fn atomic_write_payload(path: &Path, bytes: bytes::Bytes) -> io::Result<()> {
-    let direct = !bytes.is_empty()
-        && bytes.len() % DIRECT_ALIGNMENT == 0
-        && bytes.as_ptr() as usize % DIRECT_ALIGNMENT == 0;
-    atomic_write_inner(path, bytes, direct).await
+/// Write the original download allocation, including its initialized tail.
+/// Logical length is unchanged; files keep padding without a truncate. External
+/// admissions without a safe aligned view use buffered I/O without copying.
+pub async fn atomic_write_payload(
+    path: &Path,
+    payload: Payload,
+    alignment: DirectIoAlignment,
+) -> io::Result<()> {
+    match payload.direct_bytes(alignment) {
+        Some(bytes) => atomic_write_inner(path, bytes, true).await,
+        None => atomic_write_inner(path, payload.into_bytes(), false).await,
+    }
 }
 
 async fn atomic_write_inner(path: &Path, bytes: bytes::Bytes, direct: bool) -> io::Result<()> {
