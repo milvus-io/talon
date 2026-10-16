@@ -97,6 +97,7 @@ pub struct AzureBackend {
     config: AzureConfig,
     /// Optional SAS token query string (without leading `?`).
     sas_token: Option<String>,
+    sas_provider: Option<Arc<dyn crate::credentials::ProvideSasToken>>,
     /// Optional base64 account key for Shared Key authorization (an alternative
     /// to SAS). When set, every request is signed just before execution.
     shared_key: Option<String>,
@@ -112,6 +113,7 @@ impl AzureBackend {
         Self {
             config,
             sas_token,
+            sas_provider: None,
             shared_key: None,
             bearer: None,
             http,
@@ -128,6 +130,7 @@ impl AzureBackend {
         Self {
             config,
             sas_token: None,
+            sas_provider: None,
             shared_key: Some(shared_key.into()),
             bearer: None,
             http,
@@ -145,10 +148,34 @@ impl AzureBackend {
         Self {
             config,
             sas_token: None,
+            sas_provider: None,
             shared_key: None,
             bearer: Some(bearer),
             http,
         }
+    }
+
+    /// Construct with a refreshing SAS query source. Each URL takes one cheap
+    /// snapshot, so all service read/write/list paths observe credential rotation.
+    pub fn with_sas_provider(
+        config: AzureConfig,
+        sas: Arc<dyn crate::credentials::ProvideSasToken>,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
+        Self {
+            config,
+            sas_token: None,
+            sas_provider: Some(sas),
+            shared_key: None,
+            bearer: None,
+            http,
+        }
+    }
+
+    fn current_sas(&self) -> Option<Arc<AzureSas>> {
+        self.sas_provider
+            .as_ref()
+            .map(|provider| provider.current())
     }
 
     /// Build the blob URL with the SAS query appended when present.
@@ -171,7 +198,12 @@ impl AzureBackend {
         } else {
             format!("{scheme}://{host}/{}/{}", obj.bucket, blob)
         };
-        match &self.sas_token {
+        let current = self.current_sas();
+        match current
+            .as_ref()
+            .map(|sas| sas.expose_secret())
+            .or(self.sas_token.as_deref())
+        {
             Some(sas) => format!("{base}?{sas}"),
             None => base,
         }
@@ -248,7 +280,12 @@ impl AzureBackend {
         if let Some(marker) = cursor {
             query.push_str(&format!("&marker={}", encode_query_value(marker)));
         }
-        match &self.sas_token {
+        let current = self.current_sas();
+        match current
+            .as_ref()
+            .map(|sas| sas.expose_secret())
+            .or(self.sas_token.as_deref())
+        {
             // The SAS is already a query string; join with `&`.
             Some(sas) => format!("{base}?{query}&{}", sas.trim_start_matches('?')),
             None => format!("{base}?{query}"),

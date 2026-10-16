@@ -28,6 +28,12 @@ pub trait ProvideBearerToken: Send + Sync {
     fn current(&self) -> Option<Arc<String>>;
 }
 
+/// Snapshot source for an Azure SAS query credential.
+pub trait ProvideSasToken: Send + Sync {
+    /// Cheap point-in-time query credential; never performs HTTP.
+    fn current(&self) -> Arc<crate::AzureSas>;
+}
+
 /// Fixed credentials from env/config; never refreshed.
 pub struct StaticS3Credentials(Arc<S3Credentials>);
 
@@ -199,6 +205,15 @@ where
 {
     fn current(&self) -> Option<Arc<String>> {
         Some(self.snapshot())
+    }
+}
+
+impl<F> ProvideSasToken for RefreshingCredentials<F>
+where
+    F: CredentialsFetch<Value = crate::AzureSas>,
+{
+    fn current(&self) -> Arc<crate::AzureSas> {
+        self.snapshot()
     }
 }
 
@@ -392,6 +407,18 @@ mod tests {
         // At most one in-flight refresh lands after the drop; the loop must
         // then stop fetching.
         assert!(observer.succeeded.load(Ordering::SeqCst) <= after_drop + 1);
+    }
+
+    #[test]
+    fn unchanged_broker_expiry_uses_remaining_lifetime() {
+        let policy = RefreshPolicy::default();
+        let start = SystemTime::UNIX_EPOCH + Duration::from_secs(1000);
+        let expiry = Some(start + Duration::from_secs(100));
+        assert_eq!(policy.next_delay(start, expiry), Duration::from_secs(40));
+        assert_eq!(
+            policy.next_delay(start + Duration::from_secs(40), expiry),
+            Duration::from_secs(30)
+        );
     }
 
     #[test]

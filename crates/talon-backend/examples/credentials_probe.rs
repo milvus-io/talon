@@ -1,10 +1,8 @@
 //! Live workload-identity verification probe.
 //!
-//! Resolves origin credentials through the production chain (static env,
-//! then the detected or explicitly selected cloud mechanism), then proves
-//! the material signs a real request by HEADing one key. A `NotFound`
-//! answer is the success signal: the exchange, the signature, and the
-//! bucket authorization all worked without reading any data.
+//! Resolves origin credentials through the production chain and optionally
+//! HEADs one key. Reports the observed result; a 404 alone cannot establish
+//! IAM authorization, because an origin may allow public access.
 //!
 //! ```sh
 //! credentials_probe s3  --region us-west-2 --bucket b --key prefix/absent
@@ -12,7 +10,7 @@
 //! ```
 //!
 //! Select an env-markerless mechanism with
-//! `TALON_ORIGIN_CREDENTIALS_SOURCE` (`gcp-metadata`, `huawei-agency`).
+//! `TALON_ORIGIN_CREDENTIALS_SOURCE` (`broker`, `gcp-metadata`, `huawei-agency`).
 //! Output never contains key or token material.
 
 use std::sync::Arc;
@@ -23,6 +21,27 @@ use talon_backend::{
     CredentialsObserver, GcsBackend, GcsConfig, HttpClient, ReqwestClient, S3Backend, S3Config,
 };
 use talon_core::{Backend, BackendStore, Error, ObjectId};
+
+// Print only method/status for the origin HEAD, without URLs or error bodies.
+struct ProbeHttp(ReqwestClient);
+
+#[async_trait::async_trait]
+impl HttpClient for ProbeHttp {
+    async fn execute(
+        &self,
+        request: talon_backend::HttpRequest,
+    ) -> Result<talon_backend::HttpResponse, String> {
+        let is_head = request.method == talon_backend::Method::Head;
+        let result = self.0.execute(request).await;
+        if is_head {
+            match &result {
+                Ok(response) => println!("origin HEAD HTTP status: {}", response.status),
+                Err(_) => println!("origin HEAD transport failed"),
+            }
+        }
+        result
+    }
+}
 
 struct PrintObserver;
 
@@ -53,25 +72,21 @@ fn arg(name: &str) -> Option<String> {
 }
 
 fn redacted(value: &str) -> String {
-    let head: String = value.chars().take(4).collect();
-    format!("{head}... ({} chars)", value.chars().count())
+    format!("present ({} chars)", value.chars().count())
 }
 
 async fn probe(backend: &dyn BackendStore, kind: Backend, bucket: &str, key: &str) -> i32 {
     match backend.head(&ObjectId::new(kind, bucket, key)).await {
         Err(Error::NotFound(_)) => {
-            println!("probe HEAD: NotFound - exchange, signing, and authorization verified");
+            println!("probe HEAD: HTTP 404 (NotFound)");
             0
         }
         Ok(stat) => {
-            println!(
-                "probe HEAD: object exists ({} bytes) - exchange, signing, and authorization verified",
-                stat.len
-            );
+            println!("probe HEAD: object exists ({} bytes)", stat.len);
             0
         }
-        Err(error) => {
-            println!("probe HEAD failed: {error}");
+        Err(_) => {
+            println!("probe HEAD failed (details suppressed to protect query credentials)");
             2
         }
     }
@@ -83,7 +98,7 @@ async fn main() {
     let selector = std::env::var("TALON_ORIGIN_CREDENTIALS_SOURCE")
         .ok()
         .filter(|value| !value.is_empty());
-    let http: Arc<dyn HttpClient> = Arc::new(ReqwestClient::new());
+    let http: Arc<dyn HttpClient> = Arc::new(ProbeHttp(ReqwestClient::new()));
     let observer = Arc::new(PrintObserver);
     let key = arg("--key").unwrap_or_else(|| "talon-credentials-probe/absent".to_string());
     let code = match mode.as_str() {
@@ -102,7 +117,10 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            println!("credential source: {}", resolved.source);
+            println!(
+                "credential acquisition succeeded; source: {}",
+                resolved.source
+            );
             let snapshot = resolved.provider.current();
             println!("access key id: {}", redacted(&snapshot.access_key_id));
             println!(
@@ -146,7 +164,10 @@ async fn main() {
                         std::process::exit(1);
                     }
                 };
-            println!("credential source: {}", resolved.source);
+            println!(
+                "credential acquisition succeeded; source: {}",
+                resolved.source
+            );
             match resolved.provider.current() {
                 Some(token) => println!("bearer token: {}", redacted(&token)),
                 None => println!("bearer token: absent (unauthenticated)"),
@@ -164,6 +185,36 @@ async fn main() {
             }
         }
         "azure" => {
+            if selector.as_deref() == Some("broker") {
+                let account = arg("--account").unwrap_or_else(|| {
+                    println!("broker Azure requires --account");
+                    std::process::exit(1);
+                });
+                let sas = match talon_backend::resolve_azure_broker_sas(
+                    &account,
+                    Arc::clone(&http),
+                    observer,
+                )
+                .await
+                {
+                    Ok(sas) => sas,
+                    Err(error) => {
+                        println!("credential resolution failed: {error}");
+                        std::process::exit(1);
+                    }
+                };
+                println!("credential acquisition succeeded; source: broker");
+                println!("SAS token: {}", redacted(sas.current().expose_secret()));
+                let code = match arg("--container") {
+                    Some(container) => {
+                        let backend =
+                            AzureBackend::with_sas_provider(AzureConfig::new(&account), sas, http);
+                        probe(&backend, Backend::Azure, &container, &key).await
+                    }
+                    None => 0,
+                };
+                std::process::exit(code);
+            }
             let resolved = match resolve_azure_bearer(Arc::clone(&http), observer).await {
                 Ok(resolved) => resolved,
                 Err(error) => {
@@ -171,7 +222,10 @@ async fn main() {
                     std::process::exit(1);
                 }
             };
-            println!("credential source: {}", resolved.source);
+            println!(
+                "credential acquisition succeeded; source: {}",
+                resolved.source
+            );
             match resolved.provider.current() {
                 Some(token) => println!("bearer token: {}", redacted(&token)),
                 None => println!("bearer token: absent"),

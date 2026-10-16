@@ -95,10 +95,10 @@ missing static key.
 | GCP GKE | Workload Identity metadata token (GCS `Bearer`) | explicit: `TALON_ORIGIN_CREDENTIALS_SOURCE=gcp-metadata` | protocol-level |
 | Azure AKS | Workload Identity: Azure AD token (`Bearer`) | auto when no SAS/key: `AZURE_CLIENT_ID` + `AZURE_TENANT_ID` + `AZURE_FEDERATED_TOKEN_FILE`; pods also need the `azure.workload.identity/use: "true"` label | protocol-level; injected env contract verified on live AKS |
 
-Static credentials always win, so existing deployments are unaffected.
+With `auto` (the default), static credentials win, so existing deployments are unaffected.
 `TALON_ORIGIN_CREDENTIALS_SOURCE` (shared by the worker and the gateway)
 forces one mechanism — `static`, `aws-web-identity`, `aliyun-oidc`,
-`tencent-oidc`, `huawei-agency`, or `gcp-metadata` — instead of
+`tencent-oidc`, `huawei-agency`, `gcp-metadata`, or `broker` — instead of
 auto-detection; the GCP and Huawei metadata endpoints have no env marker and
 are never probed implicitly. Aliyun, Tencent, and Huawei OBS are consumed
 through their S3-compatible endpoints with SigV4 plus the temporary security
@@ -110,14 +110,150 @@ documented API shape but has not yet been validated against a live cluster.
 To validate a cluster, build the verification probe
 (`cargo build -p talon-backend --example credentials_probe`) and run it in a
 pod bound to the target ServiceAccount: it resolves the production chain and
-HEADs one key with the resolved credentials, printing only redacted material.
-A `NotFound` answer proves the exchange and the signature end to end.
+HEADs one key with the resolved credentials, printing credential presence/length
+and the origin HTTP status. Credential acquisition and origin access are separate
+results: a `404 NotFound` alone cannot prove IAM authorization when public access
+is possible.
 
 Refresh outcomes are counted as
 `talon_worker_origin_credentials_total{result="refresh_success"|"refresh_failure"}`
 (the gateway equivalent is `talon_gateway_origin_credentials_total`), and
 `talon_worker_origin_credentials_expiry_seconds` publishes the current
 credentials' hard expiry so an alert can fire before it passes.
+
+## Cloud Credential Broker
+
+The worker supports Broker credentials for S3, GCS and Azure. The S3/Azure
+gateway supports the same respective credential modes. Select Broker explicitly:
+
+```sh
+export TALON_ORIGIN_CREDENTIALS_SOURCE=broker
+export TALON_CREDENTIAL_BROKER_URL=https://broker.example/v1/credentials/assume-role
+export TALON_CREDENTIAL_BROKER_REQUEST='{"csp":"aws","region":"us-east-1","roleArn":"arn:aws:iam::123456789012:role/talon-reader","externalId":"example-external-id","bucket":"example-bucket","cluster":"example-cluster","durationSeconds":3600}'
+```
+
+Use the full HTTP(S) endpoint URL; Talon does not discover a Broker endpoint.
+`broker` overrides configured static credentials and workload identity. Without
+that selector, Broker variables have no effect. Treat request JSON as sensitive
+configuration; Talon does not log it or the returned credential values.
+Required request fields and resulting authentication are:
+
+| Backend | Required request JSON fields | Credential mapping |
+|---|---|---|
+| S3 | `csp: "aws"`, `region`, `roleArn` | `tempAk` / `tempSk` sign SigV4; `sessionToken` sets the signed session header |
+| GCS | `csp: "gcp"`, `gcpServiceAccountEmail` | `sessionToken` is an OAuth bearer token |
+| Azure | `csp: "azure"`, `region`, `bucket`, `azureClientId`, `azureTenantId`, `azureAccountName` | `tempAk` must match the configured account; `sessionToken` is a SAS query |
+
+For example, GCS and Azure request JSON can use these placeholder identities:
+
+```json
+{"csp":"gcp","gcpServiceAccountEmail":"talon-reader@example-project.iam.gserviceaccount.com","cluster":"example-cluster"}
+```
+
+```json
+{"csp":"azure","region":"eastus","bucket":"example-container","azureClientId":"00000000-0000-0000-0000-000000000001","azureTenantId":"00000000-0000-0000-0000-000000000002","azureAccountName":"exampleaccount","cluster":"example-cluster"}
+```
+
+`durationSeconds` omitted or nonpositive becomes 3600. AWS requires an effective
+value from 900 through 3600. Additional server-supported fields, including
+`cluster`, are forwarded unchanged. Azure request/response accounts must both
+match `TALON_WORKER_AZURE_ACCOUNT` or `TALON_GATEWAY_AZURE_ACCOUNT`. Its `bucket`
+is the single container for which the Broker issues the SAS; configure the
+origin and its access policy for that container. This mode does not route to
+multiple buckets/containers or acquire a different SAS per request.
+
+Talon POSTs JSON and requires HTTP success plus `success: true` and the
+`credentials` object. A missing/malformed credential, expired or invalid RFC3339
+`expiredAt`, wrong cloud, or wrong Azure account fails initial startup. Timezone
+offsets and fractional seconds are accepted. Requests have a 75-second deadline;
+worker Broker exchanges use a separate transport from origin transfer retries.
+No HTTP runs in credential snapshots or on a cache hit.
+
+Refresh uses the returned absolute `expiredAt`, even when a Broker cache repeats
+an unchanged expiry. Existing refresh margins and the 30-second retry floor
+apply. A refresh failure retains the last good snapshot, **including after its
+reported expiry**; hard-expiry fail-closed behavior is not implemented. Alert on
+refresh failures and credential expiry; the origin can reject expired material.
+Errors suppress Broker response bodies and transport details to avoid exposing
+credentials.
+
+The existing probe can check acquisition alone, or report an origin HEAD status:
+
+```sh
+cargo run -p talon-backend --example credentials_probe -- s3 --region us-east-1 --bucket example-bucket
+cargo run -p talon-backend --example credentials_probe -- gcs --bucket example-bucket
+cargo run -p talon-backend --example credentials_probe -- azure --account exampleaccount --container example-container
+```
+
+These commands use the selected Broker request JSON. Offline tests verify request
+and credential contracts; successful acquisition alone does not establish access
+to the configured origin.
+
+### Real Broker/cloud tests through cargo test
+
+Six opt-in tests use the real `ReqwestClient`, Broker endpoint, and cloud storage;
+there are no HTTP mocks. They are ignored by default so ordinary unit tests do
+not contact cloud services. Explicitly selecting an ignored test without its
+required configuration fails. Acquisition/refresh and storage access are separate
+tests, and a nonexistent or inaccessible bucket/container fails the storage test.
+
+Supply identities only through private runtime environment variables. Do not put
+real request JSON, credentials, or object names into committed files or logs.
+Each cloud's `REQUEST` uses the same documented JSON schema above, and its `URL`
+is the complete Broker endpoint, for example
+`https://broker.example/v1/credentials/assume-role`.
+
+| Cloud | Required for acquisition/refresh | Additional storage configuration |
+|---|---|---|
+| AWS | `TALON_LIVE_BROKER_AWS_URL`, `TALON_LIVE_BROKER_AWS_REQUEST` | `TALON_LIVE_BROKER_AWS_BUCKET`; optional `TALON_LIVE_BROKER_AWS_KEY` |
+| GCP | `TALON_LIVE_BROKER_GCP_URL`, `TALON_LIVE_BROKER_GCP_REQUEST` | `TALON_LIVE_BROKER_GCP_BUCKET`; optional `TALON_LIVE_BROKER_GCP_KEY` |
+| Azure | `TALON_LIVE_BROKER_AZURE_URL`, `TALON_LIVE_BROKER_AZURE_REQUEST` | account/container come from request `azureAccountName`/`bucket`; optional `TALON_LIVE_BROKER_AZURE_KEY` |
+
+For example, with placeholder AWS identity/target values (replace privately):
+
+```sh
+export TALON_LIVE_BROKER_AWS_URL=https://broker.example/v1/credentials/assume-role
+export TALON_LIVE_BROKER_AWS_REQUEST='{"csp":"aws","region":"us-east-1","roleArn":"arn:aws:iam::123456789012:role/talon-reader","bucket":"example-bucket"}'
+export TALON_LIVE_BROKER_AWS_BUCKET=example-bucket
+# Optional: export TALON_LIVE_BROKER_AWS_KEY=existing/nonempty-object
+```
+
+Run each acquisition/refresh test independently:
+
+```sh
+cargo test -p talon-backend --lib broker::live_tests::live_broker_aws_acquisition_and_background_refresh -- --ignored --exact --nocapture
+cargo test -p talon-backend --lib broker::live_tests::live_broker_gcp_acquisition_and_background_refresh -- --ignored --exact --nocapture
+cargo test -p talon-backend --lib broker::live_tests::live_broker_azure_acquisition_and_background_refresh -- --ignored --exact --nocapture
+```
+
+These exercise the production public resolvers with an injected environment
+lookup, then use the real Broker fetcher and background refresh loop with a
+**test-only two-second refresh interval**. At least two real fetches must succeed
+and their installed snapshots must be valid. Normally each acquisition test makes
+three Broker POSTs: public resolver, refresh bootstrap, and background refresh.
+This accelerates invocation, not
+credential expiry: the Broker can return the same cached token and absolute
+expiry, so passing does not prove real expiry-driven token rotation. Production
+refresh policy is unchanged. Each test owns a runtime; providers are dropped and
+remaining background tasks end with that runtime.
+
+Run each read-only storage test independently:
+
+```sh
+cargo test -p talon-backend --lib broker::live_tests::live_broker_aws_storage_list_head_conditional_range_get -- --ignored --exact --nocapture
+cargo test -p talon-backend --lib broker::live_tests::live_broker_gcp_storage_list_head_conditional_range_get -- --ignored --exact --nocapture
+cargo test -p talon-backend --lib broker::live_tests::live_broker_azure_storage_list_head_conditional_range_get -- --ignored --exact --nocapture
+```
+
+Storage tests always require a successful LIST. With no `KEY`, they search at
+most three pages of 100 entries and select the first nonempty object; no match
+fails with instructions to set `KEY`. They then require HEAD and a version-
+conditional range GET of at most 1024 bytes. An explicit `KEY` must already exist
+and be nonempty. No objects are written or deleted. A storage test may fail even
+when acquisition succeeds; `404` is never accepted as success. Output reports only
+cloud, Broker/origin, HTTP method and status; it never prints URLs, headers, bodies
+or credential values. Failure messages suppress provider errors and sensitive
+values, so inspect service-side diagnostics privately when necessary.
 
 ## Testing against emulators
 

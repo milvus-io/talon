@@ -237,6 +237,7 @@ fn origin_credentials_source() -> Option<String> {
 async fn build_azure_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
+    exchange_http: Arc<dyn talon_backend::http::HttpClient>,
     observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<AzureBackend> {
     let account = cfg.azure_account.clone().ok_or_else(|| {
@@ -249,13 +250,21 @@ async fn build_azure_backend(
         }
         None => AzureConfig::new(account),
     };
+    if origin_credentials_source().as_deref() == Some("broker") {
+        let sas =
+            talon_backend::resolve_azure_broker_sas(&azure_config.account, exchange_http, observer)
+                .await
+                .map_err(anyhow::Error::msg)?;
+        tracing::info!(source = "broker", "origin Azure credentials resolved");
+        return Ok(AzureBackend::with_sas_provider(azure_config, sas, http));
+    }
     match azure_sas_from_env() {
         Some(sas) => {
             tracing::info!(source = "sas", "origin Azure credentials resolved");
             Ok(AzureBackend::new(azure_config, Some(sas), http))
         }
         None => {
-            let resolved = talon_backend::resolve_azure_bearer(Arc::clone(&http), observer)
+            let resolved = talon_backend::resolve_azure_bearer(exchange_http, observer)
                 .await
                 .map_err(|error| {
                     anyhow::anyhow!(
@@ -282,24 +291,29 @@ async fn build_azure_backend(
 async fn build_s3_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
+    exchange_http: Arc<dyn talon_backend::http::HttpClient>,
     observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<S3Backend> {
     let region = cfg
         .s3_region
         .clone()
         .ok_or_else(|| anyhow::anyhow!("s3_region is required (set TALON_WORKER_S3_REGION)"))?;
-    let static_credentials = match (cfg.s3_access_key_id.clone(), s3_secret_key_from_env()) {
-        (Some(access_key_id), Some(secret_access_key)) => Some(S3Credentials {
-            access_key_id,
-            secret_access_key,
-            session_token: s3_session_token_from_env(),
-        }),
-        (None, None) => None,
-        (Some(_), None) => {
-            anyhow::bail!("TALON_WORKER_S3_SECRET_ACCESS_KEY must be set (secret key)")
-        }
-        (None, Some(_)) => {
-            anyhow::bail!("s3_access_key_id is required (set TALON_WORKER_S3_ACCESS_KEY_ID)")
+    let static_credentials = if origin_credentials_source().as_deref() == Some("broker") {
+        None
+    } else {
+        match (cfg.s3_access_key_id.clone(), s3_secret_key_from_env()) {
+            (Some(access_key_id), Some(secret_access_key)) => Some(S3Credentials {
+                access_key_id,
+                secret_access_key,
+                session_token: s3_session_token_from_env(),
+            }),
+            (None, None) => None,
+            (Some(_), None) => {
+                anyhow::bail!("TALON_WORKER_S3_SECRET_ACCESS_KEY must be set (secret key)")
+            }
+            (None, Some(_)) => {
+                anyhow::bail!("s3_access_key_id is required (set TALON_WORKER_S3_ACCESS_KEY_ID)")
+            }
         }
     };
     let mut config = S3Config::aws(&region);
@@ -314,7 +328,7 @@ async fn build_s3_backend(
     let resolved = talon_backend::resolve_s3_credentials(
         static_credentials,
         origin_credentials_source().as_deref(),
-        Arc::clone(&http),
+        exchange_http,
         observer,
     )
     .await
@@ -333,6 +347,7 @@ async fn build_s3_backend(
 async fn build_gcs_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
+    exchange_http: Arc<dyn talon_backend::http::HttpClient>,
     observer: Arc<dyn talon_backend::CredentialsObserver>,
 ) -> anyhow::Result<GcsBackend> {
     let config = match cfg.gcs_endpoint.clone() {
@@ -345,7 +360,7 @@ async fn build_gcs_backend(
     let resolved = talon_backend::resolve_gcs_bearer(
         gcs_bearer_from_env(),
         origin_credentials_source().as_deref(),
-        Arc::clone(&http),
+        exchange_http,
         observer,
     )
     .await
@@ -590,10 +605,23 @@ async fn run() -> anyhow::Result<()> {
         Arc::new(CredentialsMetricsObserver {
             observability: Arc::clone(&observability),
         });
+    // Broker acquisition may take 60s. Origin transfer retries have a much
+    // shorter attempt deadline, so use an undecorated exchange transport for
+    // the broker while preserving existing workload identity behavior.
+    let exchange_http: Arc<dyn talon_backend::http::HttpClient> =
+        if origin_credentials_source().as_deref() == Some("broker") {
+            Arc::new(ReqwestClient::new())
+        } else {
+            Arc::clone(&http)
+        };
     let backend: Arc<dyn BackendStore> = match backend_kind {
-        "azure" => Arc::new(build_azure_backend(&cfg, http, credentials_observer).await?),
-        "s3" => Arc::new(build_s3_backend(&cfg, http, credentials_observer).await?),
-        "gcs" => Arc::new(build_gcs_backend(&cfg, http, credentials_observer).await?),
+        "azure" => {
+            Arc::new(build_azure_backend(&cfg, http, exchange_http, credentials_observer).await?)
+        }
+        "s3" => Arc::new(build_s3_backend(&cfg, http, exchange_http, credentials_observer).await?),
+        "gcs" => {
+            Arc::new(build_gcs_backend(&cfg, http, exchange_http, credentials_observer).await?)
+        }
         other => {
             anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
         }

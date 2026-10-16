@@ -30,6 +30,7 @@ url.workspace = true
 sha2 = "0.10"
 hmac = "0.12"
 base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 opentelemetry = { version = "=0.28.0", default-features = false, features = ["trace"] }
