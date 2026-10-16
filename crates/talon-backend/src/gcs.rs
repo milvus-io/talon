@@ -8,7 +8,7 @@
 //!
 //! Like [`crate::s3`], the store is generic over an [`HttpClient`] so request
 //! construction and response parsing are unit-testable offline; a real OAuth2
-//! bearer-token client is injected in production.
+//! bearer-token provider or HMAC credentials are injected in production.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -65,15 +65,99 @@ impl GcsConfig {
     }
 }
 
+/// GCS HMAC access ID and secret for XML API requests.
+///
+/// Deliberately omits `Debug` so formatting credentials cannot expose the secret.
+#[derive(Clone)]
+pub struct GcsHmacCredentials {
+    /// Access ID of a Google Cloud Storage HMAC key.
+    pub access_key_id: String,
+    /// Secret associated with the HMAC key.
+    pub secret_access_key: String,
+}
+
+/// Credentials used to authenticate GCS requests.
+#[derive(Clone)]
+pub enum GcsCredentials {
+    /// OAuth2 bearer token source, fixed or refreshed through workload identity.
+    Bearer(Arc<dyn crate::credentials::ProvideBearerToken>),
+    /// HMAC credentials for XML API requests.
+    Hmac(GcsHmacCredentials),
+}
+
 /// A GCS `BackendStore` over a pluggable HTTP client.
 pub struct GcsBackend {
     config: GcsConfig,
-    /// OAuth2 bearer token source (fixed, or workload-identity refreshed).
-    bearer: Arc<dyn crate::credentials::ProvideBearerToken>,
+    authentication: GcsCredentials,
     http: Arc<dyn HttpClient>,
 }
 
 impl GcsBackend {
+    /// Construct a backend using GCS HMAC credentials and the XML API.
+    pub fn with_hmac_credentials(
+        config: GcsConfig,
+        credentials: GcsHmacCredentials,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
+        Self::with_credentials(config, GcsCredentials::Hmac(credentials), http)
+    }
+
+    /// Construct a backend using credentials selected by the GCS mode resolver.
+    pub fn with_credentials(
+        config: GcsConfig,
+        credentials: GcsCredentials,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
+        Self {
+            config,
+            authentication: credentials,
+            http,
+        }
+    }
+
+    fn parse_xml_list_response(body: &str) -> Result<ListPage> {
+        if !body.contains("<ListBucketResult") || !body.contains("</ListBucketResult>") {
+            return Err(Error::Backend(
+                "GCS XML listing has no ListBucketResult".into(),
+            ));
+        }
+        let objects = crate::xml::blocks(body, "Contents")
+            .into_iter()
+            .map(|record| {
+                let key = crate::xml::element(record, "Key")
+                    .map(crate::xml::unescape)
+                    .ok_or_else(|| Error::Backend("GCS XML listing entry has no <Key>".into()))?;
+                let size = crate::xml::element(record, "Size")
+                    .and_then(|value| value.trim().parse::<u64>().ok())
+                    .ok_or_else(|| {
+                        Error::Backend(format!("GCS XML listing entry {key} has no usable <Size>"))
+                    })?;
+                Ok(ListedObject { key, size })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        // V2 tokens are opaque; an absent token on a truncated page must not
+        // silently terminate a scan, nor can it be replaced by the last key.
+        let next = match crate::xml::element(body, "IsTruncated").map(str::trim) {
+            Some(value) if value.eq_ignore_ascii_case("true") => Some(
+                crate::xml::element(body, "NextContinuationToken")
+                    .filter(|token| !token.is_empty())
+                    .map(crate::xml::unescape)
+                    .ok_or_else(|| {
+                        Error::Backend(
+                            "GCS XML listing is truncated without a continuation token".into(),
+                        )
+                    })?,
+            ),
+            Some(value) if value.eq_ignore_ascii_case("false") => None,
+            _ => {
+                return Err(Error::Backend(
+                    "GCS XML listing has no valid IsTruncated".into(),
+                ))
+            }
+        };
+        Ok(ListPage { objects, next })
+    }
+
     /// Construct a backend from config, an optional fixed bearer token, and a
     /// client.
     pub fn new(config: GcsConfig, bearer_token: Option<String>, http: Arc<dyn HttpClient>) -> Self {
@@ -90,27 +174,54 @@ impl GcsBackend {
         bearer: Arc<dyn crate::credentials::ProvideBearerToken>,
         http: Arc<dyn HttpClient>,
     ) -> Self {
-        Self {
-            config,
-            bearer,
-            http,
-        }
+        Self::with_credentials(config, GcsCredentials::Bearer(bearer), http)
     }
 
     /// Build the object download URL (`scheme://host/bucket/object`).
     pub fn object_url(&self, obj: &ObjectId) -> String {
         let scheme = if self.config.tls { "https" } else { "http" };
         let key = obj.object_path.trim_start_matches('/');
+        if matches!(self.authentication, GcsCredentials::Hmac(_)) {
+            // Sign exactly the escaped path transmitted by the HTTP client.
+            // Preserve separators, while treating %, ?, and # as key bytes.
+            let key = key
+                .split('/')
+                .map(encode_query_value)
+                .collect::<Vec<_>>()
+                .join("/");
+            return format!(
+                "{scheme}://{}/{}/{}",
+                self.config.endpoint,
+                encode_query_value(&obj.bucket),
+                key
+            );
+        }
         format!("{scheme}://{}/{}/{}", self.config.endpoint, obj.bucket, key)
     }
 
-    /// Build the JSON API listing URL for a bucket.
+    /// Build the listing URL for a bucket.
     ///
-    /// GCS lists through the **JSON API** (`/storage/v1/b/<bucket>/o`), not the
-    /// download endpoint the object URLs use, so this does not go through
-    /// [`object_url`](Self::object_url).
+    /// Bearer authentication retains the JSON API. HMAC keys authenticate only
+    /// XML API requests, which use ListObjectsV2 continuation tokens.
     pub fn list_url(&self, bucket: &str, prefix: &str, cursor: Option<&str>, max: u32) -> String {
         let scheme = if self.config.tls { "https" } else { "http" };
+        if matches!(self.authentication, GcsCredentials::Hmac(_)) {
+            let mut url = format!(
+                "{scheme}://{}/{}?list-type=2&max-keys={max}",
+                self.config.endpoint,
+                encode_query_value(bucket)
+            );
+            if !prefix.is_empty() {
+                url.push_str(&format!("&prefix={}", encode_query_value(prefix)));
+            }
+            if let Some(token) = cursor {
+                url.push_str(&format!(
+                    "&continuation-token={}",
+                    encode_query_value(token)
+                ));
+            }
+            return url;
+        }
         let mut url = format!(
             "{scheme}://{}/storage/v1/b/{}/o?maxResults={max}",
             self.config.endpoint,
@@ -181,11 +292,30 @@ impl GcsBackend {
         format!("bytes={offset}-{end}")
     }
 
-    fn auth_headers(&self) -> Vec<(String, String)> {
-        match self.bearer.current() {
-            Some(t) => vec![("Authorization".to_string(), format!("Bearer {t}"))],
-            None => Vec::new(),
+    async fn prepare_authentication(&self) -> Result<()> {
+        if let GcsCredentials::Bearer(provider) = &self.authentication {
+            provider.prepare().await.map_err(Error::Backend)?;
         }
+        Ok(())
+    }
+
+    fn authenticate(&self, mut request: HttpRequest, payload_hash: Option<&str>) -> HttpRequest {
+        match &self.authentication {
+            GcsCredentials::Bearer(provider) => {
+                if let Some(token) = provider.current() {
+                    request
+                        .headers
+                        .push(("Authorization".into(), format!("Bearer {token}")));
+                }
+            }
+            GcsCredentials::Hmac(credentials) => crate::sigv4::sign_gcs_request(
+                &mut request,
+                credentials,
+                &crate::sigv4::AmzDate::from_system_time(std::time::SystemTime::now()),
+                payload_hash,
+            ),
+        }
+        request
     }
 
     /// Build the ranged GET request (exposed for testing).
@@ -206,7 +336,7 @@ impl GcsBackend {
         len: u64,
         if_match: Option<&Version>,
     ) -> HttpRequest {
-        let mut headers = self.auth_headers();
+        let mut headers = Vec::new();
         headers.push(("Range".to_string(), Self::range_header(offset, len)));
         if let Some(version) = if_match {
             let v = version.as_str();
@@ -216,22 +346,28 @@ impl GcsBackend {
                 headers.push(("If-Match".to_string(), format!("\"{v}\"")));
             }
         }
-        HttpRequest {
-            method: Method::Get,
-            url: self.object_url(obj),
-            headers,
-            body: bytes::Bytes::new(),
-        }
+        self.authenticate(
+            HttpRequest {
+                method: Method::Get,
+                url: self.object_url(obj),
+                headers,
+                body: bytes::Bytes::new(),
+            },
+            None,
+        )
     }
 
     /// Build the HEAD request (exposed for testing).
     pub fn build_head(&self, obj: &ObjectId) -> HttpRequest {
-        HttpRequest {
-            method: Method::Head,
-            url: self.object_url(obj),
-            headers: self.auth_headers(),
-            body: bytes::Bytes::new(),
-        }
+        self.authenticate(
+            HttpRequest {
+                method: Method::Head,
+                url: self.object_url(obj),
+                headers: Vec::new(),
+                body: bytes::Bytes::new(),
+            },
+            None,
+        )
     }
 
     /// Build the whole-object PUT request (exposed for testing).
@@ -245,7 +381,7 @@ impl GcsBackend {
         body: bytes::Bytes,
         if_match: Option<&Version>,
     ) -> HttpRequest {
-        let mut headers = self.auth_headers();
+        let mut headers = Vec::new();
         headers.push(("Content-Length".to_string(), body.len().to_string()));
         if let Some(version) = if_match {
             let v = version.as_str();
@@ -255,34 +391,42 @@ impl GcsBackend {
                 headers.push(("If-Match".to_string(), format!("\"{v}\"")));
             }
         }
-        HttpRequest {
-            method: Method::Put,
-            url: self.object_url(obj),
-            headers,
-            body,
-        }
+        self.authenticate(
+            HttpRequest {
+                method: Method::Put,
+                url: self.object_url(obj),
+                headers,
+                body,
+            },
+            None,
+        )
     }
 
     fn build_streamed_put(&self, obj: &ObjectId, len: u64) -> HttpRequest {
-        let mut request = self.build_put(obj, bytes::Bytes::new(), None);
-        if let Some((_, value)) = request
-            .headers
-            .iter_mut()
-            .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        {
-            *value = len.to_string();
-        }
-        request
+        // GCS permits UNSIGNED-PAYLOAD with Authorization header signing.
+        // The file is streamed by the transport, so hashing an empty body here
+        // would incorrectly bind the signature to an empty upload.
+        self.authenticate(
+            HttpRequest::new(
+                Method::Put,
+                self.object_url(obj),
+                vec![("Content-Length".into(), len.to_string())],
+            ),
+            Some("UNSIGNED-PAYLOAD"),
+        )
     }
 
     /// Build the DELETE request (exposed for testing).
     pub fn build_delete(&self, obj: &ObjectId) -> HttpRequest {
-        HttpRequest {
-            method: Method::Delete,
-            url: self.object_url(obj),
-            headers: self.auth_headers(),
-            body: bytes::Bytes::new(),
-        }
+        self.authenticate(
+            HttpRequest {
+                method: Method::Delete,
+                url: self.object_url(obj),
+                headers: Vec::new(),
+                body: bytes::Bytes::new(),
+            },
+            None,
+        )
     }
 }
 
@@ -302,6 +446,7 @@ impl BackendStore for GcsBackend {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
+        self.prepare_authentication().await?;
         let resp = self
             .http
             .execute(self.build_get_if_match(obj, offset, len, if_match))
@@ -344,11 +489,12 @@ impl BackendStore for GcsBackend {
         cursor: Option<&str>,
         max_keys: u32,
     ) -> Result<ListPage> {
+        self.prepare_authentication().await?;
         // GCS caps maxResults at 1000 and silently reduces larger values;
         // clamping keeps the request honest.
         let max_keys = max_keys.clamp(1, 1000);
         let url = self.list_url(bucket, prefix, cursor, max_keys);
-        let req = HttpRequest::new(Method::Get, url, self.auth_headers());
+        let req = self.authenticate(HttpRequest::new(Method::Get, url, Vec::new()), None);
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 404 {
             return Err(Error::NotFound(bucket.to_string()));
@@ -361,10 +507,14 @@ impl BackendStore for GcsBackend {
         }
         let body = std::str::from_utf8(&resp.body)
             .map_err(|e| Error::Backend(format!("GCS listing body is not UTF-8: {e}")))?;
-        Self::parse_list_response(body)
+        match self.authentication {
+            GcsCredentials::Bearer(_) => Self::parse_list_response(body),
+            GcsCredentials::Hmac(_) => Self::parse_xml_list_response(body),
+        }
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
+        self.prepare_authentication().await?;
         let resp = self
             .http
             .execute(self.build_head(obj))
@@ -409,6 +559,7 @@ impl BackendStore for GcsBackend {
         body: bytes::Bytes,
         if_match: Option<&Version>,
     ) -> Result<Version> {
+        self.prepare_authentication().await?;
         let resp = self
             .http
             .execute(self.build_put(obj, body, if_match))
@@ -443,6 +594,7 @@ impl BackendStore for GcsBackend {
     }
 
     async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        self.prepare_authentication().await?;
         let resp = self
             .http
             .execute_file(self.build_streamed_put(obj, len), path, len)
@@ -467,6 +619,7 @@ impl BackendStore for GcsBackend {
     }
 
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        self.prepare_authentication().await?;
         let resp = self
             .http
             .execute(self.build_delete(obj))
@@ -527,6 +680,195 @@ mod tests {
 
     fn obj() -> ObjectId {
         ObjectId::new(Backend::Gcs, "my-bucket", "data/checkpoint.bin")
+    }
+
+    #[tokio::test]
+    async fn hmac_xml_listing_preserves_opaque_continuation_token() {
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::from_static(
+                br#"<?xml version="1.0" encoding="UTF-8"?>
+<ListBucketResult xmlns="http://doc.s3.amazonaws.com/2006-03-01">
+<Name>my-bucket</Name><Prefix>data/</Prefix><MaxKeys>2</MaxKeys>
+<IsTruncated>true</IsTruncated><NextContinuationToken>next+/=&amp;x</NextContinuationToken>
+<Contents><Key>data/a&amp;b</Key><Size>9007199254740993</Size></Contents>
+</ListBucketResult>"#,
+            ),
+        });
+        let backend = GcsBackend::with_hmac_credentials(
+            GcsConfig::default(),
+            GcsHmacCredentials {
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+            },
+            http.clone(),
+        );
+        let page = backend
+            .list_objects("my-bucket", "data/", Some("prev+/="), 2)
+            .await
+            .unwrap();
+        assert_eq!(page.objects[0].key, "data/a&b");
+        assert_eq!(page.objects[0].size, 9_007_199_254_740_993);
+        assert_eq!(page.next.as_deref(), Some("next+/=&x"));
+        let request = http.last.lock().unwrap().clone().unwrap();
+        assert_eq!(request.url, "https://storage.googleapis.com/my-bucket?list-type=2&max-keys=2&prefix=data%2F&continuation-token=prev%2B%2F%3D");
+        assert!(request
+            .header("authorization")
+            .unwrap()
+            .starts_with("GOOG4-HMAC-SHA256 "));
+    }
+
+    #[test]
+    fn hmac_xml_listing_rejects_truncated_page_without_token() {
+        assert!(GcsBackend::parse_xml_list_response(
+            "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>"
+        )
+        .is_err());
+        assert!(
+            GcsBackend::parse_xml_list_response("<Error><Code>InternalError</Code></Error>")
+                .is_err()
+        );
+        let page = GcsBackend::parse_xml_list_response(
+            "<ListBucketResult><IsTruncated>false</IsTruncated><NextContinuationToken>stale</NextContinuationToken></ListBucketResult>"
+        ).unwrap();
+        assert!(page.objects.is_empty());
+        assert!(page.next.is_none());
+    }
+
+    #[tokio::test]
+    async fn hmac_operations_reach_http_with_signed_conditions_and_streamed_body() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::{Request, Response, StatusCode};
+
+        let app =
+            axum::Router::new().fallback(axum::routing::any(|request: Request<Body>| async move {
+                assert_eq!(request.uri().path(), "/my-bucket/data/a%20b%2B%25%3F.bin");
+                let auth = request.headers()["authorization"].to_str().unwrap();
+                assert!(auth.starts_with("GOOG4-HMAC-SHA256 Credential=test-access/"));
+                assert!(auth.contains("/auto/storage/goog4_request, SignedHeaders="));
+                assert!(auth.contains("x-goog-date"));
+                assert!(!request.headers().contains_key("x-amz-date"));
+                for name in request
+                    .headers()
+                    .keys()
+                    .filter(|name| name.as_str().starts_with("x-goog-"))
+                {
+                    assert!(auth.contains(name.as_str()), "unsigned header: {name}");
+                }
+                if request.headers().contains_key("if-match") {
+                    assert_eq!(request.headers()["if-match"], "\"etag-value\"");
+                    assert!(auth.contains("if-match"));
+                }
+                if request
+                    .headers()
+                    .get("x-goog-if-generation-match")
+                    .is_some_and(|v| v == "41")
+                {
+                    return Response::builder()
+                        .status(StatusCode::PRECONDITION_FAILED)
+                        .header("x-goog-generation", "42")
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                let mut response = Response::builder().header("x-goog-generation", "42");
+                let method = request.method().clone();
+                let streamed = request.headers()["x-goog-content-sha256"] == "UNSIGNED-PAYLOAD";
+                let response_body = match method {
+                    axum::http::Method::GET => {
+                        assert_eq!(request.headers()["range"], "bytes=1-3");
+                        response = response
+                            .status(StatusCode::PARTIAL_CONTENT)
+                            .header("content-range", "bytes 1-3/5");
+                        Body::from("bcd")
+                    }
+                    axum::http::Method::HEAD => {
+                        response = response.header("content-length", "5");
+                        Body::empty()
+                    }
+                    axum::http::Method::PUT => {
+                        let content_length = request.headers()["content-length"]
+                            .to_str()
+                            .unwrap()
+                            .parse::<usize>()
+                            .unwrap();
+                        let body = to_bytes(request.into_body(), 1024).await.unwrap();
+                        assert_eq!(content_length, body.len());
+                        assert_eq!(
+                            body.as_ref(),
+                            if streamed {
+                                b"stream-data".as_slice()
+                            } else {
+                                b"bytes-data".as_slice()
+                            }
+                        );
+                        Body::empty()
+                    }
+                    axum::http::Method::DELETE => {
+                        response = response.status(StatusCode::NO_CONTENT);
+                        Body::empty()
+                    }
+                    _ => panic!("unexpected HTTP method"),
+                };
+                response.body(response_body).unwrap()
+            }));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let backend = GcsBackend::with_hmac_credentials(
+            GcsConfig::emulator(endpoint, false),
+            GcsHmacCredentials {
+                access_key_id: "test-access".into(),
+                secret_access_key: "test-secret".into(),
+            },
+            Arc::new(crate::ReqwestClient::with_client(
+                reqwest::Client::builder().no_proxy().build().unwrap(),
+            )),
+        );
+        let object = ObjectId::new(Backend::Gcs, "my-bucket", "data/a b+%?.bin");
+        assert_eq!(
+            backend.head(&object).await.unwrap(),
+            ObjectStat {
+                len: 5,
+                version: Version::new("42")
+            }
+        );
+        for version in ["42", "etag-value"] {
+            assert_eq!(
+                backend
+                    .fetch_range_if_match(&object, 1, 3, Some(&Version::new(version)))
+                    .await
+                    .unwrap(),
+                "bcd"
+            );
+            assert_eq!(
+                backend
+                    .put_if_match(
+                        &object,
+                        bytes::Bytes::from_static(b"bytes-data"),
+                        Some(&Version::new(version))
+                    )
+                    .await
+                    .unwrap(),
+                Version::new("42")
+            );
+        }
+        assert!(matches!(
+            backend.fetch_range_if_match(&object, 1, 3, Some(&Version::new("41"))).await,
+            Err(Error::VersionMismatch { expected, found }) if expected == "41" && found == "42"
+        ));
+        assert!(matches!(
+            backend.put_if_match(&object, bytes::Bytes::from_static(b"bytes-data"), Some(&Version::new("41"))).await,
+            Err(Error::VersionMismatch { expected, found }) if expected == "41" && found == "42"
+        ));
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut file, b"stream-data").unwrap();
+        assert_eq!(
+            backend.put_file(&object, file.path(), 11).await.unwrap(),
+            Version::new("42")
+        );
+        backend.delete(&object).await.unwrap();
+        server.abort();
     }
 
     #[test]

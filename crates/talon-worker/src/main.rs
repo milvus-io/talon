@@ -11,8 +11,8 @@
 //! - Data plane uses [`talon_transport::data`]: a
 //!   [`talon_transport::data::RangeRequest`] in, raw bytes (or an
 //!   `ERROR`-flagged frame) out.
-//! - Backend fetch is the real [`AzureBackend`] over [`ReqwestClient`]; the SAS
-//!   token is read from the environment and **never logged**.
+//! - Backend fetch uses [`ReqwestClient`]; origin credentials are resolved by
+//!   the backend's AK/SK, IAM, or Broker mode and secrets are never logged.
 //!
 //! The hot path serves cached blocks **zero-copy** via `sendfile(2)`
 //! ([`send_file_range`](talon_worker::send_file_range)) straight from the
@@ -27,8 +27,8 @@ use std::time::{Duration, Instant};
 
 use clap::Parser;
 use talon_backend::{
-    endpoint_host, AzureBackend, AzureConfig, GcsBackend, GcsConfig, ReqwestClient, S3Backend,
-    S3Config, S3Credentials,
+    endpoint_host, AzureBackend, AzureConfig, CredentialMode, GcsBackend, GcsConfig,
+    GcsHmacCredentials, ReqwestClient, S3Backend, S3Config, S3Credentials,
 };
 use talon_core::{
     azure_sas_from_env, gcs_bearer_from_env, s3_secret_key_from_env, s3_session_token_from_env,
@@ -221,19 +221,17 @@ impl Args {
     }
 }
 
-/// Explicit origin credential mechanism (`static`, `aws-web-identity`,
-/// `aliyun-oidc`, `tencent-oidc`, `huawei-agency`, `gcp-metadata`); unset
-/// means static material first, then auto-detected workload identity. Read
-/// from the environment like the secrets themselves.
+/// Origin credential mode (`aksk`, `iam`, or `broker`). Unset selects AK/SK
+/// when keys are configured, otherwise IAM. The backend resolver also accepts
+/// legacy source aliases for compatibility.
 fn origin_credentials_source() -> Option<String> {
     std::env::var("TALON_ORIGIN_CREDENTIALS_SOURCE")
         .ok()
         .filter(|value| !value.is_empty())
 }
 
-/// Build the Azure backend from account (config/env) plus a SAS token (env)
-/// or, when no SAS is set, AKS workload identity, honoring an optional
-/// endpoint override (Azurite/proxy).
+/// Build Azure from its account/endpoint and the common credential resolver.
+/// Account keys remain env-only; IAM and Broker ignore leftover direct secrets.
 async fn build_azure_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
@@ -250,44 +248,60 @@ async fn build_azure_backend(
         }
         None => AzureConfig::new(account),
     };
-    if origin_credentials_source().as_deref() == Some("broker") {
-        let sas =
-            talon_backend::resolve_azure_broker_sas(&azure_config.account, exchange_http, observer)
-                .await
-                .map_err(anyhow::Error::msg)?;
-        tracing::info!(source = "broker", "origin Azure credentials resolved");
-        return Ok(AzureBackend::with_sas_provider(azure_config, sas, http));
-    }
-    match azure_sas_from_env() {
-        Some(sas) => {
-            tracing::info!(source = "sas", "origin Azure credentials resolved");
-            Ok(AzureBackend::new(azure_config, Some(sas), http))
-        }
-        None => {
-            let resolved = talon_backend::resolve_azure_bearer(exchange_http, observer)
-                .await
-                .map_err(|error| {
-                    anyhow::anyhow!(
-                        "TALON_WORKER_AZURE_SAS must be set (SAS token), or AKS \
-                         workload identity must be available: {error}"
-                    )
-                })?;
-            tracing::info!(
-                source = resolved.source,
-                "origin Azure credentials resolved"
-            );
-            Ok(AzureBackend::with_bearer_provider(
+    let source = origin_credentials_source();
+    let shared_key = std::env::var("TALON_WORKER_AZURE_SHARED_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let legacy_sas = azure_sas_from_env();
+    // Preserve existing fixed-SAS configurations. Explicit modes still use
+    // the common resolver, so IAM/Broker cannot fall back to this credential.
+    if shared_key.is_none() && matches!(source.as_deref(), None | Some("auto" | "static")) {
+        if let Some(sas) = &legacy_sas {
+            return Ok(AzureBackend::with_credentials(
                 azure_config,
-                resolved.provider,
+                talon_backend::AzureCredentials::Sas(sas.clone()),
                 http,
-            ))
+            ));
         }
     }
+    let mode = CredentialMode::select(
+        source.as_deref(),
+        shared_key.is_some() || legacy_sas.is_some(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let shared_key = if mode == CredentialMode::AkSk {
+        if legacy_sas.is_some() {
+            anyhow::bail!(
+                "TALON_WORKER_AZURE_SAS is not an AK/SK account key; use \
+                 TALON_ORIGIN_CREDENTIALS_SOURCE=iam or broker, or configure \
+                 TALON_WORKER_AZURE_SHARED_KEY for aksk"
+            );
+        }
+        shared_key
+    } else {
+        None
+    };
+    let resolved = talon_backend::resolve_azure_credentials(
+        &azure_config.account,
+        shared_key,
+        source.as_deref(),
+        exchange_http,
+        observer,
+    )
+    .await
+    .map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        source = resolved.source,
+        "origin Azure credentials resolved"
+    );
+    Ok(AzureBackend::with_credentials(
+        azure_config,
+        resolved.provider,
+        http,
+    ))
 }
 
-/// Build the S3 backend from region/endpoint (config) plus either static keys
-/// (config + env) or a cloud workload identity (EKS IRSA, ACK RRSA, TKE OIDC
-/// auto-detected; Huawei agency via `TALON_ORIGIN_CREDENTIALS_SOURCE`).
+/// Build S3 from its region/endpoint and the common credential resolver.
 async fn build_s3_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
@@ -298,10 +312,15 @@ async fn build_s3_backend(
         .s3_region
         .clone()
         .ok_or_else(|| anyhow::anyhow!("s3_region is required (set TALON_WORKER_S3_REGION)"))?;
-    let static_credentials = if origin_credentials_source().as_deref() == Some("broker") {
-        None
-    } else {
-        match (cfg.s3_access_key_id.clone(), s3_secret_key_from_env()) {
+    let source = origin_credentials_source();
+    let secret_access_key = s3_secret_key_from_env();
+    let mode = CredentialMode::select(
+        source.as_deref(),
+        cfg.s3_access_key_id.is_some() || secret_access_key.is_some(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let static_credentials = if mode == CredentialMode::AkSk {
+        match (cfg.s3_access_key_id.clone(), secret_access_key) {
             (Some(access_key_id), Some(secret_access_key)) => Some(S3Credentials {
                 access_key_id,
                 secret_access_key,
@@ -315,6 +334,8 @@ async fn build_s3_backend(
                 anyhow::bail!("s3_access_key_id is required (set TALON_WORKER_S3_ACCESS_KEY_ID)")
             }
         }
+    } else {
+        None
     };
     let mut config = S3Config::aws(&region);
     if let Some(endpoint) = cfg.s3_endpoint.clone() {
@@ -327,7 +348,7 @@ async fn build_s3_backend(
     }
     let resolved = talon_backend::resolve_s3_credentials(
         static_credentials,
-        origin_credentials_source().as_deref(),
+        source.as_deref(),
         exchange_http,
         observer,
     )
@@ -341,9 +362,8 @@ async fn build_s3_backend(
     ))
 }
 
-/// Build the GCS backend from an optional endpoint override (fake-gcs-server)
-/// plus a bearer token (env) or the GKE metadata service
-/// (`TALON_ORIGIN_CREDENTIALS_SOURCE=gcp-metadata`).
+/// Build GCS from its endpoint and the common credential resolver. HMAC keys
+/// remain env-only; legacy fixed bearer-token configurations remain supported.
 async fn build_gcs_backend(
     cfg: &WorkerConfig,
     http: Arc<dyn talon_backend::http::HttpClient>,
@@ -357,16 +377,57 @@ async fn build_gcs_backend(
         }
         None => GcsConfig::default(),
     };
-    let resolved = talon_backend::resolve_gcs_bearer(
-        gcs_bearer_from_env(),
-        origin_credentials_source().as_deref(),
+    let source = origin_credentials_source();
+    let access_key_id = std::env::var("TALON_WORKER_GCS_ACCESS_KEY_ID")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let secret_access_key = std::env::var("TALON_WORKER_GCS_SECRET_ACCESS_KEY")
+        .ok()
+        .filter(|value| !value.is_empty());
+    let legacy_token = gcs_bearer_from_env();
+    if access_key_id.is_none()
+        && secret_access_key.is_none()
+        && matches!(source.as_deref(), None | Some("auto" | "static"))
+    {
+        if let Some(token) = &legacy_token {
+            return Ok(GcsBackend::new(config, Some(token.clone()), http));
+        }
+    }
+    let mode = CredentialMode::select(
+        source.as_deref(),
+        access_key_id.is_some() || secret_access_key.is_some() || legacy_token.is_some(),
+    )
+    .map_err(anyhow::Error::msg)?;
+    let credentials = if mode == CredentialMode::AkSk {
+        if legacy_token.is_some() {
+            anyhow::bail!(
+                "TALON_WORKER_GCS_BEARER_TOKEN is not an AK/SK HMAC key; use \
+                 TALON_ORIGIN_CREDENTIALS_SOURCE=iam or broker, or configure \
+                 TALON_WORKER_GCS_ACCESS_KEY_ID and TALON_WORKER_GCS_SECRET_ACCESS_KEY for aksk"
+            );
+        }
+        match (access_key_id, secret_access_key) {
+            (Some(access_key_id), Some(secret_access_key)) => Some(GcsHmacCredentials {
+                access_key_id,
+                secret_access_key,
+            }),
+            (None, None) => None,
+            (Some(_), None) => anyhow::bail!("TALON_WORKER_GCS_SECRET_ACCESS_KEY must be set"),
+            (None, Some(_)) => anyhow::bail!("TALON_WORKER_GCS_ACCESS_KEY_ID must be set"),
+        }
+    } else {
+        None
+    };
+    let resolved = talon_backend::resolve_gcs_credentials(
+        credentials,
+        source.as_deref(),
         exchange_http,
         observer,
     )
     .await
     .map_err(|error| anyhow::anyhow!(error))?;
     tracing::info!(source = resolved.source, "origin GCS credentials resolved");
-    Ok(GcsBackend::with_bearer_provider(
+    Ok(GcsBackend::with_credentials(
         config,
         resolved.provider,
         http,
@@ -587,7 +648,10 @@ async fn run() -> anyhow::Result<()> {
     // shorter attempt deadline, so use an undecorated exchange transport for
     // the broker while preserving existing workload identity behavior.
     let exchange_http: Arc<dyn talon_backend::http::HttpClient> =
-        if origin_credentials_source().as_deref() == Some("broker") {
+        if CredentialMode::select(origin_credentials_source().as_deref(), false)
+            .map_err(anyhow::Error::msg)?
+            == CredentialMode::Broker
+        {
             Arc::new(ReqwestClient::new())
         } else {
             Arc::clone(&http)
