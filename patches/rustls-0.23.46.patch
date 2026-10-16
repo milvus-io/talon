@@ -1,0 +1,133 @@
+--- a/src/common_state.rs
++++ b/src/common_state.rs
+@@ -50,6 +50,10 @@
+     pub(crate) peer_certificates: Option<CertificateChain<'static>>,
+     message_fragmenter: MessageFragmenter,
+     pub(crate) received_plaintext: ChunkVecBuffer,
++    // Scoped to one opt-in unbuffered process call. Offsets, never raw borrows,
++    // identify plaintext accepted by the existing protocol state handler.
++    pub(crate) plaintext_input: Option<(usize, usize)>,
++    pub(crate) plaintext_range: Option<core::ops::Range<usize>>,
+     pub(crate) sendable_tls: ChunkVecBuffer,
+     queued_key_update_message: Option<Vec<u8>>,
+ 
+@@ -85,6 +89,8 @@
+             peer_certificates: None,
+             message_fragmenter: MessageFragmenter::default(),
+             received_plaintext: ChunkVecBuffer::new(Some(DEFAULT_RECEIVED_PLAINTEXT_LIMIT)),
++            plaintext_input: None,
++            plaintext_range: None,
+             sendable_tls: ChunkVecBuffer::new(Some(DEFAULT_BUFFER_LIMIT)),
+             queued_key_update_message: None,
+             protocol: Protocol::Tcp,
+@@ -482,6 +488,14 @@
+ 
+     pub(crate) fn take_received_plaintext(&mut self, bytes: Payload<'_>) {
+         self.temper_counters.received_app_data();
++        if let (Some((base, len)), Payload::Borrowed(payload)) = (self.plaintext_input, &bytes) {
++            if let Some(start) = (payload.as_ptr() as usize).checked_sub(base) {
++                if start <= len && payload.len() <= len - start {
++                    self.plaintext_range = Some(start..start + payload.len());
++                    return;
++                }
++            }
++        }
+         self.received_plaintext
+             .append(bytes.into_vec());
+     }
+--- a/src/conn/unbuffered.rs
++++ b/src/conn/unbuffered.rs
+@@ -13,6 +13,19 @@
+ use crate::server::ServerConnectionData;
+ 
+ impl UnbufferedConnectionCommon<ClientConnectionData> {
++    /// Process records while borrowing accepted application plaintext directly
++    /// from `incoming_tls`. The existing authentication and protocol state
++    /// handlers still run. As with `process_tls_records`, handle the returned
++    /// state before discarding input or calling this method again.
++    pub fn process_tls_records_in_place<'c, 'i>(
++        &'c mut self,
++        incoming_tls: &'i mut [u8],
++    ) -> UnbufferedStatus<'c, 'i, ClientConnectionData> {
++        self.core.common_state.plaintext_input =
++            Some((incoming_tls.as_ptr() as usize, incoming_tls.len()));
++        self.process_tls_records(incoming_tls)
++    }
++
+     /// Processes the TLS records in `incoming_tls` buffer until a new [`UnbufferedStatus`] is
+     /// reached.
+     pub fn process_tls_records<'c, 'i>(
+@@ -45,6 +58,9 @@
+         mut early_data_available: impl FnMut(&mut Self) -> bool,
+         early_data_state: impl FnOnce(&'c mut Self, &'i mut [u8]) -> ConnectionState<'c, 'i, Data>,
+     ) -> UnbufferedStatus<'c, 'i, Data> {
++        // Remove the capture scope from CommonState before processing. Enable
++        // it only around process_msg, so no mode survives a returned status.
++        let plaintext_input = self.core.common_state.plaintext_input.take();
+         let mut buffer = DeframerSliceBuffer::new(incoming_tls);
+         let mut buffer_progress = self.core.hs_deframer.progress();
+ 
+@@ -61,6 +77,7 @@
+                 .common_state
+                 .received_plaintext
+                 .is_empty()
++                || self.core.common_state.plaintext_range.is_some()
+             {
+                 break (
+                     buffer.pending_discard(),
+@@ -116,7 +133,10 @@
+                         }
+                     };
+ 
+-                match self.core.process_msg(msg, state, None) {
++                self.core.common_state.plaintext_input = plaintext_input;
++                let result = self.core.process_msg(msg, state, None);
++                self.core.common_state.plaintext_input = None;
++                match result {
+                     Ok(new) => state = new,
+ 
+                     Err(e) => {
+@@ -327,7 +347,7 @@
+ /// Application data is available
+ pub struct ReadTraffic<'c, 'i, Data> {
+     conn: &'c mut UnbufferedConnectionCommon<Data>,
+-    // for forwards compatibility; to support in-place decryption in the future
++    borrowed: Option<core::ops::Range<usize>>,
+     _incoming_tls: &'i mut [u8],
+ 
+     // owner of the latest chunk obtained in `next_record`, as borrowed by
+@@ -337,9 +357,11 @@
+ 
+ impl<'c, 'i, Data> ReadTraffic<'c, 'i, Data> {
+     fn new(conn: &'c mut UnbufferedConnectionCommon<Data>, _incoming_tls: &'i mut [u8]) -> Self {
++        let borrowed = conn.core.common_state.plaintext_range.take();
+         Self {
+             conn,
+             _incoming_tls,
++            borrowed,
+             chunk: None,
+         }
+     }
+@@ -347,6 +369,12 @@
+     /// Decrypts and returns the next available app-data record
+     // TODO deprecate in favor of `Iterator` implementation, which requires in-place decryption
+     pub fn next_record(&mut self) -> Option<Result<AppDataRecord<'_>, Error>> {
++        if let Some(range) = self.borrowed.take() {
++            return Some(Ok(AppDataRecord {
++                discard: 0,
++                payload: &self._incoming_tls[range],
++            }));
++        }
+         self.chunk = self
+             .conn
+             .core
+@@ -365,6 +393,9 @@
+     ///
+     /// Returns `None` if there are no more app-data records
+     pub fn peek_len(&self) -> Option<NonZeroUsize> {
++        if let Some(range) = &self.borrowed {
++            return NonZeroUsize::new(range.len());
++        }
+         self.conn
+             .core
+             .common_state

@@ -70,20 +70,37 @@ impl Drop for Origin {
 }
 impl Origin {
     async fn start(tls: bool) -> Self {
+        Self::start_fragmented(tls, None, None).await
+    }
+    async fn start_fragmented(
+        tls: bool,
+        version: Option<&'static rustls::SupportedProtocolVersion>,
+        fragment: Option<usize>,
+    ) -> Self {
+        Self::start_controlled(tls, version, fragment, None).await
+    }
+    async fn start_controlled(
+        tls: bool,
+        version: Option<&'static rustls::SupportedProtocolVersion>,
+        fragment: Option<usize>,
+        mut control: Option<IdleControl>,
+    ) -> Self {
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])
             .unwrap();
         let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
         let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let server = rustls::ServerConfig::builder_with_provider(provider.clone())
-            .with_safe_default_protocol_versions()
+        let versions = version.map_or_else(|| rustls::DEFAULT_VERSIONS.to_vec(), |v| vec![v]);
+        let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_protocol_versions(&versions)
             .unwrap()
             .with_no_client_auth()
             .with_single_cert(vec![cert.cert.der().clone()], key.into())
             .unwrap();
+        server.max_fragment_size = fragment;
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert.cert.der().clone()).unwrap();
         let client = rustls::ClientConfig::builder_with_provider(provider)
-            .with_safe_default_protocol_versions()
+            .with_protocol_versions(&versions)
             .unwrap()
             .with_root_certificates(roots)
             .with_no_client_auth();
@@ -96,14 +113,23 @@ impl Origin {
         let accepted = connections.clone();
         let task = tokio::spawn(async move {
             while let Ok((socket, _)) = listener.accept().await {
+                socket.set_nodelay(true).unwrap();
                 accepted.fetch_add(1, Ordering::SeqCst);
                 let acceptor = acceptor.clone();
                 let count = count.clone();
+                let control = control.take();
                 tokio::spawn(async move {
                     if tls {
                         if let Ok(stream) = acceptor.accept(socket).await {
-                            respond(stream, count).await;
+                            if let Some(control) = control {
+                                controlled_idle(IdleStream::Tls(Box::new(stream)), count, control)
+                                    .await;
+                            } else {
+                                respond(stream, count).await;
+                            }
                         }
+                    } else if let Some(control) = control {
+                        controlled_idle(IdleStream::Plain(socket), count, control).await;
                     } else {
                         respond(socket, count).await;
                     }
@@ -139,6 +165,258 @@ impl Origin {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum IdleAction {
+    WaitForClose,
+    Fin,
+    Reset,
+    CloseNotify,
+    KeyUpdate,
+    PartialRecord,
+}
+
+struct IdleControl {
+    action: IdleAction,
+    start: tokio::sync::oneshot::Receiver<()>,
+    observed: tokio::sync::oneshot::Sender<()>,
+}
+
+trait TestIo: AsyncRead + AsyncWrite + Unpin {}
+impl<T: AsyncRead + AsyncWrite + Unpin> TestIo for T {}
+
+enum IdleStream {
+    Plain(tokio::net::TcpStream),
+    Tls(Box<tokio_rustls::server::TlsStream<tokio::net::TcpStream>>),
+}
+impl IdleStream {
+    fn io(&mut self) -> &mut (dyn TestIo + Send) {
+        match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => stream.as_mut(),
+        }
+    }
+    fn socket(&self) -> &tokio::net::TcpStream {
+        match self {
+            Self::Plain(stream) => stream,
+            Self::Tls(stream) => stream.get_ref().0,
+        }
+    }
+}
+
+async fn controlled_idle(mut stream: IdleStream, count: Arc<AtomicUsize>, control: IdleControl) {
+    let mut request = Vec::new();
+    while !request.ends_with(b"\r\n\r\n") {
+        request.push(stream.io().read_u8().await.unwrap());
+    }
+    count.fetch_add(1, Ordering::SeqCst);
+    stream
+        .io()
+        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabcdefgh")
+        .await
+        .unwrap();
+    stream.io().flush().await.unwrap();
+    control.start.await.unwrap();
+    match control.action {
+        IdleAction::WaitForClose => {}
+        IdleAction::Fin => stream.io().shutdown().await.unwrap(),
+        IdleAction::Reset => {
+            #[allow(deprecated)]
+            stream
+                .socket()
+                .set_linger(Some(std::time::Duration::ZERO))
+                .unwrap();
+            drop(stream);
+            let _ = control.observed.send(());
+            return;
+        }
+        IdleAction::CloseNotify => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            tls.get_mut().1.send_close_notify();
+            // Flush only the TLS alert; leave TCP open so this specifically
+            // proves the monitor processes TLS close_notify, not just FIN.
+            tls.flush().await.unwrap();
+        }
+        IdleAction::KeyUpdate => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            tls.get_mut().1.refresh_traffic_keys().unwrap();
+            tls.flush().await.unwrap();
+            // Drive the reciprocal update while no HTTP request is pending.
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(100), tls.read_u8())
+                    .await
+                    .is_err()
+            );
+            let _ = control.observed.send(());
+            respond(stream.io(), count).await;
+            return;
+        }
+        IdleAction::PartialRecord => {
+            let IdleStream::Tls(tls) = &mut stream else {
+                panic!("TLS required")
+            };
+            // Stall halfway through a TLS record header. Checkout must abandon
+            // this in-flight idle read instead of reusing its damaged state.
+            tls.get_mut().0.write_all(&[23, 3, 3]).await.unwrap();
+            let _ = control.observed.send(());
+            let mut byte = [0];
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                tls.get_mut().0.read(&mut byte),
+            )
+            .await;
+            return;
+        }
+    }
+    let mut byte = [0];
+    let read = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        stream.io().read(&mut byte),
+    )
+    .await
+    .unwrap();
+    assert!(
+        matches!(read, Ok(0)) || read.is_err(),
+        "monitor must close without sending a request"
+    );
+    let _ = control.observed.send(());
+}
+
+#[test]
+#[ignore = "requires native io_uring; verifies idle connections close during ring shutdown"]
+fn ring_shutdown_closes_idle_origin_connections() {
+    let server = tokio::runtime::Runtime::new().unwrap();
+    for version in [
+        None,
+        Some(&rustls::version::TLS12),
+        Some(&rustls::version::TLS13),
+    ] {
+        for _ in 0..2 {
+            let (start, ready) = tokio::sync::oneshot::channel();
+            let (observed, closed) = tokio::sync::oneshot::channel();
+            let origin = server.block_on(Origin::start_controlled(
+                version.is_some(),
+                version,
+                None,
+                Some(IdleControl {
+                    action: IdleAction::WaitForClose,
+                    start: ready,
+                    observed,
+                }),
+            ));
+            let client = origin.client();
+            let scheme = if version.is_some() { "https" } else { "http" };
+            let request = HttpRequest::new(
+                Method::Get,
+                format!("{scheme}://{}/keepalive", origin.address),
+                vec![],
+            );
+            let worker = std::thread::spawn(move || {
+                on_native_ring(async move {
+                    assert_eq!(client.execute(request).await.unwrap().body, "abcdefgh");
+                    start.send(()).unwrap();
+                    // Let the monitor enter its socket readiness wait before
+                    // the helper drains and drops the ring.
+                    monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                });
+            });
+            // The server stays alive across ring/thread teardown, so dropping
+            // the fixture cannot accidentally close the connection for us.
+            server.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), closed)
+                    .await
+                    .expect("ring shutdown must close the idle origin connection")
+                    .expect("origin must observe closure");
+            });
+            worker.join().unwrap();
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires native io_uring; checks idle EOF and TLS control records"]
+fn idle_origin_connections_observe_close_and_preserve_tls_control_records() {
+    on_native_ring(async {
+        for version in [
+            None,
+            Some(&rustls::version::TLS12),
+            Some(&rustls::version::TLS13),
+        ] {
+            let tls = version.is_some();
+            let mut actions = vec![IdleAction::Fin, IdleAction::Reset];
+            if tls {
+                actions.extend([IdleAction::CloseNotify, IdleAction::PartialRecord]);
+            }
+            if version == Some(&rustls::version::TLS13) {
+                actions.push(IdleAction::KeyUpdate);
+            }
+            for action in actions {
+                let (start, ready) = tokio::sync::oneshot::channel();
+                let (observed, wait) = tokio::sync::oneshot::channel();
+                let origin = Origin::start_controlled(
+                    tls,
+                    version,
+                    None,
+                    Some(IdleControl {
+                        action,
+                        start: ready,
+                        observed,
+                    }),
+                )
+                .await;
+                let client = origin.client();
+                let request = HttpRequest::new(
+                    Method::Get,
+                    format!(
+                        "{}://{}/keepalive",
+                        if tls { "https" } else { "http" },
+                        origin.address
+                    ),
+                    vec![],
+                );
+                assert_eq!(
+                    client.execute(request.clone()).await.unwrap().body,
+                    "abcdefgh"
+                );
+                start.send(()).unwrap();
+                // For FIN/close_notify the server waits for the client's close
+                // before acknowledging: no next request can trigger detection.
+                tokio::time::timeout(std::time::Duration::from_secs(3), wait)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                if matches!(action, IdleAction::PartialRecord | IdleAction::Reset) {
+                    // These events have no protocol acknowledgement. Allow the
+                    // packet to arrive and the idle monitor to start processing;
+                    // a close arriving after checkout remains a request error.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
+                let response = tokio::time::timeout(
+                    std::time::Duration::from_secs(2),
+                    client.execute(request),
+                )
+                .await
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{version:?} {action:?}: {error}"));
+                assert_eq!(response.body, "abcdefgh", "{version:?} {action:?}");
+                assert_eq!(origin.requests.load(Ordering::SeqCst), 2);
+                assert_eq!(
+                    origin.connections.load(Ordering::SeqCst),
+                    if matches!(action, IdleAction::KeyUpdate) {
+                        1
+                    } else {
+                        2
+                    },
+                    "{version:?} {action:?}"
+                );
+            }
+        }
+    });
+}
+
 async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<AtomicUsize>) {
     loop {
         let mut request = Vec::new();
@@ -152,7 +430,40 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
         let attempt = count.fetch_add(1, Ordering::SeqCst);
         let request = String::from_utf8(request).unwrap();
         let target = request.split_whitespace().nth(1).unwrap();
-        if target.starts_with("/stall") {
+        if target == "/echo" {
+            let length: usize = request
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::to_owned)
+                })
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            stream
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.flush().await.unwrap();
+            continue;
+        }
+        if target == "/stall" {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
+            return;
+        }
+        if target.contains("/stall-body") {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n\r\npartial")
+                .await
+                .unwrap();
+            stream.flush().await.unwrap();
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
             return;
         }
@@ -880,6 +1191,93 @@ fn aligned_http_bodies_and_paged_commits_preserve_payload() {
                     if l1_capacity > 0 {
                         assert_eq!(recovered.l1_resident_bytes(), 12289);
                     }
+                }
+            }
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring; fragmented TLS 1.2/1.3 application records"]
+fn fragmented_tls_records_and_body_cancellation() {
+    on_native_ring(async {
+        let probe_root = tempfile::tempdir().unwrap();
+        let alignment = talon_uring::DirectIoAlignment::probe(probe_root.path()).unwrap();
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let origin = Origin::start_fragmented(true, Some(version), Some(256)).await;
+            let client = origin.client();
+            for kind in ["fixed", "chunked"] {
+                for len in [65536, 65539] {
+                    let body = talon_uring::Download::capture(Some(alignment), async {
+                        Ok::<_, String>(
+                            client
+                                .execute(HttpRequest::new(
+                                    Method::Get,
+                                    format!("https://{}/{kind}/large-{len}", origin.address),
+                                    vec![("Range".into(), format!("bytes=0-{}", len - 1))],
+                                ))
+                                .await?
+                                .body,
+                        )
+                    })
+                    .await
+                    .unwrap();
+                    assert_eq!(body.as_ptr() as usize % alignment.memory(), 0);
+                    assert_eq!(body.len(), len);
+                    assert!(body.iter().enumerate().all(|(i, b)| *b == (i % 251) as u8));
+                }
+            }
+            for _ in 0..8 {
+                assert!(tokio::time::timeout(
+                    std::time::Duration::from_millis(30),
+                    client.execute(HttpRequest::new(
+                        Method::Get,
+                        format!("https://{}/stall-body", origin.address),
+                        vec![]
+                    ))
+                )
+                .await
+                .is_err());
+            }
+            let response = client
+                .execute(HttpRequest::new(
+                    Method::Get,
+                    format!("https://{}/keepalive", origin.address),
+                    vec![],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.body, "abcdefgh");
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring; small client TLS fragments during PUT"]
+fn small_client_tls_fragments_preserve_put_bodies() {
+    on_native_ring(async {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let origin = Origin::start_fragmented(true, Some(version), None).await;
+            for fragment in [32, 256] {
+                let mut config = (*origin.tls).clone();
+                config.max_fragment_size = Some(fragment);
+                let client = MonoioClient::with_tls_config(Arc::new(config));
+                for len in [16_384, 65_539] {
+                    let body = Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+                    let response = client
+                        .execute(HttpRequest::with_body(
+                            Method::Put,
+                            format!("https://{}/echo", origin.address),
+                            vec![],
+                            body.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status, 200);
+                    assert_eq!(
+                        response.body, body,
+                        "{version:?}, fragment={fragment}, len={len}"
+                    );
                 }
             }
         }

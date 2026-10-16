@@ -1603,15 +1603,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "monoio-io-wrapper"
-version = "0.1.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bcfaa76e5daf87cc4d31b4d1b6bc93c12db59c19df50b9200afdbde42077655"
-dependencies = [
- "monoio",
-]
-
-[[package]]
 name = "monoio-macros"
 version = "0.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1620,17 +1611,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.119",
-]
-
-[[package]]
-name = "monoio-rustls"
-version = "0.4.0"
-dependencies = [
- "bytes",
- "monoio",
- "monoio-io-wrapper",
- "rustls",
- "thiserror 1.0.69",
 ]
 
 [[package]]
@@ -2427,8 +2407,6 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "log",
  "once_cell",
@@ -2825,7 +2803,6 @@ dependencies = [
  "monoio",
  "monoio-codec",
  "monoio-http",
- "monoio-rustls",
  "opentelemetry",
  "opentelemetry_sdk",
  "reqwest",

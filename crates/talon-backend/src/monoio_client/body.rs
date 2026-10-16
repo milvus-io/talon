@@ -1,5 +1,5 @@
 //! Decode framing separately so downloaded payload lands in its final allocation.
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use monoio::{
     buf::IoBufMut,
     io::{AsyncReadRent, AsyncReadRentExt, AsyncWriteRent},
@@ -12,9 +12,9 @@ use talon_uring::AlignedBuf;
 pub(super) trait OriginIo: AsyncReadRent + AsyncWriteRent {
     fn line(&mut self, output: &mut Vec<u8>, limit: usize) -> impl Future<Output = io::Result<()>>;
 }
-impl OriginIo for monoio_rustls::ClientTlsStream<monoio::net::TcpStream> {
+impl OriginIo for super::tls::TlsStream {
     async fn line(&mut self, output: &mut Vec<u8>, limit: usize) -> io::Result<()> {
-        self.read_until_delimiter(b'\n', output, limit).await
+        super::tls::TlsStream::line(self, output, limit).await
     }
 }
 impl OriginIo for monoio::net::TcpStream {
@@ -55,9 +55,12 @@ impl OriginIo for monoio::net::TcpStream {
                     "HTTP line limit",
                 ));
             }
-            let (result, consumed) = self.read_exact(vec![0; take]).await;
+            let start = output.len();
+            output.resize(start + take, 0);
+            let buffer = std::mem::take(output).slice_mut(start..start + take);
+            let (result, consumed) = self.read_exact(buffer).await;
+            *output = consumed.into_inner();
             result?;
-            output.extend_from_slice(&consumed);
             if end.is_some() {
                 return Ok(());
             }
@@ -75,7 +78,9 @@ pub(super) async fn head<IO: OriginIo>(io: &mut IO) -> Result<http::response::Pa
             break;
         }
     }
-    let mut header = BytesMut::from(header.as_slice());
+    let mut header = Bytes::from(header)
+        .try_into_mut()
+        .expect("header allocation has a single owner");
     match ResponseHeadDecoder
         .decode(&mut header)
         .map_err(|_| "invalid origin HTTP header")?
@@ -129,7 +134,7 @@ pub(super) async fn payload<IO: OriginIo>(
         .map(|len| AlignedBuf::new(len, alignment))
         .transpose()
         .map_err(|e| e.to_string())?;
-    let mut unbounded = BytesMut::new();
+    let mut unbounded = Vec::new();
     let mut written = 0usize;
     loop {
         let mut line = Vec::new();
@@ -166,7 +171,7 @@ pub(super) async fn payload<IO: OriginIo>(
             }
             return Ok(match buffer {
                 Some(buffer) => freeze(buffer, written),
-                None => unbounded.freeze(),
+                None => Bytes::from(unbounded),
             });
         }
         let end = written
@@ -181,9 +186,13 @@ pub(super) async fn payload<IO: OriginIo>(
             buffer = Some(slice.into_inner());
         } else {
             // Non-Range APIs (e.g. listings) retain their growable-body contract.
-            let (result, chunk) = io.read_exact(vec![0; size]).await;
+            unbounded
+                .try_reserve(size)
+                .map_err(|_| "origin body allocation failed")?;
+            unbounded.resize(end, 0);
+            let (result, chunk) = io.read_exact(unbounded.slice_mut(written..end)).await;
+            unbounded = chunk.into_inner();
             result.map_err(|_| "origin HTTP body truncated or invalid")?;
-            unbounded.extend_from_slice(&chunk);
         }
         let (result, end_line) = io.read_exact(vec![0; 2]).await;
         result.map_err(|_| "origin HTTP chunk truncated")?;

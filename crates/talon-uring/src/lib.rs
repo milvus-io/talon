@@ -9,7 +9,10 @@ mod read;
 pub use read::{open_read, read_file};
 
 mod local;
-pub use local::{on_ring, require_ring, sleep, spawn_cancellable, spawn_local, timeout, LocalRing};
+pub use local::{
+    on_ring, require_ring, sleep, spawn_background, spawn_cancellable, spawn_local, timeout,
+    LocalRing,
+};
 
 /// Publish an immutable cache file. Must run on a native io_uring runtime.
 /// Both payload and metadata use native open/write/fsync/rename operations.

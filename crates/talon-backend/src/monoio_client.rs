@@ -5,31 +5,18 @@ use crate::http::{HttpClient, HttpRequest, HttpResponse, Method};
 use async_trait::async_trait;
 use monoio::io::sink::SinkExt;
 mod body;
+mod pool;
+mod tls;
 use body::OriginIo;
 use monoio_http::{
     common::body::{FixedBody, HttpBody},
     h1::codec::encoder::GenericEncoder,
 };
-use std::{
-    cell::RefCell,
-    sync::{Arc, Weak},
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 enum Connection {
     Plain(monoio::net::TcpStream),
-    Tls(Box<monoio_rustls::ClientTlsStream<monoio::net::TcpStream>>),
-}
-struct Idle {
-    owner: Weak<rustls::ClientConfig>,
-    authority: String,
-    since: Instant,
-    connection: Connection,
-}
-thread_local! {
-    // Ring-local sockets must never cross ring threads. Bound idle FDs
-    // across all authorities, and isolate pools by TLS/trust configuration.
-    static IDLE: RefCell<Vec<Idle>> = const { RefCell::new(Vec::new()) };
+    Tls(Box<tls::TlsStream>),
 }
 
 pub struct MonoioClient {
@@ -93,17 +80,7 @@ impl MonoioClient {
                     uri.scheme_str().unwrap(),
                     uri.authority().unwrap()
                 );
-                let pooled = IDLE.with(|pool| {
-                    let mut pool = pool.borrow_mut();
-                    pool.retain(|entry| {
-                        entry.owner.strong_count() > 0
-                            && entry.since.elapsed() < Duration::from_secs(90)
-                    });
-                    let index = pool.iter().position(|entry| {
-                        entry.authority == authority && entry.owner.ptr_eq(&Arc::downgrade(&tls))
-                    })?;
-                    Some(pool.swap_remove(index).connection)
-                });
+                let pooled = pool::take(&tls, &authority).await;
                 let mut connection = if let Some(connection) = pooled {
                     connection
                 } else {
@@ -141,12 +118,11 @@ impl MonoioClient {
                         if https {
                             let name = rustls::pki_types::ServerName::try_from(host)
                                 .map_err(|_| "invalid TLS server name")?;
-                            let stream = monoio_rustls::TlsConnector::from(tls.clone())
-                                .connect(name, stream)
+                            let stream = tls::TlsStream::connect(stream, tls.clone(), name)
                                 .await
                                 .map_err(|_| {
-                                    "origin TLS handshake/certificate verification failed"
-                                })?;
+                                "origin TLS handshake/certificate verification failed"
+                            })?;
                             Ok::<_, &str>(Connection::Tls(Box::new(stream)))
                         } else {
                             Ok(Connection::Plain(stream))
@@ -164,17 +140,7 @@ impl MonoioClient {
                     }
                 };
                 if reusable {
-                    IDLE.with(|pool| {
-                        let mut pool = pool.borrow_mut();
-                        if pool.len() < 64 {
-                            pool.push(Idle {
-                                owner: Arc::downgrade(&tls),
-                                authority,
-                                since: Instant::now(),
-                                connection,
-                            });
-                        }
-                    });
+                    pool::put(&tls, authority, connection);
                 }
                 Ok(response)
             };
