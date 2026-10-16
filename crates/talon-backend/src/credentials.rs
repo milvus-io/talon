@@ -22,10 +22,18 @@ pub trait ProvideS3Credentials: Send + Sync {
 }
 
 /// Source of an OAuth2-style bearer token (GCS, Azure AD).
+#[async_trait]
 pub trait ProvideBearerToken: Send + Sync {
     /// Current token, or `None` when the endpoint needs no authentication
     /// (emulators).
     fn current(&self) -> Option<Arc<String>>;
+
+    /// Prepare the snapshot for an outgoing request. Background-refresh and
+    /// static providers need no work; SDK providers await their own valid-token
+    /// cache so an opaque token is never assigned a guessed expiration.
+    async fn prepare(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Snapshot source for an Azure SAS query credential.
