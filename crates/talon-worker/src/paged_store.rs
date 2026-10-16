@@ -417,6 +417,16 @@ impl PagedBlockStore {
     pub async fn get_page_bytes(&self, id: &BlockId, page: PageIndex) -> Result<Bytes> {
         let path = self.page_path(id, page);
         let label = format!("{id} page {}", page.0);
+        if self.uring {
+            talon_uring::require_ring()?;
+            return talon_uring::spawn_cancellable(async move {
+                talon_uring::read_file(&path, None)
+                    .await
+                    .map_err(|error| crate::block_store::cache_read_error(error, label))
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("ring read task stopped: {e}")))?;
+        }
         spawn_blocking_io(move || match std::fs::File::open(&path) {
             Ok(f) => {
                 let len = f.metadata()?.len();
@@ -535,6 +545,43 @@ impl PagedBlockStore {
             let avail = handle.len.saturating_sub(in_page_off);
             let serve = in_page_len.min(avail);
             handles.push(BlockHandle::from_shared(handle.fd, in_page_off, serve));
+        }
+        Ok(handles)
+    }
+
+    /// Native equivalent of get_range, preserving buffered sendfile handles.
+    pub async fn get_range_async(
+        &self,
+        id: &BlockId,
+        offset: u64,
+        len: u64,
+    ) -> Result<Vec<BlockHandle>> {
+        if !self.uring {
+            return self.get_range(id, offset, len);
+        };
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| Error::Other("range overflows u64".into()))?;
+        let ps = u64::from(self.page_size);
+        let mut handles = Vec::new();
+        for p in offset / ps..=(end - 1) / ps {
+            let page = PageIndex(
+                u32::try_from(p).map_err(|_| Error::Other("page index exceeds u32".into()))?,
+            );
+            let hit = self
+                .fd_cache
+                .open_native(self.page_path(id, page))
+                .await
+                .map_err(|error| {
+                    crate::block_store::cache_read_error(error, format!("{id} page {}", page.0))
+                })?;
+            let from = offset.max(p * ps) - p * ps;
+            let requested = end.min((p + 1) * ps) - p * ps - from;
+            let serve = requested.min(hit.len.saturating_sub(from));
+            handles.push(BlockHandle::from_shared(hit.fd, from, serve));
         }
         Ok(handles)
     }

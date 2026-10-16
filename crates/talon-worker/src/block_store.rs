@@ -195,8 +195,17 @@ impl WholeBlockStore {
     /// per request. Under load that trio dominated the serving path — it does
     /// not scale with threads (all callers serialize on the same inode and
     /// dentry), and measured ~50x the cost of the data access it guards.
-    fn open_ro(&self, id: &BlockId) -> Result<(Arc<OwnedFd>, u64)> {
+    async fn open_ro(&self, id: &BlockId) -> Result<(Arc<OwnedFd>, u64)> {
         let path = self.path_for(id);
+        if self.uring {
+            talon_uring::require_ring()?;
+            return self
+                .fd_cache
+                .open_native(path)
+                .await
+                .map(|hit| (hit.fd, hit.len))
+                .map_err(|error| cache_read_error(error, id.to_string()));
+        }
         if let Some(hit) = self.fd_cache.get(&path) {
             return Ok((hit.fd, hit.len));
         }
@@ -233,6 +242,16 @@ impl WholeBlockStore {
     pub async fn get_range_bytes(&self, id: &BlockId, offset: u64, len: u64) -> Result<Bytes> {
         let path = self.path_for(id);
         let id = id.clone();
+        if self.uring {
+            talon_uring::require_ring()?;
+            return talon_uring::spawn_cancellable(async move {
+                talon_uring::read_file(&path, Some((offset, len)))
+                    .await
+                    .map_err(|error| cache_read_error(error, id.to_string()))
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("ring read task stopped: {e}")))?;
+        }
         spawn_blocking_io(move || {
             let file = match std::fs::File::open(&path) {
                 Ok(file) => file,
@@ -260,7 +279,7 @@ impl WholeBlockStore {
 #[async_trait]
 impl ObjectStore for WholeBlockStore {
     async fn get_block(&self, id: &BlockId) -> Result<BlockHandle> {
-        let (fd, len) = self.open_ro(id)?;
+        let (fd, len) = self.open_ro(id).await?;
         Ok(BlockHandle::from_shared(fd, 0, len))
     }
 
@@ -271,7 +290,7 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_range(&self, id: &BlockId, offset: u64, len: u64) -> Result<Vec<BlockHandle>> {
-        let (fd, file_len) = self.open_ro(id)?;
+        let (fd, file_len) = self.open_ro(id).await?;
         if offset.checked_add(len).map_or(true, |end| end > file_len) {
             return Err(Error::Other(format!(
                 "range {offset}+{len} out of bounds for block of {file_len} bytes"
@@ -283,6 +302,16 @@ impl ObjectStore for WholeBlockStore {
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
         let path = self.path_for(id);
         let id = id.clone();
+        if self.uring {
+            talon_uring::require_ring()?;
+            return talon_uring::spawn_cancellable(async move {
+                talon_uring::read_file(&path, None)
+                    .await
+                    .map_err(|error| cache_read_error(error, id.to_string()))
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("ring read task stopped: {e}")))?;
+        }
         // A whole-block read is up to block_size (256 MiB default) of blocking
         // disk I/O; run it on the blocking pool so it never stalls the async
         // reactor thread and its other multiplexed connections (issue #115).
@@ -418,6 +447,15 @@ impl ObjectStore for WholeBlockStore {
     async fn contains(&self, id: &BlockId) -> Result<bool> {
         let path = self.path_for(id);
         spawn_blocking_io(move || Ok(path.exists())).await
+    }
+}
+
+/// Preserve cache-miss semantics across the native and portable file engines.
+pub(crate) fn cache_read_error(error: std::io::Error, label: String) -> Error {
+    if error.kind() == std::io::ErrorKind::NotFound {
+        Error::NotFound(label)
+    } else {
+        error.into()
     }
 }
 

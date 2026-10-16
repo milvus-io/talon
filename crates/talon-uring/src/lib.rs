@@ -1,6 +1,9 @@
 //! Native cache I/O and task ownership on the caller's existing Monoio ring.
 use std::{io, path::Path};
 
+mod read;
+pub use read::{open_read, read_file};
+
 mod local;
 pub use local::{on_ring, require_ring, sleep, spawn_cancellable, spawn_local, timeout, LocalRing};
 

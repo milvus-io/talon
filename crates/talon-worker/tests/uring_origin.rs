@@ -421,11 +421,23 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
         .build()
         .unwrap();
     let dormant_tokio = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(1)
         .enable_all()
         .build()
         .unwrap();
     let _entered = dormant_tokio.enter();
-    for page_size in [0, 4] {
+    // Saturate the only blocking worker too: an undriven Tokio scheduler alone
+    // does not prevent spawn_blocking from making progress.
+    let (release_pool, wait_pool) = std::sync::mpsc::channel::<()>();
+    let (pool_ready, wait_pool_ready) = std::sync::mpsc::channel();
+    let pool_task = dormant_tokio.spawn_blocking(move || {
+        pool_ready.send(()).unwrap();
+        let _ = wait_pool.recv();
+    });
+    wait_pool_ready
+        .recv_timeout(Duration::from_secs(5))
+        .unwrap();
+    for (page_size, l1_capacity) in [(0, 0), (4, 0), (0, 16), (4, 16)] {
         let origin = origin_rt.block_on(Origin::start(true));
         let client = Arc::new(CheckedHttp(Arc::new(MonoioClient::with_tls_config(
             origin.tls.clone(),
@@ -459,7 +471,8 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
         let config = WorkerConfig {
             block_size: 8,
             capacity_bytes: 1024,
-            l1_capacity_bytes: 0,
+            l1_capacity_bytes: l1_capacity,
+            l1_page_size_bytes: 4,
             l2_page_size_bytes: page_size,
             backend: Some("s3".into()),
             page_tti_hours: 0,
@@ -576,6 +589,56 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
             3,
             "one 503 retry plus two successful ranges"
         );
+        // Cold/warm sendfile descriptors, cache-only byte reads, L1 promotion,
+        // origin miss, and a paged partial hit all run with the pools unavailable.
+        use talon_transport::data::{self, RangeRequest, VersionedRangeRequest};
+        let mut read = |object: &str, len: u64, cached: bool, versioned: bool| {
+            let object = ObjectId::new(Backend::S3, "bucket", object);
+            let range = RangeRequest {
+                object: object.clone(),
+                offset: 0,
+                len,
+            };
+            let frame = if cached {
+                data::encode_cached_request(
+                    9,
+                    &CachedRangeRequest {
+                        object,
+                        version: Version::new("v1"),
+                        offset: 0,
+                        len,
+                    },
+                )
+                .unwrap()
+            } else if versioned {
+                data::encode_versioned_request(
+                    9,
+                    &VersionedRangeRequest {
+                        request: range,
+                        version: Version::new("v1"),
+                        object_len: 8,
+                    },
+                )
+                .unwrap()
+            } else {
+                data::encode_request(9, &range).unwrap()
+            };
+            socket.write_all(&frame).unwrap();
+            let mut header = [0; HEADER_LEN];
+            socket.read_exact(&mut header).unwrap();
+            let parsed = FrameHeader::decode(&header).unwrap();
+            assert_eq!(parsed.msg_type, talon_transport::MsgType::GetRange);
+            let mut bytes = vec![0; parsed.length as usize];
+            socket.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, b"abcdefgh"[..len as usize]);
+        };
+        read("retry", 8, false, true);
+        read("retry", 8, false, true);
+        read("retry", 8, true, true);
+        read("read-miss", 4, false, true);
+        read("read-miss", 8, false, true);
+        read("read-miss", 8, true, true);
+        read("regular-read", 8, false, false);
         drop(socket);
         drop(guard);
         wait_finished
@@ -583,21 +646,9 @@ fn wire_load_runs_on_existing_rings_without_tokio_scheduler() {
             .unwrap()
             .unwrap();
         serving.join().unwrap();
-        // Reading back the native commits may use the legacy cache-read path;
-        // do this only AFTER proving the entire wire LOAD completed without Tokio.
-        let cached = CachedRangeRequest {
-            object: block.object,
-            version: block.version,
-            offset: 0,
-            len: 8,
-        };
-        assert_eq!(
-            dormant_tokio
-                .block_on(worker.serve_cached(&cached))
-                .unwrap(),
-            Bytes::from_static(b"abcdefgh")
-        );
     }
+    drop(release_pool);
+    dormant_tokio.block_on(pool_task).unwrap();
 }
 
 #[test]

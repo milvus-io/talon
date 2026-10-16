@@ -19,7 +19,9 @@ io_uring, is rejected at startup. Non-ring native I/O callers receive an error.
 
 With the native data plane, each connection's accepting Monoio ring also runs
 LOAD scheduling, signing, retries, HTTP/TLS, backend response validation,
-whole-block/page commits, cache-index publication and the response write. Owned
+whole-block/page commits, cache-index publication and the response write.
+Resident cache byte reads and cold descriptor open/stat operations also use native
+I/O. Buffered descriptors and the existing file-to-socket splice path are preserved. Owned
 mutation tasks use `monoio::spawn` on that ring. Timer waits use its Monoio timer.
 Tokio sync primitives (semaphores, locks and completion channels) remain, but
 waiting on them does not dispatch request work to a Tokio scheduler.
@@ -67,7 +69,7 @@ paged commits require a sidecar before publishing their page.
   populate the kernel page cache; TLS still decrypts in userspace.
 - Hostname resolution uses Tokio's resolver; IP literals skip it. Existing
   connections need no DNS lookup. Startup scanning, first-time dynamic namespace
-  initialization, maintenance, resident cache reads and control RPCs retain their
+  initialization, maintenance and control RPCs retain their
   existing implementations. Foreground capacity eviction can still reach blocking
   filesystem operations and Tokio timers. MonoioClient does not support streamed
   request bodies or file uploads: `execute_body` and `execute_file` return errors.
@@ -98,9 +100,11 @@ Tests cover ring-local cancellation/draining, concurrent directory creation,
 staging collision preservation, failed rename cleanup, HTTP/HTTPS and certificate rejection, connection reuse,
 chunked/truncated responses, cancelled HTTP attempts, S3 If-Match Range LOAD,
 whole and paged commits, dynamic namespaces, cache hits and reopen recovery.
-A wire-level LOAD/BatchLoad test leaves the Worker's Tokio scheduler undriven
-and runs without any fallback origin thread. It verifies HTTPS download,
-503 retry/backoff, whole/paged cache publication, reply and ring shutdown using
+A wire-level LOAD/BatchLoad/READ test leaves the Worker's Tokio scheduler
+undriven and blocks its only blocking worker, with no fallback origin thread.
+It verifies HTTPS download, 503 retry/backoff, whole/paged cache publication,
+cold/warm descriptors, L1 promotion, cache-only reads, full/partial misses,
+reply and ring shutdown using
 only the native data-plane rings. The fixture uses a preconfigured namespace,
 an IP-literal TLS endpoint and sufficient cache capacity to isolate this path.
 A concurrency regression test requires 129 HTTP requests to reach the origin
