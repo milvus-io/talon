@@ -28,10 +28,11 @@ pub async fn atomic_write_payload(
     payload: Payload,
     alignment: DirectIoAlignment,
 ) -> io::Result<u64> {
-    match payload.direct_bytes(alignment) {
+    let allocated = match payload.direct_bytes(alignment) {
         Some(bytes) => atomic_write_inner(path, bytes, true, true).await,
         None => atomic_write_inner(path, payload.into_bytes(), false, true).await,
-    }
+    }?;
+    Ok(allocated.expect("payload writes always measure allocation"))
 }
 
 async fn atomic_write_inner(
@@ -39,7 +40,7 @@ async fn atomic_write_inner(
     bytes: bytes::Bytes,
     direct: bool,
     measure_allocation: bool,
-) -> io::Result<u64> {
+) -> io::Result<Option<u64>> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -72,9 +73,10 @@ async fn atomic_write_inner(
         file.write_all_at(bytes, 0).await.0?;
         file.sync_all().await?;
         let allocated = if measure_allocation {
-            file.metadata().await?.blocks() * 512
+            // st_blocks uses fixed 512-byte units, independent of Direct I/O alignment.
+            Some(file.metadata().await?.blocks() * 512)
         } else {
-            0
+            None
         };
         file.close().await?;
         monoio::fs::rename(&staged, path).await?;
