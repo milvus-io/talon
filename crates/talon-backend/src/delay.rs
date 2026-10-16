@@ -124,7 +124,7 @@ impl HttpClient for DelayingHttpClient {
         let resp = self.inner.execute(req).await?;
         let delay = self.delay_for(resp.body.len());
         if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+            crate::time::sleep(delay).await;
         }
         Ok(resp)
     }
@@ -138,7 +138,7 @@ impl HttpClient for DelayingHttpClient {
         let resp = self.inner.execute_file(req, path, len).await?;
         let delay = self.delay_for(resp.body.len());
         if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+            crate::time::sleep(delay).await;
         }
         Ok(resp)
     }
@@ -152,7 +152,7 @@ impl HttpClient for DelayingHttpClient {
         let response = self.inner.execute_body(req, body, len).await?;
         let delay = self.delay_for(response.body.len());
         if !delay.is_zero() {
-            tokio::time::sleep(delay).await;
+            crate::time::sleep(delay).await;
         }
         Ok(response)
     }

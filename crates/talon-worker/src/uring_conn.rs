@@ -27,26 +27,12 @@
 //!
 //! # A Tokio context is still required on the ring thread
 //!
-//! This handler is monoio-native, but the worker *below* it is not.
-//! [`WorkerRuntime`] reaches Tokio internally: `block_store` runs its
-//! filesystem I/O on `tokio::task::spawn_blocking` so a large read or
-//! write-plus-fsync never stalls the reactor (#115), and parts of the miss path
-//! use Tokio timers and sync primitives. On a bare monoio ring those calls
-//! panic with *"there is no reactor running"*.
-//!
-//! So a ring thread must enter a Tokio runtime handle before driving these
-//! futures:
-//!
-//! ```ignore
-//! let _guard = tokio_handle.enter();   // makes spawn_blocking/timers work
-//! monoio_runtime.block_on(handle_conn(stream, worker, observability));
-//! ```
-//!
-//! This is coexistence, not a layering violation: the ring owns protocol
-//! scheduling and the zero-copy path, while Tokio's blocking pool absorbs
-//! filesystem work that must not run on either. Removing the dependency would
-//! mean porting `block_store` and the miss path to monoio's own blocking pool —
-//! worth doing eventually, but a separate change from the data plane itself.
+//! Native origin mode keeps LOAD scheduling, HTTP/TLS, writes and index
+//! publication on this connection's ring. The ring server installs a
+//! `talon_uring::LocalRing` scope and drains its detached mutations at shutdown.
+//! Tokio context is still needed for DNS, first-time namespace initialization,
+//! maintenance/eviction, streamed uploads and the portable origin mode. Entering
+//! a Tokio handle does not move a Monoio future onto Tokio's scheduler.
 
 use std::io::{Seek, Write};
 use std::sync::Arc;

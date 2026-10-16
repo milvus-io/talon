@@ -495,8 +495,30 @@ async fn run() -> anyhow::Result<()> {
     // Retry is innermost so each attempt gets its own injected latency, which is
     // what the lab is modeling; wrapping the other way would make the whole
     // retry ladder share a single delay and understate the cost of a retry.
+    let origin_uring = match std::env::var("TALON_WORKER_ORIGIN_IO")
+        .as_deref()
+        .unwrap_or("tokio")
+    {
+        "tokio" => false,
+        "uring" => true,
+        _ => anyhow::bail!("TALON_WORKER_ORIGIN_IO must be tokio or uring"),
+    };
+    if origin_uring {
+        #[cfg(target_os = "linux")]
+        let available = talon_worker::uring_serve::io_uring_available();
+        #[cfg(not(target_os = "linux"))]
+        let available = false;
+        validate_origin_runtime(force_tokio_data_plane(), available)?;
+    }
+    tracing::info!(
+        origin_io = if origin_uring { "uring" } else { "tokio" },
+        "origin download and cache commit engine"
+    );
     let http: Arc<dyn talon_backend::http::HttpClient> = {
-        let base: Arc<dyn talon_backend::http::HttpClient> = Arc::new(ReqwestClient::new());
+        let base: Arc<dyn talon_backend::http::HttpClient> = match origin_uring {
+            true => Arc::new(talon_backend::monoio_client::MonoioClient::new()),
+            false => Arc::new(ReqwestClient::new()),
+        };
 
         // Seed from the node identity so each worker's jitter is distinct yet
         // reproducible across restarts. Shared by both decorators.
@@ -578,11 +600,12 @@ async fn run() -> anyhow::Result<()> {
     };
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
-    let runtime = WorkerRuntime::open_namespaces(
+    let runtime = WorkerRuntime::open_namespaces_with_uring(
         &cfg,
         cache_root_lock,
         backend,
         observability.metrics().clone(),
+        origin_uring,
     )?;
     let worker = Arc::new(runtime);
     observability.attach_namespace_runtime(&worker);
@@ -698,6 +721,20 @@ async fn shutdown_signal() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn force_tokio_data_plane() -> bool {
+    std::env::var(FORCE_TOKIO_ENV)
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn validate_origin_runtime(force_tokio: bool, uring_available: bool) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !force_tokio && uring_available,
+        "TALON_WORKER_ORIGIN_IO=uring requires the native Monoio data plane; disable {FORCE_TOKIO_ENV} and allow io_uring"
+    );
+    Ok(())
+}
+
 async fn serve_data_plane(
     cfg: WorkerConfig,
     worker: Arc<WorkerRuntime>,
@@ -709,9 +746,7 @@ async fn serve_data_plane(
     // The io_uring data plane is the default. Fall back to the portable Tokio
     // path when the host cannot run it (older kernel, restrictive seccomp, some
     // container runtimes) or when an operator pins the legacy path explicitly.
-    let force_tokio = std::env::var(FORCE_TOKIO_ENV)
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+    let force_tokio = force_tokio_data_plane();
     #[cfg(target_os = "linux")]
     let uring_available = talon_worker::uring_serve::io_uring_available();
     #[cfg(not(target_os = "linux"))]
@@ -1128,6 +1163,14 @@ fn handle_revision_update(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn native_origin_requires_native_data_plane() {
+        assert!(super::validate_origin_runtime(false, true).is_ok());
+        for (forced, available) in [(true, true), (true, false), (false, false)] {
+            assert!(super::validate_origin_runtime(forced, available).is_err());
+        }
+    }
+
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     use std::path::PathBuf;

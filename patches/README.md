@@ -62,3 +62,18 @@ while Cargo is compiling them.
 The original release checksum is
 `3bd0f8bcde87b1949f95338b547543fcab187bc7e7a5024247e359a5e828ba6a`.
 All upstream license files remain in the generated dependency.
+
+## monoio-http 0.3.12 dependency cleanup
+
+`monoio-http-0.3.12.patch` removes its unused, unconditional `monoio-rustls`
+0.3 dependency, which brings in rustls 0.21 and webpki 0.101 with known security
+advisories. No monoio-http source references that dependency. Talon's native
+transport supplies TLS separately through monoio-rustls 0.4 and rustls 0.23.46
+or newer. It also spells out elided lifetimes flagged by Rust 1.96, because
+path dependencies are subject to CI's `-D warnings`; these annotations do not
+change behavior.
+
+The same preparation script verifies and patches the pinned monoio-http archive
+into `.patched-deps/monoio-http`. Offline builds can additionally pass
+`--monoio-http-archive /path/to/monoio-http-0.3.12.crate`.
+Remove this patch when an upstream release drops or updates the unused dependency.

@@ -63,6 +63,7 @@ pub struct CleanupReport {
 /// Owned tasks finish their disk+metadata transaction even if the requester is cancelled.
 #[derive(Default)]
 pub(crate) struct Mutations {
+    prefer_ring: bool,
     active: AtomicUsize,
     idle: Notify,
 }
@@ -75,6 +76,12 @@ impl Drop for MutationGuard {
     }
 }
 impl Mutations {
+    pub fn new(prefer_ring: bool) -> Self {
+        Self {
+            prefer_ring,
+            ..Self::default()
+        }
+    }
     #[cfg(test)]
     pub fn active_count(&self) -> usize {
         self.active.load(Ordering::Acquire)
@@ -85,12 +92,19 @@ impl Mutations {
     ) -> T {
         self.active.fetch_add(1, Ordering::AcqRel);
         let guard = MutationGuard(self.clone());
-        tokio::spawn(async move {
+        let work = async move {
             let _guard = guard;
             work.await
-        })
-        .await
-        .expect("page mutation task panicked")
+        };
+        if self.prefer_ring && talon_uring::on_ring() {
+            talon_uring::spawn_local(work)
+                .await
+                .expect("ring mutation task stopped")
+        } else {
+            tokio::spawn(work)
+                .await
+                .expect("page mutation task panicked")
+        }
     }
     pub async fn drain(&self) {
         loop {

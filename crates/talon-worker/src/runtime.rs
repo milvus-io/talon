@@ -1477,14 +1477,8 @@ impl WorkerRuntime {
                             return Ok::<_, anyhow::Error>(());
                         }
                         let paged = runtime.paged.as_ref().expect("paged store").clone();
-                        let disk = paged.clone();
-                        let block = id.clone();
                         let value = bytes.clone();
-                        crate::paged_store::spawn_blocking_io(move || {
-                            disk.write_sidecar(&block, block_len)?;
-                            disk.put_page(&block, page, value)
-                        })
-                        .await?;
+                        paged.commit_page(&id, page, block_len, value).await?;
                         runtime
                             .index
                             .init_paged(id.clone(), paged.page_size(), block_len);

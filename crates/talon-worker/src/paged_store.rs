@@ -82,6 +82,7 @@ where
 
 /// A local, file-backed store for paged blocks (per-page files).
 pub struct PagedBlockStore {
+    uring: bool,
     root: PathBuf,
     page_size: u32,
     /// Open `.page` descriptors, so a warm cross-page read does not pay one
@@ -97,6 +98,59 @@ pub struct PagedBlockStore {
 }
 
 impl PagedBlockStore {
+    pub fn with_uring(mut self, enabled: bool) -> Self {
+        self.uring = enabled;
+        self
+    }
+
+    /// Commit sidecar and page with the same ownership boundary on either engine.
+    pub async fn commit_page(
+        self: &Arc<Self>,
+        id: &BlockId,
+        page: PageIndex,
+        block_len: u64,
+        value: Bytes,
+    ) -> Result<()> {
+        let disk = self.clone();
+        let id = id.clone();
+        if self.uring {
+            talon_uring::require_ring()?;
+            return talon_uring::spawn_local(async move {
+                let path = disk.meta_path_for(&id);
+                match monoio::fs::File::open(&path).await {
+                    Ok(file) => {
+                        file.close().await?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let meta = BlockMeta {
+                            id: id.clone(),
+                            form: BlockForm::Paged {
+                                page_size: disk.page_size,
+                                present: PresentBitmap::new(id.page_count(disk.page_size)),
+                            },
+                            len: block_len,
+                        };
+                        let encoded = serde_json::to_vec(&meta).map_err(|e| {
+                            Error::Other(format!("encode paged block sidecar: {e}"))
+                        })?;
+                        talon_uring::atomic_write(&path, encoded.into()).await?;
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+                let path = disk.page_path(&id, page);
+                talon_uring::atomic_write(&path, value).await?;
+                disk.fd_cache.invalidate(&path);
+                Ok(())
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
+        }
+        spawn_blocking_io(move || {
+            disk.write_sidecar(&id, block_len)?;
+            disk.put_page(&id, page, value)
+        })
+        .await
+    }
     /// Retain the root lease through detached blocking disk mutations.
     pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
         self.root_lock = Some(lock);
@@ -120,6 +174,7 @@ impl PagedBlockStore {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
         Ok(Self {
+            uring: false,
             root_lock: None,
             root,
             page_size,
@@ -317,6 +372,18 @@ impl PagedBlockStore {
         let path = self.page_path(id, page);
         let invalidate_path = path.clone();
         let root_lock = self.root_lock.clone();
+        if self.uring {
+            talon_uring::require_ring()?;
+            let fds = self.fd_cache.clone();
+            return talon_uring::spawn_local(async move {
+                let _root_lock = root_lock;
+                talon_uring::atomic_write(&path, value).await?;
+                fds.invalidate(&path);
+                Ok(())
+            })
+            .await
+            .map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
+        }
         spawn_blocking_io(move || {
             let _root_lock = root_lock;
             std::fs::create_dir_all(&dir)?;

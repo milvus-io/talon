@@ -48,7 +48,7 @@ RUN apt-get update \
 # in seconds instead of after the multi-minute dependency build.
 COPY --from=planner /src/recipe.json recipe.json
 # Reuse the verified and patched release prepared in the planner stage.
-COPY --from=planner /src/.patched-deps/monoio .patched-deps/monoio
+COPY --from=planner /src/.patched-deps .patched-deps
 RUN cargo chef cook --release --locked --recipe-path recipe.json \
     --package talon-worker
 

@@ -188,16 +188,12 @@ async fn accept_until_stopped(
 ///
 /// # Tokio coexistence
 ///
-/// `tokio_handle` is entered on every ring thread before the ring runs. This is
-/// required, not optional: `WorkerRuntime` reaches Tokio internally —
-/// `block_store` runs filesystem I/O on `tokio::task::spawn_blocking` so a large
-/// read or write-plus-fsync never stalls the reactor (#115), and parts of the
-/// miss path use Tokio timers and sync primitives. Without an entered handle
-/// those calls panic with *"there is no reactor running"*.
-///
-/// The ring owns protocol scheduling and resident file-to-socket splice.
-/// Tokio's blocking pool still handles cache writes and other filesystem work.
-/// Kernel io-wq workers may execute buffered file I/O submitted via io_uring.
+/// `tokio_handle` is entered on every ring thread for DNS, namespace startup,
+/// maintenance/eviction and portable origin I/O. With native origin mode, LOAD
+/// mutations, HTTP/TLS and cache writes stay on the connection's ring. A local
+/// task scope retains detached work through shutdown. Tokio synchronization
+/// primitives can be awaited locally without using its scheduler. Kernel io-wq
+/// workers may still execute buffered file I/O submitted via io_uring.
 ///
 /// # Errors
 ///
@@ -320,6 +316,7 @@ where
                 };
 
                 rt.block_on(async move {
+                    let local_tasks = talon_uring::LocalRing::enter();
                     // SO_REUSEPORT is default-true in ListenerConfig: every ring
                     // binds the same address and the kernel spreads accepts.
                     let cfg = monoio::net::ListenerConfig::default();
@@ -375,6 +372,9 @@ where
                     while active.get() != 0 {
                         monoio::time::sleep(std::time::Duration::from_millis(5)).await;
                     }
+                    // Disconnected callers can leave accepted disk/index
+                    // transactions behind. Finish them before dropping the ring.
+                    local_tasks.drain().await;
                 });
             });
         match thread {
