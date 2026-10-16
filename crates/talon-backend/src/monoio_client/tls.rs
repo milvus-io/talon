@@ -244,12 +244,22 @@ impl TlsStream {
         };
         let consumed = plain.len().min(16_384);
         let mut output = vec![0; consumed + 1024];
-        let written = if close {
-            traffic.queue_close_notify(&mut output)
-        } else {
-            traffic.encrypt(&plain[..consumed], &mut output)
-        }
-        .map_err(invalid)?;
+        let written = loop {
+            let result = if close {
+                traffic.queue_close_notify(&mut output)
+            } else {
+                traffic.encrypt(&plain[..consumed], &mut output)
+            };
+            match result {
+                Ok(written) => break written,
+                // A small configured fragment size adds per-record overhead.
+                // Rustls leaves the output unchanged when it is too small.
+                Err(rustls::unbuffered::EncryptError::InsufficientSize(size)) => {
+                    output.resize(size.required_size, 0);
+                }
+                Err(error) => return Err(invalid(error)),
+            }
+        };
         self.discard_consumed();
         output.truncate(written);
         let (result, _) = self.socket.write_all(output).await;

@@ -143,3 +143,56 @@ fn local_ring_keeps_jobs_on_thread_and_drains_cancelled_callers() {
 fn native_io_requires_existing_ring() {
     assert!(talon_uring::require_ring().is_err());
 }
+
+#[test]
+#[ignore = "requires a kernel/container allowing native io_uring"]
+fn drain_cancels_background_work_even_before_first_poll() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct Guard(Arc<AtomicBool>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let mut runtime = monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+        .enable_timer()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let ring = talon_uring::LocalRing::enter();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(dropped.clone());
+        let (started, ready) = tokio::sync::oneshot::channel();
+        talon_uring::spawn_background(async move {
+            let _guard = guard;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+
+        let unpolled_dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(unpolled_dropped.clone());
+        talon_uring::spawn_background(async move {
+            let _guard = guard;
+            panic!("background work queued before drain must not start");
+        });
+        monoio::time::timeout(Duration::from_secs(2), ring.drain())
+            .await
+            .unwrap();
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(unpolled_dropped.load(Ordering::SeqCst));
+
+        // Accepted mutations can finish during drain and attempt to return an
+        // origin connection to the pool. Late background work must also drop.
+        let late_dropped = Arc::new(AtomicBool::new(false));
+        let guard = Guard(late_dropped.clone());
+        talon_uring::spawn_background(async move {
+            let _guard = guard;
+            panic!("background work submitted after drain must not start");
+        });
+        monoio::time::timeout(Duration::from_secs(2), ring.drain())
+            .await
+            .unwrap();
+        assert!(late_dropped.load(Ordering::SeqCst));
+    });
+}

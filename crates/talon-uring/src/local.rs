@@ -7,6 +7,8 @@ use tokio::sync::{oneshot, Notify};
 struct Tasks {
     active: std::cell::Cell<usize>,
     idle: Notify,
+    draining: std::cell::Cell<bool>,
+    shutdown: Notify,
 }
 thread_local! {
     static CURRENT: RefCell<Option<Rc<Tasks>>> = const { RefCell::new(None) };
@@ -27,7 +29,12 @@ impl LocalRing {
         Self(tasks)
     }
 
+    /// Stop disposable background work and finish all accepted tasks.
+    /// Call after stopping admission; background tasks spawned during the drain
+    /// are cancelled too, including those not yet polled by the runtime.
     pub async fn drain(&self) {
+        self.0.draining.set(true);
+        self.0.shutdown.notify_waiters();
         while self.0.active.get() != 0 {
             self.0.idle.notified().await;
         }
@@ -66,6 +73,23 @@ pub fn spawn_cancellable<F: Future + 'static>(work: F) -> oneshot::Receiver<F::O
         }
     });
     wait
+}
+
+/// Run disposable ring-local work until completion or shutdown. Unlike accepted
+/// mutations, this work is cancelled by `LocalRing::drain`, which waits for its
+/// owned state to be dropped before the runtime exits.
+pub fn spawn_background(work: impl Future<Output = ()> + 'static) {
+    let tasks = CURRENT.with(|current| current.borrow().as_ref().expect("ring scope").clone());
+    drop(spawn_local(async move {
+        if tasks.draining.get() {
+            return;
+        }
+        tokio::select! {
+            biased;
+            _ = tasks.shutdown.notified() => {},
+            _ = work => {},
+        }
+    }));
 }
 
 /// Detach a task from its caller, retaining it in the ring's shutdown drain.

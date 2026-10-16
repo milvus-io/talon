@@ -74,9 +74,9 @@ pub(super) fn put(owner: &Arc<rustls::ClientConfig>, authority: String, connecti
             since: Instant::now(),
             checkout,
         });
-        // Disposable idle work must not delay LocalRing::drain. Dropping the
-        // runtime drops the monitor; dropping a pool entry wakes it immediately.
-        monoio::spawn(async move {
+        // Cancel and drop idle I/O while the ring is still running. Runtime
+        // destruction alone does not release a task waiting on socket readiness.
+        talon_uring::spawn_background(async move {
             let _ = monoio::time::timeout(IDLE_TIMEOUT, monitor(connection, request)).await;
         });
     });

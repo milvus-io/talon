@@ -167,6 +167,7 @@ impl Origin {
 
 #[derive(Clone, Copy, Debug)]
 enum IdleAction {
+    WaitForClose,
     Fin,
     Reset,
     CloseNotify,
@@ -216,6 +217,7 @@ async fn controlled_idle(mut stream: IdleStream, count: Arc<AtomicUsize>, contro
     stream.io().flush().await.unwrap();
     control.start.await.unwrap();
     match control.action {
+        IdleAction::WaitForClose => {}
         IdleAction::Fin => stream.io().shutdown().await.unwrap(),
         IdleAction::Reset => {
             #[allow(deprecated)]
@@ -281,6 +283,57 @@ async fn controlled_idle(mut stream: IdleStream, count: Arc<AtomicUsize>, contro
         "monitor must close without sending a request"
     );
     let _ = control.observed.send(());
+}
+
+#[test]
+#[ignore = "requires native io_uring; verifies idle connections close during ring shutdown"]
+fn ring_shutdown_closes_idle_origin_connections() {
+    let server = tokio::runtime::Runtime::new().unwrap();
+    for version in [
+        None,
+        Some(&rustls::version::TLS12),
+        Some(&rustls::version::TLS13),
+    ] {
+        for _ in 0..2 {
+            let (start, ready) = tokio::sync::oneshot::channel();
+            let (observed, closed) = tokio::sync::oneshot::channel();
+            let origin = server.block_on(Origin::start_controlled(
+                version.is_some(),
+                version,
+                None,
+                Some(IdleControl {
+                    action: IdleAction::WaitForClose,
+                    start: ready,
+                    observed,
+                }),
+            ));
+            let client = origin.client();
+            let scheme = if version.is_some() { "https" } else { "http" };
+            let request = HttpRequest::new(
+                Method::Get,
+                format!("{scheme}://{}/keepalive", origin.address),
+                vec![],
+            );
+            let worker = std::thread::spawn(move || {
+                on_native_ring(async move {
+                    assert_eq!(client.execute(request).await.unwrap().body, "abcdefgh");
+                    start.send(()).unwrap();
+                    // Let the monitor enter its socket readiness wait before
+                    // the helper drains and drops the ring.
+                    monoio::time::sleep(std::time::Duration::from_millis(10)).await;
+                });
+            });
+            // The server stays alive across ring/thread teardown, so dropping
+            // the fixture cannot accidentally close the connection for us.
+            server.block_on(async {
+                tokio::time::timeout(std::time::Duration::from_secs(3), closed)
+                    .await
+                    .expect("ring shutdown must close the idle origin connection")
+                    .expect("origin must observe closure");
+            });
+            worker.join().unwrap();
+        }
+    }
 }
 
 #[test]
@@ -377,6 +430,30 @@ async fn respond<S: AsyncRead + AsyncWrite + Unpin>(mut stream: S, count: Arc<At
         let attempt = count.fetch_add(1, Ordering::SeqCst);
         let request = String::from_utf8(request).unwrap();
         let target = request.split_whitespace().nth(1).unwrap();
+        if target == "/echo" {
+            let length: usize = request
+                .lines()
+                .find_map(|line| {
+                    line.to_ascii_lowercase()
+                        .strip_prefix("content-length:")
+                        .map(str::to_owned)
+                })
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let mut body = vec![0; length];
+            stream.read_exact(&mut body).await.unwrap();
+            stream
+                .write_all(
+                    format!("HTTP/1.1 200 OK\r\nContent-Length: {length}\r\n\r\n").as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+            stream.flush().await.unwrap();
+            continue;
+        }
         if target == "/stall" {
             let _ = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read_u8()).await;
             return;
@@ -1171,6 +1248,38 @@ fn fragmented_tls_records_and_body_cancellation() {
                 .await
                 .unwrap();
             assert_eq!(response.body, "abcdefgh");
+        }
+    });
+}
+
+#[test]
+#[ignore = "requires native io_uring; small client TLS fragments during PUT"]
+fn small_client_tls_fragments_preserve_put_bodies() {
+    on_native_ring(async {
+        for version in [&rustls::version::TLS12, &rustls::version::TLS13] {
+            let origin = Origin::start_fragmented(true, Some(version), None).await;
+            for fragment in [32, 256] {
+                let mut config = (*origin.tls).clone();
+                config.max_fragment_size = Some(fragment);
+                let client = MonoioClient::with_tls_config(Arc::new(config));
+                for len in [16_384, 65_539] {
+                    let body = Bytes::from((0..len).map(|i| (i % 251) as u8).collect::<Vec<_>>());
+                    let response = client
+                        .execute(HttpRequest::with_body(
+                            Method::Put,
+                            format!("https://{}/echo", origin.address),
+                            vec![],
+                            body.clone(),
+                        ))
+                        .await
+                        .unwrap();
+                    assert_eq!(response.status, 200);
+                    assert_eq!(
+                        response.body, body,
+                        "{version:?}, fragment={fragment}, len={len}"
+                    );
+                }
+            }
         }
     });
 }

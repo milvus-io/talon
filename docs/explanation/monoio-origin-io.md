@@ -52,7 +52,8 @@ retry policy, single-flight and LOAD byte reservations still wrap this transport
 Dropping a timed-out HTTP attempt cancels its ring-local future. Accepted disk
 commits continue even if their caller is cancelled. Worker mutation tasks retain
 the LOAD reservation and finish the disk/index transaction before releasing it.
-Each data-plane ring drains detached work after stopping connections and before
+Each data-plane ring cancels and awaits disposable idle-connection monitors,
+and drains accepted mutation tasks, after stopping connections and before
 dropping its runtime. No fallback executor is created.
 
 When native origin I/O is enabled, each whole/page cache store probes a temporary
