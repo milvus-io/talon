@@ -113,3 +113,24 @@ try {
         .map(f -> requests.get(f.index())).toList();
 }
 ```
+
+## Availability zones
+
+`connect` reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` once. Affinity defaults
+to false. Without `TALON_ZONE`, it queries the Kubernetes Node using
+`TALON_NODE_NAME`, `KUBERNETES_SERVICE_HOST/PORT`, and the mounted ServiceAccount
+token and CA. Inject `spec.nodeName` as `TALON_NODE_NAME` and grant the Pod
+ServiceAccount `get nodes`. This is a startup-only HTTPS request with a 2-second
+connect timeout and 5-second request timeout. Missing configuration or failed
+lookup leaves the zone unknown; affinity remains enabled if requested.
+To override environment settings and bypass automatic discovery per client:
+
+```java
+TalonClient client = TalonClient.connect("talon-coordinator:7000", 256 << 20, 8,
+    new ZoneOptions("zone-a", true));
+```
+
+With affinity enabled, READ, LOAD and BatchLoad use only the same-zone primary.
+Missing/unknown local zones and offline/conflicting owners fail closed. All
+worker errors remain visible; there is no cross-zone retry option. Recovery
+uses the same local placement on the next read after discovery updates.

@@ -70,9 +70,11 @@ public final class TalonClient implements AutoCloseable {
     private Exception discoveryFailure;
     private final Map<String, ConnectionPool> instancePools = new HashMap<>();
     private final int maxIdlePerAddr;
+    private final ZoneOptions zoneOptions;
     private final java.util.concurrent.Semaphore loadSlots = new java.util.concurrent.Semaphore(8);
 
-    private TalonClient(String coordinator, int blockSize, int maxIdlePerAddr) {
+    private TalonClient(String coordinator, int blockSize, int maxIdlePerAddr, ZoneOptions zoneOptions) {
+        this.zoneOptions = java.util.Objects.requireNonNull(zoneOptions);
         this.maxIdlePerAddr = maxIdlePerAddr;
         this.coordinator = coordinator;
         this.blockSize = blockSize;
@@ -94,6 +96,11 @@ public final class TalonClient implements AutoCloseable {
      *     coordinator/worker pool; does not limit concurrent requests
      */
     public static TalonClient connect(String coordinator, int blockSize, int maxIdlePerAddr) {
+        return connect(coordinator, blockSize, maxIdlePerAddr, ZoneOptions.fromEnvironment());
+    }
+
+    /** Connect with explicit AZ settings, bypassing zone environment variables and discovery. */
+    public static TalonClient connect(String coordinator, int blockSize, int maxIdlePerAddr, ZoneOptions zoneOptions) {
         if (coordinator == null || coordinator.isBlank()) {
             throw new IllegalArgumentException("coordinator is required");
         }
@@ -103,7 +110,7 @@ public final class TalonClient implements AutoCloseable {
         if (maxIdlePerAddr <= 0) {
             throw new IllegalArgumentException("maxIdlePerAddr must be positive, got " + maxIdlePerAddr);
         }
-        return new TalonClient(coordinator, blockSize, maxIdlePerAddr);
+        return new TalonClient(coordinator, blockSize, maxIdlePerAddr, zoneOptions);
     }
 
     /**
@@ -507,22 +514,36 @@ public final class TalonClient implements AutoCloseable {
     // --- placement ---------------------------------------------------------
 
     private record CachedMembership(Placement.Table placement) {}
+    private record ReadTarget(String address, ConnectionPool pool) {}
 
-    /** Fetch from one logical owner, allowing one bounded stale-connection retry. */
+    /** Resolve one snapshot and attempt its primary owner, keeping zone affinity strict. */
     private byte[] readBlock(Segment seg, long objectSize) throws IOException {
         membership();
-        ConnectionPool pool;
-        String address;
+        ReadTarget primary;
         membershipLock.lock();
         try {
-            NodeInfo owner = membership.placement.primary(seg.block);
-            if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
-            Messages.DiscoveredWorker target = discovery.workers().stream().filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
-            if (target.state() != 2) throw new TalonException(TalonException.Code.UNAVAILABLE, "worker " + owner.id() + " offline or conflicting");
-            address = target.address();
-            pool = instancePools.get(instanceKey(target));
+            primary = readTarget(membership.placement, seg.block);
         } finally { membershipLock.unlock(); }
-        try { return fetchRange(address, seg, pool, objectSize); }
+        return readFrom(primary, seg, objectSize);
+    }
+
+    // Called with the membership lock held; capture the pool for this incarnation.
+    private ReadTarget readTarget(Placement.Table table, BlockId block) {
+        if (table == null) return null;
+        NodeInfo owner = table.primary(block);
+        if (owner == null) return null;
+        Messages.DiscoveredWorker target = discovery.workers().stream()
+                .filter(w -> w.id().equals(owner.id())).findFirst().orElseThrow();
+        return target.state() == 2
+                ? new ReadTarget(target.address(), instancePools.get(instanceKey(target)))
+                : new ReadTarget(null, null);
+    }
+
+    private byte[] readFrom(ReadTarget target, Segment seg, long objectSize) throws IOException {
+        if (target == null || target.address == null) {
+            throw new TalonException(TalonException.Code.UNAVAILABLE, "zone owner absent, offline or conflicting");
+        }
+        try { return fetchRange(target.address, seg, target.pool, objectSize); }
         catch (IOException failure) { throw TalonException.transport(failure); }
     }
 
@@ -621,10 +642,16 @@ public final class TalonClient implements AutoCloseable {
             if (keys.contains(entry.getKey())) return false;
             entry.getValue().close(); return true;
         });
-        Placement.Table table = discovery != null && discovery.topology() == view.topology()
-                ? membership.placement : new Placement.Table(logical);
+        if (discovery == null || discovery.topology() != view.topology()) {
+            List<NodeInfo> local = new ArrayList<>();
+            for (Messages.DiscoveredWorker worker : view.workers()) {
+                NodeInfo node = new NodeInfo(worker.id(), "", true);
+                if (zoneOptions.zone() != null && zoneOptions.zone().equals(worker.zone())) local.add(node);
+            }
+            Placement.Table table = new Placement.Table(zoneOptions.affinity() ? local : logical);
+            membership = new CachedMembership(table);
+        }
         discovery = view;
-        membership = new CachedMembership(table);
     }
 
     private <T> T controlRoundTrip(byte[] request, IoFunction<Messages.Response, T> decode)
