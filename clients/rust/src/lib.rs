@@ -1,5 +1,13 @@
 //! Native async client for reading objects through a Talon cache cluster.
 //!
+//! # Availability zones
+//!
+//! Construction reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` (default off).
+//! Without `TALON_ZONE`, construction resolves the Kubernetes Node zone using
+//! `TALON_NODE_NAME` and the Pod service account (`get nodes` RBAC required).
+//! [`ClientBuilder::with_zone_options`] overrides environment and discovery per
+//! client. With affinity enabled, reads and LOAD stay in the local zone; missing local owners fail closed. See [`ZoneOptions`].
+//!
 //! # Typed errors
 //!
 //! The SDK re-exports the error types carried by [`Error`], along with
@@ -53,6 +61,8 @@
 
 mod client;
 mod error;
+mod zone;
+pub use zone::ZoneOptions;
 
 pub use client::{
     parse_uri, Client, ClientBuilder, LoadRequest, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,

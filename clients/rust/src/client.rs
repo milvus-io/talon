@@ -48,6 +48,7 @@ pub struct ClientBuilder {
     block_size: u32,
     max_idle_per_addr: usize,
     max_in_flight_block_reads: usize,
+    zone_options: Option<crate::ZoneOptions>,
 }
 
 impl Default for ClientBuilder {
@@ -57,6 +58,7 @@ impl Default for ClientBuilder {
             block_size: 256 << 20,
             max_idle_per_addr: DEFAULT_MAX_IDLE_PER_ADDR,
             max_in_flight_block_reads: DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
+            zone_options: None,
         }
     }
 }
@@ -91,6 +93,13 @@ impl ClientBuilder {
         self
     }
 
+    /// Override all AZ environment settings and automatic discovery for this client.
+    /// Passing the default options explicitly disables affinity.
+    pub fn with_zone_options(mut self, options: crate::ZoneOptions) -> Self {
+        self.zone_options = Some(options);
+        self
+    }
+
     /// Validate configuration and start shared background discovery on its own thread.
     /// No caller Tokio runtime is required at construction.
     pub fn build(self) -> Result<Client, Error> {
@@ -99,7 +108,13 @@ impl ClientBuilder {
             block_size,
             max_idle_per_addr,
             max_in_flight_block_reads,
+            zone_options,
         } = self;
+        let zone_options = match zone_options {
+            Some(options) => options,
+            None => crate::ZoneOptions::from_env()?,
+        };
+        zone_options.validate()?;
         if coordinator.is_empty() {
             return Err(Error::InvalidArgument(
                 "coordinator must be non-empty".into(),
@@ -127,10 +142,16 @@ impl ClientBuilder {
             )),
         );
         let cache = Arc::new(PlacementCache::new(PLACEMENT_TTL_MS));
-        let reader =
-            BlockReader::new(coordinator.clone(), cache, REPLICAS_K).with_worker_pool(Arc::new(
-                ConnectionPool::with_limits(max_idle_per_addr, DEFAULT_IDLE_TTL),
-            ));
+        let reader = BlockReader::new(coordinator.clone(), cache, REPLICAS_K)
+            .with_worker_pool(Arc::new(ConnectionPool::with_limits(
+                max_idle_per_addr,
+                DEFAULT_IDLE_TTL,
+            )))
+            .with_zone_affinity(
+                zone_options.zone,
+                zone_options.affinity,
+                Arc::new(talon_cache_client::NoopZoneReadObserver),
+            );
         Ok(Client {
             coordinator,
             reader,
@@ -1141,6 +1162,78 @@ mod tests {
         );
         assert_eq!(stat_calls.load(Ordering::SeqCst), 0);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sdk_zone_options_route_locally_and_fail_without_local_owner() {
+        let worker = mock_worker(16).await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let coordinator = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                let worker = worker.clone();
+                tokio::spawn(async move {
+                    let mut header = [0; HEADER_LEN];
+                    if socket.read_exact(&mut header).await.is_err() {
+                        return;
+                    }
+                    let h = FrameHeader::decode(&header).unwrap();
+                    let mut body = vec![0; h.length as usize];
+                    socket.read_exact(&mut body).await.unwrap();
+                    let reply = membership_fixture::zoned(vec![
+                        talon_transport::ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new("local"),
+                                address: "127.0.0.1:0".into(),
+                                role: NodeRole::Worker,
+                            },
+                            zone: Some("a".into()),
+                        },
+                        talon_transport::ZonedNodeInfo {
+                            info: NodeInfo {
+                                id: NodeId::new("remote"),
+                                address: worker,
+                                role: NodeRole::Worker,
+                            },
+                            zone: Some("b".into()),
+                        },
+                    ]);
+                    let _ = socket
+                        .write_all(&talon_transport::encode(0, &reply).unwrap())
+                        .await;
+                });
+            }
+        });
+        let object = parse_uri("s3://bucket/key").unwrap();
+        let stat = ObjectStat {
+            size: 16,
+            version: "test-version".into(),
+        };
+        for (zone, succeeds) in [
+            (Some("b"), true),
+            (Some("a"), false),
+            (Some("absent"), false),
+            (None, false),
+        ] {
+            let client = ClientBuilder::default()
+                .with_coordinator(&coordinator)
+                .with_block_size(16)
+                .with_zone_options(crate::ZoneOptions {
+                    zone: zone.map(str::to_owned),
+                    affinity: true,
+                })
+                .build()
+                .unwrap();
+            let result = client.read(&object, 2, Some(6), Some(&stat)).await;
+            assert_eq!(result.is_ok(), succeeds);
+            if succeeds {
+                assert_eq!(result.unwrap(), vec![2, 3, 4, 5, 6, 7]);
+            }
+        }
+        server.abort();
     }
 
     #[tokio::test]

@@ -70,6 +70,12 @@ typedef struct talon_client_options {
 
 void talon_client_options_init(talon_client_options *options);
 
+/* Construction reads TALON_ZONE and TALON_ZONE_AFFINITY (default false).
+ * Invalid boolean values reject construction. Without TALON_ZONE, discovers the
+ * Kubernetes Node zone using TALON_NODE_NAME and the Pod service account with
+ * get nodes RBAC (one lookup at construction, HTTP timeout 5 seconds).
+ * With affinity enabled, reads and LOAD/BatchLoad
+ * stay local and fail without a usable local owner. The options ABI is unchanged. */
 int talon_client_new(
     const char *coordinator_addr,
     const talon_client_options *options,
