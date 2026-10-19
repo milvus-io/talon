@@ -119,7 +119,6 @@ mod tests {
             let env = gateway["env"].as_sequence().unwrap();
             for (name, value) in [
                 ("TALON_ZONE_AFFINITY", "true"),
-                ("TALON_ZONE_FALLBACK", "false"),
                 ("TALON_COORDINATOR_ADDR", "talon-coordinator:7000"),
             ] {
                 assert_eq!(

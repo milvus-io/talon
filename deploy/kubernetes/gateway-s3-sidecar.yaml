@@ -67,8 +67,6 @@ spec:
             # set TALON_ZONE directly. Opt in with TALON_ZONE_AFFINITY=true.
             - name: TALON_ZONE_AFFINITY
               value: "true"
-            - name: TALON_ZONE_FALLBACK
-              value: "false"
             - name: TALON_NODE_NAME
               valueFrom:
                 fieldRef:

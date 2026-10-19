@@ -86,7 +86,7 @@ Pods Pending; the chart does not silently relax locality.
 Gateway sidecars remain in application-owned Deployments. Bind their existing
 ServiceAccounts through `multiAz.clientServiceAccounts` and use the
 [sidecar templates](../../kubernetes/README.md). SDK clients use injected
-`TALON_ZONE`, `TALON_ZONE_AFFINITY=true`, `TALON_ZONE_FALLBACK=false` instead.
-The chart does not enable read fallback. See the
+`TALON_ZONE` and `TALON_ZONE_AFFINITY=true` instead. With affinity enabled,
+reads stay local and fail when no usable local owner exists. See the
 [zone-affinity runbook](../../../docs/operations/zone-affinity.md) before
 enabling zone discovery on existing persistent members.
