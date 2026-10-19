@@ -21,9 +21,12 @@ record describes the current implementation; historical protocol text is in Git.
 
 ### Persistent zone identity
 
-Worker/Gateway startup uses `TALON_ZONE` when provided, otherwise a Kubernetes
-Node label lookup using `TALON_NODE_NAME` and `get nodes` permission. Missing
-metadata yields an unknown zone. FUSE and SDKs use explicit zone configuration.
+Worker/Gateway startup and default SDK construction use `TALON_ZONE` when
+provided, otherwise a Kubernetes Node label lookup using `TALON_NODE_NAME` and
+`get nodes` permission. Rust/C/Python reuse the backend resolver; Java uses an
+equivalent authenticated HTTPS lookup. Missing metadata yields an unknown zone
+without disabling affinity. FUSE requires explicit zone configuration; explicit
+Rust/Java `ZoneOptions` bypass environment settings and automatic discovery.
 
 A Worker's logical ID and zone live in `MemberRegistry`, independent of leased
 instance health. Registering the same ID with a different zone fails. An operator

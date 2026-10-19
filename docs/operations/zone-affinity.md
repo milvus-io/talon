@@ -11,18 +11,29 @@ procedure and acceptance matrix, see the
 | Variable | Default | Applies to | Meaning |
 |---|---|---|---|
 | `TALON_ZONE` | unset | Worker, Gateway, FUSE, SDKs | Explicit zone, matching membership exactly. |
-| `TALON_NODE_NAME` | unset | Worker, Gateway | Resolve the node's `topology.kubernetes.io/zone` label at startup. Requires downward API injection and `get nodes` RBAC. |
+| `TALON_NODE_NAME` | unset | Worker, Gateway, SDKs | Resolve the node's `topology.kubernetes.io/zone` label at startup. Requires downward API injection and `get nodes` RBAC. |
 | `TALON_ZONE_AFFINITY` | `false` | Gateway, FUSE, SDKs | Restrict primary placement to retained same-zone members. |
 
-Explicit `TALON_ZONE` takes precedence over Kubernetes discovery. FUSE and SDKs
-use only the explicit zone; they do not query the Kubernetes API. The Downward
-API can inject `spec.nodeName`, but cannot read a Node's zone label into a Pod
-environment variable. SDK applications must receive a verified zone through
-per-zone scheduling/configuration or an external injector.
+Explicit `TALON_ZONE` takes precedence over Kubernetes discovery. Without it,
+Worker, Gateway and Rust/C/Python/Java SDKs resolve the Node zone using
+`TALON_NODE_NAME`, `KUBERNETES_SERVICE_HOST/PORT`, and the mounted ServiceAccount
+token/CA. Inject `spec.nodeName` through the Downward API and grant that Pod's
+ServiceAccount `get nodes`. This works without Kubernetes 1.35 topology-label
+propagation. FUSE still requires an explicit zone.
+
+SDK lookup runs once per client construction, with a 2-second connect timeout
+and 5-second HTTP request timeout. Rust/C/Python reuse the Worker/Gateway resolver
+on a joined helper thread, so synchronous construction also works inside a Tokio
+runtime. Java implements the same HTTPS lookup without native dependencies.
+Missing prerequisites, denied requests, missing labels and failed lookups leave
+the zone unknown; affinity is never disabled by a lookup failure. There is no
+per-read lookup or background zone refresh; reconstruct the client after fixing
+an unsuccessful initial lookup.
 
 Rust `ClientBuilder::with_zone_options(ZoneOptions)` and Java's `connect`
-overload can override the environment per client. C/Python constructors inherit
-Rust's environment configuration without ABI changes. Both SDKs validate boolean
+overload override both environment settings and automatic zone discovery per
+client, including an explicitly absent zone. C/Python constructors inherit
+Rust's environment configuration without ABI changes. SDKs validate boolean
 and zone inputs at construction. Set environment before constructing clients.
 
 Workers resolve their zone before registering it in the persistent membership

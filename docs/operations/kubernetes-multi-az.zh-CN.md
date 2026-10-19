@@ -13,7 +13,7 @@ sidecar，或直接使用配置了 zone 的 SDK。Coordinator 之间共享 Kuber
 | 配置 | 交付值 | 作用 |
 |---|---|---|
 | `TALON_ZONE_AFFINITY` | `true` | 仅在本 AZ 的持久成员集合内计算 primary placement |
-| `TALON_ZONE` | 实际 Pod 所在 AZ，或由 Worker/Gateway 启动时查询 Node | 必须与 Node 标签及成员注册表完全一致 |
+| `TALON_ZONE` | 实际 Pod 所在 AZ，或由 Worker/Gateway/SDK 初始化时查询 Node | 必须与 Node 标签及成员注册表完全一致 |
 
 亲和性开关的程序默认值是 `false`。因此**只部署跨 AZ Pod 并不会自动开启亲和性**；
 每个读请求发起端必须显式开启 `TALON_ZONE_AFFINITY=true`。
@@ -156,10 +156,55 @@ Topology Aware Routing / `trafficDistribution` 是偏好，可以跨 AZ；
 使用 sidecar 或每 AZ 独立 Service、仅选择该 AZ 的 Gateway，并确保业务调用匹配的
 Service。不要仅凭 Service annotation 宣称两跳均不跨 AZ。
 
-### Rust / C / Python / Java SDK 与 FUSE
+### Rust / C / Python / Java SDK
 
-SDK 和 FUSE 不自动查询 Node 标签，须注入实际 `TALON_ZONE`。以下为 zone-a
-业务 Deployment 合并片段；zone-b/zone-c 分别使用匹配的硬调度和 env 值：
+SDK 未配置 `TALON_ZONE` 时，采用与 Worker/Gateway 相同的 Node zone 查询机制。
+业务 Deployment 的 Pod 模板加入以下配置，不需要为每个 AZ 硬编码 zone：
+
+```yaml
+spec:
+  template:
+    spec:
+      serviceAccountName: talon-application
+      automountServiceAccountToken: true
+      containers:
+        - name: application
+          env:
+            - name: TALON_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: TALON_ZONE_AFFINITY
+              value: "true"
+```
+
+创建业务 namespace 中的 `talon-application` ServiceAccount，再将它加入 Helm 配置：
+
+```yaml
+multiAz:
+  clientServiceAccounts:
+    - name: talon-application
+      namespace: your-application-namespace
+```
+
+保留 values 中其他已配置的 ServiceAccount；上述列表是需要合并的片段。使用原始 YAML
+时，将该账号与 namespace 加入 `node-zone-rbac.yaml` 的 ClusterRoleBinding subjects。
+业务 Pod 仍须配置第 3 节的跨 AZ 调度约束。
+
+SDK 使用 `KUBERNETES_SERVICE_HOST/PORT` 和挂载的 ServiceAccount token/CA，调用
+`GET /api/v1/nodes/{TALON_NODE_NAME}`，读取 `topology.kubernetes.io/zone` 标签。
+仅在客户端构造时查询一次，连接超时 2 秒，HTTP 请求超时 5 秒；读请求不会再查 API。
+Rust/C/Python 复用现有 backend 解析器，Java 使用纯 JVM HTTPS 实现。
+这个方案不依赖 Kubernetes 1.35；缺少凭据、403、超时或没有 zone 标签时保持 zone
+未知，亲和性仍开启，读和 LOAD 失败关闭。修复初次发现失败后，需重新构造客户端。
+
+Rust/Java 的显式 per-client `ZoneOptions` 会覆盖环境配置并跳过自动发现，包括显式
+传入未指定的 zone（Rust `None` / Java `null`）；需审查业务代码是否覆盖了部署设置。C/Python 沿用 Rust 构造器，无 ABI 变更。
+
+### 显式 zone 配置与 FUSE
+
+设置 `TALON_ZONE` 会跳过 Node 查询，无需 Node 读取权限。FUSE 仍须显式配置 zone。
+以下为 zone-a 业务 Deployment 合并片段；zone-b/zone-c 分别使用匹配的硬调度和 env 值：
 
 ```yaml
 spec:
@@ -182,10 +227,8 @@ spec:
               value: "true"
 ```
 
-普通 Downward API 不能将 Node 的 zone 标签直接注入 env。
-如果使用平台 injector，必须验证注入值与落地节点一致，且 Pod 重建后仍一致。
-Rust/Java 也提供 per-client `ZoneOptions`；显式选项覆盖环境配置，需审查业务代码
-是否另行关闭 affinity。C/Python 沿用 Rust 构造器的环境设置，不增加 ABI。
+显式注入时，必须验证 zone 与实际落地节点一致，且 Pod 重建后仍一致。
+上述自动发现方案通过 Downward API 注入节点名，不要求平台将 Node zone 复制到 Pod 标签。
 
 ## 5. 验收：先证明成功请求本地，再验证故障关闭
 
@@ -194,6 +237,7 @@ kubectl -n talon get pods -o wide
 kubectl get nodes -L topology.kubernetes.io/zone
 kubectl auth can-i get nodes --as=system:serviceaccount:talon:talon-worker
 kubectl auth can-i get nodes --as=system:serviceaccount:talon:talon-gateway
+kubectl auth can-i get nodes --as=system:serviceaccount:your-application-namespace:talon-application
 ```
 
 通过带认证的管理连接查看 `GET /api/v1/worker-membership` 和
@@ -210,7 +254,7 @@ kubectl auth can-i get nodes --as=system:serviceaccount:talon:talon-gateway
 | LOAD / BatchLoad | 请求只发送至本 AZ primary；失败不改派远端 |
 | Worker 保留 PVC 重启 | worker_id/zone 不变，地址或 instance_id 可变；恢复后重新本地服务 |
 | Coordinator 单实例故障 | 其余实例服务，注册表不丢失；需单独测试客户端配置的控制面入口 |
-| 业务 Pod 重调度 | sidecar 重新识别 zone；SDK env 与新节点匹配 |
+| 业务 Pod 重调度 | sidecar/SDK 重新识别 zone；显式 zone 配置须与新节点匹配 |
 
 测试用不同对象/范围产生实际网络读，并记录成功率、错误类型和目标地址。演练时应关闭
 应用自行回源/跨 AZ 的上层重试，否则成功可能掩盖 Talon 本地失败。Gateway 默认
