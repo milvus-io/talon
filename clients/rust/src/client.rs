@@ -93,7 +93,7 @@ impl ClientBuilder {
         self
     }
 
-    /// Override all AZ environment settings for this client.
+    /// Override all AZ environment settings and automatic discovery for this client.
     /// Passing the default options explicitly disables affinity.
     pub fn with_zone_options(mut self, options: crate::ZoneOptions) -> Self {
         self.zone_options = Some(options);

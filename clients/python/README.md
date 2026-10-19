@@ -87,7 +87,10 @@ except talon.BatchLoadError as error:
 
 Client construction reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` through the
 shared Rust SDK. Affinity defaults to `false`; invalid booleans raise `ValueError`.
-Inject the actual pod zone before creating the client; SDKs do not query
-Kubernetes. With affinity enabled, reads and LOAD/BatchLoad use only same-zone
-logical members. Unknown zones, absent local members and unusable local owners
+Set `TALON_ZONE` explicitly, or inject `spec.nodeName` as `TALON_NODE_NAME`
+and grant the Pod ServiceAccount `get nodes`. Without an explicit zone, the SDK
+uses Worker/Gateway's Kubernetes Node resolver once at construction (HTTP timeout
+5 seconds), using the mounted ServiceAccount token and CA. Outside Kubernetes,
+or when lookup fails, the zone remains unknown. With affinity enabled, reads and
+LOAD/BatchLoad use only same-zone logical members. Unknown zones, absent local members and unusable local owners
 fail closed; there is no cross-zone retry option.

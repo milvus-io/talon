@@ -3019,12 +3019,14 @@ name = "talon-rust-client"
 version = "0.1.0"
 dependencies = [
  "futures",
+ "talon-backend",
  "talon-cache-client",
  "talon-core",
  "talon-telemetry",
  "talon-transport",
  "thiserror 2.0.19",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

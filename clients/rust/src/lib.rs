@@ -3,9 +3,10 @@
 //! # Availability zones
 //!
 //! Construction reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` (default off).
-//! SDKs do not query Kubernetes. [`ClientBuilder::with_zone_options`] overrides
-//! the environment per client. With affinity enabled, reads and LOAD stay in
-//! the local zone; missing local owners fail closed. See [`ZoneOptions`].
+//! Without `TALON_ZONE`, construction resolves the Kubernetes Node zone using
+//! `TALON_NODE_NAME` and the Pod service account (`get nodes` RBAC required).
+//! [`ClientBuilder::with_zone_options`] overrides environment and discovery per
+//! client. With affinity enabled, reads and LOAD stay in the local zone; missing local owners fail closed. See [`ZoneOptions`].
 //!
 //! # Typed errors
 //!
