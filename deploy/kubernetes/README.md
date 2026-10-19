@@ -7,8 +7,10 @@ external etcd); deploying both is a misconfiguration.
 
 The object-store gateway has loopback-only sidecar templates for
 [S3](gateway-s3-sidecar.yaml) and [Azure Blob](gateway-azure-sidecar.yaml).
-They intentionally have no Service until incoming provider authentication and
-authorization are implemented in issue #446.
+They use loopback-only development listeners and intentionally have no Service.
+The application owns the sidecar Deployment; zone affinity is enabled and
+cross-zone retries remain disabled. Apply in namespace `talon`, or adapt both
+coordinator DNS and the node-zone RBAC subjects to the application namespace.
 
 ## Files
 
@@ -19,7 +21,8 @@ authorization are implemented in issue #446.
 | `coordinator-etcd.yaml` | Coordinator Deployment using an external etcd backend (Secret-mounted creds/TLS). |
 | `worker.yaml` | Worker StatefulSet, governing Service and ServiceAccount. Shared by both coordinator backends. |
 | `worker-secret.example.yaml` | Template Secret for the worker's object-store (Azure account/SAS) credentials. |
-| `rbac.yaml` | Namespaced Lease and membership ConfigMap RBAC, plus optional node-zone reading. **Kubernetes backend only.** |
+| `rbac.yaml` | Namespaced Lease and membership ConfigMap RBAC. **Kubernetes backend only.** |
+| `node-zone-rbac.yaml` | Node zone lookup for Worker, Gateway and SDK ServiceAccounts. **Either backend.** |
 | `etcd-secret.example.yaml` | Template Secret for etcd endpoints/credentials/TLS and the optional management token. **etcd backend only.** |
 | `servicemonitor.yaml` | Prometheus Operator ServiceMonitor (or use the pod scrape annotations). |
 | `gateway-s3-sidecar.yaml` | Loopback-only S3 gateway sidecar template. |
@@ -29,7 +32,7 @@ authorization are implemented in issue #446.
 
 ```sh
 kubectl create namespace talon
-kubectl apply -n talon -f rbac.yaml -f service.yaml -f coordinator-kubernetes.yaml
+kubectl apply -n talon -f rbac.yaml -f node-zone-rbac.yaml -f service.yaml -f coordinator-kubernetes.yaml
 ```
 
 The pods authenticate to the API server with their mounted ServiceAccount token
@@ -60,14 +63,14 @@ kubectl create secret generic talon-etcd -n talon \
   --from-literal=endpoints=https://etcd-0:2379,https://etcd-1:2379 \
   --from-literal=username=talon --from-literal=password="$PW" \
   --from-file=ca.crt --from-file=client.crt --from-file=client.key
-kubectl apply -n talon -f service.yaml -f coordinator-etcd.yaml
+kubectl apply -n talon -f node-zone-rbac.yaml -f service.yaml -f coordinator-etcd.yaml
 ```
 
 ## HA properties
 
 - **Replicas & quorum**: 3 replicas; `RollingUpdate` with `maxUnavailable: 0`,
   `maxSurge: 1`; a PDB keeping `minAvailable: 2`; topology spread + pod
-  anti-affinity across `kubernetes.io/hostname`.
+  anti-affinity across nodes, plus zone topology spread.
 - **Probes**: startup (slow cold starts), liveness (process up), readiness
   (shared-state reachable — a backend outage pulls the pod from the Service and
   fails closed without killing it).
@@ -107,3 +110,43 @@ Workers use a StatefulSet with retained per-ordinal PVCs. Provision the
 or select your existing persistent class. Migrating an old Deployment requires
 explicit volume preservation and rebinding; follow the
 [rolling-upgrade runbook](../../docs/how-to/rolling-upgrade.md).
+
+For an explicit AZ allowlist and minimum domain count use the Helm multi-AZ
+values example. The raw manifests spread across available labeled domains;
+they do not enforce a particular AZ inventory. Follow the
+[zone-affinity runbook](../../docs/operations/zone-affinity.md) for SDK
+configuration, persistent-member migration, and acceptance checks.
+
+
+## SDK Node zone discovery
+
+Rust, C, Python and Java SDKs use the same Node zone discovery mechanism as
+Worker/Gateway when `TALON_ZONE` is unset. Add this fragment to the application
+Pod template (replace `talon-application` with its existing ServiceAccount):
+
+```yaml
+spec:
+  serviceAccountName: talon-application
+  automountServiceAccountToken: true
+  containers:
+    - name: application
+      env:
+        - name: TALON_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: TALON_ZONE_AFFINITY
+          value: "true"
+```
+
+Bind that ServiceAccount and its namespace to `talon-node-zone-reader` in
+`node-zone-rbac.yaml`, or list them in Helm's `multiAz.clientServiceAccounts`. The resolver
+uses `KUBERNETES_SERVICE_HOST/PORT` and the mounted ServiceAccount token/CA to
+GET `/api/v1/nodes/{node}` and read `topology.kubernetes.io/zone`. Nodes must
+already carry the actual zone label. No Kubernetes 1.35 feature is required.
+
+Resolution runs once per client construction, with a 2-second connect timeout
+and 5-second HTTP request timeout. Lookup failure leaves the zone unknown;
+affinity stays enabled and cache reads/loads fail closed. Explicit Rust/Java
+`ZoneOptions` bypass environment settings and automatic discovery. FUSE still
+requires explicit `TALON_ZONE`.

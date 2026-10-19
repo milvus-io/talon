@@ -61,3 +61,49 @@ Effective coordinator replica count (memory backend is single-node).
 {{- define "talon.coordinatorReplicas" -}}
 {{- if eq .Values.coordinator.backend "memory" -}}1{{- else -}}{{ .Values.coordinator.replicas }}{{- end -}}
 {{- end -}}
+
+{{/* Shared zone placement; selectors count only this release's component. */}}
+{{- define "talon.zoneSpread" -}}
+- maxSkew: 1
+  minDomains: {{ len .root.Values.multiAz.zones }}
+  topologyKey: topology.kubernetes.io/zone
+  whenUnsatisfiable: DoNotSchedule
+  labelSelector:
+    matchLabels:
+      app.kubernetes.io/instance: {{ .root.Release.Name }}
+      {{- include "talon.selectorLabels" (dict "component" .component) | nindent 6 }}
+{{- end -}}
+
+{{- define "talon.zoneNodeAffinity" -}}
+nodeAffinity:
+  requiredDuringSchedulingIgnoredDuringExecution:
+    nodeSelectorTerms:
+      - matchExpressions:
+          - key: topology.kubernetes.io/zone
+            operator: In
+            values:
+              {{- toYaml .Values.multiAz.zones | nindent 14 }}
+{{- end -}}
+
+{{- define "talon.validateMultiAz" -}}
+{{- if .Values.multiAz.enabled -}}
+{{- if not (semverCompare ">=1.30-0" .Capabilities.KubeVersion.Version) -}}
+{{- fail "multiAz requires Kubernetes 1.30+ (minDomains)" -}}
+{{- end -}}
+{{- $zones := .Values.multiAz.zones -}}
+{{- if or (lt (len $zones) 2) (ne (len $zones) (len (uniq $zones))) -}}
+{{- fail "multiAz.zones must list at least two distinct zones" -}}
+{{- end -}}
+{{- range $zone := $zones -}}
+{{- if not (regexMatch "^[A-Za-z0-9]([A-Za-z0-9_.-]{0,61}[A-Za-z0-9])?$" $zone) -}}
+{{- fail "multiAz.zones entries must be valid nonempty Kubernetes label values" -}}
+{{- end -}}
+{{- end -}}
+{{- if or (eq .Values.coordinator.backend "memory") (lt (int .Values.coordinator.replicas) (len $zones)) -}}
+{{- fail "multiAz requires an HA backend and at least one coordinator per zone" -}}
+{{- end -}}
+{{- if and .Values.worker.enabled (lt (int .Values.worker.replicas) (len $zones)) -}}
+{{- fail "multiAz requires at least one worker per zone" -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

@@ -104,3 +104,13 @@ serviceMonitor:
   enabled: false
   interval: 30s
   scrapeTimeout: 10s
+
+# -- Opt-in multi-AZ scheduling and Worker zone discovery. Requires Kubernetes
+# 1.30+ and labeled schedulable nodes in every listed zone. Enabling this on an
+# existing cluster requires the membership migration in the zone-affinity runbook.
+multiAz:
+  enabled: false
+  zones: []
+  # Existing application ServiceAccounts whose gateways or SDKs discover Node zones.
+  # Clients with explicit TALON_ZONE do not need this get nodes permission.
+  clientServiceAccounts: []

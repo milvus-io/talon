@@ -26,6 +26,9 @@ pub const WORKER_SECRET_EXAMPLE_YAML: &str =
 pub const SERVICE_YAML: &str = include_str!("../../../deploy/kubernetes/service.yaml");
 /// Least-privilege RBAC for the Kubernetes backend.
 pub const RBAC_YAML: &str = include_str!("../../../deploy/kubernetes/rbac.yaml");
+/// Node-label lookup RBAC, independent of the coordinator state backend.
+pub const NODE_ZONE_RBAC_YAML: &str =
+    include_str!("../../../deploy/kubernetes/node-zone-rbac.yaml");
 /// Example Secret template for etcd credentials/TLS.
 pub const ETCD_SECRET_EXAMPLE_YAML: &str =
     include_str!("../../../deploy/kubernetes/etcd-secret.example.yaml");
@@ -60,6 +63,7 @@ mod tests {
             ("worker-secret.example", WORKER_SECRET_EXAMPLE_YAML),
             ("service", SERVICE_YAML),
             ("rbac", RBAC_YAML),
+            ("node-zone-rbac", NODE_ZONE_RBAC_YAML),
             ("etcd-secret.example", ETCD_SECRET_EXAMPLE_YAML),
             ("servicemonitor", SERVICEMONITOR_YAML),
         ] {
@@ -94,6 +98,47 @@ mod tests {
             .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("PodDisruptionBudget"))
             .unwrap();
         assert_eq!(pdb["spec"]["minAvailable"].as_u64().unwrap(), 2);
+    }
+
+    #[test]
+    fn sidecars_enable_local_affinity_without_cross_zone_retries() {
+        for yaml in [
+            include_str!("../../../deploy/kubernetes/gateway-s3-sidecar.yaml"),
+            include_str!("../../../deploy/kubernetes/gateway-azure-sidecar.yaml"),
+        ] {
+            let docs = parse_documents(yaml);
+            let dep = docs.iter().find(|d| d["kind"] == "Deployment").unwrap();
+            let pod = &dep["spec"]["template"]["spec"];
+            assert_eq!(pod["serviceAccountName"], "talon-gateway");
+            let gateway = pod["containers"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .find(|c| c["name"] == "talon-gateway")
+                .unwrap();
+            let env = gateway["env"].as_sequence().unwrap();
+            for (name, value) in [
+                ("TALON_ZONE_AFFINITY", "true"),
+                ("TALON_COORDINATOR_ADDR", "talon-coordinator:7000"),
+            ] {
+                assert_eq!(
+                    env.iter().find(|e| e["name"] == name).unwrap()["value"],
+                    value
+                );
+            }
+        }
+        let docs = parse_documents(NODE_ZONE_RBAC_YAML);
+        let binding = docs
+            .iter()
+            .find(|d| d["kind"] == "ClusterRoleBinding")
+            .unwrap();
+        for account in ["talon-worker", "talon-gateway"] {
+            assert!(binding["subjects"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .any(|s| s["name"] == account));
+        }
     }
 
     #[test]
@@ -139,7 +184,8 @@ mod tests {
 
     #[test]
     fn kubernetes_backend_uses_least_privilege_state_rbac() {
-        let docs = parse_documents(RBAC_YAML);
+        let mut docs = parse_documents(RBAC_YAML);
+        docs.extend(parse_documents(NODE_ZONE_RBAC_YAML));
         let role = docs
             .iter()
             .find(|d| d.get("kind").and_then(|k| k.as_str()) == Some("Role"))

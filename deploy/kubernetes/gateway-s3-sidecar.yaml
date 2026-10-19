@@ -1,6 +1,14 @@
+# Application-owned sidecar. Apply in the same namespace as Talon, or adapt
+# the coordinator DNS and node-zone RBAC subject namespace together.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: talon-gateway
+---
 # Loopback-only S3 gateway sidecar template. The application container shares
 # the Pod network namespace and uses http://127.0.0.1:8080. Do not add a Service
-# before #446 installs incoming SigV4 authentication and bucket authorization.
+# for this loopback development-mode template; a network-facing gateway needs
+# production authentication and authorization configured separately.
 apiVersion: v1
 kind: Secret
 metadata:
@@ -15,7 +23,7 @@ kind: Deployment
 metadata:
   name: application-with-talon-s3
 spec:
-  replicas: 1
+  replicas: 3
   selector:
     matchLabels:
       app: application-with-talon-s3
@@ -24,6 +32,14 @@ spec:
       labels:
         app: application-with-talon-s3
     spec:
+      serviceAccountName: talon-gateway
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: application-with-talon-s3
       containers:
         - name: application
           image: replace-with-your-application
@@ -42,13 +58,15 @@ spec:
             - name: TALON_GATEWAY_PATH_STYLE
               value: "true"
             - name: TALON_COORDINATOR_ADDR
-              value: talon-coordinator:7411
+              value: talon-coordinator:7000
             - name: TALON_GATEWAY_S3_REGION
               value: us-east-1
             # Zone-aware cache reads (ADR 0006): the gateway resolves its zone
             # from this node's label, which needs the talon-node-zone-reader
-            # ClusterRole (rbac.yaml) bound to this Pod's ServiceAccount — or
+            # ClusterRole (node-zone-rbac.yaml) bound to this Pod's ServiceAccount — or
             # set TALON_ZONE directly. Opt in with TALON_ZONE_AFFINITY=true.
+            - name: TALON_ZONE_AFFINITY
+              value: "true"
             - name: TALON_NODE_NAME
               valueFrom:
                 fieldRef:

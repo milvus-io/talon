@@ -72,3 +72,23 @@ See `values.yaml` for the full list.
 `helm lint` and `helm template` (all three backends) run in CI. The chart
 rejects invalid configurations at render time — an unknown backend, or the
 `memory` backend with more than one replica.
+
+## Multi-AZ deployments
+
+Use `values-multi-az.example.yaml` with real node zone labels, a tested image
+tag, and your retained storage class. `multiAz.enabled=true` requires Kubernetes
+1.30+, an HA backend, at least two distinct zones, and enough replicas to cover
+every zone. The chart restricts scheduling to the listed zones and adds
+`minDomains`, `DoNotSchedule`, zone discovery and node `get` RBAC for both HA
+backends. Storage must be provisionable in every zone. Missing capacity leaves
+Pods Pending; the chart does not silently relax locality.
+
+Gateway sidecars and SDK applications remain in application-owned Deployments.
+Bind their existing ServiceAccounts through `multiAz.clientServiceAccounts`,
+inject `spec.nodeName` as `TALON_NODE_NAME`, and mount the ServiceAccount token
+and cluster CA. Set `TALON_ZONE_AFFINITY=true` on each reader. Worker, Gateway
+and SDKs discover their Node zone once at startup; explicit `TALON_ZONE` bypasses
+the lookup and needs no Node RBAC. See the [Pod configuration](../../kubernetes/README.md). With affinity enabled,
+reads stay local and fail when no usable local owner exists. See the
+[zone-affinity runbook](../../../docs/operations/zone-affinity.md) before
+enabling zone discovery on existing persistent members.
