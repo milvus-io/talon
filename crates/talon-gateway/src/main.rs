@@ -384,10 +384,6 @@ impl ZoneReadObserver for ZoneReadMetrics {
     fn worker_read(&self, matched: ZoneMatch, bytes: u64) {
         self.0.record_zone_read(matched.label(), bytes);
     }
-
-    fn affinity_fallback(&self) {
-        self.0.record_zone_affinity_fallback();
-    }
 }
 
 fn cache_reader(

@@ -143,10 +143,6 @@ pub trait ZoneReadObserver: Send + Sync {
     fn worker_read(&self, matched: ZoneMatch, bytes: u64) {
         let _ = (matched, bytes);
     }
-
-    /// Zone affinity was requested but the same-zone worker set was empty, so
-    /// this placement resolution used the full membership.
-    fn affinity_fallback(&self) {}
 }
 
 /// Observer that drops every event.

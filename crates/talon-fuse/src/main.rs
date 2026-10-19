@@ -12,49 +12,12 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
 use talon_core::{FuseConfig, FuseConfigPatch};
 use talon_fuse::{path_to_object, BlockReader, CoordinatorClient, PlacementCache, ReadOnlyFs};
 use talon_transport::ObjectEntry;
-
-/// Warn about a persisting zone-affinity fallback at most this often.
-const FALLBACK_WARN_INTERVAL_MS: u64 = 300_000;
-
-/// Zone-affinity events surfaced as throttled log lines. The mount has no
-/// metrics endpoint (the gateway exports real counters), and a fallback can
-/// persist for hours, so warn once per interval rather than per resolve.
-#[derive(Default)]
-struct LoggingZoneObserver {
-    last_fallback_warn_ms: AtomicU64,
-}
-
-impl talon_cache_client::ZoneReadObserver for LoggingZoneObserver {
-    fn affinity_fallback(&self) {
-        let now = now_unix_ms();
-        let last = self.last_fallback_warn_ms.load(Ordering::Relaxed);
-        if now.saturating_sub(last) >= FALLBACK_WARN_INTERVAL_MS
-            && self
-                .last_fallback_warn_ms
-                .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                .is_ok()
-        {
-            tracing::warn!(
-                "zone affinity fell back to full membership: no same-zone workers reachable"
-            );
-        }
-    }
-}
-
-fn now_unix_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
 
 /// Command-line arguments for the Talon FUSE mount.
 #[derive(Debug, Parser)]
@@ -154,7 +117,7 @@ async fn run() -> anyhow::Result<()> {
     let reader = BlockReader::new(coordinator.clone(), cache, 1).with_zone_affinity(
         zone,
         zone_affinity,
-        Arc::new(LoggingZoneObserver::default()),
+        Arc::new(talon_cache_client::NoopZoneReadObserver),
     );
 
     // Populate the namespace before mounting. A listing failure is fatal: an

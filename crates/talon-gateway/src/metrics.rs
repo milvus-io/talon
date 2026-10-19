@@ -92,18 +92,6 @@ impl GatewayMetrics {
             .add(bytes);
     }
 
-    /// Count one placement resolution that used the full membership because
-    /// the same-zone worker set was empty.
-    pub fn record_zone_affinity_fallback(&self) {
-        self.registry
-            .counter(
-                "talon_gateway_zone_affinity_fallback_total",
-                "Placement resolutions without a same-zone worker.",
-                labels(&[]),
-            )
-            .inc();
-    }
-
     /// Count one identity or authorization file reload poll outcome.
     ///
     /// Public because the reload loop lives in the gateway binary; both label

@@ -514,3 +514,21 @@ block cache, custom TCP data plane, read-only FUSE, and pluggable blob backends
 Add RF=2 and a protobuf control API once miss cost and compatibility
 requirements are demonstrated. Coordinator HA follows
 [`ADR 0001`](docs/adr/0001-management-plane-ha.md).
+
+## Multi-AZ read policy
+
+Zone affinity (ADR 0006) ranks persistent logical members in the reader's zone.
+Offline/conflicting instances do not change that placement. With affinity enabled,
+READ, LOAD and BatchLoad stay in the local zone; unknown reader zones and absent
+local members fail closed. There is no cross-zone retry option. Reads retain the
+existing bounded candidate retry policy within the selected zone, including
+terminal version, origin and quota errors. Recovery returns requests to the same
+logical owners without a topology change.
+
+Affinity defaults off for existing global deployments; multi-AZ deployments must
+explicitly enable it. Each zone warms independently through read-through; Talon
+does not replicate blocks across zones or guarantee durable cache replicas.
+
+Implementation is organized as a linear stack: core read policy and tests;
+Rust/C/Python configuration; Java configuration;
+Kubernetes/Helm deployment; multi-AZ rollout, migration, and acceptance runbook.

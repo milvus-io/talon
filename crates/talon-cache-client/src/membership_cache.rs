@@ -19,9 +19,6 @@ pub struct MembershipSnapshot {
     pub epoch: u64,
     /// Worker zones by dialable address, for read classification.
     pub zones_by_address: Arc<HashMap<String, String>>,
-    /// Zone affinity was requested but no same-zone worker exists, so
-    /// `placement` covers the full membership instead.
-    pub affinity_fallback: bool,
     /// Serving instances keyed by logical worker ID. Missing IDs are offline or conflicted.
     pub instances: Arc<HashMap<String, (String, crate::WorkerClient)>>,
     /// Refresh scheduling hint only; requests use published availability.
@@ -51,7 +48,7 @@ impl MembershipCache {
 
     /// Configure zone-affine placement (ADR 0006). With `enabled` and a known
     /// `zone`, placement tables are built from the same-zone worker subset;
-    /// an empty subset falls back to the full membership.
+    /// an unknown zone or empty subset fails closed.
     pub fn with_zone_affinity(mut self, zone: Option<String>, enabled: bool) -> Self {
         self.zone = zone;
         self.zone_affinity = enabled;
@@ -97,11 +94,7 @@ impl MembershipCache {
                         .is_some_and(|z| Some(z) == w.member.zone.as_ref())
             })
             .collect();
-        let affinity_fallback = self.zone_affinity
-            && self.zone.is_some()
-            && local.is_empty()
-            && !view.workers.is_empty();
-        let selected: Vec<_> = if local.is_empty() {
+        let selected: Vec<_> = if !self.zone_affinity {
             view.workers.iter().collect()
         } else {
             local
@@ -146,7 +139,6 @@ impl MembershipCache {
             placement,
             epoch: view.topology_token,
             zones_by_address: Arc::new(zones),
-            affinity_fallback,
             instances: Arc::new(instances),
             valid_until: observed
                 + std::time::Duration::from_millis(
@@ -162,11 +154,11 @@ impl MembershipCache {
 
 impl MembershipSnapshot {
     /// Rank logical candidates before resolving their published availability.
-    pub(crate) fn candidates(
-        &self,
-        block: &talon_core::BlockId,
+    pub(crate) fn candidates<'a>(
+        &'a self,
+        block: &'a talon_core::BlockId,
         replicas_k: u8,
-    ) -> impl Iterator<Item = (&str, Result<crate::WorkerClient, crate::WorkerError>)> + '_ {
+    ) -> impl Iterator<Item = (&'a str, Result<crate::WorkerClient, crate::WorkerError>)> + 'a {
         self.placement
             .rank(block, usize::from(replicas_k.max(1)))
             .into_iter()
@@ -312,23 +304,63 @@ mod tests {
     }
 
     #[test]
-    fn affinity_tracks_logical_zones_and_falls_back_only_without_local_members() {
+    fn affinity_tracks_logical_zones_and_rejects_unknown_zones() {
         let pool = crate::ConnectionPool::new();
         let cache = MembershipCache::new(500).with_zone_affinity(Some("a".into()), true);
         let first = cache.replace(view(&[None, None]), Instant::now(), &pool);
-        assert_eq!(first.placement.workers().len(), 2);
-        assert!(first.affinity_fallback);
+        assert_eq!(first.placement.workers().len(), 0);
+
         let second = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
         assert_ne!(first.epoch, second.epoch);
         assert_eq!(second.placement.workers().len(), 1);
         assert_eq!(second.placement.workers()[0].id.0, "w0");
-        assert!(!second.affinity_fallback);
+
         assert_eq!(second.zones_by_address.get("w1:7001").unwrap(), "b");
         for (zone, enabled) in [(Some("a".into()), false), (None, true)] {
             let cache = MembershipCache::new(500).with_zone_affinity(zone, enabled);
             let snapshot = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
-            assert_eq!(snapshot.placement.workers().len(), 2);
-            assert!(!snapshot.affinity_fallback);
+            assert_eq!(
+                snapshot.placement.workers().len(),
+                if enabled { 0 } else { 2 }
+            );
+        }
+    }
+
+    #[test]
+    fn local_candidates_preserve_ownership_and_recover_locally() {
+        let pool = crate::ConnectionPool::new();
+        let cache = MembershipCache::new(500).with_zone_affinity(Some("a".into()), true);
+        let mut discovery = view(&[Some("a"), Some("b")]);
+        let block = talon_core::BlockId::new(
+            talon_core::ObjectId::new(talon_core::Backend::S3, "bucket", "key"),
+            0,
+            64,
+            talon_core::Version::new("v"),
+        );
+        let first = cache.replace(discovery.clone(), Instant::now(), &pool);
+        for state in [InstanceState::Offline, InstanceState::Conflict] {
+            discovery.workers[0].state = state;
+            let snapshot = cache.replace(discovery.clone(), Instant::now(), &pool);
+            assert!(Arc::ptr_eq(&first.placement, &snapshot.placement));
+            assert!(
+                snapshot.owner(&block).is_err(),
+                "LOAD cannot remap the primary"
+            );
+            let candidates: Vec<_> = snapshot.candidates(&block, 8).collect();
+            assert_eq!(candidates.len(), 1);
+            assert_eq!(candidates[0].0, "w0");
+            assert!(candidates[0].1.is_err());
+        }
+        let recovered = cache.replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+        assert!(Arc::ptr_eq(&first.placement, &recovered.placement));
+        assert_eq!(recovered.owner(&block).unwrap().addr(), "w0:7001");
+        for zone in [None, Some("absent".into())] {
+            let strict = MembershipCache::new(500)
+                .with_zone_affinity(zone, true)
+                .replace(view(&[Some("a"), Some("b")]), Instant::now(), &pool);
+            assert_eq!(strict.placement.worker_count(), 0);
+            assert!(strict.owner(&block).is_err());
+            assert_eq!(strict.candidates(&block, 8).count(), 0);
         }
     }
 
@@ -378,7 +410,7 @@ mod tests {
         let offline = cache.replace(view.clone(), std::time::Instant::now(), &pool);
         assert!(Arc::ptr_eq(&first.placement, &offline.placement));
         assert!(offline.owner(&block).is_err());
-        assert!(!offline.affinity_fallback);
+
         view.workers[0].state = InstanceState::Conflict;
         let conflict = cache.replace(view.clone(), std::time::Instant::now(), &pool);
         assert!(Arc::ptr_eq(&first.placement, &conflict.placement));

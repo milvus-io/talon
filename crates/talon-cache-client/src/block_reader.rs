@@ -171,8 +171,8 @@ impl BlockReader {
     /// Configure zone-affine placement (ADR 0006).
     ///
     /// With `enabled` and a known `zone`, placement is computed over the
-    /// same-zone worker subset; an empty subset falls back to the full
-    /// membership and reports through `observer`. Served reads are classified
+    /// same-zone worker subset. Unknown zones or absent local members fail
+    /// closed. Served reads are classified
     /// same/cross/unknown against `zone` regardless of `enabled`, so the
     /// observer also measures the cross-zone baseline before the filter is
     /// turned on.
@@ -361,9 +361,6 @@ impl BlockReader {
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
-        if snapshot.affinity_fallback {
-            self.zone_observer.affinity_fallback();
-        }
         let offset = block.offset + u64::from(offset_in_block);
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
@@ -439,9 +436,6 @@ impl BlockReader {
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
-        if snapshot.affinity_fallback {
-            self.zone_observer.affinity_fallback();
-        }
         let offset = block.offset + u64::from(offset_in_block);
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
@@ -1204,7 +1198,6 @@ mod tests {
         same: std::sync::atomic::AtomicU32,
         cross: std::sync::atomic::AtomicU32,
         unknown: std::sync::atomic::AtomicU32,
-        fallbacks: std::sync::atomic::AtomicU32,
     }
 
     impl crate::metrics::ZoneReadObserver for CountingZoneObserver {
@@ -1216,16 +1209,11 @@ mod tests {
                 crate::metrics::ZoneMatch::Unknown => self.unknown.fetch_add(1, Ordering::SeqCst),
             };
         }
-
-        fn affinity_fallback(&self) {
-            self.fallbacks
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
     }
 
     /// With affinity on, every block lands on the same-zone worker even when a
     /// worker in another zone would rank first globally; the observer counts
-    /// only same-zone reads and no fallbacks.
+    /// only same-zone reads.
     #[tokio::test]
     async fn zone_affinity_reads_stay_in_the_readers_zone() {
         let hits_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1254,36 +1242,75 @@ mod tests {
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         assert_eq!(observer.same.load(Ordering::SeqCst), 4);
         assert_eq!(observer.cross.load(Ordering::SeqCst), 0);
-        assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 0);
     }
 
-    /// With affinity on but no same-zone worker, reads fall back to the full
-    /// membership and the fallback is observed.
     #[tokio::test]
-    async fn missing_local_zone_falls_back_to_full_membership() {
+    async fn absent_or_unknown_local_zone_never_contacts_workers() {
         let hits_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hits_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let worker_a = mock_worker(Arc::clone(&hits_a)).await;
-        let worker_b = mock_worker(Arc::clone(&hits_b)).await;
+        let worker_a = mock_worker(hits_a.clone()).await;
+        let worker_b = mock_worker(hits_b.clone()).await;
         let coordinator = mock_zoned_coordinator(worker_a, worker_b).await;
+        for api in READ_APIS {
+            for zone in [None, Some("az-c".into())] {
+                let reader = BlockReader::new(
+                    CoordinatorClient::new(coordinator.clone()),
+                    Arc::new(PlacementCache::new(500)),
+                    3,
+                )
+                .with_zone_affinity(
+                    zone,
+                    true,
+                    Arc::new(CountingZoneObserver::default()),
+                );
+                assert!(read_via(&reader, api).await.is_err(), "{api:?}");
+            }
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
+    }
 
-        let observer = Arc::new(CountingZoneObserver::default());
-        let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1)
-            .with_zone_affinity(
-                Some("az-c".into()),
-                true,
-                Arc::clone(&observer) as Arc<dyn crate::metrics::ZoneReadObserver>,
-            );
-
-        reader.read_block(&block(), 0, 16).await.unwrap();
-        use std::sync::atomic::Ordering;
-        assert_eq!(
-            hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 1);
-        assert_eq!(observer.cross.load(Ordering::SeqCst), 1);
+    #[tokio::test]
+    async fn local_read_errors_never_retry_across_zones() {
+        for api in READ_APIS {
+            for replicas_k in [1, 3] {
+                for code in [
+                    DataErrorCode::Unavailable,
+                    DataErrorCode::Timeout,
+                    DataErrorCode::InvalidRequest,
+                    DataErrorCode::VersionMismatch,
+                    DataErrorCode::RateLimited,
+                    DataErrorCode::Origin,
+                    DataErrorCode::NotFound,
+                    DataErrorCode::Internal,
+                    DataErrorCode::CacheMiss,
+                    DataErrorCode::Unknown,
+                ] {
+                    let local = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let remote = Arc::new(std::sync::atomic::AtomicU32::new(0));
+                    let a = spawn_worker_error(
+                        local.clone(),
+                        encode_typed_error(0, code, "local failure"),
+                    )
+                    .await;
+                    let b = mock_worker(remote.clone()).await;
+                    let coordinator = mock_zoned_coordinator(a, b).await;
+                    let reader = BlockReader::new(
+                        CoordinatorClient::new(coordinator),
+                        Arc::new(PlacementCache::new(500)),
+                        replicas_k,
+                    )
+                    .with_zone_affinity(
+                        Some("az-a".into()),
+                        true,
+                        Arc::new(CountingZoneObserver::default()),
+                    );
+                    assert!(read_via(&reader, api).await.is_err(), "{api:?} {code:?}");
+                    assert_eq!(local.load(Ordering::SeqCst), 1);
+                    assert_eq!(remote.load(Ordering::SeqCst), 0);
+                }
+            }
+        }
     }
 
     #[tokio::test]
