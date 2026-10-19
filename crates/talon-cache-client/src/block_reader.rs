@@ -183,9 +183,7 @@ impl BlockReader {
         observer: Arc<dyn ZoneReadObserver>,
     ) -> Self {
         self.membership = Arc::new(
-            self.membership
-                .empty_with_same_policy()
-                .with_zone_affinity(zone.clone(), enabled),
+            MembershipCache::new(self.cache.ttl_ms()).with_zone_affinity(zone.clone(), enabled),
         );
         self.configure_discovery();
         self.zone = zone;
