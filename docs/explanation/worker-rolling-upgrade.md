@@ -131,7 +131,7 @@ Object version + block -> Maglev(logical members) -> worker_id
 
 The block routing cache stores logical Worker IDs. Resolve addresses through a separate instance view. Taking a member offline or updating its address must not change its Maglev ownership or filter it out of the placement table.
 
-With zone affinity enabled, derive the same-zone subset from logical membership rather than online instances. Cross-zone READ fallback defaults to disabled: offline/conflicting local owners, an absent local subset, and an unknown reader zone fail closed. Explicit `TALON_ZONE_FALLBACK=true` permits bounded nonlocal READ attempts on eligible failures; LOAD and BatchLoad keep the local primary. See [zone-aware reads](../operations/zone-affinity.md) for the policy matrix.
+With zone affinity enabled, derive the same-zone subset from logical membership rather than online instances. READ candidates remain in the same-zone table; an exhausted local candidate list, an absent local subset, and an unknown reader zone fail closed. No cross-zone retry option exists. LOAD and BatchLoad keep the local primary. See [zone-aware reads](../operations/zone-affinity.md) for the policy matrix.
 
 Separate the topology content token from the instance-state content token. The topology token covers logical attributes that affect placement; the state token covers instances, addresses, and availability. Both are equality tokens, not fencing counters. The current membership token includes addresses and cannot directly support a claim that address changes leave the topology version unchanged. Heartbeat renewal updates expiration only and should not invalidate per-block caches or rebuild the Maglev table.
 

@@ -32,23 +32,22 @@ compare-and-swap to migrate a zone. Heartbeats cannot perform that migration.
 The topology token includes active member identity and zone; retiring a member
 removes it from that topology. Availability-only updates do not change placement.
 
-### Strict local placement with explicit fallback
+### Strict local placement
 
 Affinity remains opt-in for compatibility with existing global deployments.
 With affinity enabled, READ and LOAD rank retained members in the reader's zone.
-Unknown zones and absent local membership fail closed by default. Offline or
+Unknown zones and absent local membership fail closed. Offline or
 conflicting owners remain in placement and return an availability error; they do
 not silently remap ownership.
 
-`TALON_ZONE_FALLBACK` defaults to false. Explicitly enabling it allows bounded
-nonlocal READ attempts after eligible local failures, or when no local placement
-exists. LOAD and BatchLoad always retain the primary placement policy. The
-[operations reference](../operations/zone-affinity.md) specifies retry error
-classification and limits for each implementation.
+There is no cross-zone retry switch. READ candidates remain in the same-zone
+table even when all local owners fail; LOAD and BatchLoad use only its primary.
+The [operations reference](../operations/zone-affinity.md) specifies local
+candidate retry limits and error classification for each implementation.
 
 There is no cross-zone replica placement or background replication. Zones warm
-independently through read-through; each needs adequate cache capacity. Optional
-remote reads are opportunistic, not proof that a remote replica exists.
+independently through read-through; each needs adequate cache capacity. Cache
+membership and local read-through do not guarantee durable replicas.
 
 ### Kubernetes deployment and observability
 
@@ -80,7 +79,7 @@ hops and unsuccessful attempts.
 ## Validation and rollout
 
 Regression tests cover local selection, absent/unknown zones, retained offline
-and conflicting owners, recovery, opt-in fallback and terminal errors. Helm
+and conflicting owners, recovery, and local errors without remote retries. Helm
 rendering tests cover both HA backends and rejected configurations. Kubernetes
 failure drills remain a deployment acceptance step, not a conclusion from unit
 or render tests. Follow the [multi-AZ runbook](../operations/kubernetes-multi-az.zh-CN.md)

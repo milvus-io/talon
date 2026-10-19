@@ -1,7 +1,7 @@
 # Talon Kubernetes 多 AZ 部署交付手册
 
 本手册面向 Kubernetes 部署团队，适用于包含本次 multi-AZ 改动的 Talon 镜像和 SDK。
-目标是 Coordinator/Worker 跨 AZ 部署，业务读请求留在本 AZ，且故障时默认不跨 AZ 重试。
+目标是 Coordinator/Worker 跨 AZ 部署，业务读请求留在本 AZ，且故障时不跨 AZ 重试。
 本文配置、源码单测和 Helm 渲染已经纳入验证；实际集群的调度、网络、存储和 AZ 故障演练仍须在交付环境执行。
 
 ## 1. 部署契约
@@ -13,15 +13,13 @@ sidecar，或直接使用配置了 zone 的 SDK。Coordinator 之间共享 Kuber
 | 配置 | 交付值 | 作用 |
 |---|---|---|
 | `TALON_ZONE_AFFINITY` | `true` | 仅在本 AZ 的持久成员集合内计算 primary placement |
-| `TALON_ZONE_FALLBACK` | `false` | 禁止 READ 跨 AZ 重试，包括本地离线、冲突、无成员、zone 未知 |
 | `TALON_ZONE` | 实际 Pod 所在 AZ，或由 Worker/Gateway 启动时查询 Node | 必须与 Node 标签及成员注册表完全一致 |
 
-两个开关的程序默认值都是 `false`。因此**只部署跨 AZ Pod 并不会自动开启亲和性**；
+亲和性开关的程序默认值是 `false`。因此**只部署跨 AZ Pod 并不会自动开启亲和性**；
 每个读请求发起端必须显式开启 `TALON_ZONE_AFFINITY=true`。
-`TALON_ZONE_FALLBACK=false` 不能限制 affinity 关闭时的全局 placement。
+affinity 关闭时使用全局 placement；开启后没有跨 AZ 重试选项。
 
-LOAD/BatchLoad 使用本 AZ primary；即便显式启用 READ fallback，也不会把 LOAD
-改派到远端 owner。本地 AZ 故障时，严格模式会返回错误，其他 AZ 存活不代表请求可以成功。
+LOAD/BatchLoad 使用本 AZ primary，不会改派到远端 owner。本地 AZ 故障时，严格模式会返回错误，其他 AZ 存活不代表请求可以成功。
 同 AZ 的其他候选是否被尝试仍由客户端的候选数量及错误分类决定；多部署 Worker
 不等于每个块都有多副本。缓存通过各 AZ 独立回源预热，没有跨 AZ 自动复制保证。
 各 AZ 应分别预留工作集容量和回源带宽。
@@ -140,8 +138,6 @@ spec:
               value: talon-coordinator.talon.svc.cluster.local:7000
             - name: TALON_ZONE_AFFINITY
               value: "true"
-            - name: TALON_ZONE_FALLBACK
-              value: "false"
             - name: TALON_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -184,14 +180,12 @@ spec:
               value: zone-a
             - name: TALON_ZONE_AFFINITY
               value: "true"
-            - name: TALON_ZONE_FALLBACK
-              value: "false"
 ```
 
 普通 Downward API 不能将 Node 的 zone 标签直接注入 env。
 如果使用平台 injector，必须验证注入值与落地节点一致，且 Pod 重建后仍一致。
 Rust/Java 也提供 per-client `ZoneOptions`；显式选项覆盖环境配置，需审查业务代码
-是否另行关闭 affinity 或开启 fallback。C/Python 沿用 Rust 构造器的环境设置，不增加 ABI。
+是否另行关闭 affinity。C/Python 沿用 Rust 构造器的环境设置，不增加 ABI。
 
 ## 5. 验收：先证明成功请求本地，再验证故障关闭
 
@@ -224,16 +218,13 @@ kubectl auth can-i get nodes --as=system:serviceaccount:talon:talon-gateway
 禁止 Gateway 自身绕过缓存路径。`cache-only` 不承诺 Worker 内部永远不回源。
 
 Gateway 指标：`talon_gateway_zone_reads_total{zone_match}`、
-`talon_gateway_zone_read_bytes_total{zone_match}`，以及
-`talon_gateway_zone_affinity_fallback_total`。严格配置下，成功的 Worker 读应为 `same`，
-`cross/unknown` 不增长且 fallback 不增长。它们仅统计 Gateway 观测到的 Worker
-读结果/回退路径，不能证明业务到 Gateway 的第一跳、失败连接或 origin 流量没跨 AZ。
+`talon_gateway_zone_read_bytes_total{zone_match}`。开启亲和性后，成功的 Worker 读应为
+`same`，`cross/unknown` 不增长。它们仅统计 Gateway 观测到的成功 Worker 读结果，不能证明业务到 Gateway 的第一跳、失败连接或 origin 流量没跨 AZ。
 SDK 不暴露这些 Gateway 指标；应使用地址到 AZ 的映射、CNI/云网络流日志和请求计数
 交叉验证。没有成功请求时，零跨 AZ 字节不是验收通过。
 
-显式打开 `TALON_ZONE_FALLBACK=true` 的可用性演练须作为单独、可产生跨 AZ 流量的测试，
-结束后恢复 `false`。它只允许有界 READ 重试，不提供远端副本或跨 AZ 零费用保证。
-各语言的可重试错误细节见 [策略参考](zone-affinity.md)。
+各语言的本地候选重试细节见 [策略参考](zone-affinity.md)。Talon 不提供跨 AZ
+缓存副本或零流量费用保证。
 
 ## 6. 旧集群 zone 迁移
 
