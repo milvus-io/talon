@@ -513,24 +513,18 @@ public final class TalonClient implements AutoCloseable {
 
     // --- placement ---------------------------------------------------------
 
-    private record CachedMembership(Placement.Table placement, Placement.Table fallback) {}
+    private record CachedMembership(Placement.Table placement) {}
     private record ReadTarget(String address, ConnectionPool pool) {}
 
-    /** Resolve one snapshot, then attempt at most one local and one nonlocal owner. */
+    /** Resolve one snapshot and attempt its primary owner, keeping zone affinity strict. */
     private byte[] readBlock(Segment seg, long objectSize) throws IOException {
         membership();
         ReadTarget primary;
-        ReadTarget remote;
         membershipLock.lock();
         try {
             primary = readTarget(membership.placement, seg.block);
-            remote = readTarget(membership.fallback, seg.block);
         } finally { membershipLock.unlock(); }
-        try { return readFrom(primary, seg, objectSize); }
-        catch (TalonException failure) {
-            if (remote == null || !failure.fallbackEligible()) throw failure;
-            return readFrom(remote, seg, objectSize);
-        }
+        return readFrom(primary, seg, objectSize);
     }
 
     // Called with the membership lock held; capture the pool for this incarnation.
@@ -650,16 +644,12 @@ public final class TalonClient implements AutoCloseable {
         });
         if (discovery == null || discovery.topology() != view.topology()) {
             List<NodeInfo> local = new ArrayList<>();
-            List<NodeInfo> remote = new ArrayList<>();
             for (Messages.DiscoveredWorker worker : view.workers()) {
                 NodeInfo node = new NodeInfo(worker.id(), "", true);
                 if (zoneOptions.zone() != null && zoneOptions.zone().equals(worker.zone())) local.add(node);
-                else remote.add(node);
             }
             Placement.Table table = new Placement.Table(zoneOptions.affinity() ? local : logical);
-            Placement.Table fallback = zoneOptions.affinity() && zoneOptions.fallback()
-                    ? new Placement.Table(remote) : null;
-            membership = new CachedMembership(table, fallback);
+            membership = new CachedMembership(table);
         }
         discovery = view;
     }

@@ -10,53 +10,48 @@ import java.util.concurrent.atomic.*;
 public final class ZoneAffinityTest {
     public static void main(String[] args) throws Exception {
         ZoneOptions defaults = ZoneOptions.fromEnvironment(k -> null);
-        if (defaults.affinity() || defaults.fallback()) throw new AssertionError("unsafe defaults");
+        if (defaults.affinity()) throw new AssertionError("unexpected default affinity");
         try { ZoneOptions.fromEnvironment(k -> "typo"); throw new AssertionError("invalid boolean accepted"); }
         catch (IllegalArgumentException expected) { }
         for (int state : new int[] {0, 1, 2}) {
-            for (boolean fallback : new boolean[] {false, true}) {
-                try (Cluster cluster = new Cluster(state, null);
-                     TalonClient client = cluster.client("a", fallback)) {
-                    if (state == 2 || fallback) {
-                        assertBytes(client, state == 2 ? 1 : 2);
-                    } else expectUnavailable(client);
-                    if (cluster.remoteHits.get() != (state == 2 || !fallback ? 0 : 1)) {
-                        throw new AssertionError("unexpected remote request");
-                    }
-                    if (state != 2) {
-                        int before = cluster.remoteHits.get();
-                        try { client.load("s3://bucket/key", "v", 8); throw new AssertionError("LOAD remapped"); }
-                        catch (IOException expected) { }
-                        if (cluster.remoteHits.get() != before) throw new AssertionError("remote LOAD");
-                    }
+            try (Cluster cluster = new Cluster(state, null);
+                 TalonClient client = cluster.client("a")) {
+                if (state == 2) assertBytes(client, 1);
+                else expectUnavailable(client);
+                if (cluster.remoteHits.get() != 0) throw new AssertionError("remote READ");
+                if (state != 2) {
+                    try { client.load("s3://bucket/key", "v", 8); throw new AssertionError("LOAD remapped"); }
+                    catch (IOException expected) { }
+                    if (cluster.remoteHits.get() != 0) throw new AssertionError("remote LOAD");
                 }
             }
         }
         for (String zone : new String[] {null, "absent"}) {
-            try (Cluster cluster = new Cluster(2, null); TalonClient client = cluster.client(zone, false)) {
+            try (Cluster cluster = new Cluster(2, null); TalonClient client = cluster.client(zone)) {
                 expectUnavailable(client);
                 if (cluster.localHits.get() + cluster.remoteHits.get() != 0) throw new AssertionError("unknown zone dialed");
             }
         }
-        for (TalonException.Code code : new TalonException.Code[] {
-                TalonException.Code.VERSION_MISMATCH, TalonException.Code.RATE_LIMITED,
-                TalonException.Code.ORIGIN, TalonException.Code.NOT_FOUND}) {
-            try (Cluster cluster = new Cluster(2, code); TalonClient client = cluster.client("a", true)) {
-                try { read(client); throw new AssertionError("terminal error hidden"); }
+        for (TalonException.Code code : TalonException.Code.values()) {
+            try (Cluster cluster = new Cluster(2, code); TalonClient client = cluster.client("a")) {
+                try { read(client); throw new AssertionError("local error hidden"); }
                 catch (TalonException expected) { if (expected.code() != code) throw expected; }
-                if (cluster.remoteHits.get() != 0) throw new AssertionError("terminal failure retried");
+                if (cluster.remoteHits.get() != 0) throw new AssertionError("local failure retried remotely");
             }
         }
-        try (Cluster cluster = new Cluster(2, TalonException.Code.UNAVAILABLE);
-             TalonClient client = cluster.client("a", true)) { assertBytes(client, 2); }
-        try (Cluster cluster = new Cluster(0, null); TalonClient client = cluster.client("a", true)) {
-            assertBytes(client, 2);
+        try (Cluster cluster = new Cluster(0, null); TalonClient client = cluster.client("a")) {
+            expectUnavailable(client);
             cluster.localState.set(2);
             long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
-            while (read(client)[0] != 1) {
-                if (System.nanoTime() > deadline) throw new AssertionError("local recovery failed");
-                Thread.sleep(25);
+            while (true) {
+                try { assertBytes(client, 1); break; }
+                catch (TalonException unavailable) {
+                    if (unavailable.code() != TalonException.Code.UNAVAILABLE) throw unavailable;
+                    if (System.nanoTime() > deadline) throw new AssertionError("local recovery failed");
+                    Thread.sleep(25);
+                }
             }
+            if (cluster.remoteHits.get() != 0) throw new AssertionError("recovery escaped local zone");
         }
         System.out.println("zone affinity: defaults, offline/conflict, recovery, LOAD and terminal errors passed");
     }
@@ -86,8 +81,8 @@ public final class ZoneAffinityTest {
             localState = new AtomicInteger(state); localError = error;
             serve(coordinator, 0); serve(local, 1); serve(remote, 2);
         }
-        TalonClient client(String zone, boolean fallback) {
-            return TalonClient.connect(address(coordinator), 64, 8, new ZoneOptions(zone, true, fallback));
+        TalonClient client(String zone) {
+            return TalonClient.connect(address(coordinator), 64, 8, new ZoneOptions(zone, true));
         }
         static String address(ServerSocket server) { return "127.0.0.1:" + server.getLocalPort(); }
         void serve(ServerSocket server, int kind) {

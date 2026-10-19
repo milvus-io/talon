@@ -116,18 +116,16 @@ try {
 
 ## Availability zones
 
-`connect` reads `TALON_ZONE`, `TALON_ZONE_AFFINITY`, and `TALON_ZONE_FALLBACK`
-once. Both switches default to false. Inject the actual pod zone; the SDK does
-not query Kubernetes. To override the environment per client:
+`connect` reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` once. Affinity defaults
+to false. Inject the actual pod zone; the SDK does not query Kubernetes.
+To override the environment per client:
 
 ```java
 TalonClient client = TalonClient.connect("talon-coordinator:7000", 256 << 20, 8,
-    new ZoneOptions("zone-a", true, false));
+    new ZoneOptions("zone-a", true));
 ```
 
-With affinity enabled, missing/unknown local zones fail closed. Explicitly
-enabling fallback permits at most one nonlocal owner after the local owner is
-unavailable or times out. Version, origin, quota and protocol errors stay
-visible. LOAD and BatchLoad always keep the primary placement, including when
-all local workers are offline; fallback never turns them into remote prewarm.
-Recovery uses local placement again on the next read after discovery updates.
+With affinity enabled, READ, LOAD and BatchLoad use only the same-zone primary.
+Missing/unknown local zones and offline/conflicting owners fail closed. All
+worker errors remain visible; there is no cross-zone retry option. Recovery
+uses the same local placement on the next read after discovery updates.
