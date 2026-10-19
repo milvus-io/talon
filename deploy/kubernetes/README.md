@@ -22,7 +22,7 @@ coordinator DNS and the node-zone RBAC subjects to the application namespace.
 | `worker.yaml` | Worker StatefulSet, governing Service and ServiceAccount. Shared by both coordinator backends. |
 | `worker-secret.example.yaml` | Template Secret for the worker's object-store (Azure account/SAS) credentials. |
 | `rbac.yaml` | Namespaced Lease and membership ConfigMap RBAC. **Kubernetes backend only.** |
-| `node-zone-rbac.yaml` | Node zone lookup for Worker and Gateway ServiceAccounts. **Either backend.** |
+| `node-zone-rbac.yaml` | Node zone lookup for Worker, Gateway and SDK ServiceAccounts. **Either backend.** |
 | `etcd-secret.example.yaml` | Template Secret for etcd endpoints/credentials/TLS and the optional management token. **etcd backend only.** |
 | `servicemonitor.yaml` | Prometheus Operator ServiceMonitor (or use the pod scrape annotations). |
 | `gateway-s3-sidecar.yaml` | Loopback-only S3 gateway sidecar template. |
@@ -140,7 +140,7 @@ spec:
 ```
 
 Bind that ServiceAccount and its namespace to `talon-node-zone-reader` in
-`rbac.yaml`, or list them in Helm's `multiAz.clientServiceAccounts`. The resolver
+`node-zone-rbac.yaml`, or list them in Helm's `multiAz.clientServiceAccounts`. The resolver
 uses `KUBERNETES_SERVICE_HOST/PORT` and the mounted ServiceAccount token/CA to
 GET `/api/v1/nodes/{node}` and read `topology.kubernetes.io/zone`. Nodes must
 already carry the actual zone label. No Kubernetes 1.35 feature is required.
