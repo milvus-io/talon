@@ -83,10 +83,12 @@ every zone. The chart restricts scheduling to the listed zones and adds
 backends. Storage must be provisionable in every zone. Missing capacity leaves
 Pods Pending; the chart does not silently relax locality.
 
-Gateway sidecars remain in application-owned Deployments. Bind their existing
-ServiceAccounts through `multiAz.clientServiceAccounts` and use the
-[sidecar templates](../../kubernetes/README.md). SDK clients use injected
-`TALON_ZONE` and `TALON_ZONE_AFFINITY=true` instead. With affinity enabled,
+Gateway sidecars and SDK applications remain in application-owned Deployments.
+Bind their existing ServiceAccounts through `multiAz.clientServiceAccounts`,
+inject `spec.nodeName` as `TALON_NODE_NAME`, and mount the ServiceAccount token
+and cluster CA. Set `TALON_ZONE_AFFINITY=true` on each reader. Worker, Gateway
+and SDKs discover their Node zone once at startup; explicit `TALON_ZONE` bypasses
+the lookup and needs no Node RBAC. See the [Pod configuration](../../kubernetes/README.md). With affinity enabled,
 reads stay local and fail when no usable local owner exists. See the
 [zone-affinity runbook](../../../docs/operations/zone-affinity.md) before
 enabling zone discovery on existing persistent members.

@@ -116,3 +116,37 @@ values example. The raw manifests spread across available labeled domains;
 they do not enforce a particular AZ inventory. Follow the
 [zone-affinity runbook](../../docs/operations/zone-affinity.md) for SDK
 configuration, persistent-member migration, and acceptance checks.
+
+
+## SDK Node zone discovery
+
+Rust, C, Python and Java SDKs use the same Node zone discovery mechanism as
+Worker/Gateway when `TALON_ZONE` is unset. Add this fragment to the application
+Pod template (replace `talon-application` with its existing ServiceAccount):
+
+```yaml
+spec:
+  serviceAccountName: talon-application
+  automountServiceAccountToken: true
+  containers:
+    - name: application
+      env:
+        - name: TALON_NODE_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: spec.nodeName
+        - name: TALON_ZONE_AFFINITY
+          value: "true"
+```
+
+Bind that ServiceAccount and its namespace to `talon-node-zone-reader` in
+`rbac.yaml`, or list them in Helm's `multiAz.clientServiceAccounts`. The resolver
+uses `KUBERNETES_SERVICE_HOST/PORT` and the mounted ServiceAccount token/CA to
+GET `/api/v1/nodes/{node}` and read `topology.kubernetes.io/zone`. Nodes must
+already carry the actual zone label. No Kubernetes 1.35 feature is required.
+
+Resolution runs once per client construction, with a 2-second connect timeout
+and 5-second HTTP request timeout. Lookup failure leaves the zone unknown;
+affinity stays enabled and cache reads/loads fail closed. Explicit Rust/Java
+`ZoneOptions` bypass environment settings and automatic discovery. FUSE still
+requires explicit `TALON_ZONE`.

@@ -111,6 +111,6 @@ serviceMonitor:
 multiAz:
   enabled: false
   zones: []
-  # Existing application ServiceAccounts whose gateway sidecars need get nodes.
-  # Direct SDK clients use TALON_ZONE and do not need this permission.
+  # Existing application ServiceAccounts whose gateways or SDKs discover Node zones.
+  # Clients with explicit TALON_ZONE do not need this get nodes permission.
   clientServiceAccounts: []
