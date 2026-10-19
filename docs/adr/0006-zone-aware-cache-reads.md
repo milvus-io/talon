@@ -1,139 +1,89 @@
 # ADR 0006: Zone-Aware Cache Reads
 
-> Protocol update: schema 6 consolidates membership into `MembershipQuery` /
-> `MembershipList { view: WorkerDiscovery }`, with zones on persistent members.
-> The schema-v5 negotiation described below is historical and has been removed;
-> current clients do not probe or fall back to earlier membership protocols.
-
-
-- Status: Accepted
-- Date: 2026-08-11
+- Status: Accepted; updated for retained membership and strict local reads
+- Original date: 2026-08-11
 - Tracking issue: #531
-- Related: extends ADR 0001 (membership and placement version); complements
-  ADR 0005 (object-store gateways)
+- Related: ADR 0001 (membership and placement), ADR 0005 (gateways)
 
 ## Context
 
-Cache traffic is large, and on every major cloud a byte that crosses an
-availability zone is billed in both directions while a byte served within the
-zone is free. Talon has no topology concept anywhere: `NodeInfo` carries only
-id, address, and role; block placement is a deterministic Maglev ranking over
-the full worker set computed locally by every reader; and the deployment has
-no zone-aware hop. With three zones, roughly two thirds of cache reads leave
-the reader's zone.
+Global cache placement sends reads to Workers in other availability zones.
+Deployments need to bound those transfers independently of availability policy.
+Readers and Workers can move with Kubernetes scheduling; a zone assigned to an
+entire application instance may not describe each Pod. Cache data is read-through,
+so each zone can warm its own working set without cross-zone replication.
 
-Two deployment facts shape the solution space:
-
-- Consumers move. Milvus query nodes are scheduled per pod across zones and
-  are not pinned, so any design that assigns a zone per *instance* (for
-  example, the control plane rendering a per-instance gateway address) writes
-  configuration that is wrong for some of that instance's pods some of the
-  time.
-- The cache is read-through. A worker that does not hold a block fetches it
-  from the origin object store, which is regional: an in-zone origin fetch
-  costs no transfer fee and permanently seeds the zone. Replicating blocks
-  across zones inside Talon would add placement and fill machinery to reach
-  the same steady state that per-zone read-through reaches on its own.
+The original schema-5 discovery design is superseded by schema 6 persistent
+membership. Current clients do not negotiate older membership messages. This
+record describes the current implementation; historical protocol text is in Git.
 
 ## Decision
 
-### 1. One zone field, self-discovered, never load-bearing for startup
+### Persistent zone identity
 
-Each worker and gateway resolves its own zone at startup: the `TALON_ZONE`
-environment variable wins; otherwise the process asks the Kubernetes API for
-its node's standard `topology.kubernetes.io/zone` label (node name injected
-via the downward API as `TALON_NODE_NAME`; requires a `get nodes` RBAC grant;
-the label was verified present on EKS, ACK, and AKS). Cloud instance-metadata
-endpoints are deliberately not used: they are unreachable from pods in common
-EKS configurations (IMDS hop limit). Resolution failure yields "zone unknown"
-and the process starts normally with today's behavior.
+Worker/Gateway startup and default SDK construction use `TALON_ZONE` when
+provided, otherwise a Kubernetes Node label lookup using `TALON_NODE_NAME` and
+`get nodes` permission. Rust/C/Python reuse the backend resolver; Java uses an
+equivalent authenticated HTTPS lookup. Missing metadata yields an unknown zone
+without disabling affinity. FUSE requires explicit zone configuration; explicit
+Rust/Java `ZoneOptions` bypass environment settings and automatic discovery.
 
-### 2. Zone reporting rides the existing status heartbeat
+A Worker's logical ID and zone live in `MemberRegistry`, independent of leased
+instance health. Registering the same ID with a different zone fails. An operator
+must fence the old instance and update the complete registry with revision-checked
+compare-and-swap to migrate a zone. Heartbeats cannot perform that migration.
+The topology token includes active member identity and zone; retiring a member
+removes it from that topology. Availability-only updates do not change placement.
 
-Workers put the zone into the `labels` map of the schema-v2
-`NodeStatusHeartbeat` (`labels["zone"]`), which already flows into the shared
-state store and is therefore visible to every coordinator replica. No wire
-format changes on the reporting path.
+### Strict local placement
 
-### 3. Zoned membership is two new schema-v5 messages
+Affinity remains opt-in for compatibility with existing global deployments.
+With affinity enabled, READ and LOAD rank retained members in the reader's zone.
+Unknown zones and absent local membership fail closed. Offline or
+conflicting owners remain in placement and return an availability error; they do
+not silently remap ownership.
 
-`bincode` encodes fields positionally, so `NodeInfo` and `MembershipList`
-cannot grow fields compatibly. Following the schema-v2/v4 precedent, schema v5
-appends `MembershipQueryV2 {}` and `MembershipListV2 { nodes:
-Vec<ZonedNodeInfo> }`, where `ZonedNodeInfo` pairs the unchanged `NodeInfo`
-with an optional zone. Coordinators answer from membership joined with the
-zone reported per node.
+There is no cross-zone retry switch. READ candidates remain in the same-zone
+table even when all local owners fail; LOAD and BatchLoad use only its primary.
+The [operations reference](../operations/zone-affinity.md) specifies local
+candidate retry limits and error classification for each implementation.
 
-Placement epochs remain computed over the node set only. ADR 0001 §7.1
-anticipated folding a future failure-domain field into the canonical
-placement version; this ADR deliberately takes the other fork: a zone
-arriving late for an unchanged node set (reporting lag during rollout) is a
-client-local concern, so churning the cluster-wide version for it would
-invalidate every reader's cache to fix one reader's view. Instead the
-membership cache hashes the observed `(address, zone)` pairs alongside the
-epoch and rebuilds its table when that token moves even though the epoch
-does not. A pod that moves zones re-registers as a new node and changes the
-epoch as before.
+There is no cross-zone replica placement or background replication. Zones warm
+independently through read-through; each needs adequate cache capacity. Cache
+membership and local read-through do not guarantee durable replicas.
 
-Readers request V2 first and fall back to the V1 query automatically when the
-round trip fails (an older coordinator drops the connection on an unknown
-schema), remembering the failure for a cooldown period so connection churn
-stays bounded. Mixed-version clusters are therefore safe in both upgrade
-orders, though coordinator-first remains the documented order.
+### Kubernetes deployment and observability
 
-### 4. Zone affinity is an off-by-default read-side filter
+Spread Coordinators and Workers over the intended zones, with an HA state backend.
+The Helm multi-AZ mode validates replicas, constrains nodes to an explicit zone
+list and uses hard topology spread with `minDomains`. Worker and Gateway zone
+lookup permissions are independent of the Coordinator's chosen state backend.
 
-With `TALON_ZONE_AFFINITY=true` and a known local zone, a reader builds its
-placement table from the same-zone subset of membership; the hash itself is
-unchanged. All readers in one zone therefore agree on owners within that zone,
-and each zone warms independently through read-through. When the same-zone
-subset is empty (no workers, or none healthy) the reader falls back to the
-full membership — availability over cost — and counts the event. Every worker
-read is classified `same`/`cross`/`unknown` against the reader's zone and
-surfaced through an observer so each binary counts into its own registry.
+Gateway sidecars keep the consumer hop on loopback. For centralized Gateways,
+Kubernetes topology-aware Service preferences do not guarantee locality. Strict
+first-hop locality needs zone-scoped endpoints or sidecars. Worker-read metrics
+cover only the Gateway-to-Worker hop; network-level evidence is needed for other
+hops and unsuccessful attempts.
 
-### 5. The consumer-to-gateway hop is Kubernetes' job
+## Alternatives and consequences
 
-Milvus stays a plain S3 client against one cluster-wide gateway Service.
-Same-zone steering for that hop uses Kubernetes Topology Aware Routing
-(`service.kubernetes.io/topology-mode: Auto`) plus
-`topologySpreadConstraints` keeping at least two gateway replicas per zone.
-Kubernetes silently disables the feature when replicas are unbalanced, so the
-cross-zone read metrics from section 4 are the required alarm, not an
-optional nicety. Reference manifests and the rollout order live in the
-operations documentation.
+- Active cross-zone replication is outside this read-through design. It adds
+  placement, transfer and repair machinery and is not needed for local warming.
+- Automatically choosing a global owner when the zone is unavailable is rejected
+  as the default: it silently changes the operator's transfer policy.
+- Filtering placement to healthy Workers is rejected: transient failures must
+  not rehash retained ownership.
+- Cloud instance metadata is not required; Pod access is frequently restricted.
+- Explicit per-zone capacity and operational migration are required. Local-zone
+  failures can reduce availability even while other zones remain healthy.
+- Origin access is a separate network/cost policy; regional origin storage does
+  not imply every configured endpoint is free of cross-zone transfer charges.
 
-### 6. Rollout and rollback
+## Validation and rollout
 
-Upgrade coordinators first, then workers and gateways (zone reporting starts;
-behavior unchanged). Verify zones populate on the membership surface, enable
-the Service annotation, then set `TALON_ZONE_AFFINITY=true` on readers. Rollback
-at any point is turning the flag off.
-
-## Rejected alternatives
-
-- **Zone-spread replication with nearest-replica reads** (the Kafka/HDFS
-  shape): requires replication factor ≈ zone count plus active fill to be
-  effective, reaching the same per-zone capacity cost as read-through with
-  strictly more machinery. Rejected for a read-through cache.
-- **Control plane renders per-zone gateway addresses per instance**: broken by
-  pod-level consumer mobility (see Context). Rejected.
-- **Cloud instance metadata as the zone source**: unreachable from pods on
-  default EKS node settings. Rejected in favor of the node-label lookup.
-- **Growing `NodeInfo` in place**: incompatible under bincode's positional
-  encoding; every mixed-version pairing misparses. Rejected for appended
-  messages.
-
-## Consequences
-
-- Steady-state cache reads stop crossing zones; the hot set occupies disk in
-  every zone that reads it, and each zone pays one origin fetch per block to
-  warm. The trade is favorable whenever a block is read across zones more
-  than a handful of times per month.
-- Zone capacity follows worker placement: uneven worker distribution across
-  zones produces uneven cache capacity. Spread constraints on workers are the
-  operational lever.
-- A zone with readers but no workers runs permanently on the full-membership
-  fallback; the fallback counter makes this visible.
-- The conformance vectors gain schema-v5 cases, and `CONTROL_SCHEMA_VERSION`
-  moves to 5.
+Regression tests cover local selection, absent/unknown zones, retained offline
+and conflicting owners, recovery, and local errors without remote retries. Helm
+rendering tests cover both HA backends and rejected configurations. Kubernetes
+failure drills remain a deployment acceptance step, not a conclusion from unit
+or render tests. Follow the [multi-AZ runbook](../operations/kubernetes-multi-az.zh-CN.md)
+for setup, fenced membership migration, failure drills and rollback.

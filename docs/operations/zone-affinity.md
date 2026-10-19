@@ -1,91 +1,103 @@
 # Zone-aware cache reads
 
-Cross-zone traffic is billed in both directions on every major cloud, while
-the origin object store is regional and free to read from any zone. Zone
-affinity (ADR 0006) keeps steady-state cache reads inside the reader's zone:
-each zone's readers compute placement over the same-zone worker subset, and a
-block first read in a zone is fetched once from the origin and stays there.
+Talon supports zone-local placement in Gateway, FUSE and the Rust, C, Python
+and Java SDKs. Enable affinity explicitly to keep Worker reads and retries
+inside the local zone. For the deployment team's Kubernetes instructions, migration
+procedure and acceptance matrix, see the
+[Chinese multi-AZ runbook](kubernetes-multi-az.zh-CN.md).
 
-The switch is off by default; enabling it changes read placement only. Blocks
-are never replicated across zones by Talon — each zone warms independently
-through the ordinary read-through path.
-
-## How a process learns its zone
-
-1. `TALON_ZONE`, when set, wins (worker, gateway, and FUSE client alike).
-   The FUSE client uses only this variable — it often runs outside
-   Kubernetes, so it never attempts the node-label lookup below.
-2. Otherwise workers and gateways ask the Kubernetes API for their node's
-   `topology.kubernetes.io/zone` label. This needs two deployment pieces,
-   both in the reference manifests: the downward-API env
-   `TALON_NODE_NAME` (from `spec.nodeName`) and the `talon-node-zone-reader`
-   ClusterRole bound to the pod's ServiceAccount. Cloud instance-metadata
-   endpoints are deliberately not used (unreachable from pods under common
-   EKS settings).
-3. Neither available: the zone is unknown and behavior stays exactly as
-   today. Zone resolution never blocks or fails startup.
-
-## Configuration
+## Configuration and discovery
 
 | Variable | Default | Applies to | Meaning |
 |---|---|---|---|
-| `TALON_ZONE` | unset | worker, gateway, FUSE | Explicit zone; skips the node-label lookup. |
-| `TALON_NODE_NAME` | unset | worker, gateway | Node name for the label lookup; inject via the downward API. |
-| `TALON_ZONE_AFFINITY` | `false` | gateway, FUSE | Compute placement over the same-zone worker subset. |
+| `TALON_ZONE` | unset | Worker, Gateway, FUSE, SDKs | Explicit zone, matching membership exactly. |
+| `TALON_NODE_NAME` | unset | Worker, Gateway, SDKs | Resolve the node's `topology.kubernetes.io/zone` label at startup. Requires downward API injection and `get nodes` RBAC. |
+| `TALON_ZONE_AFFINITY` | `false` | Gateway, FUSE, SDKs | Restrict primary placement to retained same-zone members. |
 
-Workers need no affinity flag: they only *report* their zone, inside the
-status heartbeat they already send. Coordinators store and serve it; they
-have no zone logic and need no zone of their own (the control plane carries
-no data bytes, and its replicas should simply be spread across zones for
-availability like any HA deployment).
+Explicit `TALON_ZONE` takes precedence over Kubernetes discovery. Without it,
+Worker, Gateway and Rust/C/Python/Java SDKs resolve the Node zone using
+`TALON_NODE_NAME`, `KUBERNETES_SERVICE_HOST/PORT`, and the mounted ServiceAccount
+token/CA. Inject `spec.nodeName` through the Downward API and grant that Pod's
+ServiceAccount `get nodes`. This works without Kubernetes 1.35 topology-label
+propagation. FUSE still requires an explicit zone.
 
-## Behavior contract
+SDK lookup runs once per client construction, with a 2-second connect timeout
+and 5-second HTTP request timeout. Rust/C/Python reuse the Worker/Gateway resolver
+on a joined helper thread, so synchronous construction also works inside a Tokio
+runtime. Java implements the same HTTPS lookup without native dependencies.
+Missing prerequisites, denied requests, missing labels and failed lookups leave
+the zone unknown; affinity is never disabled by a lookup failure. There is no
+per-read lookup or background zone refresh; reconstruct the client after fixing
+an unsuccessful initial lookup.
 
-- Readers with an unknown zone, and zones with no workers, use the full
-  membership: availability wins over transfer cost, and the event is counted.
-- A worker that is healthy but does not hold a block fetches it from the
-  origin itself (regional, no transfer fee) — that is the ordinary
-  read-through path, not a fallback.
-- Every served read is classified against the reader's zone and counted as
-  `same`, `cross`, or `unknown` — including with affinity off, so the
-  cross-zone baseline is measurable before the switch is thrown. Gateway
-  metrics: `talon_gateway_zone_reads_total{zone_match}`,
-  `talon_gateway_zone_read_bytes_total{zone_match}`, and
-  `talon_gateway_zone_affinity_fallback_total`. The FUSE mount has no
-  metrics endpoint; it logs a throttled warning while the fallback
-  persists.
-- Mixed versions are safe in both upgrade orders: a new reader against an
-  older coordinator falls back to the zone-less membership query
-  automatically (with a cooldown), and older readers ignore zones entirely.
+Rust `ClientBuilder::with_zone_options(ZoneOptions)` and Java's `connect`
+overload override both environment settings and automatic zone discovery per
+client, including an explicitly absent zone. C/Python constructors inherit
+Rust's environment configuration without ABI changes. SDKs validate boolean
+and zone inputs at construction. Set environment before constructing clients.
 
-## The consumer-to-gateway hop
+Workers resolve their zone before registering it in the persistent membership
+registry. Heartbeats publish liveness; they do not mutate a member's zone.
+Reusing an ID with a different zone is rejected. Unknown-zone startup remains
+possible, but strict readers cannot use that Worker as a known local owner.
 
-Zone affinity covers gateway-to-worker reads. The reference sidecar
-templates need nothing more: a sidecar gateway shares the consumer's pod,
-so that hop is loopback and same-zone by construction.
+## Placement and failure contract
 
-For a *centralized* gateway Deployment behind a Service, steering clients
-(for example Milvus query nodes) to a same-zone gateway is Kubernetes' job:
+| Affinity | Local zone / membership | READ | LOAD / BatchLoad |
+|---|---|---|---|
+| off | any | Global placement | Global primary |
+| on | known local members | Same-zone candidates only; local failure remains a failure | Same-zone primary only |
+| on | unknown zone or no local members | Fail closed | Fail closed |
 
-- annotate the gateway Service with
-  `service.kubernetes.io/topology-mode: Auto`;
-- keep at least two gateway replicas in every zone with a
-  `topologySpreadConstraints` block (`topologyKey:
-  topology.kubernetes.io/zone`, `whenUnsatisfiable: DoNotSchedule`).
+Placement includes retained offline/conflicting logical members. Availability
+changes do not rehash ownership, so local failure cannot silently choose a global
+primary. Affinity filters logical membership before ranking; it does not filter
+to only healthy endpoints. Retirement/zone edits change topology; recovery of
+an existing member restores its endpoint without changing placement.
 
-Kubernetes silently reverts to cluster-wide routing when a zone's replicas
-are missing or unbalanced. The cross-zone byte metrics above are the required
-alarm for that regression, not an optional dashboard.
+Rust's shared reader retains its existing candidate retry classification within
+the selected zone: transport/protocol and nonterminal worker failures can try
+the next local candidate, up to `replicas_k`. Java attempts one local primary.
+Both preserve terminal version mismatch, not found, invalid request, origin
+failure and rate limiting errors. No zone-affine read can select a nonlocal
+candidate, including when the local candidate list is empty or exhausted.
 
-## Rollout
+No background cross-zone replication is promised. Each zone warms independently
+through normal read-through, and must have capacity for its own working set.
+Origin access and any caller-level fallback are separate policies; network paths
+and cloud charges depend on the provider and endpoints.
 
-1. Upgrade coordinators, then workers and gateways. Zone reporting starts;
-   behavior is unchanged.
-2. Confirm zones appear on the membership surface (management UI / status
-   API) for every worker.
-3. Annotate the gateway Service and verify the spread constraints hold.
-4. Set `TALON_ZONE_AFFINITY=true` for gateways (and FUSE mounts where used).
-   Watch `zone_match="cross"` bytes drop to zero and the fallback counter
-   stay flat.
+## Two network hops and observability
 
-Rollback at any step is unsetting `TALON_ZONE_AFFINITY`.
+A Gateway sidecar makes the consumer-to-Gateway hop loopback. The affinity policy
+controls Gateway-to-Worker traffic. A centralized Gateway Service introduces a
+separate routing policy: Kubernetes topology hints / traffic distribution are
+preferences and can route outside the zone. They do not enforce the strict
+contract above. Use a sidecar or an explicitly zone-scoped Service and endpoints
+when the first hop must also remain local.
+
+Gateway records served Worker reads in
+`talon_gateway_zone_reads_total{zone_match="same|cross|unknown"}` and
+`talon_gateway_zone_read_bytes_total{zone_match="same|cross|unknown"}`.
+FUSE and SDKs currently do not export these Gateway counters.
+
+These metrics do not measure consumer-to-Gateway traffic, failed attempts, or
+origin transfers. Validate those paths with endpoint-to-node/zone mapping and
+network telemetry. Zero cross-zone bytes without successful requests is not an
+acceptance result.
+
+## Upgrade and rollback
+
+Current discovery uses schema 6 `MembershipQuery` / `MembershipList` with
+persistent members. There is no negotiation fallback to the historical schema-5
+or lease-only membership. Upgrade only within the supported retained-membership
+protocol contract; see [rolling upgrades](../how-to/rolling-upgrade.md).
+
+Before enabling zone discovery on an existing Worker, inspect its retained zone.
+Migrate zone-less/mismatched records using the runbook's fenced, revision-checked
+registry update. Preserve IDs, PVCs, retirement markers and unrelated members.
+Then enable affinity on readers.
+
+Turning affinity off restores global placement and permits cross-zone traffic;
+it is not a cost-preserving rollback. For strict-zone requirements, keep
+affinity enabled and restore local capacity or roll back to a compatible binary.
