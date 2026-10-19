@@ -94,7 +94,7 @@ impl ClientBuilder {
     }
 
     /// Override all AZ environment settings for this client.
-    /// Passing the default options explicitly disables affinity and fallback.
+    /// Passing the default options explicitly disables affinity.
     pub fn with_zone_options(mut self, options: crate::ZoneOptions) -> Self {
         self.zone_options = Some(options);
         self
@@ -151,8 +151,7 @@ impl ClientBuilder {
                 zone_options.zone,
                 zone_options.affinity,
                 Arc::new(talon_cache_client::NoopZoneReadObserver),
-            )
-            .with_zone_fallback(zone_options.fallback);
+            );
         Ok(Client {
             coordinator,
             reader,
@@ -1166,7 +1165,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sdk_zone_options_route_locally_and_enable_read_fallback() {
+    async fn sdk_zone_options_route_locally_and_fail_without_local_owner() {
         let worker = mock_worker(16).await;
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let coordinator = listener.local_addr().unwrap().to_string();
@@ -1213,16 +1212,18 @@ mod tests {
             size: 16,
             version: "test-version".into(),
         };
-        for (zone, fallback, succeeds) in
-            [("b", false, true), ("a", false, false), ("a", true, true)]
-        {
+        for (zone, succeeds) in [
+            (Some("b"), true),
+            (Some("a"), false),
+            (Some("absent"), false),
+            (None, false),
+        ] {
             let client = ClientBuilder::default()
                 .with_coordinator(&coordinator)
                 .with_block_size(16)
                 .with_zone_options(crate::ZoneOptions {
-                    zone: Some(zone.into()),
+                    zone: zone.map(str::to_owned),
                     affinity: true,
-                    fallback,
                 })
                 .build()
                 .unwrap();

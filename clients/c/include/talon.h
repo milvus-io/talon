@@ -70,10 +70,10 @@ typedef struct talon_client_options {
 
 void talon_client_options_init(talon_client_options *options);
 
-/* Construction reads TALON_ZONE, TALON_ZONE_AFFINITY and TALON_ZONE_FALLBACK.
- * The switches default false; invalid boolean values reject construction.
- * Inject the actual pod zone; the SDK does not query Kubernetes. Read fallback
- * is optional and never remaps LOAD/BatchLoad owners. The options ABI is unchanged. */
+/* Construction reads TALON_ZONE and TALON_ZONE_AFFINITY (default false).
+ * Invalid boolean values reject construction. Inject the actual pod zone; the
+ * SDK does not query Kubernetes. With affinity enabled, reads and LOAD/BatchLoad
+ * stay local and fail without a usable local owner. The options ABI is unchanged. */
 int talon_client_new(
     const char *coordinator_addr,
     const talon_client_options *options,

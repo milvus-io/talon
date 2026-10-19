@@ -85,9 +85,9 @@ except talon.BatchLoadError as error:
 
 ## Availability zones
 
-Client construction reads `TALON_ZONE`, `TALON_ZONE_AFFINITY` and
-`TALON_ZONE_FALLBACK` through the shared Rust SDK. Both switches default to
-`false`; invalid booleans raise `ValueError`. Inject the actual pod zone before
-creating the client; SDKs do not query Kubernetes. Affinity selects same-zone
-logical members. Read fallback optionally tries a nonlocal owner after a
-retryable local failure. LOAD and BatchLoad stay on their original primary.
+Client construction reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` through the
+shared Rust SDK. Affinity defaults to `false`; invalid booleans raise `ValueError`.
+Inject the actual pod zone before creating the client; SDKs do not query
+Kubernetes. With affinity enabled, reads and LOAD/BatchLoad use only same-zone
+logical members. Unknown zones, absent local members and unusable local owners
+fail closed; there is no cross-zone retry option.

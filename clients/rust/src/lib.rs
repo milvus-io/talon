@@ -2,11 +2,10 @@
 //!
 //! # Availability zones
 //!
-//! Construction reads `TALON_ZONE`, `TALON_ZONE_AFFINITY`, and
-//! `TALON_ZONE_FALLBACK` (both switches default off). SDKs do not query
-//! Kubernetes. [`ClientBuilder::with_zone_options`] overrides the environment
-//! per client. Reads may opt into bounded nonlocal retries; LOAD never remaps
-//! an unavailable primary. See [`ZoneOptions`].
+//! Construction reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` (default off).
+//! SDKs do not query Kubernetes. [`ClientBuilder::with_zone_options`] overrides
+//! the environment per client. With affinity enabled, reads and LOAD stay in
+//! the local zone; missing local owners fail closed. See [`ZoneOptions`].
 //!
 //! # Typed errors
 //!

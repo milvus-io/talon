@@ -7,15 +7,12 @@ use crate::Error;
 pub struct ZoneOptions {
     /// Reader zone, using the same spelling as Worker membership.
     pub zone: Option<String>,
-    /// Rank same-zone members when present. Defaults to false.
+    /// Require same-zone members; unknown or absent zones fail closed. Defaults off.
     pub affinity: bool,
-    /// Try nonlocal read candidates after retryable local failures. Defaults off.
-    /// LOAD and BatchLoad never use these fallback candidates.
-    pub fallback: bool,
 }
 
 impl ZoneOptions {
-    /// Read `TALON_ZONE`, `TALON_ZONE_AFFINITY`, and `TALON_ZONE_FALLBACK`.
+    /// Read `TALON_ZONE` and `TALON_ZONE_AFFINITY`.
     /// Invalid booleans or zone lengths fail construction rather than silently
     /// disabling the requested routing policy.
     pub fn from_env() -> Result<Self, Error> {
@@ -31,7 +28,6 @@ impl ZoneOptions {
         let value = Self {
             zone: get("TALON_ZONE").filter(|v| !v.trim().is_empty()),
             affinity: boolean("TALON_ZONE_AFFINITY")?,
-            fallback: boolean("TALON_ZONE_FALLBACK")?,
         };
         value.validate()?;
         Ok(value)
@@ -72,10 +68,10 @@ mod tests {
         })
         .unwrap();
         assert_eq!(configured.zone.as_deref(), Some("zone-a"));
-        assert!(configured.affinity && configured.fallback);
-        for key in ["TALON_ZONE_AFFINITY", "TALON_ZONE_FALLBACK"] {
-            assert!(ZoneOptions::resolve(|k| (k == key).then(|| "typo".into())).is_err());
-        }
+        assert!(configured.affinity);
+        assert!(
+            ZoneOptions::resolve(|k| (k == "TALON_ZONE_AFFINITY").then(|| "typo".into())).is_err()
+        );
         assert!(ZoneOptions::resolve(|k| (k == "TALON_ZONE").then(|| "z".repeat(257))).is_err());
     }
 }
