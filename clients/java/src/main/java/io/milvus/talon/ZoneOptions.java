@@ -3,6 +3,7 @@ package io.milvus.talon;
 import java.nio.charset.StandardCharsets;
 import java.util.Locale;
 import java.util.function.Function;
+import java.util.function.Supplier;
 
 /** Immutable per-client AZ policy. Affinity defaults off. */
 public record ZoneOptions(String zone, boolean affinity) {
@@ -12,15 +13,23 @@ public record ZoneOptions(String zone, boolean affinity) {
         }
     }
 
-    /** Read deployment settings once. SDKs do not query the Kubernetes API. */
+    /** Read settings once; if TALON_ZONE is unset, query the Kubernetes Node zone.
+     * Requires TALON_NODE_NAME and a mounted ServiceAccount with get nodes RBAC.
+     * The startup HTTP request has a five-second timeout; lookup failure leaves
+     * the zone unknown and preserves the requested affinity policy. */
     public static ZoneOptions fromEnvironment() {
         return fromEnvironment(System::getenv);
     }
 
     static ZoneOptions fromEnvironment(Function<String, String> get) {
+        return fromEnvironment(get, () -> KubernetesZone.resolve(get));
+    }
+
+    static ZoneOptions fromEnvironment(Function<String, String> get, Supplier<String> discover) {
         String zone = get.apply("TALON_ZONE");
         if (zone != null && zone.isBlank()) zone = null;
-        return new ZoneOptions(zone, booleanValue(get.apply("TALON_ZONE_AFFINITY")));
+        boolean affinity = booleanValue(get.apply("TALON_ZONE_AFFINITY"));
+        return new ZoneOptions(zone == null ? discover.get() : zone, affinity);
     }
 
     private static boolean booleanValue(String value) {

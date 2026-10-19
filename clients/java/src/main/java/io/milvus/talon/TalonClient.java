@@ -99,7 +99,7 @@ public final class TalonClient implements AutoCloseable {
         return connect(coordinator, blockSize, maxIdlePerAddr, ZoneOptions.fromEnvironment());
     }
 
-    /** Connect with explicit AZ settings, overriding all zone environment variables. */
+    /** Connect with explicit AZ settings, bypassing zone environment variables and discovery. */
     public static TalonClient connect(String coordinator, int blockSize, int maxIdlePerAddr, ZoneOptions zoneOptions) {
         if (coordinator == null || coordinator.isBlank()) {
             throw new IllegalArgumentException("coordinator is required");
