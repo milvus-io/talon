@@ -143,10 +143,6 @@ pub trait ZoneReadObserver: Send + Sync {
     fn worker_read(&self, matched: ZoneMatch, bytes: u64) {
         let _ = (matched, bytes);
     }
-
-    /// A read used global placement because its zone was unknown or absent,
-    /// or entered the opt-in cross-zone retry stage after local failures.
-    fn affinity_fallback(&self) {}
 }
 
 /// Observer that drops every event.

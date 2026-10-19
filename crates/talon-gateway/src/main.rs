@@ -67,7 +67,6 @@ struct Settings {
     authorization_path: Option<PathBuf>,
     auth_reload_ms: u64,
     zone_affinity: bool,
-    zone_fallback: bool,
     origin_credentials_source: Option<String>,
     tls: Option<GatewayTlsConfig>,
 }
@@ -182,11 +181,6 @@ impl Settings {
             value(&mut get, "TALON_ZONE_AFFINITY").as_deref(),
             false,
             "TALON_ZONE_AFFINITY",
-        )?;
-        let zone_fallback = parse_bool(
-            value(&mut get, "TALON_ZONE_FALLBACK").as_deref(),
-            false,
-            "TALON_ZONE_FALLBACK",
         )?;
         let tls_certificate = value(&mut get, "TALON_GATEWAY_TLS_CERT_PATH");
         let tls_private_key = value(&mut get, "TALON_GATEWAY_TLS_KEY_PATH");
@@ -330,7 +324,6 @@ impl Settings {
                 .map(PathBuf::from),
             auth_reload_ms,
             zone_affinity,
-            zone_fallback,
             origin_credentials_source: value(&mut get, "TALON_ORIGIN_CREDENTIALS_SOURCE"),
             tls,
         };
@@ -391,10 +384,6 @@ impl ZoneReadObserver for ZoneReadMetrics {
     fn worker_read(&self, matched: ZoneMatch, bytes: u64) {
         self.0.record_zone_read(matched.label(), bytes);
     }
-
-    fn affinity_fallback(&self) {
-        self.0.record_zone_affinity_fallback();
-    }
 }
 
 fn cache_reader(
@@ -412,8 +401,7 @@ fn cache_reader(
             zone,
             settings.zone_affinity,
             Arc::new(ZoneReadMetrics(metrics.clone())),
-        )
-        .with_zone_fallback(settings.zone_fallback),
+        ),
     )
 }
 

@@ -92,18 +92,6 @@ impl GatewayMetrics {
             .add(bytes);
     }
 
-    /// Count a read using global placement (unknown zone or no local members)
-    /// or entering the explicitly enabled cross-zone retry stage.
-    pub fn record_zone_affinity_fallback(&self) {
-        self.registry
-            .counter(
-                "talon_gateway_zone_affinity_fallback_total",
-                "Reads using global placement or cross-zone retries.",
-                labels(&[]),
-            )
-            .inc();
-    }
-
     /// Count one identity or authorization file reload poll outcome.
     ///
     /// Public because the reload loop lives in the gateway binary; both label

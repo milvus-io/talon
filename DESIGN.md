@@ -514,20 +514,17 @@ requirements are demonstrated. Coordinator HA follows
 ## Multi-AZ read policy
 
 Zone affinity (ADR 0006) ranks persistent logical members in the reader's zone.
-Offline/conflicting instances do not change that placement. Readers may opt into
-`TALON_ZONE_FALLBACK=true` to try a separately ranked nonlocal member set after
-retryable local read failures. Each stage attempts at most the configured
-candidate count; terminal version, authorization, origin, and quota errors stay
-visible. The fallback table includes unknown-zone members and retains offline
-identities, just like the primary table. Recovery returns reads to local owners
-without a topology change. Remote fills are opportunistic and may be reclaimed
-by normal ownership GC; this is not replication or a durable replica guarantee.
-LOAD and BatchLoad keep the local primary and fail rather than warming another
-owner. With affinity enabled, unknown reader zones and absent local members
-fail closed by default. Only explicit fallback permits global placement and
-counts that event. All policy switches default off; deployment examples enable
-affinity while keeping cross-zone fallback disabled.
+Offline/conflicting instances do not change that placement. With affinity enabled,
+READ, LOAD and BatchLoad stay in the local zone; unknown reader zones and absent
+local members fail closed. There is no cross-zone retry option. Reads retain the
+existing bounded candidate retry policy within the selected zone, including
+terminal version, origin and quota errors. Recovery returns requests to the same
+logical owners without a topology change.
+
+Affinity defaults off for existing global deployments; multi-AZ deployments must
+explicitly enable it. Each zone warms independently through read-through; Talon
+does not replicate blocks across zones or guarantee durable cache replicas.
 
 Implementation is organized as a linear stack: core read policy and tests;
-Rust/C/Python configuration; Java configuration and matching semantics;
+Rust/C/Python configuration; Java configuration;
 Kubernetes/Helm deployment; multi-AZ rollout, migration, and acceptance runbook.

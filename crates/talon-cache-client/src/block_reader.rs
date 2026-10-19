@@ -172,7 +172,7 @@ impl BlockReader {
     ///
     /// With `enabled` and a known `zone`, placement is computed over the
     /// same-zone worker subset. Unknown zones or absent local members fail
-    /// closed unless `with_zone_fallback(true)` is also selected. Served reads are classified
+    /// closed. Served reads are classified
     /// same/cross/unknown against `zone` regardless of `enabled`, so the
     /// observer also measures the cross-zone baseline before the filter is
     /// turned on.
@@ -190,18 +190,6 @@ impl BlockReader {
         self.configure_discovery();
         self.zone = zone;
         self.zone_observer = observer;
-        self
-    }
-
-    /// Opt into bounded cross-zone read retries after local candidates fail.
-    /// Does not change LOAD ownership or bypass terminal errors.
-    pub fn with_zone_fallback(mut self, enabled: bool) -> Self {
-        self.membership = Arc::new(
-            self.membership
-                .empty_with_same_policy()
-                .with_zone_fallback(enabled),
-        );
-        self.configure_discovery();
         self
     }
 
@@ -250,16 +238,8 @@ impl BlockReader {
             .membership_snapshot()
             .await
             .map_err(cache_block_error)?;
-        if snapshot.affinity_fallback {
-            self.zone_observer.affinity_fallback();
-        }
         let mut last = BlockReadError::NoOwners;
-        let mut fallback_recorded = snapshot.affinity_fallback;
-        for (target, candidate, remote) in snapshot.candidates(block, self.replicas_k) {
-            if remote && !fallback_recorded {
-                self.zone_observer.affinity_fallback();
-                fallback_recorded = true;
-            }
+        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -383,17 +363,9 @@ impl BlockReader {
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
-        if snapshot.affinity_fallback {
-            self.zone_observer.affinity_fallback();
-        }
         let offset = block.offset + u64::from(offset_in_block);
         let mut last = BlockReadError::NoOwners;
-        let mut fallback_recorded = snapshot.affinity_fallback;
-        for (target, candidate, remote) in snapshot.candidates(block, self.replicas_k) {
-            if remote && !fallback_recorded {
-                self.zone_observer.affinity_fallback();
-                fallback_recorded = true;
-            }
+        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -466,17 +438,9 @@ impl BlockReader {
     ) -> Result<Vec<u8>, DetailedBlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
-        if snapshot.affinity_fallback {
-            self.zone_observer.affinity_fallback();
-        }
         let offset = block.offset + u64::from(offset_in_block);
         let mut last = BlockReadError::NoOwners;
-        let mut fallback_recorded = snapshot.affinity_fallback;
-        for (target, candidate, remote) in snapshot.candidates(block, self.replicas_k) {
-            if remote && !fallback_recorded {
-                self.zone_observer.affinity_fallback();
-                fallback_recorded = true;
-            }
+        for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
                 Ok(worker) => worker,
                 Err(error) => {
@@ -1236,7 +1200,6 @@ mod tests {
         same: std::sync::atomic::AtomicU32,
         cross: std::sync::atomic::AtomicU32,
         unknown: std::sync::atomic::AtomicU32,
-        fallbacks: std::sync::atomic::AtomicU32,
     }
 
     impl crate::metrics::ZoneReadObserver for CountingZoneObserver {
@@ -1248,16 +1211,11 @@ mod tests {
                 crate::metrics::ZoneMatch::Unknown => self.unknown.fetch_add(1, Ordering::SeqCst),
             };
         }
-
-        fn affinity_fallback(&self) {
-            self.fallbacks
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
     }
 
     /// With affinity on, every block lands on the same-zone worker even when a
     /// worker in another zone would rank first globally; the observer counts
-    /// only same-zone reads and no fallbacks.
+    /// only same-zone reads.
     #[tokio::test]
     async fn zone_affinity_reads_stay_in_the_readers_zone() {
         let hits_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1286,50 +1244,49 @@ mod tests {
         assert_eq!(hits_b.load(Ordering::SeqCst), 0);
         assert_eq!(observer.same.load(Ordering::SeqCst), 4);
         assert_eq!(observer.cross.load(Ordering::SeqCst), 0);
-        assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 0);
     }
 
-    /// With affinity on but no same-zone worker, reads fall back to the full
-    /// membership and the fallback is observed.
     #[tokio::test]
-    async fn missing_local_zone_falls_back_to_full_membership() {
+    async fn absent_or_unknown_local_zone_never_contacts_workers() {
         let hits_a = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hits_b = Arc::new(std::sync::atomic::AtomicU32::new(0));
-        let worker_a = mock_worker(Arc::clone(&hits_a)).await;
-        let worker_b = mock_worker(Arc::clone(&hits_b)).await;
+        let worker_a = mock_worker(hits_a.clone()).await;
+        let worker_b = mock_worker(hits_b.clone()).await;
         let coordinator = mock_zoned_coordinator(worker_a, worker_b).await;
-
-        let observer = Arc::new(CountingZoneObserver::default());
-        let cache = Arc::new(PlacementCache::new(10_000));
-        let reader = BlockReader::new(CoordinatorClient::new(coordinator), cache, 1)
-            .with_zone_affinity(
-                Some("az-c".into()),
-                true,
-                Arc::clone(&observer) as Arc<dyn crate::metrics::ZoneReadObserver>,
-            )
-            .with_zone_fallback(true);
-
-        reader.read_block(&block(), 0, 16).await.unwrap();
-        use std::sync::atomic::Ordering;
-        assert_eq!(
-            hits_a.load(Ordering::SeqCst) + hits_b.load(Ordering::SeqCst),
-            1
-        );
-        assert_eq!(observer.fallbacks.load(Ordering::SeqCst), 1);
-        assert_eq!(observer.cross.load(Ordering::SeqCst), 1);
+        for api in READ_APIS {
+            for zone in [None, Some("az-c".into())] {
+                let reader = BlockReader::new(
+                    CoordinatorClient::new(coordinator.clone()),
+                    Arc::new(PlacementCache::new(500)),
+                    3,
+                )
+                .with_zone_affinity(
+                    zone,
+                    true,
+                    Arc::new(CountingZoneObserver::default()),
+                );
+                assert!(read_via(&reader, api).await.is_err(), "{api:?}");
+            }
+        }
+        assert_eq!(hits_a.load(Ordering::SeqCst), 0);
+        assert_eq!(hits_b.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]
-    async fn cross_zone_retry_is_opt_in_bounded_and_preserves_terminal_errors() {
+    async fn local_read_errors_never_retry_across_zones() {
         for api in READ_APIS {
-            for enabled in [false, true] {
+            for replicas_k in [1, 3] {
                 for code in [
                     DataErrorCode::Unavailable,
                     DataErrorCode::Timeout,
+                    DataErrorCode::InvalidRequest,
                     DataErrorCode::VersionMismatch,
                     DataErrorCode::RateLimited,
                     DataErrorCode::Origin,
                     DataErrorCode::NotFound,
+                    DataErrorCode::Internal,
+                    DataErrorCode::CacheMiss,
+                    DataErrorCode::Unknown,
                 ] {
                     let local = Arc::new(std::sync::atomic::AtomicU32::new(0));
                     let remote = Arc::new(std::sync::atomic::AtomicU32::new(0));
@@ -1340,28 +1297,19 @@ mod tests {
                     .await;
                     let b = mock_worker(remote.clone()).await;
                     let coordinator = mock_zoned_coordinator(a, b).await;
-                    let observer = Arc::new(CountingZoneObserver::default());
                     let reader = BlockReader::new(
                         CoordinatorClient::new(coordinator),
                         Arc::new(PlacementCache::new(500)),
-                        1,
+                        replicas_k,
                     )
-                    .with_zone_affinity(Some("az-a".into()), true, observer.clone())
-                    .with_zone_fallback(enabled);
-                    let result = read_via(&reader, api).await;
-                    let fallback = enabled
-                        && matches!(code, DataErrorCode::Unavailable | DataErrorCode::Timeout);
-                    assert_eq!(result.is_ok(), fallback, "{api:?} {code:?}");
-                    if fallback {
-                        assert_eq!(result.unwrap(), (7..39).collect::<Vec<u8>>());
-                    }
-                    assert_eq!(local.load(Ordering::SeqCst), 1);
-                    assert_eq!(remote.load(Ordering::SeqCst), u32::from(fallback));
-                    assert_eq!(
-                        observer.fallbacks.load(Ordering::SeqCst),
-                        u32::from(fallback)
+                    .with_zone_affinity(
+                        Some("az-a".into()),
+                        true,
+                        Arc::new(CountingZoneObserver::default()),
                     );
-                    assert_eq!(observer.cross.load(Ordering::SeqCst), u32::from(fallback));
+                    assert!(read_via(&reader, api).await.is_err(), "{api:?} {code:?}");
+                    assert_eq!(local.load(Ordering::SeqCst), 1);
+                    assert_eq!(remote.load(Ordering::SeqCst), 0);
                 }
             }
         }
