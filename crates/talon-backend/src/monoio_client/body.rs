@@ -17,6 +17,11 @@ impl OriginIo for super::tls::TlsStream {
         super::tls::TlsStream::line(self, output, limit).await
     }
 }
+impl OriginIo for super::ktls::KtlsStream {
+    async fn line(&mut self, output: &mut Vec<u8>, limit: usize) -> io::Result<()> {
+        super::ktls::KtlsStream::line(self, output, limit).await
+    }
+}
 impl OriginIo for monoio::net::TcpStream {
     async fn line(&mut self, output: &mut Vec<u8>, limit: usize) -> io::Result<()> {
         use std::os::fd::AsRawFd;

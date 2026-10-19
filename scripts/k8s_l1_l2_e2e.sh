@@ -434,6 +434,7 @@ kubectl -n "$NAMESPACE" set env "statefulset/$RELEASE-worker" \
   TALON_WORKER_S3_PATH_STYLE=true \
   TALON_WORKER_BACKEND_DELAY_MS=50 \
   TALON_WORKER_OWNERSHIP_GC_REPLICAS=3 \
+  TALON_WORKER_ORIGIN_IO=tokio \
   TALON_WORKER_FORCE_TOKIO_DATA_PLANE=1 >/dev/null
 rollout_workers
 check_replaced_workers "$previous_workers"
