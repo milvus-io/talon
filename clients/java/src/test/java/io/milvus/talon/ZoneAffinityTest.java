@@ -20,7 +20,7 @@ public final class ZoneAffinityTest {
                 else expectUnavailable(client);
                 if (cluster.remoteHits.get() != 0) throw new AssertionError("remote READ");
                 if (state != 2) {
-                    try { client.load("s3://bucket/key", "v", 8); throw new AssertionError("LOAD remapped"); }
+                    try { client.load("s3://bucket/key", "v", 8, RequestOptions.INHERIT); throw new AssertionError("LOAD remapped"); }
                     catch (IOException expected) { }
                     if (cluster.remoteHits.get() != 0) throw new AssertionError("remote LOAD");
                 }
@@ -57,7 +57,7 @@ public final class ZoneAffinityTest {
     }
 
     static byte[] read(TalonClient client) throws IOException {
-        return client.read("s3://bucket/key", "v", 8, 0, 8);
+        return client.read("s3://bucket/key", "v", 8, 0, 8, RequestOptions.INHERIT);
     }
     static void assertBytes(TalonClient client, int value) throws IOException {
         byte[] expected = new byte[8]; Arrays.fill(expected, (byte) value);

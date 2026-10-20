@@ -20,16 +20,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 
-use crate::broker::{BrokerConfig, BrokerFetch};
+use crate::broker::{self, BrokerConfig, BrokerCredentials, BrokerFetch};
 use crate::credentials::{
     CredentialsFetch, CredentialsObserver, ProvideBearerToken, ProvideS3Credentials, RefreshPolicy,
     RefreshingCredentials, StaticS3Credentials,
 };
+use crate::gcs::GcpBearerToken;
 use crate::http::{HttpClient, HttpRequest, Method};
 use crate::s3::S3Credentials;
 
 /// Environment lookup used by source resolution, injectable for tests.
-pub type EnvFn<'a> = &'a dyn Fn(&str) -> Option<String>;
+pub type EnvFn<'a> = &'a (dyn Fn(&str) -> Option<String> + Sync);
 
 pub(crate) fn env_var(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
@@ -365,11 +366,19 @@ pub struct AwsWebIdentity {
 }
 
 impl AwsWebIdentity {
+    // Selection and construction must agree on what constitutes a complete
+    // injected contract; optional settings do not make a provider available.
+    fn required_env(env: EnvFn<'_>) -> Option<(String, PathBuf)> {
+        Some((
+            env("AWS_ROLE_ARN")?,
+            PathBuf::from(env("AWS_WEB_IDENTITY_TOKEN_FILE")?),
+        ))
+    }
+
     /// Build from the env contract the EKS pod-identity webhook injects.
     /// Returns `None` when the contract is absent.
     pub fn from_env(env: EnvFn<'_>, http: Arc<dyn HttpClient>) -> Option<Self> {
-        let role_arn = env("AWS_ROLE_ARN")?;
-        let token_file = PathBuf::from(env("AWS_WEB_IDENTITY_TOKEN_FILE")?);
+        let (role_arn, token_file) = Self::required_env(env)?;
         let region = env("AWS_REGION").or_else(|| env("AWS_DEFAULT_REGION"));
         // `regional` is what EKS injects; only an explicit `legacy` (or a
         // missing region) falls back to the global endpoint.
@@ -451,12 +460,21 @@ pub struct AliyunOidc {
 }
 
 impl AliyunOidc {
+    fn required_env(env: EnvFn<'_>) -> Option<(String, String, PathBuf)> {
+        Some((
+            env("ALIBABA_CLOUD_ROLE_ARN")?,
+            env("ALIBABA_CLOUD_OIDC_PROVIDER_ARN")?,
+            PathBuf::from(env("ALIBABA_CLOUD_OIDC_TOKEN_FILE")?),
+        ))
+    }
+
     /// Build from the env contract the ACK RRSA webhook injects.
     pub fn from_env(env: EnvFn<'_>, http: Arc<dyn HttpClient>) -> Option<Self> {
+        let (role_arn, provider_arn, token_file) = Self::required_env(env)?;
         Some(Self {
-            role_arn: env("ALIBABA_CLOUD_ROLE_ARN")?,
-            provider_arn: env("ALIBABA_CLOUD_OIDC_PROVIDER_ARN")?,
-            token_file: PathBuf::from(env("ALIBABA_CLOUD_OIDC_TOKEN_FILE")?),
+            role_arn,
+            provider_arn,
+            token_file,
             session_name: env("ALIBABA_CLOUD_ROLE_SESSION_NAME")
                 .unwrap_or_else(|| "talon".to_string()),
             endpoint: env("ALIBABA_CLOUD_STS_ENDPOINT")
@@ -541,12 +559,21 @@ pub struct TencentOidc {
 }
 
 impl TencentOidc {
+    fn required_env(env: EnvFn<'_>) -> Option<(String, String, PathBuf)> {
+        Some((
+            env("TKE_ROLE_ARN")?,
+            env("TKE_PROVIDER_ID")?,
+            PathBuf::from(env("TKE_WEB_IDENTITY_TOKEN_FILE")?),
+        ))
+    }
+
     /// Build from the env contract the TKE OIDC webhook injects.
     pub fn from_env(env: EnvFn<'_>, http: Arc<dyn HttpClient>) -> Option<Self> {
+        let (role_arn, provider_id, token_file) = Self::required_env(env)?;
         Some(Self {
-            role_arn: env("TKE_ROLE_ARN")?,
-            provider_id: env("TKE_PROVIDER_ID")?,
-            token_file: PathBuf::from(env("TKE_WEB_IDENTITY_TOKEN_FILE")?),
+            role_arn,
+            provider_id,
+            token_file,
             session_name: env("TKE_ROLE_SESSION_NAME").unwrap_or_else(|| "talon".to_string()),
             region: env("TKE_REGION")
                 .or_else(|| env("TENCENTCLOUD_REGION"))
@@ -996,52 +1023,233 @@ pub struct ResolvedAzureCredentials {
     pub source: &'static str,
 }
 
-struct ResolutionContext<'a> {
+/// Selection owns its parameters; raw selectors and optional Broker DTOs never
+/// enter credential acquisition or refresh.
+pub(crate) enum SelectedCredentials<K, I> {
+    AkSk(K),
+    Iam(I),
+    Broker(broker::NormalizedBrokerConfig),
+}
+
+impl<K, I> SelectedCredentials<K, I> {
+    pub(crate) fn broker(&self) -> Option<&broker::NormalizedBrokerConfig> {
+        match self {
+            Self::Broker(config) => Some(config),
+            _ => None,
+        }
+    }
+}
+
+pub(crate) enum S3Iam {
+    Default { region: Option<String> },
+    InstanceProfile,
+    WebIdentity,
+    Aliyun,
+    Tencent,
+    Huawei,
+}
+
+impl S3Iam {
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Default { .. } => "iam",
+            Self::InstanceProfile => "aws-instance-profile",
+            Self::WebIdentity => "aws-web-identity",
+            Self::Aliyun => "aliyun-oidc",
+            Self::Tencent => "tencent-oidc",
+            Self::Huawei => "huawei-agency",
+        }
+    }
+}
+pub(crate) enum GcsIam {
+    Default,
+    Metadata,
+}
+pub(crate) enum AzureIam {
+    Managed,
+    Workload,
+}
+pub(crate) type SelectedS3 = SelectedCredentials<S3Credentials, S3Iam>;
+pub(crate) type SelectedGcs = SelectedCredentials<crate::GcsHmacCredentials, GcsIam>;
+pub(crate) type SelectedAzure = SelectedCredentials<String, AzureIam>;
+
+fn select_broker(
+    options: CredentialOptions,
+    env: EnvFn<'_>,
+    csp: &str,
+    account: Option<&str>,
+) -> Result<broker::NormalizedBrokerConfig, String> {
+    let config = match options.broker {
+        Some(config) => config,
+        None => broker::config_from_env(env)?,
+    };
+    broker::normalize_config(&config, csp, account)
+}
+
+pub(crate) fn select_s3(
+    keys: Option<S3Credentials>,
+    options: CredentialOptions,
+    env: EnvFn<'_>,
+) -> Result<SelectedS3, String> {
+    Ok(
+        match CredentialMode::select(options.source.as_deref(), keys.is_some())? {
+            CredentialMode::AkSk => {
+                let keys = keys.ok_or("S3 aksk mode requires access key and secret key")?;
+                if keys.access_key_id.is_empty() || keys.secret_access_key.is_empty() {
+                    return Err("S3 aksk mode requires nonempty access key and secret key".into());
+                }
+                SelectedCredentials::AkSk(keys)
+            }
+            CredentialMode::Broker => {
+                SelectedCredentials::Broker(select_broker(options, env, broker::CSP_AWS, None)?)
+            }
+            CredentialMode::Iam => {
+                SelectedCredentials::Iam(match options.source.as_deref().unwrap_or("auto") {
+                    "auto" if AwsWebIdentity::required_env(env).is_some() => S3Iam::WebIdentity,
+                    "auto" if AliyunOidc::required_env(env).is_some() => S3Iam::Aliyun,
+                    "auto" if TencentOidc::required_env(env).is_some() => S3Iam::Tencent,
+                    "auto" | "iam" => S3Iam::Default {
+                        region: options.s3_region,
+                    },
+                    "aws-instance-profile" => S3Iam::InstanceProfile,
+                    "aws-web-identity" => S3Iam::WebIdentity,
+                    "aliyun-oidc" => S3Iam::Aliyun,
+                    "tencent-oidc" => S3Iam::Tencent,
+                    "huawei-agency" => S3Iam::Huawei,
+                    other => return Err(format!("IAM provider {other:?} does not apply to S3")),
+                })
+            }
+        },
+    )
+}
+
+pub(crate) fn select_gcs(
+    keys: Option<crate::GcsHmacCredentials>,
+    options: CredentialOptions,
+    env: EnvFn<'_>,
+) -> Result<SelectedGcs, String> {
+    Ok(
+        match CredentialMode::select(options.source.as_deref(), keys.is_some())? {
+            CredentialMode::AkSk => {
+                let keys = keys.ok_or("GCS aksk mode requires an HMAC access ID and secret")?;
+                if keys.access_key_id.is_empty() || keys.secret_access_key.is_empty() {
+                    return Err("GCS aksk mode requires nonempty HMAC access ID and secret".into());
+                }
+                SelectedCredentials::AkSk(keys)
+            }
+            CredentialMode::Broker => {
+                SelectedCredentials::Broker(select_broker(options, env, broker::CSP_GCP, None)?)
+            }
+            CredentialMode::Iam => SelectedCredentials::Iam(match options.source.as_deref() {
+                None | Some("auto" | "iam") => GcsIam::Default,
+                Some("gcp-metadata") => GcsIam::Metadata,
+                Some(other) => return Err(format!("IAM provider {other:?} does not apply to GCS")),
+            }),
+        },
+    )
+}
+
+pub(crate) fn select_azure(
+    account: &str,
+    key: Option<String>,
+    mut options: CredentialOptions,
+    env: EnvFn<'_>,
+) -> Result<SelectedAzure, String> {
+    options.source = options
+        .source
+        .or_else(|| env("TALON_ORIGIN_CREDENTIALS_SOURCE"));
+    Ok(
+        match CredentialMode::select(options.source.as_deref(), key.is_some())? {
+            CredentialMode::AkSk => {
+                let key = key
+                    .filter(|key| !key.is_empty())
+                    .ok_or("Azure aksk mode requires a storage account key")?;
+                if account.is_empty() {
+                    return Err("Azure aksk mode requires a storage account name".into());
+                }
+                SelectedCredentials::AkSk(key)
+            }
+            CredentialMode::Broker => SelectedCredentials::Broker(select_broker(
+                options,
+                env,
+                broker::CSP_AZURE,
+                Some(account),
+            )?),
+            CredentialMode::Iam => SelectedCredentials::Iam(match options.source.as_deref() {
+                Some("azure-managed-identity") => AzureIam::Managed,
+                Some("azure-workload-identity") => AzureIam::Workload,
+                None | Some("auto" | "iam") => {
+                    if env("AZURE_CLIENT_ID").filter(|v| !v.is_empty()).is_none() {
+                        return Err("Azure IAM requires AZURE_CLIENT_ID".into());
+                    }
+                    if env("AZURE_FEDERATED_TOKEN_FILE")
+                        .filter(|v| !v.is_empty())
+                        .is_none()
+                    {
+                        AzureIam::Managed
+                    } else {
+                        AzureIam::Workload
+                    }
+                }
+                Some(other) => {
+                    return Err(format!("IAM provider {other:?} does not apply to Azure"))
+                }
+            }),
+        },
+    )
+}
+
+pub(crate) struct ResolutionContext<'a> {
     env: EnvFn<'a>,
-    selector: Option<&'a str>,
-    broker: Option<&'a BrokerConfig>,
     http: Arc<dyn HttpClient>,
     observer: Arc<dyn CredentialsObserver>,
-    // Native SDK discovery reads process configuration, so its tests use
-    // isolated subprocesses rather than the protocol-level injectable seam.
     process_environment: bool,
 }
 
-impl ResolutionContext<'_> {
-    fn broker_fetch<T>(&self, csp: &str, account: Option<&str>) -> Result<BrokerFetch<T>, String> {
-        match self.broker {
-            Some(config) => BrokerFetch::from_config(config, csp, account, self.http.clone()),
-            None => BrokerFetch::from_env(self.env, csp, account, self.http.clone()),
+impl ResolutionContext<'static> {
+    pub(crate) fn process(
+        http: Arc<dyn HttpClient>,
+        observer: Arc<dyn CredentialsObserver>,
+    ) -> Self {
+        Self {
+            env: &env_var,
+            http,
+            observer,
+            process_environment: true,
         }
     }
 }
 
 trait CredentialResolver {
     type Output;
-    fn has_aksk(&self) -> bool;
-    fn aksk(self) -> Result<Self::Output, String>;
-    async fn iam(self, context: ResolutionContext<'_>) -> Result<Self::Output, String>;
-    async fn broker(self, context: ResolutionContext<'_>) -> Result<Self::Output, String>;
+    type Keys;
+    type Iam;
+    fn aksk(self, keys: Self::Keys) -> Self::Output;
+    async fn iam(
+        self,
+        provider: Self::Iam,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String>;
+    async fn broker(
+        self,
+        broker: broker::NormalizedBrokerConfig,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String>;
 }
 
-/// The only acquisition-mode dispatch. Backend implementations supply typed
-/// factories, preserving S3/GCS/Azure result types at their public entry points.
 async fn resolve_credentials<R: CredentialResolver>(
     resolver: R,
+    selected: SelectedCredentials<R::Keys, R::Iam>,
     context: ResolutionContext<'_>,
 ) -> Result<R::Output, String> {
-    match CredentialMode::select(context.selector, resolver.has_aksk())? {
-        CredentialMode::AkSk => resolver.aksk(),
-        CredentialMode::Iam => resolver.iam(context).await,
-        CredentialMode::Broker => resolver.broker(context).await,
+    match selected {
+        SelectedCredentials::AkSk(keys) => Ok(resolver.aksk(keys)),
+        SelectedCredentials::Iam(provider) => resolver.iam(provider, context).await,
+        SelectedCredentials::Broker(broker) => resolver.broker(broker, context).await,
     }
 }
 
-struct S3Resolver {
-    keys: Option<S3Credentials>,
-    region: Option<String>,
-}
-
+struct S3Resolver;
 async fn refreshing_s3<F: CredentialsFetch<Value = S3Credentials>>(
     fetcher: F,
     observer: Arc<dyn CredentialsObserver>,
@@ -1051,59 +1259,55 @@ async fn refreshing_s3<F: CredentialsFetch<Value = S3Credentials>>(
         RefreshingCredentials::bootstrap(fetcher, RefreshPolicy::default(), observer).await?;
     Ok(ResolvedS3Credentials { provider, source })
 }
-
 impl CredentialResolver for S3Resolver {
     type Output = ResolvedS3Credentials;
-    fn has_aksk(&self) -> bool {
-        self.keys.is_some()
-    }
-    fn aksk(self) -> Result<Self::Output, String> {
-        let credentials = self
-            .keys
-            .ok_or("S3 aksk mode requires access key and secret key")?;
-        if credentials.access_key_id.is_empty() || credentials.secret_access_key.is_empty() {
-            return Err("S3 aksk mode requires nonempty access key and secret key".into());
-        }
-        Ok(ResolvedS3Credentials {
-            provider: Arc::new(StaticS3Credentials::new(credentials)),
+    type Keys = S3Credentials;
+    type Iam = S3Iam;
+    fn aksk(self, keys: Self::Keys) -> Self::Output {
+        ResolvedS3Credentials {
+            provider: Arc::new(StaticS3Credentials::new(keys)),
             source: "aksk",
+        }
+    }
+    async fn broker(
+        self,
+        broker: broker::NormalizedBrokerConfig,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String> {
+        let provider = BrokerCredentials::bootstrap(
+            BrokerFetch::<S3Credentials>::new(broker, context.http),
+            RefreshPolicy::default(),
+            context.observer,
+        )
+        .await?;
+        Ok(ResolvedS3Credentials {
+            provider,
+            source: "broker",
         })
     }
-    async fn broker(self, context: ResolutionContext<'_>) -> Result<Self::Output, String> {
-        let fetcher = context.broker_fetch::<S3Credentials>("aws", None)?;
-        refreshing_s3(fetcher, context.observer).await
-    }
-    async fn iam(self, context: ResolutionContext<'_>) -> Result<Self::Output, String> {
+    async fn iam(
+        self,
+        provider: Self::Iam,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String> {
         let env = context.env;
-        let selector = context.selector.unwrap_or("auto");
+        let selector = provider.name();
         let missing = |vars: &str| format!("credentials source {selector} requires {vars}");
         let http = context.http;
         let observer = context.observer;
-        match selector {
-            "aws-instance-profile" => {
+        match provider {
+            S3Iam::InstanceProfile => {
                 let http = if context.process_environment { metadata_http(Duration::from_secs(5))? } else { http };
                 refreshing_s3(AwsInstanceProfile::from_env(env, http)?, observer).await
             }
-            "aws-web-identity" => refreshing_s3(AwsWebIdentity::from_env(env, http)
+            S3Iam::WebIdentity => refreshing_s3(AwsWebIdentity::from_env(env, http)
                 .ok_or_else(|| missing("AWS_ROLE_ARN and AWS_WEB_IDENTITY_TOKEN_FILE"))?, observer).await,
-            "aliyun-oidc" => refreshing_s3(AliyunOidc::from_env(env, http)
+            S3Iam::Aliyun => refreshing_s3(AliyunOidc::from_env(env, http)
                 .ok_or_else(|| missing("ALIBABA_CLOUD_ROLE_ARN, ALIBABA_CLOUD_OIDC_PROVIDER_ARN and ALIBABA_CLOUD_OIDC_TOKEN_FILE"))?, observer).await,
-            "tencent-oidc" => refreshing_s3(TencentOidc::from_env(env, http)
+            S3Iam::Tencent => refreshing_s3(TencentOidc::from_env(env, http)
                 .ok_or_else(|| missing("TKE_ROLE_ARN, TKE_PROVIDER_ID and TKE_WEB_IDENTITY_TOKEN_FILE"))?, observer).await,
-            "huawei-agency" => refreshing_s3(HuaweiAgency::from_env(env, http), observer).await,
-            "auto" | "iam" => {
-                // Preserve existing injected Kubernetes contracts in auto mode.
-                if selector == "auto" {
-                    if let Some(fetcher) = AwsWebIdentity::from_env(env, http.clone()) {
-                        return refreshing_s3(fetcher, observer).await;
-                    }
-                    if let Some(fetcher) = AliyunOidc::from_env(env, http.clone()) {
-                        return refreshing_s3(fetcher, observer).await;
-                    }
-                    if let Some(fetcher) = TencentOidc::from_env(env, http) {
-                        return refreshing_s3(fetcher, observer).await;
-                    }
-                }
+            S3Iam::Huawei => refreshing_s3(HuaweiAgency::from_env(env, http), observer).await,
+            S3Iam::Default { region } => {
                 if !context.process_environment {
                     return Err("no injected workload identity; AWS SDK IAM discovery requires the process-environment resolver".into());
                 }
@@ -1113,47 +1317,47 @@ impl CredentialResolver for S3Resolver {
                 let config = aws_config::provider_config::ProviderConfig::default().with_http_client(http);
                 let mut builder = aws_config::default_provider::credentials::DefaultCredentialsChain::builder()
                     .configure(config);
-                builder.set_region(self.region.map(aws_config::Region::new));
+                builder.set_region(region.map(aws_config::Region::new));
                 let chain = builder.build().await;
                 refreshing_s3(AwsDefaultCredentials(chain), observer).await
             }
-            _ => Err(format!("IAM provider {selector:?} does not apply to S3")),
         }
     }
 }
-
-struct GcsResolver(Option<crate::gcs::GcsHmacCredentials>);
-
+struct GcsResolver;
 impl CredentialResolver for GcsResolver {
     type Output = ResolvedGcsCredentials;
-    fn has_aksk(&self) -> bool {
-        self.0.is_some()
-    }
-    fn aksk(self) -> Result<Self::Output, String> {
-        let credentials = self
-            .0
-            .ok_or("GCS aksk mode requires an HMAC access ID and secret")?;
-        if credentials.access_key_id.is_empty() || credentials.secret_access_key.is_empty() {
-            return Err("GCS aksk mode requires nonempty HMAC access ID and secret".into());
-        }
-        Ok(ResolvedGcsCredentials {
-            provider: crate::gcs::GcsCredentials::Hmac(credentials),
+    type Keys = crate::GcsHmacCredentials;
+    type Iam = GcsIam;
+    fn aksk(self, keys: Self::Keys) -> Self::Output {
+        ResolvedGcsCredentials {
+            provider: crate::GcsCredentials::Hmac(keys),
             source: "aksk",
-        })
+        }
     }
-    async fn broker(self, context: ResolutionContext<'_>) -> Result<Self::Output, String> {
-        let fetcher = context.broker_fetch::<String>("gcp", None)?;
-        let provider =
-            RefreshingCredentials::bootstrap(fetcher, RefreshPolicy::default(), context.observer)
-                .await?;
+    async fn broker(
+        self,
+        broker: broker::NormalizedBrokerConfig,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String> {
+        let provider = BrokerCredentials::bootstrap(
+            BrokerFetch::<GcpBearerToken>::new(broker, context.http),
+            RefreshPolicy::default(),
+            context.observer,
+        )
+        .await?;
         Ok(ResolvedGcsCredentials {
-            provider: crate::gcs::GcsCredentials::Bearer(provider),
+            provider: crate::GcsCredentials::Bearer(provider),
             source: "broker",
         })
     }
-    async fn iam(self, context: ResolutionContext<'_>) -> Result<Self::Output, String> {
-        let (provider, source): (Arc<dyn ProvideBearerToken>, _) = match context.selector {
-            Some("gcp-metadata") => {
+    async fn iam(
+        self,
+        provider: Self::Iam,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String> {
+        let (provider, source): (Arc<dyn ProvideBearerToken>, _) = match provider {
+            GcsIam::Metadata => {
                 let fetcher = GcpMetadataToken::from_env(context.env, context.http);
                 (
                     RefreshingCredentials::bootstrap(
@@ -1165,7 +1369,7 @@ impl CredentialResolver for GcsResolver {
                     "gcp-metadata",
                 )
             }
-            None | Some("auto" | "iam") => {
+            GcsIam::Default => {
                 if !context.process_environment {
                     return Err(
                         "GCP ADC discovery requires the process-environment resolver".into(),
@@ -1186,7 +1390,6 @@ impl CredentialResolver for GcsResolver {
                 provider.prepare().await?;
                 (provider, "gcp-adc")
             }
-            Some(other) => return Err(format!("IAM provider {other:?} does not apply to GCS")),
         };
         Ok(ResolvedGcsCredentials {
             provider: crate::gcs::GcsCredentials::Bearer(provider),
@@ -1194,58 +1397,42 @@ impl CredentialResolver for GcsResolver {
         })
     }
 }
-
-struct AzureResolver<'a> {
-    account: &'a str,
-    shared_key: Option<String>,
-}
-
-impl CredentialResolver for AzureResolver<'_> {
+struct AzureResolver;
+impl CredentialResolver for AzureResolver {
     type Output = ResolvedAzureCredentials;
-    fn has_aksk(&self) -> bool {
-        self.shared_key.is_some()
-    }
-    fn aksk(self) -> Result<Self::Output, String> {
-        let key = self
-            .shared_key
-            .filter(|key| !key.is_empty())
-            .ok_or("Azure aksk mode requires a storage account key")?;
-        if self.account.is_empty() {
-            return Err("Azure aksk mode requires a storage account name".into());
-        }
-        Ok(ResolvedAzureCredentials {
-            provider: crate::azure::AzureCredentials::SharedKey(key),
+    type Keys = String;
+    type Iam = AzureIam;
+    fn aksk(self, key: Self::Keys) -> Self::Output {
+        ResolvedAzureCredentials {
+            provider: crate::AzureCredentials::SharedKey(key),
             source: "aksk",
-        })
+        }
     }
-    async fn broker(self, context: ResolutionContext<'_>) -> Result<Self::Output, String> {
-        let fetcher = context.broker_fetch::<crate::AzureSas>("azure", Some(self.account))?;
-        let provider =
-            RefreshingCredentials::bootstrap(fetcher, RefreshPolicy::default(), context.observer)
-                .await?;
+    async fn broker(
+        self,
+        broker: broker::NormalizedBrokerConfig,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String> {
+        let provider = BrokerCredentials::bootstrap(
+            BrokerFetch::<crate::AzureSas>::new(broker, context.http),
+            RefreshPolicy::default(),
+            context.observer,
+        )
+        .await?;
         Ok(ResolvedAzureCredentials {
-            provider: crate::azure::AzureCredentials::BrokerSas(provider),
+            provider: crate::AzureCredentials::BrokerSas(provider),
             source: "broker",
         })
     }
-    async fn iam(self, context: ResolutionContext<'_>) -> Result<Self::Output, String> {
-        let managed = match context.selector {
-            Some("azure-managed-identity") => true,
-            Some("azure-workload-identity") => false,
-            None | Some("auto" | "iam") => {
-                if (context.env)("AZURE_CLIENT_ID")
-                    .filter(|v| !v.is_empty())
-                    .is_none()
-                {
-                    return Err("Azure IAM requires AZURE_CLIENT_ID".into());
-                }
-                (context.env)("AZURE_FEDERATED_TOKEN_FILE")
-                    .filter(|v| !v.is_empty())
-                    .is_none()
-            }
-            Some(other) => return Err(format!("IAM provider {other:?} does not apply to Azure")),
-        };
-        let (provider, source): (Arc<dyn ProvideBearerToken>, _) = if managed {
+    async fn iam(
+        self,
+        provider: Self::Iam,
+        context: ResolutionContext<'_>,
+    ) -> Result<Self::Output, String> {
+        let (provider, source): (Arc<dyn ProvideBearerToken>, _) = if matches!(
+            provider,
+            AzureIam::Managed
+        ) {
             let http = if context.process_environment {
                 metadata_http(AZURE_IMDS_TIMEOUT)?
             } else {
@@ -1281,33 +1468,66 @@ impl CredentialResolver for AzureResolver<'_> {
     }
 }
 
-/// Resolve S3 AK/SK, IAM, or Broker credentials. Explicit broker settings take
-/// precedence over broker environment variables.
+pub(crate) async fn acquire_s3(
+    selected: SelectedS3,
+    context: ResolutionContext<'_>,
+) -> Result<ResolvedS3Credentials, String> {
+    resolve_credentials(S3Resolver, selected, context).await
+}
+pub(crate) async fn acquire_gcs(
+    selected: SelectedGcs,
+    context: ResolutionContext<'_>,
+) -> Result<ResolvedGcsCredentials, String> {
+    resolve_credentials(GcsResolver, selected, context).await
+}
+pub(crate) async fn acquire_azure(
+    selected: SelectedAzure,
+    context: ResolutionContext<'_>,
+) -> Result<ResolvedAzureCredentials, String> {
+    resolve_credentials(AzureResolver, selected, context).await
+}
+
+/// Resolve S3 AK/SK, IAM, or Broker credentials. Explicit Broker settings take precedence over environment settings.
 pub async fn resolve_s3_credentials(
     keys: Option<S3Credentials>,
     options: impl Into<CredentialOptions>,
     http: Arc<dyn HttpClient>,
     observer: Arc<dyn CredentialsObserver>,
 ) -> Result<ResolvedS3Credentials, String> {
-    let options = options.into();
-    resolve_credentials(
-        S3Resolver {
-            keys,
-            region: options.s3_region,
-        },
-        ResolutionContext {
-            env: &env_var,
-            selector: options.source.as_deref(),
-            broker: options.broker.as_ref(),
-            http,
-            observer,
-            process_environment: true,
-        },
+    acquire_s3(
+        select_s3(keys, options.into(), &env_var)?,
+        ResolutionContext::process(http, observer),
+    )
+    .await
+}
+/// Resolve GCS HMAC keys, IAM tokens, or Broker tokens.
+pub async fn resolve_gcs_credentials(
+    keys: Option<crate::GcsHmacCredentials>,
+    options: impl Into<CredentialOptions>,
+    http: Arc<dyn HttpClient>,
+    observer: Arc<dyn CredentialsObserver>,
+) -> Result<ResolvedGcsCredentials, String> {
+    acquire_gcs(
+        select_gcs(keys, options.into(), &env_var)?,
+        ResolutionContext::process(http, observer),
+    )
+    .await
+}
+/// Resolve Azure account keys, IAM tokens, or Broker SAS.
+pub async fn resolve_azure_credentials(
+    account: &str,
+    key: Option<String>,
+    options: impl Into<CredentialOptions>,
+    http: Arc<dyn HttpClient>,
+    observer: Arc<dyn CredentialsObserver>,
+) -> Result<ResolvedAzureCredentials, String> {
+    acquire_azure(
+        select_azure(account, key, options.into(), &env_var)?,
+        ResolutionContext::process(http, observer),
     )
     .await
 }
 
-/// Protocol-test variant. Native SDK IAM discovery is tested in isolated processes.
 #[cfg(test)]
 pub(crate) async fn resolve_s3_credentials_with_env(
     env: EnvFn<'_>,
@@ -1316,12 +1536,10 @@ pub(crate) async fn resolve_s3_credentials_with_env(
     http: Arc<dyn HttpClient>,
     observer: Arc<dyn CredentialsObserver>,
 ) -> Result<ResolvedS3Credentials, String> {
-    resolve_credentials(
-        S3Resolver { keys, region: None },
+    acquire_s3(
+        select_s3(keys, selector.into(), env)?,
         ResolutionContext {
             env,
-            selector,
-            broker: None,
             http,
             observer,
             process_environment: false,
@@ -1329,44 +1547,18 @@ pub(crate) async fn resolve_s3_credentials_with_env(
     )
     .await
 }
-
-/// Resolve GCS HMAC keys, IAM tokens, or Broker tokens.
-pub async fn resolve_gcs_credentials(
-    keys: Option<crate::gcs::GcsHmacCredentials>,
-    options: impl Into<CredentialOptions>,
-    http: Arc<dyn HttpClient>,
-    observer: Arc<dyn CredentialsObserver>,
-) -> Result<ResolvedGcsCredentials, String> {
-    let options = options.into();
-    resolve_credentials(
-        GcsResolver(keys),
-        ResolutionContext {
-            env: &env_var,
-            selector: options.source.as_deref(),
-            broker: options.broker.as_ref(),
-            http,
-            observer,
-            process_environment: true,
-        },
-    )
-    .await
-}
-
-/// Protocol-test variant. Native ADC discovery is tested in isolated processes.
 #[cfg(test)]
 pub(crate) async fn resolve_gcs_credentials_with_env(
     env: EnvFn<'_>,
-    keys: Option<crate::gcs::GcsHmacCredentials>,
+    keys: Option<crate::GcsHmacCredentials>,
     selector: Option<&str>,
     http: Arc<dyn HttpClient>,
     observer: Arc<dyn CredentialsObserver>,
 ) -> Result<ResolvedGcsCredentials, String> {
-    resolve_credentials(
-        GcsResolver(keys),
+    acquire_gcs(
+        select_gcs(keys, selector.into(), env)?,
         ResolutionContext {
             env,
-            selector,
-            broker: None,
             http,
             observer,
             process_environment: false,
@@ -1374,57 +1566,19 @@ pub(crate) async fn resolve_gcs_credentials_with_env(
     )
     .await
 }
-
-/// Resolve Azure account keys, IAM tokens, or Broker SAS. The configured account
-/// is required for AK/SK and Broker; IAM selection follows the token-file rule.
-pub async fn resolve_azure_credentials(
-    account: &str,
-    shared_key: Option<String>,
-    options: impl Into<CredentialOptions>,
-    http: Arc<dyn HttpClient>,
-    observer: Arc<dyn CredentialsObserver>,
-) -> Result<ResolvedAzureCredentials, String> {
-    let options = options.into();
-    let source = options
-        .source
-        .or_else(|| env_var("TALON_ORIGIN_CREDENTIALS_SOURCE"));
-    resolve_credentials(
-        AzureResolver {
-            account,
-            shared_key,
-        },
-        ResolutionContext {
-            env: &env_var,
-            selector: source.as_deref(),
-            broker: options.broker.as_ref(),
-            http,
-            observer,
-            process_environment: true,
-        },
-    )
-    .await
-}
-
-/// Injectable environment and HTTP variant of [`resolve_azure_credentials`].
 #[cfg(test)]
 pub(crate) async fn resolve_azure_credentials_with_env(
     env: EnvFn<'_>,
     account: &str,
-    shared_key: Option<String>,
+    key: Option<String>,
     selector: Option<&str>,
     http: Arc<dyn HttpClient>,
     observer: Arc<dyn CredentialsObserver>,
 ) -> Result<ResolvedAzureCredentials, String> {
-    let from_env = env("TALON_ORIGIN_CREDENTIALS_SOURCE");
-    resolve_credentials(
-        AzureResolver {
-            account,
-            shared_key,
-        },
+    acquire_azure(
+        select_azure(account, key, selector.into(), env)?,
         ResolutionContext {
             env,
-            selector: selector.or(from_env.as_deref()),
-            broker: None,
             http,
             observer,
             process_environment: false,
@@ -2848,6 +3002,59 @@ mod tests {
         }
         assert!(CredentialMode::select(Some("bearer"), false).is_err());
         assert!(CredentialMode::select(Some("sas"), false).is_err());
+    }
+
+    #[test]
+    fn s3_auto_selects_provider_at_boundary_in_contract_order() {
+        let contracts = [
+            ("AWS_ROLE_ARN", "aws-role"),
+            ("AWS_WEB_IDENTITY_TOKEN_FILE", "/aws-token"),
+            ("ALIBABA_CLOUD_ROLE_ARN", "ali-role"),
+            ("ALIBABA_CLOUD_OIDC_PROVIDER_ARN", "ali-provider"),
+            ("ALIBABA_CLOUD_OIDC_TOKEN_FILE", "/ali-token"),
+            ("TKE_ROLE_ARN", "tencent-role"),
+            ("TKE_PROVIDER_ID", "tencent-provider"),
+            ("TKE_WEB_IDENTITY_TOKEN_FILE", "/tencent-token"),
+        ];
+        // Remove every individual required field, not only the first one:
+        // incomplete higher-priority contracts must fall through as a whole.
+        let cases = [
+            (vec![], "aws-web-identity"),
+            (vec![0], "aliyun-oidc"),
+            (vec![1], "aliyun-oidc"),
+            (vec![0, 2], "tencent-oidc"),
+            (vec![0, 3], "tencent-oidc"),
+            (vec![0, 4], "tencent-oidc"),
+            (vec![0, 2, 5], "iam"),
+            (vec![0, 2, 6], "iam"),
+            (vec![0, 2, 7], "iam"),
+            ((0..contracts.len()).collect(), "iam"),
+        ];
+        for (missing, expected) in cases {
+            let env = |name: &str| {
+                contracts
+                    .iter()
+                    .enumerate()
+                    .find(|(index, (key, _))| !missing.contains(index) && *key == name)
+                    .map(|(_, (_, value))| (*value).to_owned())
+            };
+            for source in [None, Some("auto")] {
+                let selected = select_s3(None, source.into(), &env).unwrap();
+                let SelectedCredentials::Iam(provider) = selected else {
+                    panic!("expected IAM provider")
+                };
+                assert_eq!(provider.name(), expected, "missing fields {missing:?}");
+            }
+            // Explicit IAM always chooses the SDK, even with all webhook contracts.
+            let options = CredentialOptions {
+                source: Some("iam".into()),
+                s3_region: Some("us-west-2".into()),
+                ..Default::default()
+            };
+            assert!(
+                matches!(select_s3(None, options, &env).unwrap(), SelectedCredentials::Iam(S3Iam::Default { region: Some(region), .. }) if region == "us-west-2")
+            );
+        }
     }
 
     #[tokio::test]

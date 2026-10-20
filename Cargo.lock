@@ -4117,6 +4117,7 @@ dependencies = [
  "talon-backend",
  "talon-core",
  "talon-metadata",
+ "talon-rust-client",
  "talon-telemetry",
  "talon-transport",
  "talon-uring",

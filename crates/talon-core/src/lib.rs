@@ -15,11 +15,12 @@ pub mod namespace_policy;
 pub mod node;
 pub mod placement;
 pub mod rate_limit;
+pub mod request;
 pub mod status;
 pub mod store;
 pub mod trace;
 
-pub use backend::{BackendStore, ListPage, ListedObject, ObjectStat};
+pub use backend::{AccessScope, BackendStore, ListPage, ListedObject, ObjectStat, ResolvedBackend};
 pub use block::{page_len, BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{
     azure_sas_from_env, gcs_bearer_from_env, parse_bool_value, s3_secret_key_from_env,
@@ -41,6 +42,11 @@ pub use node::{NodeId, NodeInfo, NodeRole};
 pub use placement::{cache_membership_epoch, rank_cache_workers, CachePlacementTable};
 pub use rate_limit::{
     Gcra, MetricLimits, RateDecision, RateLimit, RateLimitError, RateLimitPolicy, RateMetric,
+};
+pub use request::{
+    BrokerConfig, OriginOptions, ValidatedBrokerConfig, BROKER_INITIAL_ATTEMPTS,
+    BROKER_INITIAL_BACKOFF_MS, BROKER_INITIAL_RETRY_DELAY_MS, BROKER_REQUEST_TIMEOUT_MS,
+    CREDENTIAL_BROKER_KEY, MAX_CREDENTIAL_BROKER_BYTES,
 };
 pub use status::{
     NodeHealth, NodeMetricsSnapshot, NodeStatus, NodeStatusError, MAX_NODE_STATUS_BYTES,

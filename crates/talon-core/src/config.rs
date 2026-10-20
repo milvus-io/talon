@@ -144,11 +144,18 @@ pub struct BucketConfig {
     pub azure_shared_key: Option<Sensitive<String>>,
     pub credential_broker_url: Option<Sensitive<String>>,
     pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
+    /// Per-attempt Broker timeout in milliseconds; omitted uses the default of 3000.
+    pub credential_broker_timeout_ms: Option<u64>,
 }
 
 impl BucketConfig {
     /// Check a resolved record before constructing its backend or fetching credentials.
     pub fn validate(&self, backend: crate::Backend) -> Result<()> {
+        if self.credential_broker_timeout_ms == Some(0) {
+            return Err(Error::Other(
+                "credential_broker_timeout_ms must be positive".into(),
+            ));
+        }
         if self.name.is_empty()
             || matches!(self.name.as_str(), "." | "..")
             || !self
@@ -384,6 +391,8 @@ pub struct WorkerConfig {
     pub credential_broker_url: Option<Sensitive<String>>,
     /// Credential broker JSON request body, parsed from a TOML table or JSON env value.
     pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
+    /// Per-attempt Broker timeout in milliseconds; omitted uses the default of 3000.
+    pub credential_broker_timeout_ms: Option<u64>,
     /// Use S3 path-style addressing (`endpoint/bucket/key`). Required by most
     /// S3-compatible emulators (LocalStack, MinIO).
     pub s3_path_style: Option<bool>,
@@ -450,6 +459,7 @@ impl WorkerConfig {
             || self.azure_shared_key.is_some()
             || self.credential_broker_url.is_some()
             || self.credential_broker_request.is_some()
+            || self.credential_broker_timeout_ms.is_some()
         {
             return Err(Error::Other(
                 "buckets cannot be combined with top-level credential fields".into(),
@@ -630,6 +640,7 @@ impl Default for WorkerConfig {
             azure_shared_key: None,
             credential_broker_url: None,
             credential_broker_request: None,
+            credential_broker_timeout_ms: None,
             s3_path_style: None,
             gcs_endpoint: None,
             data_plane_rings: 0,
@@ -773,6 +784,8 @@ pub struct WorkerConfigPatch {
     pub credential_broker_url: Option<Sensitive<String>>,
     /// Optional `[credential_broker_request]` table, replaced as a whole by higher layers.
     pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
+    /// Per-attempt Broker timeout in milliseconds; omitted uses the default of 3000.
+    pub credential_broker_timeout_ms: Option<u64>,
     /// Override for [`WorkerConfig::s3_path_style`].
     pub s3_path_style: Option<bool>,
     /// Override for [`WorkerConfig::gcs_endpoint`].
@@ -893,6 +906,9 @@ impl Patch for WorkerConfigPatch {
             gcs_secret_access_key: self.gcs_secret_access_key.or(base.gcs_secret_access_key),
             azure_shared_key: self.azure_shared_key.or(base.azure_shared_key),
             credential_broker_url: self.credential_broker_url.or(base.credential_broker_url),
+            credential_broker_timeout_ms: self
+                .credential_broker_timeout_ms
+                .or(base.credential_broker_timeout_ms),
             credential_broker_request: self
                 .credential_broker_request
                 .or(base.credential_broker_request),
@@ -908,8 +924,9 @@ impl Patch for WorkerConfigPatch {
     }
 }
 
-/// Single source of truth for the worker's `TALON_WORKER_*` environment
-/// variables. [`WorkerConfigPatch::from_env_with`] reads names from here and the
+/// Single source of truth for the worker's environment variables. Names use
+/// `TALON_WORKER_*`, except for the global `TALON_CREDENTIAL_BROKER_TIMEOUT_MS`
+/// setting. [`WorkerConfigPatch::from_env_with`] reads names from here and the
 /// documentation generator renders it, so the reference cannot drift.
 pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar {
@@ -1278,6 +1295,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: true,
         help: "Azure SAS token; env-only, never from a config file or logged.",
     },
+    ConfigVar {
+        env: worker_env::CREDENTIAL_BROKER_TIMEOUT_MS,
+        key: "credential_broker_timeout_ms",
+        default: Some("3000"),
+        cli: false,
+        secret: false,
+        help: "Positive per-attempt Broker credential request timeout in ms; does not change storage I/O timeouts.",
+    },
 ];
 
 pub(crate) mod worker_env {
@@ -1354,6 +1379,7 @@ pub(crate) mod worker_env {
     pub const AZURE_SHARED_KEY: &str = "TALON_WORKER_AZURE_SHARED_KEY";
     pub const CREDENTIAL_BROKER_URL: &str = "TALON_CREDENTIAL_BROKER_URL";
     pub const CREDENTIAL_BROKER_REQUEST: &str = "TALON_CREDENTIAL_BROKER_REQUEST";
+    pub const CREDENTIAL_BROKER_TIMEOUT_MS: &str = "TALON_CREDENTIAL_BROKER_TIMEOUT_MS";
     pub const GCS_ENDPOINT: &str = "TALON_WORKER_GCS_ENDPOINT";
     pub const GCS_BEARER_TOKEN: &str = "TALON_WORKER_GCS_BEARER_TOKEN";
     pub const AZURE_SAS: &str = "TALON_WORKER_AZURE_SAS";
@@ -1558,6 +1584,9 @@ impl WorkerConfigPatch {
             gcs_secret_access_key: get_credential(worker_env::GCS_SECRET_ACCESS_KEY)
                 .map(Sensitive::from),
             azure_shared_key: get_credential(worker_env::AZURE_SHARED_KEY).map(Sensitive::from),
+            credential_broker_timeout_ms: get_credential(worker_env::CREDENTIAL_BROKER_TIMEOUT_MS)
+                .map(|value| parse_u64(value, worker_env::CREDENTIAL_BROKER_TIMEOUT_MS))
+                .transpose()?,
             credential_broker_url: get_credential(worker_env::CREDENTIAL_BROKER_URL)
                 .map(Sensitive::from),
             credential_broker_request: get_credential(worker_env::CREDENTIAL_BROKER_REQUEST)
@@ -1741,6 +1770,9 @@ impl WorkerConfig {
             gcs_secret_access_key: merged.gcs_secret_access_key.or(d.gcs_secret_access_key),
             azure_shared_key: merged.azure_shared_key.or(d.azure_shared_key),
             credential_broker_url: merged.credential_broker_url.or(d.credential_broker_url),
+            credential_broker_timeout_ms: merged
+                .credential_broker_timeout_ms
+                .or(d.credential_broker_timeout_ms),
             credential_broker_request: merged
                 .credential_broker_request
                 .or(d.credential_broker_request),
@@ -1786,6 +1818,11 @@ impl WorkerConfig {
     /// Fail fast on invalid configuration with an actionable message.
     pub fn validate(&self) -> Result<()> {
         self.resolved_buckets()?;
+        if self.credential_broker_timeout_ms == Some(0) {
+            return Err(Error::Other(
+                "credential_broker_timeout_ms must be positive".into(),
+            ));
+        }
         if self.listen.is_empty() {
             return Err(Error::Other("listen address must not be empty".into()));
         }
@@ -2400,8 +2437,8 @@ mod tests {
 
     #[test]
     fn env_schemas_are_wellformed() {
-        // Each schema's env names are unique and match the TALON_ prefix so the
-        // generated reference and the parser stay in lockstep.
+        // Each schema's env names are unique and use its component prefix,
+        // except for the worker's shared Broker timeout setting.
         for (label, schema, prefix) in [
             ("worker", WORKER_ENV_SCHEMA, "TALON_WORKER_"),
             ("fuse", FUSE_ENV_SCHEMA, "TALON_FUSE_"),
@@ -2409,8 +2446,9 @@ mod tests {
             let mut seen = std::collections::HashSet::new();
             for v in schema {
                 assert!(
-                    v.env.starts_with(prefix),
-                    "{label}: {} lacks prefix {prefix}",
+                    v.env.starts_with(prefix)
+                        || (label == "worker" && v.env == worker_env::CREDENTIAL_BROKER_TIMEOUT_MS),
+                    "{label}: {} lacks prefix {prefix} and is not an allowed global setting",
                     v.env
                 );
                 assert!(seen.insert(v.env), "{label}: duplicate env {}", v.env);
@@ -2423,6 +2461,7 @@ mod tests {
             worker_env::LISTEN,
             worker_env::AZURE_ACCOUNT,
             worker_env::AZURE_SAS,
+            worker_env::CREDENTIAL_BROKER_TIMEOUT_MS,
         ] {
             assert!(
                 WORKER_ENV_SCHEMA.iter().any(|v| v.env == name),
@@ -2829,6 +2868,16 @@ credentials_source = "iam"
     }
 
     #[test]
+    fn static_broker_timeout_toml_accepts_global_and_per_bucket_settings() {
+        for prefix in ["", "[[buckets]]\nname = 'bucket'\n"] {
+            let patch = WorkerConfigPatch::from_toml(&format!(
+                "backend = 'gcs'\n{prefix}credentials_source = 'broker'\ncredential_broker_url = 'https://broker.example/'\ncredential_broker_request = {{ csp = 'gcp', credentialType = 'iam' }}\ncredential_broker_timeout_ms = 17"
+            )).unwrap();
+            WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+        }
+    }
+
+    #[test]
     fn buckets_reject_all_top_level_credentials_without_inheriting_them() {
         for setting in [
             "credentials_source = 'iam'",
@@ -2840,6 +2889,7 @@ credentials_source = "iam"
             "azure_shared_key = 'global-secret'",
             "credential_broker_url = 'https://broker.example/global-secret'",
             "credential_broker_request = { token = 'global-secret' }",
+            "credential_broker_timeout_ms = 17",
         ] {
             let patch = WorkerConfigPatch::from_toml(&format!(
                 "backend = 'gcs'\n{setting}\n[[buckets]]\nname = 'bucket'\ncredentials_source = 'iam'"

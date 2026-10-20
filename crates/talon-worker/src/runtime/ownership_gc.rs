@@ -111,7 +111,7 @@ impl OwnershipGc {
                 // Each namespace retains its own publication boundary.
                 0..view
                     .scan_limits
-                    .get(worker.namespace.effective_name())
+                    .get(&worker.cache_identity)
                     .copied()
                     .unwrap_or(0)
             } else {

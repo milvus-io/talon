@@ -1,5 +1,6 @@
 """Offline binding tests using real TCP frames; also embedded in Rust tests."""
 import io
+import json
 import concurrent.futures
 import socketserver
 import struct
@@ -22,6 +23,7 @@ class Peer(socketserver.ThreadingTCPServer):
         super().__init__(("127.0.0.1", 0), Handler)
         self.frames = []
         self.namespaces = []
+        self.brokers = []
         self.errors = []
         self.reject = False
         self.drop_reply = False
@@ -47,17 +49,21 @@ class Handler(socketserver.StreamRequestHandler):
                 if not header:
                     return
                 magic, version, kind, flags, reserved, request_id, length = struct.unpack(">HBBHHII", header)
-                assert magic == 0x544C and version in (1, 3) and kind in (0, 10, 11)
+                assert magic == 0x544C and version in (1, 3, 4) and kind in (0, 10, 11)
                 body = io.BytesIO(self.rfile.read(length))
                 namespace = "default"
-                if version == 3:
+                broker = None
+                fields = {}
+                if version >= 3:
                     metadata_size = struct.unpack(">H", body.read(2))[0]
                     metadata = io.BytesIO(body.read(metadata_size))
-                    fields = {}
                     while metadata.tell() < metadata_size:
                         key, size = struct.unpack(">BH", metadata.read(3))
                         fields[key] = metadata.read(size)
-                    namespace = fields[5].decode()
+                    assert version != 3 or 5 in fields
+                    namespace = fields.get(5, b"default").decode()
+                    if version == 4:
+                        broker = json.loads(fields[6])
                 def read_string():
                     size = struct.unpack("<Q", body.read(8))[0]
                     return body.read(size).decode()
@@ -65,9 +71,12 @@ class Handler(socketserver.StreamRequestHandler):
                     if kind == 11:
                         assert struct.unpack("<I", body.read(4))[0] == 0
                         scoped_namespace = read_string()
-                        if version == 3:
+                        # v4 requires broker metadata; its namespace may live
+                        # solely in the scoped data-plane message body.
+                        if 5 in fields:
                             assert scoped_namespace == namespace
                         namespace = scoped_namespace
+                    self.server.brokers.append(("read", namespace, broker))
                     assert struct.unpack("<I", body.read(4))[0] == 0
                     assert (read_string(), read_string()) == ("bucket", "file")
                     offset, count = struct.unpack("<QQ", body.read(16))
@@ -81,6 +90,8 @@ class Handler(socketserver.StreamRequestHandler):
                     continue
                 schema, tag = struct.unpack("<HI", body.read(6))
                 assert schema == 6
+                if tag != 4:
+                    self.server.brokers.append((tag, namespace, broker))
                 if tag == 4:
                     reply = struct.pack("<HIQQQQ", 6, 5, 1, 1, 500, 1)
                     reply += string("worker") + b"\0\0" + struct.pack("<I", 2)
@@ -123,6 +134,63 @@ class Handler(socketserver.StreamRequestHandler):
 
 
 class LoadTests(unittest.TestCase):
+    def test_namespace_and_broker_are_sent_together_for_every_operation(self):
+        broker = {"url": "http://localhost/broker", "request": {
+            "csp": "aws", "region": "us-west-2", "bucket": "bucket", "roleArn": "fixture"},
+            "origin": {"endpoint": "storage.example", "region": "us-west-2"}}
+        options = {"namespace": "team-a", "request_options": {
+            "credential_broker": json.dumps(broker)}}
+        with Peer() as peer:
+            client = talon.Client(peer.address, block_size=8)
+            self.assertEqual(client.stat("s3://bucket/file", **options).version, "team-a")
+            self.assertEqual([entry.path for entry in client.list("s3/bucket", **options)], ["team-a"])
+            self.assertEqual(client.read("s3://bucket/file", version="v1", size=3, length=3,
+                                         **options), b"AAA")
+            self.assertEqual(client.load("s3://bucket/file", version="v1", size=3,
+                                         **options).blocks, 1)
+            self.assertEqual(client.batch_load([talon.LoadRequest("s3://bucket/file", "v1", 3)],
+                                               **options)[0].blocks, 1)
+            self.assertEqual([operation for operation, _, _ in peer.brokers], [8, 10, "read", 19, 20])
+            self.assertTrue(all(namespace == "team-a" and observed == broker
+                                for _, namespace, observed in peer.brokers))
+            self.assertEqual(client.stat("s3://bucket/file").version, "default")
+            self.assertEqual(peer.brokers[-1], (8, "default", None))
+            self.assertFalse(peer.errors)
+            del client
+
+    def test_combined_options_are_validated_before_empty_operations(self):
+        client = talon.Client("127.0.0.1:1", block_size=8)
+        valid_broker = json.dumps({"url": "http://localhost/broker", "request": {},
+                                  "origin": {"endpoint": "storage.example"}})
+        invalid_brokers = ["PRIVATE_FIXTURE_MARKER", json.dumps({
+            "url": "http://localhost/broker/PRIVATE_FIXTURE_MARKER", "request": {}})]
+        for origin in (None, {}, {"request_timeout_ms": 17}, {"endpoint": None},
+                       {"endpoint": ""}, {"endpoint": " \t\n"}):
+            invalid_brokers.append(json.dumps({
+                "url": "http://localhost/broker/PRIVATE_FIXTURE_MARKER", "request": {},
+                "origin": origin}))
+        for csp in ("aws", "ali", "tc", "hwc"):
+            for origin in ({"endpoint": "storage.example"},
+                           {"endpoint": "storage.example", "region": None},
+                           {"endpoint": "storage.example", "region": ""},
+                           {"endpoint": "storage.example", "region": " \t\n"}):
+                invalid_brokers.append(json.dumps({
+                    "url": "http://localhost/broker/PRIVATE_FIXTURE_MARKER",
+                    "request": {"csp": csp, "region": "broker-region"}, "origin": origin}))
+        for namespace, broker in [("", valid_broker)] + [
+                ("team-a", broker) for broker in invalid_brokers]:
+            options = {"namespace": namespace, "request_options": {"credential_broker": broker}}
+            for operation in (
+                lambda: client.read("s3://bucket/file", length=0, **options),
+                lambda: client.stat("s3://bucket/file", **options),
+                lambda: client.list("s3/bucket", **options),
+                lambda: client.load("s3://bucket/file", version="v1", size=0, **options),
+                lambda: client.batch_load([], **options),
+            ):
+                with self.assertRaises(ValueError) as caught:
+                    operation()
+                self.assertNotIn("PRIVATE_FIXTURE_MARKER", str(caught.exception))
+
     def test_same_client_routes_read_stat_and_list_per_request(self):
         with Peer() as peer:
             client = talon.Client(peer.address, block_size=8)

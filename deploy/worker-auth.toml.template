@@ -30,6 +30,13 @@ credentials_source = "iam"
 [[buckets]]
 name = "bucket-c"
 credentials_source = "broker"
+# Object storage endpoint used for origin reads/writes; separate from the Broker API URL.
+# Optional for AWS (defaults from s3_region); required for OSS/COS/OBS.
+s3_endpoint = "https://s3.us-west-2.amazonaws.com"
+# Optional per-attempt credential fetch timeout; omitted defaults to 3000 ms.
+# Does not change storage I/O timeouts. Valid in each bucket or at top level for
+# a worker without [[buckets]]. Top-level env override: TALON_CREDENTIAL_BROKER_TIMEOUT_MS.
+credential_broker_timeout_ms = 3000
 credential_broker_url = "http://<broker-host>:8080/v1/credentials/assume-role"
 credential_broker_request.csp = "aws"
 credential_broker_request.region = "us-west-2"

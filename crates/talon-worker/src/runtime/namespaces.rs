@@ -5,14 +5,36 @@ use crate::page_access_store::CacheRootLock;
 use std::{collections::BTreeMap, path::Path, sync::RwLock};
 use talon_core::{NamespaceId, WorkerConfig, DEFAULT_NAMESPACE};
 
-/// Bounds disk namespaces and runtime metadata created by declared identities.
-const MAX_NAMESPACES: usize = 4096;
+/// Bounds all namespace and credential-scope cache runtimes and disk directories.
+const MAX_CACHE_RUNTIMES: usize = 4096;
+
+/// Cache identity is separate from the original namespace used by policy and QoS.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(super) struct CacheIdentity(String);
+impl CacheIdentity {
+    pub(super) fn new(
+        namespace: &NamespaceId,
+        scope: Option<talon_core::backend::AccessScope>,
+    ) -> Self {
+        // Namespace names cannot contain '/', making the compound identity
+        // unambiguous while static lookups can still borrow the original name.
+        Self(match scope {
+            Some(scope) => format!("{}/{}", namespace.effective_name(), scope.as_str()),
+            None => namespace.effective_name().to_owned(),
+        })
+    }
+}
+impl std::borrow::Borrow<str> for CacheIdentity {
+    fn borrow(&self) -> &str {
+        &self.0
+    }
+}
 
 pub(super) struct NamespaceRuntimes {
     uring: bool,
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
-    workers: RwLock<BTreeMap<String, Arc<WorkerRuntime>>>,
+    workers: RwLock<BTreeMap<CacheIdentity, Arc<WorkerRuntime>>>,
     initialize: tokio::sync::Mutex<()>,
     initializers: Arc<Mutations>,
     config: WorkerConfig,
@@ -34,11 +56,23 @@ impl NamespaceRuntimes {
         self.workers.read().unwrap().values().cloned().collect()
     }
 
-    fn open(self: &Arc<Self>, namespace: &NamespaceId) -> anyhow::Result<WorkerRuntime> {
+    fn open(
+        self: &Arc<Self>,
+        namespace: &NamespaceId,
+        scope: Option<talon_core::backend::AccessScope>,
+        backend: Option<Arc<dyn BackendStore>>,
+    ) -> anyhow::Result<WorkerRuntime> {
         let config = self.config.for_namespace(namespace)?;
         let namespace_root = self.root_lock.root.join(namespace.effective_name());
         checked_dir(&namespace_root)?;
-        let root = namespace_root.join("shared");
+        let root = match &scope {
+            None => namespace_root.join("shared"),
+            Some(scope) => {
+                let scopes = namespace_root.join("scopes");
+                checked_dir(&scopes)?;
+                scopes.join(scope.as_str())
+            }
+        };
         checked_dir(&root)?;
         // Persist geometry independently for each namespace. A changed page size
         // must never reinterpret existing page indices on restart.
@@ -103,8 +137,13 @@ impl NamespaceRuntimes {
         .with_paged_miss_run_concurrency(config.paged_miss_run_concurrency);
         worker.page_mutations = Arc::new(Mutations::new(self.uring));
         worker.background_heads = self.background_heads.clone();
-        worker.page_gc_metrics =
-            PageGcMetrics::new(&self.metrics.registry, namespace.effective_name());
+        // The backend is deliberately absent for recovered credential scopes.
+        worker.backend = Arc::new(backend.map(OnceLock::from).unwrap_or_default());
+        worker.page_gc_metrics = PageGcMetrics::with_scope(
+            &self.metrics.registry,
+            namespace.effective_name(),
+            scope.as_ref().map(|scope| scope.as_str()),
+        );
         worker.l1 = Arc::new(MemoryStore::with_shared_budget(
             config.l1_capacity_bytes,
             config.l1_page_size_bytes,
@@ -122,6 +161,7 @@ impl NamespaceRuntimes {
         worker.membership = self.membership.clone();
         worker.membership_changed = self.membership_changed.clone();
         worker.namespace = namespace.normalized();
+        worker.cache_identity = CacheIdentity::new(namespace, scope);
         worker.namespace_parent = Arc::downgrade(self);
         worker.load_slots = self.load_slots.clone();
         worker.load_bytes = self.load_bytes.clone();
@@ -133,9 +173,15 @@ impl NamespaceRuntimes {
     async fn resolve(
         self: &Arc<Self>,
         namespace: &NamespaceId,
+        scope: Option<talon_core::backend::AccessScope>,
+        backend: Arc<dyn BackendStore>,
     ) -> anyhow::Result<Arc<WorkerRuntime>> {
         namespace.validate()?;
-        if let Some(worker) = self.workers.read().unwrap().get(namespace.effective_name()) {
+        let identity = CacheIdentity::new(namespace, scope.clone());
+        if let Some(worker) = self.workers.read().unwrap().get(&identity) {
+            if worker.backend.get().is_none() {
+                let _ = worker.backend.set(backend);
+            }
             return Ok(worker.clone());
         }
         // The initializer owns publication even when the triggering request is
@@ -146,28 +192,27 @@ impl NamespaceRuntimes {
         self.initializers
             .run(async move {
                 let _guard = registry.initialize.lock().await;
-                if let Some(worker) = registry
-                    .workers
-                    .read()
-                    .unwrap()
-                    .get(namespace.effective_name())
-                {
+                if let Some(worker) = registry.workers.read().unwrap().get(&identity) {
+                    let _ = worker.backend.set(backend);
                     return Ok(worker.clone());
                 }
                 anyhow::ensure!(
-                    registry.workers.read().unwrap().len() < MAX_NAMESPACES,
-                    "namespace limit reached"
+                    registry.workers.read().unwrap().len() < MAX_CACHE_RUNTIMES,
+                    "cache runtime limit reached"
                 );
                 let owner = registry.clone();
-                let name = namespace.effective_name().to_owned();
-                let worker =
-                    Arc::new(tokio::task::spawn_blocking(move || owner.open(&namespace)).await??);
+                let worker = Arc::new(
+                    tokio::task::spawn_blocking(move || {
+                        owner.open(&namespace, scope, Some(backend))
+                    })
+                    .await??,
+                );
                 worker.recover_page_file_cleanup().await;
                 registry
                     .workers
                     .write()
                     .unwrap()
-                    .insert(name, worker.clone());
+                    .insert(identity, worker.clone());
                 registry.membership_changed.send_replace(());
                 Ok::<_, anyhow::Error>(worker)
             })
@@ -212,7 +257,7 @@ impl WorkerRuntime {
         }
     }
 
-    /// Open all persisted and configured namespaces under one locked root.
+    /// Open configured namespaces and every persisted credential scope under one locked root.
     pub fn open_namespaces(
         config: &WorkerConfig,
         root_lock: Arc<CacheRootLock>,
@@ -266,15 +311,65 @@ impl WorkerRuntime {
                     .into_string()
                     .map_err(|_| anyhow::anyhow!("invalid namespace directory"))?;
                 // Never silently strand an old flat cache or adopt it as a namespace.
-                anyhow::ensure!(entry.path().join("shared").is_dir() || (entry.file_type()?.is_dir() && std::fs::read_dir(entry.path())?.next().is_none()), "legacy/unrecognized cache directory {}; configure a new cache root for namespace storage", entry.path().display());
+                anyhow::ensure!(entry.path().join("shared").is_dir() || entry.path().join("scopes").is_dir() || (entry.file_type()?.is_dir() && std::fs::read_dir(entry.path())?.next().is_none()), "legacy/unrecognized cache directory {}; configure a new cache root for namespace storage", entry.path().display());
                 names.insert(name);
             }
         }
-        anyhow::ensure!(names.len() <= MAX_NAMESPACES, "too many namespaces");
+        anyhow::ensure!(names.len() <= MAX_CACHE_RUNTIMES, "too many namespaces");
         for name in names {
             let namespace = NamespaceId::named(&name);
-            let worker = Arc::new(registry.open(&namespace)?);
-            registry.workers.write().unwrap().insert(name, worker);
+            namespace.validate()?;
+            let namespace_root = registry.root_lock.root.join(&name);
+            checked_dir(&namespace_root)?;
+            let has_shared = match std::fs::symlink_metadata(namespace_root.join("shared")) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            let scopes = namespace_root.join("scopes");
+            let has_scopes = match std::fs::symlink_metadata(&scopes) {
+                Ok(_) => true,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+                Err(error) => return Err(error.into()),
+            };
+            if namespace.is_default()
+                || config.namespaces.contains_key(&name)
+                || has_shared
+                || !has_scopes
+            {
+                anyhow::ensure!(
+                    registry.workers.read().unwrap().len() < MAX_CACHE_RUNTIMES,
+                    "too many cache runtimes"
+                );
+                let worker =
+                    Arc::new(registry.open(&namespace, None, Some(registry.backend.clone()))?);
+                registry
+                    .workers
+                    .write()
+                    .unwrap()
+                    .insert(worker.cache_identity.clone(), worker);
+            }
+            if has_scopes {
+                checked_dir(&scopes)?;
+                for entry in std::fs::read_dir(scopes)? {
+                    let entry = entry?;
+                    let scope = entry
+                        .file_name()
+                        .into_string()
+                        .map_err(|_| anyhow::anyhow!("invalid credential scope directory"))?
+                        .parse()?;
+                    anyhow::ensure!(
+                        registry.workers.read().unwrap().len() < MAX_CACHE_RUNTIMES,
+                        "too many cache runtimes"
+                    );
+                    let worker = Arc::new(registry.open(&namespace, Some(scope), None)?);
+                    registry
+                        .workers
+                        .write()
+                        .unwrap()
+                        .insert(worker.cache_identity.clone(), worker);
+                }
+            }
         }
         let mut worker = (**registry
             .workers
@@ -299,7 +394,17 @@ impl WorkerRuntime {
             .cloned()
             .or_else(|| self.namespace_parent.upgrade())
         {
-            registry.resolve(namespace).await
+            if let Some(worker) = registry
+                .workers
+                .read()
+                .unwrap()
+                .get(namespace.effective_name())
+            {
+                return Ok(worker.clone());
+            }
+            registry
+                .resolve(namespace, None, registry.backend.clone())
+                .await
         } else {
             anyhow::ensure!(
                 namespace.effective_name() == self.namespace.effective_name(),
@@ -309,7 +414,7 @@ impl WorkerRuntime {
         }
     }
 
-    /// Snapshot used by maintenance and aggregate process metrics.
+    /// Snapshot every namespace and credential scope for maintenance and process metrics.
     pub fn namespace_runtimes(self: &Arc<Self>) -> Vec<Arc<Self>> {
         match self
             .namespaces
@@ -329,14 +434,14 @@ impl WorkerRuntime {
             .or_else(|| self.namespace_parent.upgrade())
     }
 
-    /// Resolve legacy read carriers and v3 metadata consistently for every operation.
+    /// Resolve namespace and credential metadata consistently for every operation.
     pub async fn for_request(
         self: &Arc<Self>,
         header: &talon_transport::FrameHeader,
         payload: &[u8],
     ) -> Result<Arc<Self>, talon_transport::DataPlaneError> {
         use talon_transport::{data, DataErrorCode, DataPlaneError, MsgType, HEADER_LEN};
-        let namespace = (|| -> anyhow::Result<NamespaceId> {
+        let (namespace, broker) = (|| -> anyhow::Result<_> {
             let (metadata, _) = talon_transport::envelope::decode(header, payload)?;
             let mut frame = Vec::new();
             let legacy = if matches!(
@@ -372,12 +477,44 @@ impl WorkerRuntime {
             }
             let namespace = metadata.namespace.or(legacy).unwrap_or_default();
             namespace.validate()?;
-            Ok(namespace)
+            Ok((namespace, metadata.credential_broker))
         })()
         .map_err(|error| DataPlaneError {
             code: DataErrorCode::InvalidRequest,
             message: error.to_string(),
         })?;
+        if let Some(broker) = broker {
+            let (backend, bucket, objects) =
+                request_target(header, payload).map_err(|error| DataPlaneError {
+                    code: DataErrorCode::InvalidRequest,
+                    message: error.to_string(),
+                })?;
+            let result = async {
+                self.ensure_configured_backend(backend)?;
+                let registry = self
+                    .registry()
+                    .ok_or_else(|| anyhow::anyhow!("runtime has no credential scope registry"))?;
+                let resolved = registry
+                    .backend
+                    .bind_request(backend, &bucket, broker.config())
+                    .await?;
+                anyhow::ensure!(
+                    resolved.scope.is_some(),
+                    "explicit credentials require a cache scope"
+                );
+                for object in &objects {
+                    resolved.store.validate_object(object)?;
+                }
+                registry
+                    .resolve(&namespace, resolved.scope, resolved.store)
+                    .await
+            }
+            .await;
+            return result.map_err(|error| DataPlaneError {
+                code: crate::data_error::classify(&error),
+                message: error.to_string(),
+            });
+        }
         self.for_namespace(&namespace)
             .await
             .map_err(|error| DataPlaneError {
@@ -385,6 +522,75 @@ impl WorkerRuntime {
                 message: error.to_string(),
             })
     }
+}
+
+/// Resolve one request's target before selecting its credential-scoped cache.
+/// A batch shares one Broker request, so none of its blocks may cross that target.
+fn request_target(
+    header: &talon_transport::FrameHeader,
+    payload: &[u8],
+) -> anyhow::Result<(Backend, String, Vec<ObjectId>)> {
+    use talon_transport::{data, MsgType, HEADER_LEN};
+    let mut frame = Vec::with_capacity(HEADER_LEN + payload.len());
+    frame.extend_from_slice(&header.encode());
+    frame.extend_from_slice(payload);
+    let object = match header.msg_type {
+        MsgType::GetRange => data::decode_request(&frame)?.1.object,
+        MsgType::GetRangeNamespace => data::decode_namespace_request(&frame)?.1.request.object,
+        MsgType::GetVersionedRange => data::decode_versioned_request(&frame)?.1.request.object,
+        MsgType::GetVersionedRangeNamespace => {
+            data::decode_versioned_namespace_request(&frame)?
+                .1
+                .request
+                .request
+                .object
+        }
+        MsgType::GetCachedRange => data::decode_cached_request(&frame)?.1.object,
+        MsgType::GetCachedRangeNamespace => {
+            data::decode_cached_namespace_request(&frame)?
+                .1
+                .request
+                .object
+        }
+        MsgType::Put => data::decode_put_header(&frame)?.1.object,
+        MsgType::AdmitCachedBlock => data::decode_cached_block_put_header(&frame)?.1.block.object,
+        MsgType::Delete => data::decode_delete(&frame)?.1.object,
+        MsgType::Control => match codec::decode_request(&frame)?.1 {
+            ControlMessage::StatObject { object } => object,
+            ControlMessage::LoadBlock { block, .. } => block.object,
+            ControlMessage::BatchLoad { blocks } => {
+                let first = blocks
+                    .first()
+                    .ok_or_else(|| anyhow::anyhow!("empty credential-scoped batch"))?;
+                let object = &first.block.object;
+                anyhow::ensure!(
+                    blocks
+                        .iter()
+                        .all(|request| request.block.object.backend == object.backend
+                            && request.block.object.bucket == object.bucket),
+                    "credential-scoped batch must use one backend and bucket"
+                );
+                return Ok((
+                    object.backend,
+                    object.bucket.clone(),
+                    blocks
+                        .into_iter()
+                        .map(|request| request.block.object)
+                        .collect(),
+                ));
+            }
+            ControlMessage::ListObjects { prefix } => {
+                let mut parts = prefix.trim_start_matches('/').splitn(3, '/');
+                let backend = parts.next().unwrap_or("").parse()?;
+                let bucket = parts.next().unwrap_or("");
+                anyhow::ensure!(!bucket.is_empty(), "listing prefix must name a bucket");
+                return Ok((backend, bucket.to_owned(), Vec::new()));
+            }
+            _ => anyhow::bail!("unsupported credential-scoped control request"),
+        },
+        _ => anyhow::bail!("unsupported credential-scoped request"),
+    };
+    Ok((object.backend, object.bucket.clone(), vec![object]))
 }
 
 #[cfg(test)]
@@ -473,6 +679,775 @@ mod tests {
             .serve_versioned(&request(), &Version::new("v1"), 64)
             .await
             .unwrap();
+    }
+
+    fn scope(digit: char) -> talon_core::backend::AccessScope {
+        format!("v1-{}", digit.to_string().repeat(64))
+            .parse()
+            .unwrap()
+    }
+
+    #[derive(Default)]
+    struct CredentialHttp {
+        exchanges: AtomicUsize,
+        gets: AtomicUsize,
+    }
+    #[async_trait::async_trait]
+    impl talon_backend::HttpClient for CredentialHttp {
+        async fn execute(
+            &self,
+            request: talon_backend::HttpRequest,
+        ) -> Result<talon_backend::HttpResponse, String> {
+            use talon_backend::http::Method;
+            if request.method == Method::Post {
+                self.exchanges.fetch_add(1, Ordering::SeqCst);
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                let external_id = body["externalId"].as_str().unwrap();
+                return Ok(talon_backend::HttpResponse {
+                    status: if external_id == "rejected" { 403 } else { 200 },
+                    headers: vec![],
+                    body: Bytes::from(
+                        serde_json::json!({
+                            "success": true,
+                            "credentials": {
+                                "tempAk": external_id, "tempSk": "test-secret",
+                                "sessionToken": "test-token", "expiredAt": "2099-01-01T00:00:00Z"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                });
+            }
+            let mut body = Bytes::new();
+            if request.method == Method::Get {
+                self.gets.fetch_add(1, Ordering::SeqCst);
+                let (start, end) = request
+                    .header("range")
+                    .unwrap()
+                    .strip_prefix("bytes=")
+                    .unwrap()
+                    .split_once('-')
+                    .unwrap();
+                let len = end.parse::<usize>().unwrap() - start.parse::<usize>().unwrap() + 1;
+                let value = if request
+                    .header("authorization")
+                    .unwrap()
+                    .contains("Credential=a/")
+                {
+                    42
+                } else {
+                    84
+                };
+                body = Bytes::from(vec![value; len]);
+            }
+            Ok(talon_backend::HttpResponse {
+                status: if request.method == Method::Get {
+                    206
+                } else {
+                    200
+                },
+                headers: vec![
+                    ("etag".into(), "\"v1\"".into()),
+                    ("content-length".into(), "64".into()),
+                ],
+                body,
+            })
+        }
+    }
+
+    fn open_broker(
+        root: &Path,
+        config: &WorkerConfig,
+        http: Arc<CredentialHttp>,
+    ) -> Arc<WorkerRuntime> {
+        let resolver = talon_backend::DefaultBackendResolver::new(
+            Backend::S3,
+            http.clone(),
+            http,
+            Arc::new(talon_backend::NoopObserver),
+        )
+        .with_legacy_backend(Arc::new(Origin::default()));
+        Arc::new(
+            WorkerRuntime::open_namespaces(
+                config,
+                Arc::new(CacheRootLock::acquire(root).unwrap()),
+                Arc::new(talon_backend::BackendRouter::new(
+                    Backend::S3,
+                    Arc::new(resolver),
+                )),
+                WorkerMetrics::new(config.capacity_bytes),
+            )
+            .unwrap(),
+        )
+    }
+
+    fn broker_config(external_id: &str) -> talon_core::BrokerConfig {
+        talon_core::BrokerConfig {
+            origin: Some(talon_core::OriginOptions {
+                endpoint: Some("s3.us-east-1.amazonaws.com".into()),
+                region: Some("us-east-1".into()),
+                ..Default::default()
+            }),
+            url: "https://broker.example/credentials".into(),
+            request: serde_json::json!({
+                "csp": "aws", "bucket": "bucket", "region": "us-east-1",
+                "roleArn": "arn:aws:iam::123456789012:role/shared",
+                "externalId": external_id
+            }),
+        }
+    }
+
+    async fn select_broker(
+        worker: &Arc<WorkerRuntime>,
+        external_id: &str,
+        mut frame: Vec<u8>,
+    ) -> Result<Arc<WorkerRuntime>, talon_transport::DataPlaneError> {
+        let broker = broker_config(external_id);
+        talon_transport::envelope::encode_credential_broker(&mut frame, &broker).unwrap();
+        let header = talon_transport::FrameHeader::decode(&frame).unwrap();
+        worker
+            .for_request(&header, &frame[talon_transport::HEADER_LEN..])
+            .await
+    }
+
+    #[tokio::test]
+    async fn request_external_ids_isolate_same_bucket_cache_and_survive_restart() {
+        use talon_transport::{codec, data, ControlMessage};
+        for paged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            cfg.l1_capacity_bytes = 8;
+            cfg.l1_page_size_bytes = 4;
+            if !paged {
+                cfg.l2_page_size_bytes = 0;
+            }
+            let http = Arc::new(CredentialHttp::default());
+            let root = open_broker(dir.path(), &cfg, http.clone());
+            let a = select_broker(&root, "a", data::encode_request(1, &request()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(
+                match a.serve(&request()).await.unwrap() {
+                    ServeOutcome::Bytes(bytes) => bytes.to_vec(),
+                    _ => panic!("first request must fetch bytes"),
+                },
+                [42; 4]
+            );
+            let cached = CachedRangeRequest {
+                object: request().object,
+                version: Version::new("v1"),
+                offset: 0,
+                len: 4,
+            };
+            let b = select_broker(&root, "b", data::encode_cached_request(2, &cached).unwrap())
+                .await
+                .unwrap();
+            assert!(b.serve_cached(&cached).await.is_err());
+            assert!(
+                root.serve_cached(&cached).await.is_err(),
+                "static cache is separate"
+            );
+            assert_eq!(
+                http.gets.load(Ordering::SeqCst),
+                1,
+                "cache-only B never fetches A's object"
+            );
+            assert!(
+                b.cached_version(&request().object).is_none(),
+                "B cannot reuse A's version lookup"
+            );
+            let load = select_broker(
+                &root,
+                "b",
+                codec::encode(
+                    3,
+                    &ControlMessage::LoadBlock {
+                        block: block(16),
+                        len: 16,
+                    },
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+            load.load_block(&block(16), 16).await.unwrap();
+            assert_eq!(b.serve_cached(&cached).await.unwrap().to_vec(), [84; 4]);
+            assert_eq!(a.serve_cached(&cached).await.unwrap().to_vec(), [42; 4]);
+            assert_ne!(a.cache_identity, b.cache_identity);
+            assert_eq!(a.namespace(), &NamespaceId::default());
+            assert_eq!(http.exchanges.load(Ordering::SeqCst), 2);
+            assert!(select_broker(
+                &root,
+                "rejected",
+                data::encode_cached_request(4, &cached).unwrap()
+            )
+            .await
+            .is_err());
+            assert_eq!(
+                root.namespace_runtimes().len(),
+                3,
+                "failed Broker must not create a cache scope"
+            );
+            let mut other = block(16);
+            other.object.bucket = "other".into();
+            let batch = codec::encode(
+                5,
+                &ControlMessage::BatchLoad {
+                    blocks: vec![
+                        talon_transport::LoadBlockRequest {
+                            block: block(16),
+                            len: 16,
+                        },
+                        talon_transport::LoadBlockRequest {
+                            block: other,
+                            len: 16,
+                        },
+                    ],
+                },
+            )
+            .unwrap();
+            assert!(select_broker(&root, "new", batch).await.is_err());
+            // Two successful acquisitions plus four rejected acquisition attempts.
+            assert_eq!(
+                http.exchanges.load(Ordering::SeqCst),
+                6,
+                "cross-bucket batch rejects before binding"
+            );
+            let gets = http.gets.load(Ordering::SeqCst);
+            drop(a);
+            drop(b);
+            drop(load);
+            drop(root);
+
+            let restarted = open_broker(dir.path(), &cfg, http.clone());
+            assert_eq!(
+                http.exchanges.load(Ordering::SeqCst),
+                6,
+                "restart does not resolve credentials"
+            );
+            assert_eq!(restarted.namespace_runtimes().len(), 3);
+            let b = select_broker(
+                &restarted,
+                "b",
+                data::encode_cached_request(6, &cached).unwrap(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(b.serve_cached(&cached).await.unwrap().to_vec(), [84; 4]);
+            assert_eq!(http.gets.load(Ordering::SeqCst), gets);
+        }
+    }
+
+    async fn check_broker_rejection_replies(use_uring: bool) {
+        use talon_transport::{codec, data, ControlMessage, DataErrorCode, Flags, HEADER_LEN};
+        use tokio::io::AsyncWriteExt;
+
+        let requests = [
+            Some(ControlMessage::StatObject {
+                object: request().object,
+            }),
+            Some(ControlMessage::ListObjects {
+                prefix: "s3/bucket/".into(),
+            }),
+            Some(ControlMessage::LoadBlock {
+                block: block(16),
+                len: 16,
+            }),
+            Some(ControlMessage::BatchLoad {
+                blocks: vec![talon_transport::LoadBlockRequest {
+                    block: block(16),
+                    len: 16,
+                }],
+            }),
+            None,
+        ];
+        let request_count = requests.len();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config();
+        let worker = open_broker(dir.path(), &cfg, Arc::new(CredentialHttp::default()));
+        let obs = Arc::new(
+            crate::WorkerObservability::new(
+                "test".into(),
+                talon_core::NodeInfo {
+                    id: talon_core::NodeId::new("worker"),
+                    address: "127.0.0.1:0".into(),
+                    role: talon_core::NodeRole::Worker,
+                },
+                "127.0.0.1:0".into(),
+                cfg.capacity_bytes,
+                worker.index.clone(),
+                worker.inflight.clone(),
+            )
+            .unwrap(),
+        );
+        obs.readiness().set_backend_ready(true);
+        obs.readiness().set_store_ready(true);
+        obs.readiness().set_control_registered(true);
+        let (ready, address) = tokio::sync::oneshot::channel();
+        let server = if use_uring {
+            #[cfg(target_os = "linux")]
+            {
+                let handle = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    let _entered = handle.enter();
+                    monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                        .with_iowq_max_workers(1, 1)
+                        .enable_timer()
+                        .build()
+                        .unwrap()
+                        .block_on(async {
+                            let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                            ready.send(listener.local_addr().unwrap()).unwrap();
+                            for _ in 0..request_count {
+                                let (stream, _) = listener.accept().await.unwrap();
+                                crate::uring_conn::handle_conn(stream, worker.clone(), obs.clone())
+                                    .await
+                                    .unwrap();
+                            }
+                        });
+                })
+            }
+            #[cfg(not(target_os = "linux"))]
+            unreachable!("io_uring requires Linux")
+        } else {
+            tokio::spawn(async move {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                ready.send(listener.local_addr().unwrap()).unwrap();
+                for _ in 0..request_count {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    crate::tokio_conn::handle_conn(stream, worker.clone(), obs.clone())
+                        .await
+                        .unwrap();
+                }
+            })
+        };
+        let address = address.await.unwrap();
+        let mut replies = Vec::new();
+        for (index, message) in requests.iter().enumerate() {
+            let request_id = 17 + index as u32;
+            let mut frame = match message {
+                Some(message) => codec::encode(request_id, message).unwrap(),
+                None => data::encode_request(request_id, &request()).unwrap(),
+            };
+            talon_transport::envelope::encode_credential_broker(
+                &mut frame,
+                &broker_config("rejected"),
+            )
+            .unwrap();
+            let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+            stream.write_all(&frame).await.unwrap();
+            replies.push(
+                talon_transport::read_frame(&mut stream, std::time::Duration::from_secs(5))
+                    .await
+                    .unwrap(),
+            );
+        }
+        server.await.unwrap();
+
+        for (index, (header, body)) in replies.into_iter().enumerate() {
+            assert_eq!(header.request_id, 17 + index as u32);
+            assert_eq!(header.version, 4);
+            let diagnostic = if requests[index].is_some() {
+                assert_eq!(header.msg_type, talon_transport::MsgType::Control);
+                assert!(!header.flags.contains(Flags::ERROR));
+                let mut frame = Vec::with_capacity(HEADER_LEN + body.len());
+                frame.extend_from_slice(&header.encode());
+                frame.extend_from_slice(&body);
+                match codec::decode(&frame).unwrap().1 {
+                    ControlMessage::ControlFailure { code, message } if index < 2 => {
+                        assert_eq!(code, DataErrorCode::Origin);
+                        message
+                    }
+                    ControlMessage::Ack { ok: false, detail } if index >= 2 => detail.unwrap(),
+                    reply => panic!("unexpected rejection for {:?}: {reply:?}", requests[index]),
+                }
+            } else {
+                assert_eq!(header.msg_type, talon_transport::MsgType::GetRange);
+                assert!(header.flags.contains(Flags::ERROR));
+                let error = data::decode_error_payload(&body);
+                assert_eq!(error.code, DataErrorCode::Origin);
+                error.message
+            };
+            assert!(
+                diagnostic.contains("broker returned HTTP status 403"),
+                "lost broker diagnostic: {diagnostic}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tokio_broker_rejections_preserve_reply_type_and_diagnostic() {
+        check_broker_rejection_replies(false).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn uring_broker_rejections_preserve_reply_type_and_diagnostic() {
+        check_broker_rejection_replies(true).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn native_uring_binds_cold_v4_credentials_before_cache_access() {
+        use talon_transport::{data, Flags, FrameHeader, HEADER_LEN};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = config();
+        cfg.l2_page_size_bytes = 0;
+        let http = Arc::new(CredentialHttp::default());
+        let worker = open_broker(dir.path(), &cfg, http.clone());
+        let obs = Arc::new(
+            crate::WorkerObservability::new(
+                "test".into(),
+                talon_core::NodeInfo {
+                    id: talon_core::NodeId::new("worker"),
+                    address: "127.0.0.1:0".into(),
+                    role: talon_core::NodeRole::Worker,
+                },
+                "127.0.0.1:0".into(),
+                cfg.capacity_bytes,
+                worker.index.clone(),
+                worker.inflight.clone(),
+            )
+            .unwrap(),
+        );
+        obs.readiness().set_backend_ready(true);
+        obs.readiness().set_store_ready(true);
+        obs.readiness().set_control_registered(true);
+        let handle = tokio::runtime::Handle::current();
+        let (ready, address) = tokio::sync::oneshot::channel();
+        let server = std::thread::spawn(move || {
+            // Production ring threads enter the worker's Tokio handle so a
+            // cold Broker exchange can spawn credential initialization there.
+            let _entered = handle.enter();
+            monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+                .with_iowq_max_workers(1, 1)
+                .enable_timer()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    let listener = monoio::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                    ready.send(listener.local_addr().unwrap()).unwrap();
+                    let (stream, _) = listener.accept().await.unwrap();
+                    crate::uring_conn::handle_conn(stream, worker, obs)
+                        .await
+                        .unwrap();
+                });
+        });
+        let mut stream = tokio::net::TcpStream::connect(address.await.unwrap())
+            .await
+            .unwrap();
+        let cached = CachedRangeRequest {
+            object: request().object,
+            version: Version::new("v1"),
+            offset: 0,
+            len: 4,
+        };
+        for (id, cached_only, expected) in [
+            ("a", true, None),
+            ("a", false, Some(vec![42; 4])),
+            ("b", true, None),
+            ("b", false, Some(vec![84; 4])),
+            ("a", true, Some(vec![42; 4])),
+        ] {
+            let mut frame = if cached_only {
+                data::encode_cached_request(1, &cached).unwrap()
+            } else {
+                data::encode_request(1, &request()).unwrap()
+            };
+            talon_transport::envelope::encode_credential_broker(&mut frame, &broker_config(id))
+                .unwrap();
+            stream.write_all(&frame).await.unwrap();
+            let mut header = [0; HEADER_LEN];
+            stream.read_exact(&mut header).await.unwrap();
+            let header = FrameHeader::decode(&header).unwrap();
+            let mut body = vec![0; header.length as usize];
+            stream.read_exact(&mut body).await.unwrap();
+            assert_eq!(header.version, 4);
+            if let Some(expected) = expected {
+                assert!(!header.flags.contains(Flags::ERROR));
+                assert_eq!(body, expected);
+            } else {
+                assert!(header.flags.contains(Flags::ERROR));
+                assert_eq!(
+                    data::decode_error_payload(&body).code,
+                    talon_transport::DataErrorCode::CacheMiss
+                );
+            }
+        }
+        assert_eq!(http.exchanges.load(Ordering::SeqCst), 2);
+        assert_eq!(http.gets.load(Ordering::SeqCst), 2);
+        drop(stream);
+        tokio::task::spawn_blocking(move || server.join().unwrap())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_scopes_isolate_admissions_load_versions_and_l1() {
+        for paged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            cfg.l1_capacity_bytes = 8;
+            cfg.l1_page_size_bytes = 4;
+            if !paged {
+                cfg.l2_page_size_bytes = 0;
+            }
+            let root = open(dir.path(), &cfg, Arc::default());
+            let registry = root.registry().unwrap();
+            let namespace = NamespaceId::named("analytics");
+            let a = registry
+                .resolve(&namespace, Some(scope('a')), Arc::new(Origin::default()))
+                .await
+                .unwrap();
+            let b = registry
+                .resolve(&namespace, Some(scope('b')), Arc::new(Origin::default()))
+                .await
+                .unwrap();
+            let cached = CachedRangeRequest {
+                object: request().object,
+                version: Version::new("v1"),
+                offset: 0,
+                len: 4,
+            };
+            a.admit_cached_block(
+                &CachedBlockPutRequest {
+                    block: block(16),
+                    object_len: 64,
+                    body_len: 16,
+                },
+                Bytes::from_static(&[42; 16]),
+            )
+            .await
+            .unwrap();
+            assert_eq!(a.serve_cached(&cached).await.unwrap().to_vec(), [42; 4]);
+            assert!(b.serve_cached(&cached).await.is_err());
+            assert!(root.serve_cached(&cached).await.is_err());
+            a.stat_object(&request().object).await.unwrap();
+            assert!(a.cached_version(&request().object).is_some());
+            assert!(b.cached_version(&request().object).is_none());
+            b.load_block(&block(16), 16).await.unwrap();
+            assert_eq!(
+                b.serve_cached(&cached).await.unwrap().to_vec(),
+                [0, 1, 2, 3]
+            );
+            assert_eq!(a.serve_cached(&cached).await.unwrap().to_vec(), [42; 4]);
+            assert_eq!(a.namespace(), &namespace);
+            assert_eq!(b.namespace(), &namespace);
+            assert!(Arc::ptr_eq(&a.rate_limiter, &b.rate_limiter));
+            assert!(Arc::ptr_eq(&a.load_slots, &b.load_slots));
+            assert!(Arc::ptr_eq(&a.load_bytes, &b.load_bytes));
+            assert!(registry.l1_budget.residency().1 <= 8);
+            assert_eq!(
+                a.page_gc_metrics.tti_seconds.get(),
+                b.page_gc_metrics.tti_seconds.get()
+            );
+            b.page_gc_metrics.dirty_blocks.set(3.0);
+            a.page_gc_metrics.dirty_blocks.set(7.0);
+            assert_eq!(b.page_gc_metrics.dirty_blocks.get(), 3.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn recovered_scope_waits_for_binding_and_local_eviction_remains_available() {
+        for paged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            if !paged {
+                cfg.l2_page_size_bytes = 0;
+            }
+            let root = open(dir.path(), &cfg, Arc::default());
+            let namespace = NamespaceId::named("dynamic-only");
+            let scoped = root
+                .registry()
+                .unwrap()
+                .resolve(&namespace, Some(scope('a')), Arc::new(Origin::default()))
+                .await
+                .unwrap();
+            read(&scoped).await;
+            drop(scoped);
+            drop(root);
+
+            let restarted = open(dir.path(), &cfg, Arc::default());
+            let registry = restarted.registry().unwrap();
+            let recovered = registry
+                .snapshot()
+                .into_iter()
+                .find(|worker| worker.namespace() == &namespace)
+                .unwrap();
+            assert!(recovered.backend.get().is_none());
+            assert!(super::super::stale_gc::StaleGc::new(&cfg)
+                .run_slice(&recovered)
+                .await
+                .is_none());
+            assert!(recovered
+                .serve_versioned(&request(), &Version::new("v1"), 64)
+                .await
+                .is_err());
+            let origin = Arc::new(Origin::default());
+            let rebound = registry
+                .resolve(&namespace, Some(scope('a')), origin.clone())
+                .await
+                .unwrap();
+            assert!(Arc::ptr_eq(&recovered, &rebound));
+            read(&rebound).await;
+            assert_eq!(
+                origin.reads.load(Ordering::SeqCst),
+                0,
+                "rebinding reuses only this scope's persisted bytes"
+            );
+            rebound.evict_to_target(0).await;
+            assert_eq!(rebound.resident_bytes(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_scope_initializer_is_published_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(dir.path(), &config(), Arc::default());
+        let registry = root.registry().unwrap();
+        let guard = registry.initialize.lock().await;
+        let pending = registry.clone();
+        let task = tokio::spawn(async move {
+            pending
+                .resolve(
+                    &NamespaceId::default(),
+                    Some(scope('a')),
+                    Arc::new(Origin::default()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while registry.initializers.active_count() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let _ = task.await;
+        drop(guard);
+        root.drain_namespace_initializers().await;
+        let a = registry
+            .resolve(
+                &NamespaceId::default(),
+                Some(scope('a')),
+                Arc::new(Origin::default()),
+            )
+            .await
+            .unwrap();
+        let b = registry
+            .resolve(
+                &NamespaceId::default(),
+                Some(scope('a')),
+                Arc::new(Origin::default()),
+            )
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(root.namespace_runtimes().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_scopes_do_not_coalesce_origin_fills() {
+        for paged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            if !paged {
+                cfg.l2_page_size_bytes = 0;
+            }
+            let root = open(dir.path(), &cfg, Arc::default());
+            let registry = root.registry().unwrap();
+            let origin = Arc::new(Origin::default());
+            let a = registry
+                .resolve(&NamespaceId::default(), Some(scope('a')), origin.clone())
+                .await
+                .unwrap();
+            let b = registry
+                .resolve(&NamespaceId::default(), Some(scope('b')), origin.clone())
+                .await
+                .unwrap();
+            tokio::join!(read(&a), read(&b));
+            assert_eq!(origin.reads.load(Ordering::SeqCst), 2);
+            assert_eq!(a.resident_bytes(), b.resident_bytes());
+        }
+    }
+
+    #[tokio::test]
+    async fn credential_scopes_consume_the_existing_total_runtime_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = open(dir.path(), &config(), Arc::default());
+        let registry = root.registry().unwrap();
+        // Populate only registry bookkeeping to exercise the boundary without
+        // allocating thousands of independent disk stores in a unit test.
+        let existing = registry.snapshot().pop().unwrap();
+        {
+            let mut workers = registry.workers.write().unwrap();
+            for n in 0..MAX_CACHE_RUNTIMES - 1 {
+                workers.insert(
+                    CacheIdentity::new(
+                        &NamespaceId::default(),
+                        Some(format!("v1-{n:064x}").parse().unwrap()),
+                    ),
+                    existing.clone(),
+                );
+            }
+        }
+        assert!(registry
+            .resolve(
+                &NamespaceId::default(),
+                Some(scope('f')),
+                Arc::new(Origin::default())
+            )
+            .await
+            .is_err());
+        assert!(root
+            .for_namespace(&NamespaceId::named("overflow"))
+            .await
+            .is_err());
+        assert!(!dir.path().join("default/scopes").exists());
+        assert!(!dir.path().join("overflow").exists());
+    }
+
+    #[tokio::test]
+    async fn restart_accounts_for_persisted_credential_scopes_without_requests() {
+        for paged in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            if !paged {
+                cfg.l2_page_size_bytes = 0;
+            }
+            drop(open(dir.path(), &cfg, Arc::default()));
+            let scope = dir
+                .path()
+                .join("default/scopes")
+                .join(format!("v1-{}", "a".repeat(64)));
+            std::fs::create_dir_all(&scope).unwrap();
+            if paged {
+                let store = PagedBlockStore::open(scope.join("paged"), 4).unwrap();
+                store.write_sidecar(&block(16), 16).unwrap();
+                store
+                    .put_page(&block(16), PageIndex(0), Bytes::from_static(b"data"))
+                    .unwrap();
+            } else {
+                let store = WholeBlockStore::open(&scope).unwrap();
+                store
+                    .put(&block(16), Bytes::from_static(b"data"))
+                    .await
+                    .unwrap();
+            }
+            let restarted = open(dir.path(), &cfg, Arc::default());
+            let runtimes = restarted.namespace_runtimes();
+            assert_eq!(runtimes.len(), 2, "idle scopes must be recovered");
+            assert_eq!(
+                runtimes
+                    .iter()
+                    .map(|worker| worker.resident_bytes())
+                    .sum::<u64>(),
+                disk_unit()
+            );
+        }
     }
 
     #[tokio::test]
@@ -1150,7 +2125,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = config();
         cfg.l2_page_size_bytes = 0;
-        let worker = open(dir.path(), &cfg, Arc::default());
+        let worker = open_broker(dir.path(), &cfg, Arc::new(CredentialHttp::default()));
         let obs = Arc::new(
             crate::WorkerObservability::new(
                 "test".into(),
@@ -1330,6 +2305,63 @@ mod tests {
         assert_eq!(
             exchange(&mut stream, cached(), None, &[]).await.1,
             [0, 1, 2, 3]
+        );
+        // v4 admissions retain the raw response body and echo the request
+        // version. This connection can switch credentials just like namespaces.
+        let mut admission = data::encode_cached_block_put_header(
+            9,
+            &CachedBlockPutRequest {
+                block: block(16),
+                object_len: 64,
+                body_len: 16,
+            },
+        )
+        .unwrap();
+        talon_transport::envelope::encode_credential_broker(&mut admission, &broker_config("a"))
+            .unwrap();
+        let (header, body) = exchange(&mut stream, admission, None, &[51; 16]).await;
+        assert_eq!(header.version, 4);
+        assert!(!header.flags.contains(Flags::ERROR));
+        assert!(body.is_empty());
+        for (id, expected) in [("a", Some(vec![51; 4])), ("b", None)] {
+            let mut frame = cached();
+            talon_transport::envelope::encode_credential_broker(&mut frame, &broker_config(id))
+                .unwrap();
+            let (header, body) = exchange(&mut stream, frame, None, &[]).await;
+            assert_eq!(header.version, 4);
+            if let Some(expected) = expected {
+                assert!(!header.flags.contains(Flags::ERROR));
+                assert_eq!(body, expected);
+            } else {
+                assert_eq!(
+                    data::decode_error_payload(&body).code,
+                    talon_transport::DataErrorCode::CacheMiss
+                );
+            }
+        }
+        let scoped = select_broker(&worker, "a", cached()).await.unwrap();
+        let scope_root = scoped.store.root().to_path_buf();
+        std::fs::rename(&scope_root, scope_root.with_extension("saved")).unwrap();
+        std::fs::write(&scope_root, b"block disk writes").unwrap();
+        let mut other = block(16);
+        other.object.object_path = "failed-admission".into();
+        let mut admission = data::encode_cached_block_put_header(
+            10,
+            &CachedBlockPutRequest {
+                block: other,
+                object_len: 64,
+                body_len: 16,
+            },
+        )
+        .unwrap();
+        talon_transport::envelope::encode_credential_broker(&mut admission, &broker_config("a"))
+            .unwrap();
+        let (header, body) = exchange(&mut stream, admission, None, &[51; 16]).await;
+        assert_eq!(header.version, 4);
+        assert!(header.flags.contains(Flags::ERROR));
+        assert_eq!(
+            data::decode_error_payload(&body).code,
+            talon_transport::DataErrorCode::Unavailable
         );
         drop(stream);
         server.await.unwrap();

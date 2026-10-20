@@ -65,6 +65,12 @@ impl GcsConfig {
     }
 }
 
+/// OAuth access token for GCP request authentication.
+pub(crate) struct GcpBearerToken {
+    // Share the token with outgoing requests without copying its contents.
+    pub(crate) token: Arc<String>,
+}
+
 /// GCS HMAC access ID and secret for XML API requests.
 ///
 /// Deliberately omits `Debug` so formatting credentials cannot expose the secret.

@@ -1,6 +1,6 @@
 //! Persistent SDK client driven by scripts/rolling_upgrade_e2e.py.
 use std::io::{BufRead, Write};
-use talon_rust_client::{parse_uri, ClientBuilder, ObjectStat};
+use talon_rust_client::{parse_uri, ClientBuilder, ObjectStat, RequestOptions};
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,7 +24,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     0,
                     Some(8192),
                     Some(&stat),
-                    &talon_rust_client::RequestOptions::default(),
+                    &RequestOptions::default(),
                 )
                 .await
             {
@@ -37,10 +37,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(error) => println!("ERR {:?}", error.kind()),
             },
-            "stat" => match client
-                .stat(&object, &talon_rust_client::RequestOptions::default())
-                .await
-            {
+            "stat" => match client.stat(&object, &RequestOptions::default()).await {
                 Ok(_) => println!("OK stat"),
                 Err(error) => println!("ERR {:?}", error.kind()),
             },
