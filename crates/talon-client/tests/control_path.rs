@@ -63,6 +63,129 @@ async fn round_trip(addr: &str, msg: &ControlMessage) -> ControlMessage {
 }
 
 #[tokio::test]
+async fn cli_namespace_and_properties_reach_worker_without_tracing() {
+    let broker = r#"{"url":"http://broker.example/credentials?token=a=b","request":{"csp":"aws","region":"us-west-2","bucket":"bucket","roleArn":"fixture"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#;
+    for (dynamic, namespace) in [
+        (true, "analytics"),
+        (false, "analytics"),
+        (true, "default"),
+        (false, "default"),
+    ] {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let (header, payload) =
+                talon_transport::read_frame(&mut stream, talon_transport::DEFAULT_READ_TIMEOUT)
+                    .await
+                    .unwrap();
+            let (metadata, _) = talon_transport::envelope::decode(&header, &payload).unwrap();
+            assert_eq!(
+                metadata.namespace.unwrap_or_default().effective_name(),
+                namespace
+            );
+            assert_eq!(
+                header.version,
+                if dynamic {
+                    4
+                } else if namespace == "default" {
+                    1
+                } else {
+                    3
+                }
+            );
+            if dynamic {
+                let config = metadata.credential_broker.unwrap();
+                assert_eq!(
+                    config.config().url,
+                    "http://broker.example/credentials?token=a=b"
+                );
+                assert_eq!(config.config().request["roleArn"], "fixture");
+            } else {
+                assert!(metadata.credential_broker.is_none());
+            }
+            let mut reply =
+                FrameHeader::new(talon_transport::MsgType::GetRange, header.request_id, 4);
+            reply.version = header.version;
+            stream.write_all(&reply.encode()).await.unwrap();
+            stream.write_all(b"data").await.unwrap();
+        });
+        let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_talon-client"));
+        command
+            .args([
+                "--namespace",
+                namespace,
+                "--worker",
+                &address.to_string(),
+                "--path",
+                "/s3/bucket/key",
+                "--len",
+                "4",
+            ])
+            .env_clear()
+            .env("RUST_LOG", "off")
+            .kill_on_drop(true);
+        if dynamic {
+            command
+                .arg("--request-option")
+                .arg(format!("credential_broker={broker}"));
+        }
+        let output = tokio::time::timeout(Duration::from_secs(10), command.output())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        server.await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn cli_rejects_missing_origin_settings_before_dispatch() {
+    for suffix in [
+        "",
+        r#", "origin":null"#,
+        r#", "origin":{}"#,
+        r#", "origin":{"request_timeout_ms":17}"#,
+        r#", "origin":{"endpoint":null}"#,
+        r#", "origin":{"endpoint":""}"#,
+        r#", "origin":{"endpoint":" \t\n"}"#,
+        r#", "origin":{"endpoint":"storage.example"}"#,
+        r#", "origin":{"endpoint":"storage.example","region":null}"#,
+        r#", "origin":{"endpoint":"storage.example","region":""}"#,
+        r#", "origin":{"endpoint":"storage.example","region":" \t\n"}"#,
+    ] {
+        let broker = format!(
+            r#"credential_broker={{"url":"http://broker/PRIVATE_FIXTURE_MARKER","request":{{"csp":"aws","region":"broker-region"}}{suffix}}}"#
+        );
+        let output = tokio::process::Command::new(env!("CARGO_BIN_EXE_talon-client"))
+            .args([
+                "--worker",
+                "127.0.0.1:1",
+                "--path",
+                "/s3/bucket/key",
+                "--len",
+                "0",
+                "--request-option",
+                &broker,
+            ])
+            .env_clear()
+            .env("RUST_LOG", "off")
+            .kill_on_drop(true)
+            .output()
+            .await
+            .unwrap();
+        assert!(!output.status.success());
+        let error = String::from_utf8_lossy(&output.stderr);
+        assert!(error.contains("credential_broker origin "), "{error}");
+        assert!(!error.contains("PRIVATE_FIXTURE_MARKER"));
+    }
+}
+
+#[tokio::test]
 async fn control_path_register_lookup_resolve() {
     let addr = "127.0.0.1:7411";
     let bin = coordinator_bin();

@@ -1,7 +1,9 @@
 package io.milvus.talon;
 
+import java.io.ByteArrayOutputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.nio.charset.StandardCharsets;
 
 /**
  * The 16-byte frame header that prefixes every message on both planes.
@@ -26,7 +28,7 @@ public final class Frame {
     public static final int HEADER_LEN = 16;
     /** Magic prefix, ASCII "TL". */
     public static final int MAGIC = 0x544C;
-    /** Default protocol version; tracing uses v2 and named namespaces use v3. */
+    /** Default protocol version; tracing uses v2, named namespaces v3 and credential properties v4. */
     public static final int PROTOCOL_VERSION = 1;
 
     /** Set when the body is an error message rather than a payload. */
@@ -127,9 +129,9 @@ public final class Frame {
                             magic, MAGIC));
         }
         int version = b.get() & 0xFF;
-        if (version != 1 && version != 2 && version != 3) {
+        if (version != 1 && version != 2 && version != 3 && version != 4) {
             throw new ProtocolException(
-                    "unsupported protocol version " + version + "; this client supports 1, 2 and 3");
+                    "unsupported protocol version " + version);
         }
         MsgType type = MsgType.from(b.get() & 0xFF);
         int flags = b.getShort() & 0xFFFF;
@@ -140,5 +142,70 @@ public final class Frame {
             throw new ProtocolException("payload length exceeds 2^31: " + (length & 0xFFFFFFFFL));
         }
         return new Frame(version, type, flags, requestId, length);
+    }
+
+    /** Assemble request context in the protocol layer; credentials never depend on trace capability. */
+    static byte[] envelope(byte[] frame, String endpoint) {
+        Telemetry.CallContext current = Telemetry.currentContext();
+        boolean trace = Telemetry.canSend(endpoint);
+        return envelope(frame, trace ? current.parent : null, trace ? current.readId : null,
+                current == null ? "default" : current.namespace, RequestOptions.currentBroker());
+    }
+
+    static byte[] envelope(byte[] frame, TraceContext parent, byte[] readId) {
+        return traceEnvelope(frame, parent, readId, "default");
+    }
+
+    static byte[] envelope(byte[] frame, TraceContext parent, byte[] readId,
+                           String namespace, BrokerDescriptor broker) {
+        byte[] traced = traceEnvelope(frame, parent, readId, namespace);
+        if (broker == null) return traced;
+        Frame.decode(traced);
+        int version = traced[2] & 255;
+        if (version != 1 && version != 2 && version != 3) throw new ProtocolException("request already enveloped");
+        // v4 keeps the existing trace and namespace TLVs and adds the broker property.
+        if (version != 1 && traced.length < 18) throw new ProtocolException("request metadata truncated");
+        int oldMetadata = version == 1 ? 0 : ByteBuffer.wrap(traced).getShort(16) & 65535;
+        int business = version == 1 ? Frame.HEADER_LEN : 18 + oldMetadata;
+        int metadata = oldMetadata + 3 + broker.encodedLength();
+        if (business > traced.length || oldMetadata > 1024 || metadata > 1024 + 3 + BrokerDescriptor.MAX_BYTES) {
+            throw new ProtocolException("request metadata exceeds size limit");
+        }
+        byte[] result = new byte[18 + metadata + traced.length - business];
+        System.arraycopy(traced, 0, result, 0, Frame.HEADER_LEN);
+        if (oldMetadata != 0) System.arraycopy(traced, 18, result, 18, oldMetadata);
+        int offset = 18 + oldMetadata;
+        result[offset] = 6;
+        ByteBuffer.wrap(result).putShort(offset + 1, (short) broker.encodedLength());
+        broker.writeTo(result, offset + 3);
+        System.arraycopy(traced, business, result, 18 + metadata, traced.length - business);
+        result[2] = 4;
+        ByteBuffer.wrap(result).putInt(12, result.length - Frame.HEADER_LEN).putShort(16, (short) metadata);
+        return result;
+    }
+
+    private static byte[] traceEnvelope(byte[] frame, TraceContext parent, byte[] readId, String namespace) {
+        if (parent == null && namespace.equals("default")) return frame;
+        ByteArrayOutputStream metadata = new ByteArrayOutputStream();
+        if (parent != null) {
+            tlv(metadata, 1, parent.traceparent.getBytes(StandardCharsets.US_ASCII));
+            if (!parent.tracestate.isEmpty()) tlv(metadata, 2, parent.tracestate.getBytes(StandardCharsets.US_ASCII));
+            if (readId != null) tlv(metadata, 3, readId);
+        }
+        boolean named = !namespace.equals("default");
+        // v3 makes namespace routing mandatory: older peers must reject it, never ignore it.
+        if (named) tlv(metadata, 5, namespace.getBytes(StandardCharsets.US_ASCII));
+        byte[] values = metadata.toByteArray();
+        byte[] result = new byte[frame.length + 2 + values.length];
+        System.arraycopy(frame, 0, result, 0, Frame.HEADER_LEN);
+        result[2] = (byte) (named ? 3 : 2);
+        ByteBuffer.wrap(result).putInt(12, result.length - Frame.HEADER_LEN).putShort(16, (short) values.length);
+        System.arraycopy(values, 0, result, 18, values.length);
+        System.arraycopy(frame, 16, result, 18 + values.length, frame.length - 16);
+        return result;
+    }
+
+    private static void tlv(ByteArrayOutputStream out, int key, byte[] value) {
+        out.write(key); out.write(value.length >>> 8); out.write(value.length & 255); out.writeBytes(value);
     }
 }

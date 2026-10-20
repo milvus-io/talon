@@ -25,7 +25,6 @@ use talon_core::{
 use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
-use crate::S3PresignedQuery;
 
 /// Validated S3 multipart request metadata supplied by a protocol adapter.
 #[derive(Clone, Copy)]
@@ -76,7 +75,12 @@ impl S3Config {
     /// A default AWS-style config for a region.
     pub fn aws(region: impl Into<String>) -> Self {
         let region = region.into();
-        let endpoint = format!("s3.{region}.amazonaws.com");
+        let suffix = if region.starts_with("cn-") {
+            "amazonaws.com.cn"
+        } else {
+            "amazonaws.com"
+        };
+        let endpoint = format!("s3.{region}.{suffix}");
         Self {
             region,
             endpoint,
@@ -95,6 +99,49 @@ pub struct S3Credentials {
     pub secret_access_key: String,
     /// Optional session token (STS).
     pub session_token: Option<String>,
+}
+
+/// An origin-issued S3 presigned query, preserved byte-for-byte after an
+/// optional leading `?`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct S3PresignedQuery(String);
+
+impl S3PresignedQuery {
+    /// Validate the credential shape without verifying its signature.
+    pub fn new(raw: impl Into<String>) -> std::result::Result<Self, String> {
+        let raw = raw.into();
+        let query = raw.strip_prefix('?').unwrap_or(&raw);
+        if query.is_empty()
+            || query.contains('#')
+            || query.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err("S3 presigned query credential is malformed".into());
+        }
+        for required in [
+            "X-Amz-Algorithm",
+            "X-Amz-Credential",
+            "X-Amz-Date",
+            "X-Amz-Expires",
+            "X-Amz-SignedHeaders",
+            "X-Amz-Signature",
+        ] {
+            if !url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == required) {
+                return Err("S3 presigned query credential is incomplete".into());
+            }
+        }
+        Ok(Self(query.to_owned()))
+    }
+
+    /// Access the exact raw query for origin request construction.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for S3PresignedQuery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("S3PresignedQuery([REDACTED])")
+    }
 }
 
 /// An S3 `BackendStore` over a pluggable HTTP client.
@@ -338,6 +385,7 @@ impl S3Backend {
         obj: &ObjectId,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut request = self.build_head(obj);
         request.headers.extend_from_slice(conditions);
         self.http.execute(self.signed(request)).await
@@ -352,6 +400,7 @@ impl S3Backend {
         &self,
         bucket: &str,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let request = HttpRequest::new(
             Method::Head,
             self.bucket_url(bucket),
@@ -367,6 +416,7 @@ impl S3Backend {
         range: Option<(u64, u64)>,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpStreamResponse, String> {
+        self.credentials.prepare().await?;
         let mut headers = self.session_headers();
         if let Some((start, end)) = range {
             headers.push(("range".into(), format!("bytes={start}-{end}")));
@@ -485,6 +535,7 @@ impl S3Backend {
         max_keys: u32,
         encoding_type: Option<&str>,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut query = format!("list-type=2&max-keys={}", max_keys.min(1000));
         if !prefix.is_empty() {
             query.push_str("&prefix=");
@@ -522,6 +573,7 @@ impl S3Backend {
         max_keys: u32,
         encoding_type: Option<&str>,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut query = format!("max-keys={}", max_keys.min(1000));
         if !prefix.is_empty() {
             query.push_str("&prefix=");
@@ -557,6 +609,7 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut request = self.build_streamed_put(obj, len, None);
         request.headers.extend_from_slice(headers);
         let request = self.signed_with_payload_hash(request, payload_hash);
@@ -572,6 +625,7 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut request = self.build_streamed_put(obj, len, None);
         request.headers.extend_from_slice(headers);
         let request = self.signed_with_payload_hash(request, payload_hash);
@@ -585,6 +639,7 @@ impl S3Backend {
         obj: &ObjectId,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut request = self.build_streamed_put(obj, 0, None);
         request.headers.extend_from_slice(headers);
         self.http.execute(self.signed(request)).await
@@ -596,6 +651,7 @@ impl S3Backend {
         obj: &ObjectId,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut request = self.build_delete(obj);
         request.headers.extend_from_slice(conditions);
         self.http.execute(self.signed(request)).await
@@ -611,6 +667,7 @@ impl S3Backend {
         headers: &[(String, String)],
         body: bytes::Bytes,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut request = HttpRequest::with_body(
             Method::Post,
             format!("{}?delete=", self.bucket_url(bucket)),
@@ -629,6 +686,7 @@ impl S3Backend {
         &self,
         request: S3MultipartRequest<'_>,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut outgoing = HttpRequest::new(
             request.method,
             format!("{}?{}", self.object_url(request.object), request.query),
@@ -646,6 +704,7 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut outgoing = HttpRequest::new(
             request.method,
             format!("{}?{}", self.object_url(request.object), request.query),
@@ -667,6 +726,7 @@ impl S3Backend {
         len: u64,
         payload_hash: &str,
     ) -> std::result::Result<HttpResponse, String> {
+        self.credentials.prepare().await?;
         let mut outgoing = HttpRequest::new(
             request.method,
             format!("{}?{}", self.object_url(request.object), request.query),
@@ -745,6 +805,7 @@ impl BackendStore for S3Backend {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
+        self.credentials.prepare().await.map_err(Error::Backend)?;
         let req = self.signed(self.build_get_if_match(obj, offset, len, if_match));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 206 (range honored) or 200 (server ignored Range, returned the whole
@@ -790,6 +851,7 @@ impl BackendStore for S3Backend {
         cursor: Option<&str>,
         max_keys: u32,
     ) -> Result<ListPage> {
+        self.credentials.prepare().await.map_err(Error::Backend)?;
         // S3 caps a page at 1000 regardless of what is asked, so clamping here
         // keeps the request honest rather than relying on the service to
         // silently reduce it.
@@ -822,6 +884,7 @@ impl BackendStore for S3Backend {
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
+        self.credentials.prepare().await.map_err(Error::Backend)?;
         let req = self.signed(self.build_head(obj));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 404 {
@@ -861,6 +924,7 @@ impl BackendStore for S3Backend {
         body: bytes::Bytes,
         if_match: Option<&Version>,
     ) -> Result<Version> {
+        self.credentials.prepare().await.map_err(Error::Backend)?;
         let req = self.signed(self.build_put(obj, body, if_match));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         if resp.status == 412 {
@@ -894,6 +958,7 @@ impl BackendStore for S3Backend {
     }
 
     async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        self.credentials.prepare().await.map_err(Error::Backend)?;
         let payload_hash = tokio::task::spawn_blocking({
             let path = path.to_path_buf();
             move || hash_file(path, len)
@@ -925,6 +990,7 @@ impl BackendStore for S3Backend {
     }
 
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        self.credentials.prepare().await.map_err(Error::Backend)?;
         let req = self.signed(self.build_delete(obj));
         let resp = self.http.execute(req).await.map_err(Error::Backend)?;
         // 2xx or 404 are both success (delete is idempotent).
@@ -946,6 +1012,20 @@ mod tests {
     use crate::http::HttpResponse;
     use std::sync::Mutex;
     use talon_core::Backend;
+
+    #[test]
+    fn presigned_query_preserves_raw_value_and_redacts_secrets() {
+        let credential = S3PresignedQuery::new(
+            "?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=a%2Fb&X-Amz-Date=d&X-Amz-Expires=60&X-Amz-SignedHeaders=host&X-Amz-Signature=secret",
+        )
+        .unwrap();
+        assert!(credential.expose_secret().contains("a%2Fb"));
+        assert_eq!(format!("{credential:?}"), "S3PresignedQuery([REDACTED])");
+        assert!(!format!("{credential:?}").contains("secret"));
+
+        let error = S3PresignedQuery::new("X-Amz-Signature=secret").unwrap_err();
+        assert!(!error.contains("secret"));
+    }
 
     /// A mock client that records the last request and returns a canned response.
     struct MockHttp {

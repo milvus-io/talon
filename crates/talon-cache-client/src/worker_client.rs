@@ -821,13 +821,14 @@ impl WriteClient {
     /// instead of risking a duplicate backend write.
     pub async fn put_object(&self, object: &ObjectId, body: &[u8]) -> Result<Version, WorkerError> {
         let req_id = RequestId::next();
-        let header = encode_put_header(
+        let mut header = encode_put_header(
             req_id.0,
             &PutRequest {
                 object: object.clone(),
                 body_len: body.len() as u64,
             },
         )?;
+        talon_transport::envelope::outbound(&mut header, &self.addr)?;
         match self.put_exchange(&header, body).await {
             Ok(version) => Ok(version),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -871,13 +872,14 @@ impl WriteClient {
             return Err(short_file_error(actual_len, len));
         }
         let req_id = RequestId::next();
-        let header = encode_put_header(
+        let mut header = encode_put_header(
             req_id.0,
             &PutRequest {
                 object: object.clone(),
                 body_len: len,
             },
         )?;
+        talon_transport::envelope::outbound(&mut header, &self.addr)?;
         match self.put_file_exchange(&header, &mut file, len).await {
             Ok(version) => Ok(version),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -977,12 +979,13 @@ impl WriteClient {
     /// Delete `object` at the worker (which deletes it at the backend).
     pub async fn delete_object(&self, object: &ObjectId) -> Result<(), WorkerError> {
         let req_id = RequestId::next();
-        let frame = encode_delete(
+        let mut frame = encode_delete(
             req_id.0,
             &DeleteRequest {
                 object: object.clone(),
             },
         )?;
+        talon_transport::envelope::outbound(&mut frame, &self.addr)?;
         match self.delete_exchange(&frame).await {
             Ok(()) => Ok(()),
             Err((true, true, err)) if err.is_transport_failure() => {
@@ -1219,6 +1222,86 @@ mod tests {
             .admit_cached_block(&block, 13, b"tail!")
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn credential_write_headers_preserve_unframed_object_and_admission_bodies() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            for kind in [MsgType::Put, MsgType::Delete, MsgType::AdmitCachedBlock] {
+                let (header, payload) =
+                    talon_transport::read_frame(&mut stream, Duration::from_secs(2))
+                        .await
+                        .unwrap();
+                assert_eq!(header.version, 4);
+                assert_eq!(header.msg_type, kind);
+                let (metadata, _) = talon_transport::envelope::decode(&header, &payload).unwrap();
+                assert_eq!(
+                    metadata.credential_broker.unwrap().config().request["csp"],
+                    "azure"
+                );
+                let mut frame = header.encode().to_vec();
+                frame.extend_from_slice(&payload);
+                let body_len = match kind {
+                    MsgType::Put => {
+                        talon_transport::decode_put_header(&frame)
+                            .unwrap()
+                            .1
+                            .body_len
+                    }
+                    MsgType::AdmitCachedBlock => {
+                        decode_cached_block_put_header(&frame).unwrap().1.body_len
+                    }
+                    _ => {
+                        talon_transport::decode_delete(&frame).unwrap();
+                        0
+                    }
+                };
+                let mut body = vec![0; body_len as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                assert_eq!(
+                    body,
+                    if body_len == 0 {
+                        &b""[..]
+                    } else {
+                        &b"body"[..]
+                    }
+                );
+                let version = if kind == MsgType::Put {
+                    &b"v1"[..]
+                } else {
+                    &b""[..]
+                };
+                let mut reply =
+                    response_header_ok(header.request_id, version.len() as u32).to_vec();
+                reply.extend_from_slice(version);
+                stream
+                    .write_all(&talon_transport::envelope::response_version(reply, 4))
+                    .await
+                    .unwrap();
+            }
+        });
+        let pool = Arc::new(ConnectionPool::new());
+        let writes = WriteClient::with_pool(&address, pool.clone());
+        let worker = WorkerClient::with_pool(&address, pool);
+        talon_transport::RequestContext::from_properties(&[(
+            "credential_broker",
+            r#"{"url":"http://broker","request":{"csp":"azure"},"origin":{"endpoint":"storage.example"}}"#,
+        )])
+        .unwrap()
+        .scope(async {
+            assert_eq!(
+                writes.put_object(&object(), b"body").await.unwrap(),
+                Version::new("v1")
+            );
+            writes.delete_object(&object()).await.unwrap();
+            let block = BlockId::new(object(), 0, 4, Version::new("v1"));
+            worker.admit_cached_block(&block, 4, b"body").await.unwrap();
+        })
+        .await;
+        server.await.unwrap();
     }
 
     #[tokio::test]

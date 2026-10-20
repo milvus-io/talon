@@ -37,10 +37,11 @@ pub const DEFAULT_MAX_IN_FLIGHT_BLOCK_READS: usize = 1024;
 pub struct RequestOptions<'a> {
     parent: TraceParent<'a>,
     namespace: Option<&'a str>,
+    credential_broker: Option<&'a str>,
 }
 
 impl<'a> RequestOptions<'a> {
-    /// Select a namespace for this request, preserving the parent policy.
+    /// Select a namespace, preserving the trace parent and Broker descriptor.
     /// Names are validated before dispatch, including empty reads and loads.
     /// The name must remain valid until the request completes.
     #[must_use = "request options are immutable; use the returned options"]
@@ -51,10 +52,11 @@ impl<'a> RequestOptions<'a> {
         RequestOptions {
             parent: self.parent,
             namespace: Some(namespace),
+            credential_broker: self.credential_broker,
         }
     }
 
-    /// Select a trace parent for this request, preserving its namespace.
+    /// Select a trace parent, preserving the namespace and Broker descriptor.
     /// A derived copy may borrow a shorter-lived parent than the reusable base.
     #[must_use = "request options are immutable; use the returned options"]
     pub fn with_parent<'b>(self, parent: TraceParent<'b>) -> RequestOptions<'b>
@@ -64,6 +66,37 @@ impl<'a> RequestOptions<'a> {
         RequestOptions {
             parent,
             namespace: self.namespace,
+            credential_broker: self.credential_broker,
+        }
+    }
+
+    /// Set the complete JSON Broker descriptor with `url`, `request` and `origin.endpoint`.
+    /// S3 providers also require `origin.region` for request signing.
+    /// Preserves the namespace and trace parent; `None` clears the descriptor.
+    /// JSON is validated before dispatch, including empty reads and loads.
+    /// The JSON string must remain valid until the request completes.
+    #[must_use = "request options are immutable; use the returned options"]
+    pub fn with_credential_broker<'b>(
+        self,
+        credential_broker: impl Into<Option<&'b str>>,
+    ) -> RequestOptions<'b>
+    where
+        'a: 'b,
+    {
+        RequestOptions {
+            parent: self.parent,
+            namespace: self.namespace,
+            credential_broker: credential_broker.into(),
+        }
+    }
+
+    fn credential_context(&self) -> Result<talon_transport::RequestContext, String> {
+        match self.credential_broker {
+            Some(json) => talon_transport::RequestContext::from_properties(&[(
+                talon_core::CREDENTIAL_BROKER_KEY,
+                json,
+            )]),
+            None => Ok(talon_transport::RequestContext::default()),
         }
     }
 
@@ -231,6 +264,9 @@ impl Client {
         size: u64,
         options: &crate::RequestOptions<'_>,
     ) -> Result<crate::LoadResult, crate::LoadError> {
+        let context = options
+            .credential_context()
+            .map_err(crate::LoadError::InvalidArgument)?;
         let namespace = options
             .namespace_id()
             .map_err(|error| crate::LoadError::InvalidArgument(error.to_string()))?;
@@ -239,8 +275,8 @@ impl Client {
             .unwrap_or_default()
             .as_millis() as u64;
         let op = talon_telemetry::Operation::new("talon.load", "internal", options.parent);
-        let result = op
-            .scope(self.reader.load(
+        let result = context
+            .scope(op.scope(self.reader.load(
                 &talon_cache_client::FileView {
                     object,
                     version,
@@ -249,7 +285,7 @@ impl Client {
                 },
                 now_ms,
                 &namespace,
-            ))
+            )))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -260,11 +296,15 @@ impl Client {
     /// lists failed/unconfirmed input indices; omitted files succeeded. Other files
     /// continue after individual failures. Completed fills remain cached.
     /// Uses the same placement and shared RPC budget as LOAD.
+    /// All input files share the request's credential context.
     pub async fn batch_load(
         &self,
         requests: &[LoadRequest],
         options: &crate::RequestOptions<'_>,
     ) -> Result<Vec<crate::LoadResult>, crate::LoadError> {
+        let context = options
+            .credential_context()
+            .map_err(crate::LoadError::InvalidArgument)?;
         let namespace = options
             .namespace_id()
             .map_err(|error| crate::LoadError::InvalidArgument(error.to_string()))?;
@@ -282,8 +322,8 @@ impl Client {
             .unwrap_or_default()
             .as_millis() as u64;
         let op = talon_telemetry::Operation::new("talon.batch_load", "internal", options.parent);
-        let result = op
-            .scope(self.reader.batch_load(&files, now_ms, &namespace))
+        let result = context
+            .scope(op.scope(self.reader.batch_load(&files, now_ms, &namespace)))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -295,11 +335,16 @@ impl Client {
         object: &ObjectId,
         options: &crate::RequestOptions<'_>,
     ) -> Result<ObjectStat, Error> {
+        let context = options
+            .credential_context()
+            .map_err(Error::InvalidArgument)?;
         let namespace = options
             .namespace_id()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let op = talon_telemetry::Operation::new("talon.stat", "internal", options.parent);
-        let result = op.scope(self.stat_inner(object, &namespace)).await;
+        let result = context
+            .scope(op.scope(self.stat_inner(object, &namespace)))
+            .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
     }
@@ -318,12 +363,15 @@ impl Client {
         prefix: &str,
         options: &crate::RequestOptions<'_>,
     ) -> Result<Vec<ObjectEntry>, Error> {
+        let context = options
+            .credential_context()
+            .map_err(Error::InvalidArgument)?;
         let namespace = options
             .namespace_id()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let op = talon_telemetry::Operation::new("talon.list", "internal", options.parent);
-        let result = op
-            .scope(self.coordinator.list_objects(prefix, &namespace))
+        let result = context
+            .scope(op.scope(self.coordinator.list_objects(prefix, &namespace)))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         Ok(result?)
@@ -336,6 +384,7 @@ impl Client {
     /// a version mismatch fails the read instead of substituting newer bytes.
     /// Large ranges are planned lazily, with at most eight block reads in flight
     /// per logical read. Assembly retains byte order without intermediate block buffers.
+    /// Implicit stat and block RPCs share the request's credential and trace context.
     pub async fn read(
         &self,
         object: &ObjectId,
@@ -344,12 +393,15 @@ impl Client {
         known_stat: Option<&ObjectStat>,
         options: &crate::RequestOptions<'_>,
     ) -> Result<Vec<u8>, Error> {
+        let context = options
+            .credential_context()
+            .map_err(Error::InvalidArgument)?;
         let namespace = options
             .namespace_id()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
-        let result = op
-            .scope(self.read_inner(object, offset, length, known_stat, &namespace))
+        let result = context
+            .scope(op.scope(self.read_inner(object, offset, length, known_stat, &namespace)))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -396,6 +448,7 @@ impl Client {
     /// Read an object range into a caller-owned buffer.
     ///
     /// `known_stat` has the same exact-version semantics as [`read`](Self::read).
+    /// Implicit stat and block RPCs share the request's credential and trace context.
     pub async fn read_into(
         &self,
         object: &ObjectId,
@@ -404,12 +457,15 @@ impl Client {
         known_stat: Option<&ObjectStat>,
         options: &crate::RequestOptions<'_>,
     ) -> Result<usize, Error> {
+        let context = options
+            .credential_context()
+            .map_err(Error::InvalidArgument)?;
         let namespace = options
             .namespace_id()
             .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
-        let result = op
-            .scope(self.read_into_inner(object, offset, dst, known_stat, &namespace))
+        let result = context
+            .scope(op.scope(self.read_into_inner(object, offset, dst, known_stat, &namespace)))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -577,7 +633,7 @@ mod tests {
     use tokio::sync::{Notify, Semaphore};
 
     #[test]
-    fn reusable_options_preserve_independent_namespace_and_parent_choices() {
+    fn reusable_options_preserve_independent_namespace_parent_and_broker_choices() {
         let base: RequestOptions<'static> = RequestOptions::default().with_namespace("analytics");
         {
             let trace = TraceContext::from_w3c(
@@ -585,9 +641,13 @@ mod tests {
                 None,
             )
             .unwrap();
-            // The derived options may borrow a short-lived trace while the
-            // base remains usable after that trace has gone out of scope.
-            let request = base.with_parent(TraceParent::Explicit(&trace));
+            let broker = String::from("request-local");
+            // The derived options may borrow short-lived data while the base
+            // remains usable after those values have gone out of scope.
+            let request = base
+                .with_credential_broker(broker.as_str())
+                .with_parent(TraceParent::Explicit(&trace));
+            assert_eq!(request.credential_broker, Some(broker.as_str()));
             assert_eq!(
                 request.namespace_id().unwrap().effective_name(),
                 "analytics"
@@ -597,11 +657,18 @@ mod tests {
                 matches!(other.parent, TraceParent::Explicit(parent) if std::ptr::eq(parent, &trace))
             );
             assert_eq!(other.namespace_id().unwrap().effective_name(), "training");
+            assert_eq!(other.credential_broker, Some(broker.as_str()));
             let root = other.with_parent(TraceParent::Root);
             assert!(matches!(root.parent, TraceParent::Root));
             assert_eq!(root.namespace_id().unwrap().effective_name(), "training");
+            assert_eq!(root.credential_broker, Some(broker.as_str()));
+            let cleared = root.with_credential_broker(None);
+            assert!(cleared.credential_broker.is_none());
+            assert!(matches!(cleared.parent, TraceParent::Root));
+            assert_eq!(cleared.namespace_id().unwrap().effective_name(), "training");
         }
         assert!(matches!(base.parent, TraceParent::Inherit));
+        assert!(base.credential_broker.is_none());
         assert_eq!(base.namespace_id().unwrap().effective_name(), "analytics");
         assert_eq!(
             base.with_namespace("default").namespace_id().unwrap(),

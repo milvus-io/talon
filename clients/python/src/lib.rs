@@ -46,6 +46,18 @@ fn capture_trace(
     )
 }
 
+fn credential_broker(
+    options: &Option<std::collections::HashMap<String, String>>,
+) -> PyResult<Option<&str>> {
+    let Some(properties) = options else {
+        return Ok(None);
+    };
+    if properties.keys().any(|key| key != "credential_broker") {
+        return Err(PyValueError::new_err("unsupported request property"));
+    }
+    Ok(properties.get("credential_broker").map(String::as_str))
+}
+
 #[cfg(feature = "telemetry")]
 static TELEMETRY: std::sync::Mutex<
     Option<(talon_telemetry::export::ExportOwner, tracing::Dispatch)>,
@@ -259,6 +271,7 @@ pub struct LoadResult {
 }
 
 impl Client {
+    #[allow(clippy::too_many_arguments)]
     fn run_loads(
         &self,
         py: Python<'_>,
@@ -266,8 +279,13 @@ impl Client {
         batch: bool,
         trace_context: Option<std::collections::HashMap<String, String>>,
         namespace: Option<String>,
+        request_options: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Vec<LoadResult>> {
         let parent = capture_trace(py, trace_context);
+        let broker = credential_broker(&request_options)?;
+        let options = talon_rust_client::RequestOptions::default()
+            .with_namespace(namespace.as_deref().unwrap_or("default"))
+            .with_credential_broker(broker);
         let requests = requests
             .into_iter()
             .map(|r| {
@@ -294,8 +312,6 @@ impl Client {
                         );
                         let result = operation
                             .scope(async {
-                                let options = talon_rust_client::RequestOptions::default()
-                                    .with_namespace(namespace.as_deref().unwrap_or("default"));
                                 if batch {
                                     client.batch_load(&requests, &options).await
                                 } else {
@@ -326,7 +342,8 @@ impl Client {
 #[pymethods]
 impl Client {
     /// Prewarm a file without HEAD. Wait for every assigned block to complete.
-    #[pyo3(signature = (uri, *, version, size, trace_context = None, namespace = None))]
+    #[pyo3(signature = (uri, *, version, size, trace_context = None, namespace = None, request_options = None))]
+    #[allow(clippy::too_many_arguments)]
     fn load(
         &self,
         py: Python<'_>,
@@ -335,24 +352,40 @@ impl Client {
         size: u64,
         trace_context: Option<std::collections::HashMap<String, String>>,
         namespace: Option<String>,
+        request_options: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<LoadResult> {
         let request = LoadRequest::new(uri, version, size)?;
         Ok(self
-            .run_loads(py, vec![request], false, trace_context, namespace)?
+            .run_loads(
+                py,
+                vec![request],
+                false,
+                trace_context,
+                namespace,
+                request_options,
+            )?
             .remove(0))
     }
 
     /// Prewarm files through protocol batches. Results follow input order.
     /// BatchLoadError.failed_files identifies failed/unconfirmed input indices.
-    #[pyo3(signature = (requests, *, trace_context = None, namespace = None))]
+    #[pyo3(signature = (requests, *, trace_context = None, namespace = None, request_options = None))]
     fn batch_load(
         &self,
         py: Python<'_>,
         requests: Vec<LoadRequest>,
         trace_context: Option<std::collections::HashMap<String, String>>,
         namespace: Option<String>,
+        request_options: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Vec<LoadResult>> {
-        self.run_loads(py, requests, true, trace_context, namespace)
+        self.run_loads(
+            py,
+            requests,
+            true,
+            trace_context,
+            namespace,
+            request_options,
+        )
     }
 
     /// Connect to a coordinator.
@@ -395,7 +428,7 @@ impl Client {
     /// pair skips `stat` and pins the read to that exact source generation.
     /// Supplying only one raises `ValueError`, since metadata from different
     /// generations cannot safely be combined.
-    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None, namespace = None))]
+    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None, namespace = None, request_options = None))]
     #[allow(clippy::too_many_arguments)]
     fn read<'py>(
         &self,
@@ -407,8 +440,13 @@ impl Client {
         size: Option<u64>,
         trace_context: Option<std::collections::HashMap<String, String>>,
         namespace: Option<String>,
+        request_options: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let trace_context = capture_trace(py, trace_context);
+        let broker = credential_broker(&request_options)?;
+        let options = talon_rust_client::RequestOptions::default()
+            .with_namespace(namespace.as_deref().unwrap_or("default"))
+            .with_credential_broker(broker);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let known_stat = known_stat_from_pair(version.map(str::to_owned), size)?;
         let runtime = Arc::clone(&self.runtime);
@@ -429,8 +467,6 @@ impl Client {
                     );
                     let result = operation
                         .scope(async {
-                            let options = talon_rust_client::RequestOptions::default()
-                                .with_namespace(namespace.as_deref().unwrap_or("default"));
                             client
                                 .read(&object, offset, length, known_stat.as_ref(), &options)
                                 .await
@@ -446,15 +482,17 @@ impl Client {
     }
 
     /// Return an object's size and version.
-    #[pyo3(signature = (uri, *, trace_context = None, namespace = None))]
+    #[pyo3(signature = (uri, *, trace_context = None, namespace = None, request_options = None))]
     fn stat(
         &self,
         py: Python<'_>,
         uri: &str,
         trace_context: Option<std::collections::HashMap<String, String>>,
         namespace: Option<String>,
+        request_options: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<ObjectStat> {
         let trace_context = capture_trace(py, trace_context);
+        let broker = credential_broker(&request_options)?;
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
@@ -463,6 +501,7 @@ impl Client {
                 runtime.block_on(async move {
                     let options = talon_rust_client::RequestOptions::default()
                         .with_namespace(namespace.as_deref().unwrap_or("default"))
+                        .with_credential_broker(broker)
                         .with_parent(
                             trace_context
                                 .as_ref()
@@ -490,20 +529,23 @@ impl Client {
     /// The control protocol carries one bounded response. If a prefix exceeds
     /// the server's object, page, or payload limit, the call fails explicitly
     /// instead of returning an incomplete list; use a narrower prefix.
-    #[pyo3(signature = (prefix, *, namespace = None))]
+    #[pyo3(signature = (prefix, *, namespace = None, request_options = None))]
     fn list(
         &self,
         py: Python<'_>,
         prefix: &str,
         namespace: Option<String>,
+        request_options: Option<std::collections::HashMap<String, String>>,
     ) -> PyResult<Vec<ObjectEntry>> {
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
         let prefix = prefix.to_string();
+        let broker = credential_broker(&request_options)?;
         let entries = py.allow_threads(move || {
             runtime.block_on(async move {
                 let options = talon_rust_client::RequestOptions::default()
-                    .with_namespace(namespace.as_deref().unwrap_or("default"));
+                    .with_namespace(namespace.as_deref().unwrap_or("default"))
+                    .with_credential_broker(broker);
                 client.list(&prefix, &options).await
             })
         });
@@ -624,6 +666,48 @@ mod tests {
     }
 
     #[test]
+    fn broker_properties_are_independent_of_trace_options() {
+        pyo3::prepare_freethreaded_python();
+        Python::with_gil(|py| {
+            let client = py.get_type_bound::<Client>().call1(("unused",)).unwrap();
+            let properties = pyo3::types::PyDict::new_bound(py);
+            properties
+                .set_item("credential_broker", "PRIVATE_FIXTURE_MARKER")
+                .unwrap();
+            let kwargs = pyo3::types::PyDict::new_bound(py);
+            kwargs.set_item("request_options", &properties).unwrap();
+            kwargs.set_item("namespace", "team-a").unwrap();
+            for (method, argument) in [
+                ("read", "s3://bucket/key"),
+                ("stat", "s3://bucket/key"),
+                ("list", "s3/bucket"),
+            ] {
+                let error = client
+                    .call_method(method, (argument,), Some(&kwargs))
+                    .unwrap_err();
+                assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+                assert!(!error.to_string().contains("PRIVATE_FIXTURE_MARKER"));
+            }
+            let requests = pyo3::types::PyList::empty_bound(py);
+            let error = client
+                .call_method("batch_load", (requests,), Some(&kwargs))
+                .unwrap_err();
+            assert!(error.is_instance_of::<PyValueError>(py), "{error}");
+            properties
+                .set_item(
+                    "credential_broker",
+                    r#"{"url":"http://localhost/broker","request":{"csp":"aws","region":"us-west-2","bucket":"bucket","roleArn":"fixture"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
+                )
+                .unwrap();
+            kwargs.set_item("length", 0).unwrap();
+            let bytes = client
+                .call_method("read", ("s3://bucket/key",), Some(&kwargs))
+                .unwrap();
+            assert!(bytes.extract::<Vec<u8>>().unwrap().is_empty());
+        });
+    }
+
+    #[test]
     fn version_and_size_must_describe_one_generation() {
         assert!(known_stat_from_pair(Some("v1".into()), None).is_err());
         assert!(known_stat_from_pair(None, Some(4096)).is_err());
@@ -652,6 +736,7 @@ mod tests {
                 Some(oversized),
                 None,
                 None,
+                None,
             ) {
                 Ok(_) => panic!("oversized read must fail"),
                 Err(error) => error,
@@ -667,7 +752,7 @@ mod tests {
         let client = Client::new("127.0.0.1:0", 1, 8).unwrap();
 
         Python::with_gil(|py| {
-            let error = match client.stat(py, "s3://bucket/key", None, None) {
+            let error = match client.stat(py, "s3://bucket/key", None, None, None) {
                 Ok(_) => panic!("stat without a coordinator must fail"),
                 Err(error) => error,
             };

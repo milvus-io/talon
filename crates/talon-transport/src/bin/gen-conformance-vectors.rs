@@ -303,6 +303,44 @@ fn vectors() -> Vec<Vector> {
             bytes,
         });
     }
+    let broker = talon_core::BrokerConfig {
+        origin: Some(talon_core::OriginOptions {
+            endpoint: Some("storage.example".into()),
+            region: Some("us-west-2".into()),
+            ..Default::default()
+        }),
+        url: "http://broker.example/v1/credentials/assume-role".into(),
+        request: serde_json::json!({"csp": "aws", "region": "us-east-1", "roleArn": "test-role"}),
+    };
+    for (name, source) in [
+        ("v4.range.credential_broker", "data.range_request"),
+        (
+            "v4.range.context_namespace_credential_broker",
+            "v3.range.context_namespace",
+        ),
+        ("v4.load.credential_broker", "control.load_block"),
+    ] {
+        let mut bytes = result
+            .iter()
+            .find(|v| v.name == source)
+            .unwrap()
+            .bytes
+            .clone();
+        talon_transport::envelope::encode_credential_broker(&mut bytes, &broker).unwrap();
+        result.push(Vector {
+            name,
+            note: "v4 requires broker credentials; original business payload unchanged",
+            bytes,
+        });
+    }
+    result.push(Vector {
+        name: "v4.response.raw",
+        note: "v4 response has no metadata prefix",
+        bytes: talon_transport::envelope::response_version(
+            data::response_header_ok(9, 4096).to_vec(),
+            4,
+        ),
+    });
     use talon_core::worker_membership::*;
     result.push(control(
         "control.membership_instances",

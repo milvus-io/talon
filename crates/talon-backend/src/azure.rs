@@ -36,7 +36,6 @@ use talon_core::{
 use crate::http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
-use crate::AzureSas;
 
 /// Percent-encode a query value. `/` is escaped: a listing prefix contains
 /// slashes and an unescaped one would change the request path.
@@ -104,18 +103,48 @@ impl AzureConfig {
     }
 }
 
+/// An origin-issued Azure SAS query, preserved byte-for-byte after an optional
+/// leading `?`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct AzureSas(String);
+
+impl AzureSas {
+    /// Validate the credential shape without verifying its signature.
+    pub fn new(raw: impl Into<String>) -> std::result::Result<Self, String> {
+        let raw = raw.into();
+        let query = raw.strip_prefix('?').unwrap_or(&raw);
+        if query.is_empty()
+            || query.contains('#')
+            || query.bytes().any(|byte| byte.is_ascii_control())
+        {
+            return Err("Azure SAS query credential is malformed".into());
+        }
+        let contains_key = |expected: &str| {
+            url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == expected)
+        };
+        if !contains_key("sig") || !contains_key("sv") {
+            return Err("Azure SAS query credential is incomplete".into());
+        }
+        Ok(Self(query.to_owned()))
+    }
+
+    /// Access the exact raw query for origin request construction.
+    pub fn expose_secret(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for AzureSas {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("AzureSas([REDACTED])")
+    }
+}
+
 /// An Azure Blob `BackendStore` over a pluggable HTTP client.
 pub struct AzureBackend {
     config: AzureConfig,
-    /// Optional SAS token query string (without leading `?`).
-    sas_token: Option<String>,
-    sas_provider: Option<Arc<dyn crate::credentials::ProvideSasToken>>,
-    /// Optional base64 account key for Shared Key authorization (an alternative
-    /// to SAS). When set, every request is signed just before execution.
-    shared_key: Option<String>,
-    /// Optional Azure AD bearer-token source (workload identity), an
-    /// alternative to both SAS and Shared Key.
-    bearer: Option<Arc<dyn crate::credentials::ProvideBearerToken>>,
+    /// One service authentication source; `None` preserves anonymous access.
+    credentials: Option<AzureCredentials>,
     http: Arc<dyn HttpClient>,
 }
 
@@ -126,15 +155,10 @@ impl AzureBackend {
         credentials: AzureCredentials,
         http: Arc<dyn HttpClient>,
     ) -> Self {
-        match credentials {
-            AzureCredentials::SharedKey(key) => Self::with_shared_key(config, key, http),
-            AzureCredentials::Sas(sas) => Self::new(config, Some(sas), http),
-            AzureCredentials::Bearer(provider) => {
-                Self::with_bearer_provider(config, provider, http)
-            }
-            AzureCredentials::BrokerSas(provider) => {
-                Self::with_sas_provider(config, provider, http)
-            }
+        Self {
+            config,
+            credentials: Some(credentials),
+            http,
         }
     }
 
@@ -142,10 +166,7 @@ impl AzureBackend {
     pub fn new(config: AzureConfig, sas_token: Option<String>, http: Arc<dyn HttpClient>) -> Self {
         Self {
             config,
-            sas_token,
-            sas_provider: None,
-            shared_key: None,
-            bearer: None,
+            credentials: sas_token.map(AzureCredentials::Sas),
             http,
         }
     }
@@ -157,14 +178,7 @@ impl AzureBackend {
         shared_key: impl Into<String>,
         http: Arc<dyn HttpClient>,
     ) -> Self {
-        Self {
-            config,
-            sas_token: None,
-            sas_provider: None,
-            shared_key: Some(shared_key.into()),
-            bearer: None,
-            http,
-        }
+        Self::with_credentials(config, AzureCredentials::SharedKey(shared_key.into()), http)
     }
 
     /// Construct with an Azure AD bearer-token source (workload identity)
@@ -175,14 +189,7 @@ impl AzureBackend {
         bearer: Arc<dyn crate::credentials::ProvideBearerToken>,
         http: Arc<dyn HttpClient>,
     ) -> Self {
-        Self {
-            config,
-            sas_token: None,
-            sas_provider: None,
-            shared_key: None,
-            bearer: Some(bearer),
-            http,
-        }
+        Self::with_credentials(config, AzureCredentials::Bearer(bearer), http)
     }
 
     /// Construct with a refreshing SAS query source. Each URL takes one cheap
@@ -192,20 +199,7 @@ impl AzureBackend {
         sas: Arc<dyn crate::credentials::ProvideSasToken>,
         http: Arc<dyn HttpClient>,
     ) -> Self {
-        Self {
-            config,
-            sas_token: None,
-            sas_provider: Some(sas),
-            shared_key: None,
-            bearer: None,
-            http,
-        }
-    }
-
-    fn current_sas(&self) -> Option<Arc<AzureSas>> {
-        self.sas_provider
-            .as_ref()
-            .map(|provider| provider.current())
+        Self::with_credentials(config, AzureCredentials::BrokerSas(sas), http)
     }
 
     /// Build the blob URL with the SAS query appended when present.
@@ -228,14 +222,12 @@ impl AzureBackend {
         } else {
             format!("{scheme}://{host}/{}/{}", obj.bucket, blob)
         };
-        let current = self.current_sas();
-        match current
-            .as_ref()
-            .map(|sas| sas.expose_secret())
-            .or(self.sas_token.as_deref())
-        {
-            Some(sas) => format!("{base}?{sas}"),
-            None => base,
+        match &self.credentials {
+            Some(AzureCredentials::Sas(sas)) => format!("{base}?{sas}"),
+            Some(AzureCredentials::BrokerSas(provider)) => {
+                format!("{base}?{}", provider.current().expose_secret())
+            }
+            _ => base,
         }
     }
 
@@ -310,15 +302,16 @@ impl AzureBackend {
         if let Some(marker) = cursor {
             query.push_str(&format!("&marker={}", encode_query_value(marker)));
         }
-        let current = self.current_sas();
-        match current
-            .as_ref()
-            .map(|sas| sas.expose_secret())
-            .or(self.sas_token.as_deref())
-        {
+        match &self.credentials {
             // The SAS is already a query string; join with `&`.
-            Some(sas) => format!("{base}?{query}&{}", sas.trim_start_matches('?')),
-            None => format!("{base}?{query}"),
+            Some(AzureCredentials::Sas(sas)) => {
+                format!("{base}?{query}&{}", sas.trim_start_matches('?'))
+            }
+            Some(AzureCredentials::BrokerSas(provider)) => format!(
+                "{base}?{query}&{}",
+                provider.current().expose_secret().trim_start_matches('?')
+            ),
+            _ => format!("{base}?{query}"),
         }
     }
 
@@ -400,31 +393,38 @@ impl AzureBackend {
         vec![("x-ms-version".to_string(), Self::API_VERSION.to_string())]
     }
 
-    /// Apply Shared Key authorization to `req` when a shared key is configured:
-    /// stamp `x-ms-date` (RFC 1123 GMT) and add the `Authorization: SharedKey`
-    /// header. A SAS-only backend (no shared key) returns the request unchanged
-    /// (the SAS travels in the URL query).
-    fn authorized(&self, mut req: HttpRequest) -> HttpRequest {
-        if let Some(bearer) = &self.bearer {
-            // Azure AD auth: the always-stamped `x-ms-version` satisfies the
-            // minimum API version bearer tokens require.
-            if let Some(token) = bearer.current() {
-                req.headers
-                    .push(("Authorization".to_string(), format!("Bearer {token}")));
-            }
-            return req;
+    async fn prepare_authentication(&self) -> std::result::Result<(), String> {
+        match &self.credentials {
+            Some(AzureCredentials::BrokerSas(provider)) => provider.prepare().await,
+            Some(AzureCredentials::Bearer(provider)) => provider.prepare().await,
+            _ => Ok(()),
         }
-        let Some(key) = &self.shared_key else {
-            return req;
-        };
-        let date = crate::azure_sharedkey::rfc1123_date(std::time::SystemTime::now());
-        req.headers.push(("x-ms-date".to_string(), date));
-        // A misconfigured key surfaces as an auth failure at the server; we still
-        // send the request rather than panic.
-        if let Ok(auth) =
-            crate::azure_sharedkey::authorization_header(&req, &self.config.account, key)
-        {
-            req.headers.push(("Authorization".to_string(), auth));
+    }
+
+    /// Apply the configured bearer token or Shared Key signature. SAS travels
+    /// in the URL query, and anonymous requests need no authorization headers.
+    fn authorized(&self, mut req: HttpRequest) -> HttpRequest {
+        match &self.credentials {
+            Some(AzureCredentials::Bearer(bearer)) => {
+                // Azure AD auth: the always-stamped `x-ms-version` satisfies
+                // the minimum API version bearer tokens require.
+                if let Some(token) = bearer.current() {
+                    req.headers
+                        .push(("Authorization".to_string(), format!("Bearer {token}")));
+                }
+            }
+            Some(AzureCredentials::SharedKey(key)) => {
+                let date = crate::azure_sharedkey::rfc1123_date(std::time::SystemTime::now());
+                req.headers.push(("x-ms-date".to_string(), date));
+                // A misconfigured key surfaces as an auth failure at the server;
+                // we still send the request rather than panic.
+                if let Ok(auth) =
+                    crate::azure_sharedkey::authorization_header(&req, &self.config.account, key)
+                {
+                    req.headers.push(("Authorization".to_string(), auth));
+                }
+            }
+            Some(AzureCredentials::Sas(_) | AzureCredentials::BrokerSas(_)) | None => {}
         }
         req
     }
@@ -476,6 +476,7 @@ impl AzureBackend {
         obj: &ObjectId,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = self.build_head(obj);
         request.headers.extend_from_slice(conditions);
         self.http.execute(self.authorized(request)).await
@@ -488,6 +489,7 @@ impl AzureBackend {
         range: Option<(u64, u64)>,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpStreamResponse, String> {
+        self.prepare_authentication().await?;
         let mut headers = self.common_headers();
         if let Some((start, end)) = range {
             headers.push(("x-ms-range".into(), format!("bytes={start}-{end}")));
@@ -603,6 +605,7 @@ impl AzureBackend {
         max_results: u32,
         conditions: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let url = self.list_url_with_delimiter(
             container,
             prefix,
@@ -624,6 +627,7 @@ impl AzureBackend {
         body: HttpRequestBody,
         len: u64,
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = self.build_streamed_put(obj, len);
         Self::extend_mutation_headers(&mut request, headers);
         self.http
@@ -640,6 +644,7 @@ impl AzureBackend {
         body: HttpRequestBody,
         len: u64,
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = HttpRequest::new(
             Method::Put,
             self.blob_url_with_query(obj, query),
@@ -662,6 +667,7 @@ impl AzureBackend {
         query: &str,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = HttpRequest::new(
             Method::Put,
             self.blob_url_with_query(destination, query),
@@ -682,6 +688,7 @@ impl AzureBackend {
         query: &str,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = HttpRequest::new(
             Method::Get,
             self.blob_url_with_query(obj, query),
@@ -698,6 +705,7 @@ impl AzureBackend {
         query: &str,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = HttpRequest::new(
             Method::Put,
             self.blob_url_with_query(obj, query),
@@ -715,6 +723,7 @@ impl AzureBackend {
         source: &ObjectId,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = HttpRequest::new(
             Method::Put,
             self.blob_url(destination),
@@ -734,6 +743,7 @@ impl AzureBackend {
         obj: &ObjectId,
         headers: &[(String, String)],
     ) -> std::result::Result<HttpResponse, String> {
+        self.prepare_authentication().await?;
         let mut request = self.build_delete(obj);
         Self::extend_mutation_headers(&mut request, headers);
         self.http.execute(self.authorized(request)).await
@@ -803,6 +813,9 @@ impl BackendStore for AzureBackend {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
+        self.prepare_authentication()
+            .await
+            .map_err(Error::Backend)?;
         let resp = self
             .http
             .execute(self.authorized(self.build_get_if_match(obj, offset, len, if_match)))
@@ -844,6 +857,9 @@ impl BackendStore for AzureBackend {
         cursor: Option<&str>,
         max_keys: u32,
     ) -> Result<ListPage> {
+        self.prepare_authentication()
+            .await
+            .map_err(Error::Backend)?;
         // Azure caps maxresults at 5000, higher than S3 and GCS.
         let max_keys = max_keys.clamp(1, 5000);
         let url = self.list_url(bucket, prefix, cursor, max_keys);
@@ -868,6 +884,9 @@ impl BackendStore for AzureBackend {
     }
 
     async fn head(&self, obj: &ObjectId) -> Result<ObjectStat> {
+        self.prepare_authentication()
+            .await
+            .map_err(Error::Backend)?;
         let resp = self
             .http
             .execute(self.authorized(self.build_head(obj)))
@@ -910,6 +929,9 @@ impl BackendStore for AzureBackend {
         body: bytes::Bytes,
         if_match: Option<&Version>,
     ) -> Result<Version> {
+        self.prepare_authentication()
+            .await
+            .map_err(Error::Backend)?;
         let resp = self
             .http
             .execute(self.authorized(self.build_put(obj, body, if_match)))
@@ -942,6 +964,9 @@ impl BackendStore for AzureBackend {
     }
 
     async fn put_file(&self, obj: &ObjectId, path: &Path, len: u64) -> Result<Version> {
+        self.prepare_authentication()
+            .await
+            .map_err(Error::Backend)?;
         let request = self.authorized(self.build_streamed_put(obj, len));
         let resp = self
             .http
@@ -966,6 +991,9 @@ impl BackendStore for AzureBackend {
     }
 
     async fn delete(&self, obj: &ObjectId) -> Result<()> {
+        self.prepare_authentication()
+            .await
+            .map_err(Error::Backend)?;
         let resp = self
             .http
             .execute(self.authorized(self.build_delete(obj)))
@@ -989,6 +1017,19 @@ mod tests {
     use crate::http::HttpResponse;
     use std::sync::Mutex;
     use talon_core::Backend;
+
+    #[test]
+    fn sas_query_preserves_raw_value_and_redacts_secrets() {
+        let credential = AzureSas::new("?sv=2024-11-04&sp=r&sig=secret%2Bvalue").unwrap();
+        assert_eq!(
+            credential.expose_secret(),
+            "sv=2024-11-04&sp=r&sig=secret%2Bvalue"
+        );
+        assert_eq!(format!("{credential:?}"), "AzureSas([REDACTED])");
+
+        let error = AzureSas::new("sv=2024-11-04&sig=secret#fragment").unwrap_err();
+        assert!(!error.contains("secret"));
+    }
 
     struct MockHttp {
         last: Mutex<Option<HttpRequest>>,
@@ -1248,6 +1289,67 @@ mod tests {
         a.fetch_range(&obj(), 0, 8).await.unwrap();
         let req = http.last.lock().unwrap().clone().unwrap();
         assert_eq!(req.header("Authorization"), None);
+    }
+
+    #[tokio::test]
+    async fn broker_sas_rotation_reaches_blob_list_and_mutation_requests() {
+        struct SasProvider(Mutex<Arc<AzureSas>>);
+
+        impl crate::credentials::ProvideSasToken for SasProvider {
+            fn current(&self) -> Arc<AzureSas> {
+                Arc::clone(&self.0.lock().unwrap())
+            }
+        }
+
+        let provider = Arc::new(SasProvider(Mutex::new(Arc::new(
+            AzureSas::new("sv=2024-11-04&sp=rwl&sig=first").unwrap(),
+        ))));
+        let http = MockHttp::new(HttpResponse {
+            status: 200,
+            headers: vec![],
+            body: bytes::Bytes::new(),
+        });
+        let backend = AzureBackend::with_credentials(
+            AzureConfig::new("acct"),
+            AzureCredentials::BrokerSas(provider.clone()),
+            http.clone(),
+        );
+        assert_eq!(
+            backend.build_get(&obj(), 0, 8).url,
+            "https://acct.blob.core.windows.net/my-container/data/checkpoint.bin?sv=2024-11-04&sp=rwl&sig=first"
+        );
+
+        *provider.0.lock().unwrap() =
+            Arc::new(AzureSas::new("sv=2024-11-04&sp=rwl&sig=second").unwrap());
+        assert_eq!(
+            backend.build_get(&obj(), 0, 8).url,
+            "https://acct.blob.core.windows.net/my-container/data/checkpoint.bin?sv=2024-11-04&sp=rwl&sig=second"
+        );
+        backend
+            .execute_list_raw("my-container", "", None, None, 10, &[])
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            "https://acct.blob.core.windows.net/my-container?restype=container&comp=list&maxresults=10&sv=2024-11-04&sp=rwl&sig=second"
+        );
+        assert!(request.header("authorization").is_none());
+        assert!(request.header("x-ms-date").is_none());
+
+        *provider.0.lock().unwrap() =
+            Arc::new(AzureSas::new("sv=2024-11-04&sp=rwl&sig=third").unwrap());
+        backend
+            .execute_put_raw(&obj(), "comp=metadata", &[])
+            .await
+            .unwrap();
+        let request = http.last.lock().unwrap().take().unwrap();
+        assert_eq!(
+            request.url,
+            "https://acct.blob.core.windows.net/my-container/data/checkpoint.bin?sv=2024-11-04&sp=rwl&sig=third&comp=metadata"
+        );
+        assert!(request.header("authorization").is_none());
+        assert!(request.header("x-ms-date").is_none());
     }
 
     #[tokio::test]

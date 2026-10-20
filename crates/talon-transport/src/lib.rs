@@ -16,6 +16,7 @@ pub mod data;
 pub mod frame;
 pub mod limits;
 pub mod pool;
+mod request;
 pub mod shutdown;
 pub mod uring;
 
@@ -41,5 +42,8 @@ pub use limits::{
     MAX_CONTROL_PAYLOAD_LEN,
 };
 pub use pool::{Channel, CheckoutError, Connector, Pool, PoolConfig};
+pub use request::{
+    current_credential_broker, request_timeout, RequestContext, CREDENTIAL_REQUEST_TIMEOUT,
+};
 
 pub mod envelope;

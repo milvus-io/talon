@@ -6,10 +6,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::Deserialize;
+use talon_backend::origin::{
+    validate_s3_broker_endpoint, AzureCredentialInput, AzureOrigin, AzureOriginInput,
+    OriginValidation, S3Origin, S3OriginInput,
+};
 use talon_backend::{
-    endpoint_host, resolve_azure_credentials, resolve_s3_credentials, AzureBackend, AzureConfig,
-    CredentialOptions, CredentialsObserver, ProvideS3Credentials, ReqwestClient, S3Backend,
-    S3Config, S3Credentials,
+    AzureBackend, CredentialOptions, CredentialsObserver, ReqwestClient, S3Backend, S3Credentials,
 };
 use talon_cache_client::{
     BlockReader, CoordinatorClient, PlacementCache, ZoneMatch, ZoneReadObserver,
@@ -328,6 +330,23 @@ impl Settings {
             tls,
         };
         settings.validate_origin_auth()?;
+        if settings.protocol == "s3"
+            && settings.origin_auth == OriginAuthMode::Service
+            && settings.credentials_source.as_deref() == Some("broker")
+            && settings.s3_endpoint.is_none()
+        {
+            let request = value(&mut get, "TALON_CREDENTIAL_BROKER_REQUEST")
+                .map(|raw| {
+                    serde_json::from_str::<serde_json::Value>(&raw)
+                        .map_err(|_| invalid("TALON_CREDENTIAL_BROKER_REQUEST must be valid JSON"))
+                })
+                .transpose()?;
+            if validate_s3_broker_endpoint(None, request.as_ref()).is_err() {
+                return Err(invalid(
+                    "Ali/Tencent/Huawei Broker credentials require TALON_GATEWAY_S3_ENDPOINT",
+                ));
+            }
+        }
         Ok(settings)
     }
 
@@ -434,9 +453,56 @@ fn azure_static_auth(settings: &Settings) -> MainResult<Option<String>> {
     Ok(settings.azure_shared_key.clone())
 }
 
+fn prepare_azure_origin(settings: &Settings) -> MainResult<AzureOrigin> {
+    let account = settings
+        .azure_account
+        .as_deref()
+        .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
+    let shared_key = azure_static_auth(settings)?;
+    let credentials = match (settings.credentials_source.as_deref(), &settings.azure_sas) {
+        (None | Some("auto" | "static"), Some(sas)) => {
+            AzureCredentialInput::FixedSas(sas.trim_start_matches('?').into())
+        }
+        _ => AzureCredentialInput::Resolve {
+            shared_key,
+            options: Box::new(settings.credentials_source.as_deref().into()),
+        },
+    };
+    AzureOrigin::prepare(AzureOriginInput {
+        account: account.to_owned(),
+        endpoint: settings.azure_endpoint.clone(),
+        endpoint_suffix: settings.endpoint_suffix.clone(),
+        path_style: None,
+        use_ssl: None,
+        validation: OriginValidation::Legacy,
+        credentials,
+    })
+    .map_err(invalid)
+}
+
+fn prepare_s3_origin(settings: &Settings) -> MainResult<S3Origin> {
+    S3Origin::prepare(S3OriginInput {
+        region: settings
+            .s3_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".into()),
+        endpoint: settings.s3_endpoint.clone(),
+        path_style: settings.s3_endpoint.is_some() && settings.s3_origin_path_style,
+        use_ssl: None,
+        validation: OriginValidation::Legacy,
+        keys: static_s3_credentials(settings)?,
+        credentials: CredentialOptions {
+            source: settings.credentials_source.clone(),
+            s3_region: settings.s3_region.clone(),
+            ..Default::default()
+        },
+    })
+    .map_err(invalid)
+}
+
 fn azure_adapter(
     settings: &Settings,
-    auth: talon_backend::AzureCredentials,
+    origin: Arc<AzureBackend>,
     cache: Arc<BlockReader>,
 ) -> MainResult<Arc<dyn GatewayAdapter>> {
     if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
@@ -448,20 +514,6 @@ fn azure_adapter(
         .azure_account
         .clone()
         .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
-    let mut origin_config = match settings.azure_endpoint.as_deref() {
-        Some(endpoint) => {
-            let (host, tls) = endpoint_host(endpoint);
-            AzureConfig::emulator(&account, host, tls)
-        }
-        None => AzureConfig::new(&account),
-    };
-    if settings.azure_endpoint.is_none() {
-        if let Some(suffix) = &settings.endpoint_suffix {
-            origin_config.endpoint_suffix.clone_from(suffix);
-        }
-    }
-    let http = Arc::new(ReqwestClient::new());
-    let origin = Arc::new(AzureBackend::with_credentials(origin_config, auth, http));
     let mut config = if settings.incoming_path_style {
         AzureAdapterConfig::path_style(&account)
     } else {
@@ -510,7 +562,7 @@ fn static_s3_credentials(settings: &Settings) -> MainResult<Option<S3Credentials
 
 fn s3_adapter(
     settings: &Settings,
-    credentials: Arc<dyn ProvideS3Credentials>,
+    origin: Arc<S3Backend>,
     cache: Arc<BlockReader>,
 ) -> MainResult<Arc<dyn GatewayAdapter>> {
     if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
@@ -522,23 +574,6 @@ fn s3_adapter(
         .s3_region
         .clone()
         .unwrap_or_else(|| "us-east-1".to_string());
-    let origin_config = match settings.s3_endpoint.as_deref() {
-        Some(endpoint) => {
-            let (host, tls) = endpoint_host(endpoint);
-            S3Config {
-                region: region.clone(),
-                endpoint: host,
-                path_style: settings.s3_origin_path_style,
-                tls,
-            }
-        }
-        None => S3Config::aws(&region),
-    };
-    let origin = Arc::new(S3Backend::with_credentials_provider(
-        origin_config,
-        credentials,
-        Arc::new(ReqwestClient::new()),
-    ));
     let mut config = if settings.incoming_path_style {
         S3AdapterConfig::path_style(
             settings
@@ -970,33 +1005,16 @@ async fn run() -> MainResult<()> {
                     "trusted-passthrough Azure routing is not available in this build",
                 ));
             }
-            let account = settings
-                .azure_account
-                .as_deref()
-                .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
-            let shared_key = azure_static_auth(&settings)?;
-            let auth = match (settings.credentials_source.as_deref(), &settings.azure_sas) {
-                (None | Some("auto" | "static"), Some(sas)) => {
-                    talon_backend::AzureCredentials::Sas(sas.trim_start_matches('?').into())
-                }
-                _ => {
-                    let resolved = resolve_azure_credentials(
-                        account,
-                        shared_key,
-                        settings.credentials_source.as_deref(),
-                        Arc::clone(&exchange_http),
-                        Arc::clone(&credentials_observer),
-                    )
-                    .await
-                    .map_err(invalid)?;
-                    info!(
-                        source = resolved.source,
-                        "origin Azure credentials resolved"
-                    );
-                    resolved.provider
-                }
-            };
-            azure_adapter(&settings, auth, Arc::clone(&cache))?
+            let (origin, source) = prepare_azure_origin(&settings)?
+                .build(
+                    Arc::new(ReqwestClient::new()),
+                    Arc::clone(&exchange_http),
+                    Arc::clone(&credentials_observer),
+                )
+                .await
+                .map_err(invalid)?;
+            info!(source, "origin Azure credentials resolved");
+            azure_adapter(&settings, Arc::new(origin), Arc::clone(&cache))?
         }
         "s3" => {
             if settings.origin_auth == OriginAuthMode::TrustedPassthrough {
@@ -1004,20 +1022,16 @@ async fn run() -> MainResult<()> {
                     "trusted-passthrough S3 routing is not available in this build",
                 ));
             }
-            let resolved = resolve_s3_credentials(
-                static_s3_credentials(&settings)?,
-                CredentialOptions {
-                    source: settings.credentials_source.clone(),
-                    s3_region: settings.s3_region.clone(),
-                    ..CredentialOptions::default()
-                },
-                Arc::clone(&exchange_http),
-                Arc::clone(&credentials_observer),
-            )
-            .await
-            .map_err(invalid)?;
-            info!(source = resolved.source, "origin S3 credentials resolved");
-            s3_adapter(&settings, resolved.provider, Arc::clone(&cache))?
+            let (origin, source) = prepare_s3_origin(&settings)?
+                .build(
+                    Arc::new(ReqwestClient::new()),
+                    Arc::clone(&exchange_http),
+                    Arc::clone(&credentials_observer),
+                )
+                .await
+                .map_err(invalid)?;
+            info!(source, "origin S3 credentials resolved");
+            s3_adapter(&settings, Arc::new(origin), Arc::clone(&cache))?
         }
         _ => unreachable!("validated protocol"),
     };
@@ -1079,6 +1093,143 @@ mod tests {
             .map(|(name, value)| (name.to_string(), value.to_string()))
             .collect::<HashMap<_, _>>();
         Settings::from_lookup(|name| values.get(name).cloned())
+    }
+
+    #[derive(Default)]
+    struct OriginRequests(std::sync::Mutex<Vec<HttpRequest>>);
+
+    #[async_trait]
+    impl talon_backend::HttpClient for OriginRequests {
+        async fn execute(
+            &self,
+            request: HttpRequest,
+        ) -> Result<talon_backend::HttpResponse, String> {
+            self.0.lock().unwrap().push(request);
+            Ok(talon_backend::HttpResponse {
+                status: 404,
+                headers: vec![],
+                body: Default::default(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_s3_origin_preserves_endpoint_and_addressing_defaults() {
+        use talon_core::BackendStore;
+        for (endpoint, path_style, expected) in [
+            (
+                None,
+                "true",
+                "https://bucket.s3.us-east-1.amazonaws.com/key",
+            ),
+            (
+                Some("http://minio:9000/prefix/"),
+                "true",
+                "http://minio:9000/prefix/bucket/key",
+            ),
+            (
+                Some("https://objects.example/"),
+                "false",
+                "https://bucket.objects.example/key",
+            ),
+        ] {
+            let mut values = vec![
+                ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+                ("AWS_ACCESS_KEY_ID", "access"),
+                ("AWS_SECRET_ACCESS_KEY", "secret"),
+                ("TALON_GATEWAY_S3_ORIGIN_PATH_STYLE", path_style),
+            ];
+            if let Some(endpoint) = endpoint {
+                values.push(("TALON_GATEWAY_S3_ENDPOINT", endpoint));
+            }
+            let configured = settings(&values).unwrap();
+            let http = Arc::new(OriginRequests::default());
+            let (origin, source) = prepare_s3_origin(&configured)
+                .unwrap()
+                .build(
+                    http.clone(),
+                    http.clone(),
+                    Arc::new(talon_backend::NoopObserver),
+                )
+                .await
+                .unwrap();
+            assert_eq!(source, "aksk");
+            let _ = origin
+                .head(&ObjectId::new(Backend::S3, "bucket", "key"))
+                .await;
+            let requests = http.0.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].url, expected);
+            assert!(requests[0]
+                .headers
+                .iter()
+                .any(|(name, value)| name.eq_ignore_ascii_case("authorization")
+                    && value.contains("/us-east-1/s3/aws4_request")));
+        }
+    }
+
+    #[tokio::test]
+    async fn gateway_azure_origin_preserves_suffix_emulator_and_fixed_sas() {
+        use talon_core::BackendStore;
+        for (endpoint, expected) in [
+            (None, "https://account.blob.custom.example/bucket/key"),
+            (
+                Some("http://localhost:10000/prefix/"),
+                "http://localhost:10000/prefix/account/bucket/key",
+            ),
+        ] {
+            let mut values = vec![
+                ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+                ("TALON_GATEWAY_PROTOCOL", "azure"),
+                ("TALON_GATEWAY_AZURE_ACCOUNT", "account"),
+                ("TALON_GATEWAY_ENDPOINT_SUFFIX", "blob.custom.example"),
+                ("TALON_GATEWAY_AZURE_SAS", "?sv=fixture&sig=fixed"),
+                ("TALON_ORIGIN_CREDENTIALS_SOURCE", "static"),
+            ];
+            if let Some(endpoint) = endpoint {
+                values.push(("TALON_GATEWAY_AZURE_ENDPOINT", endpoint));
+            }
+            let configured = settings(&values).unwrap();
+            let http = Arc::new(OriginRequests::default());
+            let (origin, source) = prepare_azure_origin(&configured)
+                .unwrap()
+                .build(
+                    http.clone(),
+                    http.clone(),
+                    Arc::new(talon_backend::NoopObserver),
+                )
+                .await
+                .unwrap();
+            assert_eq!(source, "static");
+            let _ = origin
+                .head(&ObjectId::new(Backend::Azure, "bucket", "key"))
+                .await;
+            let requests = http.0.lock().unwrap();
+            assert_eq!(requests.len(), 1);
+            assert_eq!(requests[0].url, format!("{expected}?sv=fixture&sig=fixed"));
+        }
+    }
+
+    #[test]
+    fn pod_iam_s3_compatible_broker_requires_explicit_gateway_endpoint() {
+        for (csp, endpoint) in [
+            ("ali", "s3.oss-cn-hangzhou.aliyuncs.com"),
+            ("tc", "cos.ap-beijing.myqcloud.com"),
+            ("hwc", "obs.cn-east-3.myhuaweicloud.com"),
+        ] {
+            let request =
+                serde_json::json!({"credentialType":"iam","csp":csp,"region":"cn-hangzhou"})
+                    .to_string();
+            let mut values = vec![
+                ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+                ("TALON_ORIGIN_CREDENTIALS_SOURCE", "broker"),
+                ("TALON_CREDENTIAL_BROKER_REQUEST", request.as_str()),
+            ];
+            let failure = settings(&values).err().expect("missing endpoint must fail");
+            assert!(failure.to_string().contains("TALON_GATEWAY_S3_ENDPOINT"));
+            values.push(("TALON_GATEWAY_S3_ENDPOINT", endpoint));
+            assert!(settings(&values).is_ok());
+        }
     }
 
     #[test]
@@ -1160,7 +1311,7 @@ mod tests {
         ])
         .unwrap();
         assert_eq!(trusted.origin_auth, OriginAuthMode::TrustedPassthrough);
-        assert!(s3_adapter(&trusted, test_s3_provider(), test_cache(&trusted)).is_err());
+        assert!(s3_adapter(&trusted, test_s3_backend(), test_cache(&trusted)).is_err());
 
         assert!(settings(&[
             ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
@@ -1190,12 +1341,16 @@ mod tests {
         ))
     }
 
-    fn test_s3_provider() -> Arc<dyn ProvideS3Credentials> {
-        Arc::new(talon_backend::StaticS3Credentials::new(S3Credentials {
-            access_key_id: "AKIDTEST".into(),
-            secret_access_key: "secret".into(),
-            session_token: None,
-        }))
+    fn test_s3_backend() -> Arc<S3Backend> {
+        Arc::new(S3Backend::new(
+            talon_backend::S3Config::aws("us-east-1"),
+            S3Credentials {
+                access_key_id: "AKIDTEST".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+            },
+            Arc::new(ReqwestClient::new()),
+        ))
     }
 
     #[test]
@@ -1310,7 +1465,11 @@ mod tests {
         .unwrap();
         assert!(azure_adapter(
             &no_account,
-            talon_backend::AzureCredentials::SharedKey("c2VjcmV0".into()),
+            Arc::new(AzureBackend::with_credentials(
+                talon_backend::AzureConfig::new("account"),
+                talon_backend::AzureCredentials::SharedKey("c2VjcmV0".into()),
+                Arc::new(ReqwestClient::new())
+            )),
             test_cache(&no_account)
         )
         .is_err());

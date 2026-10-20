@@ -43,7 +43,7 @@ import java.util.concurrent.locks.ReentrantLock;
  * <pre>{@code
  * try (TalonClient client = TalonClient.connect("coordinator:7000", 8 << 20)) {
  *     byte[] data = client.read("az://container/dataset.parquet",
- *                               "0x8DABCDEF", 64L << 20, 0, 1 << 20);
+ *                               "0x8DABCDEF", 64L << 20, 0, 1 << 20, RequestOptions.INHERIT);
  * }
  * }</pre>
  */
@@ -140,40 +140,29 @@ public final class TalonClient implements AutoCloseable {
      * cache.
      *
      * <p>Resolves the object's version with a {@code stat} first. Use
-     * {@link #read(String, String, long, long, long)} to supply a known version and size and
+     * {@link #read(String, String, long, long, long, RequestOptions)} to supply a known version and size and
      * skip that round trip.
+     *
+     * <p>Request options are captured once on the caller thread before any network I/O.
      */
-    public byte[] read(String uri, long offset, long length) throws IOException { return read(uri, offset, length, RequestOptions.INHERIT); }
-
-    /** Explicit carrier; captured once on the caller thread before any network I/O. */
     public byte[] read(String uri, long offset, long length, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, offset, length));
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options, () -> readInternal(uri, offset, length));
     }
 
     private byte[] readInternal(String uri, long offset, long length) throws IOException {
         ObjectId object = ObjectId.parse(uri);
-        ObjectStat stat = stat(object);
+        ObjectStat stat = statInternal(object);
         return readInternal(object, stat.version(), stat.size(), offset, length);
     }
 
     /** Read with a known source version and total size, without metadata HEAD. */
-    public byte[] read(String uri, String version, long size, long offset, long length) throws IOException {
-        return read(uri, version, size, offset, length, RequestOptions.INHERIT);
-    }
-
-    /** Explicit carrier for a read with known size and version. */
     public byte[] read(String uri, String version, long size, long offset, long length, RequestOptions options) throws IOException {
         return read(ObjectId.parse(uri), version, size, offset, length, options);
     }
 
-    /** As {@link #read(String, String, long, long, long)}, with a parsed object id. */
-    public byte[] read(ObjectId object, String version, long size, long offset, long length) throws IOException {
-        return read(object, version, size, offset, length, RequestOptions.INHERIT);
-    }
-
-    /** Explicit carrier for a read with known size and version. */
+    /** As {@link #read(String, String, long, long, long, RequestOptions)}, with a parsed object id. */
     public byte[] read(ObjectId object, String version, long size, long offset, long length, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options,
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options,
                 () -> readInternal(object, version, size, offset, length));
     }
 
@@ -196,35 +185,26 @@ public final class TalonClient implements AutoCloseable {
     }
 
     /** Prewarm an exact source version without HEAD; completed fills survive failure. */
-    public LoadResult load(String uri, String version, long size) throws IOException {
-        return load(new LoadRequest(uri, version, size), RequestOptions.INHERIT);
+    public LoadResult load(String uri, String version, long size, RequestOptions options) throws IOException {
+        return load(new LoadRequest(uri, version, size), options);
     }
 
-    /** Prewarm with a parsed request and inherited tracing. */
-    public LoadResult load(LoadRequest request) throws IOException {
-        return load(request, RequestOptions.INHERIT);
-    }
-
-    /** Prewarm a parsed object with explicit tracing and namespace options. */
+    /** Prewarm a parsed object with the supplied request options. */
     public LoadResult load(LoadRequest request, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options,
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options,
                 () -> loadFiles(List.of(request), false).get(0));
     }
 
     /** Batch by worker and frame size, with up to 1024 block instructions per RPC.
      * Results follow input order, including empty files and duplicates.
      * The operation is not atomic: failure may leave completed fills cached. */
-    public List<LoadResult> batchLoad(List<LoadRequest> requests) throws IOException {
-        return batchLoad(requests, RequestOptions.INHERIT);
-    }
-
-    /** Batch prewarm with explicit tracing and namespace options. */
     public List<LoadResult> batchLoad(List<LoadRequest> requests, RequestOptions options) throws IOException {
         List<LoadRequest> copy = List.copyOf(requests);
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> loadFiles(copy, true));
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options, () -> loadFiles(copy, true));
     }
 
     private record IndexedLoad(int index, Messages.LoadBlock block) {}
+    private record LoadGroup(String worker, ObjectId.Backend backend, String bucket) {}
 
     private static final class LoadProgress {
         final LoadFailure[] failures;
@@ -281,8 +261,9 @@ public final class TalonClient implements AutoCloseable {
         try {
             topology = membership(deadline).placement;
             // Bound pending planning across all workers independently of file sizes.
-            Map<String, List<IndexedLoad>> groups = new java.util.LinkedHashMap<>();
-            Map<String, Long> sizes = new HashMap<>();
+            Map<LoadGroup, List<IndexedLoad>> groups = new java.util.LinkedHashMap<>();
+            Map<LoadGroup, Long> sizes = new HashMap<>();
+            boolean dynamic = RequestOptions.hasBroker();
             int pending = 0;
             long pendingBytes = 0;
             for (int fileIndex = 0; fileIndex < files.size(); fileIndex++) {
@@ -297,7 +278,11 @@ public final class TalonClient implements AutoCloseable {
                     } else {
                         NodeInfo owner = topology.primary(request.block());
                         if (owner == null) throw new TalonException(TalonException.Code.UNAVAILABLE, "empty logical membership");
-                        String key = owner.id();
+                        // One dynamic frame binds exactly one origin target.
+                        // Legacy batches retain their existing per-worker grouping.
+                        LoadGroup key = new LoadGroup(owner.id(),
+                                dynamic ? file.object().backend() : null,
+                                dynamic ? file.object().bucket() : null);
                         List<IndexedLoad> group = groups.computeIfAbsent(key, ignored -> new ArrayList<>());
                         long bytes = sizes.getOrDefault(key, (long) Messages.BATCH_LOAD_OVERHEAD);
                         long size = Messages.loadBlockSize(request);
@@ -369,13 +354,14 @@ public final class TalonClient implements AutoCloseable {
             } finally { membershipLock.unlock(); }
             int id = requestIds.getAndIncrement();
             byte[] request = batch ? Messages.batchLoad(id, blocks) : Messages.loadBlock(id, blocks.get(0));
-            long rpcDeadline = Math.min(deadline, System.nanoTime() + java.util.concurrent.TimeUnit.SECONDS.toNanos(batch ? 1800 : 120));
+            long rpcDeadline = Math.min(deadline, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(
+                    RequestOptions.requestTimeoutMillis(batch ? 1_800_000 : 120_000)));
             return pool.exchange(address, true, rpcDeadline, socket -> {
                 long left = rpcDeadline - System.nanoTime();
                 if (left <= 0) throw new TalonException(TalonException.Code.TIMEOUT, "load deadline exceeded");
                 socket.setSoTimeout((int) Math.max(1, java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(left)));
                 try {
-                    socket.getOutputStream().write(Telemetry.envelope(request, address));
+                    socket.getOutputStream().write(Frame.envelope(request, address));
                     socket.getOutputStream().flush();
                     Frame header = readHeader(socket.getInputStream());
                     if (header.isError() || header.type() != Frame.MsgType.CONTROL || header.requestId() != id || header.length() > (1 << 20)) {
@@ -396,24 +382,18 @@ public final class TalonClient implements AutoCloseable {
         } finally { loadSlots.release(); }
     }
 
-    /** Return an object's size and version. */
-    public ObjectStat stat(String uri) throws IOException { return stat(uri, RequestOptions.INHERIT); }
-
-    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    /** Return an object's size and version with request options captured before any network I/O. */
     public ObjectStat stat(String uri, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(uri));
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(uri));
     }
 
     private ObjectStat statInternal(String uri) throws IOException {
-        return stat(ObjectId.parse(uri));
+        return statInternal(ObjectId.parse(uri));
     }
 
-    /** As {@link #stat(String)}, with a parsed object id. */
-    public ObjectStat stat(ObjectId object) throws IOException { return stat(object, RequestOptions.INHERIT); }
-
-    /** Explicit carrier; captured once on the caller thread before any network I/O. */
+    /** As {@link #stat(String, RequestOptions)}, with a parsed object id. */
     public ObjectStat stat(ObjectId object, RequestOptions options) throws IOException {
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(object));
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options, () -> statInternal(object));
     }
 
     private ObjectStat statInternal(ObjectId object) throws IOException {
@@ -439,12 +419,16 @@ public final class TalonClient implements AutoCloseable {
      * the server's object, page, or payload limit, the call fails explicitly
      * instead of returning an incomplete list; use a narrower prefix.
      *
-     * @param options per-call tracing and namespace; null selects the default namespace without tracing
+     * @param options per-call tracing, namespace and credential properties; null selects the default namespace without tracing
      */
     public List<ObjectEntry> list(String prefix, RequestOptions options) throws IOException {
+        return RequestOptions.call(options == null ? RequestOptions.ROOT : options,
+                () -> listInternal(prefix));
+    }
+
+    private List<ObjectEntry> listInternal(String prefix) throws IOException {
         int id = requestIds.getAndIncrement();
-        return Telemetry.call(options == null ? RequestOptions.ROOT : options,
-                () -> controlRoundTrip(Messages.listObjects(id, prefix), resp -> {
+        return controlRoundTrip(Messages.listObjects(id, prefix), resp -> {
             if (resp.tag == Messages.TAG_OBJECT_LIST) {
                 int n = resp.body.seqLen();
                 List<ObjectEntry> entries = new ArrayList<>(n);
@@ -454,7 +438,7 @@ public final class TalonClient implements AutoCloseable {
                 return entries;
             }
             throw unexpected("ListObjects", resp);
-        }));
+        });
     }
 
     @Override
@@ -671,7 +655,7 @@ public final class TalonClient implements AutoCloseable {
                                   IoFunction<Messages.Response, T> decode) throws IOException {
         try { return pool.exchange(coordinator, false, deadline, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(Telemetry.envelope(request, coordinator));
+            out.write(Frame.envelope(request, coordinator));
             out.flush();
 
             Frame header = readHeader(socket.getInputStream());
@@ -700,7 +684,7 @@ public final class TalonClient implements AutoCloseable {
 
         return pool.exchange(workerAddress, true, socket -> {
             OutputStream out = socket.getOutputStream();
-            out.write(Telemetry.envelope(request, workerAddress));
+            out.write(Frame.envelope(request, workerAddress));
             out.flush();
 
             InputStream in = socket.getInputStream();
@@ -800,6 +784,9 @@ public final class TalonClient implements AutoCloseable {
                 try (SocketDeadline guard = deadline == null ? null : new SocketDeadline(socket, deadline)) {
                     // The same deadline covers connect, write, header, body, and any retry.
                     if (!socket.isConnected()) connect(socket, address);
+                    // Reapply on every checkout: a pooled connection can alternate
+                    // between static and credential-bearing requests.
+                    socket.setSoTimeout(RequestOptions.requestTimeoutMillis(READ_TIMEOUT_MS));
                     T result = request.apply(socket);
                     if (guard != null) guard.finish();
                     release(address, socket);

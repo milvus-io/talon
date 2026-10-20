@@ -1,11 +1,12 @@
 //! Opt-in real broker/cloud tests. Every HTTP call uses ReqwestClient; no mocks.
-//! Each test owns its Tokio runtime, which drops remaining refresh tasks on exit.
+//! Broker refresh is driven explicitly by request preparation.
 
-use super::BrokerFetch;
+use super::{BrokerCredentials, BrokerFetch};
 use crate::credentials::{
     CredentialsObserver, NoopObserver, ProvideBearerToken, ProvideS3Credentials, ProvideSasToken,
-    RefreshPolicy, RefreshingCredentials,
+    RefreshPolicy,
 };
+use crate::gcs::GcpBearerToken;
 use crate::workload_identity::{
     resolve_azure_credentials_with_env, resolve_gcs_credentials_with_env,
     resolve_s3_credentials_with_env,
@@ -117,10 +118,10 @@ impl CredentialsObserver for SuccessfulFetches {
 
 async fn refresh_twice<F: CredentialsFetch>(
     fetcher: F,
-    valid: impl Fn(&RefreshingCredentials<F>) -> bool,
+    valid: impl Fn(&BrokerCredentials<F>) -> bool,
 ) {
     let observer = Arc::new(SuccessfulFetches::default());
-    // Test-only pacing invokes the real background fetch in two seconds. The
+    // Test-only pacing makes the snapshot immediately due. The
     // broker may return the same cached token/expiry; this is not expiry rotation.
     let policy = RefreshPolicy {
         margin_fraction: 1.0,
@@ -130,24 +131,21 @@ async fn refresh_twice<F: CredentialsFetch>(
         ..RefreshPolicy::default()
     };
     let cell = live_result(
-        RefreshingCredentials::bootstrap(fetcher, policy, observer.clone()).await,
+        BrokerCredentials::bootstrap(fetcher, policy, observer.clone()).await,
         "refresh bootstrap",
     );
     assert!(valid(&cell), "initial real snapshot is invalid");
     live_result(
-        tokio::time::timeout(Duration::from_secs(90), async {
-            while observer.0.load(Ordering::SeqCst) < 2 {
-                tokio::time::sleep(Duration::from_millis(50)).await;
-            }
-        })
-        .await,
-        "background refresh (two successful real fetches required)",
+        tokio::time::timeout(Duration::from_secs(90), cell.prepare()).await,
+        "request-driven refresh deadline",
+    )
+    .unwrap_or_else(|_| panic!("request preparation failed"));
+    assert_eq!(
+        observer.0.load(Ordering::SeqCst),
+        2,
+        "two successful real exchanges required"
     );
     assert!(valid(&cell), "refreshed real snapshot is invalid");
-    assert!(
-        cell.expires_at().is_some_and(|at| at > SystemTime::now()),
-        "real refreshed expiry is not in the future"
-    );
     drop(cell);
 }
 
@@ -215,7 +213,7 @@ async fn read_storage(backend: &dyn BackendStore, kind: Backend, bucket: &str, c
 
 #[tokio::test]
 #[ignore = "requires live broker AWS configuration and real network access"]
-async fn live_broker_aws_acquisition_and_background_refresh() {
+async fn live_broker_aws_acquisition_and_request_driven_refresh() {
     let config = LiveConfig::load("AWS");
     let http = real_http("AWS", &config.url);
     let resolved = live_result(
@@ -246,7 +244,7 @@ async fn live_broker_aws_acquisition_and_background_refresh() {
 
 #[tokio::test]
 #[ignore = "requires live broker GCP configuration and real network access"]
-async fn live_broker_gcp_acquisition_and_background_refresh() {
+async fn live_broker_gcp_acquisition_and_request_driven_refresh() {
     let config = LiveConfig::load("GCP");
     let http = real_http("GCP", &config.url);
     let resolved = live_result(
@@ -266,7 +264,7 @@ async fn live_broker_gcp_acquisition_and_background_refresh() {
     );
     drop(resolved);
     let fetcher = live_result(
-        BrokerFetch::<String>::from_env(&|name| config.env(name), "gcp", None, http),
+        BrokerFetch::<GcpBearerToken>::from_env(&|name| config.env(name), "gcp", None, http),
         "GCP fetcher configuration",
     );
     refresh_twice(fetcher, |cell| {
@@ -277,7 +275,7 @@ async fn live_broker_gcp_acquisition_and_background_refresh() {
 
 #[tokio::test]
 #[ignore = "requires live broker Azure configuration and real network access"]
-async fn live_broker_azure_acquisition_and_background_refresh() {
+async fn live_broker_azure_acquisition_and_request_driven_refresh() {
     let config = LiveConfig::load("AZURE");
     let http = real_http("AZURE", &config.url);
     let account = config.field("azureAccountName");
