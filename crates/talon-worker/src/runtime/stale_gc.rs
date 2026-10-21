@@ -803,15 +803,26 @@ mod tests {
             let task = tokio::spawn({
                 let r = r.clone();
                 async move {
-                    StaleGc::default().run_round_at(&r, cold_now()).await;
+                    let mut gc = StaleGc::new(&WorkerConfig {
+                        stale_gc_head_concurrency: 2,
+                        ..Default::default()
+                    });
+                    gc.run_round_at(&r, cold_now()).await;
                 }
             });
-            origin.entered.notified().await;
+            // Hold a full concurrent HEAD wave before inserting the late entry.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while origin.calls.load(Ordering::Relaxed) < 2 {
+                    origin.entered.notified().await;
+                }
+            })
+            .await
+            .expect("both concurrent HEAD requests must enter the backend");
             let mut late = block(0);
             late.object = ObjectId::new(Backend::S3, "bucket", "late");
             fill(&r, &late, false).await;
             origin.hold.store(false, Ordering::Relaxed);
-            origin.release.notify_one();
+            origin.release.notify_waiters();
             tokio::time::timeout(Duration::from_secs(5), task)
                 .await
                 .unwrap()
