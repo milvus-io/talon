@@ -1,5 +1,22 @@
 //! Native async client for reading objects through a Talon cache cluster.
 //!
+//! # Cache namespace
+//!
+//! Select a namespace on each request. Omitting it uses `default`; metadata,
+//! block reads and retries retain the namespace of their enclosing request.
+//!
+//! ```no_run
+//! use talon_rust_client::{ClientBuilder, RequestOptions, parse_uri};
+//!
+//! # async fn example() -> Result<(), talon_rust_client::Error> {
+//! let client = ClientBuilder::default().with_coordinator("coordinator:7000").build()?;
+//! let options = RequestOptions::default().with_namespace("analytics");
+//! let object = parse_uri("s3://bucket/key")?;
+//! let bytes = client.read(&object, 0, Some(4096), None, &options).await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! # Availability zones
 //!
 //! Construction reads `TALON_ZONE` and `TALON_ZONE_AFFINITY` (default off).
@@ -65,7 +82,8 @@ mod zone;
 pub use zone::ZoneOptions;
 
 pub use client::{
-    parse_uri, Client, ClientBuilder, LoadRequest, DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
+    parse_uri, Client, ClientBuilder, LoadRequest, RequestOptions,
+    DEFAULT_MAX_IN_FLIGHT_BLOCK_READS,
 };
 pub use error::{Error, ErrorKind, UriError};
 pub use talon_cache_client::{
@@ -75,4 +93,4 @@ pub use talon_cache_client::{
 pub use talon_core::{ObjectId, Version, UNCHECKED_VERSION};
 pub use talon_transport::{DataErrorCode, DataPlaneError, ObjectEntry};
 
-pub use talon_telemetry::{RequestOptions, TraceContext, TraceParent};
+pub use talon_telemetry::{TraceContext, TraceParent};

@@ -26,7 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use talon_core::{BlockId, NodeId, NodeInfo, ObjectId};
+use talon_core::{BlockId, NamespaceId, NodeId, NodeInfo, ObjectId};
 use talon_transport::frame::{FrameHeader, MsgType, HEADER_LEN};
 use talon_transport::{ControlMessage, ZonedNodeInfo, MAX_CONTROL_PAYLOAD_LEN};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -143,7 +143,10 @@ impl CoordinatorClient {
             block: block.clone(),
             k,
         };
-        match self.round_trip(req, "PlacementLookup").await? {
+        match self
+            .round_trip(req, "PlacementLookup", &NamespaceId::Unattributed)
+            .await?
+        {
             ControlMessage::PlacementResponse { owners, epoch } => Ok(Placement { owners, epoch }),
             other => Err(CoordinatorError::Unexpected {
                 expected: "PlacementLookup",
@@ -157,7 +160,11 @@ impl CoordinatorClient {
         &self,
     ) -> Result<talon_core::worker_membership::WorkerDiscovery, CoordinatorError> {
         match self
-            .round_trip(ControlMessage::MembershipQuery {}, "MembershipQuery")
+            .round_trip(
+                ControlMessage::MembershipQuery {},
+                "MembershipQuery",
+                &NamespaceId::Unattributed,
+            )
             .await?
         {
             ControlMessage::MembershipList { view } => Ok(view),
@@ -207,7 +214,7 @@ impl CoordinatorClient {
             .collect())
     }
 
-    /// Fetch an object's size + version for `getattr` / block addressing.
+    /// Fetch an object's size + version in the request's cache namespace.
     ///
     /// Forward-surface: the mount currently sizes files from the coordinator
     /// listing (`list_objects`) and addresses blocks under a canonical version
@@ -215,11 +222,15 @@ impl CoordinatorClient {
     /// not yet on the hot path. It is the natural entry point for real per-object
     /// version resolution if the mount ever becomes version-aware; kept for that
     /// and covered by its own test.
-    pub async fn stat_object(&self, object: &ObjectId) -> Result<ObjectStat, CoordinatorError> {
+    pub async fn stat_object(
+        &self,
+        object: &ObjectId,
+        namespace: &NamespaceId,
+    ) -> Result<ObjectStat, CoordinatorError> {
         let req = ControlMessage::StatObject {
             object: object.clone(),
         };
-        match self.round_trip(req, "StatObject").await? {
+        match self.round_trip(req, "StatObject", namespace).await? {
             ControlMessage::ControlFailure { code, message } => {
                 Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
                     code,
@@ -234,18 +245,19 @@ impl CoordinatorClient {
         }
     }
 
-    /// List objects under `prefix` (mount-relative) for `readdir`.
+    /// List objects under `prefix` (mount-relative) in the request's cache namespace.
     ///
     /// Returns `(path, size)` entries from which a protocol frontend can
     /// synthesize its namespace view.
     pub async fn list_objects(
         &self,
         prefix: &str,
+        namespace: &NamespaceId,
     ) -> Result<Vec<talon_transport::ObjectEntry>, CoordinatorError> {
         let req = ControlMessage::ListObjects {
             prefix: prefix.to_string(),
         };
-        match self.round_trip(req, "ListObjects").await? {
+        match self.round_trip(req, "ListObjects", namespace).await? {
             ControlMessage::ControlFailure { code, message } => {
                 Err(CoordinatorError::Remote(talon_transport::DataPlaneError {
                     code,
@@ -307,14 +319,15 @@ impl CoordinatorClient {
         &self,
         msg: ControlMessage,
         expected: &'static str,
+        namespace: &NamespaceId,
     ) -> Result<ControlMessage, CoordinatorError> {
         let mut out = talon_transport::encode(0, &msg)?;
-        match self.exchange(&mut out, expected).await {
+        match self.exchange(&mut out, expected, namespace).await {
             Ok(reply) => Ok(reply),
             Err((true, err)) if err.is_transport_failure() => {
                 talon_telemetry::observe("talon.rpc", "client", async {
                     talon_telemetry::text("server.address", &self.addr);
-                    talon_transport::envelope::outbound(&mut out, &self.addr)
+                    talon_transport::envelope::outbound_namespace(&mut out, &self.addr, namespace)
                         .map_err(talon_transport::CodecError::from)?;
 
                     let mut stream = self.pool.fresh(&self.addr).await?;
@@ -344,10 +357,11 @@ impl CoordinatorClient {
         &self,
         out: &mut Vec<u8>,
         expected: &'static str,
+        namespace: &NamespaceId,
     ) -> Result<ControlMessage, (bool, CoordinatorError)> {
         talon_telemetry::observe("talon.rpc", "client", async {
             talon_telemetry::text("server.address", &self.addr);
-            talon_transport::envelope::outbound(out, &self.addr)
+            talon_transport::envelope::outbound_namespace(out, &self.addr, namespace)
                 .map_err(|e| (false, CoordinatorError::Codec(e.into())))?;
 
             let (mut stream, reused) = self
@@ -559,7 +573,10 @@ mod tests {
         .await;
         let client = CoordinatorClient::new(addr);
         let stat = client
-            .stat_object(&ObjectId::new(Backend::S3, "b", "o/1"))
+            .stat_object(
+                &ObjectId::new(Backend::S3, "b", "o/1"),
+                &NamespaceId::Unattributed,
+            )
             .await
             .unwrap();
         assert_eq!(stat.size, 2_500_000_000);
@@ -582,7 +599,10 @@ mod tests {
         })
         .await;
         let client = CoordinatorClient::new(addr);
-        let entries = client.list_objects("s3/b/dir").await.unwrap();
+        let entries = client
+            .list_objects("s3/b/dir", &NamespaceId::Unattributed)
+            .await
+            .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].path, "s3/b/dir/a.bin");
         assert_eq!(entries[1].size, 30);

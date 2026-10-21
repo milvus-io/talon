@@ -1,5 +1,6 @@
 """Offline binding tests using real TCP frames; also embedded in Rust tests."""
 import io
+import concurrent.futures
 import socketserver
 import struct
 import threading
@@ -20,6 +21,7 @@ class Peer(socketserver.ThreadingTCPServer):
     def __init__(self):
         super().__init__(("127.0.0.1", 0), Handler)
         self.frames = []
+        self.namespaces = []
         self.errors = []
         self.reject = False
         self.drop_reply = False
@@ -45,21 +47,55 @@ class Handler(socketserver.StreamRequestHandler):
                 if not header:
                     return
                 magic, version, kind, flags, reserved, request_id, length = struct.unpack(">HBBHHII", header)
-                assert (magic, version, kind) == (0x544C, 1, 0)
+                assert magic == 0x544C and version in (1, 3) and kind in (0, 10, 11)
                 body = io.BytesIO(self.rfile.read(length))
+                namespace = "default"
+                if version == 3:
+                    metadata_size = struct.unpack(">H", body.read(2))[0]
+                    metadata = io.BytesIO(body.read(metadata_size))
+                    fields = {}
+                    while metadata.tell() < metadata_size:
+                        key, size = struct.unpack(">BH", metadata.read(3))
+                        fields[key] = metadata.read(size)
+                    namespace = fields[5].decode()
+                def read_string():
+                    size = struct.unpack("<Q", body.read(8))[0]
+                    return body.read(size).decode()
+                if kind in (10, 11):
+                    if kind == 11:
+                        assert struct.unpack("<I", body.read(4))[0] == 0
+                        scoped_namespace = read_string()
+                        if version == 3:
+                            assert scoped_namespace == namespace
+                        namespace = scoped_namespace
+                    assert struct.unpack("<I", body.read(4))[0] == 0
+                    assert (read_string(), read_string()) == ("bucket", "file")
+                    offset, count = struct.unpack("<QQ", body.read(16))
+                    assert offset == 0
+                    assert read_string() == "v1"
+                    assert struct.unpack("<Q", body.read(8))[0] == 3
+                    assert not body.read()
+                    reply = {"team-a": b"A", "team-b": b"B", "default": b"D"}[namespace] * count
+                    self.wfile.write(struct.pack(">HBBHHII", 0x544C, 1, 2, 0, 0, request_id, len(reply)) + reply)
+                    self.wfile.flush()
+                    continue
                 schema, tag = struct.unpack("<HI", body.read(6))
                 assert schema == 6
                 if tag == 4:
                     reply = struct.pack("<HIQQQQ", 6, 5, 1, 1, 500, 1)
                     reply += string("worker") + b"\0\0" + struct.pack("<I", 2)
                     reply += string("instance") + string(self.server.address)
+                elif tag == 8:
+                    assert struct.unpack("<I", body.read(4))[0] == 0
+                    assert (read_string(), read_string()) == ("bucket", "file")
+                    reply = struct.pack("<HIQ", 6, 9, 3) + string(namespace)
+                elif tag == 10:
+                    assert read_string() == "s3/bucket"
+                    reply = struct.pack("<HIQ", 6, 11, 1) + string(namespace) + struct.pack("<Q", 3)
                 else:
                     assert tag in (19, 20), "unexpected metadata or non-load request"
                     count = struct.unpack("<Q", body.read(8))[0] if tag == 20 else 1
                     entries = []
-                    def read_string():
-                        size = struct.unpack("<Q", body.read(8))[0]
-                        return body.read(size).decode()
                     for _ in range(count):
                         backend = struct.unpack("<I", body.read(4))[0]
                         bucket, key = read_string(), read_string()
@@ -69,6 +105,7 @@ class Handler(socketserver.StreamRequestHandler):
                         entries.append((backend, bucket, key, offset, block_size, source_version, size))
                     assert not body.read()
                     self.server.frames.append((tag, entries))
+                    self.server.namespaces.append(namespace)
                     if self.server.drop_reply:
                         return
                     if tag == 20 and not self.server.reject:
@@ -86,6 +123,59 @@ class Handler(socketserver.StreamRequestHandler):
 
 
 class LoadTests(unittest.TestCase):
+    def test_same_client_routes_read_stat_and_list_per_request(self):
+        with Peer() as peer:
+            client = talon.Client(peer.address, block_size=8)
+            def request(namespace):
+                expected = namespace or "default"
+                self.assertEqual(client.stat("s3://bucket/file", namespace=namespace).version, expected)
+                self.assertEqual([entry.path for entry in client.list("s3/bucket", namespace=namespace)], [expected])
+                self.assertEqual(client.read("s3://bucket/file", version="v1", size=3, length=3,
+                                             namespace=namespace),
+                                 {"team-a": b"AAA", "team-b": b"BBB", "default": b"DDD"}[expected])
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                list(executor.map(request, ["team-a", "team-b", None]))
+            self.assertEqual(client.stat("s3://bucket/file").version, "default")
+            self.assertFalse(peer.errors)
+            del client
+
+    def test_named_namespace_is_sent_for_single_and_batch_loads(self):
+        with Peer() as peer:
+            client = talon.Client(peer.address, block_size=8)
+            def load(namespace):
+                result = client.load("s3://bucket/file", version="v1", size=3,
+                                     namespace=namespace)
+                self.assertEqual((result.size, result.blocks), (3, 1))
+                results = client.batch_load([talon.LoadRequest("s3://bucket/file", "v1", 3)],
+                                            namespace=namespace)
+                self.assertEqual([(r.size, r.blocks) for r in results], [(3, 1)])
+            with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+                list(executor.map(load, ["team-a", "team-b", None]))
+            client.load("s3://bucket/file", version="v1", size=3)
+            self.assertEqual(sorted(peer.namespaces),
+                             ["default"] * 3 + ["team-a"] * 2 + ["team-b"] * 2)
+            self.assertFalse(peer.errors)
+            del client
+
+    def test_invalid_namespaces_are_rejected_by_every_operation(self):
+        client = talon.Client("127.0.0.1:1", block_size=8)
+        for namespace in (None, "default", "team-a.b_1", "x" * 255):
+            self.assertEqual(client.read("s3://bucket/file", version="v1", size=0, length=0, namespace=namespace), b"")
+            self.assertEqual(client.load("s3://bucket/file", version="v1", size=0, namespace=namespace).blocks, 0)
+            self.assertEqual(client.batch_load([], namespace=namespace), [])
+        for namespace in ("", ".", "..", "a/b", "a b", "租户", "worker_identity", ".worker.lock", "x" * 256):
+            with self.subTest(namespace=namespace):
+                with self.assertRaises(ValueError):
+                    client.read("s3://bucket/file", length=0, version="v1", size=0, namespace=namespace)
+                with self.assertRaises(ValueError):
+                    client.stat("s3://bucket/file", namespace=namespace)
+                with self.assertRaises(ValueError):
+                    client.list("s3/bucket", namespace=namespace)
+                with self.assertRaises(ValueError):
+                    client.load("s3://bucket/file", version="v1", size=0, namespace=namespace)
+                with self.assertRaises(ValueError):
+                    client.batch_load([], namespace=namespace)
+
     def test_single_and_batch_use_the_expected_frames(self):
         with Peer() as peer:
             client = talon.Client(peer.address, block_size=8)
@@ -99,6 +189,7 @@ class LoadTests(unittest.TestCase):
             self.assertEqual(singles, [(0, "bucket", "file", 0, 8, "v1", 8), (0, "bucket", "file", 8, 8, "v1", 1)])
             self.assertEqual(sorted(len(entries) for tag, entries in peer.frames if tag == 20), [1, 1024])
             self.assertTrue(all(e[5:] == ("v2", 3) for tag, entries in peer.frames if tag == 20 for e in entries))
+            self.assertEqual(peer.namespaces, ["default"] * len(peer.frames))
             self.assertFalse(peer.errors)
             del client
 

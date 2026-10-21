@@ -80,6 +80,7 @@ int main(void) {
     int status = talon_stat_async(
         client,
         "s3://bucket/path/object.bin",
+        NULL,
         on_stat,
         &ctx,
         &request_id);

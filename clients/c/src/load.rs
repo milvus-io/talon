@@ -20,32 +20,10 @@ pub struct TalonLoadResult {
     pub blocks: u64,
 }
 
-/// Submit a single file prewarm. See talon.h for ownership and callback rules.
+/// Submit a single file prewarm with a copied namespace and trace context.
+/// See talon.h for ownership and callback rules.
 #[no_mangle]
 pub unsafe extern "C" fn talon_load_async(
-    client: *mut TalonClient,
-    uri: *const c_char,
-    version: *const c_char,
-    size: u64,
-    callback: Option<TalonCallback>,
-    user_data: *mut c_void,
-    request_id_out: *mut u64,
-) -> c_int {
-    talon_load_async_with_options(
-        client,
-        uri,
-        version,
-        size,
-        ptr::null(),
-        callback,
-        user_data,
-        request_id_out,
-    )
-}
-
-/// Submit a single file prewarm with copied request-local trace context.
-#[no_mangle]
-pub unsafe extern "C" fn talon_load_async_with_options(
     client: *mut TalonClient,
     uri: *const c_char,
     version: *const c_char,
@@ -69,29 +47,9 @@ pub unsafe extern "C" fn talon_load_async_with_options(
 }
 
 /// Submit files using protocol-level batches, not repeated single LOAD RPCs.
+/// Namespace and trace context are copied before submission returns.
 #[no_mangle]
 pub unsafe extern "C" fn talon_batch_load_async(
-    client: *mut TalonClient,
-    requests: *const TalonLoadRequest,
-    count: usize,
-    callback: Option<TalonCallback>,
-    user_data: *mut c_void,
-    request_id_out: *mut u64,
-) -> c_int {
-    talon_batch_load_async_with_options(
-        client,
-        requests,
-        count,
-        ptr::null(),
-        callback,
-        user_data,
-        request_id_out,
-    )
-}
-
-/// Submit a protocol batch with copied request-local trace context.
-#[no_mangle]
-pub unsafe extern "C" fn talon_batch_load_async_with_options(
     client: *mut TalonClient,
     requests: *const TalonLoadRequest,
     count: usize,
@@ -125,7 +83,7 @@ unsafe fn submit(
 ) -> c_int {
     ffi_status(|| {
         let inner = client_inner(client)?;
-        let parent = trace_options::copy_options(options)?;
+        let (parent, namespace) = trace_options::copy_options(options)?;
         let callback = callback.ok_or((STATUS_INVALID_ARGUMENT, "callback is null".into()))?;
         if request_id_out.is_null()
             || (count != 0 && requests.is_null())
@@ -181,12 +139,14 @@ unsafe fn submit(
             );
             let result = operation
                 .scope(async {
+                    let options = talon_rust_client::RequestOptions::default()
+                        .with_namespace(namespace.as_deref().unwrap_or("default"));
                     if batch {
-                        client.batch_load(&requests).await
+                        client.batch_load(&requests, &options).await
                     } else {
                         let request = &requests[0];
                         client
-                            .load(&request.object, &request.version, request.size)
+                            .load(&request.object, &request.version, request.size, &options)
                             .await
                             .map(|result| vec![result])
                     }

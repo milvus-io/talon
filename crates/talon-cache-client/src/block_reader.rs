@@ -327,12 +327,19 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
     ) -> Result<usize, BlockReadError> {
-        self.read_block_into_with_mode(block, offset_in_block, dst, OriginReadMode::Current)
-            .await
+        self.read_block_into_with_mode(
+            block,
+            offset_in_block,
+            dst,
+            OriginReadMode::Current,
+            &talon_core::NamespaceId::Unattributed,
+        )
+        .await
     }
 
     /// Read into `dst` from the exact source version carried by `block`.
     ///
+    /// `namespace` applies only to this request; default keeps legacy framing.
     /// A miss is conditionally fetched without resolving a newer generation.
     /// Version mismatches retain their worker error classification.
     /// [`read_block_into`](Self::read_block_into) keeps following the current origin.
@@ -342,12 +349,14 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
         object_len: u64,
+        namespace: &talon_core::NamespaceId,
     ) -> Result<usize, BlockReadError> {
         self.read_block_into_with_mode(
             block,
             offset_in_block,
             dst,
             OriginReadMode::ExactVersion(object_len),
+            namespace,
         )
         .await
     }
@@ -358,6 +367,7 @@ impl BlockReader {
         offset_in_block: u32,
         dst: &mut [u8],
         mode: OriginReadMode,
+        namespace: &talon_core::NamespaceId,
     ) -> Result<usize, BlockReadError> {
         let snapshot = self.membership_snapshot().await?;
         self.stats.record_cache_miss();
@@ -365,7 +375,11 @@ impl BlockReader {
         let mut last = BlockReadError::NoOwners;
         for (target, candidate) in snapshot.candidates(block, self.replicas_k) {
             let worker = match candidate {
-                Ok(worker) => worker,
+                Ok(worker) => worker.with_namespace(if namespace.is_default() {
+                    talon_core::NamespaceId::Unattributed
+                } else {
+                    namespace.clone()
+                }),
                 Err(error) => {
                     last = snapshot.replica_error(target, error);
                     continue;
@@ -1555,7 +1569,13 @@ mod tests {
                         .await
                         .unwrap_err(),
                     ReadApi::VersionedInto => reader
-                        .read_versioned_block_into(&block(), 7, &mut dst, block().offset + 64)
+                        .read_versioned_block_into(
+                            &block(),
+                            7,
+                            &mut dst,
+                            block().offset + 64,
+                            &talon_core::NamespaceId::Unattributed,
+                        )
                         .await
                         .unwrap_err(),
                     ReadApi::Detailed => {
@@ -1757,7 +1777,13 @@ mod tests {
                 let mut dst = vec![42; 32];
                 let n = if matches!(api, ReadApi::VersionedInto) {
                     reader
-                        .read_versioned_block_into(&block(), 7, &mut dst, block().offset + 64)
+                        .read_versioned_block_into(
+                            &block(),
+                            7,
+                            &mut dst,
+                            block().offset + 64,
+                            &talon_core::NamespaceId::Unattributed,
+                        )
                         .await
                 } else {
                     reader.read_block_into(&block(), 7, &mut dst).await

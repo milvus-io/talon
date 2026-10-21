@@ -18,7 +18,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     for line in std::io::stdin().lock().lines() {
         match line?.as_str() {
-            "read" => match client.read(&object, 0, Some(8192), Some(&stat)).await {
+            "read" => match client
+                .read(
+                    &object,
+                    0,
+                    Some(8192),
+                    Some(&stat),
+                    &talon_rust_client::RequestOptions::default(),
+                )
+                .await
+            {
                 Ok(bytes) => {
                     assert_eq!(
                         bytes,
@@ -28,7 +37,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 Err(error) => println!("ERR {:?}", error.kind()),
             },
-            "stat" => match client.stat(&object).await {
+            "stat" => match client
+                .stat(&object, &talon_rust_client::RequestOptions::default())
+                .await
+            {
                 Ok(_) => println!("OK stat"),
                 Err(error) => println!("ERR {:?}", error.kind()),
             },

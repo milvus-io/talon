@@ -26,7 +26,7 @@ public final class Frame {
     public static final int HEADER_LEN = 16;
     /** Magic prefix, ASCII "TL". */
     public static final int MAGIC = 0x544C;
-    /** Protocol version this client speaks. */
+    /** Default protocol version; tracing uses v2 and named namespaces use v3. */
     public static final int PROTOCOL_VERSION = 1;
 
     /** Set when the body is an error message rather than a payload. */
@@ -127,10 +127,9 @@ public final class Frame {
                             magic, MAGIC));
         }
         int version = b.get() & 0xFF;
-        if (version != 1 && version != 2) {
+        if (version != 1 && version != 2 && version != 3) {
             throw new ProtocolException(
-                    "unsupported protocol version " + version + "; this client speaks "
-                            + PROTOCOL_VERSION);
+                    "unsupported protocol version " + version + "; this client supports 1, 2 and 3");
         }
         MsgType type = MsgType.from(b.get() & 0xFF);
         int flags = b.getShort() & 0xFFFF;

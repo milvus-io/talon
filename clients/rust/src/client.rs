@@ -5,7 +5,7 @@ mod membership_fixture;
 use std::sync::Arc;
 use tokio::sync::Semaphore;
 
-use crate::{Error, ObjectEntry, ObjectId, ObjectStat, UriError, Version};
+use crate::{Error, ObjectEntry, ObjectId, ObjectStat, TraceParent, UriError, Version};
 use futures::stream::{FuturesUnordered, StreamExt};
 use talon_cache_client::pool::{DEFAULT_IDLE_TTL, DEFAULT_MAX_IDLE_PER_ADDR};
 use talon_cache_client::{
@@ -29,6 +29,54 @@ pub struct LoadRequest {
 }
 /// Default active block-read budget shared by a client and all its clones.
 pub const DEFAULT_MAX_IN_FLIGHT_BLOCK_READS: usize = 1024;
+
+/// Options for one SDK operation; never changes the shared client.
+/// Defaults to the `default` namespace and inherited tracing. Chain configuration
+/// methods directly; no build step is needed. Copies can be reused concurrently.
+#[derive(Clone, Copy, Default)]
+pub struct RequestOptions<'a> {
+    parent: TraceParent<'a>,
+    namespace: Option<&'a str>,
+}
+
+impl<'a> RequestOptions<'a> {
+    /// Select a namespace for this request, preserving the parent policy.
+    /// Names are validated before dispatch, including empty reads and loads.
+    /// The name must remain valid until the request completes.
+    #[must_use = "request options are immutable; use the returned options"]
+    pub fn with_namespace<'b>(self, namespace: &'b str) -> RequestOptions<'b>
+    where
+        'a: 'b,
+    {
+        RequestOptions {
+            parent: self.parent,
+            namespace: Some(namespace),
+        }
+    }
+
+    /// Select a trace parent for this request, preserving its namespace.
+    /// A derived copy may borrow a shorter-lived parent than the reusable base.
+    #[must_use = "request options are immutable; use the returned options"]
+    pub fn with_parent<'b>(self, parent: TraceParent<'b>) -> RequestOptions<'b>
+    where
+        'a: 'b,
+    {
+        RequestOptions {
+            parent,
+            namespace: self.namespace,
+        }
+    }
+
+    fn namespace_id(&self) -> Result<talon_core::NamespaceId, talon_core::NamespaceIdError> {
+        let name = self.namespace.unwrap_or(talon_core::DEFAULT_NAMESPACE);
+        talon_core::NamespaceContext::new(name)?;
+        Ok(if name == talon_core::DEFAULT_NAMESPACE {
+            talon_core::NamespaceId::Unattributed
+        } else {
+            talon_core::NamespaceId::named(name)
+        })
+    }
+}
 
 /// A reusable, runtime-owning-neutral Talon client.
 #[derive(Clone)]
@@ -181,13 +229,18 @@ impl Client {
         object: &ObjectId,
         version: &Version,
         size: u64,
+        options: &crate::RequestOptions<'_>,
     ) -> Result<crate::LoadResult, crate::LoadError> {
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| crate::LoadError::InvalidArgument(error.to_string()))?;
         let now_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.reader
-            .load(
+        let op = talon_telemetry::Operation::new("talon.load", "internal", options.parent);
+        let result = op
+            .scope(self.reader.load(
                 &talon_cache_client::FileView {
                     object,
                     version,
@@ -195,8 +248,11 @@ impl Client {
                     block_size: self.block_size,
                 },
                 now_ms,
-            )
-            .await
+                &namespace,
+            ))
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
     }
 
     /// Prewarm files with one protocol batch per worker/chunk, without HEAD.
@@ -207,7 +263,11 @@ impl Client {
     pub async fn batch_load(
         &self,
         requests: &[LoadRequest],
+        options: &crate::RequestOptions<'_>,
     ) -> Result<Vec<crate::LoadResult>, crate::LoadError> {
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| crate::LoadError::InvalidArgument(error.to_string()))?;
         let files = requests
             .iter()
             .map(|request| talon_cache_client::FileView {
@@ -221,34 +281,52 @@ impl Client {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        self.reader.batch_load(&files, now_ms).await
-    }
-
-    /// Return an object's current size and source version.
-    pub async fn stat(&self, object: &ObjectId) -> Result<ObjectStat, Error> {
-        self.stat_with_options(object, &crate::RequestOptions::default())
-            .await
-    }
-
-    /// Stat with an explicit request-local parent policy.
-    pub async fn stat_with_options(
-        &self,
-        object: &ObjectId,
-        options: &crate::RequestOptions<'_>,
-    ) -> Result<ObjectStat, Error> {
-        let op = talon_telemetry::Operation::new("talon.stat", "internal", options.parent);
-        let result = op.scope(self.stat_inner(object)).await;
+        let op = talon_telemetry::Operation::new("talon.batch_load", "internal", options.parent);
+        let result = op
+            .scope(self.reader.batch_load(&files, now_ms, &namespace))
+            .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
     }
 
-    async fn stat_inner(&self, object: &ObjectId) -> Result<ObjectStat, Error> {
-        Ok(self.coordinator.stat_object(object).await?)
+    /// Return an object's current size and source version.
+    pub async fn stat(
+        &self,
+        object: &ObjectId,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<ObjectStat, Error> {
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let op = talon_telemetry::Operation::new("talon.stat", "internal", options.parent);
+        let result = op.scope(self.stat_inner(object, &namespace)).await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
+    async fn stat_inner(
+        &self,
+        object: &ObjectId,
+        namespace: &talon_core::NamespaceId,
+    ) -> Result<ObjectStat, Error> {
+        Ok(self.coordinator.stat_object(object, namespace).await?)
     }
 
     /// List objects below a mount-relative prefix.
-    pub async fn list(&self, prefix: &str) -> Result<Vec<ObjectEntry>, Error> {
-        Ok(self.coordinator.list_objects(prefix).await?)
+    pub async fn list(
+        &self,
+        prefix: &str,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<Vec<ObjectEntry>, Error> {
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let op = talon_telemetry::Operation::new("talon.list", "internal", options.parent);
+        let result = op
+            .scope(self.coordinator.list_objects(prefix, &namespace))
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        Ok(result?)
     }
 
     /// Read an object range into a newly allocated buffer.
@@ -264,29 +342,14 @@ impl Client {
         offset: u64,
         length: Option<u64>,
         known_stat: Option<&ObjectStat>,
-    ) -> Result<Vec<u8>, Error> {
-        self.read_with_options(
-            object,
-            offset,
-            length,
-            known_stat,
-            &crate::RequestOptions::default(),
-        )
-        .await
-    }
-
-    /// Read with explicit parent selection; stat and block RPCs share this scope.
-    pub async fn read_with_options(
-        &self,
-        object: &ObjectId,
-        offset: u64,
-        length: Option<u64>,
-        known_stat: Option<&ObjectStat>,
         options: &crate::RequestOptions<'_>,
     ) -> Result<Vec<u8>, Error> {
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
         let result = op
-            .scope(self.read_inner(object, offset, length, known_stat))
+            .scope(self.read_inner(object, offset, length, known_stat, &namespace))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -298,13 +361,14 @@ impl Client {
         offset: u64,
         length: Option<u64>,
         known_stat: Option<&ObjectStat>,
+        namespace: &talon_core::NamespaceId,
     ) -> Result<Vec<u8>, Error> {
         if length == Some(0) {
             return Ok(Vec::new());
         }
         let stat = match known_stat {
             Some(stat) => stat.clone(),
-            None => self.stat_inner(object).await?,
+            None => self.stat_inner(object, namespace).await?,
         };
         let requested = length.unwrap_or_else(|| stat.size.saturating_sub(offset));
         let planned = requested.min(stat.size.saturating_sub(offset));
@@ -323,7 +387,7 @@ impl Client {
 
         let mut bytes = vec![0_u8; planned];
         let written = self
-            .read_into_resolved(object, offset, &mut bytes, &stat)
+            .read_into_resolved(object, offset, &mut bytes, &stat, namespace)
             .await?;
         bytes.truncate(written);
         Ok(bytes)
@@ -338,29 +402,14 @@ impl Client {
         offset: u64,
         dst: &mut [u8],
         known_stat: Option<&ObjectStat>,
-    ) -> Result<usize, Error> {
-        self.read_into_with_options(
-            object,
-            offset,
-            dst,
-            known_stat,
-            &crate::RequestOptions::default(),
-        )
-        .await
-    }
-
-    /// Read with explicit parent selection; stat and block RPCs share this scope.
-    pub async fn read_into_with_options(
-        &self,
-        object: &ObjectId,
-        offset: u64,
-        dst: &mut [u8],
-        known_stat: Option<&ObjectStat>,
         options: &crate::RequestOptions<'_>,
     ) -> Result<usize, Error> {
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
         let op = talon_telemetry::Operation::new("talon.read", "internal", options.parent);
         let result = op
-            .scope(self.read_into_inner(object, offset, dst, known_stat))
+            .scope(self.read_into_inner(object, offset, dst, known_stat, &namespace))
             .await;
         op.outcome(if result.is_ok() { "success" } else { "error" });
         result
@@ -372,15 +421,17 @@ impl Client {
         offset: u64,
         dst: &mut [u8],
         known_stat: Option<&ObjectStat>,
+        namespace: &talon_core::NamespaceId,
     ) -> Result<usize, Error> {
         if dst.is_empty() {
             return Ok(0);
         }
         let stat = match known_stat {
             Some(stat) => stat.clone(),
-            None => self.stat_inner(object).await?,
+            None => self.stat_inner(object, namespace).await?,
         };
-        self.read_into_resolved(object, offset, dst, &stat).await
+        self.read_into_resolved(object, offset, dst, &stat, namespace)
+            .await
     }
 
     async fn read_into_resolved(
@@ -389,6 +440,7 @@ impl Client {
         offset: u64,
         dst: &mut [u8],
         stat: &ObjectStat,
+        namespace: &talon_core::NamespaceId,
     ) -> Result<usize, Error> {
         let requested = u64::try_from(dst.len())
             .map_err(|_| Error::InvalidArgument("destination length does not fit in u64".into()))?;
@@ -430,6 +482,7 @@ impl Client {
                 segment,
                 chunk,
                 stat.size,
+                namespace,
             ));
         }
 
@@ -445,6 +498,7 @@ impl Client {
                     segment,
                     chunk,
                     stat.size,
+                    namespace,
                 ));
             }
         }
@@ -458,13 +512,20 @@ async fn read_segment_into(
     segment: BlockSegment,
     dst: &mut [u8],
     object_len: u64,
+    namespace: &talon_core::NamespaceId,
 ) -> Result<usize, Error> {
     let _permit = permits
         .acquire()
         .await
         .expect("client never closes its read budget");
     reader
-        .read_versioned_block_into(&segment.block, segment.offset_in_block, dst, object_len)
+        .read_versioned_block_into(
+            &segment.block,
+            segment.offset_in_block,
+            dst,
+            object_len,
+            namespace,
+        )
         .await
         .map_err(Error::from)
 }
@@ -501,6 +562,7 @@ pub fn parse_uri(uri: &str) -> Result<ObjectId, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TraceContext;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -513,6 +575,291 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
     use tokio::sync::{Notify, Semaphore};
+
+    #[test]
+    fn reusable_options_preserve_independent_namespace_and_parent_choices() {
+        let base: RequestOptions<'static> = RequestOptions::default().with_namespace("analytics");
+        {
+            let trace = TraceContext::from_w3c(
+                "00-11111111111111111111111111111111-2222222222222222-01",
+                None,
+            )
+            .unwrap();
+            // The derived options may borrow a short-lived trace while the
+            // base remains usable after that trace has gone out of scope.
+            let request = base.with_parent(TraceParent::Explicit(&trace));
+            assert_eq!(
+                request.namespace_id().unwrap().effective_name(),
+                "analytics"
+            );
+            let other = request.with_namespace("training");
+            assert!(
+                matches!(other.parent, TraceParent::Explicit(parent) if std::ptr::eq(parent, &trace))
+            );
+            assert_eq!(other.namespace_id().unwrap().effective_name(), "training");
+            let root = other.with_parent(TraceParent::Root);
+            assert!(matches!(root.parent, TraceParent::Root));
+            assert_eq!(root.namespace_id().unwrap().effective_name(), "training");
+        }
+        assert!(matches!(base.parent, TraceParent::Inherit));
+        assert_eq!(base.namespace_id().unwrap().effective_name(), "analytics");
+        assert_eq!(
+            base.with_namespace("default").namespace_id().unwrap(),
+            talon_core::NamespaceId::Unattributed
+        );
+    }
+
+    #[tokio::test]
+    async fn namespace_reaches_metadata_reads_and_loads_after_socket_reuse() {
+        use talon_transport::{codec, envelope, MsgType};
+        // Closing each connection after a reply also exercises the stale pooled
+        // socket retry, where dropping namespace would cross cache boundaries.
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let received = recorded.clone();
+        let server_addr = addr.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let received = received.clone();
+                let worker_addr = server_addr.clone();
+                tokio::spawn(async move {
+                    let mut bytes = [0; HEADER_LEN];
+                    if socket.read_exact(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    let header = FrameHeader::decode(&bytes).unwrap();
+                    let mut payload = vec![0; header.length as usize];
+                    socket.read_exact(&mut payload).await.unwrap();
+                    let (metadata, _) = envelope::decode(&header, &payload).unwrap();
+                    let mut namespace = metadata
+                        .namespace
+                        .unwrap_or_default()
+                        .effective_name()
+                        .to_owned();
+                    let mut frame = bytes.to_vec();
+                    frame.extend_from_slice(&payload);
+                    let (operation, response) = match header.msg_type {
+                        MsgType::Control => {
+                            let (_, message) = codec::decode_request(&frame).unwrap();
+                            let (operation, reply) = match message {
+                                ControlMessage::MembershipQuery {} => (
+                                    "membership",
+                                    membership_fixture::plain(vec![NodeInfo {
+                                        id: NodeId::new("worker"),
+                                        address: worker_addr,
+                                        role: NodeRole::Worker,
+                                    }]),
+                                ),
+                                ControlMessage::StatObject { .. } => (
+                                    "stat",
+                                    ControlMessage::ObjectStat {
+                                        size: 8,
+                                        version: "v1".into(),
+                                    },
+                                ),
+                                ControlMessage::ListObjects { .. } => {
+                                    ("list", ControlMessage::ObjectList { entries: vec![] })
+                                }
+                                ControlMessage::LoadBlock { .. } => (
+                                    "load",
+                                    ControlMessage::Ack {
+                                        ok: true,
+                                        detail: None,
+                                    },
+                                ),
+                                ControlMessage::BatchLoad { .. } => (
+                                    "batch",
+                                    ControlMessage::BatchLoadResult { failures: vec![] },
+                                ),
+                                other => panic!("unexpected request: {other:?}"),
+                            };
+                            (operation, codec::encode(header.request_id, &reply).unwrap())
+                        }
+                        MsgType::GetVersionedRange | MsgType::GetVersionedRangeNamespace => {
+                            let request = if header.msg_type == MsgType::GetVersionedRangeNamespace
+                            {
+                                let (_, scoped) =
+                                    talon_transport::decode_versioned_namespace_request(&frame)
+                                        .unwrap();
+                                namespace = scoped.namespace.effective_name().to_owned();
+                                scoped.request
+                            } else {
+                                talon_transport::decode_versioned_request(&frame).unwrap().1
+                            };
+                            assert_eq!(request.version.as_str(), "v1");
+                            let request = request.request;
+                            let mut response =
+                                response_header_ok(header.request_id, request.len as u32).to_vec();
+                            let marker = match namespace.as_str() {
+                                "analytics" => 16,
+                                "training" => 32,
+                                "default" => 0,
+                                other => panic!("unexpected namespace: {other}"),
+                            };
+                            response.extend(
+                                (request.offset..request.offset + request.len)
+                                    .map(|i| i as u8 + marker),
+                            );
+                            ("read", response)
+                        }
+                        other => panic!("unexpected frame: {other:?}"),
+                    };
+                    received.lock().unwrap().push((
+                        operation,
+                        namespace,
+                        header.version,
+                        header.msg_type,
+                    ));
+                    socket.write_all(&response).await.unwrap();
+                });
+            }
+        });
+        let client = ClientBuilder::default()
+            .with_coordinator(&addr)
+            .with_block_size(8)
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        for selected in [
+            None,
+            Some("analytics"),
+            Some("training"),
+            Some("default"),
+            None,
+        ] {
+            recorded.lock().unwrap().clear();
+            let mut options = crate::RequestOptions::default();
+            if let Some(name) = selected {
+                options = options.with_namespace(name);
+            }
+            let marker = match selected {
+                Some("analytics") => 16,
+                Some("training") => 32,
+                _ => 0,
+            };
+            let stat = client.stat(&object, &options).await.unwrap();
+            assert_eq!(
+                client.read(&object, 0, None, None, &options).await.unwrap(),
+                (0..8).map(|i| i + marker).collect::<Vec<_>>()
+            );
+            let mut dst = [0; 4];
+            assert_eq!(
+                client
+                    .clone()
+                    .read_into(&object, 2, &mut dst, Some(&stat), &options)
+                    .await
+                    .unwrap(),
+                4
+            );
+            assert_eq!(dst, [2 + marker, 3 + marker, 4 + marker, 5 + marker]);
+            assert!(client.list("s3/bucket", &options).await.unwrap().is_empty());
+            assert_eq!(
+                client
+                    .load(&object, &Version::new("v1"), 8, &options)
+                    .await
+                    .unwrap()
+                    .blocks,
+                1
+            );
+            assert_eq!(
+                client
+                    .batch_load(
+                        &[LoadRequest {
+                            object: object.clone(),
+                            version: Version::new("v1"),
+                            size: 8
+                        }],
+                        &options
+                    )
+                    .await
+                    .unwrap()[0]
+                    .blocks,
+                1
+            );
+            let received = recorded.lock().unwrap();
+            for operation in ["stat", "list", "read", "load", "batch"] {
+                assert!(
+                    received.iter().any(|entry| entry.0 == operation),
+                    "missing {operation}"
+                );
+            }
+            for (operation, name, version, kind) in received.iter() {
+                if *operation == "membership" {
+                    assert_eq!(
+                        name, "default",
+                        "discovery must remain independent of request namespaces"
+                    );
+                    continue;
+                }
+                assert_eq!(name, selected.unwrap_or("default"), "{operation}");
+                if selected.is_none() || selected == Some("default") {
+                    assert!(*version < 3, "default must retain the legacy protocol");
+                    assert_ne!(*kind, MsgType::GetVersionedRangeNamespace);
+                }
+            }
+        }
+        let a = crate::RequestOptions::default().with_namespace("analytics");
+        let b = crate::RequestOptions::default().with_namespace("training");
+        let default_options = crate::RequestOptions::default();
+        let (a, b, default) = tokio::join!(
+            client.read(&object, 0, Some(4), None, &a),
+            client.read(&object, 0, Some(4), None, &b),
+            client.read(&object, 0, Some(4), None, &default_options),
+        );
+        assert_eq!(a.unwrap(), vec![16, 17, 18, 19]);
+        assert_eq!(b.unwrap(), vec![32, 33, 34, 35]);
+        assert_eq!(default.unwrap(), vec![0, 1, 2, 3]);
+        drop(client);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn invalid_request_namespace_is_rejected_even_for_empty_operations() {
+        let client = ClientBuilder::default()
+            .with_coordinator("127.0.0.1:1")
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/key").unwrap();
+        for name in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a b",
+            "中文",
+            "worker_identity",
+            ".worker.lock",
+            &"a".repeat(256),
+        ] {
+            let options = crate::RequestOptions::default().with_namespace(name);
+            assert!(matches!(
+                client.stat(&object, &options).await,
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                client.read(&object, 0, Some(0), None, &options).await,
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                client.read_into(&object, 0, &mut [], None, &options).await,
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                client.list("s3/bucket", &options).await,
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                client.load(&object, &Version::new("v1"), 0, &options).await,
+                Err(crate::LoadError::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                client.batch_load(&[], &options).await,
+                Err(crate::LoadError::InvalidArgument(_))
+            ));
+        }
+    }
 
     async fn mock_coordinator() -> String {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1041,11 +1388,27 @@ mod tests {
                         futures::future::join_all((0..concurrent).map(|_| async {
                             if worker {
                                 assert_eq!(
-                                    client.read(&object, 0, Some(8), Some(&stat)).await.unwrap(),
+                                    client
+                                        .read(
+                                            &object,
+                                            0,
+                                            Some(8),
+                                            Some(&stat),
+                                            &crate::RequestOptions::default()
+                                        )
+                                        .await
+                                        .unwrap(),
                                     vec![7; 8]
                                 );
                             } else {
-                                assert_eq!(client.stat(&object).await.unwrap().size, 8);
+                                assert_eq!(
+                                    client
+                                        .stat(&object, &crate::RequestOptions::default())
+                                        .await
+                                        .unwrap()
+                                        .size,
+                                    8
+                                );
                             }
                         }))
                         .await;
@@ -1072,7 +1435,10 @@ mod tests {
             .unwrap();
 
         let stat = client
-            .stat(&parse_uri("s3://bucket/key").unwrap())
+            .stat(
+                &parse_uri("s3://bucket/key").unwrap(),
+                &crate::RequestOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -1088,7 +1454,10 @@ mod tests {
             .build()
             .unwrap();
 
-        let entries = client.list("s3/bucket/data").await.unwrap();
+        let entries = client
+            .list("s3/bucket/data", &crate::RequestOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].path, "s3/bucket/data/a.parquet");
@@ -1139,18 +1508,21 @@ mod tests {
             .build()
             .unwrap();
         let results = client
-            .batch_load(&[
-                LoadRequest {
-                    object: parse_uri("s3://bucket/a").unwrap(),
-                    version: Version::new("v1"),
-                    size: 9,
-                },
-                LoadRequest {
-                    object: parse_uri("s3://bucket/b").unwrap(),
-                    version: Version::new("v2"),
-                    size: 3,
-                },
-            ])
+            .batch_load(
+                &[
+                    LoadRequest {
+                        object: parse_uri("s3://bucket/a").unwrap(),
+                        version: Version::new("v1"),
+                        size: 9,
+                    },
+                    LoadRequest {
+                        object: parse_uri("s3://bucket/b").unwrap(),
+                        version: Version::new("v2"),
+                        size: 3,
+                    },
+                ],
+                &crate::RequestOptions::default(),
+            )
             .await
             .unwrap();
         assert_eq!(
@@ -1227,7 +1599,15 @@ mod tests {
                 })
                 .build()
                 .unwrap();
-            let result = client.read(&object, 2, Some(6), Some(&stat)).await;
+            let result = client
+                .read(
+                    &object,
+                    2,
+                    Some(6),
+                    Some(&stat),
+                    &crate::RequestOptions::default(),
+                )
+                .await;
             assert_eq!(result.is_ok(), succeeds);
             if succeeds {
                 assert_eq!(result.unwrap(), vec![2, 3, 4, 5, 6, 7]);
@@ -1245,7 +1625,16 @@ mod tests {
             version: "test-version".into(),
         };
 
-        let bytes = client.read(&object, 2, Some(6), Some(&stat)).await.unwrap();
+        let bytes = client
+            .read(
+                &object,
+                2,
+                Some(6),
+                Some(&stat),
+                &crate::RequestOptions::default(),
+            )
+            .await
+            .unwrap();
 
         assert_eq!(bytes, vec![2, 3, 4, 5, 6, 7]);
         assert_eq!(stat_calls.load(Ordering::SeqCst), 0);
@@ -1256,7 +1645,10 @@ mod tests {
         let (client, stat_calls) = read_client(16).await;
         let object = parse_uri("s3://bucket/key").unwrap();
 
-        let bytes = client.read(&object, 0, Some(4), None).await.unwrap();
+        let bytes = client
+            .read(&object, 0, Some(4), None, &crate::RequestOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(bytes, vec![0, 1, 2, 3]);
         assert_eq!(stat_calls.load(Ordering::SeqCst), 1);
@@ -1267,7 +1659,10 @@ mod tests {
         let (client, _) = read_client(10).await;
         let object = parse_uri("s3://bucket/key").unwrap();
 
-        let bytes = client.read(&object, 4, None, None).await.unwrap();
+        let bytes = client
+            .read(&object, 4, None, None, &crate::RequestOptions::default())
+            .await
+            .unwrap();
 
         assert_eq!(bytes, vec![4, 5, 6, 7, 8, 9]);
     }
@@ -1287,7 +1682,13 @@ mod tests {
         };
 
         let error = client
-            .read(&object, 0, Some(too_large), Some(&stat))
+            .read(
+                &object,
+                0,
+                Some(too_large),
+                Some(&stat),
+                &crate::RequestOptions::default(),
+            )
             .await
             .expect_err("lengths above Vec capacity must be rejected");
 
@@ -1305,7 +1706,13 @@ mod tests {
         let mut dst = [0_u8; 8];
 
         let written = client
-            .read_into(&object, 6, &mut dst, Some(&stat))
+            .read_into(
+                &object,
+                6,
+                &mut dst,
+                Some(&stat),
+                &crate::RequestOptions::default(),
+            )
             .await
             .unwrap();
 
@@ -1320,12 +1727,21 @@ mod tests {
         let mut dst = [];
 
         assert!(client
-            .read(&object, 0, Some(0), None)
+            .read(&object, 0, Some(0), None, &crate::RequestOptions::default())
             .await
             .unwrap()
             .is_empty());
         assert_eq!(
-            client.read_into(&object, 0, &mut dst, None).await.unwrap(),
+            client
+                .read_into(
+                    &object,
+                    0,
+                    &mut dst,
+                    None,
+                    &crate::RequestOptions::default()
+                )
+                .await
+                .unwrap(),
             0
         );
         assert_eq!(stat_calls.load(Ordering::SeqCst), 0);
@@ -1352,7 +1768,17 @@ mod tests {
             size: 16,
             version: "test-version".into(),
         };
-        let read = tokio::spawn(async move { client.read(&object, 6, Some(8), Some(&stat)).await });
+        let read = tokio::spawn(async move {
+            client
+                .read(
+                    &object,
+                    6,
+                    Some(8),
+                    Some(&stat),
+                    &crate::RequestOptions::default(),
+                )
+                .await
+        });
 
         let overlapped =
             tokio::time::timeout(Duration::from_millis(250), second_block_started.notified())
@@ -1399,8 +1825,17 @@ mod tests {
             size: 10,
             version: "test-version".into(),
         };
-        let read =
-            tokio::spawn(async move { client.read(&object, 0, Some(10), Some(&stat)).await });
+        let read = tokio::spawn(async move {
+            client
+                .read(
+                    &object,
+                    0,
+                    Some(10),
+                    Some(&stat),
+                    &crate::RequestOptions::default(),
+                )
+                .await
+        });
 
         wait_for_started(
             &started,
@@ -1463,11 +1898,26 @@ mod tests {
         let first_stat = stat.clone();
         let first = tokio::spawn(async move {
             first_client
-                .read(&first_object, 0, Some(8), Some(&first_stat))
+                .read(
+                    &first_object,
+                    0,
+                    Some(8),
+                    Some(&first_stat),
+                    &crate::RequestOptions::default(),
+                )
                 .await
         });
-        let second =
-            tokio::spawn(async move { client.read(&object, 8, Some(8), Some(&stat)).await });
+        let second = tokio::spawn(async move {
+            client
+                .read(
+                    &object,
+                    8,
+                    Some(8),
+                    Some(&stat),
+                    &crate::RequestOptions::default(),
+                )
+                .await
+        });
 
         wait_for_started(&started, &started_notify, 1).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -1529,7 +1979,8 @@ mod tests {
             size: 1,
             version: "v1".into(),
         };
-        let read = client.read(&object, 0, Some(1), Some(&stat));
+        let options = crate::RequestOptions::default();
+        let read = client.read(&object, 0, Some(1), Some(&stat), &options);
         assert!(tokio::time::timeout(Duration::from_millis(20), read)
             .await
             .is_err());
@@ -1561,7 +2012,13 @@ mod tests {
         let mut dst = [0_u8; 16];
 
         let error = client
-            .read_into(&object, 0, &mut dst, Some(&stat))
+            .read_into(
+                &object,
+                0,
+                &mut dst,
+                Some(&stat),
+                &crate::RequestOptions::default(),
+            )
             .await
             .expect_err("one failed block must fail the whole read");
 
@@ -1596,7 +2053,13 @@ mod tests {
         let mut dst = [0_u8; 8];
 
         let error = client
-            .read_into(&object, 0, &mut dst, Some(&stat))
+            .read_into(
+                &object,
+                0,
+                &mut dst,
+                Some(&stat),
+                &crate::RequestOptions::default(),
+            )
             .await
             .expect_err("short worker reply must fail the whole read");
 

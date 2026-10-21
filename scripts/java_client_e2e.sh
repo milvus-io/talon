@@ -68,6 +68,7 @@ done
 echo
 echo "=== conformance vectors ==="
 "$JAVA" -cp "$CLASSES" io.milvus.talon.ConformanceTest || exit 1
+"$JAVA" -cp "$CLASSES" io.milvus.talon.NamespaceTest || exit 1
 
 echo
 echo "=== availability zones ==="

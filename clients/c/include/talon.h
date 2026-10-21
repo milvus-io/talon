@@ -129,35 +129,25 @@ typedef struct talon_request_options {
     size_t traceparent_len;
     const char *tracestate;
     size_t tracestate_len;
+    /* Per-request namespace. NULL selects "default" independently of tracing. */
+    const char *namespace_name;
 } talon_request_options;
 
-/* Initialize only the v1 fields; size must be at least sizeof(options).
- * Submission copies the carrier before returning. NULL/NONE never inherits
+/* Initialize the fields present in size, which must cover the original v1
+ * prefix (offsetof(talon_request_options, namespace_name)). The namespace tail
+ * is initialized/read only when size covers the full current struct. Older v1
+ * callers remain compatible and select "default"; extra bytes are untouched.
+ * Submission copies the carrier and namespace before returning. NULL/NONE never inherits
  * ambient context. Invalid W3C data does not fail a valid business request.
  * Unknown version/flags/mode or a short struct returns INVALID_ARGUMENT
- * synchronously, without scheduling a callback. */
+ * synchronously, without scheduling a callback.
+ *
+ * Namespace names contain 1-255 ASCII letters, digits, '.', '_' or '-', excluding
+ * ".", "..", "worker_identity" and ".worker.lock". Invalid names, including an
+ * empty string or invalid UTF-8, return INVALID_ARGUMENT before scheduling a
+ * callback, even when tracing is disabled. namespace_name must be NUL-terminated.
+ * All async operations accept options before the callback; NULL selects defaults. */
 int talon_request_options_init(talon_request_options *options, size_t size);
-
-int talon_read_async_with_options(
-    talon_client *client,
-    const char *uri,
-    uint64_t offset,
-    uint8_t *dst,
-    size_t dst_len,
-    const char *version,
-    const uint64_t *object_size,
-    const talon_request_options *options,
-    talon_callback callback,
-    void *user_data,
-    uint64_t *request_id_out);
-
-int talon_stat_async_with_options(
-    talon_client *client,
-    const char *uri,
-    const talon_request_options *options,
-    talon_callback callback,
-    void *user_data,
-    uint64_t *request_id_out);
 
 int talon_read_async(
     talon_client *client,
@@ -167,6 +157,7 @@ int talon_read_async(
     size_t dst_len,
     const char *version,
     const uint64_t *object_size,
+    const talon_request_options *options,
     talon_callback callback,
     void *user_data,
     uint64_t *request_id_out);
@@ -174,6 +165,7 @@ int talon_read_async(
 int talon_stat_async(
     talon_client *client,
     const char *uri,
+    const talon_request_options *options,
     talon_callback callback,
     void *user_data,
     uint64_t *request_id_out);
@@ -188,14 +180,10 @@ int talon_stat_async(
  * completed cache fills remain resident subject to eviction.
  * Batches use up to 1024 block instructions per protocol frame, not one RPC
  * per file. Worker origin retries apply to both operations. */
-int talon_load_async(talon_client *client, const char *uri, const char *version,
-    uint64_t size, talon_callback callback, void *user_data, uint64_t *request_id_out);
-int talon_load_async_with_options(talon_client *client, const char *uri,
+int talon_load_async(talon_client *client, const char *uri,
     const char *version, uint64_t size, const talon_request_options *options,
     talon_callback callback, void *user_data, uint64_t *request_id_out);
-int talon_batch_load_async(talon_client *client, const talon_load_request *requests,
-    size_t count, talon_callback callback, void *user_data, uint64_t *request_id_out);
-int talon_batch_load_async_with_options(talon_client *client,
+int talon_batch_load_async(talon_client *client,
     const talon_load_request *requests, size_t count,
     const talon_request_options *options, talon_callback callback,
     void *user_data, uint64_t *request_id_out);

@@ -205,7 +205,7 @@ public final class TalonClient implements AutoCloseable {
         return load(request, RequestOptions.INHERIT);
     }
 
-    /** Prewarm a parsed object with explicit request tracing. */
+    /** Prewarm a parsed object with explicit tracing and namespace options. */
     public LoadResult load(LoadRequest request, RequestOptions options) throws IOException {
         return Telemetry.call(options == null ? RequestOptions.ROOT : options,
                 () -> loadFiles(List.of(request), false).get(0));
@@ -218,7 +218,7 @@ public final class TalonClient implements AutoCloseable {
         return batchLoad(requests, RequestOptions.INHERIT);
     }
 
-    /** Batch prewarm with explicit request tracing. */
+    /** Batch prewarm with explicit tracing and namespace options. */
     public List<LoadResult> batchLoad(List<LoadRequest> requests, RequestOptions options) throws IOException {
         List<LoadRequest> copy = List.copyOf(requests);
         return Telemetry.call(options == null ? RequestOptions.ROOT : options, () -> loadFiles(copy, true));
@@ -438,10 +438,13 @@ public final class TalonClient implements AutoCloseable {
      * <p>The control protocol carries one bounded response. If a prefix exceeds
      * the server's object, page, or payload limit, the call fails explicitly
      * instead of returning an incomplete list; use a narrower prefix.
+     *
+     * @param options per-call tracing and namespace; null selects the default namespace without tracing
      */
-    public List<ObjectEntry> list(String prefix) throws IOException {
+    public List<ObjectEntry> list(String prefix, RequestOptions options) throws IOException {
         int id = requestIds.getAndIncrement();
-        return controlRoundTrip(Messages.listObjects(id, prefix), resp -> {
+        return Telemetry.call(options == null ? RequestOptions.ROOT : options,
+                () -> controlRoundTrip(Messages.listObjects(id, prefix), resp -> {
             if (resp.tag == Messages.TAG_OBJECT_LIST) {
                 int n = resp.body.seqLen();
                 List<ObjectEntry> entries = new ArrayList<>(n);
@@ -451,7 +454,7 @@ public final class TalonClient implements AutoCloseable {
                 return entries;
             }
             throw unexpected("ListObjects", resp);
-        });
+        }));
     }
 
     @Override

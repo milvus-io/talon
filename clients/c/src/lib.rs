@@ -353,39 +353,9 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
 /// rather than fabricated bytes. A caller that has no valid size passes NULL.
 ///
 /// Blocks spanned by the read are fetched concurrently.
+/// Namespace and W3C context are copied from `options`; null selects defaults.
 #[no_mangle]
 pub unsafe extern "C" fn talon_read_async(
-    client: *mut TalonClient,
-    uri: *const c_char,
-    offset: u64,
-    dst: *mut u8,
-    dst_len: usize,
-    version: *const c_char,
-    object_size: *const u64,
-    callback: Option<TalonCallback>,
-    user_data: *mut c_void,
-    request_id_out: *mut u64,
-) -> c_int {
-    unsafe {
-        talon_read_async_with_options(
-            client,
-            uri,
-            offset,
-            dst,
-            dst_len,
-            version,
-            object_size,
-            ptr::null(),
-            callback,
-            user_data,
-            request_id_out,
-        )
-    }
-}
-
-/// Submit with copied request-local W3C context.
-#[no_mangle]
-pub unsafe extern "C" fn talon_read_async_with_options(
     client: *mut TalonClient,
     uri: *const c_char,
     offset: u64,
@@ -399,7 +369,7 @@ pub unsafe extern "C" fn talon_read_async_with_options(
     request_id_out: *mut u64,
 ) -> c_int {
     ffi_status(|| {
-        let trace_context = unsafe { trace_options::copy_options(options) }?;
+        let (trace_context, namespace) = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -450,19 +420,21 @@ pub unsafe extern "C" fn talon_read_async_with_options(
         };
         use tracing::instrument::WithSubscriber;
         let task = async move {
-            let options = talon_rust_client::RequestOptions {
-                parent: trace_context
-                    .as_ref()
-                    .map(talon_rust_client::TraceParent::Explicit)
-                    .unwrap_or(talon_rust_client::TraceParent::Root),
-            };
+            let options = talon_rust_client::RequestOptions::default()
+                .with_namespace(namespace.as_deref().unwrap_or("default"))
+                .with_parent(
+                    trace_context
+                        .as_ref()
+                        .map(talon_rust_client::TraceParent::Explicit)
+                        .unwrap_or(talon_rust_client::TraceParent::Root),
+                );
             let result = async {
                 if read_buffer.len == 0 {
                     return Ok(0);
                 }
                 let dst = unsafe { read_buffer.into_mut_slice() };
                 client
-                    .read_into_with_options(&object, offset, dst, known_stat.as_ref(), &options)
+                    .read_into(&object, offset, dst, known_stat.as_ref(), &options)
                     .await
             }
             .await;
@@ -482,30 +454,9 @@ pub unsafe extern "C" fn talon_read_async_with_options(
     })
 }
 
-/// Submit an async stat.
+/// Submit an async stat with copied request-local namespace and W3C context.
 #[no_mangle]
 pub unsafe extern "C" fn talon_stat_async(
-    client: *mut TalonClient,
-    uri: *const c_char,
-    callback: Option<TalonCallback>,
-    user_data: *mut c_void,
-    request_id_out: *mut u64,
-) -> c_int {
-    unsafe {
-        talon_stat_async_with_options(
-            client,
-            uri,
-            ptr::null(),
-            callback,
-            user_data,
-            request_id_out,
-        )
-    }
-}
-
-/// Submit with copied request-local W3C context.
-#[no_mangle]
-pub unsafe extern "C" fn talon_stat_async_with_options(
     client: *mut TalonClient,
     uri: *const c_char,
     options: *const TalonRequestOptions,
@@ -514,7 +465,7 @@ pub unsafe extern "C" fn talon_stat_async_with_options(
     request_id_out: *mut u64,
 ) -> c_int {
     ffi_status(|| {
-        let trace_context = unsafe { trace_options::copy_options(options) }?;
+        let (trace_context, namespace) = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -539,13 +490,15 @@ pub unsafe extern "C" fn talon_stat_async_with_options(
         let dispatcher = Arc::clone(&inner.dispatcher);
         use tracing::instrument::WithSubscriber;
         let task = async move {
-            let options = talon_rust_client::RequestOptions {
-                parent: trace_context
-                    .as_ref()
-                    .map(talon_rust_client::TraceParent::Explicit)
-                    .unwrap_or(talon_rust_client::TraceParent::Root),
-            };
-            let result = client.stat_with_options(&object, &options).await;
+            let options = talon_rust_client::RequestOptions::default()
+                .with_namespace(namespace.as_deref().unwrap_or("default"))
+                .with_parent(
+                    trace_context
+                        .as_ref()
+                        .map(talon_rust_client::TraceParent::Explicit)
+                        .unwrap_or(talon_rust_client::TraceParent::Root),
+                );
+            let result = client.stat(&object, &options).await;
             dispatch_result(
                 dispatcher,
                 callback,
@@ -966,10 +919,166 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn same_client_routes_read_and_stat_per_request() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let peer_address = address.clone();
+        let peer = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let address = peer_address.clone();
+                tokio::spawn(async move {
+                    loop {
+                        let mut header = [0; HEADER_LEN];
+                        if socket.read_exact(&mut header).await.is_err() {
+                            break;
+                        }
+                        let header = FrameHeader::decode(&header).unwrap();
+                        let mut frame = header.encode().to_vec();
+                        frame.resize(HEADER_LEN + header.length as usize, 0);
+                        socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
+                        let (metadata, _) =
+                            talon_transport::envelope::decode(&header, &frame[HEADER_LEN..])
+                                .unwrap();
+                        let namespace = metadata.namespace.clone().unwrap_or_default();
+                        let name = namespace.effective_name();
+                        let reply = if header.msg_type == talon_transport::frame::MsgType::Control {
+                            let (_, message) =
+                                talon_transport::codec::decode_request(&frame).unwrap();
+                            let response = match message {
+                                ControlMessage::MembershipQuery {} => {
+                                    membership_fixture::zoned(vec![
+                                        talon_transport::ZonedNodeInfo {
+                                            info: NodeInfo {
+                                                id: NodeId::new("worker-a"),
+                                                address: address.clone(),
+                                                role: NodeRole::Worker,
+                                            },
+                                            zone: None,
+                                        },
+                                    ])
+                                }
+                                ControlMessage::StatObject { .. } => ControlMessage::ObjectStat {
+                                    size: 3,
+                                    version: name.into(),
+                                },
+                                other => panic!("unexpected request {other:?}"),
+                            };
+                            talon_transport::encode(header.request_id, &response).unwrap()
+                        } else {
+                            let (request, name) = if header.msg_type
+                                == talon_transport::frame::MsgType::GetVersionedRangeNamespace
+                            {
+                                let (_, scoped) =
+                                    talon_transport::decode_versioned_namespace_request(&frame)
+                                        .unwrap();
+                                if metadata.namespace.is_some() {
+                                    assert_eq!(scoped.namespace.effective_name(), name);
+                                }
+                                (scoped.request, scoped.namespace.effective_name().to_owned())
+                            } else {
+                                (decode_versioned_request(&frame).unwrap().1, name.to_owned())
+                            };
+                            assert_eq!(request.version.as_str(), "v1");
+                            let byte = match name.as_str() {
+                                "team-a" => b'A',
+                                "team-b" => b'B',
+                                "default" => b'D',
+                                _ => panic!("unexpected namespace"),
+                            };
+                            let mut reply =
+                                response_header_ok(header.request_id, request.request.len as u32)
+                                    .to_vec();
+                            reply.extend(vec![byte; request.request.len as usize]);
+                            reply
+                        };
+                        socket.write_all(&reply).await.unwrap();
+                    }
+                });
+            }
+        });
+        let mut client = ptr::null_mut();
+        assert_eq!(
+            unsafe { talon_client_new(cstring(&address).as_ptr(), ptr::null(), &mut client) },
+            STATUS_OK
+        );
+        let mut pending = Vec::new();
+        for (name, byte) in [("team-a", b'A'), ("team-b", b'B'), ("default", b'D')] {
+            let namespace = cstring(name);
+            let mut options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
+            assert_eq!(
+                unsafe {
+                    talon_request_options_init(
+                        options.as_mut_ptr(),
+                        std::mem::size_of::<TalonRequestOptions>(),
+                    )
+                },
+                STATUS_OK
+            );
+            let mut options = unsafe { options.assume_init() };
+            options.namespace_name = namespace.as_ptr();
+            let options = if name == "default" {
+                ptr::null()
+            } else {
+                &options
+            };
+            let stat_state = CallbackState::new();
+            let read_state = CallbackState::new();
+            let mut buffer = vec![0u8; 3];
+            let mut id = 0;
+            assert_eq!(
+                unsafe {
+                    talon_stat_async(
+                        client,
+                        cstring("s3://bucket/file").as_ptr(),
+                        options,
+                        Some(capture_callback),
+                        stat_state.user_data(),
+                        &mut id,
+                    )
+                },
+                STATUS_OK
+            );
+            assert_eq!(
+                unsafe {
+                    talon_read_async(
+                        client,
+                        cstring("s3://bucket/file").as_ptr(),
+                        0,
+                        buffer.as_mut_ptr(),
+                        buffer.len(),
+                        cstring("v1").as_ptr(),
+                        &3,
+                        options,
+                        Some(capture_callback),
+                        read_state.user_data(),
+                        &mut id,
+                    )
+                },
+                STATUS_OK
+            );
+            pending.push((name, byte, stat_state, read_state, buffer));
+        }
+        for (name, byte, stat_state, read_state, buffer) in pending {
+            let stat = stat_state.wait();
+            assert_eq!(stat.status, STATUS_OK);
+            assert_eq!(stat.version.as_deref(), Some(name));
+            let read = read_state.wait();
+            assert_eq!(read.status, STATUS_OK);
+            assert_eq!(read.bytes_written, 3);
+            assert_eq!(buffer, vec![byte; 3]);
+        }
+        unsafe { talon_client_free(client) };
+        peer.abort();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn load_bindings_copy_inputs_and_send_protocol_batches() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let batches = Arc::new(Mutex::new(Vec::new()));
         let observed = batches.clone();
+        let namespaces = Arc::new(Mutex::new(Vec::new()));
+        let observed_namespaces = namespaces.clone();
         let stats = Arc::new(AtomicUsize::new(0));
         let coordinator =
             mock_coordinator_counting(listener.local_addr().unwrap().to_string(), stats.clone())
@@ -978,6 +1087,7 @@ mod tests {
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let observed = observed.clone();
+                let observed_namespaces = observed_namespaces.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut header = [0; HEADER_LEN];
@@ -988,7 +1098,15 @@ mod tests {
                         let mut frame = header.to_vec();
                         frame.resize(HEADER_LEN + parsed.length as usize, 0);
                         socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
-                        let (_, message) = talon_transport::decode(&frame).unwrap();
+                        let (metadata, _) =
+                            talon_transport::envelope::decode(&parsed, &frame[HEADER_LEN..])
+                                .unwrap();
+                        let namespace = metadata
+                            .namespace
+                            .unwrap_or_default()
+                            .effective_name()
+                            .to_owned();
+                        let (_, message) = talon_transport::codec::decode_request(&frame).unwrap();
                         let batch = matches!(message, ControlMessage::BatchLoad { .. });
                         let requests = match message {
                             ControlMessage::LoadBlock { block, len } => {
@@ -1002,6 +1120,10 @@ mod tests {
                             other => panic!("unexpected request {other:?}"),
                         };
                         assert!(requests.iter().all(|r| r.block.version.as_str() == "v1"));
+                        observed_namespaces
+                            .lock()
+                            .unwrap()
+                            .push((namespace, requests[0].block.object.object_path.clone()));
                         let reply = if batch {
                             ControlMessage::BatchLoadResult {
                                 failures: requests
@@ -1042,11 +1164,24 @@ mod tests {
         );
         let state = CallbackState::new();
         let mut id = 0;
+        let mut request_options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
+        assert_eq!(
+            unsafe {
+                talon_request_options_init(
+                    request_options.as_mut_ptr(),
+                    std::mem::size_of::<TalonRequestOptions>(),
+                )
+            },
+            STATUS_OK
+        );
+        let mut request_options = unsafe { request_options.assume_init() };
         // These strings and the request array go out of scope immediately after
         // submission. Callback results own their storage until explicitly freed.
         {
             let uri = cstring("s3://bucket/file");
             let version = cstring("v1");
+            let namespace = cstring("team-a");
+            request_options.namespace_name = namespace.as_ptr();
             let requests = (0..1025)
                 .map(|_| TalonLoadRequest {
                     uri: uri.as_ptr(),
@@ -1060,6 +1195,7 @@ mod tests {
                         client,
                         requests.as_ptr(),
                         requests.len(),
+                        &request_options,
                         Some(capture_callback),
                         state.user_data(),
                         &mut id,
@@ -1073,6 +1209,8 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(result.loads, vec![(3, 1); 1025]);
         assert_eq!(result.request_id, id);
+        let namespace = cstring("team-b");
+        request_options.namespace_name = namespace.as_ptr();
         assert_eq!(
             unsafe {
                 talon_load_async(
@@ -1080,6 +1218,7 @@ mod tests {
                     cstring("s3://bucket/file").as_ptr(),
                     cstring("v1").as_ptr(),
                     9,
+                    &request_options,
                     Some(capture_callback),
                     state.user_data(),
                     &mut id,
@@ -1087,12 +1226,62 @@ mod tests {
             },
             STATUS_OK
         );
+        drop(namespace);
         let result = state.wait();
         assert_eq!(result.operation, OPERATION_LOAD);
         assert_eq!(result.loads, [(9, 2)]);
         let mut sizes = batches.lock().unwrap().clone();
         sizes.sort_unstable();
         assert_eq!(sizes, [0, 0, 1, 1024]);
+        let mut names = namespaces
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        assert_eq!(names, ["team-a", "team-a", "team-b", "team-b"]);
+        namespaces.lock().unwrap().clear();
+        let mut concurrent = Vec::new();
+        for name in ["team-a", "team-b", "default"] {
+            let namespace = cstring(name);
+            request_options.namespace_name = namespace.as_ptr();
+            let state = CallbackState::new();
+            assert_eq!(
+                unsafe {
+                    talon_load_async(
+                        client,
+                        cstring(&format!("s3://bucket/{name}")).as_ptr(),
+                        cstring("v1").as_ptr(),
+                        3,
+                        if name == "default" {
+                            ptr::null()
+                        } else {
+                            &request_options
+                        },
+                        Some(capture_callback),
+                        state.user_data(),
+                        &mut id,
+                    )
+                },
+                STATUS_OK
+            );
+            concurrent.push(state);
+        }
+        for state in concurrent {
+            assert_eq!(state.wait().status, STATUS_OK);
+        }
+        let mut observed = namespaces.lock().unwrap().clone();
+        observed.sort_unstable();
+        assert_eq!(
+            observed,
+            [
+                ("default".into(), "default".into()),
+                ("team-a".into(), "team-a".into()),
+                ("team-b".into(), "team-b".into())
+            ]
+        );
+        namespaces.lock().unwrap().clear();
         assert_eq!(stats.load(Ordering::SeqCst), 0);
         assert_eq!(
             unsafe {
@@ -1100,6 +1289,7 @@ mod tests {
                     client,
                     ptr::null(),
                     0,
+                    ptr::null(),
                     Some(capture_callback),
                     state.user_data(),
                     &mut id,
@@ -1114,6 +1304,7 @@ mod tests {
                     client,
                     ptr::null(),
                     1,
+                    ptr::null(),
                     Some(capture_callback),
                     ptr::null_mut(),
                     &mut id,
@@ -1128,6 +1319,7 @@ mod tests {
                     cstring("s3://bucket/file").as_ptr(),
                     ptr::null(),
                     1,
+                    ptr::null(),
                     Some(capture_callback),
                     ptr::null_mut(),
                     &mut id,
@@ -1166,6 +1358,7 @@ mod tests {
                     client,
                     files.as_ptr(),
                     files.len(),
+                    ptr::null(),
                     Some(capture_callback),
                     state.user_data(),
                     &mut id,
@@ -1175,6 +1368,12 @@ mod tests {
         );
         let result = state.wait();
         assert_eq!(result.status, STATUS_OPERATION_ERROR);
+        assert!(!namespaces.lock().unwrap().is_empty());
+        assert!(namespaces
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(name, _)| name == "default"));
         assert!(result.loads.is_empty());
         assert_eq!(
             result.load_failures,
@@ -1227,7 +1426,7 @@ mod tests {
                     sock.read_exact(&mut body).await.unwrap();
                     let mut full = hdr.to_vec();
                     full.extend_from_slice(&body);
-                    let (_header, msg) = talon_transport::decode(&full).unwrap();
+                    let (_header, msg) = talon_transport::codec::decode_request(&full).unwrap();
                     let reply = match msg {
                         ControlMessage::StatObject { .. } => {
                             stat_calls.fetch_add(1, Ordering::SeqCst);
@@ -1349,6 +1548,7 @@ mod tests {
                 dst.len(),
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1383,6 +1583,7 @@ mod tests {
                 100,
                 ptr::null_mut(),
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 Some(capture_callback),
@@ -1422,6 +1623,7 @@ mod tests {
                 dst.len(),
                 version.as_ptr(),
                 &object_size,
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1468,6 +1670,7 @@ mod tests {
                 dst.len(),
                 ptr::null(),
                 ptr::null(),
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1506,6 +1709,7 @@ mod tests {
                 dst.as_mut_ptr(),
                 dst.len(),
                 version.as_ptr(),
+                ptr::null(),
                 ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
@@ -1548,6 +1752,7 @@ mod tests {
                 dst.len(),
                 version.as_ptr(),
                 &object_size,
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1589,6 +1794,7 @@ mod tests {
                 dst.len(),
                 version.as_ptr(),
                 &object_size,
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1627,6 +1833,7 @@ mod tests {
             talon_stat_async(
                 client,
                 uri.as_ptr(),
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1684,6 +1891,7 @@ mod tests {
             talon_stat_async(
                 client,
                 uri.as_ptr(),
+                ptr::null(),
                 Some(capture_callback),
                 state.user_data(),
                 &mut request_id,
@@ -1720,6 +1928,7 @@ mod tests {
                     0,
                     ptr::null(),
                     ptr::null(),
+                    ptr::null(),
                     Some(capture_callback),
                     ptr::null_mut(),
                     &mut request_id,
@@ -1749,6 +1958,7 @@ mod tests {
                 0,
                 ptr::null_mut(),
                 0,
+                ptr::null(),
                 ptr::null(),
                 ptr::null(),
                 Some(capture_callback),

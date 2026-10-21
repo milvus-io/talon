@@ -313,7 +313,7 @@ impl WorkerClient {
         };
         let request_id = RequestId::next().0;
         let mut output = talon_transport::codec::encode(request_id, message)?;
-        talon_transport::envelope::outbound(&mut output, &self.addr)
+        talon_transport::envelope::outbound_namespace(&mut output, &self.addr, &self.namespace)
             .map_err(talon_transport::CodecError::from)?;
         self.pool
             .with_deadline("worker load", deadline, async {
@@ -636,7 +636,7 @@ impl WorkerClient {
         body: &[u8],
     ) -> Result<(), WorkerError> {
         let request_id = RequestId::next();
-        let header = encode_cached_block_put_header(
+        let mut header = encode_cached_block_put_header(
             request_id.0,
             &CachedBlockPutRequest {
                 block: block.clone(),
@@ -644,6 +644,7 @@ impl WorkerClient {
                 body_len: body.len() as u64,
             },
         )?;
+        talon_transport::envelope::outbound_namespace(&mut header, &self.addr, &self.namespace)?;
         match self.admit_exchange(&header, body).await {
             Ok(()) => Ok(()),
             Err((true, err)) if err.is_transport_failure() => {
@@ -1399,6 +1400,50 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(bytes.len(), 8);
+    }
+
+    #[tokio::test]
+    async fn admission_scopes_each_request_on_a_shared_connection() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for name in ["analytics", "training", "default"] {
+                let mut header_bytes = [0; HEADER_LEN];
+                socket.read_exact(&mut header_bytes).await.unwrap();
+                let header = FrameHeader::decode(&header_bytes).unwrap();
+                let mut payload = vec![0; header.length as usize];
+                socket.read_exact(&mut payload).await.unwrap();
+                let (metadata, _) = talon_transport::envelope::decode(&header, &payload).unwrap();
+                assert_eq!(
+                    metadata.namespace.unwrap_or_default().effective_name(),
+                    name
+                );
+                assert_eq!(header.version, if name == "default" { 1 } else { 3 });
+                let mut frame = header_bytes.to_vec();
+                frame.extend_from_slice(&payload);
+                let (_, request) = decode_cached_block_put_header(&frame).unwrap();
+                assert_eq!(request.body_len, 4);
+                let mut body = [0; 4];
+                socket.read_exact(&mut body).await.unwrap();
+                assert_eq!(&body, b"data");
+                let reply = talon_transport::envelope::response_version(
+                    response_header_ok(header.request_id, 0),
+                    header.version,
+                );
+                socket.write_all(&reply).await.unwrap();
+            }
+        });
+        let pool = Arc::new(ConnectionPool::new());
+        let block = BlockId::new(object(), 0, 4, Version::new("v1"));
+        for name in ["analytics", "training", "default"] {
+            WorkerClient::with_pool(&addr, pool.clone())
+                .with_namespace(NamespaceId::named(name))
+                .admit_cached_block(&block, 4, b"data")
+                .await
+                .unwrap();
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]

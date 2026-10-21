@@ -25,8 +25,10 @@ public final class Telemetry {
     private static final class CallContext {
         final TraceContext parent;
         final byte[] readId;
-        CallContext(TraceContext parent) {
+        final String namespace;
+        CallContext(TraceContext parent, String namespace) {
             this.parent = parent;
+            this.namespace = namespace;
             if (parent != null && (Character.digit(parent.traceparent.charAt(54), 16) & 1) != 0) {
                 UUID id = UUID.randomUUID();
                 readId = ByteBuffer.allocate(16).putLong(id.getMostSignificantBits()).putLong(id.getLeastSignificantBits()).array();
@@ -38,14 +40,22 @@ public final class Telemetry {
     interface IOCall<T> { T run() throws IOException; }
 
     static <T> T call(RequestOptions options, IOCall<T> call) throws IOException {
-        if (v2Endpoints.isEmpty()) return call.run();
         CallContext previous = CURRENT.get();
-        if (options.inherit && previous != null) return call.run();
-        TraceContext parent = options.parent;
-        if (options.inherit) {
-            try { parent = contextSupplier.get(); } catch (RuntimeException ignored) { parent = null; }
+        // Internal calls keep the whole scope only for the unmodified INHERIT singleton.
+        // Derived options must apply their namespace, including an explicit default reset.
+        if (options == RequestOptions.INHERIT && previous != null) return call.run();
+        TraceContext parent = null;
+        if (!v2Endpoints.isEmpty()) {
+            parent = options.parent;
+            if (options.inherit) {
+                if (previous != null) parent = previous.parent;
+                else {
+                    try { parent = contextSupplier.get(); } catch (RuntimeException ignored) { parent = null; }
+                }
+            }
         }
-        CURRENT.set(new CallContext(parent));
+        // Namespace routing is required even when trace propagation is disabled.
+        CURRENT.set(new CallContext(parent, options.namespace));
         try { return call.run(); }
         finally { if (previous == null) CURRENT.remove(); else CURRENT.set(previous); }
     }
@@ -57,19 +67,30 @@ public final class Telemetry {
 
     static byte[] envelope(byte[] frame, String endpoint) {
         CallContext current = CURRENT.get();
-        if (current == null || current.parent == null || !(v2Endpoints.contains(endpoint) || v2Endpoints.contains("*"))) return frame;
-        return envelope(frame, current.parent, current.readId);
+        String namespace = current == null ? "default" : current.namespace;
+        boolean trace = canSend(endpoint);
+        if (!trace && namespace.equals("default")) return frame;
+        return envelope(frame, trace ? current.parent : null, trace ? current.readId : null, namespace);
     }
 
     static byte[] envelope(byte[] frame, TraceContext parent, byte[] readId) {
+        return envelope(frame, parent, readId, "default");
+    }
+
+    private static byte[] envelope(byte[] frame, TraceContext parent, byte[] readId, String namespace) {
         ByteArrayOutputStream metadata = new ByteArrayOutputStream();
-        tlv(metadata, 1, parent.traceparent.getBytes(StandardCharsets.US_ASCII));
-        if (!parent.tracestate.isEmpty()) tlv(metadata, 2, parent.tracestate.getBytes(StandardCharsets.US_ASCII));
-        if (readId != null) tlv(metadata, 3, readId);
+        if (parent != null) {
+            tlv(metadata, 1, parent.traceparent.getBytes(StandardCharsets.US_ASCII));
+            if (!parent.tracestate.isEmpty()) tlv(metadata, 2, parent.tracestate.getBytes(StandardCharsets.US_ASCII));
+            if (readId != null) tlv(metadata, 3, readId);
+        }
+        boolean named = !namespace.equals("default");
+        // v3 makes namespace routing mandatory: older peers must reject it, never ignore it.
+        if (named) tlv(metadata, 5, namespace.getBytes(StandardCharsets.US_ASCII));
         byte[] values = metadata.toByteArray();
         byte[] result = new byte[frame.length + 2 + values.length];
         System.arraycopy(frame, 0, result, 0, Frame.HEADER_LEN);
-        result[2] = 2;
+        result[2] = (byte) (named ? 3 : 2);
         ByteBuffer.wrap(result).putInt(12, result.length - Frame.HEADER_LEN).putShort(16, (short) values.length);
         System.arraycopy(values, 0, result, 18, values.length);
         System.arraycopy(frame, 16, result, 18 + values.length, frame.length - 16);
