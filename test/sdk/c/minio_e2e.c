@@ -115,7 +115,7 @@ static int do_read(talon_client *client, const char *uri, uint64_t offset,
 
     uint64_t request_id = 0;
     int rc = talon_read_async(client, uri, offset, ctx->buffer, len, version,
-                              object_size, on_result, ctx, &request_id);
+                              object_size, NULL, on_result, ctx, &request_id);
     if (rc != TALON_STATUS_OK) {
         fprintf(stderr, "  FAIL %s: submit failed: %s\n", name, talon_last_error());
         pthread_cond_destroy(&ctx->cond);
@@ -147,7 +147,7 @@ static int do_stat(talon_client *client, const char *uri, op_context *ctx) {
     pthread_cond_init(&ctx->cond, NULL);
 
     uint64_t request_id = 0;
-    int rc = talon_stat_async(client, uri, on_result, ctx, &request_id);
+    int rc = talon_stat_async(client, uri, NULL, on_result, ctx, &request_id);
     if (rc != TALON_STATUS_OK) {
         fprintf(stderr, "  FAIL stat: submit failed: %s\n", talon_last_error());
         pthread_mutex_destroy(&ctx->mutex);
@@ -172,6 +172,7 @@ static int do_bad_uri(talon_client *client, op_context *ctx) {
     uint8_t byte;
     uint64_t request_id = 0;
     int rc = talon_read_async(client, "ftp://bucket/key", 0, &byte, 1, NULL, 0,
+                              NULL,
                               on_result, ctx, &request_id);
     int ok = rc != TALON_STATUS_OK;
     if (!ok) {

@@ -65,7 +65,10 @@ async fn negative_ack_marks_fresh_and_reused_rpc_as_errors() {
         let client = talon_cache_client::CoordinatorClient::new(address.to_string());
         let object = talon_core::ObjectId::new(talon_core::Backend::S3, "bucket", "object");
         for _ in 0..2 {
-            assert!(client.stat_object(&object).await.is_err());
+            assert!(client
+                .stat_object(&object, &talon_core::NamespaceId::Unattributed)
+                .await
+                .is_err());
         }
     }
     .with_subscriber(dispatch)

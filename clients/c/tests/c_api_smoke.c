@@ -50,7 +50,8 @@ int talon_c_api_smoke_test(void) {
     talon_request_options trace_options;
     if (talon_request_options_init(&trace_options, sizeof(trace_options)) != TALON_STATUS_OK ||
         trace_options.struct_size != sizeof(trace_options) || trace_options.version != 1 ||
-        trace_options.flags != 0 || trace_options.parent_mode != 0) return 10;
+        trace_options.flags != 0 || trace_options.parent_mode != 0 ||
+        trace_options.namespace_name != NULL) return 10;
 
     talon_client_options_init(&options);
     if (options.block_size != (256u << 20) || options.callback_executor != NULL ||
@@ -73,27 +74,42 @@ int talon_c_api_smoke_test(void) {
     }
 
     if (talon_read_async(client, "s3://bucket/object", 0, NULL, 1, NULL, NULL,
-                         capture_zero_length_read, NULL, &request_id) !=
+                         NULL, capture_zero_length_read, NULL, &request_id) !=
         TALON_STATUS_INVALID_ARGUMENT) {
         talon_client_free(client);
         return 5;
     }
-    if (talon_stat_async(client, NULL, capture_zero_length_read, NULL, &request_id) !=
+    if (talon_stat_async(client, NULL, NULL, capture_zero_length_read, NULL, &request_id) !=
         TALON_STATUS_INVALID_ARGUMENT) {
         talon_client_free(client);
         return 6;
     }
 
     trace_options.version = 2;
-    if (talon_stat_async_with_options(client, "s3://bucket/object", &trace_options,
+    if (talon_stat_async(client, "s3://bucket/object", &trace_options,
                                      capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT) {
         talon_client_free(client);
         return 11;
     }
     trace_options.version = 1;
+    trace_options.namespace_name = "";
+    atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
+    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0,
+            NULL, NULL, &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+        talon_stat_async(client, "s3://bucket/object", &trace_options,
+            capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+        talon_load_async(client, "s3://bucket/object", "v1", 0,
+            &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+        talon_batch_load_async(client, NULL, 0, &trace_options,
+            capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+        request_id != 0 || atomic_load_explicit(&callback_done, memory_order_acquire)) {
+        talon_client_free(client);
+        return 14;
+    }
+    trace_options.namespace_name = NULL;
     atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
     atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
-    if (talon_read_async_with_options(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL, &trace_options,
+    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL, &trace_options,
                          capture_zero_length_read, NULL, &request_id) != TALON_STATUS_OK ||
         request_id != 1) {
         talon_client_free(client);
@@ -123,9 +139,9 @@ int talon_c_api_smoke_test(void) {
         atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
         talon_load_request request = {"s3://bucket/empty", "v1", 0};
         int status = operation == TALON_OPERATION_LOAD
-            ? talon_load_async_with_options(client, request.uri, request.version, request.size,
+            ? talon_load_async(client, request.uri, request.version, request.size,
                 &trace_options, capture_empty_load, (void *)(uintptr_t)operation, &request_id)
-            : talon_batch_load_async_with_options(client, &request, 1, &trace_options,
+            : talon_batch_load_async(client, &request, 1, &trace_options,
                 capture_empty_load, (void *)(uintptr_t)operation, &request_id);
         if (status != TALON_STATUS_OK) { talon_client_free(client); return 12; }
         for (unsigned int i = 0; i < 100000000u; ++i) {

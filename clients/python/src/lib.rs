@@ -175,6 +175,8 @@ impl ObjectEntry {
 }
 
 /// A client for reading objects through a Talon cache cluster.
+/// Each operation accepts `namespace`; omitting it selects `default` for that
+/// request, independently of other operations on the same client.
 #[pyclass(module = "talon")]
 pub struct Client {
     runtime: Arc<tokio::runtime::Runtime>,
@@ -263,6 +265,7 @@ impl Client {
         requests: Vec<LoadRequest>,
         batch: bool,
         trace_context: Option<std::collections::HashMap<String, String>>,
+        namespace: Option<String>,
     ) -> PyResult<Vec<LoadResult>> {
         let parent = capture_trace(py, trace_context);
         let requests = requests
@@ -291,12 +294,14 @@ impl Client {
                         );
                         let result = operation
                             .scope(async {
+                                let options = talon_rust_client::RequestOptions::default()
+                                    .with_namespace(namespace.as_deref().unwrap_or("default"));
                                 if batch {
-                                    client.batch_load(&requests).await
+                                    client.batch_load(&requests, &options).await
                                 } else {
                                     let r = &requests[0];
                                     client
-                                        .load(&r.object, &r.version, r.size)
+                                        .load(&r.object, &r.version, r.size, &options)
                                         .await
                                         .map(|r| vec![r])
                                 }
@@ -321,7 +326,7 @@ impl Client {
 #[pymethods]
 impl Client {
     /// Prewarm a file without HEAD. Wait for every assigned block to complete.
-    #[pyo3(signature = (uri, *, version, size, trace_context = None))]
+    #[pyo3(signature = (uri, *, version, size, trace_context = None, namespace = None))]
     fn load(
         &self,
         py: Python<'_>,
@@ -329,23 +334,25 @@ impl Client {
         version: String,
         size: u64,
         trace_context: Option<std::collections::HashMap<String, String>>,
+        namespace: Option<String>,
     ) -> PyResult<LoadResult> {
         let request = LoadRequest::new(uri, version, size)?;
         Ok(self
-            .run_loads(py, vec![request], false, trace_context)?
+            .run_loads(py, vec![request], false, trace_context, namespace)?
             .remove(0))
     }
 
     /// Prewarm files through protocol batches. Results follow input order.
     /// BatchLoadError.failed_files identifies failed/unconfirmed input indices.
-    #[pyo3(signature = (requests, *, trace_context = None))]
+    #[pyo3(signature = (requests, *, trace_context = None, namespace = None))]
     fn batch_load(
         &self,
         py: Python<'_>,
         requests: Vec<LoadRequest>,
         trace_context: Option<std::collections::HashMap<String, String>>,
+        namespace: Option<String>,
     ) -> PyResult<Vec<LoadResult>> {
-        self.run_loads(py, requests, true, trace_context)
+        self.run_loads(py, requests, true, trace_context, namespace)
     }
 
     /// Connect to a coordinator.
@@ -388,7 +395,7 @@ impl Client {
     /// pair skips `stat` and pins the read to that exact source generation.
     /// Supplying only one raises `ValueError`, since metadata from different
     /// generations cannot safely be combined.
-    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None))]
+    #[pyo3(signature = (uri, *, offset = 0, length = None, version = None, size = None, trace_context = None, namespace = None))]
     #[allow(clippy::too_many_arguments)]
     fn read<'py>(
         &self,
@@ -399,6 +406,7 @@ impl Client {
         version: Option<&str>,
         size: Option<u64>,
         trace_context: Option<std::collections::HashMap<String, String>>,
+        namespace: Option<String>,
     ) -> PyResult<Bound<'py, PyBytes>> {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -421,8 +429,10 @@ impl Client {
                     );
                     let result = operation
                         .scope(async {
+                            let options = talon_rust_client::RequestOptions::default()
+                                .with_namespace(namespace.as_deref().unwrap_or("default"));
                             client
-                                .read(&object, offset, length, known_stat.as_ref())
+                                .read(&object, offset, length, known_stat.as_ref(), &options)
                                 .await
                         })
                         .await;
@@ -436,12 +446,13 @@ impl Client {
     }
 
     /// Return an object's size and version.
-    #[pyo3(signature = (uri, *, trace_context = None))]
+    #[pyo3(signature = (uri, *, trace_context = None, namespace = None))]
     fn stat(
         &self,
         py: Python<'_>,
         uri: &str,
         trace_context: Option<std::collections::HashMap<String, String>>,
+        namespace: Option<String>,
     ) -> PyResult<ObjectStat> {
         let trace_context = capture_trace(py, trace_context);
         let object = parse_uri(uri).map_err(|error| PyValueError::new_err(error.to_string()))?;
@@ -450,13 +461,15 @@ impl Client {
         let stat = py.allow_threads(move || {
             with_telemetry(|| {
                 runtime.block_on(async move {
-                    let options = talon_telemetry::RequestOptions {
-                        parent: trace_context
-                            .as_ref()
-                            .map(talon_telemetry::TraceParent::Explicit)
-                            .unwrap_or(talon_telemetry::TraceParent::Root),
-                    };
-                    client.stat_with_options(&object, &options).await
+                    let options = talon_rust_client::RequestOptions::default()
+                        .with_namespace(namespace.as_deref().unwrap_or("default"))
+                        .with_parent(
+                            trace_context
+                                .as_ref()
+                                .map(talon_telemetry::TraceParent::Explicit)
+                                .unwrap_or(talon_telemetry::TraceParent::Root),
+                        );
+                    client.stat(&object, &options).await
                 })
             })
         });
@@ -477,12 +490,23 @@ impl Client {
     /// The control protocol carries one bounded response. If a prefix exceeds
     /// the server's object, page, or payload limit, the call fails explicitly
     /// instead of returning an incomplete list; use a narrower prefix.
-    fn list(&self, py: Python<'_>, prefix: &str) -> PyResult<Vec<ObjectEntry>> {
+    #[pyo3(signature = (prefix, *, namespace = None))]
+    fn list(
+        &self,
+        py: Python<'_>,
+        prefix: &str,
+        namespace: Option<String>,
+    ) -> PyResult<Vec<ObjectEntry>> {
         let runtime = Arc::clone(&self.runtime);
         let client = Arc::clone(&self.client);
         let prefix = prefix.to_string();
-        let entries =
-            py.allow_threads(move || runtime.block_on(async move { client.list(&prefix).await }));
+        let entries = py.allow_threads(move || {
+            runtime.block_on(async move {
+                let options = talon_rust_client::RequestOptions::default()
+                    .with_namespace(namespace.as_deref().unwrap_or("default"));
+                client.list(&prefix, &options).await
+            })
+        });
         let entries = entries.map_err(client_err)?;
         Ok(entries
             .into_iter()
@@ -627,6 +651,7 @@ mod tests {
                 Some("version"),
                 Some(oversized),
                 None,
+                None,
             ) {
                 Ok(_) => panic!("oversized read must fail"),
                 Err(error) => error,
@@ -642,7 +667,7 @@ mod tests {
         let client = Client::new("127.0.0.1:0", 1, 8).unwrap();
 
         Python::with_gil(|py| {
-            let error = match client.stat(py, "s3://bucket/key", None) {
+            let error = match client.stat(py, "s3://bucket/key", None, None) {
                 Ok(_) => panic!("stat without a coordinator must fail"),
                 Err(error) => error,
             };

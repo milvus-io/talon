@@ -131,6 +131,7 @@ impl BlockReader {
         &self,
         block: &talon_core::BlockId,
         topology: &std::sync::Arc<talon_core::CachePlacementTable>,
+        namespace: &talon_core::NamespaceId,
         send: F,
     ) -> Result<T, LoadError>
     where
@@ -141,18 +142,24 @@ impl BlockReader {
         if !std::sync::Arc::ptr_eq(&current.placement, topology) {
             return Err(LoadError::MembershipChanged);
         }
-        send(current.owner(block)?).await
+        send(current.owner(block)?.with_namespace(namespace.clone())).await
     }
 
     /// Warm a file directly on its primary workers using the read placement.
     ///
+    /// The namespace scopes this request without changing shared discovery or pools.
     /// The caller supplies version and size, so no HEAD is issued. Membership
     /// discovery reuses the read path's bounded instance cache;
     /// no LOAD is sent to the coordinator. Each load uses one logical topology, at most
     /// eight pending block futures, and a 30-minute overall deadline. Clones
     /// share eight active block requests. Dropping this future stops dispatch;
     /// workers may finish already accepted requests.
-    pub async fn load(&self, file: &FileView<'_>, _now_ms: u64) -> Result<LoadResult, LoadError> {
+    pub async fn load(
+        &self,
+        file: &FileView<'_>,
+        _now_ms: u64,
+        namespace: &talon_core::NamespaceId,
+    ) -> Result<LoadResult, LoadError> {
         let LoadResult { blocks, .. } = validate_file(file)?;
         if blocks == 0 {
             return Ok(LoadResult { size: 0, blocks: 0 });
@@ -179,7 +186,7 @@ impl BlockReader {
                         .await
                         .expect("load semaphore is never closed");
                     let block = &segment.block;
-                    self.with_load_owner(block, topology, |client| async move {
+                    self.with_load_owner(block, topology, namespace, |client| async move {
                         client
                             .load_block(block, u64::from(segment.len))
                             .await
@@ -219,10 +226,12 @@ impl BlockReader {
     /// discovery is maintained by the background thread, independently of dispatch.
     /// Single and batch loads share eight active RPCs. Individual failures do not
     /// cancel other files. Errors report failed/unconfirmed file indices. This is not atomic.
+    /// The namespace applies to every file in this batch only.
     pub async fn batch_load(
         &self,
         files: &[FileView<'_>],
         _now_ms: u64,
+        namespace: &talon_core::NamespaceId,
     ) -> Result<Vec<LoadResult>, LoadError> {
         let results = files
             .iter()
@@ -334,6 +343,7 @@ impl BlockReader {
                                 self.with_load_owner(
                                     &blocks[0].block,
                                     topology,
+                                    namespace,
                                     |client| async move {
                                         client
                                             .batch_load(blocks)
@@ -422,6 +432,163 @@ mod tests {
     use talon_transport::{codec, ControlMessage, FrameHeader, HEADER_LEN};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
+
+    #[tokio::test]
+    async fn request_namespaces_share_clients_without_leaking_into_discovery() {
+        use talon_core::NamespaceId;
+        use talon_transport::{data, envelope, MsgType};
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let node = NodeInfo {
+            id: NodeId::new("worker"),
+            address: address.clone(),
+            role: NodeRole::Worker,
+        };
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let server = tokio::spawn(async move {
+            loop {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let recorded = recorded.clone();
+                let node = node.clone();
+                tokio::spawn(async move {
+                    // Close after each response to exercise stale pooled retries.
+                    let mut bytes = [0; HEADER_LEN];
+                    if socket.read_exact(&mut bytes).await.is_err() {
+                        return;
+                    }
+                    let header = FrameHeader::decode(&bytes).unwrap();
+                    let mut payload = vec![0; header.length as usize];
+                    socket.read_exact(&mut payload).await.unwrap();
+                    let (metadata, _) = envelope::decode(&header, &payload).unwrap();
+                    let mut namespace = metadata.namespace.unwrap_or_default();
+                    let mut frame = bytes.to_vec();
+                    frame.extend_from_slice(&payload);
+                    let (operation, response) = if header.msg_type == MsgType::Control {
+                        let (_, message) = codec::decode_request(&frame).unwrap();
+                        let (operation, reply) = match message {
+                            ControlMessage::MembershipQuery {} => {
+                                ("discovery", crate::membership_fixture::plain(vec![node]))
+                            }
+                            ControlMessage::StatObject { .. } => (
+                                "stat",
+                                ControlMessage::ObjectStat {
+                                    size: 8,
+                                    version: namespace.effective_name().into(),
+                                },
+                            ),
+                            ControlMessage::ListObjects { .. } => (
+                                "list",
+                                ControlMessage::ObjectList {
+                                    entries: vec![talon_transport::ObjectEntry {
+                                        path: namespace.effective_name().into(),
+                                        size: 8,
+                                    }],
+                                },
+                            ),
+                            ControlMessage::LoadBlock { .. } => (
+                                "load",
+                                ControlMessage::Ack {
+                                    ok: true,
+                                    detail: None,
+                                },
+                            ),
+                            ControlMessage::BatchLoad { .. } => (
+                                "batch",
+                                ControlMessage::BatchLoadResult { failures: vec![] },
+                            ),
+                            other => panic!("unexpected request: {other:?}"),
+                        };
+                        (operation, codec::encode(header.request_id, &reply).unwrap())
+                    } else {
+                        let request = if header.msg_type == MsgType::GetVersionedRangeNamespace {
+                            let (_, scoped) =
+                                data::decode_versioned_namespace_request(&frame).unwrap();
+                            namespace = scoped.namespace;
+                            scoped.request
+                        } else {
+                            data::decode_versioned_request(&frame).unwrap().1
+                        };
+                        let mut reply =
+                            data::response_header_ok(header.request_id, request.request.len as u32)
+                                .to_vec();
+                        reply.extend_from_slice(&vec![
+                            namespace.effective_name().as_bytes()[0];
+                            request.request.len as usize
+                        ]);
+                        ("read", reply)
+                    };
+                    if namespace.is_default() {
+                        assert!(header.version < 3);
+                        assert_ne!(header.msg_type, MsgType::GetVersionedRangeNamespace);
+                    }
+                    recorded
+                        .lock()
+                        .unwrap()
+                        .push((operation, namespace.effective_name().to_owned()));
+                    socket.write_all(&response).await.unwrap();
+                });
+            }
+        });
+        let coordinator = CoordinatorClient::new(address.clone());
+        let reader = reader(address, &[]);
+        let object = object();
+        let version = Version::new("v1");
+        let file = FileView {
+            object: &object,
+            version: &version,
+            size: 8,
+            block_size: 8,
+        };
+        let block = BlockId::new(object.clone(), 0, 8, version.clone());
+        for name in ["alpha", "beta", "default"] {
+            let namespace = NamespaceId::named(name);
+            assert_eq!(
+                coordinator
+                    .stat_object(&object, &namespace)
+                    .await
+                    .unwrap()
+                    .version,
+                name
+            );
+            assert_eq!(
+                coordinator
+                    .list_objects("s3/bucket", &namespace)
+                    .await
+                    .unwrap()[0]
+                    .path,
+                name
+            );
+            let mut bytes = [0; 8];
+            reader
+                .read_versioned_block_into(&block, 0, &mut bytes, 8, &namespace)
+                .await
+                .unwrap();
+            assert_eq!(bytes, [name.as_bytes()[0]; 8]);
+            reader.load(&file, 0, &namespace).await.unwrap();
+            reader
+                .batch_load(std::slice::from_ref(&file), 0, &namespace)
+                .await
+                .unwrap();
+        }
+        drop(reader);
+        let recorded = requests.lock().unwrap();
+        for operation in ["stat", "list", "read", "load", "batch"] {
+            let names = recorded
+                .iter()
+                .filter(|(kind, _)| *kind == operation)
+                .map(|(_, name)| name.as_str())
+                .collect::<Vec<_>>();
+            assert_eq!(names, ["alpha", "beta", "default"], "{operation}");
+        }
+        assert!(recorded.iter().any(|(kind, _)| *kind == "discovery"));
+        assert!(recorded
+            .iter()
+            .filter(|(kind, _)| *kind == "discovery")
+            .all(|(_, name)| name == "default"));
+        server.abort();
+    }
 
     async fn receive(stream: &mut TcpStream) -> Option<(u32, ControlMessage)> {
         let mut header = [0; HEADER_LEN];
@@ -572,9 +739,16 @@ mod tests {
                 &crate::ConnectionPool::new(),
             );
             for error in [
-                reader.load(&file, 100).await.unwrap_err(),
                 reader
-                    .batch_load(std::slice::from_ref(&file), 100)
+                    .load(&file, 100, &talon_core::NamespaceId::Unattributed)
+                    .await
+                    .unwrap_err(),
+                reader
+                    .batch_load(
+                        std::slice::from_ref(&file),
+                        100,
+                        &talon_core::NamespaceId::Unattributed,
+                    )
                     .await
                     .unwrap_err(),
             ] {
@@ -673,7 +847,10 @@ mod tests {
                 block_size: 8,
             },
         ];
-        let error = reader.batch_load(&files, 0).await.unwrap_err();
+        let error = reader
+            .batch_load(&files, 0, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap_err();
         assert_eq!(
             error
                 .failed_files()
@@ -731,7 +908,10 @@ mod tests {
                 block_size: 8,
             },
         ];
-        let error = reader.batch_load(&files, 0).await.unwrap_err();
+        let error = reader
+            .batch_load(&files, 0, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap_err();
         assert_eq!(
             error
                 .failed_files()
@@ -777,7 +957,10 @@ mod tests {
             size: 8,
             block_size: 8,
         };
-        let error = reader.batch_load(&[file], 0).await.unwrap_err();
+        let error = reader
+            .batch_load(&[file], 0, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap_err();
         assert_eq!(
             error
                 .failed_files()
@@ -810,7 +993,10 @@ mod tests {
                 block_size: 8,
             },
         ];
-        let error = reader.batch_load(&files, 0).await.unwrap_err();
+        let error = reader
+            .batch_load(&files, 0, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap_err();
         assert_eq!(
             error
                 .failed_files()
@@ -845,7 +1031,10 @@ mod tests {
             size: 0,
             block_size: 8,
         });
-        let results = reader.batch_load(&files, 100).await.unwrap();
+        let results = reader
+            .batch_load(&files, 100, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
         assert_eq!(results.len(), files.len());
         for (result, file) in results.iter().zip(&files) {
             assert_eq!(result.size, file.size);
@@ -884,7 +1073,10 @@ mod tests {
             },
         ];
         assert_eq!(
-            reader.batch_load(&files, 100).await.unwrap(),
+            reader
+                .batch_load(&files, 100, &talon_core::NamespaceId::Unattributed)
+                .await
+                .unwrap(),
             [
                 LoadResult {
                     size: 131,
@@ -931,17 +1123,30 @@ mod tests {
             size: 16,
             block_size: 8,
         }];
-        reader.batch_load(&files, 100).await.unwrap();
+        reader
+            .batch_load(&files, 100, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
         assert_eq!(a.batch_sizes.lock().unwrap().as_slice(), &[1, 1]);
         let invalid = FileView {
             block_size: 0,
             ..files[0]
         };
         assert!(matches!(
-            reader.batch_load(&[files[0].clone(), invalid], 100).await,
+            reader
+                .batch_load(
+                    &[files[0].clone(), invalid],
+                    100,
+                    &talon_core::NamespaceId::Unattributed
+                )
+                .await,
             Err(LoadError::InvalidArgument(_))
         ));
-        assert!(reader.batch_load(&[], 100).await.unwrap().is_empty());
+        assert!(reader
+            .batch_load(&[], 100, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap()
+            .is_empty());
         assert_eq!(a.requests.lock().unwrap().len(), 2);
     }
 
@@ -958,8 +1163,8 @@ mod tests {
         let files = [file.clone()];
         let single_file = FileView { size: 128, ..file };
         let (batch, single) = tokio::join!(
-            reader.batch_load(&files, 100),
-            reader.load(&single_file, 100)
+            reader.batch_load(&files, 100, &talon_core::NamespaceId::Unattributed),
+            reader.load(&single_file, 100, &talon_core::NamespaceId::Unattributed)
         );
         batch.unwrap();
         single.unwrap();
@@ -969,7 +1174,7 @@ mod tests {
         let reader = self::reader("127.0.0.1:0".into(), std::slice::from_ref(&rejected.node));
         assert!(matches!(
             reader
-                .batch_load(&[FileView { size: 8, ..file }], 100)
+                .batch_load(&[FileView { size: 8, ..file }], 100, &talon_core::NamespaceId::Unattributed)
                 .await,
             Err(LoadError::Batch { failed_files, .. }) if failed_files.len() == 1 && failed_files[0].uncertain
         ));
@@ -998,6 +1203,7 @@ mod tests {
                     block_size: 8,
                 },
                 100,
+                &talon_core::NamespaceId::Unattributed,
             )
             .await
             .unwrap();
@@ -1053,11 +1259,21 @@ mod tests {
             size: 17,
             block_size: 8,
         };
-        reader.load(&file, 100).await.unwrap();
-        server.await.unwrap();
-        reader.load(&file, 101).await.unwrap();
         reader
-            .batch_load(std::slice::from_ref(&file), 102)
+            .load(&file, 100, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        reader
+            .load(&file, 101, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
+        reader
+            .batch_load(
+                std::slice::from_ref(&file),
+                102,
+                &talon_core::NamespaceId::Unattributed,
+            )
             .await
             .unwrap();
         assert_eq!(a.requests.lock().unwrap().len(), 9);
@@ -1067,8 +1283,14 @@ mod tests {
             std::slice::from_ref(&a.node),
             std::time::Instant::now() - Duration::from_secs(1),
         );
-        reader.load(&file, 103).await.unwrap();
-        reader.batch_load(&[file], 104).await.unwrap();
+        reader
+            .load(&file, 103, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
+        reader
+            .batch_load(&[file], 104, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
         assert_eq!(a.requests.lock().unwrap().len(), 15);
     }
 
@@ -1083,7 +1305,10 @@ mod tests {
             size: 800,
             block_size: 8,
         };
-        let (left, right) = tokio::join!(reader.load(&file, 100), clone.load(&file, 100));
+        let (left, right) = tokio::join!(
+            reader.load(&file, 100, &talon_core::NamespaceId::Unattributed),
+            clone.load(&file, 100, &talon_core::NamespaceId::Unattributed)
+        );
         assert_eq!(left.unwrap().blocks, 100);
         assert_eq!(right.unwrap().blocks, 100);
         assert_eq!(a.peak.load(Ordering::SeqCst), 8);
@@ -1100,6 +1325,7 @@ mod tests {
                         block_size: 8,
                     },
                     100,
+                    &talon_core::NamespaceId::Unattributed,
                 )
                 .await
         });
@@ -1140,6 +1366,7 @@ mod tests {
                         block_size: 8,
                     },
                     100,
+                    &talon_core::NamespaceId::Unattributed,
                 )
                 .await
         });
@@ -1160,10 +1387,13 @@ mod tests {
             size: 8,
             block_size: 8,
         };
-        let (result, ()) = tokio::join!(reader.load(&file, 100), async {
-            wait_for_requests(&a, 1).await;
-            install_membership(&reader, &[], std::time::Instant::now());
-        });
+        let (result, ()) = tokio::join!(
+            reader.load(&file, 100, &talon_core::NamespaceId::Unattributed),
+            async {
+                wait_for_requests(&a, 1).await;
+                install_membership(&reader, &[], std::time::Instant::now());
+            }
+        );
         assert!(matches!(result, Err(LoadError::MembershipChanged)));
     }
 
@@ -1215,7 +1445,8 @@ mod tests {
                         size: u64::MAX,
                         ..file
                     },
-                    100
+                    100,
+                    &talon_core::NamespaceId::Unattributed
                 )
                 .await,
             Err(LoadError::InvalidArgument(_))
@@ -1227,21 +1458,29 @@ mod tests {
                         block_size: 0,
                         ..file
                     },
-                    100
+                    100,
+                    &talon_core::NamespaceId::Unattributed
                 )
                 .await,
             Err(LoadError::InvalidArgument(_))
         ));
         assert_eq!(
             reader
-                .load(&FileView { size: 0, ..file }, 100)
+                .load(
+                    &FileView { size: 0, ..file },
+                    100,
+                    &talon_core::NamespaceId::Unattributed
+                )
                 .await
                 .unwrap()
                 .blocks,
             0
         );
         assert!(a.requests.lock().unwrap().is_empty());
-        let error = reader.load(&file, 100).await.unwrap_err();
+        let error = reader
+            .load(&file, 100, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap_err();
         assert!(matches!(
             error,
             LoadError::Worker {

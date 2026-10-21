@@ -13,7 +13,7 @@
 use std::time::Instant;
 
 use clap::{Parser, Subcommand};
-use talon_core::{BlockId, CachePlacementTable, NodeRole, ObjectId, Version};
+use talon_core::{BlockId, CachePlacementTable, NamespaceId, NodeRole, ObjectId, Version};
 use talon_transport::data::{self, RangeRequest};
 use talon_transport::frame::{Flags, HEADER_LEN};
 use talon_transport::{codec, ControlMessage, FrameHeader};
@@ -41,6 +41,11 @@ struct Args {
     /// Address of the coordinator to query for placement.
     #[arg(long, global = true, default_value = "127.0.0.1:7000")]
     coordinator: String,
+    /// Cache namespace used by reads and prewarming.
+    #[arg(long, global = true, default_value = "default", value_parser = |name: &str| {
+        talon_core::NamespaceContext::new(name).map(|_| name.to_owned())
+    })]
+    namespace: String,
     /// Connect directly to one worker, bypassing placement (diagnostics/tests).
     #[arg(long)]
     worker: Option<String>,
@@ -121,7 +126,11 @@ async fn main() -> anyhow::Result<()> {
     result
 }
 
-async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
+async fn run_load(
+    command: Command,
+    coordinator: &str,
+    namespace: NamespaceId,
+) -> anyhow::Result<()> {
     let (entries, block_size, batch) = match command {
         Command::Load {
             path,
@@ -167,8 +176,9 @@ async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
             block_size,
         })
         .collect::<Vec<_>>();
+    let coordinator = talon_cache_client::CoordinatorClient::new(coordinator);
     let reader = talon_cache_client::BlockReader::new(
-        talon_cache_client::CoordinatorClient::new(coordinator),
+        coordinator,
         std::sync::Arc::new(talon_cache_client::PlacementCache::new(30_000)),
         1,
     );
@@ -177,7 +187,7 @@ async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
         .unwrap_or_default()
         .as_millis() as u64;
     if batch {
-        let results = match reader.batch_load(&files, now_ms).await {
+        let results = match reader.batch_load(&files, now_ms, &namespace).await {
             Ok(results) => results,
             Err(error) => {
                 for failure in error.failed_files() {
@@ -203,7 +213,7 @@ async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
             );
         }
     } else {
-        let result = reader.load(&files[0], now_ms).await?;
+        let result = reader.load(&files[0], now_ms, &namespace).await?;
         println!("loaded {} bytes in {} blocks", result.size, result.blocks);
     }
     Ok(())
@@ -211,11 +221,18 @@ async fn run_load(command: Command, coordinator: &str) -> anyhow::Result<()> {
 
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+    let namespace = if args.namespace == talon_core::DEFAULT_NAMESPACE {
+        NamespaceId::Unattributed
+    } else {
+        NamespaceId::named(args.namespace)
+    };
     if let Some(command) = args.command {
-        return run_load(command, &args.coordinator).await;
+        return run_load(command, &args.coordinator, namespace).await;
     }
     if args.membership_only {
-        let mut nodes = membership_lookup(&args.coordinator).await?.nodes;
+        let mut nodes = membership_lookup(&args.coordinator, &namespace)
+            .await?
+            .nodes;
         nodes.sort_by(|left, right| {
             left.address
                 .cmp(&right.address)
@@ -255,7 +272,7 @@ async fn run() -> anyhow::Result<()> {
             worker
         }
         None => {
-            let membership = membership_lookup(&args.coordinator).await?;
+            let membership = membership_lookup(&args.coordinator, &namespace).await?;
             let placement = CachePlacementTable::new(&membership.nodes);
             let owner = placement
                 .primary(&block)
@@ -280,7 +297,7 @@ async fn run() -> anyhow::Result<()> {
 
     // Fetch the range from the selected worker.
     let start = Instant::now();
-    let bytes = fetch_range(&worker_addr, &object, args.offset, len).await?;
+    let bytes = fetch_range(&worker_addr, &object, args.offset, len, &namespace).await?;
     let elapsed = start.elapsed();
 
     // Verify the worker returned the full requested range. A short read means
@@ -325,9 +342,12 @@ fn unavailable(message: String) -> anyhow::Error {
 }
 
 /// Resolve the published membership for this one-shot CLI operation.
-async fn membership_lookup(coordinator: &str) -> anyhow::Result<CliMembership> {
+async fn membership_lookup(
+    coordinator: &str,
+    namespace: &NamespaceId,
+) -> anyhow::Result<CliMembership> {
     use talon_core::worker_membership::InstanceState;
-    match request_control(coordinator, &ControlMessage::MembershipQuery {}).await? {
+    match request_control(coordinator, &ControlMessage::MembershipQuery {}, namespace).await? {
         ControlMessage::MembershipList { view } => {
             let nodes = view
                 .workers
@@ -349,9 +369,14 @@ async fn membership_lookup(coordinator: &str) -> anyhow::Result<CliMembership> {
 }
 
 /// Send a control request over a fresh connection and read one reply.
-async fn request_control(addr: &str, msg: &ControlMessage) -> anyhow::Result<ControlMessage> {
+async fn request_control(
+    addr: &str,
+    msg: &ControlMessage,
+    namespace: &NamespaceId,
+) -> anyhow::Result<ControlMessage> {
     let mut stream = TcpStream::connect(addr).await?;
-    let buf = codec::encode(0, msg)?;
+    let mut buf = codec::encode(0, msg)?;
+    talon_transport::envelope::outbound_namespace(&mut buf, addr, namespace)?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
 
@@ -373,6 +398,7 @@ async fn fetch_range(
     object: &ObjectId,
     offset: u64,
     len: u64,
+    namespace: &NamespaceId,
 ) -> anyhow::Result<Vec<u8>> {
     let mut stream = TcpStream::connect(worker_addr).await?;
     let req = RangeRequest {
@@ -380,7 +406,8 @@ async fn fetch_range(
         offset,
         len,
     };
-    let buf = data::encode_request(0, &req)?;
+    let mut buf = data::encode_request(0, &req)?;
+    talon_transport::envelope::outbound_namespace(&mut buf, worker_addr, namespace)?;
     stream.write_all(&buf).await?;
     stream.flush().await?;
 
@@ -411,6 +438,86 @@ mod tests {
     use clap::Parser;
 
     use super::{Args, Command};
+
+    #[tokio::test]
+    async fn read_sends_selected_namespace_and_preserves_default_wire_format() {
+        use super::*;
+        for name in ["default", "analytics"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap().to_string();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut bytes = [0; HEADER_LEN];
+                socket.read_exact(&mut bytes).await.unwrap();
+                let header = FrameHeader::decode(&bytes).unwrap();
+                let mut payload = vec![0; header.length as usize];
+                socket.read_exact(&mut payload).await.unwrap();
+                let (metadata, _) = talon_transport::envelope::decode(&header, &payload).unwrap();
+                assert_eq!(
+                    metadata.namespace.unwrap_or_default().effective_name(),
+                    name
+                );
+                assert_eq!(header.version, if name == "default" { 1 } else { 3 });
+                let mut reply = data::response_header_ok(header.request_id, 3).to_vec();
+                reply.extend_from_slice(b"abc");
+                socket.write_all(&reply).await.unwrap();
+            });
+            let bytes = fetch_range(
+                &addr,
+                &ObjectId::from_path("/s3/b/k").unwrap(),
+                0,
+                3,
+                &talon_core::NamespaceId::named(name),
+            )
+            .await
+            .unwrap();
+            assert_eq!(bytes, b"abc");
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn namespace_is_global_and_validated() {
+        for args in [
+            vec![
+                "talon-client",
+                "--namespace",
+                "analytics",
+                "--membership-only",
+            ],
+            vec![
+                "talon-client",
+                "load",
+                "--path",
+                "/s3/b/k",
+                "--version",
+                "v1",
+                "--size",
+                "8",
+                "--namespace",
+                "analytics",
+            ],
+            vec![
+                "talon-client",
+                "batch-load",
+                "--namespace",
+                "analytics",
+                "--manifest",
+                "files.json",
+            ],
+        ] {
+            Args::try_parse_from(args).unwrap();
+        }
+        for name in ["", "..", "a/b", "worker_identity", ".worker.lock", "中文"] {
+            assert!(Args::try_parse_from([
+                "talon-client",
+                "--namespace",
+                name,
+                "--membership-only"
+            ])
+            .is_err());
+        }
+    }
 
     #[test]
     fn batch_load_command_and_manifest_require_explicit_file_coordinates() {

@@ -125,7 +125,12 @@ async fn run() -> anyhow::Result<()> {
     // failures and is less useful than an actionable startup error (#366).
     let (mount_uid, mount_gid) = mount_owner();
     let fs = Arc::new(ReadOnlyFs::new_with_owner(mount_uid, mount_gid));
-    let listing = coordinator.list_objects(&cfg.namespace_prefix).await;
+    let listing = coordinator
+        .list_objects(
+            &cfg.namespace_prefix,
+            &talon_core::NamespaceId::Unattributed,
+        )
+        .await;
     populate_namespace(&fs, &cfg.namespace_prefix, listing)?;
 
     run_mount(cfg, fs, reader).await
