@@ -413,11 +413,16 @@ enum AzureOriginAuth {
     Sas(String),
     /// Azure AD bearer tokens from AKS workload identity.
     Bearer(Arc<dyn ProvideBearerToken>),
+    /// SAS snapshots refreshed by the credential broker.
+    BrokerSas(Arc<dyn talon_backend::ProvideSasToken>),
 }
 
 /// The statically configured Azure credential, `None` when the environment
 /// configures neither form and workload identity should be resolved.
 fn azure_static_auth(settings: &Settings) -> MainResult<Option<AzureOriginAuth>> {
+    if settings.origin_credentials_source.as_deref() == Some("broker") {
+        return Ok(None);
+    }
     match (&settings.azure_shared_key, &settings.azure_sas) {
         (Some(_), Some(_)) => Err(invalid(
             "set only one of TALON_GATEWAY_AZURE_SHARED_KEY or TALON_GATEWAY_AZURE_SAS",
@@ -462,6 +467,9 @@ fn azure_adapter(
             Arc::new(AzureBackend::with_shared_key(origin_config, key, http))
         }
         AzureOriginAuth::Sas(sas) => Arc::new(AzureBackend::new(origin_config, Some(sas), http)),
+        AzureOriginAuth::BrokerSas(sas) => {
+            Arc::new(AzureBackend::with_sas_provider(origin_config, sas, http))
+        }
         AzureOriginAuth::Bearer(bearer) => Arc::new(AzureBackend::with_bearer_provider(
             origin_config,
             bearer,
@@ -492,6 +500,9 @@ fn azure_adapter(
 /// The statically configured S3 origin keys, `None` when the environment
 /// sets none and workload identity should be resolved.
 fn static_s3_credentials(settings: &Settings) -> MainResult<Option<S3Credentials>> {
+    if settings.origin_credentials_source.as_deref() == Some("broker") {
+        return Ok(None);
+    }
     match (&settings.s3_access_key, &settings.s3_secret_key) {
         (Some(access_key), Some(secret_key)) => Ok(Some(S3Credentials {
             access_key_id: access_key.clone(),
@@ -973,6 +984,21 @@ async fn run() -> MainResult<()> {
                     auth
                 }
                 None => match settings.origin_credentials_source.as_deref() {
+                    Some("broker") => {
+                        let account = settings
+                            .azure_account
+                            .as_deref()
+                            .ok_or_else(|| invalid("TALON_GATEWAY_AZURE_ACCOUNT is required"))?;
+                        let sas = talon_backend::resolve_azure_broker_sas(
+                            account,
+                            Arc::clone(&exchange_http),
+                            Arc::clone(&credentials_observer),
+                        )
+                        .await
+                        .map_err(invalid)?;
+                        info!(source = "broker", "origin Azure credentials resolved");
+                        AzureOriginAuth::BrokerSas(sas)
+                    }
                     None | Some("auto") | Some("azure-workload-identity") => {
                         let resolved = resolve_azure_bearer(
                             Arc::clone(&exchange_http),
@@ -1195,6 +1221,27 @@ mod tests {
             secret_access_key: "secret".into(),
             session_token: None,
         }))
+    }
+
+    #[test]
+    fn broker_selection_overrides_static_gateway_credentials() {
+        let s3 = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_ORIGIN_CREDENTIALS_SOURCE", "broker"),
+            ("AWS_ACCESS_KEY_ID", "incomplete-static"),
+        ])
+        .unwrap();
+        assert!(static_s3_credentials(&s3).unwrap().is_none());
+        let azure = settings(&[
+            ("TALON_COORDINATOR_ADDR", "coordinator:7411"),
+            ("TALON_GATEWAY_PROTOCOL", "azure"),
+            ("TALON_GATEWAY_AZURE_ACCOUNT", "account"),
+            ("TALON_ORIGIN_CREDENTIALS_SOURCE", "broker"),
+            ("TALON_GATEWAY_AZURE_SHARED_KEY", "static-key"),
+            ("TALON_GATEWAY_AZURE_SAS", "static-sas"),
+        ])
+        .unwrap();
+        assert!(azure_static_auth(&azure).unwrap().is_none());
     }
 
     #[test]

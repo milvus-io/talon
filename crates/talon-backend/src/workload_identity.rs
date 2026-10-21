@@ -69,78 +69,26 @@ fn exchange_error(mechanism: &str, status: u16, code: Option<String>) -> String 
     }
 }
 
-// --- UTC calendar helpers -----------------------------------------------
+// --- Credential timestamps -----------------------------------------------
 
-/// Civil (year, month, day) → days since 1970-01-01. Howard Hinnant's
-/// algorithm, the inverse of `sigv4::civil_from_days`.
-fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u64;
-    let mp = ((m as u64) + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + (d as u64) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    era * 146_097 + doe as i64 - 719_468
-}
-
-/// Parse `YYYY-MM-DDTHH:MM:SS[.fraction](Z|+00:00)` into a [`SystemTime`].
-///
-/// This is the only timestamp shape the exchanges emit; fractional seconds
-/// are truncated. Anything else yields `None` and the caller treats the
-/// expiry as unknown rather than failing the exchange.
+/// Parse a trimmed RFC3339 expiry, preserving offsets and fractional seconds.
+/// Keep the workload exchanges' uppercase `T` separator contract. Invalid
+/// timestamps yield `None`; existing callers treat that as unknown expiry.
 pub(crate) fn parse_iso8601_utc(text: &str) -> Option<SystemTime> {
     let text = text.trim();
-    let digits = |range: std::ops::Range<usize>| -> Option<i64> {
-        let slice = text.get(range)?;
-        if slice.bytes().all(|byte| byte.is_ascii_digit()) {
-            slice.parse().ok()
-        } else {
-            None
-        }
-    };
-    if text.len() < 20 || text.get(4..5)? != "-" || text.get(7..8)? != "-" {
+    if text.as_bytes().get(10) != Some(&b'T') {
         return None;
     }
-    let time_separator = text.get(10..11)?;
-    if time_separator != "T" || text.get(13..14)? != ":" || text.get(16..17)? != ":" {
-        return None;
-    }
-    let tail = text.get(19..)?;
-    if !(tail == "Z" || tail == "+00:00" || (tail.starts_with('.') && tail.ends_with('Z'))) {
-        return None;
-    }
-    let (year, month, day) = (digits(0..4)?, digits(5..7)?, digits(8..10)?);
-    let (hour, minute, second) = (digits(11..13)?, digits(14..16)?, digits(17..19)?);
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return None;
-    }
-    if hour > 23 || minute > 59 || second > 60 {
-        return None;
-    }
-    let days = days_from_civil(year, month as u32, day as u32);
-    let seconds = days
-        .checked_mul(86_400)?
-        .checked_add(hour * 3600 + minute * 60 + second)?;
-    u64::try_from(seconds)
+    chrono::DateTime::parse_from_rfc3339(text)
         .ok()
-        .map(|seconds| UNIX_EPOCH + Duration::from_secs(seconds))
+        .map(SystemTime::from)
 }
 
-/// Format a [`SystemTime`] as `YYYY-MM-DDTHH:MM:SSZ` (Aliyun's `Timestamp`
-/// common parameter).
+/// Format Aliyun's `Timestamp` in UTC seconds, retaining the existing epoch
+/// clamp for pre-epoch values and omitting fractional seconds.
 fn format_iso8601_utc(time: SystemTime) -> String {
-    let seconds = time
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let (year, month, day) = crate::sigv4::civil_from_days((seconds / 86_400) as i64);
-    let second_of_day = seconds % 86_400;
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
-        second_of_day / 3600,
-        (second_of_day % 3600) / 60,
-        second_of_day % 60
-    )
+    let time: chrono::DateTime<chrono::Utc> = time.max(UNIX_EPOCH).into();
+    time.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
 }
 
 fn expires_in_seconds(now: SystemTime, seconds: u64) -> SystemTime {
@@ -649,7 +597,7 @@ pub struct ResolvedBearerToken {
 /// Resolve the S3-family credential source from explicit static material, an
 /// optional explicit selector, and the process environment.
 ///
-/// Static credentials always win so existing deployments keep their exact
+/// With `auto`, static credentials win so existing deployments keep their exact
 /// behavior. With `selector` unset (`auto`), the env contracts injected by
 /// EKS IRSA, ACK RRSA, and TKE OIDC are detected in that order; the Huawei
 /// metadata agency has no env marker and must be selected explicitly.
@@ -675,6 +623,15 @@ pub async fn resolve_s3_credentials_with_env(
     let missing =
         |what: &str| format!("credentials source {selector} requires {what} in the environment");
     match selector {
+        "broker" => {
+            let fetcher =
+                crate::broker::BrokerFetch::<S3Credentials>::from_env(env, "aws", None, http)?;
+            let cell = RefreshingCredentials::bootstrap(fetcher, policy, observer).await?;
+            Ok(ResolvedS3Credentials {
+                provider: cell,
+                source: "broker",
+            })
+        }
         "static" => {
             let credentials =
                 static_credentials.ok_or("static origin credentials are not configured")?;
@@ -764,7 +721,7 @@ pub async fn resolve_s3_credentials_with_env(
         }
         other => Err(format!(
             "unknown origin credentials source {other:?}; expected auto, static, \
-             aws-web-identity, aliyun-oidc, tencent-oidc, or huawei-agency"
+             broker, aws-web-identity, aliyun-oidc, tencent-oidc, or huawei-agency"
         )),
     }
 }
@@ -789,6 +746,11 @@ pub async fn resolve_gcs_bearer_with_env(
     observer: Arc<dyn CredentialsObserver>,
 ) -> Result<ResolvedBearerToken, String> {
     match selector.unwrap_or("auto") {
+        "broker" => {
+            let fetcher = crate::broker::BrokerFetch::<String>::from_env(env, "gcp", None, http)?;
+            let cell = RefreshingCredentials::bootstrap(fetcher, RefreshPolicy::default(), observer).await?;
+            Ok(ResolvedBearerToken { provider: cell, source: "broker" })
+        }
         "gcp-metadata" => {
             let fetcher = GcpMetadataToken::from_env(env, http);
             let source = fetcher.source();
@@ -809,7 +771,7 @@ pub async fn resolve_gcs_bearer_with_env(
             provider: Arc::new(StaticBearerToken::new(static_token)),
         }),
         other => Err(format!(
-            "unknown GCS credentials source {other:?}; expected auto, static, or gcp-metadata"
+            "unknown GCS credentials source {other:?}; expected auto, static, broker, or gcp-metadata"
         )),
     }
 }
@@ -941,6 +903,60 @@ mod tests {
         assert!(parse_iso8601_utc("2026-08-10 01:02:03Z").is_none());
     }
 
+    #[test]
+    fn iso8601_preserves_timezone_offsets_and_fractional_seconds() {
+        let expected = UNIX_EPOCH + Duration::from_millis(1_786_323_723_125);
+        for text in [
+            "2026-08-10T09:02:03.125+08:00",
+            "2026-08-09T18:02:03.125-07:00",
+            "2026-08-10T01:02:03.125Z",
+            "  2026-08-10T01:02:03.125+00:00\n",
+        ] {
+            assert_eq!(parse_iso8601_utc(text), Some(expected));
+        }
+    }
+
+    #[test]
+    fn iso8601_rejects_invalid_calendar_dates() {
+        for text in [
+            "2026-02-29T01:02:03Z",
+            "2026-02-30T01:02:03Z",
+            "2026-04-31T01:02:03Z",
+        ] {
+            assert!(parse_iso8601_utc(text).is_none());
+        }
+        assert!(parse_iso8601_utc("2024-02-29T01:02:03Z").is_some());
+    }
+
+    #[test]
+    fn iso8601_rejects_malformed_fraction_and_non_t_separator_without_panicking() {
+        for text in [
+            "2026-08-10T01:02:03.invalidZ",
+            "2026-08-10T01:02:03.125garbageZ",
+            "2026-08-10 01:02:03Z",
+            "2026-08-10t01:02:03Z",
+            "2026-08-10T01:02:03+25:00",
+            "2026-08-1éT01:02:03Z",
+            "",
+            "🕒",
+        ] {
+            assert!(parse_iso8601_utc(text).is_none());
+        }
+    }
+
+    #[test]
+    fn iso8601_aliyun_timestamp_stays_utc_seconds_only() {
+        assert_eq!(format_iso8601_utc(UNIX_EPOCH), "1970-01-01T00:00:00Z");
+        assert_eq!(
+            format_iso8601_utc(UNIX_EPOCH - Duration::from_secs(1)),
+            "1970-01-01T00:00:00Z"
+        );
+        assert_eq!(
+            format_iso8601_utc(UNIX_EPOCH + Duration::from_millis(1_786_323_723_125)),
+            "2026-08-10T01:02:03Z"
+        );
+    }
+
     const AWS_STS_OK: &str = r#"<AssumeRoleWithWebIdentityResponse>
       <AssumeRoleWithWebIdentityResult><Credentials>
         <AccessKeyId>ASIAEXAMPLE</AccessKeyId>
@@ -972,6 +988,26 @@ mod tests {
         assert!(body.contains("Action=AssumeRoleWithWebIdentity"));
         assert!(body.contains("WebIdentityToken=jwt-abc"));
         assert!(body.contains("RoleArn=arn%3Aaws%3Aiam%3A%3A1%3Arole%2Ftalon"));
+    }
+
+    #[tokio::test]
+    async fn aws_invalid_calendar_expiry_keeps_credentials_with_unknown_expiry() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let http = MockHttp::new(
+            200,
+            &AWS_STS_OK.replace("2026-08-10T13:00:00Z", "2026-02-30T13:00:00Z"),
+        );
+        let env = env_map(&[
+            ("AWS_ROLE_ARN", "arn:aws:iam::1:role/talon"),
+            (
+                "AWS_WEB_IDENTITY_TOKEN_FILE",
+                &token_file(&temp, "fixture-token"),
+            ),
+        ]);
+        let fetcher = AwsWebIdentity::from_env(&env, http).unwrap();
+        let (credentials, expiry) = ok(fetcher.fetch().await);
+        assert_eq!(credentials.access_key_id, "ASIAEXAMPLE");
+        assert!(expiry.is_none());
     }
 
     #[tokio::test]
@@ -1137,6 +1173,38 @@ mod tests {
         let error = err(fetcher.fetch().await);
         assert!(error.contains("invalid_client"));
         assert!(!error.contains("fed-jwt"));
+    }
+
+    #[tokio::test]
+    async fn broker_selector_fetches_instead_of_using_static_credentials() {
+        let http = MockHttp::new(
+            200,
+            r#"{"success":true,"credentials":{"tempAk":"BROKERAK","tempSk":"secret","sessionToken":"token","expiredAt":"2099-01-01T00:00:00Z"}}"#,
+        );
+        let env = env_map(&[
+            (
+                "TALON_CREDENTIAL_BROKER_URL",
+                "https://broker.example/credentials",
+            ),
+            (
+                "TALON_CREDENTIAL_BROKER_REQUEST",
+                r#"{"csp":"aws","region":"us-east-1","roleArn":"arn:aws:iam::123456789012:role/example"}"#,
+            ),
+        ]);
+        let resolved = ok(resolve_s3_credentials_with_env(
+            &env,
+            Some(S3Credentials {
+                access_key_id: "STATIC".into(),
+                secret_access_key: "static-secret".into(),
+                session_token: None,
+            }),
+            Some("broker"),
+            http.clone(),
+            Arc::new(crate::credentials::NoopObserver),
+        )
+        .await);
+        assert_eq!(resolved.provider.current().access_key_id, "BROKERAK");
+        assert_eq!(http.request().method, Method::Post);
     }
 
     #[tokio::test]
