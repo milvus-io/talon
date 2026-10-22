@@ -65,6 +65,7 @@ struct MetricsRetryObserver {
 /// Bridges origin credential refresh outcomes to the worker's registry.
 struct CredentialsMetricsObserver {
     observability: Arc<WorkerObservability>,
+    report_expiry: bool,
 }
 
 impl talon_backend::CredentialsObserver for CredentialsMetricsObserver {
@@ -73,6 +74,7 @@ impl talon_backend::CredentialsObserver for CredentialsMetricsObserver {
             .metrics()
             .record_origin_credentials("refresh_success");
         let unix_seconds = expires_at
+            .filter(|_| self.report_expiry)
             .and_then(|at| at.duration_since(std::time::UNIX_EPOCH).ok())
             .map_or(0.0, |since_epoch| since_epoch.as_secs_f64());
         self.observability
@@ -214,6 +216,7 @@ impl Args {
             s3_endpoint: None,
             s3_access_key_id: None,
             credentials_source: None,
+            buckets: None,
             s3_secret_access_key: None,
             s3_session_token: None,
             gcs_access_key_id: None,
@@ -752,34 +755,67 @@ async fn run() -> anyhow::Result<()> {
     // Select the object-store backend from config (default: azure). Each backend
     // reads its endpoint and credentials from resolved configuration. IAM and
     // Broker credentials refresh through their providers and update metrics.
+    let buckets = cfg.resolved_buckets()?;
+    if buckets.is_some() {
+        // FIXME: Expose expiry per credential instance for bucket routes. Until
+        // then, 0 means unavailable; one provider must not overwrite another.
+        // Initialize it even when all routes use static keys and emit no events.
+        observability.metrics().set_origin_credentials_expiry(0.0);
+    }
     let credentials_observer: Arc<dyn talon_backend::CredentialsObserver> =
         Arc::new(CredentialsMetricsObserver {
             observability: Arc::clone(&observability),
+            report_expiry: buckets.is_none(),
         });
-    // Broker acquisition may take 60s. Origin transfer retries have a much
-    // shorter attempt deadline, so use an undecorated exchange transport for
-    // the broker while preserving existing workload identity behavior.
-    let exchange_http: Arc<dyn talon_backend::http::HttpClient> =
-        if CredentialMode::select(cfg.credentials_source.as_deref(), false)
-            .map_err(anyhow::Error::msg)?
-            == CredentialMode::Broker
-        {
-            Arc::new(ReqwestClient::new())
-        } else {
-            Arc::clone(&http)
-        };
-    let backend: Arc<dyn BackendStore> = match backend_kind {
-        "azure" => {
-            Arc::new(build_azure_backend(&cfg, http, exchange_http, credentials_observer).await?)
-        }
-        "s3" => Arc::new(build_s3_backend(&cfg, http, exchange_http, credentials_observer).await?),
-        "gcs" => {
-            Arc::new(build_gcs_backend(&cfg, http, exchange_http, credentials_observer).await?)
-        }
-        other => {
-            anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
+    if buckets.is_some() && (azure_sas_from_env().is_some() || gcs_bearer_from_env().is_some()) {
+        anyhow::bail!("buckets cannot be combined with global fixed SAS or bearer credentials");
+    }
+    // Credential discovery and refresh run on Tokio, outside the origin's
+    // Monoio ring. Broker acquisition also needs its own retry deadlines,
+    // including when only one bucket uses it.
+    let uses_broker = buckets.as_ref().is_some_and(|entries| {
+        entries
+            .iter()
+            .any(|entry| entry.credentials_source == "broker")
+    }) || CredentialMode::select(cfg.credentials_source.as_deref(), false)
+        .map_err(anyhow::Error::msg)?
+        == CredentialMode::Broker;
+    let exchange_http: Arc<dyn talon_backend::http::HttpClient> = if uses_broker || origin_uring {
+        Arc::new(ReqwestClient::new())
+    } else {
+        Arc::clone(&http)
+    };
+    let backend: Arc<dyn BackendStore> = if let Some(buckets) = buckets {
+        Arc::new(
+            talon_backend::BackendRouter::from_configs(
+                backend_kind.parse()?,
+                buckets,
+                http,
+                exchange_http,
+                credentials_observer,
+            )
+            .await
+            .map_err(anyhow::Error::msg)?,
+        )
+    } else {
+        match backend_kind {
+            "azure" => Arc::new(
+                build_azure_backend(&cfg, http, exchange_http, credentials_observer).await?,
+            ),
+            "s3" => {
+                Arc::new(build_s3_backend(&cfg, http, exchange_http, credentials_observer).await?)
+            }
+            "gcs" => {
+                Arc::new(build_gcs_backend(&cfg, http, exchange_http, credentials_observer).await?)
+            }
+            other => {
+                anyhow::bail!("unknown TALON_WORKER_BACKEND {other:?}; expected azure, s3, or gcs")
+            }
         }
     };
+    // The router owns initialized providers. Namespace cache runtimes only
+    // need cache policy; avoid cloning all bucket secrets into each namespace.
+    cfg.buckets = None;
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
     let runtime = WorkerRuntime::open_namespaces_with_uring(
@@ -1368,6 +1404,45 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
+
+    #[test]
+    fn credential_metrics_keep_counts_and_only_report_single_backend_expiry() {
+        use talon_backend::CredentialsObserver;
+
+        for report_expiry in [false, true] {
+            let (_worker, observability, _node, root) = test_worker();
+            let observer = CredentialsMetricsObserver {
+                observability: observability.clone(),
+                report_expiry,
+            };
+            for timestamp in [1000, 2000] {
+                observer.refresh_succeeded(Some(
+                    std::time::UNIX_EPOCH + Duration::from_secs(timestamp),
+                ));
+                let expected = if report_expiry { timestamp } else { 0 };
+                assert!(observability.metrics().render().lines().any(|line| {
+                    line == format!("talon_worker_origin_credentials_expiry_seconds {expected}")
+                }));
+            }
+            observer.refresh_failed();
+            let metrics = observability.metrics().render();
+            assert!(metrics
+                .contains("talon_worker_origin_credentials_total{result=\"refresh_success\"} 2"));
+            assert!(metrics
+                .contains("talon_worker_origin_credentials_total{result=\"refresh_failure\"} 1"));
+            let expected = if report_expiry { 2000 } else { 0 };
+            assert!(metrics.lines().any(|line| {
+                line == format!("talon_worker_origin_credentials_expiry_seconds {expected}")
+            }));
+            observer.refresh_succeeded(None);
+            assert!(observability
+                .metrics()
+                .render()
+                .lines()
+                .any(|line| line == "talon_worker_origin_credentials_expiry_seconds 0"));
+            std::fs::remove_dir_all(root).unwrap();
+        }
+    }
 
     #[test]
     fn connection_budget_cli_overrides_environment() {

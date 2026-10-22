@@ -23,8 +23,9 @@ pub use backend::{BackendStore, ListPage, ListedObject, ObjectStat};
 pub use block::{page_len, BlockForm, BlockMeta, LoadHint, PresentBitmap};
 pub use config::{
     azure_sas_from_env, gcs_bearer_from_env, parse_bool_value, s3_secret_key_from_env,
-    s3_session_token_from_env, ConfigVar, FuseConfig, FuseConfigPatch, NamespaceCacheConfig, Patch,
-    WorkerConfig, WorkerConfigPatch, FUSE_ENV_SCHEMA, WORKER_ENV_SCHEMA,
+    s3_session_token_from_env, BucketConfig, ConfigVar, FuseConfig, FuseConfigPatch,
+    NamespaceCacheConfig, Patch, WorkerConfig, WorkerConfigPatch, FUSE_ENV_SCHEMA,
+    WORKER_ENV_SCHEMA,
 };
 pub use control_identity::{
     ControlTlsConfig, ControlTlsConfigPatch, WorkloadIdentity, WorkloadIdentityError, WorkloadRole,

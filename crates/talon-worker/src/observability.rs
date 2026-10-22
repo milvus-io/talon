@@ -445,12 +445,13 @@ impl WorkerMetrics {
     }
 
     /// Publish when the current origin credentials expire (unix seconds,
-    /// `0` when the mechanism reports no expiry or credentials are static).
+    /// `0` when the mechanism reports no expiry, credentials are static, or
+    /// bucket routes have independent credentials).
     pub fn set_origin_credentials_expiry(&self, unix_seconds: f64) {
         self.registry
             .gauge(
                 "talon_worker_origin_credentials_expiry_seconds",
-                "Unix time when the current origin credentials expire.",
+                "Unix time when the current origin credentials expire; 0 when unknown or not applicable to multiple bucket routes.",
                 labels(&[]),
             )
             .set(unix_seconds);

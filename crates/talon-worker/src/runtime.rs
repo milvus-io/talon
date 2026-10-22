@@ -429,15 +429,28 @@ impl WorkerRuntime {
 
     /// Reject an operation routed to a worker for another object-store backend.
     fn ensure_configured_backend(&self, requested: Backend) -> anyhow::Result<()> {
-        let Some(configured) = self.configured_backend else {
-            return Ok(());
-        };
-        if requested != configured {
-            anyhow::bail!(
-                "request selects backend {requested}, but this worker is configured for \
-                 {configured}; route the request to a {requested} worker"
-            );
+        if let Some(configured) = self.configured_backend {
+            if requested != configured {
+                anyhow::bail!(
+                    "request selects backend {requested}, but this worker is configured for \
+                     {configured}; route the request to a {requested} worker"
+                );
+            }
         }
+        Ok(())
+    }
+
+    /// Validate the bucket before listing its contents.
+    fn ensure_configured_bucket(&self, requested: Backend, bucket: &str) -> anyhow::Result<()> {
+        self.ensure_configured_backend(requested)?;
+        self.backend.validate_bucket(requested, bucket)?;
+        Ok(())
+    }
+
+    /// Validate the complete object target before origin calls or cache access.
+    fn ensure_configured_object(&self, object: &ObjectId) -> anyhow::Result<()> {
+        self.ensure_configured_backend(object.backend)?;
+        self.backend.validate_object(object)?;
         Ok(())
     }
 
@@ -483,7 +496,7 @@ impl WorkerRuntime {
     /// invalidated and the request is retried once against the freshly-resolved
     /// version (issue #163).
     pub async fn serve_range(&self, request: &RangeRequest) -> anyhow::Result<bytes::Bytes> {
-        self.ensure_configured_backend(request.object.backend)?;
+        self.ensure_configured_object(&request.object)?;
         if request.len == 0 {
             return Ok(bytes::Bytes::new());
         }
@@ -516,7 +529,7 @@ impl WorkerRuntime {
     /// blocks are keyed by the resolved ETag, and a `412`/`VersionMismatch` inside
     /// the version-cache window re-resolves once (issues #119, #163).
     pub async fn serve(&self, request: &RangeRequest) -> anyhow::Result<ServeOutcome> {
-        self.ensure_configured_backend(request.object.backend)?;
+        self.ensure_configured_object(&request.object)?;
         if request.len == 0 {
             return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
         }
@@ -547,7 +560,7 @@ impl WorkerRuntime {
         version: &Version,
         object_len: u64,
     ) -> anyhow::Result<ServeOutcome> {
-        self.ensure_configured_backend(request.object.backend)?;
+        self.ensure_configured_object(&request.object)?;
         if version.0.trim().is_empty() {
             anyhow::bail!("version-pinned range request has an empty source version");
         }
@@ -567,10 +580,10 @@ impl WorkerRuntime {
     /// Serve a versioned range only from resident cache state.
     ///
     /// Unlike [`serve`](Self::serve), this path neither resolves metadata nor
-    /// invokes `BackendStore`. A partially resident multi-block/page request is
+    /// fetches from `BackendStore`. A partially resident multi-block/page request is
     /// a complete miss; no prefix is returned.
     pub async fn serve_cached(&self, request: &CachedRangeRequest) -> anyhow::Result<bytes::Bytes> {
-        self.ensure_configured_backend(request.object.backend)?;
+        self.ensure_configured_object(&request.object)?;
         if request.len == 0 {
             return Ok(bytes::Bytes::new());
         }
@@ -852,13 +865,13 @@ impl WorkerRuntime {
         let backend: Backend = backend_prefix.parse().map_err(|_| {
             anyhow::anyhow!("unknown backend {backend_prefix:?} in listing prefix {prefix:?}")
         })?;
-        self.ensure_configured_backend(backend)?;
         let bucket = parts.next().unwrap_or("");
         if bucket.is_empty() {
             anyhow::bail!(
                 "listing prefix must name a bucket/container, e.g. `az/container`; got {prefix:?}"
             );
         }
+        self.ensure_configured_bucket(backend, bucket)?;
         let key_prefix = parts.next().unwrap_or("");
 
         let mut out = Vec::new();
@@ -912,7 +925,7 @@ impl WorkerRuntime {
     /// maintains: a size can change under an overwrite, and serving a stale one
     /// would make a client read past the end of the new object.
     pub async fn stat_object(&self, object: &ObjectId) -> anyhow::Result<talon_core::ObjectStat> {
-        self.ensure_configured_backend(object.backend)?;
+        self.ensure_configured_object(object)?;
         let stat = self
             .backend
             .head(object)
@@ -1941,7 +1954,7 @@ impl WorkerRuntime {
         &self,
         request: &CachedBlockPutRequest,
     ) -> anyhow::Result<()> {
-        self.ensure_configured_backend(request.block.object.backend)?;
+        self.ensure_configured_object(&request.block.object)?;
         let block_size = u64::from(self.block_size);
         if request.block.block_size != self.block_size {
             anyhow::bail!(
@@ -1974,7 +1987,7 @@ impl WorkerRuntime {
         Ok(())
     }
 
-    /// Admit one complete versioned block without consulting the backend.
+    /// Admit one complete versioned block without fetching from the backend.
     pub async fn admit_cached_block(
         &self,
         request: &CachedBlockPutRequest,
@@ -2007,7 +2020,7 @@ impl WorkerRuntime {
         object: &ObjectId,
         body: bytes::Bytes,
     ) -> anyhow::Result<Version> {
-        self.ensure_configured_backend(object.backend)?;
+        self.ensure_configured_object(object)?;
         if body.len() as u64 > self.block_size as u64 {
             anyhow::bail!(
                 "object {} is {} bytes; v1 write supports at most one block ({} bytes)",
@@ -2052,7 +2065,7 @@ impl WorkerRuntime {
         path: &Path,
         len: u64,
     ) -> anyhow::Result<Version> {
-        self.ensure_configured_backend(object.backend)?;
+        self.ensure_configured_object(object)?;
         if len <= self.block_size as u64 {
             let body = tokio::fs::read(path).await?;
             if body.len() as u64 != len {
@@ -2101,7 +2114,7 @@ impl WorkerRuntime {
     /// cached version so a subsequent read re-resolves (and sees the object gone).
     /// Best-effort evicts the object's currently-cached block.
     pub async fn delete_object(&self, object: &ObjectId) -> anyhow::Result<()> {
-        self.ensure_configured_backend(object.backend)?;
+        self.ensure_configured_object(object)?;
         match self.backend.delete(object).await {
             Ok(()) => self.metrics.record_backend_delete_success(),
             Err(error) => {
@@ -2350,6 +2363,435 @@ mod tests {
                 len: 8,
                 version: Version::new("v1"),
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct BucketBackend {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl BackendStore for BucketBackend {
+        fn validate_bucket(&self, backend: Backend, bucket: &str) -> Result<()> {
+            if backend == Backend::S3 && matches!(bucket, "bucket-a" | "bucket-b") {
+                Ok(())
+            } else {
+                Err(Error::Backend("unconfigured bucket".into()))
+            }
+        }
+
+        fn validate_object(&self, object: &ObjectId) -> Result<()> {
+            self.validate_bucket(object.backend, &object.bucket)?;
+            if object.object_path == "disallowed-key" {
+                return Err(Error::Backend("disallowed object key".into()));
+            }
+            Ok(())
+        }
+
+        async fn fetch_range(&self, object: &ObjectId, offset: u64, len: u64) -> Result<Bytes> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let body = if object.bucket == "bucket-a" {
+                b"aaaaaaaa"
+            } else {
+                b"bbbbbbbb"
+            };
+            Ok(Bytes::copy_from_slice(
+                &body[offset as usize..(offset + len).min(8) as usize],
+            ))
+        }
+
+        async fn fetch_range_if_match(
+            &self,
+            object: &ObjectId,
+            offset: u64,
+            len: u64,
+            if_match: Option<&Version>,
+        ) -> Result<Bytes> {
+            expect_test_version(if_match, "v1")?;
+            self.fetch_range(object, offset, len).await
+        }
+
+        async fn head(&self, _object: &ObjectId) -> Result<ObjectStat> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ObjectStat {
+                len: 8,
+                version: Version::new("v1"),
+            })
+        }
+
+        async fn list_objects(
+            &self,
+            _bucket: &str,
+            _prefix: &str,
+            _cursor: Option<&str>,
+            _max_keys: u32,
+        ) -> Result<ListPage> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(ListPage::default())
+        }
+
+        async fn put(&self, _object: &ObjectId, _body: Bytes) -> Result<Version> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Version::new("v2"))
+        }
+
+        async fn put_file(&self, _object: &ObjectId, _path: &Path, _len: u64) -> Result<Version> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(Version::new("v2"))
+        }
+
+        async fn delete(&self, _object: &ObjectId) -> Result<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn bucket_runtime(paged: bool) -> (tempfile::TempDir, Arc<BucketBackend>, WorkerRuntime) {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(BucketBackend::default());
+        // No configured_backend: bucket validation must also protect this runtime.
+        let mut runtime = WorkerRuntime::new_with_l1(
+            WholeBlockStore::open(root.path()).unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            backend.clone(),
+            8,
+            0,
+            64,
+            4,
+            WorkerMetrics::new(1024),
+        );
+        if paged {
+            runtime = runtime
+                .with_paged_store(PagedBlockStore::open(root.path().join("paged"), 4).unwrap());
+        }
+        (root, backend, runtime)
+    }
+
+    fn assert_bucket_rejected<T>(result: anyhow::Result<T>) {
+        let error = match result {
+            Ok(_) => panic!("runtime accepted an unconfigured bucket"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::Backend(message))
+                if message == "unconfigured bucket"),
+            "{error:#}"
+        );
+    }
+
+    #[tokio::test]
+    async fn bucket_validation_precedes_resident_and_zero_length_reads() {
+        for paged in [false, true] {
+            let (_root, backend, runtime) = bucket_runtime(paged);
+            // Simulate resident state left by an earlier worker configuration.
+            for version in [Version::new("v1"), Version::new(UNCHECKED_VERSION)] {
+                let object = ObjectId::new(Backend::S3, "unconfigured", version.as_str());
+                let block = BlockId::new(object.clone(), 0, 8, version.clone());
+                runtime
+                    .commit_cached_block(&block, Bytes::from_static(b"resident"))
+                    .await
+                    .unwrap();
+                runtime.admit_l1_pages(&block, 0, Bytes::from_static(b"resident"));
+                runtime.store_version(&object, &version, 8);
+                assert!(runtime.l1_page_count() > 0);
+
+                for len in [0, 4] {
+                    let request = RangeRequest {
+                        object: object.clone(),
+                        offset: 0,
+                        len,
+                    };
+                    assert_bucket_rejected(runtime.serve_range(&request).await);
+                    assert_bucket_rejected(runtime.serve(&request).await);
+                    assert_bucket_rejected(runtime.serve_versioned(&request, &version, 8).await);
+                    assert_bucket_rejected(
+                        runtime
+                            .serve_cached(&CachedRangeRequest {
+                                object: object.clone(),
+                                offset: 0,
+                                len,
+                                version: version.clone(),
+                            })
+                            .await,
+                    );
+                }
+                assert_bucket_rejected(runtime.stat_object(&object).await);
+            }
+            assert_bucket_rejected(runtime.list_objects("s3/unconfigured").await);
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_validation_precedes_cache_admission_and_origin_mutations() {
+        for paged in [false, true] {
+            let (root, backend, runtime) = bucket_runtime(paged);
+            let object = ObjectId::new(Backend::S3, "unconfigured", "same-key");
+            let block = BlockId::new(object.clone(), 0, 8, Version::new("v1"));
+            runtime
+                .commit_cached_block(&block, Bytes::from_static(b"resident"))
+                .await
+                .unwrap();
+            runtime.store_version(&object, &Version::new("v1"), 8);
+
+            for version in ["v1", "v2"] {
+                let admission = CachedBlockPutRequest {
+                    block: BlockId::new(object.clone(), 0, 8, Version::new(version)),
+                    object_len: 8,
+                    body_len: 8,
+                };
+                assert_bucket_rejected(runtime.validate_cached_block_admission(&admission));
+                assert_bucket_rejected(
+                    runtime
+                        .admit_cached_block(&admission, Bytes::from_static(b"replaced"))
+                        .await,
+                );
+            }
+            for body in [Bytes::new(), Bytes::from_static(b"replaced")] {
+                assert_bucket_rejected(runtime.write_object(&object, body).await);
+            }
+            for len in [0, 8, 16] {
+                assert_bucket_rejected(
+                    runtime
+                        .write_object_file(&object, &root.path().join("missing"), len)
+                        .await,
+                );
+            }
+            assert_bucket_rejected(runtime.delete_object(&object).await);
+            assert_eq!(runtime.block_count(), 1);
+            assert_eq!(runtime.cached_version(&object), Some(Version::new("v1")));
+            assert_eq!(
+                runtime
+                    .serve_range_at(
+                        &RangeRequest {
+                            object,
+                            offset: 0,
+                            len: 8,
+                        },
+                        &block.version,
+                        Some(8),
+                    )
+                    .await
+                    .unwrap(),
+                "resident"
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn bucket_validation_precedes_load_hits_and_keeps_valid_batch_assignments() {
+        for paged in [false, true] {
+            let (_root, backend, runtime) = bucket_runtime(paged);
+            let object = ObjectId::new(Backend::S3, "unconfigured", "same-key");
+            let mut assignments = Vec::new();
+            for version in [Version::new("v1"), Version::new(UNCHECKED_VERSION)] {
+                let block = BlockId::new(object.clone(), 0, 8, version);
+                runtime
+                    .commit_cached_block(&block, Bytes::from_static(b"resident"))
+                    .await
+                    .unwrap();
+                assert_bucket_rejected(runtime.load_block(&block, 8).await);
+                assignments.push(talon_transport::LoadBlockRequest { block, len: 8 });
+            }
+            assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            let allowed = ObjectId::new(Backend::S3, "bucket-a", "same-key");
+            assignments.push(talon_transport::LoadBlockRequest {
+                block: BlockId::new(allowed.clone(), 0, 8, Version::new("v1")),
+                len: 8,
+            });
+            let failures = runtime.batch_load(&assignments).await.unwrap();
+            assert_eq!(
+                failures
+                    .iter()
+                    .map(|failure| failure.index)
+                    .collect::<Vec<_>>(),
+                [0, 1]
+            );
+            assert!(failures
+                .iter()
+                .all(|failure| failure.error.contains("unconfigured bucket")));
+            let calls = backend.calls.load(Ordering::SeqCst);
+            assert!(
+                calls > 0,
+                "the allowed batch assignment must fetch its data"
+            );
+            assert_eq!(
+                runtime
+                    .serve_cached(&CachedRangeRequest {
+                        object: allowed,
+                        offset: 0,
+                        len: 8,
+                        version: Version::new("v1"),
+                    })
+                    .await
+                    .unwrap(),
+                "aaaaaaaa"
+            );
+            assert_eq!(backend.calls.load(Ordering::SeqCst), calls);
+        }
+    }
+
+    #[tokio::test]
+    async fn object_validation_precedes_cache_access_and_mutation() {
+        for paged in [false, true] {
+            for version in [Version::new("v1"), Version::new(UNCHECKED_VERSION)] {
+                let (root, backend, runtime) = bucket_runtime(paged);
+                let object = ObjectId::new(Backend::S3, "bucket-a", "disallowed-key");
+                let block = BlockId::new(object.clone(), 0, 8, version.clone());
+                // A valid bucket alone must not authorize a cached invalid object target.
+                runtime
+                    .commit_cached_block(&block, Bytes::from_static(b"resident"))
+                    .await
+                    .unwrap();
+                runtime.admit_l1_pages(&block, 0, Bytes::from_static(b"resident"));
+                runtime.store_version(&object, &version, 8);
+
+                for len in [0, 4] {
+                    let request = RangeRequest {
+                        object: object.clone(),
+                        offset: 0,
+                        len,
+                    };
+                    let cached = CachedRangeRequest {
+                        object: object.clone(),
+                        offset: 0,
+                        len,
+                        version: version.clone(),
+                    };
+                    for (operation, result) in [
+                        ("range", runtime.serve_range(&request).await.map(drop)),
+                        ("serve", runtime.serve(&request).await.map(drop)),
+                        (
+                            "versioned",
+                            runtime
+                                .serve_versioned(&request, &version, 8)
+                                .await
+                                .map(drop),
+                        ),
+                        ("cached", runtime.serve_cached(&cached).await.map(drop)),
+                    ] {
+                        let error = result.expect_err(operation);
+                        assert!(
+                            error.to_string().contains("disallowed object key"),
+                            "{operation}: {error:#}"
+                        );
+                    }
+                }
+                let admission = CachedBlockPutRequest {
+                    block: block.clone(),
+                    object_len: 8,
+                    body_len: 8,
+                };
+                let missing = root.path().join("missing");
+                for (operation, result) in [
+                    ("stat", runtime.stat_object(&object).await.map(drop)),
+                    (
+                        "validate admission",
+                        runtime.validate_cached_block_admission(&admission),
+                    ),
+                    (
+                        "admit",
+                        runtime
+                            .admit_cached_block(&admission, Bytes::from_static(b"replaced"))
+                            .await,
+                    ),
+                    (
+                        "write",
+                        runtime.write_object(&object, Bytes::new()).await.map(drop),
+                    ),
+                    (
+                        "write file",
+                        runtime
+                            .write_object_file(&object, &missing, 8)
+                            .await
+                            .map(drop),
+                    ),
+                    (
+                        "stream file",
+                        runtime
+                            .write_object_file(&object, &missing, 16)
+                            .await
+                            .map(drop),
+                    ),
+                    ("delete", runtime.delete_object(&object).await),
+                    ("load", runtime.load_block(&block, 8).await),
+                ] {
+                    let error = result.expect_err(operation);
+                    assert!(
+                        error.to_string().contains("disallowed object key"),
+                        "{operation}: {error:#}"
+                    );
+                }
+                let failures = runtime
+                    .batch_load(&[talon_transport::LoadBlockRequest {
+                        block: block.clone(),
+                        len: 8,
+                    }])
+                    .await
+                    .unwrap();
+                assert_eq!(failures.len(), 1);
+                assert_eq!(failures[0].index, 0);
+                assert!(failures[0].error.contains("disallowed object key"));
+                assert_eq!(runtime.block_count(), 1);
+                assert_eq!(runtime.cached_version(&object), Some(version.clone()));
+                assert_eq!(
+                    runtime
+                        .serve_range_at(
+                            &RangeRequest {
+                                object,
+                                offset: 0,
+                                len: 8
+                            },
+                            &version,
+                            Some(8),
+                        )
+                        .await
+                        .unwrap(),
+                    "resident"
+                );
+                assert_eq!(backend.calls.load(Ordering::SeqCst), 0);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn configured_buckets_keep_same_key_and_version_cache_entries_isolated() {
+        for paged in [false, true] {
+            let (_root, backend, runtime) = bucket_runtime(paged);
+            let runtime = runtime.with_backend_kind(Backend::S3);
+            for (bucket, expected) in [("bucket-a", "aaaa"), ("bucket-b", "bbbb")] {
+                assert_eq!(
+                    runtime
+                        .serve_range(&RangeRequest {
+                            object: ObjectId::new(Backend::S3, bucket, "same-key"),
+                            offset: 0,
+                            len: 4,
+                        })
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            }
+            let calls = backend.calls.load(Ordering::SeqCst);
+            assert_eq!(calls, 4, "one HEAD and one fetch per bucket");
+            for (bucket, expected) in [("bucket-a", "aaaa"), ("bucket-b", "bbbb")] {
+                assert_eq!(
+                    runtime
+                        .serve_cached(&CachedRangeRequest {
+                            object: ObjectId::new(Backend::S3, bucket, "same-key"),
+                            offset: 0,
+                            len: 4,
+                            version: Version::new("v1"),
+                        })
+                        .await
+                        .unwrap(),
+                    expected
+                );
+            }
+            assert_eq!(backend.calls.load(Ordering::SeqCst), calls);
         }
     }
 
