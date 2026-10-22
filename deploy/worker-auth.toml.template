@@ -1,0 +1,64 @@
+# Copy to worker.toml and replace <...> placeholders.
+# Keep ONE backend block and, for broker mode, ONE request example active.
+# Environment variables override these values. Bucket/container is in request paths.
+
+cluster_id = "default"
+coordinator = "127.0.0.1:7000"
+listen = "127.0.0.1:7001"
+admin_listen = "127.0.0.1:8001"
+cache_dirs = ["./talon-cache"]
+
+# Select "aksk", "iam", or "broker".
+credentials_source = "aksk"
+
+# S3 / S3-compatible: active example.
+backend = "s3"
+s3_region = "us-west-2"
+s3_endpoint = "https://s3.us-west-2.amazonaws.com"
+s3_path_style = false
+s3_access_key_id = "<access-key-id>"
+s3_secret_access_key = "<secret-access-key>"
+# s3_session_token = "<session-token>"  # only for temporary keys
+
+# GCS: enable instead of the S3 block. AK/SK means GCS HMAC credentials.
+# backend = "gcs"
+# gcs_endpoint = "https://storage.googleapis.com"
+# gcs_access_key_id = "<hmac-access-id>"
+# gcs_secret_access_key = "<hmac-secret>"
+
+# Azure: enable instead of the S3 block. AK/SK means account + Shared Key.
+# backend = "azure"
+# azure_account = "<storage-account>"
+# azure_shared_key = "<base64-storage-account-key>"
+# Public Azure derives the endpoint from azure_account; leave azure_endpoint unset.
+
+# IAM: set credentials_source = "iam". Direct keys above are ignored.
+# AWS uses its SDK default chain, including an attached EC2 role.
+# GCP uses ADC, including GCE/GKE service-account metadata.
+# Azure uses the platform's AZURE_CLIENT_ID and, for Workload Identity,
+# AZURE_TENANT_ID / AZURE_FEDERATED_TOKEN_FILE; otherwise it uses VM metadata.
+
+# Broker: set credentials_source = "broker", then enable this URL and
+# exactly one request example below. Dotted keys form the Broker request object.
+# credential_broker_url = "http://<broker-host>:8080/v1/credentials/assume-role"
+
+# AWS Broker request
+# credential_broker_request.csp = "aws"
+# credential_broker_request.region = "us-west-2"
+# credential_broker_request.roleArn = "arn:aws:iam::<account-id>:role/<role-name>"
+# credential_broker_request.externalId = "<external-id>"  # omit when the role does not require it
+# credential_broker_request.durationSeconds = 3600
+
+# GCP Broker request
+# credential_broker_request.csp = "gcp"
+# credential_broker_request.gcpServiceAccountEmail = "<service-account>@<project>.iam.gserviceaccount.com"
+# credential_broker_request.durationSeconds = 3600
+
+# Azure Broker request: azureAccountName must match azure_account above.
+# credential_broker_request.csp = "azure"
+# credential_broker_request.region = "<azure-region>"
+# credential_broker_request.bucket = "<container>"
+# credential_broker_request.azureClientId = "<client-id>"
+# credential_broker_request.azureTenantId = "<tenant-id>"
+# credential_broker_request.azureAccountName = "<storage-account>"
+# credential_broker_request.durationSeconds = 3600

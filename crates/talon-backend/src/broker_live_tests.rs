@@ -1,12 +1,15 @@
 //! Opt-in real broker/cloud tests. Every HTTP call uses ReqwestClient; no mocks.
 //! Each test owns its Tokio runtime, which drops remaining refresh tasks on exit.
 
-use super::{resolve_azure_broker_sas_with_env, BrokerFetch};
+use super::BrokerFetch;
 use crate::credentials::{
     CredentialsObserver, NoopObserver, ProvideBearerToken, ProvideS3Credentials, ProvideSasToken,
     RefreshPolicy, RefreshingCredentials,
 };
-use crate::workload_identity::{resolve_gcs_bearer_with_env, resolve_s3_credentials_with_env};
+use crate::workload_identity::{
+    resolve_azure_credentials_with_env, resolve_gcs_credentials_with_env,
+    resolve_s3_credentials_with_env,
+};
 use crate::{
     AzureBackend, AzureConfig, AzureSas, CredentialsFetch, GcsBackend, GcsConfig, HttpClient,
     HttpRequest, HttpResponse, ReqwestClient, S3Backend, S3Config, S3Credentials,
@@ -247,7 +250,7 @@ async fn live_broker_gcp_acquisition_and_background_refresh() {
     let config = LiveConfig::load("GCP");
     let http = real_http("GCP", &config.url);
     let resolved = live_result(
-        resolve_gcs_bearer_with_env(
+        resolve_gcs_credentials_with_env(
             &|name| config.env(name),
             None,
             Some("broker"),
@@ -258,7 +261,7 @@ async fn live_broker_gcp_acquisition_and_background_refresh() {
         "GCP production resolver",
     );
     assert!(
-        resolved.provider.current().is_some_and(|s| !s.is_empty()),
+        matches!(&resolved.provider, crate::GcsCredentials::Bearer(provider) if provider.current().is_some_and(|s| !s.is_empty())),
         "real GCP resolver snapshot is invalid"
     );
     drop(resolved);
@@ -279,17 +282,23 @@ async fn live_broker_azure_acquisition_and_background_refresh() {
     let http = real_http("AZURE", &config.url);
     let account = config.field("azureAccountName");
     let resolved = live_result(
-        resolve_azure_broker_sas_with_env(
+        resolve_azure_credentials_with_env(
             &|name| config.env(name),
             account,
+            None,
+            Some("broker"),
             http.clone(),
             Arc::new(NoopObserver),
         )
         .await,
         "Azure production resolver",
     );
+    assert_eq!(resolved.source, "broker");
+    let crate::AzureCredentials::BrokerSas(provider) = &resolved.provider else {
+        panic!("Azure broker must return SAS credentials");
+    };
     assert!(
-        !resolved.current().expose_secret().is_empty(),
+        !provider.current().expose_secret().is_empty(),
         "real Azure resolver snapshot is invalid"
     );
     drop(resolved);
@@ -336,7 +345,7 @@ async fn live_broker_gcp_storage_list_head_conditional_range_get() {
     let bucket = required_env("TALON_LIVE_BROKER_GCP_BUCKET");
     let http = real_http("GCP", &config.url);
     let resolved = live_result(
-        resolve_gcs_bearer_with_env(
+        resolve_gcs_credentials_with_env(
             &|name| config.env(name),
             None,
             Some("broker"),
@@ -346,7 +355,7 @@ async fn live_broker_gcp_storage_list_head_conditional_range_get() {
         .await,
         "GCP production resolver",
     );
-    let backend = GcsBackend::with_bearer_provider(GcsConfig::default(), resolved.provider, http);
+    let backend = GcsBackend::with_credentials(GcsConfig::default(), resolved.provider, http);
     read_storage(&backend, Backend::Gcs, &bucket, "GCP").await;
     drop(backend);
 }
@@ -357,18 +366,20 @@ async fn live_broker_azure_storage_list_head_conditional_range_get() {
     let config = LiveConfig::load("AZURE");
     let http = real_http("AZURE", &config.url);
     let resolved = live_result(
-        resolve_azure_broker_sas_with_env(
+        resolve_azure_credentials_with_env(
             &|name| config.env(name),
             config.field("azureAccountName"),
+            None,
+            Some("broker"),
             http.clone(),
             Arc::new(NoopObserver),
         )
         .await,
         "Azure production resolver",
     );
-    let backend = AzureBackend::with_sas_provider(
+    let backend = AzureBackend::with_credentials(
         AzureConfig::new(config.field("azureAccountName")),
-        resolved,
+        resolved.provider,
         http,
     );
     read_storage(&backend, Backend::Azure, config.field("bucket"), "AZURE").await;

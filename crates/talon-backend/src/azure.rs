@@ -16,6 +16,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
+/// Azure authentication material produced by the selected credential source.
+pub enum AzureCredentials {
+    /// Directly configured storage account key (AK/SK mode).
+    SharedKey(String),
+    /// Legacy directly configured SAS query.
+    Sas(String),
+    /// Tokens acquired through IAM.
+    Bearer(Arc<dyn crate::credentials::ProvideBearerToken>),
+    /// SAS snapshots acquired and refreshed through the credential broker.
+    BrokerSas(Arc<dyn crate::credentials::ProvideSasToken>),
+}
+
 use async_trait::async_trait;
 use talon_core::{
     BackendStore, Error, ListPage, ListedObject, ObjectId, ObjectStat, Result, Version,
@@ -108,6 +120,24 @@ pub struct AzureBackend {
 }
 
 impl AzureBackend {
+    /// Construct with credentials resolved from AK/SK, IAM, or Broker mode.
+    pub fn with_credentials(
+        config: AzureConfig,
+        credentials: AzureCredentials,
+        http: Arc<dyn HttpClient>,
+    ) -> Self {
+        match credentials {
+            AzureCredentials::SharedKey(key) => Self::with_shared_key(config, key, http),
+            AzureCredentials::Sas(sas) => Self::new(config, Some(sas), http),
+            AzureCredentials::Bearer(provider) => {
+                Self::with_bearer_provider(config, provider, http)
+            }
+            AzureCredentials::BrokerSas(provider) => {
+                Self::with_sas_provider(config, provider, http)
+            }
+        }
+    }
+
     /// Construct from config, an optional SAS token, and an HTTP client.
     pub fn new(config: AzureConfig, sas_token: Option<String>, http: Arc<dyn HttpClient>) -> Self {
         Self {

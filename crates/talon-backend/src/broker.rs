@@ -16,6 +16,14 @@ use crate::http::{HttpClient, HttpRequest, Method};
 use crate::workload_identity::{env_var, EnvFn};
 use crate::{AzureSas, S3Credentials};
 
+/// Explicit broker settings. The request may contain secrets, so this type
+/// deliberately does not implement `Debug`.
+#[derive(Clone)]
+pub struct BrokerConfig {
+    pub url: String,
+    pub request: Value,
+}
+
 /// Broker fetcher for S3 credentials, a GCP bearer token, or an Azure SAS.
 /// Construction validates configuration before any network request.
 pub(crate) struct BrokerFetch<T> {
@@ -34,8 +42,21 @@ impl<T> BrokerFetch<T> {
     ) -> Result<Self, String> {
         let url = env("TALON_CREDENTIAL_BROKER_URL")
             .ok_or("broker requires TALON_CREDENTIAL_BROKER_URL")?;
-        let endpoint =
-            url::Url::parse(&url).map_err(|_| "broker endpoint must be a full HTTP(S) URL")?;
+        let raw = env("TALON_CREDENTIAL_BROKER_REQUEST")
+            .ok_or("broker requires TALON_CREDENTIAL_BROKER_REQUEST")?;
+        let request =
+            serde_json::from_str(&raw).map_err(|_| "broker request must be a JSON object")?;
+        Self::from_config(&BrokerConfig { url, request }, csp, account, http)
+    }
+
+    pub(crate) fn from_config(
+        config: &BrokerConfig,
+        csp: &str,
+        account: Option<&str>,
+        http: Arc<dyn HttpClient>,
+    ) -> Result<Self, String> {
+        let endpoint = url::Url::parse(&config.url)
+            .map_err(|_| "broker endpoint must be a full HTTP(S) URL")?;
         if !matches!(endpoint.scheme(), "http" | "https")
             || endpoint.host_str().is_none()
             || !endpoint.username().is_empty()
@@ -46,10 +67,8 @@ impl<T> BrokerFetch<T> {
                 "broker endpoint must be a full HTTP(S) URL without userinfo or fragment".into(),
             );
         }
-        let raw = env("TALON_CREDENTIAL_BROKER_REQUEST")
-            .ok_or("broker requires TALON_CREDENTIAL_BROKER_REQUEST")?;
-        let mut request: Value =
-            serde_json::from_str(&raw).map_err(|_| "broker request must be a JSON object")?;
+        // Each provider retains its own normalized request and URL for refresh.
+        let mut request = config.request.clone();
         if !request.is_object() {
             return Err("broker request must be a JSON object".into());
         }
@@ -87,7 +106,7 @@ impl<T> BrokerFetch<T> {
         }
         request["durationSeconds"] = duration.into();
         Ok(Self {
-            url,
+            url: config.url.clone(),
             request,
             http,
             value: PhantomData,
@@ -229,9 +248,10 @@ pub async fn resolve_azure_broker_sas_with_env(
 mod tests {
     use super::*;
     use crate::credentials::NoopObserver;
-    use crate::workload_identity::{resolve_gcs_bearer_with_env, resolve_s3_credentials_with_env};
+    use crate::workload_identity::resolve_s3_credentials_with_env;
     use crate::{
-        AzureBackend, AzureConfig, GcsBackend, GcsConfig, HttpResponse, S3Backend, S3Config,
+        resolve_azure_credentials, resolve_gcs_credentials, resolve_s3_credentials, AzureBackend,
+        AzureConfig, CredentialOptions, GcsBackend, GcsConfig, HttpResponse, S3Backend, S3Config,
     };
     use std::collections::VecDeque;
     use std::sync::Mutex;
@@ -292,6 +312,16 @@ mod tests {
     fn azure_request() -> Value {
         serde_json::json!({"csp":"azure","region":"eastus","bucket":"container","azureAccountName":"account","azureClientId":"client","azureTenantId":"tenant"})
     }
+    fn options(request: Value) -> CredentialOptions {
+        CredentialOptions {
+            source: Some("broker".into()),
+            broker: Some(BrokerConfig {
+                url: "https://explicit-broker.example/v1/credentials?key=url-secret".into(),
+                request,
+            }),
+            ..CredentialOptions::default()
+        }
+    }
     fn ok<T>(result: Result<T, String>) -> T {
         result.unwrap_or_else(|error| panic!("unexpected error: {error}"))
     }
@@ -309,10 +339,9 @@ mod tests {
             200,
             credentials("BROKERAK", "broker-token", "2099-01-01T08:00:00.123+08:00"),
         )]);
-        let resolved = ok(resolve_s3_credentials_with_env(
-            &env(aws_request()),
+        let resolved = ok(resolve_s3_credentials(
             None,
-            Some("broker"),
+            options(aws_request()),
             http.clone(),
             Arc::new(NoopObserver),
         )
@@ -326,7 +355,11 @@ mod tests {
             .head(&ObjectId::new(Backend::S3, "bucket", "key"))
             .await;
         let requests = http.requests.lock().unwrap();
-        assert_eq!(requests[0].url, "https://broker.example/v1/credentials");
+        assert_eq!(
+            requests[0].url,
+            "https://explicit-broker.example/v1/credentials?key=url-secret"
+        );
+        assert_eq!(requests[0].method, Method::Post);
         assert_eq!(requests[0].header("content-type"), Some("application/json"));
         assert_eq!(
             serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
@@ -459,30 +492,35 @@ mod tests {
             credentials("", "oauth-token", "2099-01-01T00:00:00Z"),
         )]);
         let request = serde_json::json!({"csp":"gcp","gcpServiceAccountEmail":"reader@example.iam.gserviceaccount.com"});
-        let resolved = ok(resolve_gcs_bearer_with_env(
-            &env(request),
-            Some("static-token".into()),
-            Some("broker"),
+        let resolved = ok(resolve_gcs_credentials(
+            Some(crate::GcsHmacCredentials {
+                access_key_id: "unused-key".into(),
+                secret_access_key: "unused-secret".into(),
+            }),
+            options(request),
             http.clone(),
             Arc::new(NoopObserver),
         )
         .await);
         let backend =
-            GcsBackend::with_bearer_provider(GcsConfig::default(), resolved.provider, http.clone());
+            GcsBackend::with_credentials(GcsConfig::default(), resolved.provider, http.clone());
         let _ = backend
             .head(&ObjectId::new(Backend::Gcs, "bucket", "key"))
             .await;
         let requests = http.requests.lock().unwrap();
         assert_eq!(
+            requests[0].url,
+            "https://explicit-broker.example/v1/credentials?key=url-secret"
+        );
+        assert_eq!(requests[0].method, Method::Post);
+        assert_eq!(
             requests[1].header("authorization"),
             Some("Bearer oauth-token")
         );
         assert!(requests[1].header("x-amz-security-token").is_none());
-        let request: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(request["csp"], "gcp");
         assert_eq!(
-            request["gcpServiceAccountEmail"],
-            "reader@example.iam.gserviceaccount.com"
+            serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+            serde_json::json!({"csp":"gcp","gcpServiceAccountEmail":"reader@example.iam.gserviceaccount.com","durationSeconds":3600})
         );
     }
 
@@ -497,14 +535,16 @@ mod tests {
                 serde_json::json!({"success":false,"msg":"secret-value"}),
             ),
         ]);
-        let resolved = ok(resolve_s3_credentials_with_env(
-            &env(aws_request()),
-            None,
-            Some("broker"),
-            http.clone(),
-            Arc::new(NoopObserver),
-        )
-        .await);
+        let mut options = options(aws_request());
+        let resolved =
+            ok(
+                resolve_s3_credentials(None, options.clone(), http.clone(), Arc::new(NoopObserver))
+                    .await,
+            );
+        // A provider owns its original configuration throughout refresh.
+        let config = options.broker.as_mut().unwrap();
+        config.url = "https://replacement-broker.example/".into();
+        config.request["roleArn"] = "replacement-role".into();
         let backend = S3Backend::with_credentials_provider(
             S3Config::aws("us-east-1"),
             resolved.provider,
@@ -542,6 +582,16 @@ mod tests {
             requests.iter().filter(|r| r.method == Method::Post).count(),
             3
         );
+        for request in requests.iter().filter(|r| r.method == Method::Post) {
+            assert_eq!(
+                request.url,
+                "https://explicit-broker.example/v1/credentials?key=url-secret"
+            );
+            assert_eq!(
+                serde_json::from_slice::<Value>(&request.body).unwrap(),
+                serde_json::json!({"csp":"aws","region":"us-east-1","roleArn":"arn:aws:iam::123456789012:role/example","externalId":"external-example","durationSeconds":3600,"bucket":"bucket","cluster":"cluster-example"})
+            );
+        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -551,15 +601,19 @@ mod tests {
             response(200, credentials("account", "sv=2026&sig=first", &expiry)),
             response(200, credentials("account", "sv=2026&sig=second", &expiry)),
         ]);
-        let provider = ok(resolve_azure_broker_sas_with_env(
-            &env(azure_request()),
+        let resolved = ok(resolve_azure_credentials(
             "account",
+            None,
+            options(azure_request()),
             http.clone(),
             Arc::new(NoopObserver),
         )
         .await);
-        let backend =
-            AzureBackend::with_sas_provider(AzureConfig::new("account"), provider, http.clone());
+        let backend = AzureBackend::with_credentials(
+            AzureConfig::new("account"),
+            resolved.provider,
+            http.clone(),
+        );
         let obj = ObjectId::new(Backend::Azure, "container", "key");
         let _ = backend.execute_head_raw(&obj, &[]).await;
         tokio::task::yield_now().await;
@@ -592,10 +646,75 @@ mod tests {
             .header("x-ms-copy-source")
             .unwrap()
             .ends_with("sig=second"));
-        let request: Value = serde_json::from_slice(&requests[0].body).unwrap();
-        assert_eq!(request["csp"], "azure");
-        assert_eq!(request["azureAccountName"], "account");
-        assert_eq!(request["bucket"], "container");
+        assert_eq!(
+            requests[0].url,
+            "https://explicit-broker.example/v1/credentials?key=url-secret"
+        );
+        assert_eq!(requests[0].method, Method::Post);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&requests[0].body).unwrap(),
+            serde_json::json!({"csp":"azure","region":"eastus","bucket":"container","azureAccountName":"account","azureClientId":"client","azureTenantId":"tenant","durationSeconds":3600})
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_broker_validates_configuration_and_suppresses_secrets() {
+        for (url, request) in [
+            ("https://user:url-secret@broker.example/", aws_request()),
+            ("https://broker.example/?key=url-secret", Value::Null),
+            (
+                "https://broker.example/?key=url-secret",
+                serde_json::json!({"csp":"request-secret"}),
+            ),
+        ] {
+            let http = http(vec![]);
+            let error = error(
+                resolve_s3_credentials(
+                    None,
+                    CredentialOptions {
+                        source: Some("broker".into()),
+                        broker: Some(BrokerConfig {
+                            url: url.into(),
+                            request,
+                        }),
+                        ..CredentialOptions::default()
+                    },
+                    http.clone(),
+                    Arc::new(NoopObserver),
+                )
+                .await,
+            );
+            assert!(!error.contains("url-secret"));
+            assert!(!error.contains("request-secret"));
+            assert!(http.requests.lock().unwrap().is_empty());
+        }
+        let account_http = http(vec![]);
+        let account_error = error(
+            resolve_azure_credentials(
+                "different",
+                None,
+                options(azure_request()),
+                account_http.clone(),
+                Arc::new(NoopObserver),
+            )
+            .await,
+        );
+        assert!(account_error.contains("account"));
+        assert!(account_http.requests.lock().unwrap().is_empty());
+        let error = error(
+            resolve_s3_credentials(
+                None,
+                options(aws_request()),
+                http(vec![Err(
+                    "https://broker.example/?key=url-secret request-secret returned-secret".into(),
+                )]),
+                Arc::new(NoopObserver),
+            )
+            .await,
+        );
+        for secret in ["url-secret", "request-secret", "returned-secret"] {
+            assert!(!error.contains(secret));
+        }
     }
 
     #[tokio::test]

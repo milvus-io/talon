@@ -13,8 +13,8 @@
 //! patch is produced from each layer and folded onto the defaults in
 //! precedence order via [`Patch::merge`]; the result is [`validate`]d.
 //!
-//! Secrets are read only from the environment and are never serialized or
-//! logged.
+//! Configured secrets are wrapped to redact debug output and are never
+//! serialized.
 //!
 //! [`validate`]: WorkerConfig::validate
 
@@ -34,6 +34,30 @@ use crate::{
 pub trait Patch {
     /// Overlay `self` onto `base`, letting `self`'s set fields win.
     fn merge(self, base: Self) -> Self;
+}
+
+/// A configuration secret whose debug output never exposes its contents.
+#[derive(Clone, PartialEq, Deserialize)]
+#[serde(transparent)]
+pub struct Sensitive<T>(T);
+
+impl<T> Sensitive<T> {
+    /// Access the value explicitly when constructing credentials.
+    pub fn expose(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T> From<T> for Sensitive<T> {
+    fn from(value: T) -> Self {
+        Self(value)
+    }
+}
+
+impl<T> std::fmt::Debug for Sensitive<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("[REDACTED]")
+    }
 }
 
 fn merge_control_tls(
@@ -241,9 +265,24 @@ pub struct WorkerConfig {
     /// S3 endpoint host override (e.g. a MinIO/LocalStack host). Defaults to the
     /// AWS regional endpoint. A value with an `http://` scheme selects plaintext.
     pub s3_endpoint: Option<String>,
-    /// S3 access key id (not secret; the secret key is env-only, see
-    /// [`s3_secret_key_from_env`]).
+    /// S3 access key id.
     pub s3_access_key_id: Option<String>,
+    /// Origin credential source: `aksk`, `iam`, or `broker`.
+    pub credentials_source: Option<String>,
+    /// S3 secret access key.
+    pub s3_secret_access_key: Option<Sensitive<String>>,
+    /// Optional session token for temporary S3 credentials.
+    pub s3_session_token: Option<Sensitive<String>>,
+    /// GCS HMAC access key id.
+    pub gcs_access_key_id: Option<String>,
+    /// GCS HMAC secret access key.
+    pub gcs_secret_access_key: Option<Sensitive<String>>,
+    /// Azure Storage Shared Key.
+    pub azure_shared_key: Option<Sensitive<String>>,
+    /// Credential broker URL, which may contain authentication parameters.
+    pub credential_broker_url: Option<Sensitive<String>>,
+    /// Credential broker JSON request body, parsed from a TOML table or JSON env value.
+    pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
     /// Use S3 path-style addressing (`endpoint/bucket/key`). Required by most
     /// S3-compatible emulators (LocalStack, MinIO).
     pub s3_path_style: Option<bool>,
@@ -416,6 +455,14 @@ impl Default for WorkerConfig {
             s3_region: None,
             s3_endpoint: None,
             s3_access_key_id: None,
+            credentials_source: None,
+            s3_secret_access_key: None,
+            s3_session_token: None,
+            gcs_access_key_id: None,
+            gcs_secret_access_key: None,
+            azure_shared_key: None,
+            credential_broker_url: None,
+            credential_broker_request: None,
             s3_path_style: None,
             gcs_endpoint: None,
             data_plane_rings: 0,
@@ -541,6 +588,22 @@ pub struct WorkerConfigPatch {
     pub s3_endpoint: Option<String>,
     /// Override for [`WorkerConfig::s3_access_key_id`].
     pub s3_access_key_id: Option<String>,
+    /// Override for [`WorkerConfig::credentials_source`].
+    pub credentials_source: Option<String>,
+    /// Override for [`WorkerConfig::s3_secret_access_key`].
+    pub s3_secret_access_key: Option<Sensitive<String>>,
+    /// Override for [`WorkerConfig::s3_session_token`].
+    pub s3_session_token: Option<Sensitive<String>>,
+    /// Override for [`WorkerConfig::gcs_access_key_id`].
+    pub gcs_access_key_id: Option<String>,
+    /// Override for [`WorkerConfig::gcs_secret_access_key`].
+    pub gcs_secret_access_key: Option<Sensitive<String>>,
+    /// Override for [`WorkerConfig::azure_shared_key`].
+    pub azure_shared_key: Option<Sensitive<String>>,
+    /// Override for [`WorkerConfig::credential_broker_url`].
+    pub credential_broker_url: Option<Sensitive<String>>,
+    /// Optional `[credential_broker_request]` table, replaced as a whole by higher layers.
+    pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
     /// Override for [`WorkerConfig::s3_path_style`].
     pub s3_path_style: Option<bool>,
     /// Override for [`WorkerConfig::gcs_endpoint`].
@@ -653,6 +716,16 @@ impl Patch for WorkerConfigPatch {
             s3_region: self.s3_region.or(base.s3_region),
             s3_endpoint: self.s3_endpoint.or(base.s3_endpoint),
             s3_access_key_id: self.s3_access_key_id.or(base.s3_access_key_id),
+            credentials_source: self.credentials_source.or(base.credentials_source),
+            s3_secret_access_key: self.s3_secret_access_key.or(base.s3_secret_access_key),
+            s3_session_token: self.s3_session_token.or(base.s3_session_token),
+            gcs_access_key_id: self.gcs_access_key_id.or(base.gcs_access_key_id),
+            gcs_secret_access_key: self.gcs_secret_access_key.or(base.gcs_secret_access_key),
+            azure_shared_key: self.azure_shared_key.or(base.azure_shared_key),
+            credential_broker_url: self.credential_broker_url.or(base.credential_broker_url),
+            credential_broker_request: self
+                .credential_broker_request
+                .or(base.credential_broker_request),
             s3_path_style: self.s3_path_style.or(base.s3_path_style),
             gcs_endpoint: self.gcs_endpoint.or(base.gcs_endpoint),
             data_plane_rings: self.data_plane_rings.or(base.data_plane_rings),
@@ -1104,6 +1177,12 @@ pub(crate) mod worker_env {
     pub const S3_PATH_STYLE: &str = "TALON_WORKER_S3_PATH_STYLE";
     pub const S3_SECRET_ACCESS_KEY: &str = "TALON_WORKER_S3_SECRET_ACCESS_KEY";
     pub const S3_SESSION_TOKEN: &str = "TALON_WORKER_S3_SESSION_TOKEN";
+    pub const ORIGIN_CREDENTIALS_SOURCE: &str = "TALON_ORIGIN_CREDENTIALS_SOURCE";
+    pub const GCS_ACCESS_KEY_ID: &str = "TALON_WORKER_GCS_ACCESS_KEY_ID";
+    pub const GCS_SECRET_ACCESS_KEY: &str = "TALON_WORKER_GCS_SECRET_ACCESS_KEY";
+    pub const AZURE_SHARED_KEY: &str = "TALON_WORKER_AZURE_SHARED_KEY";
+    pub const CREDENTIAL_BROKER_URL: &str = "TALON_CREDENTIAL_BROKER_URL";
+    pub const CREDENTIAL_BROKER_REQUEST: &str = "TALON_CREDENTIAL_BROKER_REQUEST";
     pub const GCS_ENDPOINT: &str = "TALON_WORKER_GCS_ENDPOINT";
     pub const GCS_BEARER_TOKEN: &str = "TALON_WORKER_GCS_BEARER_TOKEN";
     pub const AZURE_SAS: &str = "TALON_WORKER_AZURE_SAS";
@@ -1112,7 +1191,17 @@ pub(crate) mod worker_env {
 impl WorkerConfigPatch {
     /// Parse a patch from a TOML config-file string.
     pub fn from_toml(s: &str) -> Result<Self> {
-        toml::from_str(s).map_err(|e| Error::Other(format!("invalid config file: {e}")))
+        toml::from_str(s).map_err(|e: toml::de::Error| {
+            // TOML diagnostics include source snippets and may echo secret values
+            // even for type errors. Keep only the location, never the diagnostic.
+            let location = e
+                .span()
+                .map(|span| format!(" at bytes {}..{}", span.start, span.end))
+                .unwrap_or_default();
+            Error::Other(format!(
+                "invalid config file{location}: invalid TOML syntax or field"
+            ))
+        })
     }
 
     /// Read a patch from a TOML file path. A missing file yields an empty patch.
@@ -1139,6 +1228,7 @@ impl WorkerConfigPatch {
     /// Like [`from_env`](Self::from_env) but with an injectable lookup, for
     /// tests.
     pub fn from_env_with(get: impl Fn(&str) -> Option<String>) -> Result<Self> {
+        let get_credential = |key: &str| get(key).filter(|value| !value.is_empty());
         let parse_u32 = |v: String, k: &str| {
             v.parse::<u32>()
                 .map_err(|_| Error::Other(format!("{k}: invalid u32: {v:?}")))
@@ -1274,7 +1364,31 @@ impl WorkerConfigPatch {
             backend: get(worker_env::BACKEND),
             s3_region: get(worker_env::S3_REGION),
             s3_endpoint: get(worker_env::S3_ENDPOINT),
-            s3_access_key_id: get(worker_env::S3_ACCESS_KEY_ID),
+            s3_access_key_id: get_credential(worker_env::S3_ACCESS_KEY_ID),
+            credentials_source: get_credential(worker_env::ORIGIN_CREDENTIALS_SOURCE),
+            s3_secret_access_key: get_credential(worker_env::S3_SECRET_ACCESS_KEY)
+                .map(Sensitive::from),
+            s3_session_token: get_credential(worker_env::S3_SESSION_TOKEN).map(Sensitive::from),
+            gcs_access_key_id: get_credential(worker_env::GCS_ACCESS_KEY_ID),
+            gcs_secret_access_key: get_credential(worker_env::GCS_SECRET_ACCESS_KEY)
+                .map(Sensitive::from),
+            azure_shared_key: get_credential(worker_env::AZURE_SHARED_KEY).map(Sensitive::from),
+            credential_broker_url: get_credential(worker_env::CREDENTIAL_BROKER_URL)
+                .map(Sensitive::from),
+            credential_broker_request: get_credential(worker_env::CREDENTIAL_BROKER_REQUEST)
+                .map(|value| {
+                    serde_json::from_str::<serde_json::Value>(&value)
+                        .map(Sensitive::from)
+                        .map_err(|error| {
+                            Error::Other(format!(
+                                "{}: invalid JSON at line {}, column {}",
+                                worker_env::CREDENTIAL_BROKER_REQUEST,
+                                error.line(),
+                                error.column()
+                            ))
+                        })
+                })
+                .transpose()?,
             s3_path_style: get(worker_env::S3_PATH_STYLE)
                 .map(|v| parse_bool(v, worker_env::S3_PATH_STYLE))
                 .transpose()?,
@@ -1434,6 +1548,16 @@ impl WorkerConfig {
             s3_region: merged.s3_region.or(d.s3_region),
             s3_endpoint: merged.s3_endpoint.or(d.s3_endpoint),
             s3_access_key_id: merged.s3_access_key_id.or(d.s3_access_key_id),
+            credentials_source: merged.credentials_source.or(d.credentials_source),
+            s3_secret_access_key: merged.s3_secret_access_key.or(d.s3_secret_access_key),
+            s3_session_token: merged.s3_session_token.or(d.s3_session_token),
+            gcs_access_key_id: merged.gcs_access_key_id.or(d.gcs_access_key_id),
+            gcs_secret_access_key: merged.gcs_secret_access_key.or(d.gcs_secret_access_key),
+            azure_shared_key: merged.azure_shared_key.or(d.azure_shared_key),
+            credential_broker_url: merged.credential_broker_url.or(d.credential_broker_url),
+            credential_broker_request: merged
+                .credential_broker_request
+                .or(d.credential_broker_request),
             s3_path_style: merged.s3_path_style.or(d.s3_path_style),
             gcs_endpoint: merged.gcs_endpoint.or(d.gcs_endpoint),
             backend_delay_ms: merged.backend_delay_ms.or(d.backend_delay_ms),
@@ -2358,6 +2482,229 @@ mod tests {
     }
 
     #[test]
+    fn credential_toml_accepts_provider_secrets_and_broker_table() {
+        for source in ["aksk", "iam", "broker"] {
+            let patch = WorkerConfigPatch::from_toml(&format!(
+                r#"
+credentials_source = "{source}"
+s3_access_key_id = "s3-access"
+s3_secret_access_key = "s3-secret-marker"
+s3_session_token = "session-secret-marker"
+gcs_access_key_id = "gcs-access"
+gcs_secret_access_key = "gcs-secret-marker"
+azure_shared_key = "azure-secret-marker"
+credential_broker_url = "https://broker.example/?token=url-secret-marker"
+[credential_broker_request]
+token = "request-secret-marker"
+ttl = 300
+scopes = ["read", "list"]
+[credential_broker_request.context]
+tenant = "example"
+"#
+            ))
+            .unwrap();
+            let patch_debug = format!("{patch:?}");
+            let cfg = WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+            assert_eq!(cfg.credentials_source.as_deref(), Some(source));
+            assert_eq!(cfg.s3_access_key_id.as_deref(), Some("s3-access"));
+            assert_eq!(
+                cfg.s3_secret_access_key.as_ref().unwrap().expose(),
+                "s3-secret-marker"
+            );
+            assert_eq!(
+                cfg.s3_session_token.as_ref().unwrap().expose(),
+                "session-secret-marker"
+            );
+            assert_eq!(cfg.gcs_access_key_id.as_deref(), Some("gcs-access"));
+            assert_eq!(
+                cfg.gcs_secret_access_key.as_ref().unwrap().expose(),
+                "gcs-secret-marker"
+            );
+            assert_eq!(
+                cfg.azure_shared_key.as_ref().unwrap().expose(),
+                "azure-secret-marker"
+            );
+            assert_eq!(
+                cfg.credential_broker_url.as_ref().unwrap().expose(),
+                "https://broker.example/?token=url-secret-marker"
+            );
+            assert_eq!(
+                cfg.credential_broker_request.as_ref().unwrap().expose(),
+                &serde_json::json!({
+                    "token": "request-secret-marker",
+                    "ttl": 300,
+                    "scopes": ["read", "list"],
+                    "context": {"tenant": "example"}
+                })
+            );
+            let cfg_debug = format!("{cfg:?}");
+            for debug in [&patch_debug, &cfg_debug] {
+                assert!(debug.contains("[REDACTED]"));
+                for secret in [
+                    "s3-secret-marker",
+                    "session-secret-marker",
+                    "gcs-secret-marker",
+                    "azure-secret-marker",
+                    "url-secret-marker",
+                    "request-secret-marker",
+                ] {
+                    assert!(!debug.contains(secret), "debug exposed credentials");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn credential_toml_errors_do_not_expose_source_or_values() {
+        for invalid in [
+            "s3_secret_access_key = \"syntax-secret-marker",
+            "s3_secret_access_key = [\"type-secret-marker\"]",
+            "block_size = \"type-secret-marker\"",
+            "[credential_broker_request]\n\"key-secret-marker\" =",
+        ] {
+            let error = WorkerConfigPatch::from_toml(invalid).unwrap_err();
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(
+                    !rendered.contains("secret-marker"),
+                    "error exposed a secret"
+                );
+                assert!(!rendered.contains(invalid), "error exposed source");
+                assert!(rendered.contains("bytes"), "error lost its source location");
+            }
+        }
+    }
+
+    #[test]
+    fn credential_env_overrides_toml_and_replaces_broker_request() {
+        let file = WorkerConfigPatch::from_toml(
+            r#"
+credentials_source = "aksk"
+s3_access_key_id = "file-s3-access"
+s3_secret_access_key = "file-s3-secret"
+s3_session_token = "file-session"
+gcs_access_key_id = "file-gcs-access"
+gcs_secret_access_key = "file-gcs-secret"
+azure_shared_key = "file-azure-key"
+credential_broker_url = "https://file-broker.example/"
+[credential_broker_request]
+file_only = "must-not-merge"
+"#,
+        )
+        .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            Some(
+                match key {
+                    "TALON_ORIGIN_CREDENTIALS_SOURCE" => "broker",
+                    "TALON_WORKER_S3_ACCESS_KEY_ID" => "env-s3-access",
+                    "TALON_WORKER_S3_SECRET_ACCESS_KEY" => "env-s3-secret",
+                    "TALON_WORKER_S3_SESSION_TOKEN" => "env-session",
+                    "TALON_WORKER_GCS_ACCESS_KEY_ID" => "env-gcs-access",
+                    "TALON_WORKER_GCS_SECRET_ACCESS_KEY" => "env-gcs-secret",
+                    "TALON_WORKER_AZURE_SHARED_KEY" => "env-azure-key",
+                    "TALON_CREDENTIAL_BROKER_URL" => "https://env-broker.example/",
+                    "TALON_CREDENTIAL_BROKER_REQUEST" => r#"{"token":"env-token"}"#,
+                    _ => return None,
+                }
+                .into(),
+            )
+        })
+        .unwrap();
+        let cfg = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert_eq!(cfg.credentials_source.as_deref(), Some("broker"));
+        assert_eq!(cfg.s3_access_key_id.as_deref(), Some("env-s3-access"));
+        assert_eq!(
+            cfg.s3_secret_access_key.as_ref().unwrap().expose(),
+            "env-s3-secret"
+        );
+        assert_eq!(
+            cfg.s3_session_token.as_ref().unwrap().expose(),
+            "env-session"
+        );
+        assert_eq!(cfg.gcs_access_key_id.as_deref(), Some("env-gcs-access"));
+        assert_eq!(
+            cfg.gcs_secret_access_key.as_ref().unwrap().expose(),
+            "env-gcs-secret"
+        );
+        assert_eq!(
+            cfg.azure_shared_key.as_ref().unwrap().expose(),
+            "env-azure-key"
+        );
+        assert_eq!(
+            cfg.credential_broker_url.as_ref().unwrap().expose(),
+            "https://env-broker.example/"
+        );
+        assert_eq!(
+            cfg.credential_broker_request.as_ref().unwrap().expose(),
+            &serde_json::json!({"token": "env-token"})
+        );
+        let debug = format!("{cfg:?}");
+        for secret in [
+            "env-s3-secret",
+            "env-session",
+            "env-gcs-secret",
+            "env-azure-key",
+            "https://env-broker.example/",
+            "env-token",
+        ] {
+            assert!(!debug.contains(secret), "debug exposed an env secret");
+        }
+    }
+
+    #[test]
+    fn credential_empty_env_preserves_toml_values() {
+        let file = WorkerConfigPatch::from_toml(
+            r#"
+credentials_source = "aksk"
+s3_access_key_id = "file-s3-access"
+s3_secret_access_key = "file-s3-secret"
+s3_session_token = "file-session"
+gcs_access_key_id = "file-gcs-access"
+gcs_secret_access_key = "file-gcs-secret"
+azure_shared_key = "file-azure-key"
+credential_broker_url = "https://file-broker.example/"
+[credential_broker_request]
+token = "file-token"
+"#,
+        )
+        .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            matches!(
+                key,
+                "TALON_ORIGIN_CREDENTIALS_SOURCE"
+                    | "TALON_WORKER_S3_ACCESS_KEY_ID"
+                    | "TALON_WORKER_S3_SECRET_ACCESS_KEY"
+                    | "TALON_WORKER_S3_SESSION_TOKEN"
+                    | "TALON_WORKER_GCS_ACCESS_KEY_ID"
+                    | "TALON_WORKER_GCS_SECRET_ACCESS_KEY"
+                    | "TALON_WORKER_AZURE_SHARED_KEY"
+                    | "TALON_CREDENTIAL_BROKER_URL"
+                    | "TALON_CREDENTIAL_BROKER_REQUEST"
+            )
+            .then(String::new)
+        })
+        .unwrap();
+        let expected =
+            WorkerConfig::resolve(file.clone(), Default::default(), Default::default()).unwrap();
+        let cfg = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert_eq!(cfg, expected);
+    }
+
+    #[test]
+    fn credential_broker_env_json_errors_hide_secret_values() {
+        let error = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_CREDENTIAL_BROKER_REQUEST")
+                .then(|| r#"{"token":"json-secret-marker", "unterminated-secret-marker"#.into())
+        })
+        .unwrap_err();
+        for rendered in [error.to_string(), format!("{error:?}")] {
+            assert!(rendered.contains("TALON_CREDENTIAL_BROKER_REQUEST"));
+            assert!(rendered.contains("line"));
+            assert!(rendered.contains("column"));
+            assert!(!rendered.contains("secret-marker"));
+        }
+    }
+
+    #[test]
     fn from_env_parses_typed_fields() {
         let map = |k: &str| match k {
             "TALON_WORKER_BLOCK_SIZE" => Some("1048576".to_string()),
@@ -3102,7 +3449,7 @@ mod namespace_tests {
                 "[namespaces.{name}]\nblock_size = 67108864\n"
             ))
             .unwrap_err();
-            assert!(error.to_string().contains("block_size"), "{error}");
+            assert!(error.to_string().contains("invalid config file"), "{error}");
         }
     }
 
