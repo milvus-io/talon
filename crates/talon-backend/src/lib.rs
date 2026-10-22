@@ -24,6 +24,7 @@ pub mod monoio_client;
 mod query_auth;
 pub mod reqwest_client;
 pub mod retry;
+pub mod routing;
 pub mod s3;
 pub mod sigv4;
 pub mod workload_identity;
@@ -54,6 +55,7 @@ pub use http::{
 pub use query_auth::{AzureSas, S3PresignedQuery};
 pub use reqwest_client::ReqwestClient;
 pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
+pub use routing::{BackendResolver, BackendRouter, DefaultBackendResolver, RouteRequest};
 pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest};
 pub use sigv4::{sign_request, AmzDate};
 pub use workload_identity::{

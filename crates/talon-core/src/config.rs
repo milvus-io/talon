@@ -124,6 +124,105 @@ pub struct ConfigVar {
     pub help: &'static str,
 }
 
+/// An explicit bucket/container origin; credentials never inherit from worker defaults.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BucketConfig {
+    pub name: String,
+    pub credentials_source: String,
+    pub s3_region: Option<String>,
+    pub s3_endpoint: Option<String>,
+    pub s3_path_style: Option<bool>,
+    pub s3_access_key_id: Option<String>,
+    pub s3_secret_access_key: Option<Sensitive<String>>,
+    pub s3_session_token: Option<Sensitive<String>>,
+    pub gcs_endpoint: Option<String>,
+    pub gcs_access_key_id: Option<String>,
+    pub gcs_secret_access_key: Option<Sensitive<String>>,
+    pub azure_account: Option<String>,
+    pub azure_endpoint: Option<String>,
+    pub azure_shared_key: Option<Sensitive<String>>,
+    pub credential_broker_url: Option<Sensitive<String>>,
+    pub credential_broker_request: Option<Sensitive<serde_json::Value>>,
+}
+
+impl BucketConfig {
+    /// Check a resolved record before constructing its backend or fetching credentials.
+    pub fn validate(&self, backend: crate::Backend) -> Result<()> {
+        if self.name.is_empty()
+            || matches!(self.name.as_str(), "." | "..")
+            || !self
+                .name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        {
+            return Err(Error::Other(
+                "bucket name must be a nonempty, safe bucket/container component".into(),
+            ));
+        }
+        if !matches!(self.credentials_source.as_str(), "aksk" | "iam" | "broker") {
+            return Err(Error::Other(
+                "bucket credentials_source must be aksk, iam, or broker".into(),
+            ));
+        }
+        let require = |value: Option<&str>, field: &str| {
+            if value.is_some_and(|value| !value.trim().is_empty()) {
+                Ok(())
+            } else {
+                Err(Error::Other(format!("bucket requires nonempty {field}")))
+            }
+        };
+        match backend {
+            crate::Backend::S3 => require(self.s3_region.as_deref(), "s3_region")?,
+            crate::Backend::Azure => require(self.azure_account.as_deref(), "azure_account")?,
+            crate::Backend::Gcs => {}
+        }
+        match self.credentials_source.as_str() {
+            "aksk" => match backend {
+                crate::Backend::S3 => {
+                    require(self.s3_access_key_id.as_deref(), "s3_access_key_id")?;
+                    require(
+                        self.s3_secret_access_key
+                            .as_ref()
+                            .map(|value| value.expose().as_str()),
+                        "s3_secret_access_key",
+                    )?;
+                }
+                crate::Backend::Gcs => {
+                    require(self.gcs_access_key_id.as_deref(), "gcs_access_key_id")?;
+                    require(
+                        self.gcs_secret_access_key
+                            .as_ref()
+                            .map(|value| value.expose().as_str()),
+                        "gcs_secret_access_key",
+                    )?;
+                }
+                crate::Backend::Azure => require(
+                    self.azure_shared_key
+                        .as_ref()
+                        .map(|value| value.expose().as_str()),
+                    "azure_shared_key",
+                )?,
+            },
+            "broker" => {
+                require(
+                    self.credential_broker_url
+                        .as_ref()
+                        .map(|value| value.expose().as_str()),
+                    "credential_broker_url",
+                )?;
+                if self.credential_broker_request.is_none() {
+                    return Err(Error::Other(
+                        "bucket requires credential_broker_request".into(),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+}
+
 /// Fully-resolved worker configuration.
 #[derive(Debug, Clone, PartialEq)]
 pub struct WorkerConfig {
@@ -221,6 +320,8 @@ pub struct WorkerConfig {
     /// Object-store backend selector: `azure` (default), `s3`, or `gcs`. The
     /// per-backend endpoint/credential fields below apply to the selected one.
     pub backend: Option<String>,
+    /// Explicit origins for the selected backend; absence preserves legacy routing.
+    pub buckets: Option<Vec<BucketConfig>>,
     /// Azure Blob storage account for the backend origin (`None` if unset).
     ///
     /// The container is taken per-object from the request path; the SAS token is
@@ -330,6 +431,71 @@ pub struct NamespaceCacheConfig {
 }
 
 impl WorkerConfig {
+    /// Resolve connection defaults and validate explicit origins without sharing credentials.
+    pub fn resolved_buckets(&self) -> Result<Option<Vec<BucketConfig>>> {
+        let Some(buckets) = &self.buckets else {
+            return Ok(None);
+        };
+        if buckets.is_empty() {
+            return Err(Error::Other(
+                "buckets must not be empty when configured".into(),
+            ));
+        }
+        if self.credentials_source.is_some()
+            || self.s3_access_key_id.is_some()
+            || self.s3_secret_access_key.is_some()
+            || self.s3_session_token.is_some()
+            || self.gcs_access_key_id.is_some()
+            || self.gcs_secret_access_key.is_some()
+            || self.azure_shared_key.is_some()
+            || self.credential_broker_url.is_some()
+            || self.credential_broker_request.is_some()
+        {
+            return Err(Error::Other(
+                "buckets cannot be combined with top-level credential fields".into(),
+            ));
+        }
+        let backend = self.backend.as_deref().unwrap_or("azure").parse()?;
+        let mut names = std::collections::HashSet::new();
+        let mut resolved = buckets.clone();
+        for bucket in &mut resolved {
+            // Only connection settings inherit. An explicit record always owns
+            // its credential source, direct keys, and broker configuration.
+            match backend {
+                crate::Backend::S3 => {
+                    bucket.s3_region = bucket.s3_region.take().or_else(|| self.s3_region.clone());
+                    bucket.s3_endpoint = bucket
+                        .s3_endpoint
+                        .take()
+                        .or_else(|| self.s3_endpoint.clone());
+                    bucket.s3_path_style = bucket.s3_path_style.or(self.s3_path_style);
+                }
+                crate::Backend::Gcs => {
+                    bucket.gcs_endpoint = bucket
+                        .gcs_endpoint
+                        .take()
+                        .or_else(|| self.gcs_endpoint.clone());
+                }
+                crate::Backend::Azure => {
+                    bucket.azure_account = bucket
+                        .azure_account
+                        .take()
+                        .or_else(|| self.azure_account.clone());
+                    bucket.azure_endpoint = bucket
+                        .azure_endpoint
+                        .take()
+                        .or_else(|| self.azure_endpoint.clone());
+                }
+            }
+            bucket.validate(backend)?;
+            // Azure routing also keys only by container, even across accounts.
+            if !names.insert(bucket.name.clone()) {
+                return Err(Error::Other("duplicate bucket/container name".into()));
+            }
+        }
+        Ok(Some(resolved))
+    }
+
     /// Resolve cache settings without changing process-wide resource budgets.
     pub fn for_namespace(&self, namespace: &crate::NamespaceId) -> Result<Self> {
         namespace
@@ -442,6 +608,7 @@ impl Default for WorkerConfig {
             page_gc_delete_batch_size: 1024,
             page_gc_io_concurrency: 4,
             backend: None,
+            buckets: None,
             azure_account: None,
             azure_endpoint: None,
             backend_delay_ms: None,
@@ -562,6 +729,8 @@ pub struct WorkerConfigPatch {
     pub page_gc_io_concurrency: Option<usize>,
     /// Override for [`WorkerConfig::backend`].
     pub backend: Option<String>,
+    /// Explicit origins, replaced as a whole by a higher-precedence layer.
+    pub buckets: Option<Vec<BucketConfig>>,
     /// Override for [`WorkerConfig::azure_account`].
     pub azure_account: Option<String>,
     /// Override for [`WorkerConfig::azure_endpoint`].
@@ -695,6 +864,7 @@ impl Patch for WorkerConfigPatch {
                 .or(base.page_gc_delete_batch_size),
             page_gc_io_concurrency: self.page_gc_io_concurrency.or(base.page_gc_io_concurrency),
             backend: self.backend.or(base.backend),
+            buckets: self.buckets.or(base.buckets),
             azure_account: self.azure_account.or(base.azure_account),
             azure_endpoint: self.azure_endpoint.or(base.azure_endpoint),
             backend_delay_ms: self.backend_delay_ms.or(base.backend_delay_ms),
@@ -1158,6 +1328,7 @@ pub(crate) mod worker_env {
     pub const PAGE_GC_IO_CONCURRENCY: &str = "TALON_WORKER_PAGE_GC_IO_CONCURRENCY";
 
     pub const BACKEND: &str = "TALON_WORKER_BACKEND";
+    pub const BUCKETS: &str = "TALON_WORKER_BUCKETS";
     pub const AZURE_ACCOUNT: &str = "TALON_WORKER_AZURE_ACCOUNT";
     pub const AZURE_ENDPOINT: &str = "TALON_WORKER_AZURE_ENDPOINT";
     pub const BACKEND_DELAY_MS: &str = "TALON_WORKER_BACKEND_DELAY_MS";
@@ -1362,6 +1533,20 @@ impl WorkerConfigPatch {
             azure_account: get(worker_env::AZURE_ACCOUNT),
             azure_endpoint: get(worker_env::AZURE_ENDPOINT),
             backend: get(worker_env::BACKEND),
+            buckets: get(worker_env::BUCKETS)
+                .map(|value| {
+                    serde_json::from_str::<Vec<BucketConfig>>(&value).map_err(|error| {
+                        // Schema diagnostics can contain secret values or unknown
+                        // field names. Report only the input location.
+                        Error::Other(format!(
+                            "{}: invalid bucket JSON at line {}, column {}",
+                            worker_env::BUCKETS,
+                            error.line(),
+                            error.column()
+                        ))
+                    })
+                })
+                .transpose()?,
             s3_region: get(worker_env::S3_REGION),
             s3_endpoint: get(worker_env::S3_ENDPOINT),
             s3_access_key_id: get_credential(worker_env::S3_ACCESS_KEY_ID),
@@ -1545,6 +1730,7 @@ impl WorkerConfig {
             azure_account: merged.azure_account.or(d.azure_account),
             azure_endpoint: merged.azure_endpoint.or(d.azure_endpoint),
             backend: merged.backend.or(d.backend),
+            buckets: merged.buckets.or(d.buckets),
             s3_region: merged.s3_region.or(d.s3_region),
             s3_endpoint: merged.s3_endpoint.or(d.s3_endpoint),
             s3_access_key_id: merged.s3_access_key_id.or(d.s3_access_key_id),
@@ -1599,6 +1785,7 @@ impl WorkerConfig {
 
     /// Fail fast on invalid configuration with an actionable message.
     pub fn validate(&self) -> Result<()> {
+        self.resolved_buckets()?;
         if self.listen.is_empty() {
             return Err(Error::Other("listen address must not be empty".into()));
         }
@@ -2479,6 +2666,332 @@ mod tests {
         assert_eq!(patch.l1_page_size_bytes, Some(1 << 20));
         assert_eq!(patch.paged_miss_run_concurrency, Some(4));
         assert!(WorkerConfigPatch::from_toml("bogus_key = 1").is_err());
+    }
+
+    #[test]
+    fn bucket_toml_accepts_explicit_per_bucket_credentials() {
+        let patch = WorkerConfigPatch::from_toml(
+            r#"
+backend = "s3"
+s3_region = "us-east-1"
+[[buckets]]
+name = "static-bucket"
+credentials_source = "aksk"
+s3_access_key_id = "bucket-access"
+s3_secret_access_key = "bucket-secret"
+[[buckets]]
+name = "iam-bucket"
+credentials_source = "iam"
+"#,
+        )
+        .unwrap();
+        let cfg = WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+        let buckets = cfg.resolved_buckets().unwrap().unwrap();
+        assert_eq!(buckets.len(), 2);
+        assert_eq!(buckets[0].credentials_source, "aksk");
+        assert_eq!(
+            buckets[0].s3_access_key_id.as_deref(),
+            Some("bucket-access")
+        );
+        assert_eq!(
+            buckets[0].s3_secret_access_key.as_ref().unwrap().expose(),
+            "bucket-secret"
+        );
+        assert_eq!(buckets[1].credentials_source, "iam");
+        assert!(buckets[1].s3_access_key_id.is_none());
+        assert!(buckets[1].s3_secret_access_key.is_none());
+        assert!(buckets[1].s3_session_token.is_none());
+        assert!(WorkerConfig::default()
+            .resolved_buckets()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bucket_connection_defaults_inherit_without_overwriting_local_values() {
+        let cfg = WorkerConfig {
+            backend: Some("s3".into()),
+            s3_region: Some("us-east-1".into()),
+            s3_endpoint: Some("http://default-s3:9000".into()),
+            s3_path_style: Some(true),
+            buckets: Some(vec![
+                BucketConfig {
+                    name: "inherited".into(),
+                    credentials_source: "iam".into(),
+                    ..Default::default()
+                },
+                BucketConfig {
+                    name: "overridden".into(),
+                    credentials_source: "iam".into(),
+                    s3_region: Some("us-west-2".into()),
+                    s3_endpoint: Some("http://local-s3:9001".into()),
+                    s3_path_style: Some(false),
+                    ..Default::default()
+                },
+            ]),
+            ..Default::default()
+        };
+        let buckets = cfg.resolved_buckets().unwrap().unwrap();
+        assert_eq!(buckets[0].s3_region.as_deref(), Some("us-east-1"));
+        assert_eq!(
+            buckets[0].s3_endpoint.as_deref(),
+            Some("http://default-s3:9000")
+        );
+        assert_eq!(buckets[0].s3_path_style, Some(true));
+        assert_eq!(buckets[1].s3_region.as_deref(), Some("us-west-2"));
+        assert_eq!(
+            buckets[1].s3_endpoint.as_deref(),
+            Some("http://local-s3:9001")
+        );
+        assert_eq!(buckets[1].s3_path_style, Some(false));
+        assert!(cfg.buckets.as_ref().unwrap()[0].s3_region.is_none());
+
+        for (backend, defaults, overrides, field, expected) in [
+            (
+                "gcs",
+                "gcs_endpoint = 'http://default-gcs'",
+                "",
+                "gcs_endpoint",
+                "http://default-gcs",
+            ),
+            (
+                "azure",
+                "azure_account = 'default-account'",
+                "",
+                "azure_account",
+                "default-account",
+            ),
+            (
+                "azure",
+                "azure_account = 'default-account'\nazure_endpoint = 'http://default-azure'",
+                "azure_account = 'local-account'",
+                "azure_account",
+                "local-account",
+            ),
+        ] {
+            let patch = WorkerConfigPatch::from_toml(&format!(
+                "backend = '{backend}'\n{defaults}\n[[buckets]]\nname = 'bucket'\ncredentials_source = 'iam'\n{overrides}"
+            )).unwrap();
+            let cfg = WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+            let bucket = cfg.resolved_buckets().unwrap().unwrap().remove(0);
+            let value = match field {
+                "gcs_endpoint" => bucket.gcs_endpoint.as_deref(),
+                _ => bucket.azure_account.as_deref(),
+            };
+            assert_eq!(value, Some(expected));
+            if overrides.contains("local-account") {
+                assert_eq!(
+                    bucket.azure_endpoint.as_deref(),
+                    Some("http://default-azure")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bucket_list_rejects_empty_duplicates_and_unsafe_names() {
+        let mut cfg = WorkerConfig {
+            backend: Some("gcs".into()),
+            buckets: Some(Vec::new()),
+            ..Default::default()
+        };
+        assert!(cfg.validate().is_err());
+        for name in [
+            "", ".", "..", "a/b", "a\\b", "a?b", "a#b", "a%b", "a b", "a\nb", "a\0b",
+        ] {
+            cfg.buckets = Some(vec![BucketConfig {
+                name: name.into(),
+                credentials_source: "iam".into(),
+                ..Default::default()
+            }]);
+            assert!(cfg.validate().is_err(), "accepted invalid bucket name");
+        }
+        cfg.backend = Some("azure".into());
+        cfg.buckets = Some(vec![
+            BucketConfig {
+                name: "same-container".into(),
+                credentials_source: "iam".into(),
+                azure_account: Some("first-account".into()),
+                ..Default::default()
+            },
+            BucketConfig {
+                name: "same-container".into(),
+                credentials_source: "iam".into(),
+                azure_account: Some("second-account".into()),
+                ..Default::default()
+            },
+        ]);
+        assert!(cfg
+            .resolved_buckets()
+            .unwrap_err()
+            .to_string()
+            .contains("duplicate"));
+    }
+
+    #[test]
+    fn buckets_reject_all_top_level_credentials_without_inheriting_them() {
+        for setting in [
+            "credentials_source = 'iam'",
+            "s3_access_key_id = 'global-access'",
+            "s3_secret_access_key = 'global-secret'",
+            "s3_session_token = 'global-session'",
+            "gcs_access_key_id = 'global-access'",
+            "gcs_secret_access_key = 'global-secret'",
+            "azure_shared_key = 'global-secret'",
+            "credential_broker_url = 'https://broker.example/global-secret'",
+            "credential_broker_request = { token = 'global-secret' }",
+        ] {
+            let patch = WorkerConfigPatch::from_toml(&format!(
+                "backend = 'gcs'\n{setting}\n[[buckets]]\nname = 'bucket'\ncredentials_source = 'iam'"
+            )).unwrap();
+            let error =
+                WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap_err();
+            assert!(error.to_string().contains("top-level"));
+            assert!(!format!("{error:?}").contains("global-secret"));
+        }
+    }
+
+    #[test]
+    fn bucket_sources_and_backend_credentials_are_required() {
+        for source in ["", "auto", "static", "IAM", " aksk", "broker "] {
+            let cfg = WorkerConfig {
+                backend: Some("gcs".into()),
+                buckets: Some(vec![BucketConfig {
+                    name: "bucket".into(),
+                    credentials_source: source.into(),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            };
+            assert!(cfg.validate().is_err(), "accepted noncanonical source");
+        }
+        for invalid in [
+            "[[buckets]]\nname = 'bucket'",
+            "[[buckets]]\ncredentials_source = 'iam'",
+            "[[buckets]]\nname = 'bucket'\ncredentials_source = 'iam'\nunknown = 'value'",
+        ] {
+            assert!(WorkerConfigPatch::from_toml(invalid).is_err());
+        }
+        for (backend, fields) in [
+            ("s3", "credentials_source = 'iam'"),
+            ("azure", "credentials_source = 'iam'"),
+            ("s3", "credentials_source = 'aksk'\ns3_region = 'us-east-1'"),
+            ("s3", "credentials_source = 'aksk'\ns3_region = 'us-east-1'\ns3_access_key_id = 'access'\ns3_secret_access_key = ''"),
+            ("gcs", "credentials_source = 'aksk'"),
+            ("gcs", "credentials_source = 'aksk'\ngcs_access_key_id = 'access'"),
+            ("azure", "credentials_source = 'aksk'\nazure_account = 'account'"),
+            ("gcs", "credentials_source = 'broker'"),
+            ("gcs", "credentials_source = 'broker'\ncredential_broker_url = 'https://broker.example/'"),
+            ("gcs", "credentials_source = 'broker'\ncredential_broker_url = ''\ncredential_broker_request = {}"),
+        ] {
+            let patch = WorkerConfigPatch::from_toml(&format!(
+                "backend = '{backend}'\n[[buckets]]\nname = 'bucket'\n{fields}"
+            )).unwrap();
+            assert!(WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err());
+        }
+        for (backend, fields) in [
+            ("gcs", "credentials_source = 'aksk'\ngcs_access_key_id = 'access'\ngcs_secret_access_key = 'secret'"),
+            ("azure", "credentials_source = 'aksk'\nazure_account = 'account'\nazure_shared_key = 'key'"),
+            ("gcs", "credentials_source = 'broker'\ncredential_broker_url = 'https://broker.example/'\ncredential_broker_request = { token = 'request' }"),
+        ] {
+            let patch = WorkerConfigPatch::from_toml(&format!(
+                "backend = '{backend}'\n[[buckets]]\nname = 'bucket'\n{fields}"
+            )).unwrap();
+            WorkerConfig::resolve(patch, Default::default(), Default::default()).unwrap();
+        }
+    }
+
+    #[test]
+    fn bucket_environment_replaces_the_entire_file_array() {
+        let file = WorkerConfigPatch::from_toml(
+            r#"
+backend = "s3"
+s3_region = "us-east-1"
+[[buckets]]
+name = "retained-name"
+credentials_source = "aksk"
+s3_access_key_id = "file-access"
+s3_secret_access_key = "file-secret"
+[[buckets]]
+name = "removed-name"
+credentials_source = "iam"
+"#,
+        )
+        .unwrap();
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_BUCKETS")
+                .then(|| r#"[{"name":"retained-name","credentials_source":"iam"}]"#.into())
+        })
+        .unwrap();
+        let cfg = WorkerConfig::resolve(file.clone(), env, Default::default()).unwrap();
+        let buckets = cfg.resolved_buckets().unwrap().unwrap();
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[0].name, "retained-name");
+        assert_eq!(buckets[0].credentials_source, "iam");
+        assert_eq!(buckets[0].s3_region.as_deref(), Some("us-east-1"));
+        assert!(buckets[0].s3_access_key_id.is_none());
+        assert!(buckets[0].s3_secret_access_key.is_none());
+
+        let empty_env = WorkerConfigPatch::from_env_with(|_| None).unwrap();
+        let cfg = WorkerConfig::resolve(file.clone(), empty_env, Default::default()).unwrap();
+        assert_eq!(cfg.buckets.unwrap().len(), 2);
+        let replace_with_empty = WorkerConfigPatch::from_env_with(|key| {
+            (key == "TALON_WORKER_BUCKETS").then(|| "[]".into())
+        })
+        .unwrap();
+        assert!(WorkerConfig::resolve(file, replace_with_empty, Default::default()).is_err());
+    }
+
+    #[test]
+    fn bucket_debug_and_parse_errors_hide_secrets() {
+        let bucket = BucketConfig {
+            name: "bucket".into(),
+            credentials_source: "iam".into(),
+            s3_secret_access_key: Some("s3-secret-marker".to_string().into()),
+            s3_session_token: Some("session-secret-marker".to_string().into()),
+            gcs_secret_access_key: Some("gcs-secret-marker".to_string().into()),
+            azure_shared_key: Some("azure-secret-marker".to_string().into()),
+            credential_broker_url: Some("https://broker/secret-marker".to_string().into()),
+            credential_broker_request: Some(
+                serde_json::json!({"token": "request-secret-marker"}).into(),
+            ),
+            ..Default::default()
+        };
+        let cfg = WorkerConfig {
+            buckets: Some(vec![bucket.clone()]),
+            ..Default::default()
+        };
+        let patch = WorkerConfigPatch {
+            buckets: Some(vec![bucket.clone()]),
+            ..Default::default()
+        };
+        for debug in [
+            format!("{bucket:?}"),
+            format!("{cfg:?}"),
+            format!("{patch:?}"),
+        ] {
+            assert!(debug.contains("[REDACTED]"));
+            assert!(!debug.contains("secret-marker"));
+        }
+        for input in [
+            r#"[{"name":"bucket","credentials_source":"iam","s3_secret_access_key":"secret-marker"}"#,
+            r#"[{"name":"bucket","credentials_source":"iam","s3_path_style":"secret-marker"}]"#,
+            r#"[{"name":"bucket","credentials_source":"iam","secret-marker":"value"}]"#,
+            r#"[{"name":"bucket","credentials_source":"iam","s3_secret_access_key":["secret-marker"]}]"#,
+            "null",
+            "",
+        ] {
+            let error = WorkerConfigPatch::from_env_with(|key| {
+                (key == "TALON_WORKER_BUCKETS").then(|| input.into())
+            })
+            .unwrap_err();
+            for rendered in [error.to_string(), format!("{error:?}")] {
+                assert!(rendered.contains("TALON_WORKER_BUCKETS"));
+                assert!(rendered.contains("line"));
+                assert!(rendered.contains("column"));
+                assert!(!rendered.contains("secret-marker"));
+            }
+        }
     }
 
     #[test]

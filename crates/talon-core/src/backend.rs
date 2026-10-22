@@ -6,7 +6,7 @@
 //! different failure modes, and it is driven off the data-plane ring by the
 //! loader thread pool (see `DESIGN.md`).
 
-use crate::{ObjectId, Result, Version};
+use crate::{Backend, ObjectId, Result, Version};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::Path;
@@ -52,6 +52,23 @@ pub struct ListPage {
 /// A durable blob backend that workers load blocks/pages from on cache miss.
 #[async_trait]
 pub trait BackendStore: Send + Sync {
+    /// Check whether a backend and bucket may be served, before cache access.
+    ///
+    /// Unrestricted stores accept every bucket. A configured registry overrides
+    /// this so cached data cannot bypass its bucket allowlist.
+    fn validate_bucket(&self, backend: Backend, bucket: &str) -> Result<()> {
+        let _ = (backend, bucket);
+        Ok(())
+    }
+
+    /// Check an object's complete target before reading or populating the cache.
+    ///
+    /// Stores with additional URL/path constraints override this method so
+    /// malformed targets cannot bypass validation through cached data.
+    fn validate_object(&self, object: &ObjectId) -> Result<()> {
+        self.validate_bucket(object.backend, &object.bucket)
+    }
+
     /// List objects under `prefix` within `bucket`, one page at a time.
     ///
     /// `prefix` is matched literally against object keys; an empty prefix lists

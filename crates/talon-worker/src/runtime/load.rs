@@ -243,7 +243,7 @@ impl WorkerRuntime {
             self.load_inflight_bytes >= minimum,
             "load_inflight_bytes must fit one page or whole block"
         );
-        self.ensure_configured_backend(block.object.backend)?;
+        self.ensure_configured_object(&block.object)?;
         if block.version.as_str().trim().is_empty() {
             anyhow::bail!("load requires a non-empty source version");
         }
