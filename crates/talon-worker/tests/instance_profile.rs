@@ -253,7 +253,6 @@ cache_dirs = [{}]
         ),
     )
     .unwrap();
-    drop(reservation);
     let mut command = tokio::process::Command::new(env!("CARGO_BIN_EXE_talon-worker"));
     command
         .arg("--config")
@@ -424,6 +423,7 @@ cache_dirs = [{}]
             .write_all(auth.as_bytes())
             .unwrap();
     }
+    drop(reservation);
     let child = command.spawn().unwrap();
     (child, listen)
 }
@@ -559,6 +559,7 @@ async fn worker_reads_one_bucket(backend: Backend, mode: IdentityMode) {
     // real worker heartbeat; an absent coordinator must not be bypassed in production.
     let coordinator = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let coordinator_addr = coordinator.local_addr().unwrap();
+    let (ready_tx, ready_rx) = tokio::sync::watch::channel(false);
     let control = tokio::spawn(async move {
         loop {
             let (mut stream, _) = coordinator.accept().await.unwrap();
@@ -568,17 +569,17 @@ async fn worker_reads_one_bucket(backend: Backend, mode: IdentityMode) {
             let mut frame = header.to_vec();
             frame.resize(HEADER_LEN + header_value.length as usize, 0);
             stream.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
-            assert!(matches!(
-                codec::decode(&frame).unwrap().1,
-                ControlMessage::NodeStatusHeartbeat { .. }
-            ));
+            let ControlMessage::NodeStatusHeartbeat { status } = codec::decode(&frame).unwrap().1
+            else {
+                panic!("expected worker heartbeat");
+            };
             stream
                 .write_all(
                     &codec::encode(
                         header_value.request_id,
                         &ControlMessage::NodeStatusAck {
                             accepted: true,
-                            serving: true,
+                            serving: status.ready,
                             detail: None,
                         },
                     )
@@ -586,9 +587,10 @@ async fn worker_reads_one_bucket(backend: Backend, mode: IdentityMode) {
                 )
                 .await
                 .unwrap();
+            ready_tx.send_replace(status.ready);
         }
     });
-    let (mut child, listen) = start_worker(origin, coordinator_addr, &root, backend, mode);
+    let (mut child, mut listen) = start_worker(origin, coordinator_addr, &root, backend, mode);
     tokio::time::timeout(Duration::from_secs(15), async {
         let mut stream = loop {
             if child.try_wait().unwrap().is_some() {
@@ -600,13 +602,30 @@ async fn worker_reads_one_bucket(backend: Backend, mode: IdentityMode) {
                     .read_to_string(&mut error)
                     .await
                     .unwrap();
+                // The child cannot inherit the reservation. Another listener
+                // may claim its port before it binds, so retry only that startup
+                // failure, within the same deadline. No data has been read yet.
+                let address_in_use = std::io::Error::from_raw_os_error(libc::EADDRINUSE);
+                if error.trim() == format!("Error: {address_in_use}") {
+                    fixture.paths.lock().unwrap().clear();
+                    (child, listen) = start_worker(origin, coordinator_addr, &root, backend, mode);
+                    continue;
+                }
                 panic!(
                     "worker exited before serving: {error}; requests: {:?}",
                     fixture.paths.lock().unwrap()
                 );
             }
-            if let Ok(stream) = TcpStream::connect(listen).await {
-                break stream;
+            // A released port reservation can briefly belong to another test's
+            // listener. TCP connect alone does not prove this worker started.
+            // On the forced Tokio path, a ready heartbeat follows binding the
+            // data listener. The Ack may still be in flight, so the first read
+            // below continues to tolerate an Unavailable response.
+            let ready = *ready_rx.borrow();
+            if ready {
+                if let Ok(stream) = TcpStream::connect(listen).await {
+                    break stream;
+                }
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
