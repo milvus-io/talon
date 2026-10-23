@@ -586,7 +586,7 @@ impl Default for WorkerConfig {
             background_delete_batch_size: 1024,
             background_io_max_mb_per_sec: 8,
             background_delete_max_per_sec: 1024,
-            async_eviction_enabled: false,
+            async_eviction_enabled: true,
             stale_gc_enabled: true,
             stale_gc_head_concurrency: 4,
             stale_gc_head_max_per_sec: 32,
@@ -1049,7 +1049,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
     ConfigVar { env: "TALON_WORKER_STALE_GC_ENABLED", key: "stale_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Check blocks idle over 24 hours for deleted backend objects; cache successful checks for 24 hours." },
     ConfigVar { env: "TALON_WORKER_STALE_GC_HEAD_CONCURRENCY", key: "stale_gc_head_concurrency", default: Some("4"), cli: false, secret: false, help: "Maximum concurrent backend HEAD checks in stale GC." },
     ConfigVar { env: "TALON_WORKER_STALE_GC_HEAD_MAX_PER_SEC", key: "stale_gc_head_max_per_sec", default: Some("32"), cli: false, secret: false, help: "Backend HEAD requests per second for stale GC; zero disables throttling." },
-    ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("false"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
+    ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_ENABLED", key: "async_eviction_enabled", default: Some("true"), cli: false, secret: false, help: "Enable background eviction at cache occupancy watermarks." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_HIGH_WATERMARK", key: "async_eviction_high_watermark", default: Some("0.9"), cli: false, secret: false, help: "Start background eviction at this fraction of capacity_bytes." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK", key: "async_eviction_low_watermark", default: Some("0.8"), cli: false, secret: false, help: "Stop background eviction at or below this fraction of capacity_bytes." },
     ConfigVar { env: "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES", key: "async_eviction_check_interval_minutes", default: Some("1"), cli: false, secret: false, help: "Background cache occupancy check interval in minutes." },
@@ -3402,7 +3402,7 @@ token = "file-token"
         assert_eq!(c.async_eviction_low_watermark, 0.7);
         assert_eq!(c.async_eviction_check_interval_minutes, 1);
         let d = WorkerConfig::default();
-        assert!(!d.async_eviction_enabled);
+        assert!(d.async_eviction_enabled);
         assert_eq!(
             (
                 d.async_eviction_high_watermark,

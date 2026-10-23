@@ -108,7 +108,7 @@ GC/checkpoint error and progress metrics remain available.
 
 ## Cache watermarks
 
-Enable watermark eviction with:
+Watermark eviction is enabled by default. To customize the watermarks:
 
 ```toml
 async_eviction_enabled = true
@@ -124,7 +124,9 @@ TALON_WORKER_ASYNC_EVICTION_LOW_WATERMARK=0.75
 TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES=1
 ```
 
-Defaults are disabled, high `0.9`, low `0.8`, and `1` minute between idle checks.
+Defaults are enabled, high `0.9`, low `0.8`, and `1` minute between idle checks.
+Set `async_eviction_enabled = false` or
+`TALON_WORKER_ASYNC_EVICTION_ENABLED=false` to disable background eviction.
 While an active cycle makes progress, its next slice runs immediately. A cycle
 blocked by recent accesses, pins or errors retries after one second. Independent
 victims are unlinked with bounded concurrency and the shared deletion budget.

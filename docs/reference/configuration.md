@@ -447,7 +447,7 @@ Backend HEAD requests per second for stale GC; zero disables throttling.
 Enable background eviction at cache occupancy watermarks.
 
 - **Environment variable:** `TALON_WORKER_ASYNC_EVICTION_ENABLED`
-- **Default:** `false`
+- **Default:** `true`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
 ### `async_eviction_high_watermark`
