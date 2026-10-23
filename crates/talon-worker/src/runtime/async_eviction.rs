@@ -517,7 +517,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovered_cache_is_reclaimed_without_requests_and_service_stops() {
+    async fn recovered_cache_is_reclaimed_by_default_and_service_stops() {
         let root = tempfile::tempdir().unwrap();
         let r = runtime(root.path(), false, 160);
         for n in 0..9 {
@@ -526,8 +526,6 @@ mod tests {
         drop(r);
         let r = Arc::new(runtime(root.path(), false, 160));
         let config = WorkerConfig {
-            async_eviction_enabled: true,
-            async_eviction_check_interval_minutes: 1,
             ownership_gc_enabled: false,
             ..Default::default()
         };
@@ -572,6 +570,7 @@ mod tests {
         let disabled = crate::runtime::WorkerBackground::start(
             r.clone(),
             &WorkerConfig {
+                async_eviction_enabled: false,
                 ownership_gc_enabled: false,
                 ..Default::default()
             },
