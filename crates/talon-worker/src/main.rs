@@ -532,6 +532,9 @@ async fn run() -> anyhow::Result<()> {
         .cloned()
         .unwrap_or_else(|| PathBuf::from("/tmp/talon-cache"));
     std::fs::create_dir_all(&root)?;
+    // The running store uses this root, not the sum of all configured paths.
+    // Fail before initializing identity, recovering cache data, or registering.
+    talon_worker::capacity::validate_filesystem_capacity(&root, cfg.capacity_bytes)?;
     let cache_root_lock = Arc::new(talon_worker::page_access_store::CacheRootLock::acquire(
         &root,
     )?);

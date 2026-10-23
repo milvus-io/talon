@@ -364,7 +364,7 @@ Colon-separated cache directories.
 
 ### `capacity_bytes`
 
-Worker cache capacity (bytes).
+Worker cache capacity (bytes). Startup fails if this exceeds the total filesystem capacity of the first cache directory (the active cache root), or if capacity cannot be queried. This checks total size, not free space or per-directory quotas; leave headroom for metadata and other files.
 
 - **Environment variable:** `TALON_WORKER_CAPACITY_BYTES`
 - **Default:** `68719476736`

@@ -1038,7 +1038,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         default: Some("68719476736"),
         cli: false,
         secret: false,
-        help: "Worker cache capacity (bytes).",
+        help: "Worker cache capacity (bytes). Startup fails if this exceeds the total filesystem capacity of the first cache directory (the active cache root), or if capacity cannot be queried. This checks total size, not free space or per-directory quotas; leave headroom for metadata and other files.",
     },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },

@@ -11,10 +11,48 @@
 //! remembered so reads/evictions address the right device.
 
 use std::collections::HashMap;
+use std::os::fd::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
 
+use anyhow::Context;
 use talon_core::{BlockId, Error, Result};
+
+/// Reject a cache limit larger than the filesystem backing the active cache root.
+///
+/// Compare total capacity, not free space: existing cache files must not make a
+/// restart fail. This does not reserve space or account for per-directory quotas.
+pub fn validate_filesystem_capacity(root: &Path, capacity_bytes: u64) -> anyhow::Result<()> {
+    let total_bytes = filesystem_capacity(root)?;
+    anyhow::ensure!(
+        u128::from(capacity_bytes) <= total_bytes,
+        "configured capacity_bytes={capacity_bytes} exceeds filesystem capacity \
+         {total_bytes} bytes for cache directory {}",
+        root.display()
+    );
+    Ok(())
+}
+
+fn filesystem_capacity(root: &Path) -> anyhow::Result<u128> {
+    let directory = std::fs::File::open(root)
+        .with_context(|| format!("open cache directory {} for capacity check", root.display()))?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: directory owns a valid fd and stats points to writable storage of
+    // the required size. Only read the struct after fstatvfs reports success.
+    if unsafe { libc::fstatvfs(directory.as_raw_fd(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error()).with_context(|| {
+            format!(
+                "inspect filesystem capacity for cache directory {}",
+                root.display()
+            )
+        });
+    }
+    // SAFETY: the successful fstatvfs call initialized stats.
+    let stats = unsafe { stats.assume_init() };
+    // f_blocks is expressed in f_frsize units, not f_bsize. Use u128 to avoid
+    // overflow even if both native counters are 64 bits wide.
+    Ok(u128::from(stats.f_blocks) * u128::from(stats.f_frsize))
+}
 
 /// One cache directory and its byte capacity.
 #[derive(Debug, Clone)]
@@ -169,6 +207,45 @@ impl CacheDirs {
 mod tests {
     use super::*;
     use talon_core::{Backend, ObjectId, Version};
+
+    #[test]
+    fn filesystem_capacity_checks_total_not_remaining_space() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cached-block"), [1u8; 4096]).unwrap();
+        let total = u64::try_from(filesystem_capacity(dir.path()).unwrap()).unwrap();
+        assert!(total > 0);
+        validate_filesystem_capacity(dir.path(), total - 1).unwrap();
+        validate_filesystem_capacity(dir.path(), total).unwrap();
+        let error = validate_filesystem_capacity(dir.path(), total + 1).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains(&format!("capacity_bytes={}", total + 1)));
+        assert!(message.contains(&format!("{total} bytes")));
+        assert!(message.contains(&dir.path().display().to_string()));
+    }
+
+    #[test]
+    fn filesystem_capacity_follows_the_cache_directory_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir(&cache).unwrap();
+        let link = dir.path().join("cache-link");
+        std::os::unix::fs::symlink(&cache, &link).unwrap();
+        let total = u64::try_from(filesystem_capacity(&cache).unwrap()).unwrap();
+        validate_filesystem_capacity(&link, total).unwrap();
+        assert!(validate_filesystem_capacity(&link, total + 1).is_err());
+    }
+
+    #[test]
+    fn filesystem_capacity_query_failure_is_fatal() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        let error = validate_filesystem_capacity(&missing, 1).unwrap_err();
+        assert!(error.to_string().contains(&missing.display().to_string()));
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
 
     fn block(n: u64) -> BlockId {
         BlockId::new(
