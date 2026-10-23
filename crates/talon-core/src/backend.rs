@@ -10,6 +10,46 @@ use crate::{Backend, ObjectId, Result, Version};
 use async_trait::async_trait;
 use bytes::Bytes;
 use std::path::Path;
+use std::str::FromStr;
+use std::sync::Arc;
+
+/// Stable, non-secret identity of one normalized origin access configuration.
+///
+/// This spelling is also used in cache directory names, so parsing must reject
+/// alternate spellings and path syntax before recovery opens a directory.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct AccessScope(String);
+
+impl AccessScope {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl FromStr for AccessScope {
+    type Err = crate::Error;
+
+    fn from_str(value: &str) -> Result<Self> {
+        let digest = value
+            .strip_prefix("v1-")
+            .ok_or_else(|| crate::Error::Other("invalid backend access scope".into()))?;
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+        {
+            return Err(crate::Error::Other("invalid backend access scope".into()));
+        }
+        Ok(Self(value.to_owned()))
+    }
+}
+
+/// One validated origin binding and its independent cache identity.
+#[derive(Clone)]
+pub struct ResolvedBackend {
+    pub scope: Option<AccessScope>,
+    pub store: Arc<dyn BackendStore>,
+}
 
 /// Metadata about a source object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +92,25 @@ pub struct ListPage {
 /// A durable blob backend that workers load blocks/pages from on cache miss.
 #[async_trait]
 pub trait BackendStore: Send + Sync {
+    /// Whether maintenance may access this origin without initializing credentials.
+    fn ready_for_background(&self) -> bool {
+        true
+    }
+
+    /// Bind request credentials before any cache access. Stores without a
+    /// resolver reject this explicitly rather than ignoring supplied credentials.
+    async fn bind_request(
+        &self,
+        backend: Backend,
+        bucket: &str,
+        broker: &crate::BrokerConfig,
+    ) -> Result<ResolvedBackend> {
+        let _ = (backend, bucket, broker);
+        Err(crate::Error::Unsupported(
+            "backend does not support request credential binding".into(),
+        ))
+    }
+
     /// Check whether a backend and bucket may be served, before cache access.
     ///
     /// Unrestricted stores accept every bucket. A configured registry overrides

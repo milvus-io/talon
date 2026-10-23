@@ -135,7 +135,7 @@ impl ConnectionPool {
     /// Clients wrap their write/flush/read sequence in this so a peer that
     /// accepts the connection and then never replies cannot hang the caller.
     pub fn request_timeout(&self) -> Duration {
-        self.request_timeout
+        talon_transport::request_timeout(self.request_timeout)
     }
 
     /// The deadline applied to establishing a connection.
@@ -164,7 +164,9 @@ impl ConnectionPool {
         F: std::future::Future<Output = Result<T, E>>,
         E: From<std::io::Error>,
     {
-        self.deadlines.run(what, timeout, fut).await
+        self.deadlines
+            .run(what, talon_transport::request_timeout(timeout), fut)
+            .await
     }
 
     /// Take a ready connection for `addr`: a fresh-enough pooled one, or a newly
@@ -262,6 +264,39 @@ mod tests {
     use std::sync::Arc;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    #[tokio::test(start_paused = true)]
+    async fn credential_requests_allow_cold_broker_acquisition_without_shortening_loads() {
+        let pool = ConnectionPool::new();
+        let delayed = || async {
+            tokio::time::sleep(DEFAULT_REQUEST_TIMEOUT + Duration::from_secs(1)).await;
+            Ok::<_, std::io::Error>(())
+        };
+        assert!(pool
+            .with_request_deadline("static", delayed())
+            .await
+            .is_err());
+        talon_transport::RequestContext::from_properties(&[(
+            "credential_broker",
+            r#"{"url":"http://broker","request":{"csp":"aws"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
+        )])
+        .unwrap()
+        .scope(async {
+            assert!(pool
+                .with_request_deadline("dynamic", delayed())
+                .await
+                .is_ok());
+            let result: Result<(), std::io::Error> = pool
+                .with_deadline("long load", Duration::from_secs(300), async {
+                    tokio::time::sleep(Duration::from_secs(121)).await;
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_ok());
+        })
+        .await;
+        assert_eq!(pool.request_timeout(), DEFAULT_REQUEST_TIMEOUT);
+    }
 
     /// An echo server that handles many sequential 1-byte exchanges per
     /// connection, counting how many connections it accepts.

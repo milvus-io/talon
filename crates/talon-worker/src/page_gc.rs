@@ -149,16 +149,19 @@ pub(crate) struct PageGcMetrics {
 }
 impl PageGcMetrics {
     pub fn new(r: &Metrics, namespace: &str) -> Self {
+        Self::with_scope(r, namespace, None)
+    }
+    pub fn with_scope(r: &Metrics, namespace: &str, scope: Option<&str>) -> Self {
         let c = |name, help| r.counter(name, help, Default::default());
         // Counts accumulate process-wide. Gauges describe one namespace's
         // policy or latest maintenance state and must never overwrite another's.
-        let g = |name, help| {
-            r.gauge(
-                name,
-                help,
-                talon_core::metrics::labels(&[("namespace", namespace)]),
-            )
+        let gauge_labels = match scope {
+            Some(scope) => {
+                talon_core::metrics::labels(&[("namespace", namespace), ("access_scope", scope)])
+            }
+            None => talon_core::metrics::labels(&[("namespace", namespace)]),
         };
+        let g = |name, help| r.gauge(name, help, gauge_labels.clone());
         Self {
             cleanup_scanned: c("talon_worker_page_cleanup_scanned_total", "Disk entries examined for checkpoint leftovers."),
             cleanup_removed: c("talon_worker_page_cleanup_removed_total", "Leftover files and empty page directories removed."),

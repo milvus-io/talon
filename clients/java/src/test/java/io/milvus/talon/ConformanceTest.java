@@ -61,7 +61,7 @@ public final class ConformanceTest {
         });
         check("v2 carrier envelope matches Rust", () -> {
             TraceContext parent = TraceContext.fromW3c("00-11111111111111111111111111111111-2222222222222222-01", "vendor=value");
-            assertBytes(byName.get("v2.range.context"), Telemetry.envelope(byName.get("data.range_request"), parent, null));
+            assertBytes(byName.get("v2.range.context"), Frame.envelope(byName.get("data.range_request"), parent, null));
             assertBytes(byName.get("v2.response.raw"), Frame.decode(byName.get("v2.response.raw")).encode());
             assertTrue(TraceContext.fromW3c("invalid", null) == null, "invalid parent");
         });
@@ -71,31 +71,134 @@ public final class ConformanceTest {
             byte[] frame = byName.get("data.range_request");
             Telemetry.configure(java.util.Set.of("worker"), () -> a);
             Telemetry.call(RequestOptions.INHERIT, () -> {
-                assertBytes(Telemetry.envelope(frame, a, null), Telemetry.envelope(frame, "worker"));
+                assertBytes(Frame.envelope(frame, a, null), Frame.envelope(frame, "worker"));
                 Telemetry.call(RequestOptions.explicit(b), () -> {
-                    assertBytes(Telemetry.envelope(frame, b, null), Telemetry.envelope(frame, "worker"));
+                    assertBytes(Frame.envelope(frame, b, null), Frame.envelope(frame, "worker"));
                     return null;
                 });
                 Telemetry.call(RequestOptions.ROOT, () -> {
-                    assertBytes(frame, Telemetry.envelope(frame, "worker"));
+                    assertBytes(frame, Frame.envelope(frame, "worker"));
                     return null;
                 });
-                assertBytes(Telemetry.envelope(frame, a, null), Telemetry.envelope(frame, "worker"));
-                assertBytes(frame, Telemetry.envelope(frame, "old-worker"));
+                assertBytes(Frame.envelope(frame, a, null), Frame.envelope(frame, "worker"));
+                assertBytes(frame, Frame.envelope(frame, "old-worker"));
                 return null;
             });
-            assertBytes(frame, Telemetry.envelope(frame, "worker"));
+            assertBytes(frame, Frame.envelope(frame, "worker"));
             Telemetry.configure(java.util.Set.of(), null);
+        });
+        check("broker request properties survive disabled tracing without ambient inheritance", () -> {
+            Telemetry.configure(Set.of(), null);
+            byte[] frame = byName.get("data.range_request");
+            String broker = "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\",\"bucket\":\"bucket\",\"region\":\"us-west-2\",\"roleArn\":\"fixture\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"us-west-2\"}}";
+            RequestOptions options = RequestOptions.ROOT.withCredentialBroker(broker);
+            RequestOptions.call(options, () -> {
+                byte[] encoded = Frame.envelope(frame, "worker");
+                assertEquals(4, encoded[2] & 255, "credential protocol version");
+                Frame.decode(encoded);
+                java.nio.ByteBuffer bytes = java.nio.ByteBuffer.wrap(encoded);
+                int metadataLength = bytes.getShort(16) & 65535;
+                assertEquals(6, encoded[18] & 255, "broker property key");
+                int jsonLength = bytes.getShort(19) & 65535;
+                assertEquals(broker, new String(encoded, 21, jsonLength, StandardCharsets.UTF_8), "broker JSON");
+                assertBytes(java.util.Arrays.copyOfRange(frame, 16, frame.length),
+                        java.util.Arrays.copyOfRange(encoded, 18 + metadataLength, encoded.length));
+                RequestOptions.call(RequestOptions.INHERIT, () -> {
+                    assertBytes(frame, Frame.envelope(frame, "worker"));
+                    return null;
+                });
+                assertEquals(4, Frame.envelope(frame, "worker")[2] & 255, "outer options restored");
+                return null;
+            });
+            assertBytes(frame, Frame.envelope(frame, "worker"));
         });
         check("known and resolved object sizes reach versioned reads", () -> {
             try (PoolPeer peer = new PoolPeer();
                     TalonClient client = TalonClient.connect(peer.address(), 1024)) {
-                assertBytes(new byte[] {42}, client.read("s3://bucket/key", "v1", 21, 20, 9));
+                assertBytes(new byte[] {42}, client.read("s3://bucket/key", "v1", 21, 20, 9, RequestOptions.INHERIT));
                 assertEquals(0, peer.statCalls.get(), "known stat avoids coordinator stat");
-                assertBytes(new byte[] {42}, client.read("s3://bucket/key", 0, 1));
+                assertBytes(new byte[] {42}, client.read("s3://bucket/key", 0, 1, RequestOptions.INHERIT));
                 assertEquals(List.of(21L, 1L), peer.readSizes, "total size forwarded in both paths");
-                assertBytes(new byte[0], client.read("s3://bucket/key", "v1", 21, 21, 1));
+                assertBytes(new byte[0], client.read("s3://bucket/key", "v1", 21, 21, 1, RequestOptions.INHERIT));
                 assertEquals(2, peer.readSizes.size(), "EOF completes without worker request");
+            }
+        });
+        check("Broker properties reach implicit stat, reads, list and load over TCP", () -> {
+            Telemetry.configure(Set.of(), null);
+            String broker = "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\",\"bucket\":\"bucket\",\"region\":\"us-west-2\",\"roleArn\":\"fixture\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"us-west-2\"}}";
+            RequestOptions options = RequestOptions.ROOT.withCredentialBroker(broker);
+            try (PoolPeer peer = new PoolPeer();
+                    TalonClient client = TalonClient.connect(peer.address(), 1024)) {
+                assertEquals("v1", client.stat("s3://bucket/key", options).version(), "URI stat");
+                assertBytes(new byte[] {42}, client.read("s3://bucket/key", 0, 1, options));
+                assertBytes(new byte[] {42}, client.read("s3://bucket/key", "v1", 1, 0, 1, options));
+                assertEquals(List.of(), client.list("s3/bucket", options), "list");
+                client.load(new LoadRequest("s3://bucket/key", "v1", 1), options);
+                client.batchLoad(List.of(new LoadRequest("s3://bucket/key", "v1", 1)), options);
+                client.stat("s3://bucket/key", RequestOptions.INHERIT);
+                assertEquals(List.of(broker, broker, broker, broker, broker, broker, broker, "STATIC"),
+                        peer.credentialProperties, "all object RPCs keep the selected configuration");
+            }
+        });
+        check("dynamic batch LOAD groups buckets independently on the same worker", () -> {
+            RequestOptions options = RequestOptions.ROOT.withCredentialBroker(
+                    "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\",\"region\":\"us-west-2\",\"roleArn\":\"fixture\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"us-west-2\"}}");
+            List<LoadRequest> files = List.of(
+                    new LoadRequest("s3://alpha/one", "v1", 1),
+                    new LoadRequest("s3://bravo/two", "v1", 1),
+                    new LoadRequest("s3://alpha/three", "v1", 1));
+            for (boolean dynamic : List.of(true, false)) {
+                try (PoolPeer peer = new PoolPeer();
+                        TalonClient client = TalonClient.connect(peer.address(), 8)) {
+                    client.batchLoad(files, dynamic ? options : RequestOptions.ROOT);
+                    assertEquals(dynamic ? List.of(2, 1) : List.of(3), peer.loadCounts, "scope-specific frame grouping");
+                    assertEquals(dynamic ? List.of(List.of("alpha", "alpha"), List.of("bravo"))
+                                    : List.of(List.of("alpha", "bravo", "alpha")),
+                            peer.loadBuckets, "each dynamic frame has exactly one bucket");
+                }
+            }
+        });
+        check("Broker network budgets apply to new and reused sockets without changing static requests", () -> {
+            try (ServerSocket listener = new ServerSocket(0, 1, java.net.InetAddress.getLoopbackAddress())) {
+                ExecutorService peer = Executors.newSingleThreadExecutor();
+                Future<Socket> accepted = peer.submit(listener::accept);
+                Class<?> poolType = Class.forName("io.milvus.talon.TalonClient$ConnectionPool");
+                java.lang.reflect.Constructor<?> constructor = poolType.getDeclaredConstructor(int.class);
+                constructor.setAccessible(true);
+                Object pool = constructor.newInstance(1);
+                Class<?> function = Class.forName("io.milvus.talon.TalonClient$IoFunction");
+                List<Socket> sockets = new ArrayList<>();
+                Object inspect = java.lang.reflect.Proxy.newProxyInstance(function.getClassLoader(), new Class<?>[]{function}, (proxy, method, values) -> {
+                    Socket socket = (Socket) values[0];
+                    sockets.add(socket);
+                    return socket.getSoTimeout();
+                });
+                java.lang.reflect.Method exchange = poolType.getDeclaredMethod("exchange", String.class, boolean.class, Long.class, function);
+                exchange.setAccessible(true);
+                RequestOptions options = RequestOptions.ROOT.withCredentialBroker(
+                        "{\"url\":\"http://localhost/broker\",\"request\":{},\"origin\":{\"endpoint\":\"storage.example\"}}");
+                try {
+                    RequestOptions.call(options, () -> {
+                        assertEquals(132_700, RequestOptions.requestTimeoutMillis(120_000), "single LOAD budget preserved");
+                        assertEquals(1_812_700, RequestOptions.requestTimeoutMillis(1_800_000), "longer batch LOAD budget preserved");
+                        return null;
+                    });
+                    for (boolean worker : List.of(false, true)) {
+                        Telemetry.IOCall<Integer> timeout = () -> {
+                            try { return (Integer) invoke(exchange, pool, "127.0.0.1:" + listener.getLocalPort(), worker, null, inspect); }
+                            catch (Exception failure) { throw new IOException(failure); }
+                        };
+                        assertEquals(42_700, RequestOptions.call(options, timeout), "Broker reply budget");
+                        assertEquals(30_000, RequestOptions.call(RequestOptions.ROOT, timeout), "static reply budget");
+                    }
+                    assertTrue(sockets.stream().allMatch(socket -> socket == sockets.get(0)), "same pooled socket used across credential modes");
+                } finally {
+                    java.lang.reflect.Method close = poolType.getDeclaredMethod("close");
+                    close.setAccessible(true);
+                    invoke(close, pool);
+                    try { accepted.get(5, TimeUnit.SECONDS).close(); }
+                    finally { peer.shutdownNow(); }
+                }
             }
         });
         check("incompatible control schemas fail before decoding tags", () -> {
@@ -186,7 +289,7 @@ public final class ConformanceTest {
                     new LoadRequest("s3://bucket/bad", "v2", 8),
                     new LoadRequest("s3://bucket/good", "v1", 8));
                 boolean failed = false;
-                try { client.batchLoad(requests); }
+                try { client.batchLoad(requests, RequestOptions.INHERIT); }
                 catch (BatchLoadException error) {
                     assertEquals(List.of(new LoadFailure(1, false, "origin failure"), new LoadFailure(3, false, "origin failure")), error.failedFiles(), "failed input files");
                     failed = true;
@@ -198,11 +301,11 @@ public final class ConformanceTest {
         });
         check("LOAD and batch LOAD preserve sizes, versions and protocol batching", () -> {
             try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                assertEquals(new LoadResult(9, 2), client.load("s3://bucket/file", "v1", 9), "single result");
+                assertEquals(new LoadResult(9, 2), client.load("s3://bucket/file", "v1", 9, RequestOptions.INHERIT), "single result");
                 List<LoadRequest> requests = new ArrayList<>();
                 for (int i = 0; i < 1025; i++) requests.add(new LoadRequest("s3://bucket/file-" + i, "v2", 3));
                 requests.add(new LoadRequest("s3://bucket/empty", "v3", 0));
-                List<LoadResult> results = client.batchLoad(requests);
+                List<LoadResult> results = client.batchLoad(requests, RequestOptions.INHERIT);
                 assertEquals(1026, results.size(), "result count");
                 assertEquals(new LoadResult(0, 0), results.get(1025), "empty file result");
                 assertTrue(results.subList(0, 1025).stream().allMatch(r -> r.equals(new LoadResult(3, 1))), "ordered results");
@@ -214,16 +317,16 @@ public final class ConformanceTest {
         });
         check("batch LOAD splits by encoded bytes", () -> {
             try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                client.batchLoad(List.of(new LoadRequest("s3://bucket/" + "x".repeat(600_000), "v1", 16)));
+                client.batchLoad(List.of(new LoadRequest("s3://bucket/" + "x".repeat(600_000), "v1", 16)), RequestOptions.INHERIT);
                 assertEquals(List.of(1, 1), peer.loadCounts, "frame byte limit");
             }
         });
         check("empty LOAD is local and invalid input is rejected", () -> {
             try (TalonClient client = TalonClient.connect("127.0.0.1:1", 8)) {
-                assertEquals(List.of(), client.batchLoad(List.of()), "empty batch");
-                assertEquals(new LoadResult(0, 0), client.load("s3://bucket/empty", "v1", 0), "empty object");
+                assertEquals(List.of(), client.batchLoad(List.of(), RequestOptions.INHERIT), "empty batch");
+                assertEquals(new LoadResult(0, 0), client.load("s3://bucket/empty", "v1", 0, RequestOptions.INHERIT), "empty object");
                 boolean rejected = false;
-                try { client.load("s3://bucket/file", "v1", Long.MAX_VALUE); }
+                try { client.load("s3://bucket/file", "v1", Long.MAX_VALUE, RequestOptions.INHERIT); }
                 catch (IllegalArgumentException expected) { rejected = true; }
                 assertTrue(rejected, "overflow before network I/O");
             }
@@ -231,11 +334,11 @@ public final class ConformanceTest {
         check("LOAD refusals and malformed acknowledgements are not retried", () -> {
             for (boolean malformed : List.of(false, true)) {
                 try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                    client.load("s3://bucket/file", "v1", 1); // Prime a reused socket.
+                    client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT); // Prime a reused socket.
                     peer.rejectLoad = !malformed;
                     peer.wrongLoadRequestId = malformed;
                     boolean failed = false;
-                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
+                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)), RequestOptions.INHERIT); }
                     catch (BatchLoadException error) {
                         assertEquals(1, error.failedFiles().size(), "one unknown file");
                         assertTrue(error.failedFiles().get(0).uncertain(), "legacy refusal or malformed reply is unconfirmed");
@@ -252,7 +355,7 @@ public final class ConformanceTest {
                 try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
                     peer.workerState = state;
                     boolean failed = false;
-                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1))); }
+                    try { client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)), RequestOptions.INHERIT); }
                     catch (BatchLoadException error) {
                         assertEquals(TalonException.Code.UNAVAILABLE, ((TalonException) error.getCause()).code(), "availability");
                         assertEquals(0, error.failedFiles().get(0).index(), "unknown input");
@@ -308,7 +411,7 @@ public final class ConformanceTest {
             for (boolean batch : List.of(false, true)) {
                 for (boolean header : List.of(false, true)) {
                     try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                        client.load("s3://bucket/file", "v1", 1);
+                        client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT);
                         peer.slowLoadHeader = header;
                         peer.loadByteDelayMs = 100;
                         long start = System.nanoTime();
@@ -321,7 +424,7 @@ public final class ConformanceTest {
                         assertTrue(System.nanoTime() - start < TimeUnit.MILLISECONDS.toNanos(900), "deadline must not reset for each byte");
                         assertEquals(2, peer.loadCounts.size(), "timeout never retries the request");
                         peer.loadByteDelayMs = 0;
-                        assertEquals(new LoadResult(1, 1), client.load("s3://bucket/file", "v1", 1), "capacity released and a healthy connection used");
+                        assertEquals(new LoadResult(1, 1), client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT), "capacity released and a healthy connection used");
                     }
                 }
             }
@@ -353,7 +456,7 @@ public final class ConformanceTest {
                     expectBatchTimeout(client, 200);
                     assertTrue(peer.loadCounts.isEmpty(), "initial discovery is still pending");
                     peer.discoveryRelease.countDown();
-                    assertEquals(new LoadResult(1, 1), client.load("s3://bucket/file", "v1", 1), "background initialization survives request timeout");
+                    assertEquals(new LoadResult(1, 1), client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT), "background initialization survives request timeout");
                 } finally { peer.discoveryRelease.countDown(); }
             }
         });
@@ -365,19 +468,19 @@ public final class ConformanceTest {
                     String diagnostic = incompatibleSchema ? "control schema 5" : "invalid discovered member";
                     try (TalonClient client = TalonClient.connect(peer.address(), 8)) {
                         try {
-                            client.read("s3://bucket/file", "v1", 1, 0, 1);
+                            client.read("s3://bucket/file", "v1", 1, 0, 1, RequestOptions.INHERIT);
                             throw new AssertionError("malformed discovery accepted by read");
                         } catch (ProtocolException expected) {
                             assertTrue(expected.getMessage().contains(diagnostic), "read preserves protocol diagnostic");
                         }
                         try {
-                            client.load("s3://bucket/file", "v1", 1);
+                            client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT);
                             throw new AssertionError("malformed discovery accepted by LOAD");
                         } catch (ProtocolException expected) {
                             assertTrue(expected.getMessage().contains(diagnostic), "LOAD preserves protocol diagnostic");
                         }
                         try {
-                            client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)));
+                            client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)), RequestOptions.INHERIT);
                             throw new AssertionError("malformed discovery accepted by batch LOAD");
                         } catch (BatchLoadException expected) {
                             assertTrue(expected.getCause() instanceof ProtocolException, "batch preserves protocol cause");
@@ -391,7 +494,7 @@ public final class ConformanceTest {
                         boolean recovered = false;
                         while (System.nanoTime() < until) {
                             try {
-                                assertBytes(new byte[] {42}, client.read("s3://bucket/file", "v1", 1, 0, 1));
+                                assertBytes(new byte[] {42}, client.read("s3://bucket/file", "v1", 1, 0, 1, RequestOptions.INHERIT));
                                 recovered = true;
                                 break;
                             } catch (ProtocolException expected) { Thread.sleep(5); }
@@ -405,22 +508,22 @@ public final class ConformanceTest {
             try (PoolPeer peer = new PoolPeer()) {
                 peer.discoveryValidityMs = 100;
                 try (TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                    client.load("s3://bucket/file", "v1", 1);
+                    client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT);
                     peer.discoveryRelease = new CountDownLatch(1);
                     peer.discoveryArrived = new CountDownLatch(1);
                     assertTrue(peer.discoveryArrived.await(2, TimeUnit.SECONDS), "idle timer refreshes without requests");
                     Thread.sleep(150); // Exceed the advertised age while discovery remains blocked.
                     int queries = peer.discoveryCalls.get();
-                    for (int i = 0; i < 10; i++) assertBytes(new byte[] {42}, client.read("s3://bucket/file", "v1", 1, 0, 1));
-                    client.load("s3://bucket/file", "v1", 1);
-                    client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)));
+                    for (int i = 0; i < 10; i++) assertBytes(new byte[] {42}, client.read("s3://bucket/file", "v1", 1, 0, 1, RequestOptions.INHERIT));
+                    client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT);
+                    client.batchLoad(List.of(new LoadRequest("s3://bucket/file", "v1", 1)), RequestOptions.INHERIT);
                     assertEquals(queries, peer.discoveryCalls.get(), "foreground never requests discovery");
                     peer.workerState = 0;
                     peer.discoveryRelease.countDown();
                     long until = System.nanoTime() + TimeUnit.SECONDS.toNanos(2);
                     boolean offline = false;
                     while (System.nanoTime() < until) {
-                        try { client.read("s3://bucket/file", "v1", 1, 0, 1); }
+                        try { client.read("s3://bucket/file", "v1", 1, 0, 1, RequestOptions.INHERIT); }
                         catch (TalonException expected) {
                             assertEquals(TalonException.Code.UNAVAILABLE, expected.code(), "offline classification");
                             offline = true; break;
@@ -429,7 +532,7 @@ public final class ConformanceTest {
                     }
                     assertTrue(offline, "background publishes offline owner");
                     int loads = peer.loadCounts.size();
-                    try { client.load("s3://bucket/file", "v1", 1); throw new AssertionError("offline LOAD accepted"); }
+                    try { client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT); throw new AssertionError("offline LOAD accepted"); }
                     catch (TalonException expected) { assertEquals(TalonException.Code.UNAVAILABLE, expected.code(), "offline LOAD"); }
                     assertEquals(loads, peer.loadCounts.size(), "offline owner is not contacted");
                     peer.discoveryRelease = new CountDownLatch(1);
@@ -445,7 +548,7 @@ public final class ConformanceTest {
         });
         check("completed LOAD cancels its timer before connection reuse", () -> {
             try (PoolPeer peer = new PoolPeer(); TalonClient client = TalonClient.connect(peer.address(), 8)) {
-                client.load("s3://bucket/file", "v1", 1);
+                client.load("s3://bucket/file", "v1", 1, RequestOptions.INHERIT);
                 sendLoadWithDeadline(client, true, System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(200));
                 int connections = peer.accepts.get();
                 peer.loadByteDelayMs = 30;
@@ -696,17 +799,17 @@ public final class ConformanceTest {
                 for (Socket socket : peer.sockets) {
                     socket.close();
                 }
-                assertEquals("v1", client.stat("s3://bucket/key").version(), "fresh retry response");
+                assertEquals("v1", client.stat("s3://bucket/key", RequestOptions.INHERIT).version(), "fresh retry response");
                 assertEquals(1, peer.statAccepts.get(), "fresh metadata connection after closing sockets");
                 peer.malformedStat = true;
                 try {
-                    client.stat("s3://bucket/key");
+                    client.stat("s3://bucket/key", RequestOptions.INHERIT);
                     throw new AssertionError("malformed stat accepted");
                 } catch (ProtocolException expected) {
                     // A complete frame with an invalid body must also be discarded.
                 }
                 peer.malformedStat = false;
-                client.stat("s3://bucket/key");
+                client.stat("s3://bucket/key", RequestOptions.INHERIT);
                 assertEquals(2, peer.statAccepts.get(), "malformed connection was discarded");
             }
         });
@@ -714,8 +817,8 @@ public final class ConformanceTest {
             try (PoolPeer peer = new PoolPeer();
                     TalonClient client = TalonClient.connect(peer.address(), 1024)) {
                 poolWave(client, peer, 10, false);
-                client.stat("s3://bucket/key");
-                client.stat("s3://bucket/key");
+                client.stat("s3://bucket/key", RequestOptions.INHERIT);
+                client.stat("s3://bucket/key", RequestOptions.INHERIT);
                 assertEquals(11, peer.dataAccepts.get() + peer.statAccepts.get(), "ten worker connections and one metadata connection");
                 poolWave(client, peer, 10, false);
                 assertEquals(13, peer.dataAccepts.get() + peer.statAccepts.get(), "eight idle worker connections reused");
@@ -726,7 +829,7 @@ public final class ConformanceTest {
                 }
                 assertTrue(peer.sockets.isEmpty(), "close releases idle and in-flight connections");
                 try {
-                    client.stat("s3://bucket/key");
+                    client.stat("s3://bucket/key", RequestOptions.INHERIT);
                     throw new AssertionError("closed client accepted a request");
                 } catch (IOException expected) {
                     // A closed pool cannot dial or accept an in-flight return.
@@ -743,7 +846,7 @@ public final class ConformanceTest {
         try {
             List<Future<byte[]>> results = new ArrayList<>();
             for (int i = 0; i < count; i++) {
-                results.add(readers.submit(() -> client.read("s3://bucket/key", "v1", 1, 0, 1)));
+                results.add(readers.submit(() -> client.read("s3://bucket/key", "v1", 1, 0, 1, RequestOptions.INHERIT)));
             }
             assertTrue(peer.arrived.await(5, TimeUnit.SECONDS), "idle limit must not limit concurrency");
             if (close) {
@@ -782,8 +885,10 @@ public final class ConformanceTest {
         volatile CountDownLatch discoveryRelease = new CountDownLatch(0);
         volatile int workerState = 2;
         final AtomicInteger statCalls = new AtomicInteger();
+        final List<String> credentialProperties = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<Long> readSizes = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<Integer> loadCounts = java.util.Collections.synchronizedList(new ArrayList<>());
+        final List<List<String>> loadBuckets = java.util.Collections.synchronizedList(new ArrayList<>());
         final List<Messages.LoadBlock> loaded = java.util.Collections.synchronizedList(new ArrayList<>());
 
         PoolPeer() throws IOException {
@@ -827,6 +932,22 @@ public final class ConformanceTest {
                     Frame request = Frame.decode(header);
                     byte[] body = new byte[request.length()];
                     in.readFully(body);
+                    String broker = null;
+                    if ((header[2] & 255) > 1) {
+                        int metadataLength = java.nio.ByteBuffer.wrap(body).getShort() & 65535;
+                        int end = 2 + metadataLength;
+                        for (int at = 2; at < end;) {
+                            int key = body[at] & 255;
+                            int length = java.nio.ByteBuffer.wrap(body).getShort(at + 1) & 65535;
+                            if (key == 6) broker = new String(body, at + 3, length, StandardCharsets.UTF_8);
+                            at += 3 + length;
+                        }
+                        body = Arrays.copyOfRange(body, end, body.length);
+                    }
+                    int controlTag = request.type() == Frame.MsgType.CONTROL ? Messages.decodeBody(body).tag : -1;
+                    if (controlTag != Messages.TAG_MEMBERSHIP_QUERY) {
+                        credentialProperties.add(broker == null ? "STATIC" : broker);
+                    }
                     byte[] response;
                     int byteDelay = 0;
                     if (request.type() == Frame.MsgType.GET_VERSIONED_RANGE) {
@@ -856,12 +977,15 @@ public final class ConformanceTest {
                         loadCounts.add(message.tag == Messages.TAG_BATCH_LOAD ? count : 0);
                         if (loadCounts.size() > slowLoadAfter) byteDelay = loadByteDelayMs;
                         List<Integer> failures = new ArrayList<>();
+                        List<String> buckets = new ArrayList<>();
                         for (int i = 0; i < count; i++) {
                             ObjectId object = new ObjectId(Messages.backendFrom(message.body.variant()), message.body.string(), message.body.string());
+                            buckets.add(object.bucket());
                             BlockId block = new BlockId(object, message.body.u64(), (int) message.body.u32(), message.body.string());
                             loaded.add(new Messages.LoadBlock(block, message.body.u64()));
                             if (object.key().equals("bad")) failures.add(i);
                         }
+                        loadBuckets.add(List.copyOf(buckets));
                         Bincode.Writer ack = new Bincode.Writer().u16(6).variant(Messages.TAG_ACK).u8(rejectLoad ? 0 : 1).u8(rejectLoad ? 1 : 0);
                         if (rejectLoad) ack.string("origin unavailable");
                         if (message.tag == Messages.TAG_BATCH_LOAD && !rejectLoad) {
@@ -869,6 +993,9 @@ public final class ConformanceTest {
                             for (int index : failures) ack.u32(index).string("origin failure");
                         }
                         response = ack.toBytes();
+                    } else if (controlTag == Messages.TAG_LIST_OBJECTS) {
+                        response = new Bincode.Writer().u16(Messages.CONTROL_SCHEMA_VERSION)
+                                .variant(Messages.TAG_OBJECT_LIST).u64(0).toBytes();
                     } else {
                         if (!counted) { statAccepts.incrementAndGet(); counted = true; }
                         statCalls.incrementAndGet();
@@ -878,8 +1005,10 @@ public final class ConformanceTest {
                         }
                         response = w.toBytes();
                     }
-                    writeReplyPart(socket, new Frame(request.type(), 0,
-                            request.requestId() + (wrongLoadRequestId ? 1 : 0), response.length).encode(), slowLoadHeader ? byteDelay : 0);
+                    byte[] replyHeader = new Frame(request.type(), 0,
+                            request.requestId() + (wrongLoadRequestId ? 1 : 0), response.length).encode();
+                    replyHeader[2] = header[2];
+                    writeReplyPart(socket, replyHeader, slowLoadHeader ? byteDelay : 0);
                     writeReplyPart(socket, response, slowLoadHeader ? 0 : byteDelay);
                     socket.getOutputStream().flush();
                 }

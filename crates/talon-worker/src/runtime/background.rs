@@ -1,5 +1,5 @@
 //! Worker maintenance registrations; scheduling policy lives in `background`.
-use super::{async_eviction::EvictionCycle, WorkerRuntime};
+use super::{async_eviction::EvictionCycle, namespaces::CacheIdentity, WorkerRuntime};
 use crate::background::{BackgroundBudget, BackgroundHandle, BackgroundScheduler};
 use std::{
     collections::HashMap,
@@ -49,7 +49,7 @@ impl WorkerBackground {
             async move {
                 let mut schedule = schedule.lock().await;
                 for namespace in w.namespace_runtimes() {
-                    let name = namespace.namespace().effective_name();
+                    let name = &namespace.cache_identity;
                     if schedule.ready(name) {
                         let complete = namespace.gc_next_batch().await.completed_scan;
                         schedule.defer(
@@ -74,7 +74,7 @@ impl WorkerBackground {
             async move {
                 let mut schedule = schedule.lock().await;
                 for namespace in w.namespace_runtimes() {
-                    let name = namespace.namespace().effective_name();
+                    let name = &namespace.cache_identity;
                     if schedule.ready(name) {
                         let complete = namespace
                             .cleanup_page_files_batch(4096, 64)
@@ -151,7 +151,7 @@ impl WorkerBackground {
                     let mut states = states.lock().await;
                     let (schedule, collectors) = &mut *states;
                     for namespace in w.namespace_runtimes() {
-                        let name = namespace.namespace().effective_name();
+                        let name = &namespace.cache_identity;
                         if schedule.ready(name) {
                             let gc = collectors.entry(name.to_owned()).or_insert_with(|| {
                                 super::stale_gc::StaleGc::with_head_rate(&config, heads.clone())
@@ -183,7 +183,7 @@ impl WorkerBackground {
                         let mut next = None;
                         for namespace in w.namespace_runtimes() {
                             let gc = states
-                                .entry(namespace.namespace().effective_name().to_owned())
+                                .entry(namespace.cache_identity.clone())
                                 .or_insert_with(|| super::ownership_gc::OwnershipGc::new(&config));
                             gc.run_slice(&namespace).await;
                             if let Some(delay) = gc.next_delay(&namespace) {
@@ -236,10 +236,10 @@ impl WorkerBackground {
     }
 }
 
-fn due(last: &Mutex<HashMap<String, Instant>>, worker: &WorkerRuntime, millis: u64) -> bool {
+fn due(last: &Mutex<HashMap<CacheIdentity, Instant>>, worker: &WorkerRuntime, millis: u64) -> bool {
     let mut last = last.lock().unwrap();
     let now = Instant::now();
-    let name = worker.namespace.effective_name();
+    let name = &worker.cache_identity;
     if last
         .get(name)
         .is_some_and(|previous| now.duration_since(*previous) < Duration::from_millis(millis))
@@ -253,15 +253,15 @@ fn due(last: &Mutex<HashMap<String, Instant>>, worker: &WorkerRuntime, millis: u
 // A namespace that finishes early must stay idle while another continues scanning.
 #[derive(Default)]
 struct SliceSchedule {
-    next: HashMap<String, tokio::time::Instant>,
+    next: HashMap<CacheIdentity, tokio::time::Instant>,
 }
 impl SliceSchedule {
-    fn ready(&self, name: &str) -> bool {
+    fn ready(&self, name: &CacheIdentity) -> bool {
         self.next
             .get(name)
             .map_or(true, |next| *next <= tokio::time::Instant::now())
     }
-    fn defer(&mut self, name: &str, delay: Duration) {
+    fn defer(&mut self, name: &CacheIdentity, delay: Duration) {
         self.next
             .insert(name.to_owned(), tokio::time::Instant::now() + delay);
     }
@@ -282,17 +282,28 @@ mod tests {
     async fn namespace_slices_continue_without_rescanning_completed_namespaces() {
         let mut schedule = SliceSchedule::default();
         let idle = Duration::from_secs(3600);
-        assert!(schedule.ready("new"));
-        schedule.defer("finished", idle);
-        schedule.defer("scanning", Duration::ZERO);
-        assert!(!schedule.ready("finished"));
-        assert!(schedule.ready("scanning"));
+        let new = CacheIdentity::new(&talon_core::NamespaceId::named("new"), None);
+        let finished = CacheIdentity::new(&talon_core::NamespaceId::named("finished"), None);
+        let scanning = CacheIdentity::new(&talon_core::NamespaceId::named("scanning"), None);
+        let scoped = CacheIdentity::new(
+            &talon_core::NamespaceId::named("finished"),
+            Some(format!("v1-{}", "a".repeat(64)).parse().unwrap()),
+        );
+        assert!(schedule.ready(&new));
+        schedule.defer(&finished, idle);
+        schedule.defer(&scanning, Duration::ZERO);
+        assert!(!schedule.ready(&finished));
+        assert!(
+            schedule.ready(&scoped),
+            "one credential scope cannot defer another"
+        );
+        assert!(schedule.ready(&scanning));
         assert_eq!(schedule.delay(idle), Duration::ZERO);
-        schedule.defer("scanning", idle);
+        schedule.defer(&scanning, idle);
         assert_eq!(schedule.delay(idle), idle);
         tokio::time::advance(idle).await;
-        assert!(schedule.ready("finished"));
-        assert!(schedule.ready("scanning"));
+        assert!(schedule.ready(&finished));
+        assert!(schedule.ready(&scanning));
         assert_eq!(schedule.delay(idle), Duration::ZERO);
     }
 }

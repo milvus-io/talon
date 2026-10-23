@@ -766,6 +766,14 @@ Azure SAS token; env-only, never from a config file or logged.
 - **CLI flag:** not settable via CLI (config file or environment only)
 - **Secret:** read only from the environment; never written to a config file or logged
 
+### `credential_broker_timeout_ms`
+
+Positive per-attempt Broker credential request timeout in ms; does not change storage I/O timeouts.
+
+- **Environment variable:** `TALON_CREDENTIAL_BROKER_TIMEOUT_MS`
+- **Default:** `3000`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ## FUSE client
 
 ### `mountpoint`

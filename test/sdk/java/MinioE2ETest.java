@@ -35,7 +35,7 @@ public final class MinioE2ETest {
 
         try (TalonClient client = TalonClient.connect(coordinator, blockSize)) {
             check("stat returns size and version", () -> {
-                ObjectStat s = client.stat(uri);
+                ObjectStat s = client.stat(uri, RequestOptions.INHERIT);
                 if (s.version() == null || s.version().isEmpty()) {
                     throw new AssertionError("version should be the MinIO ETag, was "
                             + s.version());
@@ -47,17 +47,17 @@ public final class MinioE2ETest {
 
             // The common case after #318: no version supplied, resolved via stat.
             check("read resolves the version automatically", () -> {
-                byte[] got = client.read(uri, 0, 4096);
+                byte[] got = client.read(uri, 0, 4096, RequestOptions.INHERIT);
                 assertBytes(ramp(0, 4096), got);
             });
 
             check("reads exact bytes at offset 0", () -> {
-                byte[] got = client.read(uri, 0, 4096);
+                byte[] got = client.read(uri, 0, 4096, RequestOptions.INHERIT);
                 assertBytes(ramp(0, 4096), got);
             });
 
             check("reads exact bytes at a non-zero offset", () -> {
-                byte[] got = client.read(uri, 1000, 8192);
+                byte[] got = client.read(uri, 1000, 8192, RequestOptions.INHERIT);
                 assertBytes(ramp(1000, 8192), got);
             });
 
@@ -65,24 +65,24 @@ public final class MinioE2ETest {
             // the wrong bytes in the middle, so assert content and not length.
             check("reassembles a range spanning block boundaries", () -> {
                 int length = blockSize + (4 << 20);
-                byte[] got = client.read(uri, 0, length);
+                byte[] got = client.read(uri, 0, length, RequestOptions.INHERIT);
                 assertBytes(ramp(0, length), got);
             });
 
             check("reads across exactly one block edge", () -> {
                 long offset = blockSize - 2048;
-                byte[] got = client.read(uri, offset, 4096);
+                byte[] got = client.read(uri, offset, 4096, RequestOptions.INHERIT);
                 assertBytes(ramp(offset, 4096), got);
             });
 
             check("zero-length read returns empty", () -> {
-                byte[] got = client.read(uri, 0, 0);
+                byte[] got = client.read(uri, 0, 0, RequestOptions.INHERIT);
                 assertEquals(0, got.length, "length");
             });
 
             check("placement cache serves a repeated read", () -> {
-                byte[] first = client.read(uri, 0, 4096);
-                byte[] second = client.read(uri, 0, 4096);
+                byte[] first = client.read(uri, 0, 4096, RequestOptions.INHERIT);
+                byte[] second = client.read(uri, 0, 4096, RequestOptions.INHERIT);
                 assertBytes(first, second);
             });
 
@@ -95,7 +95,7 @@ public final class MinioE2ETest {
                     final int idx = i;
                     Thread t = new Thread(() -> {
                         try {
-                            results[idx] = client.read(uri, idx * 65536L, 65536);
+                            results[idx] = client.read(uri, idx * 65536L, 65536, RequestOptions.INHERIT);
                         } catch (Throwable e) {
                             errors[idx] = e;
                         }
@@ -118,7 +118,7 @@ public final class MinioE2ETest {
                 for (String bad : Arrays.asList(
                         "no-scheme", "ftp://bucket/key", "s3://bucket", "s3:///key")) {
                     try {
-                        client.read(bad, 0, 1);
+                        client.read(bad, 0, 1, RequestOptions.INHERIT);
                         throw new AssertionError("should have rejected " + bad);
                     } catch (IllegalArgumentException expected) {
                         if (expected.getMessage() == null || expected.getMessage().isEmpty()) {

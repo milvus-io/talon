@@ -27,7 +27,7 @@ const PLACEMENT_BLOCK_SIZE: u32 = 256 << 20;
 const PLACEHOLDER_VERSION: &str = "e2e-v1";
 
 /// Command-line arguments for the Talon client.
-#[derive(Debug, Parser)]
+#[derive(Parser)]
 #[command(
     name = "talon-client",
     version,
@@ -46,6 +46,10 @@ struct Args {
         talon_core::NamespaceContext::new(name).map(|_| name.to_owned())
     })]
     namespace: String,
+    /// Request property KEY=JSON; credential_broker requires url, request and origin.endpoint.
+    /// S3 providers also require origin.region for request signing.
+    #[arg(long = "request-option", global = true)]
+    request_options: Vec<String>,
     /// Connect directly to one worker, bypassing placement (diagnostics/tests).
     #[arg(long)]
     worker: Option<String>,
@@ -221,6 +225,21 @@ async fn run_load(
 
 async fn run() -> anyhow::Result<()> {
     let args = Args::parse();
+    let properties = args
+        .request_options
+        .iter()
+        .map(|option| {
+            option
+                .split_once('=')
+                .ok_or_else(|| anyhow::anyhow!("request option must be KEY=VALUE"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    let context = talon_transport::RequestContext::from_properties(&properties)
+        .map_err(anyhow::Error::msg)?;
+    context.scope(run_with_args(args)).await
+}
+
+async fn run_with_args(args: Args) -> anyhow::Result<()> {
     let namespace = if args.namespace == talon_core::DEFAULT_NAMESPACE {
         NamespaceId::Unattributed
     } else {

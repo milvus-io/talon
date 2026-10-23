@@ -130,9 +130,12 @@ impl OriginHeads {
 
 impl super::WorkerRuntime {
     pub(super) async fn background_head(&self, object: &ObjectId) -> Result<ObjectStat> {
+        let backend = self
+            .backend()
+            .map_err(|error| Error::Backend(error.to_string()))?;
         match &self.background_heads {
-            Some(heads) => heads.head(self.backend.clone(), object.clone()).await,
-            None => self.backend.head(object).await,
+            Some(heads) => heads.head(backend.clone(), object.clone()).await,
+            None => backend.head(object).await,
         }
     }
 

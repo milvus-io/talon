@@ -58,6 +58,11 @@ impl StaleGc {
     }
 
     pub(super) async fn run_slice(&mut self, worker: &WorkerRuntime) -> Option<Duration> {
+        // Recovery has no Broker configuration. Only a request may bind the
+        // backend; local maintenance remains active while origin GC waits.
+        if !worker.backend.get()?.ready_for_background() {
+            return None;
+        }
         let now = *self.round_now.get_or_insert_with(access_millis);
         if self.missing.is_empty() {
             self.check_batch(worker, now).await;
@@ -114,6 +119,12 @@ impl StaleGc {
     }
 
     async fn check_batch(&mut self, worker: &WorkerRuntime, now: u64) {
+        let Some(backend) = worker.backend.get() else {
+            return;
+        };
+        if !backend.ready_for_background() {
+            return;
+        }
         if self.pending.is_empty() {
             let lru = worker.lru.clone();
             let mut cursor = self.cursor;

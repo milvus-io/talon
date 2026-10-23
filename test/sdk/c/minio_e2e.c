@@ -172,8 +172,7 @@ static int do_bad_uri(talon_client *client, op_context *ctx) {
     uint8_t byte;
     uint64_t request_id = 0;
     int rc = talon_read_async(client, "ftp://bucket/key", 0, &byte, 1, NULL, 0,
-                              NULL,
-                              on_result, ctx, &request_id);
+                              NULL, on_result, ctx, &request_id);
     int ok = rc != TALON_STATUS_OK;
     if (!ok) {
         fprintf(stderr, "  FAIL bad-uri: submit unexpectedly succeeded\n");
