@@ -173,7 +173,7 @@ those 67 failures are that refusal and its cascade. **POSIX locking is likewise
 refused rather than faked** — `getlk`/`setlk` return `EOPNOTSUPP` instead of
 falling back to kernel-local locks that would look cluster-wide and not be.
 
-**Status: v0.1, pre-1.0.** The APIs and on-disk layout may still change between
+**Status: v0.2, pre-1.0.** The APIs and on-disk layout may still change between
 releases. What is claimed above is measured and reproducible; what is not
 claimed yet is a stability guarantee.
 

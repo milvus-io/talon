@@ -38,9 +38,10 @@ jobs:
             runner: ubuntu-latest
             manylinux: "2_28"
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-14
+            # Cross-compile with the macOS SDK; do not depend on ARM runner capacity.
+            runner: macos-15-intel
     steps:
       - uses: actions/checkout@v4
       - name: Prepare patched Monoio
@@ -55,6 +56,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: >-
             --release
+            --locked
             --manifest-path clients/python/Cargo.toml
             --out dist
           # Cross-compilation needs a linker for the target; the action's
@@ -68,6 +70,24 @@ jobs:
           python -m pip install --upgrade twine
           python -m twine check dist/*.whl
           ls -l dist/
+
+      - name: Check macOS extension architecture
+        if: runner.os == 'macOS'
+        env:
+          EXPECTED_ARCH: ${{ matrix.target == 'aarch64-apple-darwin' && 'arm64' || 'x86_64' }}
+        run: |
+          python3 - <<'PY'
+          import os, pathlib, subprocess, tempfile, zipfile
+          for wheel in pathlib.Path("dist").glob("*.whl"):
+              with zipfile.ZipFile(wheel) as archive, tempfile.TemporaryDirectory() as directory:
+                  extensions = [name for name in archive.namelist() if name.endswith(".so")]
+                  assert extensions, f"No extension in {wheel}"
+                  for name in extensions:
+                      path = archive.extract(name, directory)
+                      arches = subprocess.check_output(["lipo", "-archs", path], text=True).split()
+                      assert arches == [os.environ["EXPECTED_ARCH"]], (wheel, name, arches)
+                      print(wheel.name, name, arches)
+          PY
 
       - uses: actions/upload-artifact@v4
         with:

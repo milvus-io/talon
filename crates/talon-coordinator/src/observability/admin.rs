@@ -269,7 +269,11 @@ mod tests {
         let ready = request(address, "/readyz").await;
         assert!(ready.starts_with("HTTP/1.1 200 OK"));
         let metrics = request(address, "/metrics").await;
-        assert!(metrics.contains("talon_coordinator_build_info{version=\"0.1.0\"} 1"));
+        assert!(metrics.contains(concat!(
+            "talon_coordinator_build_info{version=\"",
+            env!("CARGO_PKG_VERSION"),
+            "\"} 1"
+        )));
         assert!(metrics.contains("talon_coordinator_ready 1"));
         assert!(metrics.contains("talon_coordinator_state_snapshot_age_seconds"));
 
@@ -320,7 +324,11 @@ mod tests {
 
         let metrics = request(address, "/metrics").await;
         assert!(metrics.starts_with("HTTP/1.1 200 OK"));
-        assert!(metrics.contains("talon_coordinator_build_info{version=\"0.1.0\"} 1"));
+        assert!(metrics.contains(concat!(
+            "talon_coordinator_build_info{version=\"",
+            env!("CARGO_PKG_VERSION"),
+            "\"} 1"
+        )));
         // Crucially, scraping /metrics recorded no state-store operation: a
         // snapshot RPC would have incremented the state-store error counter
         // (the store is unavailable), so its absence proves no store call.
