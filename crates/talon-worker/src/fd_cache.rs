@@ -19,15 +19,15 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
-/// Number of shards in the open-fd cache. Sharding keeps the per-request
-/// lookup off a single global mutex when many connections hit distinct files.
+/// Number of shards in the whole-block open-fd cache. Sharding keeps the per-request
+/// lookup off a single global lock when many connections hit distinct files.
 const FD_CACHE_SHARDS: usize = 16;
 
-/// Per-shard capacity of the open-fd cache, so the process-wide ceiling is
-/// `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY` descriptors on top of the
-/// connection and listener fds.
+/// Per-shard capacity of the whole-block open-fd cache. Cached entries are
+/// bounded by `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY`; active readers,
+/// the separate paged cache, connections, and listeners hold additional fds.
 ///
 /// The bound matters because an unbounded cache would pin one fd per file ever
 /// touched; capping it keeps worst-case fd usage predictable and independent of
@@ -44,12 +44,15 @@ pub(crate) struct CachedFd {
 
 /// A sharded, bounded cache of open descriptors.
 ///
+/// Cache hits share a read lock; insertion and invalidation take a write lock.
+/// File opens and reads happen outside the shard locks.
+///
 /// Eviction is a simple random-ish replacement within a shard (drop one
 /// arbitrary entry when full). Entries are equally hot in the steady state and
 /// the cost of a miss is exactly the old behaviour — one `openat` — so a
 /// precise LRU is not worth the extra bookkeeping on this path.
 pub(crate) struct FdCache {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<RwLock<Shard>>,
     per_shard: usize,
 }
 
@@ -66,50 +69,47 @@ impl FdCache {
     /// working set — well past the point where the per-request `openat` was
     /// measurable.
     pub(crate) fn new() -> Self {
-        Self::with_capacity(FD_CACHE_SHARD_CAPACITY)
+        Self::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARD_CAPACITY)
     }
 
-    /// Pages need a larger working set: 16 shards x 512 = 8192 descriptors.
+    /// Pages spread their larger working set across more locks:
+    /// 128 shards x 512 = 65,536 descriptors.
     pub(crate) fn for_pages() -> Self {
-        Self::with_capacity(512)
+        Self::with_capacity(128, 512)
     }
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap().entries.len())
+            .map(|shard| shard.read().unwrap().entries.len())
             .sum()
     }
 
-    /// A cache with an explicit per-shard capacity, for callers whose files are
-    /// far smaller than a whole block (a 1 MiB page vs a 256 MiB block) and
-    /// which therefore need proportionally more descriptors to cover the same
-    /// resident bytes.
-    pub(crate) fn with_capacity(per_shard: usize) -> Self {
+    /// A cache with an explicit shard count and per-shard capacity.
+    pub(crate) fn with_capacity(shards: usize, per_shard: usize) -> Self {
+        assert!(shards > 0, "FD cache needs at least one shard");
         Self {
-            shards: (0..FD_CACHE_SHARDS)
-                .map(|_| Mutex::new(Shard::default()))
-                .collect(),
+            shards: (0..shards).map(|_| RwLock::new(Shard::default())).collect(),
             per_shard,
         }
     }
 
-    fn shard_for(&self, path: &Path) -> &Mutex<Shard> {
+    fn shard_for(&self, path: &Path) -> &RwLock<Shard> {
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
-        &self.shards[(hasher.finish() as usize) % FD_CACHE_SHARDS]
+        &self.shards[(hasher.finish() as usize) % self.shards.len()]
     }
 
     pub(crate) fn get(&self, path: &Path) -> Option<CachedFd> {
         let shard = self.shard_for(path);
-        let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
         guard.entries.get(path).cloned()
     }
 
     pub(crate) fn insert(&self, path: PathBuf, entry: CachedFd) {
         let shard = self.shard_for(&path);
-        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
             if let Some(victim) = guard.entries.keys().next().cloned() {
                 guard.entries.remove(&victim);
@@ -125,7 +125,7 @@ impl FdCache {
         let generation = {
             let guard = self
                 .shard_for(&path)
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(hit) = guard.entries.get(&path) {
                 return Ok(hit.clone());
@@ -143,7 +143,7 @@ impl FdCache {
         };
         let mut guard = self
             .shard_for(&path)
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner());
         if guard.generation == generation {
             if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
@@ -164,7 +164,7 @@ impl FdCache {
     /// for a block evicted mid-request.
     pub(crate) fn invalidate(&self, path: &Path) {
         let shard = self.shard_for(path);
-        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         guard.generation = guard.generation.wrapping_add(1);
         guard.entries.remove(path);
     }
@@ -175,7 +175,7 @@ impl FdCache {
     /// all of them at once, so every descriptor beneath it must be dropped.
     pub(crate) fn invalidate_prefix(&self, dir: &Path) {
         for shard in &self.shards {
-            let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
             guard.generation = guard.generation.wrapping_add(1);
             guard.entries.retain(|path, _| !path.starts_with(dir));
         }
@@ -231,13 +231,13 @@ mod tests {
     #[test]
     fn a_shard_never_exceeds_its_capacity() {
         let dir = tmp_dir();
-        let cache = FdCache::with_capacity(2);
+        let cache = FdCache::with_capacity(FD_CACHE_SHARDS, 2);
         for i in 0..64 {
             let path = dir.join(format!("cap-{i}.page"));
             cache.insert(path.clone(), write(&path, b"x"));
         }
         for shard in &cache.shards {
-            assert!(shard.lock().unwrap().entries.len() <= 2);
+            assert!(shard.read().unwrap().entries.len() <= 2);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -248,8 +248,8 @@ mod tests {
         use talon_core::{Backend, BlockId, ObjectId, ObjectStore, PageIndex, Version};
 
         let root = tempfile::tempdir().unwrap();
-        let whole_fds = Arc::new(FdCache::with_capacity(1));
-        let page_fds = Arc::new(FdCache::with_capacity(1));
+        let whole_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, 1));
+        let page_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, 1));
         let id = BlockId::new(
             ObjectId::new(Backend::S3, "bucket", "key"),
             0,
@@ -289,6 +289,33 @@ mod tests {
             assert!(whole_fds.len() <= FD_CACHE_SHARDS);
             assert!(page_fds.len() <= FD_CACHE_SHARDS);
         }
+    }
+
+    #[test]
+    fn paged_cache_retains_entries_across_expanded_shards() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = write(&dir.path().join("data.page"), b"page");
+        let cache = FdCache::for_pages();
+        // Reuse one descriptor to exercise routing without requiring thousands
+        // of open files. The keys need not name real files for cache lookups.
+        let prefix = Path::new("paged-cache-routing");
+        let paths: Vec<_> = (0..8192)
+            .map(|i| prefix.join(format!("{i}.page")))
+            .collect();
+        for path in &paths {
+            cache.insert(path.clone(), entry.clone());
+        }
+        // A hard-coded 16-shard modulus would overload some 512-entry shards
+        // and evict entries even though the new cache has ample total space.
+        for path in &paths {
+            let hit = cache
+                .get(path)
+                .expect("expanded shards retain the working set");
+            assert!(Arc::ptr_eq(&hit.fd, &entry.fd));
+        }
+        cache.invalidate_prefix(prefix);
+        assert!(paths.iter().all(|path| cache.get(path).is_none()));
+        assert_eq!(cache.len(), 0);
     }
 
     /// Deleting a paged block unlinks a whole directory of page files at once.
