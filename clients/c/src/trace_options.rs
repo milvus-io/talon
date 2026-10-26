@@ -3,14 +3,6 @@ use super::*;
 use talon_rust_client::TraceContext;
 
 #[repr(C)]
-pub struct TalonRequestProperty {
-    pub key: *const c_char,
-    pub key_len: usize,
-    pub value: *const c_char,
-    pub value_len: usize,
-}
-
-#[repr(C)]
 pub struct TalonRequestOptions {
     pub struct_size: u32,
     pub version: u32,
@@ -22,15 +14,16 @@ pub struct TalonRequestOptions {
     pub tracestate_len: usize,
     /// Optional request namespace; null selects `default`.
     pub namespace_name: *const c_char,
-    pub properties: *const TalonRequestProperty,
-    pub properties_len: usize,
+    /// Optional UTF-8 Broker descriptor; null with zero length uses worker configuration.
+    pub credential_broker: *const c_char,
+    pub credential_broker_len: usize,
 }
 
 #[derive(Default)]
 pub struct OwnedRequestOptions {
     pub parent: Option<TraceContext>,
     pub namespace: Option<String>,
-    pub properties: Vec<(String, String)>,
+    pub credential_broker: Option<String>,
 }
 
 #[no_mangle]
@@ -59,8 +52,8 @@ pub unsafe extern "C" fn talon_request_options_init(
                 tracestate: ptr::null(),
                 tracestate_len: 0,
                 namespace_name: ptr::null(),
-                properties: ptr::null(),
-                properties_len: 0,
+                credential_broker: ptr::null(),
+                credential_broker_len: 0,
             });
         }
         Ok(())
@@ -98,44 +91,34 @@ pub unsafe fn copy_options(
             .map_err(|error| (STATUS_INVALID_ARGUMENT, error.to_string()))?;
         result.namespace = Some(namespace);
     }
-    if o.properties_len > 1 || (o.properties_len > 0 && o.properties.is_null()) {
-        return Err((STATUS_INVALID_ARGUMENT, "invalid request properties".into()));
-    }
-    if o.properties_len == 1 {
-        let property = unsafe { &*o.properties };
-        if property.key.is_null()
-            || property.value.is_null()
-            || property.key_len == 0
-            || property.key_len > 128
-            || property.value_len == 0
-            || property.value_len > talon_core::MAX_CREDENTIAL_BROKER_BYTES
+    if o.credential_broker.is_null() {
+        if o.credential_broker_len != 0 {
+            return Err((
+                STATUS_INVALID_ARGUMENT,
+                "invalid credential_broker buffer".into(),
+            ));
+        }
+    } else {
+        if o.credential_broker_len == 0
+            || o.credential_broker_len > talon_core::MAX_CREDENTIAL_BROKER_BYTES
         {
             return Err((
                 STATUS_INVALID_ARGUMENT,
-                "invalid request property buffers".into(),
+                "invalid credential_broker buffer".into(),
             ));
         }
-        let key = std::str::from_utf8(unsafe {
-            std::slice::from_raw_parts(property.key.cast(), property.key_len)
+        let broker = std::str::from_utf8(unsafe {
+            std::slice::from_raw_parts(o.credential_broker.cast(), o.credential_broker_len)
         })
         .map_err(|_| {
             (
                 STATUS_INVALID_ARGUMENT,
-                "request property key must be UTF-8".into(),
+                "credential_broker must be UTF-8".into(),
             )
         })?;
-        let value = std::str::from_utf8(unsafe {
-            std::slice::from_raw_parts(property.value.cast(), property.value_len)
-        })
-        .map_err(|_| {
-            (
-                STATUS_INVALID_ARGUMENT,
-                "request property value must be UTF-8".into(),
-            )
-        })?;
-        talon_transport::RequestContext::from_properties(&[(key, value)])
-            .map_err(|error| (STATUS_INVALID_ARGUMENT, error.to_string()))?;
-        result.properties.push((key.to_owned(), value.to_owned()));
+        talon_core::ValidatedBrokerConfig::from_json(broker)
+            .map_err(|error| (STATUS_INVALID_ARGUMENT, error))?;
+        result.credential_broker = Some(broker.to_owned());
     }
     if o.parent_mode == 0 || !talon_telemetry::enabled() || o.traceparent_len > 1024 {
         return Ok(result);
@@ -180,8 +163,8 @@ mod tests {
             tracestate: state.as_ptr().cast(),
             tracestate_len: state.len(),
             namespace_name: ptr::null(),
-            properties: ptr::null(),
-            properties_len: 0,
+            credential_broker: ptr::null(),
+            credential_broker_len: 0,
         };
         let copied = unsafe { copy_options(&options) }.unwrap().parent.unwrap();
         drop(parent);
@@ -263,11 +246,11 @@ mod tests {
         let defaults = unsafe { copy_options(ptr::null()) }.unwrap();
         assert!(defaults.parent.is_none());
         assert!(defaults.namespace.is_none());
-        assert!(defaults.properties.is_empty());
+        assert!(defaults.credential_broker.is_none());
         let defaults = unsafe { copy_options(&options) }.unwrap();
         assert!(defaults.parent.is_none());
         assert!(defaults.namespace.is_none());
-        assert!(defaults.properties.is_empty());
+        assert!(defaults.credential_broker.is_none());
         options.version = 1;
         assert!(unsafe { copy_options(&options) }.is_err());
         options.version = 99;
@@ -275,18 +258,42 @@ mod tests {
     }
 
     #[test]
-    fn namespace_and_request_properties_are_owned_without_a_trace_parent() {
+    fn broker_buffer_rejects_invalid_pointer_length_pairs_and_utf8() {
+        let mut options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
+        assert_eq!(
+            unsafe {
+                talon_request_options_init(
+                    options.as_mut_ptr(),
+                    std::mem::size_of::<TalonRequestOptions>(),
+                )
+            },
+            STATUS_OK
+        );
+        let mut options = unsafe { options.assume_init() };
+        let invalid_utf8 = [0xffu8];
+        let buffer = invalid_utf8.as_ptr().cast();
+        for (pointer, length) in [
+            (ptr::null(), 1),
+            (buffer, 0),
+            // Reject oversized lengths before reading the one-byte buffer.
+            (buffer, talon_core::MAX_CREDENTIAL_BROKER_BYTES + 1),
+            (buffer, invalid_utf8.len()),
+        ] {
+            options.credential_broker = pointer;
+            options.credential_broker_len = length;
+            assert_eq!(
+                unsafe { copy_options(&options) }.err().unwrap().0,
+                STATUS_INVALID_ARGUMENT
+            );
+        }
+    }
+
+    #[test]
+    fn namespace_and_broker_json_are_owned_without_a_trace_parent() {
         let namespace = CString::new("team-a").unwrap();
-        let key = String::from("credential_broker");
         let value = String::from(
             r#"{"url":"http://localhost/broker","request":{"csp":"aws","region":"us-west-2","bucket":"fixture","roleArn":"fixture-role"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
         );
-        let property = TalonRequestProperty {
-            key: key.as_ptr().cast(),
-            key_len: key.len(),
-            value: value.as_ptr().cast(),
-            value_len: value.len(),
-        };
         let mut options = std::mem::MaybeUninit::<TalonRequestOptions>::uninit();
         assert_eq!(
             unsafe {
@@ -300,17 +307,17 @@ mod tests {
         let mut options = unsafe { options.assume_init() };
         assert_eq!(options.version, 2);
         options.namespace_name = namespace.as_ptr();
-        options.properties = &property;
-        options.properties_len = 1;
+        options.credential_broker = value.as_ptr().cast();
+        options.credential_broker_len = value.len();
         let copied = unsafe { copy_options(&options) }.unwrap();
         drop(namespace);
-        drop(key);
         drop(value);
         assert!(copied.parent.is_none());
         assert_eq!(copied.namespace.as_deref(), Some("team-a"));
-        assert_eq!(copied.properties[0].0, "credential_broker");
-        assert!(copied.properties[0]
-            .1
+        assert!(copied
+            .credential_broker
+            .as_deref()
+            .unwrap()
             .contains("\"roleArn\":\"fixture-role\""));
     }
 }

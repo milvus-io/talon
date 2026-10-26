@@ -118,17 +118,7 @@ int talon_telemetry_init(void);
 void talon_telemetry_shutdown(void);
 #define TALON_TRACE_PARENT_NONE 0u
 #define TALON_TRACE_PARENT_EXPLICIT 1u
-#define TALON_CREDENTIAL_BROKER_KEY "credential_broker"
 #define TALON_REQUEST_OPTIONS_VERSION_2 2u
-
-/* A UTF-8 request property. credential_broker carries JSON {url, request, origin:{endpoint}}.
- * S3 providers also require origin.region for request signing. */
-typedef struct talon_request_property {
-    const char *key;
-    size_t key_len;
-    const char *value;
-    size_t value_len;
-} talon_request_property;
 
 typedef struct talon_request_options {
     uint32_t struct_size;
@@ -141,16 +131,20 @@ typedef struct talon_request_options {
     size_t tracestate_len;
     /* Per-request namespace. NULL selects "default" independently of tracing. */
     const char *namespace_name;
-    const talon_request_property *properties;
-    size_t properties_len;
+    /* Optional UTF-8 Broker JSON: {url, request, origin:{endpoint}}.
+     * S3 providers also require origin.region. NULL + 0 uses worker configuration.
+     * Otherwise, supply 1..16384 bytes; length excludes any trailing NUL.
+     * The buffer need not be NUL-terminated. */
+    const char *credential_broker;
+    size_t credential_broker_len;
 } talon_request_options;
 
 /* Initialize the full request options struct with size = sizeof(options).
- * Submission copies namespace, trace and property buffers before returning, so
- * keep the property array and its buffers alive until submission returns.
+ * Submission copies namespace, trace and Broker JSON buffers before returning,
+ * so keep these buffers alive until submission returns.
  * NULL options uses defaults. NULL/NONE never inherits ambient trace context.
  * Invalid W3C data does not fail a valid business request.
- * Invalid credential properties fail even when tracing is disabled.
+ * Invalid Broker JSON or pointer/length pairs fail even when tracing is disabled.
  * Unknown version/flags/mode or a short struct returns INVALID_ARGUMENT
  * synchronously, without scheduling a callback.
  *

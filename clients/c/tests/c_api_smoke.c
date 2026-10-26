@@ -52,17 +52,14 @@ int talon_c_api_smoke_test(void) {
         trace_options.struct_size != sizeof(trace_options) ||
         trace_options.version != TALON_REQUEST_OPTIONS_VERSION_2 ||
         trace_options.flags != 0 || trace_options.parent_mode != 0 ||
-        trace_options.namespace_name != NULL || trace_options.properties != NULL ||
-        trace_options.properties_len != 0) return 10;
+        trace_options.namespace_name != NULL || trace_options.credential_broker != NULL ||
+        trace_options.credential_broker_len != 0) return 10;
     const char *broker_json =
         "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\","
         "\"bucket\":\"bucket\",\"region\":\"us-west-2\",\"roleArn\":\"fixture\"},"
         "\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"us-west-2\"}}";
-    talon_request_property property = {
-        TALON_CREDENTIAL_BROKER_KEY, sizeof(TALON_CREDENTIAL_BROKER_KEY) - 1,
-        broker_json, strlen(broker_json)};
-    trace_options.properties = &property;
-    trace_options.properties_len = 1;
+    trace_options.credential_broker = broker_json;
+    trace_options.credential_broker_len = strlen(broker_json);
 
     talon_client_options_init(&options);
     if (options.block_size != (256u << 20) || options.callback_executor != NULL ||
@@ -122,8 +119,8 @@ int talon_c_api_smoke_test(void) {
     };
     for (size_t invalid = 0; invalid < sizeof(invalid_brokers) / sizeof(invalid_brokers[0]); invalid++) {
         trace_options.namespace_name = invalid == 0 ? "" : "team-a";
-        property.value = invalid_brokers[invalid];
-        property.value_len = strlen(property.value);
+        trace_options.credential_broker = invalid_brokers[invalid];
+        trace_options.credential_broker_len = strlen(trace_options.credential_broker);
         atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
         if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0,
                 NULL, NULL, &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
@@ -143,8 +140,8 @@ int talon_c_api_smoke_test(void) {
         }
     }
     trace_options.namespace_name = "team-a";
-    property.value = broker_json;
-    property.value_len = strlen(broker_json);
+    trace_options.credential_broker = broker_json;
+    trace_options.credential_broker_len = strlen(broker_json);
     atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
     atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
     if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL, &trace_options,

@@ -131,12 +131,7 @@ unsafe fn submit(
         let task = async move {
             let options = talon_rust_client::RequestOptions::default()
                 .with_namespace(request_options.namespace.as_deref().unwrap_or("default"))
-                .with_credential_broker(
-                    request_options
-                        .properties
-                        .first()
-                        .map(|(_, value)| value.as_str()),
-                );
+                .with_credential_broker(request_options.credential_broker.as_deref());
             let operation = talon_telemetry::Operation::new(
                 "talon.c.load",
                 "internal",

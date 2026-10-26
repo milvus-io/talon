@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -113,7 +113,7 @@ struct DynamicBackends {
 pub struct DefaultBackendResolver {
     backend: Backend,
     static_routes: HashMap<String, Arc<dyn BackendStore>>,
-    dynamic: Arc<Mutex<DynamicBackends>>,
+    dynamic: Arc<RwLock<DynamicBackends>>,
     defaults: DynamicBackendDefaults,
     legacy: Option<LegacyBackend>,
     origin_http: Arc<dyn HttpClient>,
@@ -132,7 +132,7 @@ impl DefaultBackendResolver {
         Self {
             backend,
             static_routes: HashMap::new(),
-            dynamic: Arc::new(Mutex::new(DynamicBackends::default())),
+            dynamic: Arc::new(RwLock::new(DynamicBackends::default())),
             defaults: DynamicBackendDefaults::default(),
             legacy: None,
             origin_http,
@@ -230,7 +230,21 @@ impl DefaultBackendResolver {
         let key = prepared.key();
         let scope = key.access_scope()?;
         let pending = {
-            let mut dynamic = self.dynamic.lock().unwrap();
+            let dynamic = self.dynamic.read().unwrap();
+            if let Some(store) = dynamic.stores.get(&key) {
+                return Ok(ResolvedBackend {
+                    scope: Some(scope),
+                    store: store.clone(),
+                });
+            }
+            dynamic.pending.get(&key).cloned()
+        };
+        let pending = if let Some(pending) = pending {
+            pending
+        } else {
+            // Another caller may have registered or completed this key since
+            // the read lock was released. Recheck before reserving capacity.
+            let mut dynamic = self.dynamic.write().unwrap();
             if let Some(store) = dynamic.stores.get(&key) {
                 return Ok(ResolvedBackend {
                     scope: Some(scope),
@@ -278,7 +292,7 @@ impl DefaultBackendResolver {
                         )) as Arc<dyn BackendStore>
                     });
                     {
-                        let mut registry = registry.lock().unwrap();
+                        let mut registry = registry.write().unwrap();
                         if let Ok(store) = &result {
                             registry.stores.insert(key.clone(), store.clone());
                         }
@@ -727,6 +741,70 @@ impl BackendStore for BackendRouter {
 #[cfg(test)]
 mod identity_tests {
     use super::*;
+
+    #[test]
+    fn cached_and_pending_bindings_do_not_block_other_readers() {
+        let http = Arc::new(crate::ReqwestClient::new());
+        let resolver = DefaultBackendResolver::new(
+            Backend::S3,
+            http.clone(),
+            http.clone(),
+            Arc::new(crate::NoopObserver),
+        );
+        let store: Arc<dyn BackendStore> = Arc::new(crate::S3Backend::new(
+            crate::S3Config::aws("us-west-2"),
+            S3Credentials {
+                access_key_id: "access".into(),
+                secret_access_key: "secret".into(),
+                session_token: None,
+            },
+            http,
+        ));
+        let broker = BrokerConfig {
+            url: "https://broker.example/exchange".into(),
+            request: serde_json::json!({"csp":"aws","region":"us-west-2","roleArn":"role"}),
+            origin: Some(OriginOptions {
+                endpoint: Some("s3.us-west-2.amazonaws.com".into()),
+                region: Some("us-west-2".into()),
+                ..Default::default()
+            }),
+        };
+        let request = RouteRequest {
+            backend: Backend::S3,
+            bucket: "bucket",
+            broker: Some(&broker),
+        };
+        let key = resolver.prepare_dynamic(&request).unwrap().key();
+        for cached in [true, false] {
+            {
+                let mut dynamic = resolver.dynamic.write().unwrap();
+                if cached {
+                    dynamic.stores.insert(key.clone(), store.clone());
+                } else {
+                    dynamic.stores.clear();
+                    dynamic
+                        .pending
+                        .insert(key.clone(), Arc::new(PendingBackend::default()));
+                }
+            }
+            std::thread::scope(|threads| {
+                let reader = resolver.dynamic.read().unwrap();
+                let (sent, received) = std::sync::mpsc::sync_channel(1);
+                let lookup = resolver.resolve(&request);
+                threads.spawn(move || sent.send(lookup.now_or_never()).unwrap());
+                let result = received.recv_timeout(std::time::Duration::from_secs(2));
+                // Release the reader before checking the result so a blocked
+                // lookup can finish and the scoped thread always joins.
+                drop(reader);
+                let result = result.expect("binding lookup must not wait for other readers");
+                if cached {
+                    assert!(Arc::ptr_eq(&store, &result.unwrap().unwrap().store));
+                } else {
+                    assert!(result.is_none(), "reuse the pending initializer");
+                }
+            });
+        }
+    }
 
     // Pin persisted key bytes for explicit endpoints. Changing them migrates the
     // cache scope even when pairwise normalization tests still pass.

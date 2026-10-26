@@ -23,7 +23,7 @@ use talon_rust_client::{
 };
 
 mod trace_options;
-pub use trace_options::{talon_request_options_init, TalonRequestOptions, TalonRequestProperty};
+pub use trace_options::{talon_request_options_init, TalonRequestOptions};
 
 #[cfg(feature = "telemetry")]
 static TELEMETRY: std::sync::Mutex<
@@ -422,12 +422,7 @@ pub unsafe extern "C" fn talon_read_async(
         let task = async move {
             let options = talon_rust_client::RequestOptions::default()
                 .with_namespace(request_options.namespace.as_deref().unwrap_or("default"))
-                .with_credential_broker(
-                    request_options
-                        .properties
-                        .first()
-                        .map(|(_, value)| value.as_str()),
-                )
+                .with_credential_broker(request_options.credential_broker.as_deref())
                 .with_parent(
                     request_options
                         .parent
@@ -499,12 +494,7 @@ pub unsafe extern "C" fn talon_stat_async(
         let task = async move {
             let options = talon_rust_client::RequestOptions::default()
                 .with_namespace(request_options.namespace.as_deref().unwrap_or("default"))
-                .with_credential_broker(
-                    request_options
-                        .properties
-                        .first()
-                        .map(|(_, value)| value.as_str()),
-                )
+                .with_credential_broker(request_options.credential_broker.as_deref())
                 .with_parent(
                     request_options
                         .parent
@@ -1203,19 +1193,12 @@ mod tests {
             let uri = cstring("s3://bucket/file");
             let version = cstring("v1");
             let namespace = cstring("team-a");
-            let key = String::from("credential_broker");
             let value = String::from(
                 r#"{"url":"http://localhost/broker","request":{"csp":"aws","region":"us-west-2","bucket":"bucket","roleArn":"fixture-role"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
             );
-            let property = TalonRequestProperty {
-                key: key.as_ptr().cast(),
-                key_len: key.len(),
-                value: value.as_ptr().cast(),
-                value_len: value.len(),
-            };
             request_options.namespace_name = namespace.as_ptr();
-            request_options.properties = &property;
-            request_options.properties_len = 1;
+            request_options.credential_broker = value.as_ptr().cast();
+            request_options.credential_broker_len = value.len();
             let requests = (0..1025)
                 .map(|_| TalonLoadRequest {
                     uri: uri.as_ptr(),
@@ -1244,8 +1227,8 @@ mod tests {
         assert_eq!(result.loads, vec![(3, 1); 1025]);
         assert_eq!(result.request_id, id);
         assert_eq!(*brokers.lock().unwrap(), ["team-a", "team-a"]);
-        request_options.properties = ptr::null();
-        request_options.properties_len = 0;
+        request_options.credential_broker = ptr::null();
+        request_options.credential_broker_len = 0;
         let namespace = cstring("team-b");
         request_options.namespace_name = namespace.as_ptr();
         assert_eq!(
