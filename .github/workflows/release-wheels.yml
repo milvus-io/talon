@@ -38,9 +38,9 @@ jobs:
             runner: ubuntu-latest
             manylinux: "2_28"
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
           - target: aarch64-apple-darwin
-            runner: macos-14
+            runner: macos-15
     steps:
       - uses: actions/checkout@v4
       - name: Prepare patched Monoio
@@ -55,6 +55,7 @@ jobs:
           manylinux: ${{ matrix.manylinux || 'auto' }}
           args: >-
             --release
+            --locked
             --manifest-path clients/python/Cargo.toml
             --out dist
           # Cross-compilation needs a linker for the target; the action's
