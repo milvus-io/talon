@@ -19,10 +19,10 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, RwLock};
 
 /// Number of shards in the open-fd cache. Sharding keeps the per-request
-/// lookup off a single global mutex when many connections hit distinct files.
+/// lookup off a single global lock when many connections hit distinct files.
 const FD_CACHE_SHARDS: usize = 16;
 
 /// Per-shard capacity of the open-fd cache, so the process-wide ceiling is
@@ -44,12 +44,15 @@ pub(crate) struct CachedFd {
 
 /// A sharded, bounded cache of open descriptors.
 ///
+/// Cache hits share a read lock; insertion and invalidation take a write lock.
+/// File opens and reads happen outside the shard locks.
+///
 /// Eviction is a simple random-ish replacement within a shard (drop one
 /// arbitrary entry when full). Entries are equally hot in the steady state and
 /// the cost of a miss is exactly the old behaviour — one `openat` — so a
 /// precise LRU is not worth the extra bookkeeping on this path.
 pub(crate) struct FdCache {
-    shards: Vec<Mutex<Shard>>,
+    shards: Vec<RwLock<Shard>>,
     per_shard: usize,
 }
 
@@ -78,7 +81,7 @@ impl FdCache {
     pub(crate) fn len(&self) -> usize {
         self.shards
             .iter()
-            .map(|shard| shard.lock().unwrap().entries.len())
+            .map(|shard| shard.read().unwrap().entries.len())
             .sum()
     }
 
@@ -89,13 +92,13 @@ impl FdCache {
     pub(crate) fn with_capacity(per_shard: usize) -> Self {
         Self {
             shards: (0..FD_CACHE_SHARDS)
-                .map(|_| Mutex::new(Shard::default()))
+                .map(|_| RwLock::new(Shard::default()))
                 .collect(),
             per_shard,
         }
     }
 
-    fn shard_for(&self, path: &Path) -> &Mutex<Shard> {
+    fn shard_for(&self, path: &Path) -> &RwLock<Shard> {
         let mut hasher = DefaultHasher::new();
         path.hash(&mut hasher);
         &self.shards[(hasher.finish() as usize) % FD_CACHE_SHARDS]
@@ -103,13 +106,13 @@ impl FdCache {
 
     pub(crate) fn get(&self, path: &Path) -> Option<CachedFd> {
         let shard = self.shard_for(path);
-        let guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        let guard = shard.read().unwrap_or_else(|e| e.into_inner());
         guard.entries.get(path).cloned()
     }
 
     pub(crate) fn insert(&self, path: PathBuf, entry: CachedFd) {
         let shard = self.shard_for(&path);
-        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
             if let Some(victim) = guard.entries.keys().next().cloned() {
                 guard.entries.remove(&victim);
@@ -125,7 +128,7 @@ impl FdCache {
         let generation = {
             let guard = self
                 .shard_for(&path)
-                .lock()
+                .read()
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(hit) = guard.entries.get(&path) {
                 return Ok(hit.clone());
@@ -143,7 +146,7 @@ impl FdCache {
         };
         let mut guard = self
             .shard_for(&path)
-            .lock()
+            .write()
             .unwrap_or_else(|e| e.into_inner());
         if guard.generation == generation {
             if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
@@ -164,7 +167,7 @@ impl FdCache {
     /// for a block evicted mid-request.
     pub(crate) fn invalidate(&self, path: &Path) {
         let shard = self.shard_for(path);
-        let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
         guard.generation = guard.generation.wrapping_add(1);
         guard.entries.remove(path);
     }
@@ -175,7 +178,7 @@ impl FdCache {
     /// all of them at once, so every descriptor beneath it must be dropped.
     pub(crate) fn invalidate_prefix(&self, dir: &Path) {
         for shard in &self.shards {
-            let mut guard = shard.lock().unwrap_or_else(|e| e.into_inner());
+            let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
             guard.generation = guard.generation.wrapping_add(1);
             guard.entries.retain(|path, _| !path.starts_with(dir));
         }
@@ -237,7 +240,7 @@ mod tests {
             cache.insert(path.clone(), write(&path, b"x"));
         }
         for shard in &cache.shards {
-            assert!(shard.lock().unwrap().entries.len() <= 2);
+            assert!(shard.read().unwrap().entries.len() <= 2);
         }
         std::fs::remove_dir_all(&dir).ok();
     }
