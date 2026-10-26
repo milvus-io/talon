@@ -1160,7 +1160,11 @@ mod tests {
         let metrics = request(address, "/metrics").await;
         assert!(metrics.contains("talon_worker_requests_total"));
         assert!(metrics.contains("talon_worker_capacity_bytes 4096"));
-        assert!(metrics.contains("talon_worker_build_info{version=\"0.1.0\"} 1"));
+        assert!(metrics.contains(concat!(
+            "talon_worker_build_info{version=\"",
+            env!("CARGO_PKG_VERSION"),
+            "\"} 1"
+        )));
         assert!(metrics.contains("talon_worker_active_connections 0"));
         assert!(metrics.contains("talon_worker_ready 1"));
 
