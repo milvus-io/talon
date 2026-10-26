@@ -25,9 +25,9 @@ use std::sync::{Arc, RwLock};
 /// lookup off a single global lock when many connections hit distinct files.
 const FD_CACHE_SHARDS: usize = 16;
 
-/// Per-shard capacity of the open-fd cache, so the process-wide ceiling is
-/// `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY` descriptors on top of the
-/// connection and listener fds.
+/// Per-shard capacity of the whole-block open-fd cache. Cached entries are
+/// bounded by `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY`; active readers,
+/// the separate paged cache, connections, and listeners hold additional fds.
 ///
 /// The bound matters because an unbounded cache would pin one fd per file ever
 /// touched; capping it keeps worst-case fd usage predictable and independent of
@@ -72,9 +72,9 @@ impl FdCache {
         Self::with_capacity(FD_CACHE_SHARD_CAPACITY)
     }
 
-    /// Pages need a larger working set: 16 shards x 512 = 8192 descriptors.
+    /// Pages need a larger working set: 16 shards x 4096 = 65,536 descriptors.
     pub(crate) fn for_pages() -> Self {
-        Self::with_capacity(512)
+        Self::with_capacity(4096)
     }
 
     #[cfg(test)]
