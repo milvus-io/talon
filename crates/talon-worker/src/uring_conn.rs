@@ -134,10 +134,7 @@ async fn handle_request(
     let selected = match worker.for_request(header, payload).await {
         Ok(selected) => selected,
         Err(error) => {
-            let error = talon_transport::envelope::response_version(
-                data::encode_typed_error(header.request_id, error.code, error.message),
-                header.version,
-            );
+            let error = crate::data_error::encode_request_error(header, payload, error)?;
             write_all(&mut stream, error).await?;
             // Raw PUT bodies may follow; close instead of interpreting them as a frame.
             return Ok(None);
@@ -564,13 +561,17 @@ async fn handle_cached_block_admission(
         .await
     {
         Ok(()) => {
-            write_all(stream, data::response_header_ok(h.request_id, 0).to_vec()).await?;
+            let mut reply = data::response_header_ok(h.request_id, 0).to_vec();
+            reply[2] = response_version;
+            write_all(stream, reply).await?;
             observability
                 .metrics()
                 .record_request_success(req.body_len, request_started.elapsed());
         }
         Err(error) => {
-            write_all(stream, encode_runtime_error(h.request_id, &error)).await?;
+            let mut reply = encode_runtime_error(h.request_id, &error);
+            reply[2] = response_version;
+            write_all(stream, reply).await?;
             observability
                 .metrics()
                 .record_request_error(request_started.elapsed());

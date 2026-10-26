@@ -20,7 +20,7 @@ pub struct TalonLoadResult {
     pub blocks: u64,
 }
 
-/// Submit a single file prewarm with a copied namespace and trace context.
+/// Submit a single file prewarm with copied request options.
 /// See talon.h for ownership and callback rules.
 #[no_mangle]
 pub unsafe extern "C" fn talon_load_async(
@@ -47,7 +47,7 @@ pub unsafe extern "C" fn talon_load_async(
 }
 
 /// Submit files using protocol-level batches, not repeated single LOAD RPCs.
-/// Namespace and trace context are copied before submission returns.
+/// Request options are copied before submission returns.
 #[no_mangle]
 pub unsafe extern "C" fn talon_batch_load_async(
     client: *mut TalonClient,
@@ -83,7 +83,7 @@ unsafe fn submit(
 ) -> c_int {
     ffi_status(|| {
         let inner = client_inner(client)?;
-        let (parent, namespace) = trace_options::copy_options(options)?;
+        let request_options = trace_options::copy_options(options)?;
         let callback = callback.ok_or((STATUS_INVALID_ARGUMENT, "callback is null".into()))?;
         if request_id_out.is_null()
             || (count != 0 && requests.is_null())
@@ -129,18 +129,20 @@ unsafe fn submit(
         let dispatcher = Arc::clone(&inner.dispatcher);
         let user_data = UserData(user_data);
         let task = async move {
+            let options = talon_rust_client::RequestOptions::default()
+                .with_namespace(request_options.namespace.as_deref().unwrap_or("default"))
+                .with_credential_broker(request_options.credential_broker.as_deref());
             let operation = talon_telemetry::Operation::new(
                 "talon.c.load",
                 "internal",
-                parent
+                request_options
+                    .parent
                     .as_ref()
                     .map(talon_telemetry::TraceParent::Explicit)
                     .unwrap_or(talon_telemetry::TraceParent::Root),
             );
             let result = operation
                 .scope(async {
-                    let options = talon_rust_client::RequestOptions::default()
-                        .with_namespace(namespace.as_deref().unwrap_or("default"));
                     if batch {
                         client.batch_load(&requests, &options).await
                     } else {

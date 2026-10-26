@@ -353,7 +353,7 @@ pub unsafe extern "C" fn talon_client_free(client: *mut TalonClient) {
 /// rather than fabricated bytes. A caller that has no valid size passes NULL.
 ///
 /// Blocks spanned by the read are fetched concurrently.
-/// Namespace and W3C context are copied from `options`; null selects defaults.
+/// Request options are copied before submission; null selects defaults.
 #[no_mangle]
 pub unsafe extern "C" fn talon_read_async(
     client: *mut TalonClient,
@@ -369,7 +369,7 @@ pub unsafe extern "C" fn talon_read_async(
     request_id_out: *mut u64,
 ) -> c_int {
     ffi_status(|| {
-        let (trace_context, namespace) = unsafe { trace_options::copy_options(options) }?;
+        let request_options = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -421,9 +421,11 @@ pub unsafe extern "C" fn talon_read_async(
         use tracing::instrument::WithSubscriber;
         let task = async move {
             let options = talon_rust_client::RequestOptions::default()
-                .with_namespace(namespace.as_deref().unwrap_or("default"))
+                .with_namespace(request_options.namespace.as_deref().unwrap_or("default"))
+                .with_credential_broker(request_options.credential_broker.as_deref())
                 .with_parent(
-                    trace_context
+                    request_options
+                        .parent
                         .as_ref()
                         .map(talon_rust_client::TraceParent::Explicit)
                         .unwrap_or(talon_rust_client::TraceParent::Root),
@@ -454,7 +456,7 @@ pub unsafe extern "C" fn talon_read_async(
     })
 }
 
-/// Submit an async stat with copied request-local namespace and W3C context.
+/// Submit an async stat with copied request options.
 #[no_mangle]
 pub unsafe extern "C" fn talon_stat_async(
     client: *mut TalonClient,
@@ -465,7 +467,7 @@ pub unsafe extern "C" fn talon_stat_async(
     request_id_out: *mut u64,
 ) -> c_int {
     ffi_status(|| {
-        let (trace_context, namespace) = unsafe { trace_options::copy_options(options) }?;
+        let request_options = unsafe { trace_options::copy_options(options) }?;
         let inner = client_inner(client)?;
         if uri.is_null() {
             return Err((STATUS_INVALID_ARGUMENT, "uri is null".into()));
@@ -491,9 +493,11 @@ pub unsafe extern "C" fn talon_stat_async(
         use tracing::instrument::WithSubscriber;
         let task = async move {
             let options = talon_rust_client::RequestOptions::default()
-                .with_namespace(namespace.as_deref().unwrap_or("default"))
+                .with_namespace(request_options.namespace.as_deref().unwrap_or("default"))
+                .with_credential_broker(request_options.credential_broker.as_deref())
                 .with_parent(
-                    trace_context
+                    request_options
+                        .parent
                         .as_ref()
                         .map(talon_rust_client::TraceParent::Explicit)
                         .unwrap_or(talon_rust_client::TraceParent::Root),
@@ -1079,6 +1083,8 @@ mod tests {
         let observed = batches.clone();
         let namespaces = Arc::new(Mutex::new(Vec::new()));
         let observed_namespaces = namespaces.clone();
+        let brokers = Arc::new(Mutex::new(Vec::new()));
+        let observed_brokers = brokers.clone();
         let stats = Arc::new(AtomicUsize::new(0));
         let coordinator =
             mock_coordinator_counting(listener.local_addr().unwrap().to_string(), stats.clone())
@@ -1088,6 +1094,7 @@ mod tests {
                 let (mut socket, _) = listener.accept().await.unwrap();
                 let observed = observed.clone();
                 let observed_namespaces = observed_namespaces.clone();
+                let observed_brokers = observed_brokers.clone();
                 tokio::spawn(async move {
                     loop {
                         let mut header = [0; HEADER_LEN];
@@ -1106,6 +1113,11 @@ mod tests {
                             .unwrap_or_default()
                             .effective_name()
                             .to_owned();
+                        if let Some(broker) = metadata.credential_broker {
+                            assert_eq!(broker.config().url, "http://localhost/broker");
+                            assert_eq!(broker.config().request["roleArn"], "fixture-role");
+                            observed_brokers.lock().unwrap().push(namespace.clone());
+                        }
                         let (_, message) = talon_transport::codec::decode_request(&frame).unwrap();
                         let batch = matches!(message, ControlMessage::BatchLoad { .. });
                         let requests = match message {
@@ -1181,7 +1193,12 @@ mod tests {
             let uri = cstring("s3://bucket/file");
             let version = cstring("v1");
             let namespace = cstring("team-a");
+            let value = String::from(
+                r#"{"url":"http://localhost/broker","request":{"csp":"aws","region":"us-west-2","bucket":"bucket","roleArn":"fixture-role"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
+            );
             request_options.namespace_name = namespace.as_ptr();
+            request_options.credential_broker = value.as_ptr().cast();
+            request_options.credential_broker_len = value.len();
             let requests = (0..1025)
                 .map(|_| TalonLoadRequest {
                     uri: uri.as_ptr(),
@@ -1209,6 +1226,9 @@ mod tests {
         assert_eq!(result.status, STATUS_OK);
         assert_eq!(result.loads, vec![(3, 1); 1025]);
         assert_eq!(result.request_id, id);
+        assert_eq!(*brokers.lock().unwrap(), ["team-a", "team-a"]);
+        request_options.credential_broker = ptr::null();
+        request_options.credential_broker_len = 0;
         let namespace = cstring("team-b");
         request_options.namespace_name = namespace.as_ptr();
         assert_eq!(

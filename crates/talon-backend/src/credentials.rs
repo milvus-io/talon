@@ -16,9 +16,15 @@ use async_trait::async_trait;
 use crate::s3::S3Credentials;
 
 /// Source of the S3-family credential triple used for SigV4 signing.
+#[async_trait]
 pub trait ProvideS3Credentials: Send + Sync {
     /// Cheap point-in-time snapshot used to build and sign exactly one request.
     fn current(&self) -> Arc<S3Credentials>;
+
+    /// Refresh request-driven credentials before signing an outgoing request.
+    async fn prepare(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Source of an OAuth2-style bearer token (GCS, Azure AD).
@@ -37,9 +43,15 @@ pub trait ProvideBearerToken: Send + Sync {
 }
 
 /// Snapshot source for an Azure SAS query credential.
+#[async_trait]
 pub trait ProvideSasToken: Send + Sync {
     /// Cheap point-in-time query credential; never performs HTTP.
     fn current(&self) -> Arc<crate::AzureSas>;
+
+    /// Refresh request-driven credentials before generating an outgoing URL.
+    async fn prepare(&self) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 /// Fixed credentials from env/config; never refreshed.
@@ -139,16 +151,25 @@ impl RefreshPolicy {
     /// Time to sleep before the next refresh attempt for credentials fetched
     /// `now` with `expires_at`.
     fn next_delay(&self, now: SystemTime, expires_at: Option<SystemTime>) -> Duration {
+        if expires_at.is_none() {
+            return self.unknown_expiry_interval;
+        }
+        self.request_delay(now, expires_at).max(self.retry_interval)
+    }
+
+    /// Request-driven providers retry on the next request, with no timer floor.
+    pub(crate) fn request_delay(
+        &self,
+        now: SystemTime,
+        expires_at: Option<SystemTime>,
+    ) -> Duration {
         let Some(expires_at) = expires_at else {
             return self.unknown_expiry_interval;
         };
         let lifetime = expires_at.duration_since(now).unwrap_or(Duration::ZERO);
         let margin = lifetime.mul_f64(self.margin_fraction.clamp(0.0, 1.0));
         let margin = margin.clamp(self.min_margin, self.max_margin);
-        let delay = lifetime.saturating_sub(margin);
-        // An already-expired or nearly-expired credential still backs off by
-        // the retry interval so a broken issuer is not hammered.
-        delay.max(self.retry_interval)
+        lifetime.saturating_sub(margin)
     }
 }
 

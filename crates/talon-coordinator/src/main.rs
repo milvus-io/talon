@@ -350,10 +350,10 @@ struct Coordinator {
 }
 
 fn proxy_request_budget(message: &ControlMessage) -> Duration {
-    match message {
+    talon_transport::request_timeout(match message {
         ControlMessage::ListObjects { .. } => LIST_OBJECTS_PROXY_BUDGET,
         _ => PROXY_REQUEST_BUDGET,
-    }
+    })
 }
 
 /// Give one serial attempt most of the time still available while preserving a
@@ -1616,8 +1616,11 @@ where
         };
         let operation =
             talon_telemetry::Operation::server(metadata.context.as_ref(), metadata.read_id);
-        let result: anyhow::Result<()> = operation
-            .scope(async {
+        let request_context = talon_transport::RequestContext {
+            credential_broker: metadata.credential_broker,
+        };
+        let result: anyhow::Result<()> = request_context
+            .scope(operation.scope(async {
                 let allowed = access.allows_message(&message);
                 let operation = talon_coordinator::ControlOperation::from_message(&message);
                 let started = Instant::now();
@@ -1672,7 +1675,7 @@ where
                 stream.write_all(&buffer).await?;
                 stream.flush().await?;
                 Ok(())
-            })
+            }))
             .await;
         operation.outcome(if result.is_ok() { "success" } else { "error" });
         result?;
@@ -2281,6 +2284,100 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn credential_proxy_preserves_context_and_clears_it_between_requests() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            for expected in [Some("A"), Some("B"), None] {
+                // Close after each reply: subsequent proxy attempts must retry
+                // a stale pooled socket with the same required credentials.
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let (header, request, metadata) = read_control(&mut stream).await.unwrap().unwrap();
+                assert_eq!(header.version, if expected.is_some() { 4 } else { 1 });
+                assert_eq!(
+                    metadata
+                        .credential_broker
+                        .as_ref()
+                        .and_then(|broker| broker.config().request["scope"].as_str()),
+                    expected
+                );
+                let reply = match request {
+                    ControlMessage::StatObject { .. } => stat_reply(),
+                    ControlMessage::ListObjects { .. } => {
+                        ControlMessage::ObjectList { entries: vec![] }
+                    }
+                    other => panic!("unexpected request: {other:?}"),
+                };
+                stream
+                    .write_all(&talon_transport::envelope::response_version(
+                        codec::encode(header.request_id, &reply).unwrap(),
+                        header.version,
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let state = proxy_test_coordinator();
+        state.observability.check_ready().await.unwrap();
+        assert!(matches!(
+            state
+                .dispatch(ControlMessage::NodeStatusHeartbeat {
+                    status: Box::new(worker_status("cluster-a", "worker-1", "inc-1", &address))
+                })
+                .await,
+            ControlMessage::NodeStatusAck {
+                accepted: true,
+                serving: true,
+                ..
+            }
+        ));
+        let (mut client, stream) = tokio::io::duplex(4096);
+        let connection = tokio::spawn(handle_conn(stream, state, ControlAccess::Legacy));
+        for scope in [Some("A"), Some("B"), None] {
+            let message = if scope == Some("B") {
+                ControlMessage::ListObjects {
+                    prefix: "s3/bucket".into(),
+                }
+            } else {
+                stat_request()
+            };
+            let mut frame = codec::encode(7, &message).unwrap();
+            if let Some(scope) = scope {
+                talon_transport::envelope::encode_credential_broker(
+                    &mut frame,
+                    &talon_core::BrokerConfig {
+                        origin: Some(talon_core::OriginOptions {
+                            endpoint: Some("storage.example".into()),
+                            region: Some("us-west-2".into()),
+                            ..Default::default()
+                        }),
+                        url: "http://broker/v1/credentials/assume-role".into(),
+                        request: serde_json::json!({"csp":"aws", "scope":scope}),
+                    },
+                )
+                .unwrap();
+            }
+            client.write_all(&frame).await.unwrap();
+            let (header, payload) =
+                talon_transport::read_frame(&mut client, Duration::from_secs(2))
+                    .await
+                    .unwrap();
+            assert_eq!(header.version, if scope.is_some() { 4 } else { 1 });
+            let mut frame = header.encode().to_vec();
+            frame.extend_from_slice(&payload);
+            let reply = codec::decode(&frame).unwrap().1;
+            if scope == Some("B") {
+                assert!(matches!(reply, ControlMessage::ObjectList { .. }));
+            } else {
+                assert_eq!(reply, stat_reply());
+            }
+        }
+        drop(client);
+        connection.await.unwrap().unwrap();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
     async fn proxy_reuses_one_worker_connection_for_sequential_stats() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap().to_string();
@@ -2482,6 +2579,50 @@ mod tests {
         );
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn credential_metadata_proxy_reserves_retries_and_allows_cold_acquisition() {
+        talon_transport::RequestContext::from_properties(&[(
+            "credential_broker",
+            r#"{"url":"http://broker","request":{"csp":"aws"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
+        )])
+        .unwrap()
+        .scope(async {
+            for (request, expected_budget, crowded_attempt) in [
+                (
+                    stat_request(),
+                    Duration::from_millis(17_700),
+                    Duration::from_millis(177),
+                ),
+                (
+                    ControlMessage::ListObjects {
+                        prefix: "s3/bucket".into(),
+                    },
+                    Duration::from_millis(37_700),
+                    Duration::from_millis(377),
+                ),
+            ] {
+                let total = proxy_request_budget(&request);
+                assert_eq!(total, expected_budget);
+                assert_eq!(proxy_attempt_budget(total, 1), total);
+                assert_eq!(proxy_attempt_budget(total, 100), crowded_attempt);
+                let attempt = proxy_attempt_budget(total, 2);
+                assert_eq!(total - attempt, Duration::from_secs(1));
+                let reply = tokio::time::timeout(attempt, async {
+                    tokio::time::sleep(Duration::from_secs(13)).await;
+                    stat_reply()
+                })
+                .await
+                .expect("cold credential acquisition must fit the proxy attempt");
+                assert_eq!(reply, stat_reply());
+            }
+        })
+        .await;
+        assert_eq!(
+            proxy_request_budget(&stat_request()),
+            Duration::from_secs(5)
+        );
+    }
+
     #[test]
     fn proxy_attempt_errors_are_bounded_without_hiding_the_next_worker() {
         let mut errors = String::new();
@@ -2573,33 +2714,90 @@ mod tests {
 
     #[tokio::test]
     async fn proxy_retries_a_healthy_worker_after_a_silent_worker_times_out() {
+        check_proxy_timeout_failover(
+            talon_transport::RequestContext::default(),
+            ControlMessage::ListObjects {
+                prefix: "s3/bucket".into(),
+            },
+            ControlMessage::ObjectList {
+                entries: vec![talon_transport::ObjectEntry {
+                    path: "s3/bucket/object".into(),
+                    size: 42,
+                }],
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn credential_metadata_proxy_retries_after_a_silent_worker_times_out() {
+        let context = talon_transport::RequestContext::from_properties(&[(
+            "credential_broker",
+            r#"{"url":"http://broker","request":{"csp":"aws"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
+        )])
+        .unwrap();
+        for (request, reply) in [
+            (stat_request(), stat_reply()),
+            (
+                ControlMessage::ListObjects {
+                    prefix: "s3/bucket".into(),
+                },
+                ControlMessage::ObjectList { entries: vec![] },
+            ),
+        ] {
+            check_proxy_timeout_failover(context.clone(), request, reply).await;
+        }
+    }
+
+    async fn check_proxy_timeout_failover(
+        context: talon_transport::RequestContext,
+        message: ControlMessage,
+        expected_reply: ControlMessage,
+    ) {
         let stalled_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let stalled_address = stalled_listener.local_addr().unwrap().to_string();
         let (stalled_request_tx, stalled_request_rx) = tokio::sync::oneshot::channel();
+        let expected_request = message.clone();
+        let expected_broker = context.credential_broker.clone();
         let stalled_server = tokio::spawn(async move {
             let (mut stream, _) = stalled_listener.accept().await.unwrap();
-            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
-            assert!(matches!(request, ControlMessage::ListObjects { .. }));
+            let (_, request, metadata) = read_control(&mut stream).await.unwrap().unwrap();
+            assert_eq!(request, expected_request);
+            assert_eq!(
+                metadata
+                    .credential_broker
+                    .as_ref()
+                    .map(|b| (&b.config().url, &b.config().request)),
+                expected_broker
+                    .as_ref()
+                    .map(|b| (&b.config().url, &b.config().request))
+            );
             stalled_request_tx.send(()).unwrap();
             std::future::pending::<()>().await;
         });
 
         let serving_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let serving_address = serving_listener.local_addr().unwrap().to_string();
+        let expected_request = message.clone();
+        let expected_broker = context.credential_broker.clone();
+        let reply = expected_reply.clone();
         let serving_server = tokio::spawn(async move {
             let (mut stream, _) = serving_listener.accept().await.unwrap();
-            let (_, request, _) = read_control(&mut stream).await.unwrap().unwrap();
-            assert!(matches!(request, ControlMessage::ListObjects { .. }));
-            let reply = codec::encode(
-                0,
-                &ControlMessage::ObjectList {
-                    entries: vec![talon_transport::ObjectEntry {
-                        path: "s3/bucket/object".into(),
-                        size: 42,
-                    }],
-                },
-            )
-            .unwrap();
+            let (header, request, metadata) = read_control(&mut stream).await.unwrap().unwrap();
+            assert_eq!(request, expected_request);
+            assert_eq!(
+                metadata
+                    .credential_broker
+                    .as_ref()
+                    .map(|b| (&b.config().url, &b.config().request)),
+                expected_broker
+                    .as_ref()
+                    .map(|b| (&b.config().url, &b.config().request))
+            );
+            let reply = talon_transport::envelope::response_version(
+                codec::encode(header.request_id, &reply).unwrap(),
+                header.version,
+            );
             stream.write_all(&reply).await.unwrap();
             stream.flush().await.unwrap();
         });
@@ -2618,13 +2816,10 @@ mod tests {
         ];
         let budget = Duration::from_secs(4);
         let proxy = tokio::spawn(async move {
-            proxy_test_coordinator()
-                .proxy_to_workers_with_budget(
-                    &workers,
-                    ControlMessage::ListObjects {
-                        prefix: "s3/bucket".into(),
-                    },
-                    budget,
+            context
+                .scope(
+                    proxy_test_coordinator()
+                        .proxy_to_workers_with_budget(&workers, message, budget),
                 )
                 .await
         });
@@ -2641,14 +2836,7 @@ mod tests {
             .await
             .expect("coordinator did not retry the healthy worker")
             .unwrap();
-        assert!(matches!(
-            reply,
-            ControlMessage::ObjectList { entries }
-                if entries == vec![talon_transport::ObjectEntry {
-                    path: "s3/bucket/object".into(),
-                    size: 42,
-                }]
-        ));
+        assert_eq!(reply, expected_reply);
 
         stalled_server.abort();
         serving_server.await.unwrap();

@@ -49,9 +49,17 @@ int talon_c_api_smoke_test(void) {
     const char *last_error;
     talon_request_options trace_options;
     if (talon_request_options_init(&trace_options, sizeof(trace_options)) != TALON_STATUS_OK ||
-        trace_options.struct_size != sizeof(trace_options) || trace_options.version != 1 ||
+        trace_options.struct_size != sizeof(trace_options) ||
+        trace_options.version != TALON_REQUEST_OPTIONS_VERSION_2 ||
         trace_options.flags != 0 || trace_options.parent_mode != 0 ||
-        trace_options.namespace_name != NULL) return 10;
+        trace_options.namespace_name != NULL || trace_options.credential_broker != NULL ||
+        trace_options.credential_broker_len != 0) return 10;
+    const char *broker_json =
+        "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\","
+        "\"bucket\":\"bucket\",\"region\":\"us-west-2\",\"roleArn\":\"fixture\"},"
+        "\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"us-west-2\"}}";
+    trace_options.credential_broker = broker_json;
+    trace_options.credential_broker_len = strlen(broker_json);
 
     talon_client_options_init(&options);
     if (options.block_size != (256u << 20) || options.callback_executor != NULL ||
@@ -73,8 +81,8 @@ int talon_c_api_smoke_test(void) {
         return 4;
     }
 
-    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 1, NULL, NULL,
-                         NULL, capture_zero_length_read, NULL, &request_id) !=
+    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 1, NULL, NULL, NULL,
+                         capture_zero_length_read, NULL, &request_id) !=
         TALON_STATUS_INVALID_ARGUMENT) {
         talon_client_free(client);
         return 5;
@@ -85,28 +93,55 @@ int talon_c_api_smoke_test(void) {
         return 6;
     }
 
-    trace_options.version = 2;
+    trace_options.version = 99;
     if (talon_stat_async(client, "s3://bucket/object", &trace_options,
                                      capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT) {
         talon_client_free(client);
         return 11;
     }
-    trace_options.version = 1;
-    trace_options.namespace_name = "";
-    atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
-    if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0,
-            NULL, NULL, &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
-        talon_stat_async(client, "s3://bucket/object", &trace_options,
-            capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
-        talon_load_async(client, "s3://bucket/object", "v1", 0,
-            &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
-        talon_batch_load_async(client, NULL, 0, &trace_options,
-            capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
-        request_id != 0 || atomic_load_explicit(&callback_done, memory_order_acquire)) {
-        talon_client_free(client);
-        return 14;
+    trace_options.version = TALON_REQUEST_OPTIONS_VERSION_2;
+    /* Both required fields are checked before dispatch, including empty reads
+     * and batches. A bad namespace must not mask a valid broker or vice versa. */
+    const char *invalid_brokers[] = {
+        broker_json,
+        "PRIVATE_FIXTURE_MARKER",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{},\"origin\":null}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{},\"origin\":{}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{},\"origin\":{\"request_timeout_ms\":17}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{},\"origin\":{\"endpoint\":null}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{},\"origin\":{\"endpoint\":\"\"}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{},\"origin\":{\"endpoint\":\" \\t\\n\"}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{\"csp\":\"aws\",\"region\":\"broker-region\"},\"origin\":{\"endpoint\":\"storage.example\"}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{\"csp\":\"ali\",\"region\":\"broker-region\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":null}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{\"csp\":\"tc\",\"region\":\"broker-region\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"\"}}",
+        "{\"url\":\"http://broker/PRIVATE_FIXTURE_MARKER\",\"request\":{\"csp\":\"hwc\",\"region\":\"broker-region\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":\" \\t\\n\"}}",
+    };
+    for (size_t invalid = 0; invalid < sizeof(invalid_brokers) / sizeof(invalid_brokers[0]); invalid++) {
+        trace_options.namespace_name = invalid == 0 ? "" : "team-a";
+        trace_options.credential_broker = invalid_brokers[invalid];
+        trace_options.credential_broker_len = strlen(trace_options.credential_broker);
+        atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
+        if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0,
+                NULL, NULL, &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+            talon_stat_async(client, "s3://bucket/object", &trace_options,
+                capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+            talon_load_async(client, "s3://bucket/object", "v1", 0,
+                &trace_options, capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+            talon_batch_load_async(client, NULL, 0, &trace_options,
+                capture_zero_length_read, NULL, &request_id) != TALON_STATUS_INVALID_ARGUMENT ||
+            request_id != 0 || atomic_load_explicit(&callback_done, memory_order_acquire)) {
+            talon_client_free(client);
+            return 14;
+        }
+        if (strstr(talon_last_error(), "PRIVATE_FIXTURE_MARKER") != NULL) {
+            talon_client_free(client);
+            return 15;
+        }
     }
-    trace_options.namespace_name = NULL;
+    trace_options.namespace_name = "team-a";
+    trace_options.credential_broker = broker_json;
+    trace_options.credential_broker_len = strlen(broker_json);
     atomic_store_explicit(&callback_done, 0, memory_order_relaxed);
     atomic_store_explicit(&callback_ok, 0, memory_order_relaxed);
     if (talon_read_async(client, "s3://bucket/object", 0, NULL, 0, NULL, NULL, &trace_options,

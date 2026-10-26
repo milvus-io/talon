@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger;
 /** Socket-level namespace routing, compatibility, tracing and retry checks. */
 public final class NamespaceTest {
     private static final String PARENT = "00-11111111111111111111111111111111-2222222222222222-01";
+    private static final String BROKER = "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\"},\"origin\":{\"endpoint\":\"storage.example\",\"region\":\"us-west-2\"}}";
     private static final TraceContext TRACE = TraceContext.fromW3c(PARENT, "vendor=value");
 
     public static void main(String[] args) throws Exception {
@@ -38,18 +39,25 @@ public final class NamespaceTest {
         }
         workflow("team.A_1-", true);
         workflow("default", true);
-        retryAndRefusal();
+        for (boolean tracing : new boolean[] {false, true}) {
+            workflow("team-a", tracing, true);
+            workflow("default", tracing, true);
+            combinedFluentOptions(tracing);
+            concurrentNamespaces(tracing, true);
+        }
+        retryAndRefusal(false);
+        retryAndRefusal(true);
         concurrentNamespaces(false);
         concurrentNamespaces(true);
         try (Peer peer = new Peer(); TalonClient client = TalonClient.connect(peer.address())) {
-            client.stat("s3://bucket/key");
+            client.stat("s3://bucket/key", RequestOptions.INHERIT);
             Request request = peer.requests.stream().filter(r -> r.tag() == Messages.TAG_STAT_OBJECT)
                     .findFirst().orElseThrow();
-            assertEquals("default", request.namespace(), "omitted namespace");
-            assertEquals(1, request.version(), "omitted namespace keeps v1");
+            assertEquals("default", request.namespace(), "default options namespace");
+            assertEquals(1, request.version(), "default options namespace keeps v1");
             peer.assertHealthy();
         }
-        System.out.println("namespaces: per-call validation, concurrent isolation, default/v3 frames, metadata, reads, LOAD, tracing and retries passed");
+        System.out.println("namespaces: per-call validation, concurrent isolation, default/v3/v4 frames, broker properties, metadata, reads, LOAD, tracing and retries passed");
     }
 
     private static void fluentOptions() throws Exception {
@@ -105,8 +113,8 @@ public final class NamespaceTest {
         } finally { Telemetry.configure(Set.of(), null); }
     }
 
-    private static void assertStatCarrier(TalonClient client, Peer peer, RequestOptions options,
-                                          String namespace, TraceContext trace) throws IOException {
+    private static Request assertStatCarrier(TalonClient client, Peer peer, RequestOptions options,
+                                             String namespace, TraceContext trace) throws IOException {
         client.stat("s3://bucket/key", options);
         Request request = peer.requests.stream().filter(r -> r.tag() == Messages.TAG_STAT_OBJECT)
                 .reduce((first, last) -> last).orElseThrow();
@@ -114,6 +122,36 @@ public final class NamespaceTest {
         if (trace == null) {
             if (request.metadata().containsKey(1)) throw new AssertionError("unexpected trace parent");
         } else assertEquals(trace.traceparent(), request.text(1), "selected stat trace parent");
+        // Background discovery may append a MembershipQuery after this STAT was selected.
+        return request;
+    }
+
+    private static void combinedFluentOptions(boolean tracing) throws Exception {
+        Telemetry.configure(tracing ? Set.of("*") : Set.of(), () -> TRACE);
+        try (Peer peer = new Peer(); TalonClient client = connect(peer.address())) {
+            for (String broker : new String[] {BROKER,
+                    "{\"url\":\"http://localhost/broker\",\"request\":{\"csp\":\"aws\"},"
+                    + "\"origin\":{\"endpoint\":\"localhost:9000\",\"use_ssl\":false,\"region\":\"us-east-1\"}}"}) {
+                for (RequestOptions options : new RequestOptions[] {
+                        RequestOptions.ROOT.withNamespace("team-a").withParent(TRACE).withCredentialBroker(broker),
+                        RequestOptions.ROOT.withCredentialBroker(broker).withNamespace("team-a").withParent(TRACE),
+                        RequestOptions.ROOT.withParent(TRACE).withCredentialBroker(broker).withNamespace("team-a")}) {
+                    Request stat = assertStatCarrier(client, peer, options, "team-a", tracing ? TRACE : null);
+                    assertEquals(broker, stat.text(6), "fluent broker preservation");
+                    stat = assertStatCarrier(client, peer, options.withNamespace(null), "default", tracing ? TRACE : null);
+                    assertEquals(broker, stat.text(6), "default reset keeps broker");
+                    stat = assertStatCarrier(client, peer, options.withParent(null), "team-a", null);
+                    assertEquals(broker, stat.text(6), "root reset keeps broker");
+                    stat = assertStatCarrier(client, peer, options.withCredentialBroker(null), "team-a", tracing ? TRACE : null);
+                    if (stat.metadata().containsKey(6)) {
+                        throw new AssertionError("cleared broker retained");
+                    }
+                    stat = assertStatCarrier(client, peer, options, "team-a", tracing ? TRACE : null);
+                    assertEquals(broker, stat.text(6), "fluent copies leave source unchanged");
+                }
+            }
+            peer.assertHealthy();
+        } finally { Telemetry.configure(Set.of(), null); }
     }
 
     private static void requestNamespace() throws Exception {
@@ -122,7 +160,7 @@ public final class NamespaceTest {
             byte[] named = new byte[8]; Arrays.fill(named, (byte) 2);
             byte[] defaults = new byte[8]; Arrays.fill(defaults, (byte) 1);
             assertBytes(named, client.read("s3://bucket/key", "v", 8, 0, 8, options));
-            assertBytes(defaults, client.read("s3://bucket/key", "v", 8, 0, 8));
+            assertBytes(defaults, client.read("s3://bucket/key", "v", 8, 0, 8, RequestOptions.INHERIT));
             for (RequestOptions defaultsOption : new RequestOptions[] {null, RequestOptions.ROOT, RequestOptions.INHERIT}) {
                 assertBytes(named, client.read("s3://bucket/key", "v", 8, 0, 8, options));
                 assertBytes(defaults, client.read("s3://bucket/key", "v", 8, 0, 8, defaultsOption));
@@ -146,8 +184,13 @@ public final class NamespaceTest {
     }
 
     private static void workflow(String namespace, boolean tracing) throws Exception {
+        workflow(namespace, tracing, false);
+    }
+
+    private static void workflow(String namespace, boolean tracing, boolean broker) throws Exception {
         Telemetry.configure(tracing ? Set.of("*") : Set.of(), () -> TRACE);
         RequestOptions options = RequestOptions.explicit(tracing ? TRACE : null).withNamespace(namespace);
+        if (broker) options = options.withCredentialBroker(BROKER);
         try (Peer peer = new Peer(); TalonClient client = connect(peer.address())) {
             String expectedNamespace = namespace == null ? "default" : namespace;
             assertEquals(8L, client.stat("s3://bucket/key", options).size(), "stat size");
@@ -175,7 +218,10 @@ public final class NamespaceTest {
                 String selected = discovery ? "default" : expectedNamespace;
                 assertEquals(selected, request.namespace(), "request namespace");
                 boolean carriesTrace = tracing && !discovery;
-                int version = selected.equals("default") ? (carriesTrace ? 2 : 1) : 3;
+                boolean carriesBroker = broker && !discovery;
+                int version = carriesBroker ? 4 : selected.equals("default") ? (carriesTrace ? 2 : 1) : 3;
+                if (carriesBroker) assertEquals(BROKER, request.text(6), "request broker");
+                else if (request.metadata().containsKey(6)) throw new AssertionError("unexpected broker carrier");
                 assertEquals(version, request.version(), "request version");
                 if (carriesTrace) {
                     assertEquals(PARENT, request.text(1), "traceparent");
@@ -194,9 +240,10 @@ public final class NamespaceTest {
         } finally { Telemetry.configure(Set.of(), null); }
     }
 
-    private static void retryAndRefusal() throws Exception {
+    private static void retryAndRefusal(boolean broker) throws Exception {
         Telemetry.configure(Set.of("*"), () -> TRACE);
         RequestOptions options = RequestOptions.explicit(TRACE).withNamespace("team-a");
+        if (broker) options = options.withCredentialBroker(BROKER);
         try (Peer peer = new Peer(); TalonClient client = connect(peer.address())) {
             client.read("s3://bucket/key", "v", 8, 0, 8, options);
             peer.dropRead.set(true);
@@ -205,7 +252,8 @@ public final class NamespaceTest {
             List<Request> reads = peer.requests.stream().filter(r -> r.tag() == -1).toList();
             for (Request request : reads) {
                 assertEquals("team-a", request.namespace(), "retry namespace");
-                assertEquals(3, request.version(), "retry protocol version");
+                assertEquals(broker ? 4 : 3, request.version(), "retry protocol version");
+                if (broker) assertEquals(BROKER, request.text(6), "retry broker");
                 assertEquals(PARENT, request.text(1), "retry traceparent");
             }
             assertBytes(reads.get(1).body(), reads.get(2).body());
@@ -213,7 +261,7 @@ public final class NamespaceTest {
             peer.rejectRead.set(true);
             try {
                 client.read("s3://bucket/key", "v", 8, 0, 8, options);
-                throw new AssertionError("v3 worker refusal hidden");
+                throw new AssertionError("worker refusal hidden");
             } catch (TalonException expected) {
                 assertEquals(TalonException.Code.INVALID_REQUEST, expected.code(), "worker refusal code");
                 assertEquals("namespace rejected", expected.getMessage(), "worker refusal detail");
@@ -222,15 +270,15 @@ public final class NamespaceTest {
             peer.rejectStat.set(true);
             try {
                 client.stat("s3://bucket/key", options);
-                throw new AssertionError("v3 coordinator refusal hidden");
+                throw new AssertionError("coordinator refusal hidden");
             } catch (TalonException expected) {
                 assertEquals(TalonException.Code.INVALID_REQUEST, expected.code(), "coordinator refusal code");
             }
             assertEquals(1L, peer.requests.stream().filter(r -> r.tag() == Messages.TAG_STAT_OBJECT).count(),
                     "coordinator refusal must not fall back");
             byte[] defaults = new byte[8]; Arrays.fill(defaults, (byte) 1);
-            assertBytes(defaults, client.read("s3://bucket/key", "v", 8, 0, 8));
-            client.stat("s3://bucket/key");
+            assertBytes(defaults, client.read("s3://bucket/key", "v", 8, 0, 8, RequestOptions.INHERIT));
+            client.stat("s3://bucket/key", RequestOptions.INHERIT);
             for (Request request : peer.requests.subList(peer.requests.size() - 2, peer.requests.size())) {
                 assertEquals("default", request.namespace(), "failed call must not leak namespace");
                 assertEquals(2, request.version(), "default keeps inherited tracing after failure");
@@ -240,6 +288,10 @@ public final class NamespaceTest {
     }
 
     private static void concurrentNamespaces(boolean tracing) throws Exception {
+        concurrentNamespaces(tracing, false);
+    }
+
+    private static void concurrentNamespaces(boolean tracing, boolean broker) throws Exception {
         String otherParent = "00-33333333333333333333333333333333-4444444444444444-01";
         TraceContext otherTrace = TraceContext.fromW3c(otherParent, "vendor=other");
         Telemetry.configure(tracing ? Set.of("*") : Set.of(), () -> TRACE);
@@ -252,6 +304,10 @@ public final class NamespaceTest {
                 results.add(callers.submit(() -> {
                     RequestOptions options = namespace.equals("default") ? RequestOptions.INHERIT
                             : RequestOptions.explicit(tracing ? (namespace.equals("team-b") ? otherTrace : TRACE) : null).withNamespace(namespace);
+                    if (broker && !namespace.equals("default")) {
+                        options = options.withCredentialBroker(
+                                BROKER.replace("aws", namespace));
+                    }
                     String uri = "s3://bucket/" + namespace + "/key";
                     byte[] expected = new byte[8];
                     Arrays.fill(expected, (byte) (namespace.equals("default") ? 1 : namespace.equals("team-b") ? 3 : 2));
@@ -293,8 +349,11 @@ public final class NamespaceTest {
                 }
                 assertEquals(expectedNamespace, request.namespace(), "concurrent request namespace matches caller");
                 seen.computeIfAbsent(expectedNamespace, ignored -> new java.util.HashSet<>()).add(tag);
-                assertEquals(expectedNamespace.equals("default") ? (tracing ? 2 : 1) : 3, request.version(),
-                        "concurrent request version");
+                boolean carriesBroker = broker && !expectedNamespace.equals("default");
+                assertEquals(carriesBroker ? 4 : expectedNamespace.equals("default") ? (tracing ? 2 : 1) : 3,
+                        request.version(), "concurrent request version");
+                if (carriesBroker) assertEquals(BROKER.replace("aws", expectedNamespace), request.text(6), "concurrent broker");
+                else if (request.metadata().containsKey(6)) throw new AssertionError("broker leaked across callers");
                 if (tracing) {
                     assertEquals(expectedNamespace.equals("team-b") ? otherParent : PARENT, request.text(1), "concurrent trace context");
                 } else if (request.metadata().containsKey(1)) throw new AssertionError("trace leaked with telemetry disabled");
@@ -361,9 +420,9 @@ public final class NamespaceTest {
                     Map<Integer, byte[]> metadata = new HashMap<>();
                     int start = 0;
                     if (version != 1) {
-                        if (version != 2 && version != 3) throw new AssertionError("invalid request version");
+                        if (version != 2 && version != 3 && version != 4) throw new AssertionError("invalid request version");
                         start = 2 + (ByteBuffer.wrap(payload).getShort() & 65535);
-                        if (start > payload.length || start > 1026) throw new AssertionError("invalid metadata length");
+                        if (start > payload.length || start > (version == 4 ? 1026 + 3 + 16384 : 1026)) throw new AssertionError("invalid metadata length");
                         for (int i = 2; i < start;) {
                             int key = payload[i++] & 255;
                             int length = ByteBuffer.wrap(payload).getShort(i) & 65535;

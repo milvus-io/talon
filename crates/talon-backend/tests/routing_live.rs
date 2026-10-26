@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use talon_backend::{
-    BackendRouter, HttpClient, HttpRequest, HttpResponse, NoopObserver, ReqwestClient,
+    BackendResolver, BackendRouter, DefaultBackendResolver, HttpClient, HttpRequest, HttpResponse,
+    NoopObserver, ReqwestClient, RouteRequest,
 };
-use talon_core::{Backend, BackendStore, ObjectId, WorkerConfig, WorkerConfigPatch};
+use talon_core::{Backend, BackendStore, BrokerConfig, ObjectId, WorkerConfig, WorkerConfigPatch};
 
 struct LiveHttp(ReqwestClient);
 #[async_trait::async_trait]
@@ -20,6 +21,67 @@ impl HttpClient for LiveHttp {
         eprintln!("live bucket router {method:?} HTTP {}", response.status);
         Ok(response)
     }
+}
+
+#[tokio::test]
+#[ignore = "requires TALON_LIVE_CREDENTIAL_BROKER JSON; acquires credentials without storage I/O"]
+async fn live_dynamic_broker_acquisition_reuses_binding() {
+    let json = std::env::var("TALON_LIVE_CREDENTIAL_BROKER")
+        .unwrap_or_else(|_| panic!("set TALON_LIVE_CREDENTIAL_BROKER"));
+    let broker = BrokerConfig::from_json(&json)
+        .unwrap_or_else(|_| panic!("invalid live broker descriptor (details suppressed)"));
+    let backend = match broker.request.get("csp").and_then(|value| value.as_str()) {
+        Some("aws") => Backend::S3,
+        Some("gcp") => Backend::Gcs,
+        Some("azure") => Backend::Azure,
+        _ => panic!("live descriptor requires a supported csp"),
+    };
+    let bucket = std::env::var("TALON_LIVE_BUCKET")
+        .ok()
+        .or_else(|| {
+            broker
+                .request
+                .get("bucket")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+        })
+        .filter(|value| !value.is_empty())
+        .expect("descriptor request.bucket or TALON_LIVE_BUCKET is required");
+    tokio::time::timeout(Duration::from_secs(120), async {
+        let http: Arc<dyn HttpClient> = Arc::new(LiveHttp(ReqwestClient::new()));
+        let resolver =
+            DefaultBackendResolver::new(backend, http.clone(), http, Arc::new(NoopObserver));
+        let request = RouteRequest {
+            backend,
+            bucket: &bucket,
+            broker: Some(&broker),
+        };
+        let first = resolver.resolve(&request).await.unwrap_or_else(|_| {
+            panic!("live dynamic credential acquisition failed (details suppressed)")
+        });
+        let second = resolver
+            .resolve(&request)
+            .await
+            .unwrap_or_else(|_| panic!("live dynamic binding reuse failed (details suppressed)"));
+        assert!(
+            Arc::ptr_eq(&first.store, &second.store),
+            "dynamic binding was not reused"
+        );
+        assert!(
+            first
+                .scope
+                .as_ref()
+                .is_some_and(|scope| !scope.as_str().is_empty()),
+            "dynamic binding requires an access scope"
+        );
+        assert!(
+            first.scope == second.scope,
+            "reused binding changed its access scope"
+        );
+        eprintln!("live dynamic broker acquisition and binding reuse passed; storage not accessed");
+    })
+    .await
+    .expect("live dynamic broker acquisition deadline exceeded");
 }
 
 #[tokio::test]

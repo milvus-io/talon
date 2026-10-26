@@ -124,21 +124,27 @@ async fn static_resolver_reuses_instances_and_rejects_unknown_targets() {
     let alpha = RouteRequest {
         backend: Backend::S3,
         bucket: "alpha",
+        broker: None,
     };
     resolver.validate(&alpha).unwrap();
     let first = resolver.resolve(&alpha).await.unwrap();
     let second = resolver.resolve(&alpha).await.unwrap();
-    assert!(Arc::ptr_eq(&first, &second));
+    assert!(Arc::ptr_eq(&first.store, &second.store));
     let bravo = resolver
         .resolve(&RouteRequest {
             backend: Backend::S3,
             bucket: "bravo",
+            broker: None,
         })
         .await
         .unwrap();
-    assert!(!Arc::ptr_eq(&first, &bravo));
+    assert!(!Arc::ptr_eq(&first.store, &bravo.store));
     for (backend, bucket) in [(Backend::S3, "unknown"), (Backend::Azure, "alpha")] {
-        let request = RouteRequest { backend, bucket };
+        let request = RouteRequest {
+            backend,
+            bucket,
+            broker: None,
+        };
         assert!(resolver.validate(&request).is_err());
         assert!(resolver.resolve(&request).await.is_err());
     }
@@ -159,7 +165,7 @@ impl BackendResolver for GatedResolver {
     async fn resolve(
         &self,
         request: &RouteRequest<'_>,
-    ) -> talon_core::Result<Arc<dyn BackendStore>> {
+    ) -> talon_core::Result<talon_core::ResolvedBackend> {
         tokio::task::yield_now().await;
         if self.unavailable.load(Ordering::Relaxed) {
             return Err(Error::Backend("resolver unavailable".into()));

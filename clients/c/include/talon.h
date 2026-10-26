@@ -112,13 +112,13 @@ void talon_client_free(talon_client *client);
  *
  * Blocks spanned by the read are fetched concurrently.
  */
-#define TALON_REQUEST_OPTIONS_VERSION_1 1u
 /* Explicit telemetry lifecycle; uses TALON_TELEMETRY_* environment variables.
  * Defaults off. Shutdown after all operations, outside SDK callbacks. */
 int talon_telemetry_init(void);
 void talon_telemetry_shutdown(void);
 #define TALON_TRACE_PARENT_NONE 0u
 #define TALON_TRACE_PARENT_EXPLICIT 1u
+#define TALON_REQUEST_OPTIONS_VERSION_2 2u
 
 typedef struct talon_request_options {
     uint32_t struct_size;
@@ -131,14 +131,20 @@ typedef struct talon_request_options {
     size_t tracestate_len;
     /* Per-request namespace. NULL selects "default" independently of tracing. */
     const char *namespace_name;
+    /* Optional UTF-8 Broker JSON: {url, request, origin:{endpoint}}.
+     * S3 providers also require origin.region. NULL + 0 uses worker configuration.
+     * Otherwise, supply 1..16384 bytes; length excludes any trailing NUL.
+     * The buffer need not be NUL-terminated. */
+    const char *credential_broker;
+    size_t credential_broker_len;
 } talon_request_options;
 
-/* Initialize the fields present in size, which must cover the original v1
- * prefix (offsetof(talon_request_options, namespace_name)). The namespace tail
- * is initialized/read only when size covers the full current struct. Older v1
- * callers remain compatible and select "default"; extra bytes are untouched.
- * Submission copies the carrier and namespace before returning. NULL/NONE never inherits
- * ambient context. Invalid W3C data does not fail a valid business request.
+/* Initialize the full request options struct with size = sizeof(options).
+ * Submission copies namespace, trace and Broker JSON buffers before returning,
+ * so keep these buffers alive until submission returns.
+ * NULL options uses defaults. NULL/NONE never inherits ambient trace context.
+ * Invalid W3C data does not fail a valid business request.
+ * Invalid Broker JSON or pointer/length pairs fail even when tracing is disabled.
  * Unknown version/flags/mode or a short struct returns INVALID_ARGUMENT
  * synchronously, without scheduling a callback.
  *

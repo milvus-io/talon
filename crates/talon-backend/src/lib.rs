@@ -21,7 +21,7 @@ pub mod gcs;
 pub mod http;
 #[cfg(feature = "uring")]
 pub mod monoio_client;
-mod query_auth;
+pub mod origin;
 pub mod reqwest_client;
 pub mod retry;
 pub mod routing;
@@ -40,7 +40,7 @@ mod time {
     pub use tokio::time::{sleep, timeout};
 }
 
-pub use azure::{AzureBackend, AzureConfig, AzureCredentials};
+pub use azure::{AzureBackend, AzureConfig, AzureCredentials, AzureSas};
 pub use broker::{resolve_azure_broker_sas, BrokerConfig};
 pub use credentials::{
     CredentialsFetch, CredentialsObserver, NoopObserver, ProvideBearerToken, ProvideS3Credentials,
@@ -52,11 +52,13 @@ pub use gcs::{GcsBackend, GcsConfig, GcsCredentials, GcsHmacCredentials};
 pub use http::{
     HttpClient, HttpRequest, HttpRequestBody, HttpResponse, HttpStreamResponse, Method,
 };
-pub use query_auth::{AzureSas, S3PresignedQuery};
 pub use reqwest_client::ReqwestClient;
 pub use retry::{RetryConfig, RetryObserver, RetryingHttpClient};
-pub use routing::{BackendResolver, BackendRouter, DefaultBackendResolver, RouteRequest};
-pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest};
+pub use routing::{
+    BackendResolver, BackendRouter, DefaultBackendResolver, DynamicBackendDefaults,
+    LegacyBackendFactory, RouteRequest,
+};
+pub use s3::{S3Backend, S3Config, S3Credentials, S3MultipartRequest, S3PresignedQuery};
 pub use sigv4::{sign_request, AmzDate};
 pub use workload_identity::{
     resolve_azure_credentials, resolve_gcs_credentials, resolve_s3_credentials, CredentialMode,

@@ -89,11 +89,11 @@ pub struct PagedBlockStore {
     /// Open `.page` descriptors, so a warm cross-page read does not pay one
     /// `openat` + `statx` per page it touches.
     ///
-    /// Sized larger per shard than the whole-block store's: a page is orders of
+    /// Sized larger than the whole-block store's: a page is orders of
     /// magnitude smaller than a block, so covering a comparable resident
-    /// working set needs proportionally more descriptors. 16 shards x 512
-    /// caps this at 8192 descriptors, which at a 1 MiB page size covers an
-    /// 8 GiB hot set.
+    /// working set needs proportionally more descriptors. 128 shards x 512
+    /// retain up to 65,536 descriptors, which at a 1 MiB page size covers up
+    /// to a 64 GiB hot set. Entries are shared across namespaces and scopes.
     fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }

@@ -264,6 +264,7 @@ impl BlockReader {
         let mut failures = vec![None; files.len()];
         let mut first_error = None;
         let mut topology = None;
+        let credential_bound = talon_transport::current_credential_broker().is_some();
         let mut completion = tokio::time::timeout(Duration::from_secs(30 * 60), async {
             let snapshot = self.membership_snapshot().await?;
             topology = Some(snapshot.placement.clone());
@@ -282,7 +283,7 @@ impl BlockReader {
                 .map(move |segment| (index, segment))
             });
             loop {
-                let mut groups: HashMap<String, Vec<(usize, LoadBlockRequest)>> = HashMap::new();
+                let mut groups = HashMap::<_, Vec<(usize, LoadBlockRequest)>>::new();
                 let mut planned_bytes = 0;
                 for (index, segment) in plan.by_ref().take(MAX_BATCH_LOAD_BLOCKS * 8) {
                     let owner = snapshot
@@ -296,8 +297,16 @@ impl BlockReader {
                     planned_bytes += request
                         .encoded_len()
                         .map_err(|e| LoadError::InvalidArgument(e.to_string()))?;
+                    // One dynamic worker frame binds one backend and bucket.
+                    // Static routes retain their existing per-worker batching.
+                    let binding = credential_bound.then(|| {
+                        (
+                            request.block.object.backend,
+                            request.block.object.bucket.clone(),
+                        )
+                    });
                     groups
-                        .entry(owner.id.0.clone())
+                        .entry((owner.id.0.clone(), binding))
                         .or_default()
                         .push((index, request));
                     if planned_bytes >= MAX_BATCH_LOAD_BYTES * 8 {
@@ -713,6 +722,60 @@ mod tests {
 
     fn object() -> ObjectId {
         ObjectId::new(Backend::S3, "bucket", "file")
+    }
+
+    #[tokio::test]
+    async fn credential_batches_keep_origin_bindings_separate_on_the_same_worker() {
+        let target = worker("a", Duration::ZERO, true).await;
+        let reader = reader("127.0.0.1:0".into(), std::slice::from_ref(&target.node));
+        let objects = [
+            ObjectId::new(Backend::S3, "a", "first"),
+            ObjectId::new(Backend::S3, "b", "second"),
+            ObjectId::new(Backend::S3, "a", "third"),
+            ObjectId::new(Backend::Gcs, "a", "fourth"),
+        ];
+        let version = Version::new("v1");
+        let files: Vec<_> = objects
+            .iter()
+            .map(|object| FileView {
+                object,
+                version: &version,
+                size: 8,
+                block_size: 8,
+            })
+            .collect();
+        talon_transport::RequestContext::from_properties(&[(
+            "credential_broker",
+            r#"{"url":"http://broker","request":{"csp":"aws","region":"us-east-1","roleArn":"role"},"origin":{"endpoint":"storage.example","region":"us-west-2"}}"#,
+        )])
+        .unwrap()
+        .scope(reader.batch_load(&files, 0, &talon_core::NamespaceId::Unattributed))
+        .await
+        .unwrap();
+        {
+            let sizes = target.batch_sizes.lock().unwrap();
+            let requests = target.requests.lock().unwrap();
+            assert_eq!(sizes.len(), 3);
+            let mut offset = 0;
+            for &size in sizes.iter() {
+                let first = &requests[offset].0.object;
+                assert!(requests[offset..offset + size].iter().all(|(block, _)| {
+                    block.object.backend == first.backend && block.object.bucket == first.bucket
+                }));
+                offset += size;
+            }
+        }
+        target.batch_sizes.lock().unwrap().clear();
+        target.requests.lock().unwrap().clear();
+        reader
+            .batch_load(&files, 0, &talon_core::NamespaceId::Unattributed)
+            .await
+            .unwrap();
+        assert_eq!(
+            *target.batch_sizes.lock().unwrap(),
+            [4],
+            "static grouping stays unchanged"
+        );
     }
 
     #[tokio::test]

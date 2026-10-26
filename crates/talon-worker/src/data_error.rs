@@ -1,7 +1,41 @@
 //! Stable data-plane error classification shared by both worker runtimes.
 
 use talon_core::Error;
-use talon_transport::{encode_typed_error, DataErrorCode};
+use talon_transport::{
+    codec, encode_typed_error, ControlMessage, DataErrorCode, DataPlaneError, FrameHeader, MsgType,
+};
+
+/// Preserve the request's reply contract when namespace or credential resolution fails.
+pub(crate) fn encode_request_error(
+    header: &FrameHeader,
+    payload: &[u8],
+    error: DataPlaneError,
+) -> Result<Vec<u8>, codec::CodecError> {
+    let frame = if header.msg_type == MsgType::Control {
+        let mut request = header.encode().to_vec();
+        request.extend_from_slice(payload);
+        let reply = match codec::decode_request(&request) {
+            Ok((_, ControlMessage::StatObject { .. } | ControlMessage::ListObjects { .. })) => {
+                ControlMessage::ControlFailure {
+                    code: error.code,
+                    message: error.message,
+                }
+            }
+            // LOAD clients consume failed acknowledgements, including batch failures.
+            _ => ControlMessage::Ack {
+                ok: false,
+                detail: Some(error.message),
+            },
+        };
+        codec::encode(header.request_id, &reply)?
+    } else {
+        encode_typed_error(header.request_id, error.code, error.message)
+    };
+    Ok(talon_transport::envelope::response_version(
+        frame,
+        header.version,
+    ))
+}
 
 /// Marker returned when a cache-only request is not fully resident.
 #[derive(Debug)]

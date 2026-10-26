@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 mod async_eviction;
@@ -94,6 +94,7 @@ pub struct WorkerRuntime {
     membership: Arc<Mutex<Option<Arc<MembershipSnapshot>>>>,
     membership_changed: tokio::sync::watch::Sender<()>,
     namespace: talon_core::NamespaceId,
+    cache_identity: namespaces::CacheIdentity,
     namespaces: Option<Arc<namespaces::NamespaceRuntimes>>,
     namespace_parent: std::sync::Weak<namespaces::NamespaceRuntimes>,
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
@@ -112,7 +113,10 @@ pub struct WorkerRuntime {
     /// Payload reservations shared by all single and batch LOADs.
     load_bytes: Arc<tokio::sync::Semaphore>,
     load_inflight_bytes: u64,
-    backend: Arc<dyn BackendStore>,
+    /// Recovered credential scopes stay unbound until a request resolves their
+    /// backend. Runtime clones share the binding without sharing cache state
+    /// with any other credential scope.
+    backend: Arc<OnceLock<Arc<dyn BackendStore>>>,
     background_heads: Option<Arc<origin_head::OriginHeads>>,
     /// Backend selected by the worker process. Optional only so unit-test
     /// runtimes that do not exercise backend routing retain their compact
@@ -154,7 +158,7 @@ struct MembershipSnapshot {
     valid_until: Instant,
     generation: u64,
     // Each namespace has an independent admission revision sequence.
-    scan_limits: Arc<HashMap<String, u64>>,
+    scan_limits: Arc<HashMap<namespaces::CacheIdentity, u64>>,
 }
 
 impl WorkerRuntime {
@@ -219,6 +223,10 @@ impl WorkerRuntime {
             membership: Arc::new(Mutex::new(None)),
             membership_changed: tokio::sync::watch::channel(()).0,
             namespace: talon_core::NamespaceId::default(),
+            cache_identity: namespaces::CacheIdentity::new(
+                &talon_core::NamespaceId::default(),
+                None,
+            ),
             namespaces: None,
             namespace_parent: std::sync::Weak::new(),
             l1,
@@ -232,7 +240,7 @@ impl WorkerRuntime {
             load_slots: Arc::new(tokio::sync::Semaphore::new(8)),
             load_bytes: Arc::new(tokio::sync::Semaphore::new(1 << 30)),
             load_inflight_bytes: 1 << 30,
-            backend,
+            backend: Arc::new(OnceLock::from(backend)),
             background_heads: None,
             configured_backend: None,
             block_size,
@@ -317,14 +325,14 @@ impl WorkerRuntime {
                                 .iter()
                                 .map(|worker| {
                                     (
-                                        worker.namespace.effective_name().to_owned(),
+                                        worker.cache_identity.clone(),
                                         worker.lru.block_scan_ceiling(),
                                     )
                                 })
                                 .collect()
                         } else {
                             HashMap::from([(
-                                self.namespace.effective_name().to_owned(),
+                                self.cache_identity.clone(),
                                 self.lru.block_scan_ceiling(),
                             )])
                         }),
@@ -440,17 +448,24 @@ impl WorkerRuntime {
         Ok(())
     }
 
+    /// Recovered credential scopes remain unavailable until a request binds their origin.
+    fn backend(&self) -> anyhow::Result<&Arc<dyn BackendStore>> {
+        self.backend
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("credential scope has no bound backend"))
+    }
+
     /// Validate the bucket before listing its contents.
     fn ensure_configured_bucket(&self, requested: Backend, bucket: &str) -> anyhow::Result<()> {
         self.ensure_configured_backend(requested)?;
-        self.backend.validate_bucket(requested, bucket)?;
+        self.backend()?.validate_bucket(requested, bucket)?;
         Ok(())
     }
 
     /// Validate the complete object target before origin calls or cache access.
     fn ensure_configured_object(&self, object: &ObjectId) -> anyhow::Result<()> {
         self.ensure_configured_backend(object.backend)?;
-        self.backend.validate_object(object)?;
+        self.backend()?.validate_object(object)?;
         Ok(())
     }
 
@@ -878,7 +893,7 @@ impl WorkerRuntime {
         let mut cursor: Option<String> = None;
         for page_number in 1..=MAX_LIST_PAGES {
             let page = self
-                .backend
+                .backend()?
                 .list_objects(bucket, key_prefix, cursor.as_deref(), LIST_PAGE_SIZE)
                 .await
                 .map_err(|error| anyhow::anyhow!("list {prefix}: {error}"))?;
@@ -927,7 +942,7 @@ impl WorkerRuntime {
     pub async fn stat_object(&self, object: &ObjectId) -> anyhow::Result<talon_core::ObjectStat> {
         self.ensure_configured_object(object)?;
         let stat = self
-            .backend
+            .backend()?
             .head(object)
             .await
             .map_err(|error| anyhow::anyhow!("stat object (HEAD): {error}"))?;
@@ -963,7 +978,7 @@ impl WorkerRuntime {
                 if force { "forced_head" } else { "head" },
             );
             let stat = self
-                .backend
+                .backend()?
                 .head(object)
                 .await
                 .map_err(|error| anyhow::anyhow!("resolve object version (HEAD): {error}"))?;
@@ -1369,7 +1384,7 @@ impl WorkerRuntime {
                 "internal",
                 talon_uring::Download::capture(
                     self.paged.as_ref().and_then(|p| p.direct_alignment()),
-                    self.backend.fetch_range_if_match(
+                    self.backend()?.fetch_range_if_match(
                         &request.object,
                         block.offset + page_start,
                         want,
@@ -1579,7 +1594,7 @@ impl WorkerRuntime {
             Some(len) => len,
             None => {
                 let stat =
-                    self.backend.head(object).await.map_err(|error| {
+                    self.backend()?.head(object).await.map_err(|error| {
                         anyhow::anyhow!("resolve object length (HEAD): {error}")
                     })?;
                 if block.version.as_str() != UNCHECKED_VERSION && stat.version != block.version {
@@ -1845,7 +1860,7 @@ impl WorkerRuntime {
                 "internal",
                 talon_uring::Download::capture(
                     self.store.direct_alignment(),
-                    self.backend.fetch_range_if_match(
+                    self.backend()?.fetch_range_if_match(
                         &request.object,
                         block.offset,
                         self.block_size as u64,
@@ -2031,7 +2046,7 @@ impl WorkerRuntime {
         }
         // Write through to the origin first; the backend PUT is the durability
         // point. Only cache after it succeeds.
-        let version = match self.backend.put(object, body.clone()).await {
+        let version = match self.backend()?.put(object, body.clone()).await {
             Ok(v) => {
                 self.metrics.record_backend_write_success(body.len() as u64);
                 v
@@ -2078,7 +2093,7 @@ impl WorkerRuntime {
             return self.write_object(object, bytes::Bytes::from(body)).await;
         }
         let old_version = self.cached_version(object);
-        let version = match self.backend.put_file(object, path, len).await {
+        let version = match self.backend()?.put_file(object, path, len).await {
             Ok(version) => {
                 self.metrics.record_backend_write_success(len);
                 version
@@ -2115,7 +2130,7 @@ impl WorkerRuntime {
     /// Best-effort evicts the object's currently-cached block.
     pub async fn delete_object(&self, object: &ObjectId) -> anyhow::Result<()> {
         self.ensure_configured_object(object)?;
-        match self.backend.delete(object).await {
+        match self.backend()?.delete(object).await {
             Ok(()) => self.metrics.record_backend_delete_success(),
             Err(error) => {
                 self.metrics.record_backend_delete_error();
