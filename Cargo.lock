@@ -3800,7 +3800,7 @@ dependencies = [
 
 [[package]]
 name = "talon-backend"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "aws-config",
@@ -3840,7 +3840,7 @@ dependencies = [
 
 [[package]]
 name = "talon-c"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "cc",
  "talon-core",
@@ -3853,7 +3853,7 @@ dependencies = [
 
 [[package]]
 name = "talon-cache-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures",
@@ -3872,7 +3872,7 @@ dependencies = [
 
 [[package]]
 name = "talon-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -3889,7 +3889,7 @@ dependencies = [
 
 [[package]]
 name = "talon-coordinator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3918,7 +3918,7 @@ dependencies = [
 
 [[package]]
 name = "talon-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "bytes",
@@ -3936,7 +3936,7 @@ dependencies = [
 
 [[package]]
 name = "talon-fuse"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3958,7 +3958,7 @@ dependencies = [
 
 [[package]]
 name = "talon-gateway"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "axum",
@@ -3997,7 +3997,7 @@ dependencies = [
 
 [[package]]
 name = "talon-metadata"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "async-trait",
  "etcd-client",
@@ -4011,7 +4011,7 @@ dependencies = [
 
 [[package]]
 name = "talon-observability"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -4020,7 +4020,7 @@ dependencies = [
 
 [[package]]
 name = "talon-python"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "pyo3",
  "talon-rust-client",
@@ -4031,7 +4031,7 @@ dependencies = [
 
 [[package]]
 name = "talon-rust-client"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "futures",
  "talon-backend",
@@ -4046,7 +4046,7 @@ dependencies = [
 
 [[package]]
 name = "talon-telemetry"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
@@ -4061,7 +4061,7 @@ dependencies = [
 
 [[package]]
 name = "talon-transport"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -4083,7 +4083,7 @@ dependencies = [
 
 [[package]]
 name = "talon-uring"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "bytes",
  "futures",
@@ -4095,7 +4095,7 @@ dependencies = [
 
 [[package]]
 name = "talon-worker"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "anyhow",
  "async-trait",
