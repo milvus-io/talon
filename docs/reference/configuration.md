@@ -370,6 +370,22 @@ Worker cache capacity (bytes). Startup fails if this exceeds the total filesyste
 - **Default:** `68719476736`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `whole_fd_cache_capacity`
+
+Worker-wide whole-block cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs.
+
+- **Environment variable:** `TALON_WORKER_WHOLE_FD_CACHE_CAPACITY`
+- **Default:** `1024`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
+### `page_fd_cache_capacity`
+
+Worker-wide paged cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs.
+
+- **Environment variable:** `TALON_WORKER_PAGE_FD_CACHE_CAPACITY`
+- **Default:** `16384`
+- **CLI flag:** not settable via CLI (config file or environment only)
+
 ### `background_task_concurrency`
 
 Maximum concurrently running background maintenance tasks.

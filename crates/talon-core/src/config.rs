@@ -265,6 +265,12 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// Worker-wide whole-block cached descriptor limit, shared by namespaces.
+    /// Zero disables caching. Startup-only; active readers and sockets hold extra FDs.
+    pub whole_fd_cache_capacity: usize,
+    /// Worker-wide paged cached descriptor limit, shared by namespaces.
+    /// Zero disables caching. Startup-only; active readers and sockets hold extra FDs.
+    pub page_fd_cache_capacity: usize,
     /// Maximum concurrently running background maintenance tasks.
     pub background_task_concurrency: usize,
     /// Shared local disk I/O concurrency for background maintenance.
@@ -590,6 +596,8 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            whole_fd_cache_capacity: 1024,
+            page_fd_cache_capacity: 16384,
             background_task_concurrency: 2,
             background_io_concurrency: 4,
             background_scan_batch_size: 65536,
@@ -684,6 +692,10 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    /// Override for [`WorkerConfig::whole_fd_cache_capacity`].
+    pub whole_fd_cache_capacity: Option<usize>,
+    /// Override for [`WorkerConfig::page_fd_cache_capacity`].
+    pub page_fd_cache_capacity: Option<usize>,
     /// Override for [`WorkerConfig::background_task_concurrency`].
     pub background_task_concurrency: Option<usize>,
     /// Override for [`WorkerConfig::background_io_concurrency`].
@@ -850,6 +862,10 @@ impl Patch for WorkerConfigPatch {
             async_eviction_check_interval_minutes: self
                 .async_eviction_check_interval_minutes
                 .or(base.async_eviction_check_interval_minutes),
+            whole_fd_cache_capacity: self
+                .whole_fd_cache_capacity
+                .or(base.whole_fd_cache_capacity),
+            page_fd_cache_capacity: self.page_fd_cache_capacity.or(base.page_fd_cache_capacity),
             l1_capacity_bytes: self.l1_capacity_bytes.or(base.l1_capacity_bytes),
             l1_page_size_bytes: self.l1_page_size_bytes.or(base.l1_page_size_bytes),
             l2_page_size_bytes: self.l2_page_size_bytes.or(base.l2_page_size_bytes),
@@ -1057,6 +1073,8 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "Worker cache capacity (bytes). Startup fails if this exceeds the total filesystem capacity of the first cache directory (the active cache root), or if capacity cannot be queried. This checks total size, not free space or per-directory quotas; leave headroom for metadata and other files.",
     },
+    ConfigVar { env: "TALON_WORKER_WHOLE_FD_CACHE_CAPACITY", key: "whole_fd_cache_capacity", default: Some("1024"), cli: false, secret: false, help: "Worker-wide whole-block cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs." },
+    ConfigVar { env: "TALON_WORKER_PAGE_FD_CACHE_CAPACITY", key: "page_fd_cache_capacity", default: Some("16384"), cli: false, secret: false, help: "Worker-wide paged cached FD limit shared by all namespaces; 0 disables caching. Startup-only; active readers and sockets need additional FDs." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY", key: "background_task_concurrency", default: Some("2"), cli: false, secret: false, help: "Maximum concurrently running background maintenance tasks." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_IO_CONCURRENCY", key: "background_io_concurrency", default: Some("4"), cli: false, secret: false, help: "Shared local disk I/O concurrency for background maintenance." },
     ConfigVar { env: "TALON_WORKER_BACKGROUND_SCAN_BATCH_SIZE", key: "background_scan_batch_size", default: Some("65536"), cli: false, secret: false, help: "Maximum entries scanned per watermark eviction or stale GC batch." },
@@ -1321,6 +1339,8 @@ pub(crate) mod worker_env {
     pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_WORKER_HEARTBEAT_INTERVAL_MS";
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
+    pub const WHOLE_FD_CACHE_CAPACITY: &str = "TALON_WORKER_WHOLE_FD_CACHE_CAPACITY";
+    pub const PAGE_FD_CACHE_CAPACITY: &str = "TALON_WORKER_PAGE_FD_CACHE_CAPACITY";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
     pub const BACKGROUND_TASK_CONCURRENCY: &str = "TALON_WORKER_BACKGROUND_TASK_CONCURRENCY";
     pub const BACKGROUND_IO_CONCURRENCY: &str = "TALON_WORKER_BACKGROUND_IO_CONCURRENCY";
@@ -1512,6 +1532,12 @@ impl WorkerConfigPatch {
             )
             .map(|v| parse_u64(v, worker_env::ASYNC_EVICTION_CHECK_INTERVAL_MINUTES))
             .transpose()?,
+            whole_fd_cache_capacity: get(worker_env::WHOLE_FD_CACHE_CAPACITY)
+                .map(|v| parse_usize(v, worker_env::WHOLE_FD_CACHE_CAPACITY))
+                .transpose()?,
+            page_fd_cache_capacity: get(worker_env::PAGE_FD_CACHE_CAPACITY)
+                .map(|v| parse_usize(v, worker_env::PAGE_FD_CACHE_CAPACITY))
+                .transpose()?,
             l1_capacity_bytes: get(worker_env::L1_CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::L1_CAPACITY_BYTES))
                 .transpose()?,
@@ -1724,6 +1750,12 @@ impl WorkerConfig {
             async_eviction_check_interval_minutes: merged
                 .async_eviction_check_interval_minutes
                 .unwrap_or(d.async_eviction_check_interval_minutes),
+            whole_fd_cache_capacity: merged
+                .whole_fd_cache_capacity
+                .unwrap_or(d.whole_fd_cache_capacity),
+            page_fd_cache_capacity: merged
+                .page_fd_cache_capacity
+                .unwrap_or(d.page_fd_cache_capacity),
             l1_capacity_bytes: merged.l1_capacity_bytes.unwrap_or(d.l1_capacity_bytes),
             l1_page_size_bytes: merged.l1_page_size_bytes.unwrap_or(d.l1_page_size_bytes),
             l2_page_size_bytes: merged.l2_page_size_bytes.unwrap_or(d.l2_page_size_bytes),
@@ -2536,6 +2568,63 @@ mod tests {
             merged.namespace_policy_path.as_deref(),
             Some(std::path::Path::new("/policy/env.toml"))
         );
+    }
+
+    #[test]
+    fn fd_cache_capacity_defaults_and_layers() {
+        let defaults =
+            WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+                .unwrap();
+        assert_eq!(defaults.whole_fd_cache_capacity, 1024);
+        assert_eq!(defaults.page_fd_cache_capacity, 16384);
+        let file = WorkerConfigPatch::from_toml(
+            "whole_fd_cache_capacity = 17\npage_fd_cache_capacity = 129",
+        )
+        .unwrap();
+        let from_file =
+            WorkerConfig::resolve(file.clone(), Default::default(), Default::default()).unwrap();
+        assert_eq!(from_file.whole_fd_cache_capacity, 17);
+        assert_eq!(from_file.page_fd_cache_capacity, 129);
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            worker_env::WHOLE_FD_CACHE_CAPACITY => Some("0".into()),
+            worker_env::PAGE_FD_CACHE_CAPACITY => Some("257".into()),
+            _ => None,
+        })
+        .unwrap();
+        let from_env =
+            WorkerConfig::resolve(file.clone(), env.clone(), Default::default()).unwrap();
+        assert_eq!(from_env.whole_fd_cache_capacity, 0);
+        assert_eq!(from_env.page_fd_cache_capacity, 257);
+        let override_patch = WorkerConfigPatch {
+            page_fd_cache_capacity: Some(0),
+            ..Default::default()
+        };
+        let overridden = WorkerConfig::resolve(file, env, override_patch).unwrap();
+        assert_eq!(overridden.whole_fd_cache_capacity, 0);
+        assert_eq!(overridden.page_fd_cache_capacity, 0);
+    }
+
+    #[test]
+    fn fd_cache_capacity_rejects_invalid_values() {
+        for key in [
+            worker_env::WHOLE_FD_CACHE_CAPACITY,
+            worker_env::PAGE_FD_CACHE_CAPACITY,
+        ] {
+            for value in ["-1", "abc", "18446744073709551616"] {
+                assert!(
+                    WorkerConfigPatch::from_env_with(|name| {
+                        (name == key).then(|| value.to_owned())
+                    })
+                    .is_err(),
+                    "{key}={value}"
+                );
+            }
+        }
+        for key in ["whole_fd_cache_capacity", "page_fd_cache_capacity"] {
+            for value in ["-1", "1.5", "\"invalid\""] {
+                assert!(WorkerConfigPatch::from_toml(&format!("{key} = {value}")).is_err());
+            }
+        }
     }
 
     #[test]

@@ -206,7 +206,12 @@ impl WholeBlockStore {
 
     /// Open (creating if needed) a store rooted at `root`.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        Self::open_with_fd_cache(root, Arc::new(FdCache::new()))
+        Self::open_with_fd_cache(
+            root,
+            Arc::new(FdCache::new(
+                talon_core::WorkerConfig::default().whole_fd_cache_capacity,
+            )),
+        )
     }
 
     pub(crate) fn open_with_fd_cache(
