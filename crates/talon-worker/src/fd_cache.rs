@@ -25,16 +25,6 @@ use std::sync::{Arc, RwLock};
 /// lookup off a single global lock when many connections hit distinct files.
 const FD_CACHE_SHARDS: usize = 16;
 
-/// Per-shard capacity of the whole-block open-fd cache. Cached entries are
-/// bounded by `FD_CACHE_SHARDS * FD_CACHE_SHARD_CAPACITY`; active readers,
-/// the separate paged cache, connections, and listeners hold additional fds.
-///
-/// The bound matters because an unbounded cache would pin one fd per file ever
-/// touched; capping it keeps worst-case fd usage predictable and independent of
-/// cache size. Callers pick a multiplier appropriate to their file granularity
-/// — see [`FdCache::new`] and [`FdCache::with_capacity`].
-const FD_CACHE_SHARD_CAPACITY: usize = 64;
-
 /// A cached, shared descriptor for an immutable cache file.
 #[derive(Clone)]
 pub(crate) struct CachedFd {
@@ -53,29 +43,24 @@ pub(crate) struct CachedFd {
 /// precise LRU is not worth the extra bookkeeping on this path.
 pub(crate) struct FdCache {
     shards: Vec<RwLock<Shard>>,
-    per_shard: usize,
 }
 
 #[derive(Default)]
 struct Shard {
     entries: HashMap<PathBuf, CachedFd>,
     generation: u64,
+    capacity: usize,
 }
 
 impl FdCache {
-    /// A cache sized for whole-block files: 1024 descriptors total.
-    ///
-    /// Blocks default to 256 MiB, so this already covers a ~256 GiB resident
-    /// working set — well past the point where the per-request `openat` was
-    /// measurable.
-    pub(crate) fn new() -> Self {
-        Self::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARD_CAPACITY)
+    /// Whole-block cache with a worker-wide descriptor limit.
+    pub(crate) fn new(capacity: usize) -> Self {
+        Self::with_capacity(FD_CACHE_SHARDS, capacity)
     }
 
-    /// Pages spread their larger working set across more locks:
-    /// 128 shards x 512 = 65,536 descriptors.
-    pub(crate) fn for_pages() -> Self {
-        Self::with_capacity(128, 512)
+    /// Paged cache spreads its larger working set across more locks.
+    pub(crate) fn for_pages(capacity: usize) -> Self {
+        Self::with_capacity(128, capacity)
     }
 
     #[cfg(test)]
@@ -86,12 +71,20 @@ impl FdCache {
             .sum()
     }
 
-    /// A cache with an explicit shard count and per-shard capacity.
-    pub(crate) fn with_capacity(shards: usize, per_shard: usize) -> Self {
+    /// Distribute a total capacity across at most `shards` shards without
+    /// rounding up. Small caches use fewer shards; zero keeps one empty shard.
+    pub(crate) fn with_capacity(shards: usize, capacity: usize) -> Self {
         assert!(shards > 0, "FD cache needs at least one shard");
+        let shards = shards.min(capacity.max(1));
         Self {
-            shards: (0..shards).map(|_| RwLock::new(Shard::default())).collect(),
-            per_shard,
+            shards: (0..shards)
+                .map(|i| {
+                    RwLock::new(Shard {
+                        capacity: capacity / shards + usize::from(i < capacity % shards),
+                        ..Default::default()
+                    })
+                })
+                .collect(),
         }
     }
 
@@ -110,7 +103,10 @@ impl FdCache {
     pub(crate) fn insert(&self, path: PathBuf, entry: CachedFd) {
         let shard = self.shard_for(&path);
         let mut guard = shard.write().unwrap_or_else(|e| e.into_inner());
-        if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
+        if guard.capacity == 0 {
+            return;
+        }
+        if guard.entries.len() >= guard.capacity && !guard.entries.contains_key(&path) {
             if let Some(victim) = guard.entries.keys().next().cloned() {
                 guard.entries.remove(&victim);
             }
@@ -145,8 +141,8 @@ impl FdCache {
             .shard_for(&path)
             .write()
             .unwrap_or_else(|e| e.into_inner());
-        if guard.generation == generation {
-            if guard.entries.len() >= self.per_shard && !guard.entries.contains_key(&path) {
+        if guard.generation == generation && guard.capacity > 0 {
+            if guard.entries.len() >= guard.capacity && !guard.entries.contains_key(&path) {
                 if let Some(victim) = guard.entries.keys().next().cloned() {
                     guard.entries.remove(&victim);
                 }
@@ -214,10 +210,90 @@ mod tests {
     }
 
     #[test]
+    fn arbitrary_total_capacities_are_respected() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = write(&dir.path().join("data"), b"data");
+        for capacity in [0, 1, 15, 16, 17, 127, 128, 129, 257] {
+            for cache in [FdCache::new(capacity), FdCache::for_pages(capacity)] {
+                for i in 0..4096 {
+                    cache.insert(PathBuf::from(format!("{i}.page")), entry.clone());
+                    assert!(cache.len() <= capacity);
+                }
+                // The bounded working set fills every shard, including remainder slots.
+                assert_eq!(cache.len(), capacity);
+                if capacity == 0 {
+                    assert!(cache.get(Path::new("4095.page")).is_none());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn native_opens_respect_capacity_including_disabled_cache() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<_> = (0..256)
+            .map(|i| dir.path().join(format!("{i}.page")))
+            .collect();
+        for path in &paths {
+            std::fs::write(path, b"data").unwrap();
+        }
+        monoio::RuntimeBuilder::<monoio::IoUringDriver>::new()
+            .with_iowq_max_workers(1, 1)
+            .build()
+            .unwrap()
+            .block_on(async {
+                let ring = talon_uring::LocalRing::enter();
+                for capacity in [0, 1, 17, 129] {
+                    let cache = FdCache::for_pages(capacity);
+                    for path in &paths {
+                        let entry = cache.open_native(path.clone()).await.unwrap();
+                        assert_eq!(entry.len, 4);
+                        let mut data = [0; 4];
+                        std::fs::File::from(entry.fd.try_clone().unwrap())
+                            .read_exact_at(&mut data, 0)
+                            .unwrap();
+                        assert_eq!(&data, b"data");
+                        assert!(cache.len() <= capacity);
+                        if capacity == 0 {
+                            assert!(cache.get(path).is_none());
+                        } else {
+                            let hit = cache.open_native(path.clone()).await.unwrap();
+                            assert!(Arc::ptr_eq(&entry.fd, &hit.fd));
+                        }
+                    }
+                }
+                ring.drain().await;
+            });
+    }
+
+    #[test]
+    fn eviction_and_disabled_cache_leave_active_readers_valid() {
+        use std::os::unix::fs::FileExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data");
+        let entry = write(&path, b"data");
+        let cache = FdCache::new(1);
+        cache.insert(path.clone(), entry);
+        let reader = cache.get(&path).unwrap();
+        let other = dir.path().join("other");
+        cache.insert(other.clone(), write(&other, b"other"));
+        assert!(cache.get(&path).is_none());
+        let disabled = FdCache::new(0);
+        disabled.insert(path.clone(), reader.clone());
+        assert!(disabled.get(&path).is_none());
+        std::fs::remove_file(&path).unwrap();
+        let file = std::fs::File::from(reader.fd.try_clone().unwrap());
+        let mut data = [0; 4];
+        file.read_exact_at(&mut data, 0).unwrap();
+        assert_eq!(&data, b"data");
+    }
+
+    #[test]
     fn a_cached_descriptor_round_trips() {
         let dir = tmp_dir();
         let path = dir.join("a.page");
-        let cache = FdCache::new();
+        let cache = FdCache::new(talon_core::WorkerConfig::default().whole_fd_cache_capacity);
         cache.insert(path.clone(), write(&path, b"hello"));
         assert_eq!(cache.get(&path).unwrap().len, 5);
         cache.invalidate(&path);
@@ -231,7 +307,7 @@ mod tests {
     #[test]
     fn a_shard_never_exceeds_its_capacity() {
         let dir = tmp_dir();
-        let cache = FdCache::with_capacity(FD_CACHE_SHARDS, 2);
+        let cache = FdCache::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARDS * 2);
         for i in 0..64 {
             let path = dir.join(format!("cap-{i}.page"));
             cache.insert(path.clone(), write(&path, b"x"));
@@ -248,8 +324,8 @@ mod tests {
         use talon_core::{Backend, BlockId, ObjectId, ObjectStore, PageIndex, Version};
 
         let root = tempfile::tempdir().unwrap();
-        let whole_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, 1));
-        let page_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, 1));
+        let whole_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARDS));
+        let page_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARDS));
         let id = BlockId::new(
             ObjectId::new(Backend::S3, "bucket", "key"),
             0,
@@ -295,7 +371,7 @@ mod tests {
     fn paged_cache_retains_entries_across_expanded_shards() {
         let dir = tempfile::tempdir().unwrap();
         let entry = write(&dir.path().join("data.page"), b"page");
-        let cache = FdCache::for_pages();
+        let cache = FdCache::for_pages(talon_core::WorkerConfig::default().page_fd_cache_capacity);
         // Reuse one descriptor to exercise routing without requiring thousands
         // of open files. The keys need not name real files for cache lookups.
         let prefix = Path::new("paged-cache-routing");
@@ -305,7 +381,7 @@ mod tests {
         for path in &paths {
             cache.insert(path.clone(), entry.clone());
         }
-        // A hard-coded 16-shard modulus would overload some 512-entry shards
+        // A hard-coded 16-shard modulus would overload some 128-entry shards
         // and evict entries even though the new cache has ample total space.
         for path in &paths {
             let hit = cache
@@ -325,7 +401,7 @@ mod tests {
         let block = dir.join("block.pages");
         std::fs::create_dir_all(&block).unwrap();
         let other = dir.join("other.page");
-        let cache = FdCache::new();
+        let cache = FdCache::new(talon_core::WorkerConfig::default().whole_fd_cache_capacity);
         for i in 0..4 {
             let path = block.join(format!("{i}.page"));
             cache.insert(path.clone(), write(&path, b"x"));

@@ -188,7 +188,13 @@ impl PagedBlockStore {
     /// Open (creating if needed) a paged store rooted at `root`, using
     /// `page_size`-byte pages.
     pub fn open(root: impl Into<PathBuf>, page_size: u32) -> Result<Self> {
-        Self::open_with_fd_cache(root, page_size, Arc::new(FdCache::for_pages()))
+        Self::open_with_fd_cache(
+            root,
+            page_size,
+            Arc::new(FdCache::for_pages(
+                talon_core::WorkerConfig::default().page_fd_cache_capacity,
+            )),
+        )
     }
 
     pub(crate) fn open_with_fd_cache(

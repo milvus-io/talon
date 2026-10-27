@@ -294,8 +294,8 @@ impl WorkerRuntime {
                 config.load_inflight_bytes as usize,
             )),
             l1_budget: Arc::default(),
-            whole_fds: Arc::new(FdCache::new()),
-            page_fds: Arc::new(FdCache::for_pages()),
+            whole_fds: Arc::new(FdCache::new(config.whole_fd_cache_capacity)),
+            page_fds: Arc::new(FdCache::for_pages(config.page_fd_cache_capacity)),
             background_budget: crate::background::BackgroundBudget::new(config),
         });
         let mut names = std::collections::BTreeSet::from([DEFAULT_NAMESPACE.to_owned()]);
@@ -1629,22 +1629,29 @@ mod tests {
 
     #[tokio::test]
     async fn namespace_runtime_reads_populate_shared_descriptor_caches() {
-        for paged in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
-            let mut config = config();
-            if !paged {
-                config.l2_page_size_bytes = 0;
+        for capacity in [None, Some(0), Some(1)] {
+            for paged in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let mut config = config();
+                if !paged {
+                    config.l2_page_size_bytes = 0;
+                }
+                if let Some(capacity) = capacity {
+                    config.whole_fd_cache_capacity = capacity;
+                    config.page_fd_cache_capacity = capacity;
+                }
+                let root = open(dir.path(), &config, Arc::default());
+                for name in ["a", "b", "c"] {
+                    let namespace = root.for_namespace(&NamespaceId::named(name)).await.unwrap();
+                    read(&namespace).await;
+                    // Repeat a warm read, including when descriptor caching is disabled.
+                    read(&namespace).await;
+                }
+                let registry = root.registry().unwrap();
+                let expected = capacity.unwrap_or(3);
+                assert_eq!(registry.whole_fds.len(), if paged { 0 } else { expected });
+                assert_eq!(registry.page_fds.len(), if paged { expected } else { 0 });
             }
-            let root = open(dir.path(), &config, Arc::default());
-            for name in ["a", "b", "c"] {
-                let namespace = root.for_namespace(&NamespaceId::named(name)).await.unwrap();
-                read(&namespace).await;
-                // A warm serve opens and retains a descriptor after the handle drops.
-                read(&namespace).await;
-            }
-            let registry = root.registry().unwrap();
-            assert_eq!(registry.whole_fds.len(), if paged { 0 } else { 3 });
-            assert_eq!(registry.page_fds.len(), if paged { 3 } else { 0 });
         }
     }
 
