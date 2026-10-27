@@ -6,7 +6,7 @@
 
   <groupId>io.milvus</groupId>
   <artifactId>talon-client</artifactId>
-  <version>0.2.0</version>
+  <version>0.2.1</version>
   <packaging>jar</packaging>
 
   <name>Talon Java client</name>
