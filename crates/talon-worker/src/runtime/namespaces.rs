@@ -117,10 +117,15 @@ impl NamespaceRuntimes {
         } else {
             None
         };
+        let recovery_started = Instant::now();
         store.restore_index(&index)?;
         if let Some(paged) = &paged {
             paged.restore_index(&index)?;
         }
+        tracing::info!(root = %root.display(), blocks = index.len(),
+            elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+            "cache index restored");
+        let runtime_started = Instant::now();
         let mut worker = WorkerRuntime::new_with_l1(
             store,
             index,
@@ -158,6 +163,9 @@ impl NamespaceRuntimes {
             .delete_batch_size
             .min(config.background_delete_batch_size);
         worker = worker.with_page_gc(gc)?;
+        tracing::info!(root = %root.display(),
+            elapsed_ms = runtime_started.elapsed().as_millis() as u64,
+            "cache runtime restored");
         worker.membership = self.membership.clone();
         worker.membership_changed = self.membership_changed.clone();
         worker.namespace = namespace.normalized();
@@ -207,7 +215,8 @@ impl NamespaceRuntimes {
                     })
                     .await??,
                 );
-                worker.recover_page_file_cleanup().await;
+                // Publish after index recovery; background cleanup also covers
+                // newly discovered namespaces without delaying their first read.
                 registry
                     .workers
                     .write()
@@ -673,6 +682,91 @@ mod tests {
     }
     fn block(size: u32) -> BlockId {
         BlockId::new(request().object, 0, size, Version::new("v1"))
+    }
+
+    /// Synthetic filesystem benchmark, not a UAT readiness measurement. Run in
+    /// release mode with TMPDIR on the benchmark disk; never evicts host caches.
+    #[tokio::test]
+    #[ignore = "manual filesystem recovery benchmark"]
+    async fn benchmark_cache_startup() {
+        let count: usize = std::env::var("TALON_RECOVERY_BENCH_BLOCKS")
+            .unwrap_or_else(|_| "100000".into())
+            .parse()
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = WorkerConfig {
+            block_size: 256 << 20,
+            l2_page_size_bytes: 1 << 20,
+            capacity_bytes: 1 << 40,
+            ..config()
+        };
+        drop(open(dir.path(), &cfg, Arc::default()));
+        let paged =
+            PagedBlockStore::open(dir.path().join("default/shared/paged"), 1 << 20).unwrap();
+        for n in 0..count {
+            let id = BlockId::new(
+                ObjectId::new(Backend::S3, "bucket", format!("object/{n}")),
+                0,
+                cfg.block_size,
+                Version::new("v1"),
+            );
+            let block_dir = paged.dir_for(&id);
+            std::fs::create_dir_all(&block_dir).unwrap();
+            let meta = talon_core::BlockMeta {
+                id,
+                form: talon_core::BlockForm::Paged {
+                    page_size: 1 << 20,
+                    present: talon_core::PresentBitmap::new(256),
+                },
+                len: 256 << 20,
+            };
+            std::fs::write(
+                block_dir.join("block.meta"),
+                serde_json::to_vec(&meta).unwrap(),
+            )
+            .unwrap();
+            // Sparse payload keeps the metadata workload realistic without
+            // allocating count MiB of test data. Index allocation remains exact.
+            let page = std::fs::File::create(block_dir.join("0.page")).unwrap();
+            page.set_len(1 << 20).unwrap();
+        }
+        eprintln!("fixture blocks={count} entries={} ready", count * 3);
+        let startup_only = std::env::var("TALON_RECOVERY_BENCH_PHASE").as_deref() == Ok("startup");
+        let cases: &[usize] = if startup_only {
+            &[]
+        } else {
+            &[0, 1, 2, 4, 8, 16, 16, 8, 4, 2, 1, 0]
+        };
+        for &workers in cases {
+            let index = BlockIndex::new();
+            let started = Instant::now();
+            if workers > 0 {
+                paged.restore_index_with_workers(&index, workers).unwrap();
+            } else {
+                for entry in paged.scan_allocated().unwrap() {
+                    index.commit_allocated(entry.meta, entry.allocated);
+                }
+            }
+            let elapsed = started.elapsed();
+            assert_eq!(index.len(), count);
+            eprintln!("index workers={workers} blocks={count} elapsed={elapsed:?}");
+        }
+        let started = Instant::now();
+        let worker = open(dir.path(), &cfg, Arc::default());
+        let recovery = started.elapsed();
+        assert_eq!(worker.index.len(), count);
+        eprintln!("startup blocks={count} recovery={recovery:?}");
+        if startup_only {
+            return;
+        }
+        let started = Instant::now();
+        for namespace in worker.namespace_runtimes() {
+            namespace.recover_page_file_cleanup().await;
+        }
+        eprintln!(
+            "startup blocks={count} deferred_cleanup={:?}",
+            started.elapsed()
+        );
     }
     async fn read(worker: &WorkerRuntime) {
         worker

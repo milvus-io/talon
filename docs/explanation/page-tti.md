@@ -190,11 +190,34 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 
 ## 崩溃残留兜底
 
+启动时，paged cache 按磁盘 hash shard 并行恢复，逐块写入索引，不再保留全缓存的
+`StoredBlock` 中间列表。恢复线程数最多为 16，与 CPU 数解耦；这限制了
+并发磁盘扫描与打开的目录数量。启动仍等待索引、分配空间记账、LRU 和访问时间恢复，
+不会通过提前报告就绪来绕过缓存一致性检查。
+
+日志 `cache index restored`、`cache runtime restored` 和
+`worker cache recovery complete` 分别记录索引恢复、内存运行时恢复和总缓存恢复耗时。
+这些时间不包括此前的身份和后端初始化，也不等同于 Coordinator 已确认 Worker 就绪。
+
+手工性能验证可运行以下忽略测试（release 模式；测试目录和构建缓存必须在数据盘）：
+
+```sh
+TALON_RECOVERY_BENCH_BLOCKS=100000 cargo test --locked --release -p talon-worker \
+  --lib benchmark_cache_startup -- --ignored --nocapture
+```
+
+设置 `TALON_RECOVERY_BENCH_PHASE=startup` 可只测完整恢复，避免之前的索引测试预热缓存。
+默认测试构造一页一个 block 的稀疏文件，比较串行恢复和 1/2/4/8/16 个扫描线程，
+然后分别测量完整缓存运行时恢复与被移出启动路径的清理。它不清空操作系统缓存，
+因此不能替代目标节点上的冷启动验收。以 60 秒为目标时，应从进程启动计时到
+Worker 实际 Ready 并成功读取已有缓存，并覆盖异常退出恢复、真实缓存规模和资源限制。
+
 正式 `access.shard` 通过原子替换更新，不保留历史版本。异常退出留下的临时文件，
 以及最后一个 page 删除后尚未清理的目录，由独立磁盘扫描回收：
 
-- 启动持有 cache root 独占锁，在接收请求前完成一轮完整扫描；不依赖 residency
-  索引，因此无 page、缺少或损坏 `block.meta` 的目录仍可被发现。
+- 启动持有 cache root 独占锁，恢复有效缓存的索引、空间记账和访问时间后接收请求。
+  崩溃残留清理交给立即启动的后台任务，不再让第二次全量磁盘扫描阻塞启动。
+  清理不依赖 residency 索引，因此无 page、缺少或损坏 `block.meta` 的目录仍可被发现。
 - 后台每次完整扫描一圈，不受扫描/删除批量上限限制；完成后按独立的
   `file_cleanup_interval_hours` 等待，默认 1 小时。仍共享后台任务并发、
   I/O 并发和删除速率预算，删除失败留到下一轮重试。

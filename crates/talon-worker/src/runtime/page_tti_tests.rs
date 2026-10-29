@@ -1017,6 +1017,40 @@ async fn orphan_cleanup_covers_unindexed_directories_with_paged_reads_disabled()
 }
 
 #[tokio::test]
+async fn background_cleanup_discovers_startup_residue_without_a_foreground_pass() {
+    let root = tempfile::tempdir().unwrap();
+    let r = runtime(root.path(), false, 0, 0);
+    r.serve_range(&request(0, 16)).await.unwrap();
+    let live = r.paged.as_ref().unwrap().dir_for(&id());
+    let orphan = root.path().join("paged/00/0000000000000001.pages");
+    std::fs::create_dir_all(&orphan).unwrap();
+    std::fs::write(orphan.join("block.meta"), b"leftover").unwrap();
+    let temporary = live.join("access.meta.tmp.crashed");
+    std::fs::write(&temporary, b"partial").unwrap();
+    let r = Arc::new(r);
+    let service = crate::runtime::WorkerBackground::start(
+        r.clone(),
+        &talon_core::WorkerConfig {
+            ownership_gc_enabled: false,
+            stale_gc_enabled: false,
+            async_eviction_enabled: false,
+            file_cleanup_interval_hours: 24,
+            ..Default::default()
+        },
+    );
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while orphan.exists() || temporary.exists() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("first background cleanup must not wait for its daily interval");
+    service.shutdown().await;
+    assert!(live.join("0.page").exists());
+    assert_eq!(r.logical_resident_bytes(), 16);
+}
+
+#[tokio::test]
 async fn orphan_cleanup_waits_for_active_checkpoint_and_commit_gate() {
     let root = tempfile::tempdir().unwrap();
     let r = runtime(root.path(), false, 0, 0);

@@ -309,87 +309,137 @@ impl PagedBlockStore {
     /// Restore indexed logical metadata and measured data-file allocations.
     /// Intended for startup while the cache directory is exclusively owned.
     pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
-        for entry in self.scan_allocated()? {
-            index.commit_allocated(entry.meta, entry.allocated);
-        }
-        Ok(())
+        // Metadata reads wait on disk even with only two CPUs. Bound I/O
+        // concurrency independently of CPU count, shared across all shards.
+        self.restore_index_with_workers(index, 16)
+    }
+
+    pub(crate) fn restore_index_with_workers(
+        &self,
+        index: &crate::BlockIndex,
+        workers: usize,
+    ) -> Result<()> {
+        let shards = self.shard_paths()?;
+        let workers = workers.max(1).min(shards.len());
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| -> Result<()> {
+            let mut tasks = Vec::new();
+            for _ in 0..workers {
+                let shards = &shards;
+                let next = &next;
+                tasks.push(
+                    std::thread::Builder::new()
+                        .name("cache-recovery".into())
+                        .spawn_scoped(scope, move || -> Result<()> {
+                            while let Some(shard) = shards.get(next.fetch_add(1, Ordering::Relaxed))
+                            {
+                                self.scan_shard(shard, &mut |entry| {
+                                    // Publish one block at a time rather than retaining
+                                    // a second full-cache metadata vector during recovery.
+                                    index.commit_allocated(entry.meta, entry.allocated);
+                                })?;
+                            }
+                            Ok(())
+                        })?,
+                );
+            }
+            for task in tasks {
+                task.join()
+                    .map_err(|_| Error::Other("cache recovery thread panicked".into()))??;
+            }
+            Ok(())
+        })
+    }
+
+    fn shard_paths(&self) -> Result<Vec<PathBuf>> {
+        let shards = match std::fs::read_dir(&self.root) {
+            Ok(rd) => rd,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(shards
+            .flatten()
+            .filter(|shard| shard.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .map(|shard| shard.path())
+            .collect())
     }
 
     pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
         let mut out = Vec::new();
-        let shards = match std::fs::read_dir(&self.root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        for shard in shards.flatten() {
-            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(shard.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let dir = entry.path();
-                if dir.extension().and_then(|e| e.to_str()) != Some("pages") {
-                    continue;
-                }
-                let Ok(bytes) = std::fs::read(dir.join("block.meta")) else {
-                    continue;
-                };
-                let mut meta = match serde_json::from_slice::<BlockMeta>(&bytes) {
-                    Ok(meta) => meta,
-                    Err(error) => {
-                        tracing::warn!(path = %dir.display(), %error, "skipping malformed paged sidecar");
-                        continue;
-                    }
-                };
-                let BlockForm::Paged { page_size, present } = &mut meta.form else {
-                    continue;
-                };
-                // A sidecar written under a different page size cannot be
-                // reinterpreted at the current one; drop it rather than serve
-                // misaligned pages.
-                if *page_size != self.page_size {
-                    tracing::warn!(
-                        path = %dir.display(),
-                        sidecar_page_size = *page_size,
-                        configured_page_size = self.page_size,
-                        "skipping paged block written under a different page size"
-                    );
-                    continue;
-                }
-                let Ok(pages) = std::fs::read_dir(&dir) else {
-                    continue;
-                };
-                let mut allocated = Vec::new();
-                *present = PresentBitmap::new(meta.id.page_count(*page_size));
-                for page_file in pages.flatten() {
-                    let path = page_file.path();
-                    if path.extension().and_then(|e| e.to_str()) != Some("page") {
-                        continue;
-                    }
-                    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-                        continue;
-                    };
-                    if let Ok(index) = stem.parse::<u32>() {
-                        if index >= present.len() || present.is_present(PageIndex(index)) {
-                            continue;
-                        }
-                        let file = page_file.metadata()?;
-                        if !file.is_file() {
-                            continue;
-                        }
-                        present.set(PageIndex(index));
-                        allocated.push((Some(PageIndex(index)), file.blocks() * 512));
-                    }
-                }
-                if present.count() > 0 {
-                    out.push(crate::index::StoredBlock { meta, allocated });
-                }
-            }
+        for shard in self.shard_paths()? {
+            self.scan_shard(&shard, &mut |entry| out.push(entry))?;
         }
         Ok(out)
+    }
+
+    fn scan_shard(
+        &self,
+        shard: &Path,
+        visit: &mut impl FnMut(crate::index::StoredBlock),
+    ) -> Result<()> {
+        let Ok(entries) = std::fs::read_dir(shard) else {
+            return Ok(());
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir.extension().and_then(|e| e.to_str()) != Some("pages") {
+                continue;
+            }
+            let Ok(bytes) = std::fs::read(dir.join("block.meta")) else {
+                continue;
+            };
+            let mut meta = match serde_json::from_slice::<BlockMeta>(&bytes) {
+                Ok(meta) => meta,
+                Err(error) => {
+                    tracing::warn!(path = %dir.display(), %error, "skipping malformed paged sidecar");
+                    continue;
+                }
+            };
+            let BlockForm::Paged { page_size, present } = &mut meta.form else {
+                continue;
+            };
+            // A sidecar written under a different page size cannot be
+            // reinterpreted at the current one; drop it rather than serve
+            // misaligned pages.
+            if *page_size != self.page_size {
+                tracing::warn!(
+                    path = %dir.display(),
+                    sidecar_page_size = *page_size,
+                    configured_page_size = self.page_size,
+                    "skipping paged block written under a different page size"
+                );
+                continue;
+            }
+            let Ok(pages) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut allocated = Vec::new();
+            *present = PresentBitmap::new(meta.id.page_count(*page_size));
+            for page_file in pages.flatten() {
+                let path = page_file.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("page") {
+                    continue;
+                }
+                let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                if let Ok(index) = stem.parse::<u32>() {
+                    if index >= present.len() || present.is_present(PageIndex(index)) {
+                        continue;
+                    }
+                    let file = page_file.metadata()?;
+                    if !file.is_file() {
+                        continue;
+                    }
+                    present.set(PageIndex(index));
+                    allocated.push((Some(PageIndex(index)), file.blocks() * 512));
+                }
+            }
+            if present.count() > 0 {
+                visit(crate::index::StoredBlock { meta, allocated });
+            }
+        }
+        Ok(())
     }
 
     /// Whether a specific page is resident.
@@ -711,6 +761,48 @@ mod tests {
         let mut buf = vec![0u8; h.len as usize];
         f.read_exact(&mut buf).unwrap();
         buf
+    }
+
+    #[test]
+    fn parallel_recovery_preserves_presence_and_allocated_bytes_across_shards() {
+        let root = tempfile::tempdir().unwrap();
+        let store = PagedBlockStore::open(root.path(), 1 << 20).unwrap();
+        let mut expected = Vec::new();
+        for n in 0..300 {
+            let id = block(n);
+            let dir = store.dir_for(&id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let meta = BlockMeta {
+                id: id.clone(),
+                form: BlockForm::Paged {
+                    page_size: 1 << 20,
+                    present: PresentBitmap::new(256),
+                },
+                len: 256 << 20,
+            };
+            std::fs::write(dir.join("block.meta"), serde_json::to_vec(&meta).unwrap()).unwrap();
+            std::fs::write(dir.join("2.page"), b"resident").unwrap();
+            std::fs::write(dir.join("3.page.tmp.crashed"), b"partial").unwrap();
+            let allocated = std::fs::metadata(dir.join("2.page")).unwrap().blocks() * 512;
+            expected.push((id, allocated));
+        }
+        assert!(store.shard_paths().unwrap().len() > 8);
+        let index = crate::BlockIndex::new();
+        store.restore_index(&index).unwrap();
+        assert_eq!(index.len(), expected.len());
+        assert_eq!(
+            index.resident_bytes(),
+            expected.iter().map(|(_, bytes)| bytes).sum::<u64>()
+        );
+        for (id, _) in expected {
+            let meta = index.get(&id).unwrap();
+            let BlockForm::Paged { present, .. } = meta.form else {
+                panic!("paged block expected")
+            };
+            assert_eq!(present.count(), 1);
+            assert!(present.is_present(PageIndex(2)));
+            assert!(!present.is_present(PageIndex(3)));
+        }
     }
 
     #[test]

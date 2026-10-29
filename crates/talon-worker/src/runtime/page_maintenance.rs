@@ -180,8 +180,8 @@ impl WorkerRuntime {
             .await
     }
 
-    /// Discover and attempt one complete disk pass before serving traffic.
-    /// Errors stay on disk and are rediscovered by the background loop.
+    /// Explicitly complete a disk cleanup pass. Normal startup uses the bounded
+    /// background loop instead. Errors stay on disk for the next pass.
     pub async fn recover_page_file_cleanup(&self) {
         self.cleanup_page_files_once().await;
     }
