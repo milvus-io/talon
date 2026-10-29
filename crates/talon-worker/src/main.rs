@@ -870,6 +870,7 @@ async fn run() -> anyhow::Result<()> {
     cfg.buckets = None;
     tracing::info!(backend = backend_kind, "object-store backend ready");
 
+    let recovery_started = Instant::now();
     let runtime = WorkerRuntime::open_namespaces_with_uring(
         &cfg,
         cache_root_lock,
@@ -879,9 +880,13 @@ async fn run() -> anyhow::Result<()> {
     )?;
     let worker = Arc::new(runtime);
     observability.attach_namespace_runtime(&worker);
-    for namespace in worker.namespace_runtimes() {
-        namespace.recover_page_file_cleanup().await;
-    }
+    tracing::info!(
+        elapsed_ms = recovery_started.elapsed().as_millis() as u64,
+        "worker cache recovery complete"
+    );
+    // Residual temp files are not indexed. The existing background cleanup
+    // starts immediately and scans in bounded batches; do not wait for a
+    // second full disk walk before accepting traffic.
 
     let admin_listener = TcpListener::bind(&cfg.admin_listen).await?;
     tracing::info!(listen = %cfg.admin_listen, "worker serving administration API");
