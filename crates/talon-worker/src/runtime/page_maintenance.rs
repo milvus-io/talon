@@ -5,7 +5,7 @@ use crate::page_gc::{CheckpointReport, GcReport};
 use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
 
 impl WorkerRuntime {
-    async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    pub(super) async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match &self.background_budget {
             Some(budget) => Some(budget.io().await),
             None => None,
@@ -44,14 +44,16 @@ impl WorkerRuntime {
             );
         }
         if config.tti_ms > 0 {
-            let paged = self
-                .paged
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("page TTI requires paged L2"))?;
+            anyhow::ensure!(
+                self.paged.is_some() || self.store.small().is_some(),
+                "TTI requires paged L2 or small-object storage"
+            );
             anyhow::ensure!(
                 config.checkpoint_interval_ms <= config.tti_ms,
                 "checkpoint interval exceeds TTI"
             );
+        }
+        if let Some(paged) = self.paged.as_ref().filter(|_| config.tti_ms > 0) {
             let now = self.page_clock.now();
             // Load each shard once; keep only one shard's recovered metadata in memory.
             for shard in 0..crate::page_lifecycle::SHARDS {
@@ -281,7 +283,7 @@ impl WorkerRuntime {
             let _background_io = runtime.background_io().await;
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
-            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= target) { return None; }
+            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
             let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
@@ -476,7 +478,7 @@ impl WorkerRuntime {
                             let _gate = state.gate.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
-                                    || runtime.lru.total_bytes() <= target)
+                                    || runtime.resident_bytes() <= target)
                             {
                                 return;
                             }
@@ -528,7 +530,7 @@ impl WorkerRuntime {
     }
 
     async fn checkpoint_shards(&self, all: bool) -> CheckpointReport {
-        if self.page_gc_config.tti_ms == 0 {
+        if self.page_gc_config.tti_ms == 0 || self.paged.is_none() {
             return CheckpointReport::default();
         }
         let Ok(mut cursor) = self.page_checkpoint.clone().try_lock_owned() else {

@@ -176,6 +176,8 @@ impl Args {
             data_plane_connections_per_thread: self.data_plane_connections_per_thread,
             cache_dirs: None,
             capacity_bytes: None,
+            small_object_threshold_bytes: None,
+            small_object_segment_bytes: None,
             whole_fd_cache_capacity: None,
             page_fd_cache_capacity: None,
             background_task_concurrency: None,

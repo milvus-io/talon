@@ -81,15 +81,30 @@ impl WorkerRuntime {
             }
             None => u64::from(self.block_size),
         };
-        let jobs = valid.into_iter().flat_map(|(index, request)| {
+        let valid: Vec<_> = valid
+            .into_iter()
+            .map(|(index, request)| {
+                let small = self.store.accepts_small(&request.block, request.len);
+                (index, request, small)
+            })
+            .collect();
+        let jobs = valid.into_iter().flat_map(|(index, request, small)| {
             (0..request.len)
-                .step_by(window as usize)
+                .step_by(if small {
+                    request.len.max(1) as usize
+                } else {
+                    window as usize
+                })
                 .map(move |offset| {
                     (
                         index,
                         request.block.clone(),
                         offset,
-                        window.min(request.len - offset),
+                        if small {
+                            request.len
+                        } else {
+                            window.min(request.len - offset)
+                        },
                         request.len,
                     )
                 })
@@ -102,7 +117,9 @@ impl WorkerRuntime {
                 // Only misses wait for payload capacity. The probe uses metadata,
                 // without opening files or admitting cache payloads into L1.
                 // Cancellation while queued is harmless.
-                let reservation = if self.paged.is_some() {
+                let reservation = if self.store.accepts_small(&block, block_len) {
+                    block_len
+                } else if self.paged.is_some() {
                     len
                 } else {
                     u64::from(self.block_size)
@@ -167,7 +184,7 @@ impl WorkerRuntime {
     }
 
     /// Trust published residency metadata; LOAD does not verify cache files.
-    fn load_range_cached(&self, block: &BlockId, offset: u64, len: u64) -> bool {
+    pub(super) fn load_range_cached(&self, block: &BlockId, offset: u64, len: u64) -> bool {
         let Some(meta) = self.index.get_and_touch(block) else {
             return false;
         };
@@ -204,6 +221,11 @@ impl WorkerRuntime {
         block: &BlockId,
         len: u64,
     ) -> anyhow::Result<()> {
+        if self.store.accepts_small(block, len) {
+            self.small_object_range(request, block, 0, len, len, true)
+                .await?;
+            return Ok(());
+        }
         let key = LoadKey::Whole(block.clone());
         loop {
             if self.load_range_cached(block, 0, len) {

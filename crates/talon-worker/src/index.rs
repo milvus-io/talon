@@ -412,6 +412,18 @@ impl BlockIndex {
         .unwrap_or(false)
     }
 
+    /// Access metadata only; does not count as a hit or establish residency.
+    pub(crate) fn whole_access(&self, id: &BlockId) -> Option<AccessHandle> {
+        self.read_entry(id, |entry| {
+            entry
+                .units
+                .get(None)
+                .and_then(|slot| slot.access.as_ref())
+                .map(|a| a.policy.clone())
+        })
+        .flatten()
+    }
+
     /// Attach the policy token after admission, retaining any page lifecycle
     /// handle. Capacity pinning and byte accounting remain owned by the policy.
     pub(crate) fn set_access(&self, unit: &CacheUnit, access: AccessHandle) {

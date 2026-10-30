@@ -5,6 +5,7 @@ use tokio::sync::{oneshot, Notify};
 
 #[derive(Default)]
 struct Tasks {
+    id: usize,
     active: std::cell::Cell<usize>,
     idle: Notify,
     draining: std::cell::Cell<bool>,
@@ -19,8 +20,17 @@ thread_local! {
 pub struct LocalRing(Rc<Tasks>);
 impl LocalRing {
     pub fn enter() -> Self {
+        Self::enter_with_id(0)
+    }
+
+    /// Install a worker-local stable ring slot. The worker assigns distinct
+    /// slots to its data-plane threads and reuses them across restarts.
+    pub fn enter_with_id(id: usize) -> Self {
         assert!(!monoio::utils::is_legacy(), "native io_uring required");
-        let tasks = Rc::new(Tasks::default());
+        let tasks = Rc::new(Tasks {
+            id,
+            ..Tasks::default()
+        });
         CURRENT.with(|current| {
             let mut current = current.borrow_mut();
             assert!(current.is_none(), "nested ring scope");
@@ -44,6 +54,11 @@ impl Drop for LocalRing {
     fn drop(&mut self) {
         CURRENT.with(|current| current.borrow_mut().take());
     }
+}
+
+/// Current worker-local slot; None for Tokio/background callers.
+pub fn ring_id() -> Option<usize> {
+    CURRENT.with(|current| current.borrow().as_ref().map(|tasks| tasks.id))
 }
 
 pub fn on_ring() -> bool {

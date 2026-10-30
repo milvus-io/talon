@@ -64,14 +64,12 @@ impl From<&BlockId> for LogicalBlock {
 #[derive(Clone)]
 pub struct AccessHandle(Arc<AtomicBool>, Arc<AtomicU64>);
 
-/// Process-local monotonic age. Restarted residents start a fresh idle window.
+/// Anchored wall time: monotonic within a process and portable across restarts.
 pub(crate) fn access_millis() -> u64 {
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-        + 1
+    static CLOCK: OnceLock<crate::page_lifecycle::AccessClock> = OnceLock::new();
+    CLOCK
+        .get_or_init(crate::page_lifecycle::AccessClock::new)
+        .now()
 }
 
 impl Default for AccessHandle {
@@ -84,6 +82,24 @@ impl Default for AccessHandle {
 }
 
 impl AccessHandle {
+    pub(crate) fn last_access(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    /// Startup only, before serving. A clock rollback must not postpone expiry
+    /// beyond one fresh idle window; a missing/invalid age starts that window.
+    pub(crate) fn restore(&self, last_access: u64) {
+        let now = access_millis();
+        self.1.store(
+            if last_access == 0 {
+                now
+            } else {
+                last_access.min(now)
+            },
+            Ordering::Relaxed,
+        );
+    }
+
     /// Coalesce hits until the eviction hand consumes this second chance.
     /// This is advisory recency only, so relaxed ordering is sufficient.
     pub fn touch(&self) {
@@ -553,6 +569,28 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), true)
+    }
+
+    pub(crate) fn idle_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        scan_budget: usize,
+        delete_budget: usize,
+    ) -> Vec<StaleBlockCandidate> {
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), false)
+    }
+
+    fn age_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        (scan_budget, delete_budget): (usize, usize),
+        consider_verified: bool,
+    ) -> Vec<StaleBlockCandidate> {
         let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
             *cursor = (0, self.inner.lock().unwrap().clock);
@@ -569,7 +607,7 @@ impl Lru {
             let verified = g.object_checks[&block.object].1;
             if activity.pins != 0
                 || now.saturating_sub(access) <= age
-                || verified.is_some_and(|at| now.saturating_sub(at) < age)
+                || (consider_verified && verified.is_some_and(|at| now.saturating_sub(at) < age))
             {
                 continue;
             }

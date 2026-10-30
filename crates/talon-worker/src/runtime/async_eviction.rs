@@ -5,6 +5,14 @@ use std::sync::Arc;
 use std::time::Duration;
 use talon_core::WorkerConfig;
 
+#[derive(Default, PartialEq, Eq)]
+pub(super) enum SmallCapacityPhase {
+    #[default]
+    Idle,
+    Selecting,
+    Reclaiming,
+}
+
 pub(super) struct EvictionCycle {
     high: u64,
     low: u64,
@@ -39,7 +47,8 @@ impl EvictionCycle {
         self.progressed = false;
         if let Some(registry) = worker.registry() {
             let workers = registry.snapshot();
-            let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
+            let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
+            let logical: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
             if total <= self.low {
                 self.active = false;
             } else if total >= self.high {
@@ -50,49 +59,116 @@ impl EvictionCycle {
                     // Cache units are indivisible: one namespace can release more
                     // than requested. Recompute the global excess before reclaiming
                     // from the next namespace instead of giving each a fixed share.
-                    let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
+                    let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
                     if total <= self.low {
                         break;
                     }
-                    let target = namespace.lru.total_bytes().saturating_sub(total - self.low);
-                    let lru = namespace.lru.clone();
-                    let scan = namespace.page_gc_config.scan_batch_size;
-                    let deletes = namespace.page_gc_config.delete_batch_size;
-                    let units = tokio::task::spawn_blocking(move || {
-                        lru.candidates_to_fit_bounded(target, &Default::default(), scan, deletes)
-                    })
-                    .await
-                    .expect("eviction scan panicked");
-                    namespace.unlink_units_to_target(units, 1, target).await;
+                    let other_credit =
+                        WorkerRuntime::other_small_reclaim_credit(&workers, namespace).await;
+                    let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
+                    if total <= self.low {
+                        break;
+                    }
+                    let target = namespace
+                        .resident_bytes()
+                        .saturating_sub((total - self.low).saturating_sub(other_credit));
+                    namespace.evict_background_batch(target).await;
                 }
-                let remaining = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>();
-                self.progressed = remaining < total;
+                let remaining = workers.iter().map(|w| w.resident_bytes()).sum::<u64>();
+                self.progressed = remaining < total
+                    || workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>() < logical;
                 self.active = remaining > self.low;
+            }
+            if !self.active {
+                for namespace in workers {
+                    *namespace.small_capacity_eviction.lock().await = SmallCapacityPhase::Idle;
+                }
             }
             return;
         }
-        let bytes = worker.lru.total_bytes();
+        let bytes = worker.resident_bytes();
+        let logical = worker.lru.total_bytes();
         if bytes <= self.low {
             self.active = false;
         } else if bytes >= self.high {
             self.active = true;
         }
         if self.active {
-            // One bounded batch. If readers, budgets, or I/O prevent reaching the target,
-            // retain the cycle across ticks, including below the high watermark.
-            let lru = worker.lru.clone();
-            let target = self.low;
-            let scan = worker.page_gc_config.scan_batch_size;
-            let deletes = worker.page_gc_config.delete_batch_size;
+            worker.evict_background_batch(self.low).await;
+            let remaining = worker.resident_bytes();
+            self.progressed = remaining < bytes || worker.lru.total_bytes() < logical;
+            self.active = remaining > self.low;
+        }
+        if !self.active {
+            *worker.small_capacity_eviction.lock().await = SmallCapacityPhase::Idle;
+        }
+    }
+}
+
+impl WorkerRuntime {
+    async fn evict_background_batch(&self, target: u64) {
+        let mut phase = if self.store.small().is_some() {
+            Some(self.small_capacity_eviction.lock().await)
+        } else {
+            None
+        };
+        let mut local_phase = SmallCapacityPhase::Idle;
+        let phase = phase.as_deref_mut().unwrap_or(&mut local_phase);
+        if self.resident_bytes() <= target {
+            *phase = SmallCapacityPhase::Idle;
+            return;
+        }
+        if *phase == SmallCapacityPhase::Idle {
+            *phase = SmallCapacityPhase::Selecting;
+        }
+        let missing = self
+            .resident_bytes()
+            .saturating_sub(target)
+            .saturating_sub(self.small_reclaim_credit().await);
+        if missing == 0 {
+            *phase = SmallCapacityPhase::Reclaiming;
+        }
+        if *phase == SmallCapacityPhase::Selecting {
+            let policy_target = self.lru.total_bytes().saturating_sub(missing);
+            let lru = self.lru.clone();
+            let count = lru.len();
+            let scan = self.page_gc_config.scan_batch_size;
+            let deletes = self.page_gc_config.delete_batch_size;
             let units = tokio::task::spawn_blocking(move || {
-                lru.candidates_to_fit_bounded(target, &Default::default(), scan, deletes)
+                lru.candidates_to_fit_bounded(policy_target, &Default::default(), scan, deletes)
             })
             .await
             .expect("eviction scan panicked");
-            worker.unlink_units_to_target(units, 1, target).await;
-            let remaining = worker.lru.total_bytes();
-            self.progressed = remaining < bytes;
-            self.active = remaining > self.low;
+            let no_victims = units.is_empty();
+            self.unlink_units_to_target(units, 1, target).await;
+            let excess = self.resident_bytes().saturating_sub(target);
+            if self.small_reclaim_credit().await >= excess
+                || (no_victims && scan >= count.saturating_mul(2))
+            {
+                // Exhausted unpinned victims may yield only partial progress.
+                *phase = SmallCapacityPhase::Reclaiming;
+            } else {
+                // Keep tombstones as credit across bounded selection batches.
+                // Routine GC also defers relocation while this plan is active.
+                return;
+            }
+        }
+        if self.resident_bytes() <= target {
+            *phase = SmallCapacityPhase::Idle;
+            return;
+        }
+        if self.small_readers_cover_excess(target) {
+            return;
+        }
+        match self
+            .reclaim_small_to_target(target, self.background_budget.clone())
+            .await
+        {
+            Ok(true) => {} // Continue relocation next tick, without selecting more victims.
+            Ok(false) => *phase = SmallCapacityPhase::Idle,
+            Err(error) => {
+                tracing::warn!(%error, "small object background pressure reclamation failed")
+            }
         }
     }
 }
@@ -177,6 +253,7 @@ mod tests {
         low_watermark: f64,
     ) -> (Arc<WorkerRuntime>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
         let config = WorkerConfig {
+            small_object_threshold_bytes: 0,
             block_size: 16,
             capacity_bytes: 10 * disk_unit(),
             l2_page_size_bytes: if paged { 16 } else { 0 },

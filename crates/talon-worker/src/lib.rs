@@ -28,6 +28,7 @@ pub mod paged_store;
 pub mod rate_limit;
 pub mod runtime;
 pub mod sendfile;
+pub mod small_store;
 #[cfg(target_os = "linux")]
 pub mod splice;
 pub mod staging;
