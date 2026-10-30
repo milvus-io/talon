@@ -342,6 +342,86 @@ impl BlockIndex {
         });
     }
 
+    /// Startup only, before serving or starting maintenance. Attach policy
+    /// tokens in place rather than cloning a full snapshot and looking every
+    /// unit up again. Membership stays stable throughout the traversal.
+    pub(crate) fn restore_lru(&self) -> crate::eviction::Lru {
+        use crate::eviction::RecoveredUnit;
+        let entries = self.entries.read().unwrap();
+        let mut units = Vec::with_capacity(entries.len());
+        for entry in entries.values() {
+            let mut guard = entry.block.write().unwrap();
+            let entry = guard.as_mut().expect("live directory entry");
+            let shared = AccessHandle::default();
+            let mut add = |page, slot: &mut UnitSlot| {
+                let access = shared.sibling();
+                match &mut slot.access {
+                    Some(old) => old.policy = access.clone(),
+                    None => {
+                        slot.access = Some(IndexedAccess {
+                            policy: access.clone(),
+                            page: None,
+                        })
+                    }
+                }
+                units.push(RecoveredUnit {
+                    unit: Arc::new(match page {
+                        Some(page) => CacheUnit::Page(entry.meta.id.clone(), page),
+                        None => CacheUnit::Whole(entry.meta.id.clone()),
+                    }),
+                    bytes: slot.allocated,
+                    access,
+                });
+            };
+            match &entry.meta.form {
+                BlockForm::Whole => add(None, entry.units.get_mut(None).unwrap()),
+                BlockForm::Paged { present, .. } => {
+                    for p in 0..present.len() {
+                        let page = PageIndex(p);
+                        if present.is_present(page) {
+                            add(Some(page), entry.units.get_mut(Some(page)).unwrap());
+                        }
+                    }
+                }
+            }
+        }
+        let blocks = entries.len();
+        drop(entries);
+        crate::eviction::Lru::from_recovered(units, blocks)
+    }
+
+    /// Startup only. Whole blocks have no page lifecycle: skip them without
+    /// allocating or cloning their identities into a second full snapshot.
+    pub(crate) fn restore_page_states(
+        &self,
+        lifecycle: &crate::page_lifecycle::PageLifecycle,
+        now: u64,
+    ) {
+        let entries = self.entries.read().unwrap();
+        for entry in entries.values() {
+            let mut guard = entry.block.write().unwrap();
+            let entry = guard.as_mut().expect("live directory entry");
+            if let BlockForm::Paged { present, .. } = &entry.meta.form {
+                if present.count() == 0 {
+                    continue;
+                }
+                let block = lifecycle.block(&entry.meta.id);
+                for p in 0..present.len() {
+                    let page = PageIndex(p);
+                    if present.is_present(page) {
+                        if let Some(access) = entry
+                            .units
+                            .get_mut(Some(page))
+                            .and_then(|s| s.access.as_mut())
+                        {
+                            access.page = Some(block.register(page, None, now, false));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /// Create an empty index.
     pub fn new() -> Self {
         Self::default()
@@ -972,6 +1052,53 @@ mod tests {
         );
         assert!(index.clear_page(&id, PageIndex(7)));
         assert_eq!((index.resident_bytes(), index.page_count()), (0, 0));
+    }
+
+    #[test]
+    fn startup_attaches_policy_and_lifecycle_to_sparse_residents() {
+        // Exercise both compact and sparse page tables, including zero-byte
+        // allocations, absent pages, whole blocks, and data-path token touches.
+        for pages in [256, 512] {
+            let index = BlockIndex::new();
+            let whole = block(1);
+            index.commit_allocated(
+                BlockMeta {
+                    id: whole.clone(),
+                    form: BlockForm::Whole,
+                    len: 17,
+                },
+                [(None, 4096)],
+            );
+            let paged = block(2);
+            index.init_paged(
+                paged.clone(),
+                paged.block_size / pages,
+                u64::from(paged.block_size),
+            );
+            index.mark_page_allocated(&paged, PageIndex(0), 0);
+            index.mark_page_allocated(&paged, PageIndex(pages - 1), 8192);
+            let lru = index.restore_lru();
+            let lifecycle = crate::page_lifecycle::PageLifecycle::new();
+            index.restore_page_states(&lifecycle, 10);
+            assert_eq!(lru.len(), 3);
+            assert_eq!(lru.total_bytes(), index.resident_bytes());
+            assert_eq!(index.page_count(), 2);
+            assert!(index
+                .page_reads_and_touch(&paged, PageIndex(1), PageIndex(2))
+                .is_none());
+            let candidates = lru.block_candidates(&paged);
+            assert_eq!(candidates.len(), 2);
+            assert!(index
+                .page_reads_and_touch(&paged, PageIndex(0), PageIndex(1))
+                .is_some());
+            assert!(index
+                .page_reads_and_touch(&paged, PageIndex(pages - 1), PageIndex(pages))
+                .is_some());
+            assert!(candidates.iter().all(|c| !lru.candidate_is_current(c)));
+            let candidate = lru.block_candidates(&whole).pop().unwrap();
+            assert!(index.get_and_touch(&whole).is_some());
+            assert!(!lru.candidate_is_current(&candidate));
+        }
     }
 
     #[test]
