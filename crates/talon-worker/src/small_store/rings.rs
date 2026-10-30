@@ -8,12 +8,15 @@ use tokio::sync::OnceCell;
 type Stream = Arc<OnceCell<Arc<SegmentStore>>>;
 
 pub struct SmallObjectStore {
-    root: PathBuf,
+    pub(super) root: PathBuf,
     legacy: Arc<SegmentStore>,
+    allocation_unit: u64,
+    pub(super) access_checkpoint: tokio::sync::Mutex<()>,
+    pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
     // Only in-flight identities are retained; no second resident-object index.
     mutations: Arc<InFlightLoads>,
-    tasks: Arc<crate::page_gc::Mutations>,
+    pub(super) tasks: Arc<crate::page_gc::Mutations>,
 }
 
 impl SmallObjectStore {
@@ -70,7 +73,19 @@ impl SmallObjectStore {
             }
             streams.insert(slot, Arc::new(OnceCell::new_with(Some(stream))));
         }
+        let access_bytes = match std::fs::metadata(root.join(super::access::FILE)) {
+            Ok(m) => m.blocks() * 512,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => 0,
+            Err(e) => return Err(e),
+        };
+        let allocation_unit = crate::capacity::filesystem_stats(&root)
+            .map_err(io::Error::other)?
+            .f_frsize
+            .max(1);
         Ok(Self {
+            allocation_unit,
+            access_checkpoint: tokio::sync::Mutex::new(()),
+            access_bytes: std::sync::atomic::AtomicU64::new(access_bytes),
             root,
             legacy,
             streams: RwLock::new(streams),
@@ -79,7 +94,7 @@ impl SmallObjectStore {
         })
     }
 
-    fn streams(&self) -> Vec<Arc<SegmentStore>> {
+    pub(super) fn streams(&self) -> Vec<Arc<SegmentStore>> {
         self.streams
             .read()
             .unwrap()
@@ -196,6 +211,7 @@ impl SmallObjectStore {
             total.dead_bytes += stats.dead_bytes;
             total.segments += stats.segments;
         }
+        total.allocated_bytes += self.access_bytes.load(std::sync::atomic::Ordering::Relaxed);
         Ok(total)
     }
 
@@ -204,6 +220,59 @@ impl SmallObjectStore {
             stream.restore_index(index)?;
         }
         Ok(())
+    }
+
+    /// Only threshold-eligible segments provide planning credit. Garbage in a
+    /// mostly-live segment cannot cover pressure until more items are evicted.
+    /// Planning credit, never physical accounting. Round the live payload and
+    /// live index separately to their destination file allocation units. Computed only on the
+    /// pressure path, not by walking all segments on each append.
+    pub(crate) async fn reclaimable_bytes(&self) -> u64 {
+        let mut bytes = 0;
+        for stream in self.streams() {
+            let state = stream.state.lock().await;
+            for (&id, s) in &state.segments {
+                if Some(id) == state.standby || s.in_flight != 0 || !meets_reclaim_threshold(s) {
+                    continue;
+                }
+                let destination = if s.live == 0 {
+                    0
+                } else {
+                    (s.live_payload.div_ceil(self.allocation_unit)
+                        + (s.live - s.live_payload + 8).div_ceil(self.allocation_unit))
+                        * self.allocation_unit
+                };
+                bytes += s.allocated.saturating_sub(destination);
+            }
+        }
+        bytes
+    }
+
+    /// One segment per stream, stopping once enough physical space was released.
+    /// Readers retaining retired inodes remain charged until their last fd closes.
+    pub(crate) async fn reclaim_with_budget(
+        self: &Arc<Self>,
+        bytes: u64,
+        budget: Option<Arc<crate::background::BackgroundBudget>>,
+    ) -> io::Result<bool> {
+        let store = self.clone();
+        self.tasks
+            .run(async move {
+                let before = store.stats()?.allocated_bytes;
+                let mut reclaimed = false;
+                let _io = match &budget {
+                    Some(b) => Some(b.io().await),
+                    None => None,
+                };
+                for stream in store.streams() {
+                    if before.saturating_sub(store.stats()?.allocated_bytes) >= bytes {
+                        break;
+                    }
+                    reclaimed |= stream.maintain_inner(false, true, budget.clone()).await?;
+                }
+                Ok(reclaimed)
+            })
+            .await
     }
 
     pub async fn maintain(self: &Arc<Self>, checkpoint: bool) -> io::Result<bool> {
@@ -220,7 +289,9 @@ impl SmallObjectStore {
             .run(async move {
                 let mut reclaimed = false;
                 for stream in store.streams() {
-                    reclaimed |= stream.maintain_inner(checkpoint, budget.clone()).await?;
+                    reclaimed |= stream
+                        .maintain_inner(checkpoint, false, budget.clone())
+                        .await?;
                 }
                 Ok(reclaimed)
             })

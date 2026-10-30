@@ -44,14 +44,16 @@ impl WorkerRuntime {
             );
         }
         if config.tti_ms > 0 {
-            let paged = self
-                .paged
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("page TTI requires paged L2"))?;
+            anyhow::ensure!(
+                self.paged.is_some() || self.store.small().is_some(),
+                "TTI requires paged L2 or small-object storage"
+            );
             anyhow::ensure!(
                 config.checkpoint_interval_ms <= config.tti_ms,
                 "checkpoint interval exceeds TTI"
             );
+        }
+        if let Some(paged) = self.paged.as_ref().filter(|_| config.tti_ms > 0) {
             let now = self.page_clock.now();
             // Load each shard once; keep only one shard's recovered metadata in memory.
             for shard in 0..crate::page_lifecycle::SHARDS {
@@ -528,7 +530,7 @@ impl WorkerRuntime {
     }
 
     async fn checkpoint_shards(&self, all: bool) -> CheckpointReport {
-        if self.page_gc_config.tti_ms == 0 {
+        if self.page_gc_config.tti_ms == 0 || self.paged.is_none() {
             return CheckpointReport::default();
         }
         let Ok(mut cursor) = self.page_checkpoint.clone().try_lock_owned() else {

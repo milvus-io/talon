@@ -118,6 +118,7 @@ impl WholeBlockStore {
         self.small.as_ref().is_some_and(|s| s.accepts(id, len))
     }
 
+    #[cfg(test)]
     pub(crate) async fn maintain_small(&self, checkpoint: bool) -> Result<()> {
         if let Some(small) = self.small.clone() {
             small.maintain(checkpoint).await?;

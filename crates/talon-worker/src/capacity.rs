@@ -34,6 +34,13 @@ pub fn validate_filesystem_capacity(root: &Path, capacity_bytes: u64) -> anyhow:
 }
 
 fn filesystem_capacity(root: &Path) -> anyhow::Result<u128> {
+    let stats = filesystem_stats(root)?;
+    // f_blocks is expressed in f_frsize units, not f_bsize. Use u128 to avoid
+    // overflow even if both native counters are 64 bits wide.
+    Ok(u128::from(stats.f_blocks) * u128::from(stats.f_frsize))
+}
+
+pub(crate) fn filesystem_stats(root: &Path) -> anyhow::Result<libc::statvfs> {
     let directory = std::fs::File::open(root)
         .with_context(|| format!("open cache directory {} for capacity check", root.display()))?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -48,10 +55,7 @@ fn filesystem_capacity(root: &Path) -> anyhow::Result<u128> {
         });
     }
     // SAFETY: the successful fstatvfs call initialized stats.
-    let stats = unsafe { stats.assume_init() };
-    // f_blocks is expressed in f_frsize units, not f_bsize. Use u128 to avoid
-    // overflow even if both native counters are 64 bits wide.
-    Ok(u128::from(stats.f_blocks) * u128::from(stats.f_frsize))
+    Ok(unsafe { stats.assume_init() })
 }
 
 /// One cache directory and its byte capacity.

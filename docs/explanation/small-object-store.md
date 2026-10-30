@@ -37,7 +37,18 @@ fills coalesce. LOAD never populates L1.
 storage facade. Small objects remain logical `BlockForm::Whole` cache units,
 allowing capacity, superseded-version, stale, and ownership eviction to retain
 their existing policy. Page TTI applies to the whole small object using its
-shared access timestamp; recovery grants a fresh idle interval. Existing paged
+shared access timestamp. With TTI enabled, `small/access.checkpoint` stores a
+checksummed snapshot of exact versioned identities and anchored Unix-millisecond
+access times for every ring. The existing access-checkpoint interval controls
+periodic writes, and graceful shutdown flushes a final snapshot. TTI can be
+enabled for small-object storage even when paged L2 is disabled. Publication uses
+temporary-file sync, rename, and directory sync; hits only update memory.
+Recovery applies ages only to objects actually recovered from sealed segments,
+including objects relocated since the snapshot. Downtime counts toward idle age.
+A crash can lose access updates since the last successful checkpoint, so expiry
+is approximate. Missing or corrupt snapshots grant a fresh idle interval (with
+corruption logged), and future timestamps are clamped to startup time after a
+clock rollback. This file is advisory and never establishes residency. Existing paged
 residency is preserved rather than migrating an object during an active fill.
 
 Each namespace and credential scope owns its own store under its existing cache
@@ -157,7 +168,7 @@ necessary because sendfile completion does not imply peer consumption. Keeping
 an fd alone would not protect against an in-place truncate or overwrite.
 
 Worker capacity accounting replaces indexed small-record charges with measured
-segment allocations, including dead bytes and retired files retained by open
+segment and access-checkpoint allocations, including dead bytes and retired files retained by open
 handles. Like the whole-file store, admission writes and publishes the object
 before best-effort capacity eviction. Capacity is a soft target: concurrent
 admissions, relocation copies, and retired files retained by readers can
@@ -165,10 +176,45 @@ transiently exceed it. Crossing that target does not reject an admission;
 actual filesystem I/O errors still propagate. Filesystem free space must
 accommodate those temporary allocations, normal large-object writes, and
 filesystem overhead; this cache budget is not a filesystem-wide reservation.
-Under pressure, existing LRU policy chooses objects and segment maintenance
-performs the physical reclamation. Foreground reclamation passes for a
-namespace with a small store are serialized and recheck occupancy after
-waiting, so concurrent commits do not each chase the same unreclaimed bytes.
+Under pressure, small objects, ordinary blocks, and pages share each namespace's
+second-chance eviction queue. Segment placement does not determine which objects
+are cold. Capacity reclamation has two phases:
+
+1. Select victims in bounded batches. Whole blocks/pages release their files;
+   small objects append tombstones. Carry the small-store reclaim estimate across
+   batches instead of repeatedly charging the same physical excess. The estimate
+   uses live payload and live index lengths rounded separately to filesystem
+   allocation units, plus retired files awaiting their last reader. Only segments
+   exceeding the shared 50% garbage threshold (by payload plus index bytes) count
+   toward this estimate. Below-threshold garbage provides no reclaim credit;
+   continue selecting items until enough eligible segments exist.
+2. Once the estimate covers the remaining excess (or no unpinned victims remain),
+   stop selecting objects and reclaim the dirty segments. Empty segments go first;
+   pressure relocation prefers more garbage but never bypasses the routine
+   50% garbage threshold. Seal eligible active segments before relocation. Each
+   maintenance step processes at most one segment per stream, retaining this
+   phase across scheduler turns. Actual allocated bytes, not the estimate,
+   determine when the low target is reached. If remaining items are pinned, keep
+   the threshold and retry later rather than forcing a mostly-live rewrite.
+
+This can evict more logical item bytes than the immediate physical deficit,
+especially when cold items are scattered across segments. That tradeoff prevents
+rewriting a nearly-full 64 MiB segment just to reclaim one 1 KiB item.
+
+Routine small-store GC defers relocation during a capacity cycle, so it cannot
+copy survivors halfway through victim selection. Foreground capacity enforcement
+also finishes selection before relocation, using the same per-namespace gate.
+With stable admissions and readers, one round batches same-segment victims into
+one rewrite; concurrent admissions, failed deletions, or filesystem allocation
+estimation differences can require another round. Relocation pays for live
+payload read/write and live index writes, rather than dead payload bytes.
+
+Already-unlinked reader-held files remain charged; when they cover the remaining
+excess, eviction waits for those descriptors instead of deleting more objects.
+Compaction still needs temporary free space for the live-data copy: reaching the
+cache watermark must happen before filesystem ENOSPC. Namespace queues remain
+independent; the worker evaluates watermarks against their combined allocations
+and credits pending reclamation in other namespaces before selecting more victims.
 
 ## Validation
 

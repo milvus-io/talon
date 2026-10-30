@@ -38,14 +38,7 @@ impl WorkerBackground {
                     namespace
                         .gc_small_idle_at(crate::eviction::access_millis())
                         .await;
-                    let _io = namespace.background_io().await;
-                    if let Err(error) = namespace
-                        .store
-                        .maintain_small_budget(false, namespace.background_budget.clone())
-                        .await
-                    {
-                        tracing::warn!(%error, "small object maintenance failed");
-                    }
+                    namespace.maintain_small_background().await;
                 }
             }
         });
@@ -131,9 +124,11 @@ impl WorkerBackground {
                     .max(1),
             );
             let last_checkpoint = Arc::new(Mutex::new(HashMap::new()));
+            let last_small_checkpoint = Arc::new(Mutex::new(HashMap::new()));
             scheduler.register("access_checkpoint", period, move || {
                 let w = w.clone();
                 let last = last_checkpoint.clone();
+                let last_small = last_small_checkpoint.clone();
                 async move {
                     for namespace in w.namespace_runtimes() {
                         if namespace.page_gc_config.tti_ms > 0
@@ -146,6 +141,15 @@ impl WorkerBackground {
                             )
                         {
                             namespace.checkpoint_next_shard().await;
+                        }
+                        if namespace.page_gc_config.tti_ms > 0
+                            && due(
+                                &last_small,
+                                &namespace,
+                                namespace.page_gc_config.checkpoint_interval_ms,
+                            )
+                        {
+                            namespace.checkpoint_small_access().await;
                         }
                     }
                 }
@@ -257,7 +261,27 @@ impl WorkerBackground {
             {
                 tracing::warn!(%error, "small object shutdown checkpoint failed");
             }
+            namespace.checkpoint_small_access().await;
             namespace.checkpoint_access_times().await;
+        }
+    }
+}
+
+impl WorkerRuntime {
+    pub(super) async fn maintain_small_background(&self) {
+        // Do not relocate halfway through capacity victim selection. Hold the
+        // same gate through maintenance so a new selection plan cannot overlap.
+        let capacity = self.small_capacity_eviction.lock().await;
+        if *capacity != super::async_eviction::SmallCapacityPhase::Idle {
+            return;
+        }
+        let _io = self.background_io().await;
+        if let Err(error) = self
+            .store
+            .maintain_small_budget(false, self.background_budget.clone())
+            .await
+        {
+            tracing::warn!(%error, "small object maintenance failed");
         }
     }
 }

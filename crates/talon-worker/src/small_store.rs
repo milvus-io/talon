@@ -4,6 +4,7 @@
 //! sealed segments appear in MANIFEST; a crash may lose the bounded active
 //! and sealing segments. Deletes of sealed entries are synced before becoming invisible.
 //! Compaction publishes a replacement manifest before unlinking old files.
+mod access;
 mod disk_io;
 mod format;
 mod rings;
@@ -50,6 +51,7 @@ struct Segment {
     metadata: u64,
     in_flight: usize,
     live: u64,
+    live_payload: u64,
     allocated: u64,
     records: BTreeMap<u64, Arc<[u8]>>,
     sealed: bool,
@@ -411,6 +413,7 @@ impl SegmentStore {
         let added = allocated.saturating_sub(segment.allocated);
         segment.allocated = segment.allocated.max(allocated);
         segment.live += charge;
+        segment.live_payload += loc.len;
         segment.records.insert(loc.offset, key.clone());
         state.allocated += added;
         state.live += charge;
@@ -462,6 +465,7 @@ impl SegmentStore {
             tests::crash("delete_sync");
             let removed = charge(&key, loc.len);
             segment.live -= removed;
+            segment.live_payload -= loc.len;
             segment.records.remove(&loc.offset);
             let allocated = segment.allocated().await?;
             let added = allocated.saturating_sub(segment.allocated);
@@ -510,30 +514,49 @@ impl SegmentStore {
     pub async fn maintain(self: &Arc<Self>, checkpoint: bool) -> io::Result<bool> {
         let store = self.clone();
         self.tasks
-            .run(async move { store.maintain_inner(checkpoint, None).await })
+            .run(async move { store.maintain_inner(checkpoint, false, None).await })
             .await
     }
 
     async fn maintain_inner(
         self: &Arc<Self>,
         checkpoint: bool,
+        pressure: bool,
         budget: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<bool> {
-        if checkpoint || self.state.lock().await.last_seal.elapsed() >= Duration::from_secs(30) {
+        let pressure_seal = if pressure {
+            let state = self.state.lock().await;
+            state
+                .active
+                .and_then(|id| state.segments.get(&id))
+                .is_some_and(|s| s.in_flight == 0 && meets_reclaim_threshold(s))
+        } else {
+            false
+        };
+        if checkpoint
+            || pressure_seal
+            || self.state.lock().await.last_seal.elapsed() >= Duration::from_secs(30)
+        {
             self.checkpoint().await?;
         }
         let _publication = self.publication.lock().await;
         // Pay before taking the mutation lock. A segment selected here cannot
         // gain new live bytes once sealed. Recheck identity and eligibility
         // after payment, since another collector may have retired it.
-        let paid_candidate = if let Some(budget) = budget {
+        let paid_candidate = if let Some(budget) = &budget {
             let candidate = {
                 let state = self.state.lock().await;
-                state
-                    .segments
-                    .iter()
-                    .find(|(id, _)| reclaimable(&state, **id))
-                    .map(|(&id, s)| (id, s.bytes.saturating_mul(2) + s.metadata))
+                reclaim_candidate(&state, pressure).map(|id| {
+                    let s = &state.segments[&id];
+                    (
+                        id,
+                        if s.live == 0 {
+                            0
+                        } else {
+                            s.live_payload.saturating_mul(2) + (s.live - s.live_payload) + 8
+                        },
+                    )
+                })
             };
             if let Some((_, cost)) = candidate {
                 budget.bytes(cost as usize).await;
@@ -547,11 +570,7 @@ impl SegmentStore {
         let result = async {
             let candidate = match paid_candidate {
                 Some(id) => id.filter(|id| reclaimable(&state, *id)),
-                None => state
-                    .segments
-                    .iter()
-                    .find(|(id, _)| reclaimable(&state, **id))
-                    .map(|(&id, _)| id),
+                None => reclaim_candidate(&state, pressure),
             };
             let Some(old) = candidate else {
                 return Ok(false);
@@ -615,6 +634,10 @@ impl SegmentStore {
             }
             let segment = state.segments.remove(&old).unwrap();
             let allocated = segment.allocated().await?;
+            if let Some(budget) = &budget {
+                budget.delete().await;
+                budget.delete().await;
+            }
             disk_io::remove(self.path(old, "data")).await?;
             disk_io::remove(self.path(old, "index")).await?;
             disk_io::sync_dir(self.root.clone()).await?;
@@ -677,6 +700,7 @@ impl SegmentStore {
             metadata: 8,
             in_flight: 0,
             live: 0,
+            live_payload: 0,
             allocated,
             records: BTreeMap::new(),
             sealed: false,
@@ -705,6 +729,7 @@ impl SegmentStore {
         segment.bytes += len;
         segment.metadata += frame_len;
         segment.live += charge(key, len);
+        segment.live_payload += len;
         segment.records.insert(offset, key.clone());
         let allocated = segment.allocated().await?;
         state.allocated += allocated.saturating_sub(segment.allocated);
@@ -957,9 +982,11 @@ impl SegmentStore {
             return Err(invalid("small object trailing payload"));
         }
         let mut live = 0;
+        let mut live_payload = 0;
         let mut segment_records = BTreeMap::new();
         for (offset, (key, loc)) in records {
             live += charge(&key, loc.len);
+            live_payload += loc.len;
             let key: Arc<[u8]> = key.into();
             segment_records.insert(offset, key.clone());
             if self.entries.get_mut().unwrap().insert(key, loc).is_some() {
@@ -981,6 +1008,7 @@ impl SegmentStore {
                 metadata,
                 in_flight: 0,
                 live,
+                live_payload,
                 allocated,
                 records: segment_records,
                 sealed: true,
@@ -1001,17 +1029,43 @@ impl SegmentStore {
     }
 }
 
+fn reclaim_candidate(state: &State, pressure: bool) -> Option<u64> {
+    state
+        .segments
+        .iter()
+        .filter(|(id, _)| reclaimable(state, **id))
+        .max_by_key(|(id, s)| {
+            (
+                // Empty files need no relocation space; under pressure prefer more
+                // garbage before paying to copy a mostly-live segment.
+                pressure && s.live == 0,
+                if pressure {
+                    s.bytes + s.metadata - s.live
+                } else {
+                    0
+                },
+                std::cmp::Reverse(**id),
+            )
+        })
+        .map(|(&id, _)| id)
+}
+
+// Both routine and pressure reclamation require more than 50% garbage by
+// record bytes (payload + index). Never rewrite a mostly-live segment merely
+// because the cache is over capacity. Empty segments require no copying.
+fn meets_reclaim_threshold(segment: &Segment) -> bool {
+    segment.live == 0 || segment.live.saturating_mul(2) < segment.bytes + segment.metadata
+}
+
 fn reclaimable(state: &State, id: u64) -> bool {
     // A spare must stay available for rollover; sealing owns its immutable
-    // snapshot until publication completes. Empty active segments remain
-    // immediately reclaimable, as before the pipeline.
+    // snapshot until publication completes. Empty active segments can be unlinked.
     Some(id) != state.standby
         && Some(id) != state.sealing
         && state.segments.get(&id).is_some_and(|segment| {
             segment.in_flight == 0
-                && (segment.live == 0
-                    || (segment.sealed
-                        && segment.live.saturating_mul(2) < segment.bytes + segment.metadata))
+                && meets_reclaim_threshold(segment)
+                && (segment.live == 0 || segment.sealed)
         })
 }
 

@@ -2060,8 +2060,13 @@ impl WorkerConfig {
                 return Err(Error::Other(format!("{name} overflows monotonic clock")));
             }
         }
-        if self.page_tti_hours > 0 && self.l2_page_size_bytes == 0 {
-            return Err(Error::Other("page_tti_hours requires paged L2".into()));
+        if self.page_tti_hours > 0
+            && self.l2_page_size_bytes == 0
+            && self.small_object_threshold_bytes == 0
+        {
+            return Err(Error::Other(
+                "page_tti_hours requires paged L2 or small-object storage".into(),
+            ));
         }
         if self.page_tti_hours > 0
             && self.page_access_checkpoint_interval_minutes > self.page_tti_hours * 60
@@ -3707,6 +3712,14 @@ token = "file-token"
             ),
             (100, 5, 2)
         );
+        let small_tti = WorkerConfig::resolve(
+            WorkerConfigPatch::from_toml("page_tti_hours = 1\nl2_page_size_bytes = 0").unwrap(),
+            Default::default(),
+            Default::default(),
+        )
+        .unwrap();
+        assert!(small_tti.small_object_threshold_bytes > 0);
+        assert_eq!(small_tti.page_tti_hours, 1);
         assert_eq!(WorkerConfig::default().page_tti_hours, 0);
         assert_eq!(WorkerConfig::default().page_gc_interval_minutes, 10);
         assert_eq!(WorkerConfig::default().file_cleanup_interval_hours, 1);
@@ -3719,7 +3732,7 @@ token = "file-token"
             2
         );
         for setting in [
-            "page_tti_hours = 1",
+            "page_tti_hours = 1\nsmall_object_threshold_bytes = 0",
             "page_gc_interval_minutes = 0",
             "file_cleanup_interval_hours = 0",
             "page_access_checkpoint_interval_minutes = 0",
