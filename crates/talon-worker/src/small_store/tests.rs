@@ -81,8 +81,8 @@ fn id(name: &str) -> BlockId {
         Version::new("v1"),
     )
 }
-fn open(root: &Path) -> Arc<SmallObjectStore> {
-    Arc::new(SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 4 << 20, None).unwrap())
+fn open(root: &Path) -> Arc<SegmentStore> {
+    Arc::new(SegmentStore::open(root.to_owned(), 128 << 10, 256 << 10, 4 << 20, None).unwrap())
 }
 fn read_handle(handle: &BlockHandle) -> Vec<u8> {
     let file = File::from(handle.fd.try_clone().unwrap());
@@ -102,11 +102,10 @@ async fn packed_ranges_recovery_and_threshold_changes() {
     }
     store.maintain(true).await.unwrap();
     let stats = store.stats().unwrap();
-    assert!(stats.segments <= 2);
+    assert!(stats.segments <= 3); // two sealed segments plus a prepared spare
     assert!(stats.allocated_bytes < 400_000);
     drop(store);
-    let recovered =
-        SmallObjectStore::open(dir.path().to_owned(), 0, 256 << 10, 4 << 20, None).unwrap();
+    let recovered = SegmentStore::open(dir.path().to_owned(), 0, 256 << 10, 4 << 20, None).unwrap();
     assert!(!recovered.accepts(&id("1"), 3072));
     for n in 0..100 {
         assert_eq!(
@@ -123,6 +122,7 @@ async fn unpublished_active_segment_is_discarded_on_restart() {
     put(&store, &id("sealed"), b"saved").await.unwrap();
     store.maintain(true).await.unwrap();
     put(&store, &id("active"), b"discard").await.unwrap();
+    store.tasks.drain().await;
     drop(store);
     let store = open(dir.path());
     assert!(store.contains(&id("sealed")));
@@ -188,7 +188,7 @@ async fn torn_delete_fails_closed_instead_of_replaying_old_entry() {
         .write_all(&[9, 0, 0])
         .unwrap();
     assert!(
-        SmallObjectStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None).is_err()
+        SegmentStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None).is_err()
     );
 }
 
@@ -334,7 +334,7 @@ async fn small_layout_probe() {
     assert_eq!(index.len(), 10_000);
     drop(index);
     let store = Arc::new(
-        SmallObjectStore::open(
+        SegmentStore::open(
             dir.path().join("packed"),
             128 << 10,
             64 << 20,
@@ -354,7 +354,7 @@ async fn small_layout_probe() {
     drop(store);
     let start = Instant::now();
     let store = Arc::new(
-        SmallObjectStore::open(
+        SegmentStore::open(
             dir.path().join("packed"),
             128 << 10,
             64 << 20,
@@ -379,7 +379,7 @@ async fn small_layout_probe() {
     assert!(packed_usage.0 < whole_usage.0 / 100);
 }
 
-async fn put(store: &Arc<SmallObjectStore>, id: &BlockId, bytes: &[u8]) -> io::Result<u64> {
+async fn put(store: &Arc<SegmentStore>, id: &BlockId, bytes: &[u8]) -> io::Result<u64> {
     store.put(id, Bytes::copy_from_slice(bytes)).await
 }
 
@@ -475,8 +475,7 @@ async fn capacity_is_a_runtime_eviction_target_not_an_engine_admission_limit() {
     let dir = tempfile::tempdir().unwrap();
     let capacity = 1 << 20;
     let store = Arc::new(
-        SmallObjectStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, capacity, None)
-            .unwrap(),
+        SegmentStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, capacity, None).unwrap(),
     );
     // No runtime eviction here: prove that passing the soft target itself
     // cannot reject an otherwise valid write or poison later admissions.
@@ -497,4 +496,311 @@ async fn capacity_is_a_runtime_eviction_target_not_an_engine_admission_limit() {
             vec![n as u8; 4096]
         );
     }
+}
+
+#[derive(Default)]
+pub(super) struct SealPause {
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) resume: tokio::sync::Notify,
+}
+
+#[tokio::test]
+async fn rollover_writes_spare_while_seal_waits_and_bounds_backlog() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    // Two 100 KiB records fit; a third rotates the 256 KiB segment.
+    let bytes = vec![7; 100 << 10];
+    put(&store, &id("a"), &bytes).await.unwrap();
+    put(&store, &id("b"), &bytes).await.unwrap();
+    store.tasks.drain().await;
+    let spare = store.state.lock().await.standby.unwrap();
+    let pause = Arc::new(SealPause::default());
+    *store.seal_pause.lock().unwrap() = Some(pause.clone());
+    put(&store, &id("c"), &bytes).await.unwrap();
+    pause.entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(2), put(&store, &id("d"), &bytes))
+        .await
+        .unwrap()
+        .unwrap();
+    {
+        let state = store.state.lock().await;
+        assert_eq!(state.active, Some(spare));
+        assert!(state.sealing.is_some());
+        assert!(state.standby.is_some());
+        assert_eq!(state.segments.len(), 3);
+    }
+    // A second rotation must wait: at most one sealing segment is allowed.
+    let writer = store.clone();
+    let mut next = tokio::spawn(async move { put(&writer, &id("e"), &vec![7; 100 << 10]).await });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut next)
+        .await
+        .is_err());
+    // Delete cannot race manifest publication and lose its tombstone.
+    let deleting = store.clone();
+    let mut delete = tokio::spawn(async move { deleting.delete(&id("a")).await });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut delete)
+        .await
+        .is_err());
+    *store.seal_pause.lock().unwrap() = None;
+    pause.resume.notify_one();
+    next.await.unwrap().unwrap();
+    delete.await.unwrap().unwrap();
+    store.maintain(true).await.unwrap();
+    store.tasks.drain().await;
+    drop(store);
+    let recovered = open(dir.path());
+    assert!(!recovered.contains(&id("a")));
+    for name in ["b", "c", "d", "e"] {
+        assert_eq!(
+            recovered.read(&id(name)).await.unwrap().unwrap().as_ref(),
+            bytes
+        );
+    }
+}
+
+#[tokio::test]
+async fn spare_creation_failure_wakes_waiters_and_fails_checkpoint() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let bytes = vec![7; 100 << 10];
+    put(&store, &id("a"), &bytes).await.unwrap();
+    put(&store, &id("b"), &bytes).await.unwrap();
+    store.tasks.drain().await;
+    let next = store.state.lock().await.next;
+    // create_new must fail without touching an existing file.
+    std::fs::write(store.path(next, "data"), b"collision").unwrap();
+    // The asynchronous creation failure may now precede C's I/O completion.
+    let _ = tokio::time::timeout(Duration::from_secs(2), put(&store, &id("c"), &bytes))
+        .await
+        .unwrap();
+    store.tasks.drain().await;
+    assert!(store.maintain(true).await.is_err());
+    assert!(put(&store, &id("d"), &bytes).await.is_err());
+    assert_eq!(
+        std::fs::read(store.path(next, "data")).unwrap(),
+        b"collision"
+    );
+}
+
+#[tokio::test]
+async fn cancelled_checkpoint_finishes_owned_seal() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("a"), b"saved").await.unwrap();
+    store.tasks.drain().await;
+    let pause = Arc::new(SealPause::default());
+    *store.seal_pause.lock().unwrap() = Some(pause.clone());
+    let writer = store.clone();
+    let checkpoint = tokio::spawn(async move { writer.maintain(true).await });
+    pause.entered.notified().await;
+    checkpoint.abort();
+    let _ = checkpoint.await;
+    *store.seal_pause.lock().unwrap() = None;
+    pause.resume.notify_one();
+    store.tasks.drain().await;
+    drop(store);
+    assert_eq!(
+        open(dir.path())
+            .read(&id("a"))
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"saved"
+    );
+}
+
+#[tokio::test]
+async fn failed_manifest_publication_poison_wakes_rotation_waiter() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let bytes = vec![7; 100 << 10];
+    put(&store, &id("a"), &bytes).await.unwrap();
+    put(&store, &id("b"), &bytes).await.unwrap();
+    store.tasks.drain().await;
+    let pause = Arc::new(SealPause::default());
+    *store.seal_pause.lock().unwrap() = Some(pause.clone());
+    put(&store, &id("c"), &bytes).await.unwrap();
+    pause.entered.notified().await;
+    put(&store, &id("d"), &bytes).await.unwrap();
+    let writer = store.clone();
+    let mut next = tokio::spawn(async move { put(&writer, &id("e"), &vec![7; 100 << 10]).await });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut next)
+        .await
+        .is_err());
+    std::fs::create_dir(dir.path().join("MANIFEST.tmp")).unwrap();
+    *store.seal_pause.lock().unwrap() = None;
+    pause.resume.notify_one();
+    assert!(tokio::time::timeout(Duration::from_secs(2), next)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    store.tasks.drain().await;
+    assert!(store.maintain(true).await.is_err());
+    drop(store);
+    // No manifest was published; neither the sealing nor new active data is recovered.
+    let recovered = open(dir.path());
+    for name in ["a", "b", "c", "d"] {
+        assert!(!recovered.contains(&id(name)));
+    }
+}
+
+#[derive(Default)]
+pub(super) struct AppendPause {
+    pub(super) entered: tokio::sync::Notify,
+    pub(super) resume: tokio::sync::Notify,
+}
+
+#[tokio::test]
+async fn out_of_order_append_rollover_and_cancelled_caller_preserve_seal_barrier() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("seed"), b"seed").await.unwrap();
+    store.tasks.drain().await;
+    let old = store.state.lock().await.active.unwrap();
+    let pause = Arc::new(AppendPause::default());
+    *store.append_pause.lock().unwrap() = Some(pause.clone());
+    let first = store.clone();
+    let request = tokio::spawn(async move { put(&first, &id("a"), &vec![1; 100 << 10]).await });
+    pause.entered.notified().await;
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        put(&store, &id("b"), &vec![2; 100 << 10]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert!(!store.contains(&id("a")));
+    assert!(
+        store.contains(&id("b")),
+        "later append publishes independently"
+    );
+    // Reserved A + completed B fill the old segment; C must use the spare.
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        put(&store, &id("c"), &vec![3; 100 << 10]),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    {
+        let state = store.state.lock().await;
+        assert_eq!(state.sealing, Some(old));
+        assert_ne!(state.active, Some(old));
+        assert_eq!(state.segments[&old].in_flight, 1);
+        assert!(!state.segments[&old].sealed);
+        assert!(state.segments[&old].bytes + state.segments[&old].metadata <= store.segment_size);
+    }
+    let checking = store.clone();
+    let mut checkpoint = tokio::spawn(async move { checking.maintain(true).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), &mut checkpoint)
+            .await
+            .is_err()
+    );
+    assert!(!dir.path().join("MANIFEST").exists());
+    request.abort();
+    let _ = request.await;
+    pause.resume.notify_one();
+    checkpoint.await.unwrap().unwrap();
+    store.tasks.drain().await;
+    drop(store);
+    let recovered = open(dir.path());
+    assert_eq!(
+        recovered.read(&id("seed")).await.unwrap().unwrap().as_ref(),
+        b"seed"
+    );
+    for (name, value) in [("a", 1), ("b", 2), ("c", 3)] {
+        assert_eq!(
+            recovered.read(&id(name)).await.unwrap().unwrap().as_ref(),
+            vec![value; 100 << 10]
+        );
+    }
+}
+
+#[tokio::test]
+async fn append_slots_bound_submissions_without_holding_state_lock() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    let held = store.append_slots.acquire_many(31).await.unwrap();
+    let pause = Arc::new(AppendPause::default());
+    *store.append_pause.lock().unwrap() = Some(pause.clone());
+    let first = store.clone();
+    let a = tokio::spawn(async move { put(&first, &id("a"), b"first").await });
+    pause.entered.notified().await;
+    let second = store.clone();
+    let mut b = tokio::spawn(async move { put(&second, &id("b"), b"second").await });
+    assert!(tokio::time::timeout(Duration::from_millis(50), &mut b)
+        .await
+        .is_err());
+    assert_eq!(
+        store
+            .state
+            .lock()
+            .await
+            .segments
+            .values()
+            .map(|s| s.in_flight)
+            .sum::<usize>(),
+        1
+    );
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(2), b)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    pause.resume.notify_one();
+    a.await.unwrap().unwrap();
+    store.tasks.drain().await;
+}
+
+#[tokio::test]
+async fn failed_reserved_index_prevents_peer_publication_and_keeps_durable_segments() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("durable"), b"saved").await.unwrap();
+    store.maintain(true).await.unwrap();
+    let pause = Arc::new(AppendPause::default());
+    *store.append_pause.lock().unwrap() = Some(pause.clone());
+    let first = store.clone();
+    let a = tokio::spawn(async move { put(&first, &id("a"), b"pending").await });
+    pause.entered.notified().await;
+    {
+        let mut state = store.state.lock().await;
+        let active = state.active.unwrap();
+        // Only later reservations receive this read-only index descriptor.
+        state.segments.get_mut(&active).unwrap().index =
+            Arc::new(File::open(store.path(active, "index")).unwrap().into());
+    }
+    assert!(put(&store, &id("b"), b"failed").await.is_err());
+    pause.resume.notify_one();
+    assert!(a.await.unwrap().is_err());
+    store.tasks.drain().await;
+    assert!(!store.contains(&id("a")) && !store.contains(&id("b")));
+    assert!(store.maintain(true).await.is_err());
+    assert_eq!(
+        store
+            .state
+            .lock()
+            .await
+            .segments
+            .values()
+            .map(|s| s.in_flight)
+            .sum::<usize>(),
+        0
+    );
+    drop(store);
+    let recovered = open(dir.path());
+    assert_eq!(
+        recovered
+            .read(&id("durable"))
+            .await
+            .unwrap()
+            .unwrap()
+            .as_ref(),
+        b"saved"
+    );
+    assert!(!recovered.contains(&id("a")) && !recovered.contains(&id("b")));
 }

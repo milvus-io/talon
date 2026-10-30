@@ -90,6 +90,15 @@ impl Mutations {
         self: &Arc<Self>,
         work: impl std::future::Future<Output = T> + Send + 'static,
     ) -> T {
+        self.spawn(work).await.expect("mutation task stopped")
+    }
+
+    /// Start an accepted mutation immediately; dropping the receiver does not
+    /// cancel it, and drain includes the task before its first poll.
+    pub fn spawn<T: Send + 'static>(
+        self: &Arc<Self>,
+        work: impl std::future::Future<Output = T> + Send + 'static,
+    ) -> tokio::sync::oneshot::Receiver<T> {
         self.active.fetch_add(1, Ordering::AcqRel);
         let guard = MutationGuard(self.clone());
         let work = async move {
@@ -98,12 +107,12 @@ impl Mutations {
         };
         if self.prefer_ring && talon_uring::on_ring() {
             talon_uring::spawn_local(work)
-                .await
-                .expect("ring mutation task stopped")
         } else {
-            tokio::spawn(work)
-                .await
-                .expect("page mutation task panicked")
+            let (send, recv) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _ = send.send(work.await);
+            });
+            recv
         }
     }
     pub async fn drain(&self) {

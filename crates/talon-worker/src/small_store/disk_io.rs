@@ -21,6 +21,16 @@ pub(super) enum Open {
     Replace,
 }
 
+pub(super) async fn create_dir(path: PathBuf) -> io::Result<()> {
+    if talon_uring::on_ring() {
+        return receive(talon_uring::spawn_local(async move {
+            monoio::fs::create_dir(path).await
+        }))
+        .await;
+    }
+    blocking(move || std::fs::create_dir(path)).await
+}
+
 pub(super) async fn open(path: PathBuf, mode: Open) -> io::Result<Arc<OwnedFd>> {
     if talon_uring::on_ring() {
         return receive(talon_uring::spawn_local(async move {

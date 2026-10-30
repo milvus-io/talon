@@ -76,19 +76,56 @@ including the current background scheduler, use the blocking pool through the
 same async interface. Startup recovery runs synchronously before serving, or in
 the namespace initializer's blocking task. No new private ring is created.
 
-A namespace has one async mutation lock and one active segment. Reads use a
-short directory lock to retain an fd, and do not hold the mutation lock. Accepted
-mutations remain owned by the worker/ring if their caller stops waiting. The
-mutation lock serializes writers, deletes, seals and compaction, making the
-relocation snapshot current through publication. Compaction can delay writes
-for one segment, but never holds the read directory lock while doing disk I/O.
+Each native ring in a namespace keeps its own active segment, prepared spare,
+reservation lock, publication lock, and at most one segment being sealed. The first insert creates the active pair and asynchronously
+prepares the spare. On rollover, the reservation lock only switches to the spare and
+starts an owned pipeline task. The task prepares the next spare, then synchronizes
+the old data/index files and publishes the manifest without holding the append
+lock. If another rollover arrives before this task finishes, it waits: the
+pipeline bounds unsealed data rather than accumulating an unlimited flush queue.
+Different rings append and seal independently; there is no namespace-wide lock
+held across append I/O. A transient per-object mutation guard coordinates writes
+and deletes of the same identity across rings, without a second resident-object
+index. Short shared directory locks remain. There is no preallocation, truncate,
+hole punching, or removal of fsync.
 
-An insert writes payload and index before exposing its locator. Active files
-are deliberately absent from MANIFEST. Sealing synchronizes data and index,
-atomically replaces the manifest, then synchronizes the directory. Segments
-seal when full, at the next maintenance tick after 30 seconds, or at graceful
-shutdown. An abrupt exit can lose the one unsealed segment per namespace/scope;
-these are cache misses, not lost origin writes. This avoids per-insert fsync.
+Reads use a short directory lock to retain an fd. Accepted mutations and pipeline
+tasks remain owned by the worker/ring if their caller stops waiting. A separate
+publication lock serializes seals, tombstones and compaction so a deletion cannot
+race a sealing fsync or manifest replacement. Compaction still holds the append
+lock while copying one segment; this pipeline does not remove that source of
+write latency. Neither sealing nor compaction holds the read directory lock while
+doing disk I/O. Pipeline failures poison the engine and wake waiting writers.
+
+Each stream permits up to 32 appends in flight. An append reserves both data and
+index offsets under the short stream lock, counting reserved bytes toward the
+segment limit, then releases the lock and submits both writes. Completion order
+may differ from reservation order: a later complete object becomes readable
+without waiting for earlier records. Both I/O completions are awaited even when
+one fails; accepted mutations retain their buffers and root lease after caller
+cancellation. The sealing task waits for every reserved append before fsync and
+manifest publication. Any failed reservation poisons the stream, so a segment
+with a hole cannot enter MANIFEST. Reclamation excludes in-flight segments, and
+allocation accounting never regresses when stat completions arrive out of order.
+
+An insert writes payload and index before exposing its locator. Active, spare,
+and not-yet-published sealing files are deliberately absent from MANIFEST.
+Sealing synchronizes data and index, atomically replaces the manifest, then
+synchronizes the directory. Segments seal when full, at the next maintenance tick
+after 30 seconds, or at graceful shutdown. Checkpoint waits for pending sealing
+and seals the current active segment. An abrupt exit can lose up to two data-bearing
+unsealed segments per writer stream; the empty spare is also discarded. The
+unsealed-data bound scales with the number of rings (plus a non-ring fallback
+stream, if used). These are cache misses, not lost origin writes. There is no per-insert fsync. Spare index
+allocation is included in physical capacity accounting. Each native ring uses a
+stable slot in `ring-<slot>/`, with independent segment IDs and MANIFEST. The root
+layout remains the legacy/non-ring stream. Startup discovers all historical
+slots even when the configured ring count is reduced or admission is disabled;
+existing objects stay readable from any ring. Duplicate identities across slots
+fail recovery closed. A newly used ring directory is created and made durable
+through native asynchronous I/O before its first insertion. Old binaries do not
+discover the new ring subdirectories, so those objects become cache misses on
+downgrade; files are not migrated or deleted automatically.
 
 Deleting a sealed record appends and synchronizes a tombstone before removing
 the locator. A failed mutation stops further mutations for that engine until
@@ -100,7 +137,7 @@ that namespace's disposable cache while the worker is stopped to rewarm it.
 ## Reclamation and capacity
 
 Logical eviction decreases live record bytes; it does not pretend to release
-physical disk space. A maintenance call processes at most one eligible segment:
+physical disk space. A maintenance call processes at most one eligible segment per writer stream:
 
 1. An empty segment is removed from the manifest and unlinked.
 2. A sealed segment with less than half its record bytes live is relocated.

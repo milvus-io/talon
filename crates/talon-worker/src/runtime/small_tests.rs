@@ -216,7 +216,15 @@ async fn small_cache_pressure_counts_dead_and_retired_bytes() {
         "open retired inode still occupies disk"
     );
     drop(handle);
-    assert_eq!(w.resident_bytes(), 0);
+    let stats = w.store.small().unwrap().stats().unwrap();
+    assert_eq!(stats.retired_bytes, 0);
+    assert_eq!(stats.live_bytes, 0);
+    assert_eq!(stats.segments, 1, "only the prepared spare remains");
+    assert_eq!(w.resident_bytes(), stats.allocated_bytes);
+    assert!(
+        stats.allocated_bytes <= 8192,
+        "only the spare index header is allocated"
+    );
 }
 
 #[tokio::test]

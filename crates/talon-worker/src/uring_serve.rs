@@ -316,7 +316,7 @@ where
                 };
 
                 rt.block_on(async move {
-                    let local_tasks = talon_uring::LocalRing::enter();
+                    let local_tasks = talon_uring::LocalRing::enter_with_id(ring_id);
                     // SO_REUSEPORT is default-true in ListenerConfig: every ring
                     // binds the same address and the kernel spreads accepts.
                     let cfg = monoio::net::ListenerConfig::default();
