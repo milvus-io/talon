@@ -5,7 +5,7 @@ use crate::page_gc::{CheckpointReport, GcReport};
 use crate::page_lifecycle::{GcCandidate, PageCheckpoint};
 
 impl WorkerRuntime {
-    async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+    pub(super) async fn background_io(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
         match &self.background_budget {
             Some(budget) => Some(budget.io().await),
             None => None,
@@ -281,7 +281,7 @@ impl WorkerRuntime {
             let _background_io = runtime.background_io().await;
             let block = &candidate.block;
             let _gate = block.gate.lock().await;
-            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.lru.total_bytes() <= target) { return None; }
+            if reason == 1 && (runtime.capacity_bytes == 0 || runtime.resident_bytes() <= target) { return None; }
             let tti = (reason == 0).then_some(runtime.page_gc_config.tti_ms);
             if !block.claim(&candidate, runtime.page_clock.now(), tti) {return None;}
             let paged = runtime.paged.as_ref()?;
@@ -476,7 +476,7 @@ impl WorkerRuntime {
                             let _gate = state.gate.lock().await;
                             if reason == 1
                                 && (runtime.capacity_bytes == 0
-                                    || runtime.lru.total_bytes() <= target)
+                                    || runtime.resident_bytes() <= target)
                             {
                                 return;
                             }

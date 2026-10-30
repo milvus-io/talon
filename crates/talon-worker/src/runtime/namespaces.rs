@@ -101,6 +101,11 @@ impl NamespaceRuntimes {
         }
         let store = WholeBlockStore::open_with_fd_cache(&root, self.whole_fds.clone())?
             .with_root_lock(self.root_lock.clone())
+            .with_small_objects(
+                config.small_object_threshold_bytes,
+                config.small_object_segment_bytes,
+                config.capacity_bytes,
+            )?
             .with_uring(self.uring)?;
         let index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
@@ -651,6 +656,8 @@ mod tests {
     }
     fn config() -> WorkerConfig {
         WorkerConfig {
+            // These fixtures exercise whole-file and paged storage at tiny capacities.
+            small_object_threshold_bytes: 0,
             block_size: 16,
             capacity_bytes: 1024 * disk_unit(),
             l1_capacity_bytes: 0,

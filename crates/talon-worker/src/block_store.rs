@@ -83,11 +83,59 @@ pub struct WholeBlockStore {
     uring: bool,
     direct_alignment: Option<talon_uring::DirectIoAlignment>,
     root: PathBuf,
+    small: Option<Arc<crate::small_store::SmallObjectStore>>,
     fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
 }
 
 impl WholeBlockStore {
+    /// Attach the independent packed store. Reopen existing segments even when
+    /// admission is disabled so threshold changes never hide resident objects.
+    pub fn with_small_objects(
+        mut self,
+        threshold: u64,
+        segment_size: u64,
+        capacity: u64,
+    ) -> Result<Self> {
+        let root = self.root.join("small");
+        if threshold > 0 || root.exists() {
+            self.small = Some(Arc::new(crate::small_store::SmallObjectStore::open(
+                root,
+                threshold,
+                segment_size,
+                capacity,
+                self.root_lock.clone(),
+            )?));
+        }
+        Ok(self)
+    }
+
+    pub(crate) fn small(&self) -> Option<&Arc<crate::small_store::SmallObjectStore>> {
+        self.small.as_ref()
+    }
+
+    pub(crate) fn accepts_small(&self, id: &BlockId, len: u64) -> bool {
+        self.small.as_ref().is_some_and(|s| s.accepts(id, len))
+    }
+
+    pub(crate) async fn maintain_small(&self, checkpoint: bool) -> Result<()> {
+        if let Some(small) = self.small.clone() {
+            small.maintain(checkpoint).await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn maintain_small_budget(
+        &self,
+        checkpoint: bool,
+        budget: Option<Arc<crate::background::BackgroundBudget>>,
+    ) -> Result<()> {
+        if let Some(small) = self.small.clone() {
+            small.maintain_with_budget(checkpoint, budget).await?;
+        }
+        Ok(())
+    }
+
     /// Select native I/O and probe this cache directory before accepting writes.
     pub fn with_uring(mut self, enabled: bool) -> std::io::Result<Self> {
         self.direct_alignment = enabled
@@ -107,6 +155,14 @@ impl WholeBlockStore {
         id: &BlockId,
         value: talon_uring::Payload,
     ) -> Result<u64> {
+        if let Some(small) = self
+            .small
+            .clone()
+            .filter(|s| s.accepts(id, value.len() as u64) || s.contains(id))
+        {
+            let id = id.clone();
+            return Ok(small.put(&id, value.into_bytes()).await?);
+        }
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
         let meta = BlockMeta {
@@ -224,6 +280,7 @@ impl WholeBlockStore {
             uring: false,
             direct_alignment: None,
             root_lock: None,
+            small: None,
             root,
             fd_cache,
         })
@@ -273,6 +330,9 @@ impl WholeBlockStore {
     pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
         for entry in self.scan_allocated()? {
             index.commit_allocated(entry.meta, entry.allocated);
+        }
+        if let Some(small) = &self.small {
+            small.restore_index(index)?;
         }
         Ok(())
     }
@@ -379,6 +439,20 @@ impl WholeBlockStore {
     /// it is not on the hot serving path that motivated the fd cache; routing it
     /// through the cache is a follow-up, not a correctness matter.
     pub async fn get_range_bytes(&self, id: &BlockId, offset: u64, len: u64) -> Result<Bytes> {
+        if let Some(small) = self.small.clone().filter(|s| s.contains(id)) {
+            let id = id.clone();
+            {
+                let bytes = small
+                    .read(&id)
+                    .await?
+                    .ok_or_else(|| Error::NotFound(id.to_string()))?;
+                let end = offset
+                    .checked_add(len)
+                    .filter(|end| *end <= bytes.len() as u64)
+                    .ok_or_else(|| Error::Other("small object range out of bounds".into()))?;
+                return Ok(bytes.slice(offset as usize..end as usize));
+            }
+        }
         let path = self.path_for(id);
         let id = id.clone();
         if self.uring {
@@ -418,6 +492,11 @@ impl WholeBlockStore {
 #[async_trait]
 impl ObjectStore for WholeBlockStore {
     async fn get_block(&self, id: &BlockId) -> Result<BlockHandle> {
+        if let Some(small) = &self.small {
+            if let Some(handle) = small.get(id)? {
+                return Ok(handle);
+            }
+        }
         let (fd, len) = self.open_ro(id).await?;
         Ok(BlockHandle::from_shared(fd, 0, len))
     }
@@ -429,6 +508,16 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_range(&self, id: &BlockId, offset: u64, len: u64) -> Result<Vec<BlockHandle>> {
+        if let Some(small) = &self.small {
+            if let Some(mut handle) = small.get(id)? {
+                if offset.checked_add(len).map_or(true, |end| end > handle.len) {
+                    return Err(Error::Other("small object range out of bounds".into()));
+                }
+                handle.offset += offset;
+                handle.len = len;
+                return Ok(vec![handle]);
+            }
+        }
         let (fd, file_len) = self.open_ro(id).await?;
         if offset.checked_add(len).map_or(true, |end| end > file_len) {
             return Err(Error::Other(format!(
@@ -439,6 +528,13 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
+        if let Some(small) = self.small.clone().filter(|s| s.contains(id)) {
+            let id = id.clone();
+            return small
+                .read(&id)
+                .await?
+                .ok_or_else(|| Error::NotFound(id.to_string()));
+        }
         let path = self.path_for(id);
         let id = id.clone();
         if self.uring {
@@ -473,6 +569,10 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
+        if let Some(small) = self.small.clone() {
+            let id = id.clone();
+            small.delete(&id).await?;
+        }
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
         let cached_path = path.clone();

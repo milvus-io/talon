@@ -39,7 +39,7 @@ impl EvictionCycle {
         self.progressed = false;
         if let Some(registry) = worker.registry() {
             let workers = registry.snapshot();
-            let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
+            let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
             if total <= self.low {
                 self.active = false;
             } else if total >= self.high {
@@ -50,28 +50,38 @@ impl EvictionCycle {
                     // Cache units are indivisible: one namespace can release more
                     // than requested. Recompute the global excess before reclaiming
                     // from the next namespace instead of giving each a fixed share.
-                    let total: u64 = workers.iter().map(|w| w.lru.total_bytes()).sum();
+                    let total: u64 = workers.iter().map(|w| w.resident_bytes()).sum();
                     if total <= self.low {
                         break;
                     }
-                    let target = namespace.lru.total_bytes().saturating_sub(total - self.low);
+                    let target = namespace.resident_bytes().saturating_sub(total - self.low);
+                    let policy_target = target.saturating_sub(
+                        namespace
+                            .resident_bytes()
+                            .saturating_sub(namespace.lru.total_bytes()),
+                    );
                     let lru = namespace.lru.clone();
                     let scan = namespace.page_gc_config.scan_batch_size;
                     let deletes = namespace.page_gc_config.delete_batch_size;
                     let units = tokio::task::spawn_blocking(move || {
-                        lru.candidates_to_fit_bounded(target, &Default::default(), scan, deletes)
+                        lru.candidates_to_fit_bounded(
+                            policy_target,
+                            &Default::default(),
+                            scan,
+                            deletes,
+                        )
                     })
                     .await
                     .expect("eviction scan panicked");
                     namespace.unlink_units_to_target(units, 1, target).await;
                 }
-                let remaining = workers.iter().map(|w| w.lru.total_bytes()).sum::<u64>();
+                let remaining = workers.iter().map(|w| w.resident_bytes()).sum::<u64>();
                 self.progressed = remaining < total;
                 self.active = remaining > self.low;
             }
             return;
         }
-        let bytes = worker.lru.total_bytes();
+        let bytes = worker.resident_bytes();
         if bytes <= self.low {
             self.active = false;
         } else if bytes >= self.high {
@@ -82,15 +92,20 @@ impl EvictionCycle {
             // retain the cycle across ticks, including below the high watermark.
             let lru = worker.lru.clone();
             let target = self.low;
+            let policy_target = target.saturating_sub(
+                worker
+                    .resident_bytes()
+                    .saturating_sub(worker.lru.total_bytes()),
+            );
             let scan = worker.page_gc_config.scan_batch_size;
             let deletes = worker.page_gc_config.delete_batch_size;
             let units = tokio::task::spawn_blocking(move || {
-                lru.candidates_to_fit_bounded(target, &Default::default(), scan, deletes)
+                lru.candidates_to_fit_bounded(policy_target, &Default::default(), scan, deletes)
             })
             .await
             .expect("eviction scan panicked");
             worker.unlink_units_to_target(units, 1, target).await;
-            let remaining = worker.lru.total_bytes();
+            let remaining = worker.resident_bytes();
             self.progressed = remaining < bytes;
             self.active = remaining > self.low;
         }
@@ -177,6 +192,7 @@ mod tests {
         low_watermark: f64,
     ) -> (Arc<WorkerRuntime>, WorkerConfig, Vec<Arc<WorkerRuntime>>) {
         let config = WorkerConfig {
+            small_object_threshold_bytes: 0,
             block_size: 16,
             capacity_bytes: 10 * disk_unit(),
             l2_page_size_bytes: if paged { 16 } else { 0 },

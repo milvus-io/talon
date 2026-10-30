@@ -553,6 +553,28 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), true)
+    }
+
+    pub(crate) fn idle_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        scan_budget: usize,
+        delete_budget: usize,
+    ) -> Vec<StaleBlockCandidate> {
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), false)
+    }
+
+    fn age_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        (scan_budget, delete_budget): (usize, usize),
+        consider_verified: bool,
+    ) -> Vec<StaleBlockCandidate> {
         let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
             *cursor = (0, self.inner.lock().unwrap().clock);
@@ -569,7 +591,7 @@ impl Lru {
             let verified = g.object_checks[&block.object].1;
             if activity.pins != 0
                 || now.saturating_sub(access) <= age
-                || verified.is_some_and(|at| now.saturating_sub(at) < age)
+                || (consider_verified && verified.is_some_and(|at| now.saturating_sub(at) < age))
             {
                 continue;
             }

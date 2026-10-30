@@ -30,6 +30,25 @@ impl WorkerBackground {
         let worker = Arc::new(background);
         let mut scheduler = BackgroundScheduler::new(config.background_task_concurrency)
             .with_metrics(worker.metrics.registry.clone());
+        let w = worker.clone();
+        scheduler.register("small_object_gc", Duration::from_secs(1), move || {
+            let w = w.clone();
+            async move {
+                for namespace in w.namespace_runtimes() {
+                    namespace
+                        .gc_small_idle_at(crate::eviction::access_millis())
+                        .await;
+                    let _io = namespace.background_io().await;
+                    if let Err(error) = namespace
+                        .store
+                        .maintain_small_budget(false, namespace.background_budget.clone())
+                        .await
+                    {
+                        tracing::warn!(%error, "small object maintenance failed");
+                    }
+                }
+            }
+        });
         let gc = &worker.page_gc_config;
         let global_gc = crate::page_gc::PageGcConfig::from(config);
         let period = Duration::from_millis(
@@ -231,6 +250,13 @@ impl WorkerBackground {
         self.worker.drain_namespace_initializers().await;
         for namespace in self.worker.namespace_runtimes() {
             namespace.drain_page_mutations().await;
+            if let Err(error) = namespace
+                .store
+                .maintain_small_budget(true, namespace.background_budget.clone())
+                .await
+            {
+                tracing::warn!(%error, "small object shutdown checkpoint failed");
+            }
             namespace.checkpoint_access_times().await;
         }
     }

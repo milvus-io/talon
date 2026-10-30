@@ -265,6 +265,10 @@ pub struct WorkerConfig {
     pub cache_dirs: Vec<PathBuf>,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
+    /// Target packed segment size, including its index.
+    pub small_object_segment_bytes: u64,
+    /// Upper exclusive object size for packed storage; 0 disables new admissions.
+    pub small_object_threshold_bytes: u64,
     /// Worker-wide whole-block cached descriptor limit, shared by namespaces.
     /// Zero disables caching. Startup-only; active readers and sockets hold extra FDs.
     pub whole_fd_cache_capacity: usize,
@@ -596,6 +600,8 @@ impl Default for WorkerConfig {
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
             capacity_bytes: 64 << 30,
+            small_object_segment_bytes: 67108864,
+            small_object_threshold_bytes: 1 << 20,
             whole_fd_cache_capacity: 1024,
             page_fd_cache_capacity: 16384,
             background_task_concurrency: 2,
@@ -692,6 +698,8 @@ pub struct WorkerConfigPatch {
     pub cache_dirs: Option<Vec<PathBuf>>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
+    pub small_object_segment_bytes: Option<u64>,
+    pub small_object_threshold_bytes: Option<u64>,
     /// Override for [`WorkerConfig::whole_fd_cache_capacity`].
     pub whole_fd_cache_capacity: Option<usize>,
     /// Override for [`WorkerConfig::page_fd_cache_capacity`].
@@ -827,6 +835,12 @@ impl Patch for WorkerConfigPatch {
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
+            small_object_segment_bytes: self
+                .small_object_segment_bytes
+                .or(base.small_object_segment_bytes),
+            small_object_threshold_bytes: self
+                .small_object_threshold_bytes
+                .or(base.small_object_threshold_bytes),
             background_task_concurrency: self
                 .background_task_concurrency
                 .or(base.background_task_concurrency),
@@ -1112,6 +1126,8 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
+    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("1048576"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; 0 disables new admissions." },
+    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES", key: "small_object_segment_bytes", default: Some("67108864"), cli: false, secret: false, help: "Target packed segment size, including its index." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },
     ConfigVar { env: "TALON_WORKER_PAGE_TTI_HOURS", key: "page_tti_hours", default: Some("0"), cli: false, secret: false, help: "Page time to idle in hours; 0 disables idle expiration." },
@@ -1358,6 +1374,8 @@ pub(crate) mod worker_env {
         "TALON_WORKER_ASYNC_EVICTION_CHECK_INTERVAL_MINUTES";
     pub const L1_CAPACITY_BYTES: &str = "TALON_WORKER_L1_CAPACITY_BYTES";
     pub const L1_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L1_PAGE_SIZE_BYTES";
+    pub const SMALL_OBJECT_THRESHOLD_BYTES: &str = "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES";
+    pub const SMALL_OBJECT_SEGMENT_BYTES: &str = "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES";
     pub const L2_PAGE_SIZE_BYTES: &str = "TALON_WORKER_L2_PAGE_SIZE_BYTES";
     pub const LOAD_INFLIGHT_BYTES: &str = "TALON_WORKER_LOAD_INFLIGHT_BYTES";
     pub const PAGED_MISS_RUN_CONCURRENCY: &str = "TALON_WORKER_PAGED_MISS_RUN_CONCURRENCY";
@@ -1544,6 +1562,12 @@ impl WorkerConfigPatch {
             l1_page_size_bytes: get(worker_env::L1_PAGE_SIZE_BYTES)
                 .map(|v| parse_u64(v, worker_env::L1_PAGE_SIZE_BYTES))
                 .transpose()?,
+            small_object_threshold_bytes: get(worker_env::SMALL_OBJECT_THRESHOLD_BYTES)
+                .map(|v| parse_u64(v, worker_env::SMALL_OBJECT_THRESHOLD_BYTES))
+                .transpose()?,
+            small_object_segment_bytes: get(worker_env::SMALL_OBJECT_SEGMENT_BYTES)
+                .map(|v| parse_u64(v, worker_env::SMALL_OBJECT_SEGMENT_BYTES))
+                .transpose()?,
             l2_page_size_bytes: get(worker_env::L2_PAGE_SIZE_BYTES)
                 .map(|v| parse_u64(v, worker_env::L2_PAGE_SIZE_BYTES))
                 .transpose()?,
@@ -1713,6 +1737,12 @@ impl WorkerConfig {
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
+            small_object_segment_bytes: merged
+                .small_object_segment_bytes
+                .unwrap_or(d.small_object_segment_bytes),
+            small_object_threshold_bytes: merged
+                .small_object_threshold_bytes
+                .unwrap_or(d.small_object_threshold_bytes),
             background_task_concurrency: merged
                 .background_task_concurrency
                 .unwrap_or(d.background_task_concurrency),
@@ -2059,6 +2089,10 @@ impl WorkerConfig {
         } else {
             self.l2_page_size_bytes
         };
+        let minimum_load = minimum_load.max(
+            self.small_object_threshold_bytes
+                .min(u64::from(self.block_size)),
+        );
         if self.load_inflight_bytes == 0
             || self.load_inflight_bytes < minimum_load
             || self.load_inflight_bytes > (usize::MAX >> 3) as u64
@@ -2074,6 +2108,15 @@ impl WorkerConfig {
         }
         if self.cache_dirs.is_empty() {
             return Err(Error::Other("at least one cache_dir is required".into()));
+        }
+        if self.small_object_threshold_bytes > 0
+            && (self.small_object_threshold_bytes > 128 << 20
+                || self.small_object_segment_bytes
+                    < self.small_object_threshold_bytes.saturating_add(65536 + 64)
+                || self.small_object_segment_bytes > 1 << 30
+                || self.small_object_segment_bytes.saturating_mul(4) > self.capacity_bytes)
+        {
+            return Err(Error::Other("small object segment must fit threshold + key, be <= 1 GiB, and capacity must fit four segments".into()));
         }
         if self.capacity_bytes < self.block_size as u64 {
             return Err(Error::Other(format!(
@@ -2571,6 +2614,51 @@ mod tests {
     }
 
     #[test]
+    fn small_object_config_layers_and_geometry() {
+        let defaults =
+            WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+                .unwrap();
+        assert_eq!(defaults.small_object_threshold_bytes, 1 << 20);
+        let file = WorkerConfigPatch::from_toml(
+            "small_object_threshold_bytes = 131072\nsmall_object_segment_bytes = 4194304",
+        )
+        .unwrap();
+        let enabled =
+            WorkerConfig::resolve(file.clone(), Default::default(), Default::default()).unwrap();
+        assert_eq!(enabled.small_object_threshold_bytes, 131072);
+        assert_eq!(enabled.small_object_segment_bytes, 4194304);
+        let env = WorkerConfigPatch::from_env_with(|key| match key {
+            worker_env::SMALL_OBJECT_THRESHOLD_BYTES => Some("0".into()),
+            worker_env::SMALL_OBJECT_SEGMENT_BYTES => Some("8388608".into()),
+            _ => None,
+        })
+        .unwrap();
+        let disabled = WorkerConfig::resolve(file, env, Default::default()).unwrap();
+        assert_eq!(disabled.small_object_threshold_bytes, 0);
+        assert_eq!(disabled.small_object_segment_bytes, 8388608);
+        for patch in [
+            WorkerConfigPatch {
+                small_object_threshold_bytes: Some(131072),
+                small_object_segment_bytes: Some(131072),
+                ..Default::default()
+            },
+            WorkerConfigPatch {
+                small_object_threshold_bytes: Some(131072),
+                small_object_segment_bytes: Some(2 << 30),
+                ..Default::default()
+            },
+            WorkerConfigPatch {
+                small_object_threshold_bytes: Some(1 << 20),
+                l2_page_size_bytes: Some(4096),
+                load_inflight_bytes: Some(4096),
+                ..Default::default()
+            },
+        ] {
+            assert!(WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err());
+        }
+    }
+
+    #[test]
     fn fd_cache_capacity_defaults_and_layers() {
         let defaults =
             WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
@@ -2659,6 +2747,7 @@ mod tests {
                 .contains("load_inflight_bytes"));
         }
         let mut cfg = WorkerConfig {
+            small_object_threshold_bytes: 0,
             l2_page_size_bytes: 64 << 10,
             load_inflight_bytes: 64 << 10,
             ..Default::default()
@@ -3689,6 +3778,7 @@ token = "file-token"
     #[test]
     fn invalid_config_fails_fast() {
         let cli = WorkerConfigPatch {
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1),
             ..Default::default()
         };
@@ -3735,6 +3825,7 @@ token = "file-token"
 
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1024),
             l1_capacity_bytes: Some(4096),
             l1_page_size_bytes: Some(2048),
@@ -3745,6 +3836,7 @@ token = "file-token"
 
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1024),
             l1_capacity_bytes: Some(4096),
             l1_page_size_bytes: Some(300),
@@ -3759,6 +3851,7 @@ token = "file-token"
         // A page larger than a block cannot be addressed.
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1024),
             l2_page_size_bytes: Some(2048),
             ..Default::default()
@@ -3769,6 +3862,7 @@ token = "file-token"
         // A block must divide evenly into pages.
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1024),
             l2_page_size_bytes: Some(300),
             ..Default::default()
@@ -3779,6 +3873,7 @@ token = "file-token"
         // With both tiers on, the page sizes must agree.
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1024),
             l1_capacity_bytes: Some(4096),
             l1_page_size_bytes: Some(512),
@@ -3791,6 +3886,7 @@ token = "file-token"
         // Matching page sizes across both tiers is accepted.
         let cli = WorkerConfigPatch {
             block_size: Some(1024),
+            small_object_threshold_bytes: Some(0),
             capacity_bytes: Some(1024),
             l1_capacity_bytes: Some(4096),
             l1_page_size_bytes: Some(256),

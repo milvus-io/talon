@@ -16,6 +16,8 @@ pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;
+#[cfg(test)]
+mod small_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
 
@@ -148,6 +150,8 @@ pub struct WorkerRuntime {
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
+    small_idle_cursor: Arc<tokio::sync::Mutex<(u64, u64)>>,
+    small_capacity_eviction: Arc<tokio::sync::Mutex<()>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
@@ -260,6 +264,8 @@ impl WorkerRuntime {
             background_budget: None,
             page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
+            small_idle_cursor: Arc::new(tokio::sync::Mutex::new((0, 0))),
+            small_capacity_eviction: Arc::new(tokio::sync::Mutex::new(())),
         }
     }
 
@@ -1048,6 +1054,13 @@ impl WorkerRuntime {
         len: u64,
         object_len: Option<u64>,
     ) -> anyhow::Result<bytes::Bytes> {
+        let known_len =
+            object_len.or_else(|| self.cached_object_len(&request.object, &block.version));
+        if let Some(size) = known_len.filter(|size| self.store.accepts_small(block, *size)) {
+            return self
+                .small_object_range(request, block, offset, len, size, false)
+                .await;
+        }
         if self.paged.is_some() {
             return self
                 .paged_block_range(
@@ -1068,6 +1081,87 @@ impl WorkerRuntime {
 
         self.metrics.record_cache_miss();
         self.load_block_range(request, block, offset, len).await
+    }
+
+    /// Small objects are fetched whole even for a range read. Never infer an
+    /// object's size from the requested range length.
+    async fn small_object_range(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+        object_len: u64,
+        warm_only: bool,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let len = available_range_len(object_len, offset, len)?;
+        if warm_only && self.load_range_cached(block, 0, object_len) {
+            return Ok(bytes::Bytes::new());
+        }
+        if !warm_only {
+            if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
+                return Ok(bytes);
+            }
+        }
+        let runtime = self.clone();
+        let request = request.clone();
+        let block = block.clone();
+        self.page_mutations
+            .run(async move {
+                let key = LoadKey::Whole(block.clone());
+                loop {
+                    if warm_only && runtime.load_range_cached(&block, 0, object_len) {
+                        return Ok(bytes::Bytes::new());
+                    }
+                    if !warm_only {
+                        if let Some(bytes) = runtime.cached_block_range(&block, offset, len).await?
+                        {
+                            return Ok(bytes);
+                        }
+                    }
+                    let (admission, flight) = runtime.inflight.admit_traced(key.clone());
+                    if let Some(_guard) = admission {
+                        runtime.metrics.record_cache_miss();
+                        let started = Instant::now();
+                        let result = runtime
+                            .backend()?
+                            .fetch_range_if_match(
+                                &request.object,
+                                0,
+                                object_len,
+                                (block.version.as_str() != UNCHECKED_VERSION)
+                                    .then_some(&block.version),
+                            )
+                            .await;
+                        let bytes = match result {
+                            Ok(bytes) => {
+                                runtime.metrics.record_backend_fetch_success(
+                                    bytes.len() as u64,
+                                    started.elapsed(),
+                                );
+                                bytes
+                            }
+                            Err(e) => {
+                                runtime
+                                    .metrics
+                                    .record_backend_fetch_error(started.elapsed());
+                                return Err(e.into());
+                            }
+                        };
+                        anyhow::ensure!(
+                            bytes.len() as u64 == object_len,
+                            "short small object fetch"
+                        );
+                        runtime.commit_cached_block(&block, bytes.clone()).await?;
+                        if warm_only {
+                            return Ok(bytes::Bytes::new());
+                        }
+                        return runtime.range_from_fetched(&block, bytes, offset, len);
+                    }
+                    talon_telemetry::wait_for(&flight, runtime.inflight.wait(&key)).await;
+                }
+            })
+            .await
     }
 
     /// Serve a block-relative range in paged mode: L1, then per-page L2 files,
@@ -1108,6 +1202,15 @@ impl WorkerRuntime {
             if let Some(bytes) = self.cached_block_range(block, offset, len).await? {
                 return Ok(bytes);
             }
+        }
+
+        if let Some(size) = known_block_len
+            .or_else(|| self.cached_object_len(&request.object, &block.version))
+            .filter(|size| self.store.accepts_small(block, *size))
+        {
+            return self
+                .small_object_range(request, block, offset, len, size, warm_only)
+                .await;
         }
 
         // Sized reads and LOAD carry the exact block extent from their caller.
@@ -2153,6 +2256,7 @@ impl WorkerRuntime {
     /// configured capacity, unlinking each evicted block's file and index entry.
     /// A `capacity_bytes` of `0` disables enforcement.
     async fn enforce_capacity(&self) {
+        let capacity = self.capacity_bytes;
         if self.capacity_bytes == 0 {
             return;
         }
@@ -2164,34 +2268,84 @@ impl WorkerRuntime {
             workers.sort_by_key(|worker| worker.namespace != self.namespace);
             for worker in &workers {
                 let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
-                if total <= self.capacity_bytes {
+                if total <= capacity {
                     break;
                 }
-                let target = worker
-                    .resident_bytes()
-                    .saturating_sub(total - self.capacity_bytes);
+                let target = worker.resident_bytes().saturating_sub(total - capacity);
                 worker.evict_to_target(target).await;
             }
         } else {
-            self.evict_to_target(self.capacity_bytes).await;
+            self.evict_to_target(capacity).await;
         }
     }
 
     /// Capacity reclamation for foreground admissions, bounded by initial residency.
     async fn evict_to_target(&self, target: u64) {
+        // Small-record deletion does not free physical space until a segment
+        // is reclaimed. Concurrent foreground passes otherwise keep chasing
+        // the same physical excess as new admissions arrive, so individual
+        // commits can wait through many reclamation cycles despite progress.
+        // Serialize those passes and recheck residency after acquiring the
+        // gate. Whole-file/page-only stores retain their existing behavior.
+        let _small_capacity = if self.store.small().is_some() {
+            Some(self.small_capacity_eviction.lock().await)
+        } else {
+            None
+        };
         // A selected page can become protected or fail to unlink. Refill from
         // other units using actual residency, attempting each unit at most once.
         // Bound the pass even if concurrent admissions keep adding new units.
         let budget = self.lru.len();
         let mut attempted = HashSet::new();
         while attempted.len() < budget {
-            let mut evicted = self.lru.candidates_to_fit(target, &attempted);
+            if self.resident_bytes() <= target {
+                break;
+            }
+            let overhead = self.resident_bytes().saturating_sub(self.lru.total_bytes());
+            let mut evicted = self
+                .lru
+                .candidates_to_fit(target.saturating_sub(overhead), &attempted);
             evicted.truncate(budget - attempted.len());
             if evicted.is_empty() {
                 break;
             }
             attempted.extend(evicted.iter().map(|c| c.unit.clone()));
             self.unlink_units_to_target(evicted, 1, target).await;
+            if let Err(error) = self.store.maintain_small(false).await {
+                tracing::warn!(%error, "small object pressure reclamation failed");
+                break;
+            }
+        }
+    }
+
+    async fn gc_small_idle_at(&self, now: u64) {
+        let Some(small) = self.store.small().cloned() else {
+            return;
+        };
+        let age = self.page_gc_config.tti_ms;
+        if age == 0 {
+            return;
+        }
+        let mut cursor = self.small_idle_cursor.lock().await;
+        let mut position = *cursor;
+        let lru = self.lru.clone();
+        let scan = self.page_gc_config.scan_batch_size.min(4096);
+        let deletes = self.page_gc_config.delete_batch_size.min(256);
+        let (next, candidates) = tokio::task::spawn_blocking(move || {
+            let candidates = lru.idle_candidates(&mut position, now, age, scan, deletes);
+            (
+                position,
+                candidates
+                    .into_iter()
+                    .filter(|c| small.contains(&c.block))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .expect("small object idle scan panicked");
+        *cursor = next;
+        for candidate in candidates {
+            self.unlink_stale_block_for(candidate, None).await;
         }
     }
 
@@ -2202,7 +2356,13 @@ impl WorkerRuntime {
 
     /// Allocated disk bytes of indexed cache data files, excluding sidecars.
     pub fn resident_bytes(&self) -> u64 {
-        self.index.resident_bytes()
+        let indexed = self.index.resident_bytes();
+        match self.store.small().and_then(|s| s.stats().ok()) {
+            Some(stats) => indexed
+                .saturating_sub(stats.live_bytes)
+                .saturating_add(stats.allocated_bytes),
+            None => indexed,
+        }
     }
 
     #[cfg(test)]
