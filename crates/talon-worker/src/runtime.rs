@@ -208,15 +208,7 @@ impl WorkerRuntime {
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
     ) -> Self {
-        let lru = Arc::new(Lru::new());
-        for (id, page, bytes) in index.snapshot_units() {
-            let unit = match page {
-                Some(page) => CacheUnit::Page(id, page),
-                None => CacheUnit::Whole(id),
-            };
-            let access = lru.insert(unit.clone(), bytes);
-            index.set_access(&unit, access);
-        }
+        let lru = Arc::new(index.restore_lru());
         if let Some(small) = store.small() {
             small.restore_access(&index);
         }
@@ -396,13 +388,8 @@ impl WorkerRuntime {
         self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
             crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
         ));
-        for (id, page, _) in self.index.snapshot_units() {
-            if let Some(page) = page {
-                let state = self.page_lifecycle.block(&id);
-                let handle = state.register(page, None, self.page_clock.now(), false);
-                self.index.set_page_state(&id, page, handle);
-            }
-        }
+        self.index
+            .restore_page_states(&self.page_lifecycle, self.page_clock.now());
         self.paged = Some(Arc::new(paged));
         self
     }
