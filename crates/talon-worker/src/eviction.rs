@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use talon_core::{BlockId, ObjectId, PageIndex, Version};
 
+mod recovery;
+pub(crate) use recovery::RecoveredUnit;
+
 /// A single evictable cache unit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CacheUnit {
@@ -98,6 +101,11 @@ impl AccessHandle {
             },
             Ordering::Relaxed,
         );
+    }
+
+    /// Separate second-chance bit, with the same block-wide idle clock.
+    pub(crate) fn sibling(&self) -> Self {
+        Self(Arc::new(AtomicBool::new(false)), self.1.clone())
     }
 
     /// Coalesce hits until the eviction hand consumes this second chance.

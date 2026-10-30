@@ -616,13 +616,17 @@ impl SegmentStore {
         Ok(stats)
     }
 
-    fn restore_policy(&self, policy: &Lru) -> io::Result<()> {
+    fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) -> io::Result<()> {
+        units.reserve(self.entries.read().unwrap().len());
         for (key, loc) in self.entries.write().unwrap().iter_mut() {
-            loc.access = Some(policy.insert_with_policy(
-                CacheUnit::Whole(format::id(key)?),
-                charge(key, loc.len),
-                true,
-            ));
+            let access = AccessHandle::default();
+            units.push(crate::eviction::RecoveredUnit {
+                unit: Arc::new(CacheUnit::Whole(format::id(key)?)),
+                bytes: charge(key, loc.len),
+                independent: true,
+                access: access.clone(),
+            });
+            loc.access = Some(access);
         }
         Ok(())
     }
