@@ -39,6 +39,9 @@ pub(super) struct NamespaceRuntimes {
     initializers: Arc<Mutations>,
     config: WorkerConfig,
     root_lock: Arc<CacheRootLock>,
+    // Both cache adapters receive the same service and canonical cache root.
+    journal_service: Arc<talon_journal::JournalService>,
+    catalog: Arc<crate::catalog::Catalog>,
     backend: Arc<dyn BackendStore>,
     background_heads: Option<Arc<origin_head::OriginHeads>>,
     metrics: WorkerMetrics,
@@ -63,7 +66,7 @@ impl NamespaceRuntimes {
         backend: Option<Arc<dyn BackendStore>>,
     ) -> anyhow::Result<WorkerRuntime> {
         let config = self.config.for_namespace(namespace)?;
-        let namespace_root = self.root_lock.root.join(namespace.effective_name());
+        let namespace_root = self.journal_service.root().join(namespace.effective_name());
         checked_dir(&namespace_root)?;
         let root = match &scope {
             None => namespace_root.join("shared"),
@@ -107,10 +110,21 @@ impl NamespaceRuntimes {
             config.small_object_segment_bytes,
             config.capacity_bytes,
             Some(self.root_lock.clone()),
+            Some(&self.journal_service),
         )?;
         let store = store.with_uring(self.uring)?;
-        let index = Arc::new(BlockIndex::new());
+        let mut index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
+            let path = self.catalog.store_path(&root.join("paged"))?;
+            let registered = self
+                .catalog
+                .registered(&path, config.l2_page_size_bytes as u32)?;
+            if !registered {
+                anyhow::ensure!(!root.join("paged").try_exists()?,
+                    "paged cache has no journal; use a new empty cache directory (legacy migration is not supported)");
+                self.catalog
+                    .register(&path, config.l2_page_size_bytes as u32)?;
+            }
             checked_dir(&root.join("paged"))?;
             Some(
                 PagedBlockStore::open_with_fd_cache(
@@ -118,6 +132,7 @@ impl NamespaceRuntimes {
                     config.l2_page_size_bytes as u32,
                     self.page_fds.clone(),
                 )?
+                .with_catalog(self.catalog.clone(), path)
                 .with_root_lock(self.root_lock.clone())
                 .with_uring(self.uring)?,
             )
@@ -125,10 +140,19 @@ impl NamespaceRuntimes {
             None
         };
         let recovery_started = Instant::now();
-        store.restore_index(&index)?;
+        store.restore_index_exclusive(
+            Arc::get_mut(&mut index).expect("unpublished startup index"),
+        )?;
+        let whole_small_ms = recovery_started.elapsed().as_secs_f64() * 1000.0;
+        let paged_started = Instant::now();
         if let Some(paged) = &paged {
-            paged.restore_index(&index)?;
+            paged.restore_index_exclusive(
+                Arc::get_mut(&mut index).expect("unpublished startup index"),
+            )?;
         }
+        tracing::info!(root = %root.display(), whole_small_ms,
+            paged_ms = paged_started.elapsed().as_secs_f64() * 1000.0,
+            "cache index recovery phases");
         tracing::info!(root = %root.display(), blocks = index.len(),
             elapsed_ms = recovery_started.elapsed().as_millis() as u64,
             "cache index restored");
@@ -163,15 +187,21 @@ impl NamespaceRuntimes {
             config.l1_page_size_bytes,
             self.l1_budget.clone(),
         ));
+        let page_states_started = Instant::now();
         if let Some(paged) = paged {
             worker = worker.with_paged_store(paged);
         }
+        let page_states_ms = page_states_started.elapsed().as_secs_f64() * 1000.0;
+        let page_gc_started = Instant::now();
         let mut gc = PageGcConfig::from(&config);
         gc.scan_batch_size = gc.scan_batch_size.min(config.background_scan_batch_size);
         gc.delete_batch_size = gc
             .delete_batch_size
             .min(config.background_delete_batch_size);
         worker = worker.with_page_gc(gc)?;
+        tracing::info!(root = %root.display(), page_states_ms,
+            page_gc_ms = page_gc_started.elapsed().as_secs_f64() * 1000.0,
+            "cache runtime page recovery phases");
         tracing::info!(root = %root.display(),
             elapsed_ms = runtime_started.elapsed().as_millis() as u64,
             "cache runtime restored");
@@ -184,6 +214,9 @@ impl NamespaceRuntimes {
         worker.load_bytes = self.load_bytes.clone();
         worker.load_inflight_bytes = config.load_inflight_bytes;
         worker.background_budget = Some(self.background_budget.clone());
+        if let Some(small) = &worker.small {
+            small.set_background_budget(self.background_budget.clone());
+        }
         Ok(worker)
     }
 
@@ -245,13 +278,26 @@ fn checked_dir(path: &Path) -> anyhow::Result<()> {
             "namespace cache path must be a real directory: {}",
             path.display()
         ),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            std::fs::create_dir(path)?;
+            std::fs::File::open(
+                path.parent()
+                    .ok_or_else(|| anyhow::anyhow!("cache directory has no parent"))?,
+            )?
+            .sync_all()?;
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())
 }
 
 impl WorkerRuntime {
+    pub(crate) async fn checkpoint_catalog(&self) -> anyhow::Result<()> {
+        if let Some(registry) = self.registry() {
+            registry.catalog.checkpoint().await?;
+        }
+        Ok(())
+    }
     pub(crate) fn inflight_count(&self) -> u64 {
         self.inflight.len() as u64
     }
@@ -293,6 +339,12 @@ impl WorkerRuntime {
         uring: bool,
     ) -> anyhow::Result<Self> {
         config.validate()?;
+        let journal_service = crate::catalog::service(root_lock.clone())?;
+        tracing::info!(
+            native = journal_service.is_native(),
+            "cache journal runtime opened"
+        );
+        let catalog = crate::catalog::Catalog::with_service(&journal_service)?;
         let registry = Arc::new(NamespaceRuntimes {
             uring,
             membership: Arc::new(Mutex::new(None)),
@@ -302,6 +354,8 @@ impl WorkerRuntime {
             initializers: Arc::new(Mutations::default()),
             config: config.clone(),
             root_lock,
+            journal_service,
+            catalog,
             backend,
             background_heads: uring
                 .then(|| origin_head::OriginHeads::new(config.stale_gc_head_concurrency)),
@@ -318,9 +372,9 @@ impl WorkerRuntime {
         });
         let mut names = std::collections::BTreeSet::from([DEFAULT_NAMESPACE.to_owned()]);
         names.extend(config.namespaces.keys().cloned());
-        for entry in std::fs::read_dir(&registry.root_lock.root)? {
+        for entry in std::fs::read_dir(registry.journal_service.root())? {
             let entry = entry?;
-            if entry.file_name() == "lost+found" {
+            if entry.file_name() == "lost+found" || entry.file_name() == crate::catalog::DIRECTORY {
                 continue;
             }
             if entry.file_type()?.is_dir() || entry.file_type()?.is_symlink() {
@@ -337,7 +391,7 @@ impl WorkerRuntime {
         for name in names {
             let namespace = NamespaceId::named(&name);
             namespace.validate()?;
-            let namespace_root = registry.root_lock.root.join(&name);
+            let namespace_root = registry.journal_service.root().join(&name);
             checked_dir(&namespace_root)?;
             let has_shared = match std::fs::symlink_metadata(namespace_root.join("shared")) {
                 Ok(_) => true,
@@ -671,6 +725,32 @@ mod tests {
             page_access_checkpoint_interval_minutes: 1,
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn legacy_paged_cache_requires_a_new_root_without_migration() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = PagedBlockStore::open(dir.path().join("default/shared/paged"), 4).unwrap();
+        legacy.write_sidecar(&block(16), 16).unwrap();
+        legacy
+            .put_page(&block(16), PageIndex(0), Bytes::from_static(b"data"))
+            .unwrap();
+        let lock = Arc::new(CacheRootLock::acquire(dir.path()).unwrap());
+        let error = WorkerRuntime::open_namespaces(
+            &config(),
+            lock,
+            Arc::new(Origin::default()),
+            WorkerMetrics::new(0),
+        )
+        .err()
+        .unwrap();
+        assert!(error
+            .to_string()
+            .contains("legacy migration is not supported"));
+        assert!(
+            legacy.has_page(&block(16), PageIndex(0)),
+            "rejected old caches are untouched"
+        );
     }
     fn open(root: &Path, config: &WorkerConfig, backend: Arc<Origin>) -> Arc<WorkerRuntime> {
         let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
@@ -1536,13 +1616,24 @@ mod tests {
                 cfg.small_object_segment_bytes,
                 cfg.capacity_bytes,
                 None,
+                None,
             )
             .unwrap();
             if paged {
-                let store = PagedBlockStore::open(scope.join("paged"), 4).unwrap();
-                store.write_sidecar(&block(16), 16).unwrap();
+                let catalog = crate::catalog::Catalog::open(Arc::new(
+                    CacheRootLock::acquire(dir.path()).unwrap(),
+                ))
+                .unwrap();
+                let path = catalog.store_path(&scope.join("paged")).unwrap();
+                catalog.register(&path, 4).unwrap();
+                let store = Arc::new(
+                    PagedBlockStore::open(scope.join("paged"), 4)
+                        .unwrap()
+                        .with_catalog(catalog, path),
+                );
                 store
-                    .put_page(&block(16), PageIndex(0), Bytes::from_static(b"data"))
+                    .commit_page(&block(16), PageIndex(0), 16, Bytes::from_static(b"data"))
+                    .await
                     .unwrap();
             } else {
                 whole
@@ -1907,6 +1998,25 @@ mod tests {
             WorkerMetrics::new(1024)
         )
         .is_err());
+    }
+
+    #[tokio::test]
+    async fn cache_root_alias_and_canonical_root_share_journal_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().join("cache");
+        let alias = dir.path().join("alias");
+        std::fs::create_dir(&canonical).unwrap();
+        std::os::unix::fs::symlink(&canonical, &alias).unwrap();
+        let origin = Arc::new(Origin::default());
+        let worker = open(&alias, &config(), origin.clone());
+        read(&worker).await;
+        let reads = origin.reads.load(Ordering::SeqCst);
+        assert!(reads > 0);
+        worker.checkpoint_catalog().await.unwrap();
+        drop(worker);
+        let worker = open(&canonical, &config(), origin.clone());
+        read(&worker).await;
+        assert_eq!(origin.reads.load(Ordering::SeqCst), reads);
     }
 
     #[tokio::test]

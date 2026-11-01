@@ -1,6 +1,6 @@
 use super::*;
 use std::fs::File;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use talon_core::{Backend, ObjectId, Version};
@@ -61,7 +61,7 @@ async fn process_loss_at_each_publication_boundary() {
                 store.read(&id("9")).await.unwrap().unwrap().as_ref(),
                 vec![9; 4096]
             );
-            if point != "seal_manifest" {
+            if !matches!(point, "seal_manifest") {
                 assert!(!store.contains(&id("0")), "{point}");
             }
             if point.starts_with("compact") {
@@ -311,17 +311,58 @@ async fn tombstones_prevent_resurrection_without_compaction() {
 }
 
 #[tokio::test]
-async fn torn_delete_fails_closed_instead_of_replaying_old_entry() {
+async fn incomplete_log_tail_preserves_acknowledged_delete() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("a"), b"first").await.unwrap();
+    put(&store, &id("b"), b"second").await.unwrap();
+    store.maintain(true).await.unwrap();
+    store.delete(&id("a")).await.unwrap();
+    drop(store);
+    let log = files(dir.path())
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("journal.")
+        })
+        .max()
+        .unwrap();
+    OpenOptions::new()
+        .append(true)
+        .open(log)
+        .unwrap()
+        .write_all(&[9, 0, 0])
+        .unwrap();
+    let store = open(dir.path());
+    assert!(!store.contains(&id("a")));
+    assert!(store.contains(&id("b")));
+}
+
+#[tokio::test]
+async fn committed_log_corruption_fails_closed() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
     put(&store, &id("a"), b"first").await.unwrap();
     store.maintain(true).await.unwrap();
+    store.delete(&id("a")).await.unwrap();
     drop(store);
+    let log = files(dir.path())
+        .into_iter()
+        .filter(|p| {
+            p.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("journal.")
+        })
+        .max()
+        .unwrap();
     OpenOptions::new()
-        .append(true)
-        .open(dir.path().join("1.index"))
+        .write(true)
+        .open(log)
         .unwrap()
-        .write_all(&[9, 0, 0])
+        .write_all_at(&[255], 12)
         .unwrap();
     assert!(
         SegmentStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None).is_err()
@@ -329,21 +370,56 @@ async fn torn_delete_fails_closed_instead_of_replaying_old_entry() {
 }
 
 #[tokio::test]
-async fn manifest_excludes_orphan_replacement() {
+async fn checkpoint_excludes_orphan_replacement() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
     put(&store, &id("a"), b"first").await.unwrap();
     store.maintain(true).await.unwrap();
+    let source = store.path(
+        store
+            .entries
+            .read()
+            .unwrap()
+            .values()
+            .next()
+            .unwrap()
+            .segment,
+        "data",
+    );
+    let orphan = store.path(1000, "data");
     drop(store);
-    std::fs::copy(dir.path().join("1.data"), dir.path().join("2.data")).unwrap();
-    std::fs::copy(dir.path().join("1.index"), dir.path().join("2.index")).unwrap();
+    std::fs::create_dir_all(orphan.parent().unwrap()).unwrap();
+    std::fs::copy(source, &orphan).unwrap();
     let store = open(dir.path());
     assert_eq!(store.stats().unwrap().segments, 1);
     assert_eq!(
         store.read(&id("a")).await.unwrap().unwrap().as_ref(),
         b"first"
     );
-    assert!(!dir.path().join("2.data").exists());
+    assert!(!orphan.exists());
+    assert!(
+        store
+            .journal
+            .next
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 1000
+    );
+}
+
+pub(crate) fn files(root: &Path) -> Vec<PathBuf> {
+    let mut pending = vec![root.to_owned()];
+    let mut files = Vec::new();
+    while let Some(path) = pending.pop() {
+        for e in std::fs::read_dir(path).unwrap() {
+            let e = e.unwrap();
+            if e.file_type().unwrap().is_dir() {
+                pending.push(e.path());
+            } else {
+                files.push(e.path());
+            }
+        }
+    }
+    files
 }
 
 #[tokio::test]
@@ -703,8 +779,12 @@ async fn spare_creation_failure_wakes_waiters_and_fails_checkpoint() {
     put(&store, &id("a"), &bytes).await.unwrap();
     put(&store, &id("b"), &bytes).await.unwrap();
     store.tasks.drain().await;
-    let next = store.state.lock().await.next;
+    let next = store
+        .journal
+        .next
+        .load(std::sync::atomic::Ordering::Relaxed);
     // create_new must fail without touching an existing file.
+    std::fs::create_dir_all(store.path(next, "data").parent().unwrap()).unwrap();
     std::fs::write(store.path(next, "data"), b"collision").unwrap();
     // The asynchronous creation failure may now precede C's I/O completion.
     let _ = tokio::time::timeout(Duration::from_secs(2), put(&store, &id("c"), &bytes))
@@ -765,7 +845,11 @@ async fn failed_manifest_publication_poison_wakes_rotation_waiter() {
     assert!(tokio::time::timeout(Duration::from_millis(50), &mut next)
         .await
         .is_err());
-    std::fs::create_dir(dir.path().join("MANIFEST.tmp")).unwrap();
+    store
+        .journal
+        .control
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     *store.seal_pause.lock().unwrap() = None;
     pause.resume.notify_one();
     assert!(tokio::time::timeout(Duration::from_secs(2), next)
@@ -904,14 +988,11 @@ async fn failed_reserved_index_prevents_peer_publication_and_keeps_durable_segme
     let first = store.clone();
     let a = tokio::spawn(async move { put(&first, &id("a"), b"pending").await });
     pause.entered.notified().await;
-    {
-        let mut state = store.state.lock().await;
-        let active = state.active.unwrap();
-        // Only later reservations receive this read-only index descriptor.
-        state.segments.get_mut(&active).unwrap().index = Some(Arc::new(
-            File::open(store.path(active, "index")).unwrap().into(),
-        ));
-    }
+    store
+        .journal
+        .control
+        .fail
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     assert!(put(&store, &id("b"), b"failed").await.is_err());
     pause.resume.notify_one();
     assert!(a.await.unwrap().is_err());

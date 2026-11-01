@@ -199,6 +199,7 @@ pub struct CacheRootLock {
 }
 impl CacheRootLock {
     pub fn acquire(root: &Path) -> anyhow::Result<Self> {
+        talon_journal::JournalService::wait_for_retiring(root)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)

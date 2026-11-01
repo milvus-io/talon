@@ -2,7 +2,6 @@
 use std::io::{self, Read, Write};
 use talon_core::{Backend, BlockId, ObjectId, Version};
 
-pub(super) const MAGIC: &[u8; 8] = b"TLSM0001";
 pub(super) const MAX_KEY: usize = 64 * 1024;
 
 pub(super) fn key(id: &BlockId) -> io::Result<Vec<u8>> {

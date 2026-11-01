@@ -277,6 +277,12 @@ impl WholeBlockStore {
         Ok(())
     }
 
+    /// Startup-only bulk restoration before the index is shared with requests.
+    pub(crate) fn restore_index_exclusive(&self, index: &mut crate::BlockIndex) -> Result<()> {
+        index.restore_allocated(self.scan_allocated()?, crate::recovery::workers());
+        Ok(())
+    }
+
     pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
         let mut out = Vec::new();
         let shards = match std::fs::read_dir(&self.root) {
@@ -285,6 +291,11 @@ impl WholeBlockStore {
             Err(e) => return Err(e.into()),
         };
         for shard in shards.flatten() {
+            // Paged recovery is owned by its catalog; never enumerate its
+            // directories as part of the whole-block sidecar scan.
+            if shard.file_name() == "paged" {
+                continue;
+            }
             if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
                 continue;
             }

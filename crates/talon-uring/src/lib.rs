@@ -38,6 +38,51 @@ pub async fn atomic_write_payload(
     Ok(allocated.expect("payload writes always measure allocation"))
 }
 
+/// Journaled page publication: the durable intent owns the staging name, so
+/// recovery can remove it by exact path. The caller owns the mutation through
+/// completion and records residency only after this function returns.
+pub async fn atomic_write_payload_staged(
+    path: &Path,
+    staged: &Path,
+    payload: Payload,
+    alignment: DirectIoAlignment,
+) -> io::Result<u64> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let parent = path
+        .parent()
+        .ok_or_else(|| io::Error::other("missing page parent"))?;
+    create_dirs(parent).await?;
+    // The store root already exists durably. Publish the shard and block dirs
+    // even if a concurrent mkdir observed them before their creator synced.
+    for directory in [parent.parent().and_then(Path::parent), parent.parent()]
+        .into_iter()
+        .flatten()
+    {
+        let file = monoio::fs::File::open(directory).await?;
+        file.sync_all().await?;
+        file.close().await?;
+    }
+    let (bytes, direct) = match payload.direct_bytes(alignment) {
+        Some(bytes) => (bytes, true),
+        None => (payload.into_bytes(), false),
+    };
+    let file = monoio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(if direct { libc::O_DIRECT } else { 0 })
+        .open(staged)
+        .await?;
+    file.write_all_at(bytes, 0).await.0?;
+    file.sync_all().await?;
+    let allocated = file.metadata().await?.blocks() * 512;
+    file.close().await?;
+    monoio::fs::rename(staged, path).await?;
+    let directory = monoio::fs::File::open(parent).await?;
+    directory.sync_all().await?;
+    directory.close().await?;
+    Ok(allocated)
+}
+
 async fn atomic_write_inner(
     path: &Path,
     bytes: bytes::Bytes,

@@ -33,7 +33,9 @@ impl Lru {
         workers: usize,
         track_checks: bool,
     ) -> Self {
+        let started = std::time::Instant::now();
         let unit_index = || {
+            let started = std::time::Instant::now();
             let entries = units
                 .iter()
                 .enumerate()
@@ -56,9 +58,17 @@ impl Lru {
                 .enumerate()
                 .map(|(position, u)| (position as u64, u.unit.clone()))
                 .collect();
+            tracing::info!(
+                units = units.len(),
+                workers,
+                phase = "membership",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "cache policy index restored"
+            );
             (entries, queue)
         };
         let version_index = || {
+            let started = std::time::Instant::now();
             let mut versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>> =
                 HashMap::with_capacity(units.iter().filter(|u| !u.independent).count().min(blocks));
             let mut checks = HashMap::with_capacity(if track_checks { blocks } else { 0 });
@@ -76,9 +86,17 @@ impl Lru {
                     checks.entry(block.object.clone()).or_insert((0, None)).0 += 1;
                 }
             }
+            tracing::info!(
+                units = units.len(),
+                workers,
+                phase = "versions",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "cache policy index restored"
+            );
             (versions, checks)
         };
         let block_index = || {
+            let started = std::time::Instant::now();
             let mut access: HashMap<BlockKey, BlockActivity> = HashMap::with_capacity(blocks);
             let mut queue = Vec::with_capacity(blocks);
             for (position, u) in units.iter().enumerate() {
@@ -100,7 +118,15 @@ impl Lru {
                 activity.revision = position;
             }
             let ownership = queue.iter().cloned().collect();
-            (access, queue.into_iter().collect(), ownership)
+            let queue = queue.into_iter().collect();
+            tracing::info!(
+                units = units.len(),
+                workers,
+                phase = "blocks",
+                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+                "cache policy index restored"
+            );
+            (access, queue, ownership)
         };
         // At most three CPU workers, including this thread. Small namespaces
         // avoid thread creation. No map is shared mutably during construction.
@@ -126,7 +152,7 @@ impl Lru {
             .iter()
             .fold(0u64, |total, u| total.saturating_add(u.bytes));
         let clock = units.len() as u64;
-        Self {
+        let lru = Self {
             inner: Mutex::new(Inner {
                 entries,
                 queue,
@@ -141,7 +167,18 @@ impl Lru {
                 admission_ceiling: clock,
             }),
             eviction: Mutex::new(()),
-        }
+        };
+        let drop_started = std::time::Instant::now();
+        drop(units);
+        tracing::info!(
+            blocks,
+            units = clock,
+            workers,
+            temporary_drop_ms = drop_started.elapsed().as_secs_f64() * 1000.0,
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "cache policy indexes completed"
+        );
+        lru
     }
 }
 

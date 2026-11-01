@@ -80,6 +80,7 @@ impl WorkerRuntime {
                                     ..Default::default()
                                 }
                             }),
+                            None if paged.journaled() => Default::default(),
                             None => PageAccessStore::load(
                                 &paged.dir_for(&state.id),
                                 &state.id,

@@ -90,7 +90,7 @@ it matches process uptime against each namespace's checkpoint period. L1 residen
 gauges remain process-wide and use incremental accounting on the request path.
 
 Namespace names are 1–255 ASCII characters from letters, digits, `.`, `_`, `-`;
-`.` and `..` are rejected. `worker_identity` and `.worker.lock` are reserved for
+`.` and `..` are rejected. `worker_identity`, `.worker.lock`, and `.paged-catalog` are reserved for
 worker metadata and are rejected by request and configuration validation.
 Names are case-sensitive. Namespace directories and
 `shared` directories must be real directories, not symlinks.

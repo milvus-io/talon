@@ -3996,6 +3996,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "talon-journal"
+version = "0.2.1"
+dependencies = [
+ "bytes",
+ "futures",
+ "monoio",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "xxhash-rust",
+]
+
+[[package]]
 name = "talon-metadata"
 version = "0.2.1"
 dependencies = [
@@ -4116,6 +4129,7 @@ dependencies = [
  "serde_json",
  "talon-backend",
  "talon-core",
+ "talon-journal",
  "talon-metadata",
  "talon-rust-client",
  "talon-telemetry",

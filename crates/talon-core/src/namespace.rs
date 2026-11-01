@@ -34,7 +34,7 @@ impl<'a> NamespaceContext<'a> {
         if name.len() > MAX_NAMESPACE_ID_BYTES {
             return Err(NamespaceIdError::TooLong(name.len()));
         }
-        if matches!(name, "worker_identity" | ".worker.lock") {
+        if matches!(name, "worker_identity" | ".worker.lock" | ".paged-catalog") {
             return Err(NamespaceIdError::Reserved);
         }
         if name == "."
@@ -215,7 +215,7 @@ mod tests {
 
     #[test]
     fn reserved_namespaces_are_rejected_by_borrowed_and_owned_contexts() {
-        for name in ["worker_identity", ".worker.lock"] {
+        for name in ["worker_identity", ".worker.lock", ".paged-catalog"] {
             assert!(matches!(
                 NamespaceContext::new(name),
                 Err(NamespaceIdError::Reserved)

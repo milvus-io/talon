@@ -241,15 +241,21 @@ impl WorkerRuntime {
         metrics: WorkerMetrics,
         track_checks: bool,
     ) -> Self {
+        let lru_started = Instant::now();
         let mut units = index.restore_policy_units();
         let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
         if let Some(small) = &small {
             small.restore_policy_units(&mut units);
         }
         let lru = Arc::new(Lru::from_recovered(units, blocks, track_checks));
+        let lru_ms = lru_started.elapsed().as_secs_f64() * 1000.0;
+        let access_started = Instant::now();
         if let Some(small) = &small {
             small.bind_policy(lru.clone());
         }
+        tracing::info!(root = %store.root().display(), lru_ms,
+            small_access_ms = access_started.elapsed().as_secs_f64() * 1000.0,
+            "cache runtime policy and access restored");
         let l1 = Arc::new(MemoryStore::with_limits(
             l1_capacity_bytes,
             l1_page_size_bytes,

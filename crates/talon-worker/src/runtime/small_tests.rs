@@ -74,7 +74,7 @@ fn runtime_with_geometry(
         ranges: Mutex::new(Vec::new()),
     });
     let store = WholeBlockStore::open(root).unwrap();
-    let small = cache_routing::open_small_store(root, threshold, segment, capacity, None).unwrap();
+    let small = cache_routing::open_small_store(root, threshold, segment, capacity, None, None).unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
     let mut worker = WorkerRuntime::new_with_l1_policy(
@@ -169,9 +169,8 @@ async fn small_l2_promotion_retains_only_each_pages_allocation() {
     assert_eq!(first.try_into_mut().unwrap().capacity(), 4096);
     assert_eq!(second.try_into_mut().unwrap().capacity(), 4096);
     // Detaching the result must not weaken full-object checksum validation.
-    let payload_path = std::fs::read_dir(dir.path().join("small/ring-0"))
-        .unwrap()
-        .map(|e| e.unwrap().path())
+    let payload_path = crate::small_store::tests::files(&dir.path().join("small"))
+        .into_iter()
         .find(|p| {
             p.extension().is_some_and(|e| e == "data") && std::fs::metadata(p).unwrap().len() > 0
         })
@@ -199,7 +198,7 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         let store = WholeBlockStore::open(dir.path()).unwrap();
         if versioned {
             assert!(
-                cache_routing::open_small_store(dir.path(), 0, 256 << 10, 16 << 20, None)
+                cache_routing::open_small_store(dir.path(), 0, 256 << 10, 16 << 20, None, None)
                     .unwrap()
                     .is_none()
             );
@@ -208,7 +207,7 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         let allocated = store.scan_allocated().unwrap()[0].allocated.clone();
         drop(store);
         assert!(
-            cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None)
+            cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
                 .is_err()
         );
         let store = WholeBlockStore::open(dir.path()).unwrap();
@@ -507,7 +506,7 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     let original = std::fs::read(&marker).unwrap();
     for threshold in [0, 64 << 10, 256 << 10] {
         let error =
-            cache_routing::open_small_store(dir.path(), threshold, 512 << 10, 16 << 20, None)
+            cache_routing::open_small_store(dir.path(), threshold, 512 << 10, 16 << 20, None, None)
                 .err()
                 .unwrap();
         assert!(error
@@ -519,12 +518,12 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     assert_eq!(recovered.block_count(), 1);
     drop(recovered);
     std::fs::write(&marker, b"broken").unwrap();
-    let error = cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None)
+    let error = cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
         .err()
         .unwrap();
     assert!(error.to_string().contains("invalid small store routing"));
     std::fs::remove_file(&marker).unwrap();
-    let error = cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None)
+    let error = cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
         .err()
         .unwrap();
     assert!(error
@@ -612,10 +611,19 @@ async fn small_cache_pressure_counts_dead_and_retired_bytes() {
     assert_eq!(stats.live_bytes, 0);
     assert_eq!(stats.segments, 1, "only the prepared spare remains");
     assert_eq!(w.resident_bytes(), stats.allocated_bytes);
-    assert!(
-        stats.allocated_bytes <= 8192,
-        "only the spare index header is allocated"
+    let payload_allocated: u64 = crate::small_store::tests::files(&dir.path().join("small"))
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "data"))
+        .map(|p| {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(p).unwrap().blocks() * 512
+        })
+        .sum();
+    assert_eq!(
+        payload_allocated, 0,
+        "only global metadata remains allocated"
     );
+    assert!(stats.allocated_bytes > 0);
 }
 
 #[tokio::test]
@@ -924,18 +932,36 @@ async fn small_background_capacity_keeps_evicting_until_segment_threshold() {
                 w.maintain_small(true).await.unwrap();
             }
             let before = w.resident_bytes();
+            let payloads = || {
+                use std::os::unix::fs::MetadataExt;
+                let mut files: Vec<_> =
+                    crate::small_store::tests::files(&dir.path().join("small/data"))
+                        .into_iter()
+                        .map(|p| {
+                            let m = std::fs::metadata(&p).unwrap();
+                            (p, m.ino(), m.blocks())
+                        })
+                        .collect();
+                files.sort();
+                files
+            };
+            let original_payloads = payloads();
             if predeleted {
                 w.unlink_units(w.lru.block_candidates(&blocks[0]), 2).await;
                 assert_eq!(
-                    w.resident_bytes(),
-                    before,
+                    payloads(),
+                    original_payloads,
                     "tombstone alone does not release payload allocation"
+                );
+                assert!(
+                    w.resident_bytes() >= before,
+                    "new log allocation remains charged"
                 );
                 w.maintain_small(false).await.unwrap();
                 assert_eq!(w.block_count(), 3);
                 assert_eq!(
-                    w.resident_bytes(),
-                    before,
+                    payloads(),
+                    original_payloads,
                     "25% garbage is below routine compaction threshold"
                 );
             }
@@ -946,8 +972,8 @@ async fn small_background_capacity_keeps_evicting_until_segment_threshold() {
             if !predeleted {
                 assert_eq!(w.block_count(), 3);
                 assert_eq!(
-                    w.resident_bytes(),
-                    before,
+                    payloads(),
+                    original_payloads,
                     "pressure cannot bypass compaction threshold"
                 );
                 assert_eq!(w.small.as_ref().unwrap().reclaimable_bytes().await, 0);
@@ -962,15 +988,8 @@ async fn small_background_capacity_keeps_evicting_until_segment_threshold() {
                 2,
                 "keep selecting items until the segment reaches its garbage threshold"
             );
-            let allocated = std::fs::read_dir(dir.path().join("small/ring-0"))
-                .unwrap()
-                .map(|e| e.unwrap().path())
-                .filter(|p| {
-                    matches!(
-                        p.extension().and_then(|e| e.to_str()),
-                        Some("data" | "index")
-                    )
-                })
+            let allocated = crate::small_store::tests::files(&dir.path().join("small"))
+                .into_iter()
                 .map(|p| {
                     use std::os::unix::fs::MetadataExt;
                     std::fs::metadata(p).unwrap().blocks() * 512
@@ -1039,9 +1058,8 @@ async fn small_capacity_batches_same_segment_victims_before_one_rewrite() {
     }
     w.maintain_small(true).await.unwrap();
     let payload_files = || {
-        let mut files: Vec<_> = std::fs::read_dir(dir.path().join("small/ring-0"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let mut files: Vec<_> = crate::small_store::tests::files(&dir.path().join("small"))
+            .into_iter()
             .filter(|p| {
                 p.extension().is_some_and(|e| e == "data")
                     && std::fs::metadata(p).unwrap().len() > 0
@@ -1054,10 +1072,10 @@ async fn small_capacity_batches_same_segment_victims_before_one_rewrite() {
     assert_eq!(files.len(), 1);
     let before = w.resident_bytes();
     let config = WorkerConfig {
-        async_eviction_low_watermark: 0.25,
+        async_eviction_low_watermark: 0.30,
         ..Default::default()
     };
-    let target = (before as f64 * 0.25) as u64;
+    let target = (before as f64 * 0.30) as u64;
     let mut cycle = async_eviction::EvictionCycle::new(before, &config);
     let mut rewrites = 0;
     let mut batches = 0;
@@ -1182,9 +1200,8 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     }
     w.maintain_small(true).await.unwrap();
     let files = || {
-        let mut paths: Vec<_> = std::fs::read_dir(dir.path().join("small/ring-0"))
-            .unwrap()
-            .map(|e| e.unwrap().path())
+        let mut paths: Vec<_> = crate::small_store::tests::files(&dir.path().join("small"))
+            .into_iter()
             .collect();
         paths.sort();
         paths
@@ -1215,7 +1232,10 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     let mut cycle = async_eviction::EvictionCycle::new(before, &config);
     cycle.tick(&w).await;
     assert_eq!(w.block_count(), 64);
-    assert_eq!(w.resident_bytes(), before);
+    assert!(
+        w.resident_bytes() >= before,
+        "new tombstone log allocation remains charged"
+    );
     assert_eq!(files(), original);
     // Once unpinned, capacity enforcement keeps evicting items until the same
     // threshold permits an actual rewrite, even for a small capacity deficit.

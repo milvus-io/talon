@@ -9,8 +9,10 @@ The origin remains the durability point. No write-back behavior is introduced.
 
 The implementation is one local stack layer, `small-object/segment-store`, based
 on `main`: engine, worker integration, tests, and this design form one feature.
-Truncate, hole punching, compression, and a separate region hierarchy are out of
-scope for v1.
+Payload truncation, hole punching, compression, and a separate region hierarchy
+are out of scope. The v2 metadata format replaces per-segment indexes with a
+namespace log and recoverable snapshots through the shared `talon-journal` crate.
+See [the shared cache journal contract](cache-journal.md) for the catalog boundary.
 
 ## Configuration and routing
 
@@ -76,26 +78,56 @@ instruction to use a new empty cache directory. The worker neither migrates nor
 deletes incompatible data automatically. This prevents read-time probing for
 historical routing choices. Do not run two owners against the same cache root;
 use a fresh cache directory when rolling back to a binary with older routing.
+Legacy `MANIFEST`, `ring-*`, and per-segment index/data layouts are also
+rejected; journal format changes require a new empty cache directory.
 
 ## Files and identity
 
-Each segment has two files, `<id>.data` and `<id>.index`, shared by many objects.
-One checksummed `MANIFEST` lists the sealed segments. New segment files use exclusive creation and IDs above the files observed
-during recovery. Data is concatenated without per-record alignment,
-padding, or compression. The index starts with a format version and contains
-length-delimited, checksummed binary insertion and deletion records. Identity
-encodes backend, bucket, object path, version, block offset and block size with
-explicit lengths. It is compared in full, without treating a fingerprint as
-proof of identity. Payload checksums are checked on byte reads and relocation;
-sendfile/splice hits do not read the entire payload merely to verify a checksum.
+```text
+small/
+  access.checkpoint
+  metadata/
+    CURRENT
+    snapshot.00000000000000000042
+    journal.00000000000000000042
+  data/
+    00/00000000000000000256.data
+    01/00000000000000000257.data
+    ...
+```
 
-The engine keeps one compact encoded identity shared by its lookup table and
-segment-local live-record directory. Recovery reads the index streams and stats
-each segment; it does not read all payloads or stat individual objects. Recovery
-remains O(number of metadata records). Small objects do not allocate generic
-`BlockIndex` entries or paged metadata. Shared LRU queues and policy records still
-consume O(number of objects) memory and must be reconstructed at startup. This is
-not a disk-only index or a claim of a fixed total RAM cost per object.
+Each segment is one raw payload file. Namespace-wide monotonic IDs select one of
+256 shards using `id % 256`; shard directories are created only when used. Rings
+retain independent active/spare segments but do not own separate directories or
+index files. Payload files are created exclusively and never overwritten.
+
+The metadata writer owns checksummed, versioned log records: insert (stream,
+segment, offset, length, checksum, full identity), delete (segment, offset), seal,
+and atomic replacement of an old segment with a new one. Metadata is kept separate
+from payloads; it is not a redo log containing origin data. Identity includes
+backend, bucket, path, version, block offset and block size, compared in full.
+Sendfile/splice still use retained payload descriptors and explicit byte ranges.
+
+`metadata/CURRENT` selects a checksummed snapshot and an explicit ordered set of
+log generations to replay. It also records exact pending cleanup paths.
+The snapshot stores the current segment table and live-object mappings, including
+pending unsealed segments needed by later seal records. Startup reads that
+snapshot, replays the remaining logs in order, discards segments without a
+committed seal/replacement, validates referenced payload lengths and duplicate
+identities, and then removes unreferenced payloads and obsolete metadata files.
+It never scans payload contents or stats individual objects to build the index.
+A partial final log frame is discarded because it cannot have been acknowledged;
+checksum corruption, gaps in log generations, corrupt snapshots, and missing
+committed data fail recovery closed. Removing a partial WAL tail is recovery
+repair, not payload truncation for space reclamation.
+
+The engine and metadata writer both retain metadata proportional to resident
+objects. Keys are compact binary identities, but the writer's checkpoint state
+is additional to the engine lookup and shared LRU policy. Small objects do not
+allocate generic BlockIndex entries or paged metadata. Encoded identity
+buffers are shared between the small-store writer state and engine locators. Recovery still
+requires O(live objects + log records since snapshot) CPU/memory work; this is
+not constant-time startup or a disk-only index.
 
 Before serving, the worker attaches access tokens directly to ordinary index
 entries and small-store locators, then bulk-builds their shared LRU membership, version, and block
@@ -104,7 +136,24 @@ parallelism, including the initializing thread); small namespaces stay serial.
 Ordered eviction and ownership queues are collected in bulk. Paged lifecycle
 initialization skips whole objects without cloning a full cache snapshot. These
 steps preserve resident byte charges, block-wide idle clocks, and eviction
-semantics; segment replay and BlockIndex publication remain serial.
+semantics. Persisted small-object access ages are restored after policy tokens
+are attached.
+
+Small-store startup constructs locators while validating each sealed payload's
+length. It reserves each ring's key directory from the recovered record counts
+and bulk-collects segment offset tables. Cross-ring uniqueness uses a temporary
+vector of fingerprints and borrowed key bytes collected during that same pass;
+sorting compares the full bytes on fingerprint collisions. No separate global
+key HashSet is built. All validation finishes before orphan payload cleanup or
+abandoned-segment resolution, and no runtime is published on failure.
+
+Before sharing the Worker index, small-object keys are decoded and index entries
+are constructed on the same bounded CPU helper as the paged catalog. Allocation
+charges use an inline single-unit value; recovery does not allocate a Vec per
+small object. A decode error leaves the existing index unchanged. Successful
+entries are merged with exclusive ownership, without per-object index locks or
+atomic counter updates. The final hash-map merge and uniqueness sort remain
+serial; this does not claim fully parallel recovery.
 
 The LRU's block membership and its idle/ownership scan queues share an immutable
 identity from an existing cache unit, instead of copying its path and version
@@ -115,32 +164,37 @@ second-chance bits sharing the same block idle clock.
 
 ## I/O and publication
 
-All runtime payload, index and manifest operations use a buffered async adapter.
-On a registered Monoio ring, open/read/write/fsync/stat/rename/unlink operations
-are submitted to that current ring, with explicit file offsets. No direct I/O
-alignment is required. Ordinary owned descriptors can be shared across rings;
-short-lived Monoio wrappers remain on the submitting ring. Tokio callers,
-including the current background scheduler, use the blocking pool through the
-same async interface. Startup recovery runs synchronously before serving, or in
-the namespace initializer's blocking task. No new private ring is created.
+The Worker creates one `talon-journal::JournalService` per cache root, with a
+dedicated Monoio thread named `cache-journal`. Each namespace/credential scope
+opens an independent small-store stream on that service; the paged catalog uses
+a separate stream on the same service. No private small-store journal engine
+remains. Data rings send metadata requests through a bounded MPSC queue;
+Tokio maintenance callers use the same service. Each stream owns its log descriptor,
+file offsets, replay order, and fsync completion notifications. Payload I/O remains
+on the originating ring, with the existing blocking-pool fallback for Tokio
+payload callers. Runtime log/snapshot filesystem I/O uses native asynchronous
+interfaces. Native io_uring is preferred, with an explicit Monoio legacy-driver
+fallback on the dedicated thread when unavailable; native benchmarks require
+the native driver. Startup waits for bounded parallel log/snapshot decode and
+ordered replay before serving. Business payload reconciliation remains in the
+small-store adapter.
 
-Each native ring in a namespace keeps its own active segment, prepared spare,
-reservation lock, publication lock, and at most one segment being sealed. The first insert creates the active pair and asynchronously
-prepares the spare. On rollover, the reservation lock only switches to the spare and
-starts an owned pipeline task. The task prepares the next spare, then synchronizes
-the old data/index files and publishes the manifest without holding the append
-lock. If another rollover arrives before this task finishes, it waits: the
-pipeline bounds unsealed data rather than accumulating an unlimited flush queue.
-Different rings append and seal independently; there is no namespace-wide lock
-held across append I/O. A transient per-object mutation guard coordinates writes
-and deletes of the same identity across rings, without a second resident-object
-index. Short shared directory locks remain. There is no preallocation, truncate,
-hole punching, or removal of fsync.
+Admission budgets cover queued and in-flight metadata requests: 1,024 requests
+and 8 MiB of encoded request bytes across the service, reserved before encoding and retained until
+completion. Batch copies are additionally bounded by four in-flight batches,
+each targeting 256 KiB and at most 256 requests (a final record can exceed the
+byte target). The writer drains immediately available requests without a timer
+that delays low-load writes. Queue saturation applies asynchronous backpressure.
+Each stream retains independent state, checkpoint progress and failure isolation.
+Caller cancellation does not cancel accepted mutations or return their permits
+early. Shutdown/root leases retain accepted I/O; last-drop does not join the I/O
+thread on a serving reactor. Startup waits for retiring services before taking
+the cache-root lock; a live owner is rejected.
 
-Sealed segments retain no idle data or index descriptors. Reads asynchronously
+Sealed segments retain no idle payload descriptors. Reads asynchronously
 open data files on demand and share a weakly cached descriptor with overlapping
 readers. Active, standby and sealing segments retain their writer descriptors;
-sealing releases them, and recovery closes each segment's files after replay.
+sealing releases them, and recovery closes each segment's payload file after reconciliation.
 Thus descriptor residency follows concurrent reads and bounded writer pipelines,
 rather than the number of live sealed segments. `SmallObjectStore::get` is async.
 LOAD residency checks and L1 hits use only the in-memory directory.
@@ -151,64 +205,79 @@ open cannot race unlink. Returned handles retain the old inode independently.
 Packed byte reads still verify the complete object's checksum; promoted L1 pages
 each own only their charged bytes, even after sibling pages are evicted.
 
-Accepted mutations and pipeline
-tasks remain owned by the worker/ring if their caller stops waiting. A separate
-publication lock serializes seals, tombstones and compaction so a deletion cannot
-race a sealing fsync or manifest replacement. Compaction still holds the append
-lock while copying one segment; this pipeline does not remove that source of
-write latency. Neither sealing nor compaction holds the read directory lock while
-doing disk I/O. Pipeline failures poison the engine and wake waiting writers.
+Each data stream still permits up to 32 concurrent appends. Append reserves its
+data offset and estimated record charge under a short stream lock, then submits
+payload and metadata writes independently. Both completions are awaited before
+publishing the locator; ordinary insertion does not require fsync. A prepared
+spare lets rollover switch files while the owned pipeline prepares another spare
+and seals the previous segment. The pipeline bounds unsealed data to an active
+and a sealing segment per stream, rather than accumulating an unlimited flush
+queue. Any failed append poisons its stream; a failed metadata writer rejects
+further metadata mutations across its namespace.
 
-Each stream permits up to 32 appends in flight. An append reserves both data and
-index offsets under the short stream lock, counting reserved bytes toward the
-segment limit, then releases the lock and submits both writes. Completion order
-may differ from reservation order: a later complete object becomes readable
-without waiting for earlier records. Both I/O completions are awaited even when
-one fails; accepted mutations retain their buffers and root lease after caller
-cancellation. The sealing task waits for every reserved append before fsync and
-manifest publication. Any failed reservation poisons the stream, so a segment
-with a hole cannot enter MANIFEST. Reclamation excludes in-flight segments, and
-allocation accounting never regresses when stat completions arrive out of order.
+The log writer pipelines writes to separate offsets. It advances its contiguous
+write-completion boundary in log order. Durable requests wait for group fsync,
+started only after all writes through the covered boundary have completed;
+submitting earlier io_uring operations alone is not sufficient ordering. Later
+batches may be written while fsync is pending. This removes producer-side log
+file contention but does not eliminate queueing, CPU scheduling, or shared-disk
+contention.
 
-An insert writes payload and index before exposing its locator. Active, spare,
-and not-yet-published sealing files are deliberately absent from MANIFEST.
-Sealing synchronizes data and index, atomically replaces the manifest, then
-synchronizes the directory. Segments seal when full, at the next maintenance tick
-after 30 seconds, or at graceful shutdown. Checkpoint waits for pending sealing
-and seals the current active segment. An abrupt exit can lose up to two data-bearing
-unsealed segments per writer stream; the empty spare is also discarded. The
-unsealed-data bound scales with the number of rings (plus a non-ring fallback
-stream, if used). These are cache misses, not lost origin writes. There is no per-insert fsync. Spare index
-allocation is included in physical capacity accounting. Every writer stream uses
-`ring-<slot>/`, with independent segment IDs and MANIFEST. Slot zero serves callers
-without a native ring; native ring N uses slot N+1. Shared configuration belongs
-to the store, and each stream is created on its first insertion. Startup discovers
-all existing slots even when the configured ring count is reduced;
-existing objects stay readable from any ring. Duplicate identities across slots
-fail recovery closed. A newly used ring directory is created and made durable
-through asynchronous I/O before its first insertion. Root-level segment files are
-not part of this layout; no prior on-disk format is supported or migrated.
+Seal waits for a data segment's outstanding appends, syncs its payload and shard
+ancestry, then submits a durable seal record. The log writer never waits for a
+data ring to fsync: it receives the seal request only after that work finishes.
+Different data streams can become recoverable independently. Segments seal when
+full, at the next maintenance tick after 30 seconds, or during graceful shutdown.
+An abrupt exit can lose the bounded unsealed cache segments; the origin remains
+the durability point. Deleting a sealed object waits for its log tombstone to be
+synced before removing the locator. Per-identity guards retain cross-ring
+write/delete ordering; per-stream publication gates order seal, deletion and GC.
 
-Deleting a sealed record appends and synchronizes a tombstone before removing
-the locator. A failed mutation stops further mutations for that engine until
-restart; continuing after a partial metadata write is unsafe. Malformed sealed
-metadata, including torn tombstones, fails startup closed rather than replaying
-a prefix that could resurrect an invalidated entry. An operator can move aside
-that namespace's disposable cache while the worker is stopped to rewarm it.
+## Snapshots and log reclamation
+
+At 64 MiB of log growth, or an explicit maintenance/shutdown checkpoint, the
+stream drains preceding writes and syncs them, creates the next log generation,
+and publishes CURRENT with the old snapshot and both log generations before
+acknowledging any append in the new log. It captures metadata at that boundary.
+Segment metadata maps use copy-on-write while a separate CPU thread encodes the
+frozen state into a bounded chunk channel, without a full encoded snapshot
+buffer. One snapshot can be in progress per stream; the shared service permits
+at most two encoders/writers at once while other streams keep appending. Its asynchronous
+write and fsync overlap appends to the new log; snapshot encoding does not run on
+the log reactor. The first mutation of a shared segment map may copy that map,
+so snapshotting still has CPU/memory cost.
+
+Publication writes and syncs the snapshot, syncs the metadata directory, atomically
+replaces `metadata/CURRENT` with the new snapshot and tail set, and syncs its
+directory. Exact obsolete paths remain recorded until cleanup completes. Only then may old
+snapshots and pre-boundary logs be deleted. A crash before publication uses the
+old snapshot plus retained logs; a crash afterwards uses the new snapshot plus
+its tail. An incomplete new snapshot is never selected. Unlike data-segment GC,
+this independently removes historical metadata without copying live payloads.
+
+Snapshot writes/deletions use a crate-independent maintenance hook to the
+worker's configured background byte, I/O and
+delete budgets after background initialization. Foreground log writes and
+commit fsyncs do not consume that background budget. Checkpoint publication
+failure stops that metadata stream rather than proceeding with uncertain
+recovery state; other streams remain independently usable. The TTI `access.checkpoint` remains a separate advisory snapshot and never
+establishes object residency.
 
 ## Reclamation and capacity
 
 Logical eviction decreases live record bytes; it does not pretend to release
 physical disk space. A maintenance call processes at most one eligible segment per writer stream:
 
-1. An empty segment is removed from the manifest and unlinked.
-2. A sealed segment with less than half its record bytes live is relocated.
-3. Relocation writes and synchronizes a new segment, publishes a manifest that
-   replaces the old segment, updates locators, then unlinks the old files.
+1. An empty segment is durably retired in the metadata log and unlinked.
+2. A sealed segment with less than half its logical record bytes live is relocated.
+3. Relocation writes a new payload segment and logs its object mappings, syncs
+   payload and directory ancestry, durably commits the segment replacement,
+   updates locators, and then unlinks the old payload file.
 
-An interruption before manifest replacement leaves an orphan replacement. An
-interruption afterwards leaves an orphan old file. Recovery only opens manifest
-members and removes unreferenced engine files. It never merges both copies.
+An interruption before replacement commit leaves an orphan replacement. An
+interruption afterwards leaves an orphan old file. Recovery applies the atomic
+replacement record and removes unreferenced engine files; it never merges both
+copies.
 The collector enumerates only the selected segment's live records, not the
 entire object directory. Background relocation pays the shared byte budget
 before acquiring the mutation lock and rechecks the selected segment afterward.
@@ -218,10 +287,11 @@ An in-flight response retains its old inode across replacement/unlink. This is
 necessary because sendfile completion does not imply peer consumption. Keeping
 an fd alone would not protect against an in-place truncate or overwrite.
 
-Worker capacity accounting adds measured small-segment and access-checkpoint
-allocations to ordinary `BlockIndex` allocations, including dead bytes and
-retired files retained by open handles. Small-record policy charges are not
-added a second time to physical occupancy. Like the whole-file store, admission writes and publishes the object
+Worker capacity accounting adds measured small payload, log, snapshot, CURRENT
+and access-checkpoint allocations to ordinary `BlockIndex` allocations, including
+dead bytes and retired payload files retained by open handles. Directory blocks
+are excluded, matching existing file-allocation accounting. Small policy charges
+are not added a second time. Like the whole-file store, admission writes and publishes the object
 before best-effort capacity eviction. Capacity is a soft target: concurrent
 admissions, relocation copies, and retired files retained by readers can
 transiently exceed it. Crossing that target does not reject an admission;
@@ -235,9 +305,11 @@ are cold. Capacity reclamation has two phases:
 1. Select victims in bounded batches. Whole blocks/pages release their files;
    small objects append tombstones. Carry the small-store reclaim estimate across
    batches instead of repeatedly charging the same physical excess. The estimate
-   uses live payload and live index lengths rounded separately to filesystem
-   allocation units, plus retired files awaiting their last reader. Only segments
-   exceeding the shared 50% garbage threshold (by payload plus index bytes) count
+   uses live payload lengths rounded to filesystem allocation units, plus retired
+   payload files awaiting their last reader. Global metadata remains charged and
+   is reclaimed independently by checkpointing. Only segments
+   exceeding the shared 50% garbage threshold (by logical payload plus metadata
+   record charges) count
    toward this estimate. Below-threshold garbage provides no reclaim credit;
    continue selecting items until enough eligible segments exist.
 2. Once the estimate covers the remaining excess (or a bounded no-progress walk
@@ -263,7 +335,7 @@ also finishes selection before relocation, using the same per-namespace gate.
 With stable admissions and readers, one round batches same-segment victims into
 one rewrite; concurrent admissions, failed deletions, or filesystem allocation
 estimation differences can require another round. Relocation pays for live
-payload read/write and live index writes, rather than dead payload bytes.
+payload read/write and relocation log records, rather than dead payload bytes.
 
 Already-unlinked reader-held files remain charged; when they cover the remaining
 excess, eviction waits for those descriptors instead of deleting more objects.
@@ -274,36 +346,22 @@ and credits pending reclamation in other namespaces before selecting more victim
 
 ## Validation
 
-Run worker and core tests, the worker binary tests, formatting, Clippy, and
-configuration-reference generation in the development container. Native tests
-require an environment that permits io_uring; a seccomp rejection is not an I/O
-correctness result.
+Regression coverage includes queue count/byte permits retained after dequeue and
+cancellation, multiple submitted log batches, fsync ordering behind incomplete
+writes, snapshot creation overlapping insert/delete/seal, automatic log rotation,
+recovery of snapshot entries sealed later, snapshot/current crash boundaries,
+truncated final log frames, corrupt committed metadata, old-format rejection
+without modification, per-ring append isolation, retained sendfile descriptors,
+TTI recovery, and threshold-preserving batched capacity reclamation.
 
-Regressions cover complete-object routing, exact conditional fetches, LOAD
-coalescing and L1 exclusion, version/short-fetch failures, write-through and
-cache admission, restart, idle/capacity eviction, physical accounting, concurrent
-read/delete/relocation, and a slow real sendfile receiver during unlink. Child
-processes exit at payload/index writes, seal synchronization, manifest
-publication, tombstone synchronization, and both relocation publication sides.
-A native-ring test exercises writes, reads, sealing, deletion and compaction
-and asserts zero blocking-pool fallbacks in the adapter.
-
-`small_store::tests::small_layout_probe` is an ignored, explicitly invoked
-10,000-object comparison against the old whole-file layout. It reports allocated
-space, file count, write time and recovery time. It uses a warm filesystem and
-is a layout check, not a cold-device or production throughput benchmark.
-
-A local development-container run on 2026-10-29 with 10,000 objects of 3 KiB
-reported the following. Timings are a single warm-filesystem observation;
-allocation includes the data and metadata files, excluding directory blocks.
-
-| Measurement | Whole-file layout | Packed layout |
-| --- | ---: | ---: |
-| Files | 20,000 | 3 |
-| Allocated bytes | 82,972,672 | 31,580,160 |
-| Recovery time | 300 ms | 134 ms |
-| Write time | 6,544 ms | 6,094 ms |
-
+`small-store-probe` remains the reproducible object-layout/recovery fixture. The
+ignored `small_layout_probe` compares 10,000 complete 3 KiB objects with ordinary
+whole-file storage in a temporary cache. Its allocated-size measure includes
+directory blocks, unlike runtime file accounting. These local fixtures do not
+establish cold-start, production throughput, or p99.9 latency results for v2.
+The separate full-object startup experiment, including its configuration and
+TTI coverage limits, is recorded in
+[combined startup validation](cache-journal.md#combined-startup-validation).
 
 ### Independent keys and recovery policy
 

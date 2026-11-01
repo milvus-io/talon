@@ -36,6 +36,7 @@ name = "talon-serve-probe"
 path = "src/bin/serve_probe.rs"
 
 [dependencies]
+talon-journal.workspace = true
 talon-uring.workspace = true
 talon-telemetry.workspace = true
 talon-core.workspace = true

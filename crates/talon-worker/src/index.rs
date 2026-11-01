@@ -246,7 +246,87 @@ impl From<BlockMeta> for IndexedBlock {
     }
 }
 
+impl IndexedBlock {
+    fn allocated(
+        meta: BlockMeta,
+        allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
+    ) -> Self {
+        let mut entry = Self::from(meta);
+        match &mut entry.units {
+            IndexedUnits::Whole(slot) => {
+                for (page, bytes) in allocated {
+                    assert!(
+                        page.is_none(),
+                        "whole allocation must not have a page index"
+                    );
+                    slot.allocated = bytes;
+                }
+            }
+            IndexedUnits::Paged(slots) => {
+                for (page, allocated) in allocated {
+                    slots
+                        .get_or_insert(page.expect("paged allocation must have a page index"))
+                        .allocated = allocated;
+                }
+            }
+        }
+        entry
+    }
+}
+
 impl BlockIndex {
+    /// Startup-only bulk restoration. Exclusive ownership prevents publication
+    /// to readers while workers build page tables without the directory lock.
+    pub(crate) fn restore_allocated(&mut self, blocks: Vec<StoredBlock>, threads: usize) {
+        self.try_restore_allocated(blocks, threads, |block| {
+            Ok::<_, std::convert::Infallible>((block.meta, block.allocated))
+        })
+        .unwrap();
+    }
+
+    /// Decode and construct entries in parallel, then publish with exclusive
+    /// ownership. A decode error leaves the existing index unchanged. Small
+    /// whole objects can supply inline allocations instead of a Vec per object.
+    pub(crate) fn try_restore_allocated<T: Send, A, E: Send>(
+        &mut self,
+        input: Vec<T>,
+        threads: usize,
+        decode: impl Fn(T) -> Result<(BlockMeta, A), E> + Sync,
+    ) -> Result<(), E>
+    where
+        A: IntoIterator<Item = (Option<PageIndex>, u64)>,
+    {
+        let built = crate::recovery::map(input, threads, |item| {
+            let (meta, allocated) = decode(item)?;
+            let id = meta.id.clone();
+            let entry = IndexedBlock::allocated(meta, allocated);
+            let bytes = entry.units.allocated_bytes();
+            let pages = materialized_pages(&entry.meta);
+            Ok((id, Arc::new(Entry::new(entry)), bytes, pages))
+        })
+        .into_iter()
+        .collect::<Result<Vec<_>, E>>()?;
+        let entries = self.entries.get_mut().unwrap();
+        entries.reserve(built.len());
+        let bytes = self.resident_bytes.get_mut();
+        let pages = self.resident_pages.get_mut();
+        for (id, entry, added_bytes, added_pages) in built {
+            if let Some(old) = entries.insert(id, entry) {
+                let old = old
+                    .block
+                    .write()
+                    .unwrap()
+                    .take()
+                    .expect("live recovery entry");
+                *bytes -= old.units.allocated_bytes();
+                *pages -= materialized_pages(&old.meta);
+            }
+            *bytes += added_bytes;
+            *pages += added_pages;
+        }
+        Ok(())
+    }
+
     fn entry(&self, id: &BlockId) -> Option<Arc<Entry>> {
         self.entries.read().unwrap().get(id).cloned()
     }
@@ -352,6 +432,7 @@ impl BlockIndex {
 
     pub(crate) fn restore_policy_units(&self) -> Vec<crate::eviction::RecoveredUnit> {
         use crate::eviction::RecoveredUnit;
+        let started = std::time::Instant::now();
         let entries = self.entries.read().unwrap();
         let mut units = Vec::with_capacity(entries.len());
         for entry in entries.values() {
@@ -397,6 +478,9 @@ impl BlockIndex {
                 }
             }
         }
+        tracing::info!(blocks = entries.len(), units = units.len(),
+            tokens_ms = started.elapsed().as_secs_f64() * 1000.0,
+            "ordinary cache policy token recovery");
         units
     }
 
@@ -601,25 +685,7 @@ impl BlockIndex {
     ) {
         let pages = materialized_pages(&meta);
         let id = meta.id.clone();
-        let mut entry = IndexedBlock::from(meta);
-        match &mut entry.units {
-            IndexedUnits::Whole(slot) => {
-                for (page, bytes) in allocated {
-                    assert!(
-                        page.is_none(),
-                        "whole allocation must not have a page index"
-                    );
-                    slot.allocated = bytes;
-                }
-            }
-            IndexedUnits::Paged(slots) => {
-                for (page, allocated) in allocated {
-                    slots
-                        .get_or_insert(page.expect("paged allocation must have a page index"))
-                        .allocated = allocated;
-                }
-            }
-        }
+        let entry = IndexedBlock::allocated(meta, allocated);
         let added = entry.units.allocated_bytes();
         let mut entries = self.entries.write().unwrap();
         // Structural mutations take directory -> entry. Ordinary operations
@@ -823,6 +889,69 @@ mod tests {
             form: BlockForm::Whole,
             len,
         }
+    }
+
+    #[test]
+    fn exclusive_parallel_recovery_matches_commits_and_retires_replacements() {
+        fn input() -> Vec<StoredBlock> {
+            (0..5000)
+                .map(|n| {
+                    let mut present = PresentBitmap::new(256);
+                    present.set(PageIndex(0));
+                    present.set(PageIndex(7));
+                    StoredBlock {
+                        meta: BlockMeta {
+                            id: block(n),
+                            len: 256 << 20,
+                            form: BlockForm::Paged {
+                                page_size: 1 << 20,
+                                present,
+                            },
+                        },
+                        allocated: vec![(Some(PageIndex(7)), 8192), (Some(PageIndex(0)), 0)],
+                    }
+                })
+                .chain(std::iter::once(StoredBlock {
+                    meta: whole_meta(block(3), 10),
+                    allocated: vec![(None, 4096)],
+                }))
+                .collect()
+        }
+        let serial = BlockIndex::new();
+        let mut parallel = BlockIndex::new();
+        for index in [&serial, &parallel] {
+            index.commit_allocated(whole_meta(block(9000), 20), [(None, 8192)]);
+            index.commit_allocated(whole_meta(block(0), 20), [(None, 4096)]);
+        }
+        let retired = parallel.entry(&block(0)).unwrap();
+        for block in input() {
+            serial.commit_allocated(block.meta, block.allocated);
+        }
+        parallel.restore_allocated(input(), 4);
+        assert!(retired.block.read().unwrap().is_none());
+        assert_eq!(parallel.resident_bytes(), serial.resident_bytes());
+        assert_eq!(parallel.page_count(), serial.page_count());
+        assert_eq!(parallel.len(), serial.len());
+        for n in (0..5000).chain(std::iter::once(9000)) {
+            assert_eq!(parallel.get(&block(n)), serial.get(&block(n)));
+        }
+    }
+
+    #[test]
+    fn parallel_decode_failure_does_not_publish_partial_index() {
+        let mut index = BlockIndex::new();
+        let original = whole_meta(block(9), 17);
+        index.commit_allocated(original.clone(), [(None, 4096)]);
+        let error = index.try_restore_allocated((0..4096).collect(), 2, |n| {
+            if n == 2048 {
+                return Err("invalid recovery record");
+            }
+            Ok((whole_meta(block(n), 32), [(None, 8192)]))
+        });
+        assert_eq!(error, Err("invalid recovery record"));
+        assert_eq!(index.len(), 1);
+        assert_eq!(index.get(&block(9)), Some(original));
+        assert_eq!(index.resident_bytes(), 4096);
     }
 
     #[test]
