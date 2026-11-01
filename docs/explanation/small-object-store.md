@@ -35,8 +35,8 @@ fills coalesce. LOAD never populates L1.
 
 `SmallObjectStore` is an independent engine behind the worker's whole-block
 storage facade. Small objects remain logical `BlockForm::Whole` cache units,
-allowing capacity, superseded-version, stale, and ownership eviction to retain
-their existing policy. Page TTI applies to the whole small object using its
+allowing capacity, stale, and ownership eviction to retain their existing policy.
+Packed keys do not participate in cross-version supersession. Page TTI applies to the whole small object using its
 shared access timestamp. With TTI enabled, `small/access.checkpoint` stores a
 checksummed snapshot of exact versioned identities and anchored Unix-millisecond
 access times for every ring. The existing access-checkpoint interval controls
