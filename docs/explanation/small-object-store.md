@@ -130,8 +130,10 @@ requires O(live objects + log records since snapshot) CPU/memory work; this is
 not constant-time startup or a disk-only index.
 
 Before serving, the worker attaches access tokens directly to ordinary index
-entries and small-store locators, then bulk-builds their shared LRU membership, version, and block
-indexes. Large namespaces use at most three CPU threads (bounded by available
+entries and small-store locators, then bulk-builds their shared LRU membership
+and block indexes. Only ordinary
+whole/paged entries enter the cross-version index; packed keys are independent.
+The object-existence check table is built only when stale GC is enabled. Large namespaces use at most three CPU threads (bounded by available
 parallelism, including the initializing thread); small namespaces stay serial.
 Ordered eviction and ownership queues are collected in bulk. Paged lifecycle
 initialization skips whole objects without cloning a full cache snapshot. These
@@ -376,3 +378,7 @@ Origin-existence checks remain a separate optional background policy. Namespace
 startup constructs their reference-counted check table only when `stale_gc_enabled`
 is true; disabling it skips both recovery-time and subsequent admission bookkeeping.
 The full key and persisted record formats are unchanged.
+
+Packed residency carries its independent-key policy into BlockIndex during both
+serial and bulk recovery. Attaching access tokens reads that flag directly,
+without re-encoding each object key or querying the engine locator again.

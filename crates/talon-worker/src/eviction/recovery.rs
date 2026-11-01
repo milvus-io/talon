@@ -90,6 +90,8 @@ impl Lru {
                 units = units.len(),
                 workers,
                 phase = "versions",
+                version_blocks = versions.len(),
+                checked_objects = checks.len(),
                 elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                 "cache policy index restored"
             );
@@ -193,6 +195,50 @@ mod tests {
             256 << 20,
             Version::new("v1"),
         )
+    }
+
+    #[test]
+    fn bulk_independent_keys_match_admission_with_optional_origin_checks() {
+        for workers in 1..=3 {
+            for track_checks in [false, true] {
+                let first = block(10);
+                let mut second = first.clone();
+                second.version = Version::new("v2");
+                let ordinary = Lru::with_object_checks(track_checks);
+                let units = [&first, &second]
+                    .into_iter()
+                    .map(|id| {
+                        let unit = CacheUnit::Whole(id.clone());
+                        let access = ordinary.insert_with_policy(unit.clone(), 100, true);
+                        RecoveredUnit {
+                            independent: true,
+                            unit: Arc::new(unit),
+                            bytes: 100,
+                            access,
+                        }
+                    })
+                    .collect();
+                let recovered = Lru::recover_with_workers(units, 2, workers, track_checks);
+                {
+                    let a = ordinary.inner.lock().unwrap();
+                    let b = recovered.inner.lock().unwrap();
+                    assert!(b.versions.is_empty());
+                    assert_eq!(b.versions.capacity(), 0);
+                    assert_eq!(a.object_checks, b.object_checks);
+                    if !track_checks {
+                        assert_eq!(b.object_checks.capacity(), 0);
+                    }
+                    assert_eq!(a.total_bytes, b.total_bytes);
+                }
+                assert!(recovered.superseded_candidates(&second).is_empty());
+                assert_eq!(recovered.block_candidates(&first).len(), 1);
+                recovered.remove_block(&first);
+                assert_eq!(recovered.block_candidates(&second).len(), 1);
+                recovered.remove_block(&second);
+                assert!(recovered.is_empty());
+                assert!(recovered.inner.lock().unwrap().object_checks.is_empty());
+            }
+        }
     }
 
     #[test]
