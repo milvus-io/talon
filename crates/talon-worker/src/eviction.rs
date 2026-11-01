@@ -97,7 +97,11 @@ impl From<&BlockId> for LogicalBlock {
 /// Stable recency token for one resident unit. Keeping this token does not pin
 /// data. After removal it cannot affect a new admission of the same identity.
 #[derive(Clone)]
-pub struct AccessHandle(Arc<AtomicBool>, Arc<AtomicU64>);
+pub struct AccessHandle(
+    Arc<AtomicBool>,
+    Arc<AtomicU64>,
+    Option<Arc<crate::small_store::DirtyAccess>>,
+);
 
 /// Anchored wall time: monotonic within a process and portable across restarts.
 pub(crate) fn access_millis() -> u64 {
@@ -112,11 +116,28 @@ impl Default for AccessHandle {
         Self(
             Arc::new(AtomicBool::new(false)),
             Arc::new(AtomicU64::new(access_millis())),
+            None,
         )
     }
 }
 
 impl AccessHandle {
+    pub(crate) fn clock(&self) -> &Arc<AtomicU64> {
+        &self.1
+    }
+
+    pub(crate) fn track_small(mut self, dirty: Arc<crate::small_store::DirtyAccess>) -> Self {
+        self.2 = Some(dirty);
+        self
+    }
+
+    pub(crate) fn sample_small(&self) -> u64 {
+        if let Some(dirty) = &self.2 {
+            dirty.consume();
+        }
+        self.last_access()
+    }
+
     pub(crate) fn last_access(&self) -> u64 {
         self.1.load(Ordering::Relaxed)
     }
@@ -137,7 +158,7 @@ impl AccessHandle {
 
     /// Separate second-chance bit, with the same block-wide idle clock.
     pub(crate) fn sibling(&self) -> Self {
-        Self(Arc::new(AtomicBool::new(false)), self.1.clone())
+        Self(Arc::new(AtomicBool::new(false)), self.1.clone(), None)
     }
 
     /// Coalesce hits until the eviction hand consumes this second chance.
@@ -146,6 +167,9 @@ impl AccessHandle {
         let now = access_millis();
         if self.1.load(Ordering::Relaxed) < now {
             self.1.fetch_max(now, Ordering::Relaxed);
+        }
+        if let Some(dirty) = &self.2 {
+            dirty.touch();
         }
         if !self.0.load(Ordering::Relaxed) {
             self.0.store(true, Ordering::Relaxed);
@@ -440,7 +464,11 @@ impl Lru {
         let activity = g.block_access.get_mut(block).expect("tracked block");
         activity.units += 1;
         activity.revision = position;
-        let access = AccessHandle(Arc::new(AtomicBool::new(false)), activity.access.clone());
+        let access = AccessHandle(
+            Arc::new(AtomicBool::new(false)),
+            activity.access.clone(),
+            None,
+        );
         // New pages also refresh the shared block idle age.
         access.1.fetch_max(access_millis(), Ordering::Relaxed);
         if g.track_checks {

@@ -53,6 +53,11 @@ impl WorkerRuntime {
                 "checkpoint interval exceeds TTI"
             );
         }
+        if config.tti_ms > 0 {
+            if let Some(small) = self.small.as_ref() {
+                small.enable_access_tracking()?;
+            }
+        }
         if let Some(paged) = self.paged.as_ref().filter(|_| config.tti_ms > 0) {
             let now = self.page_clock.now();
             // Load each shard once; keep only one shard's recovered metadata in memory.
