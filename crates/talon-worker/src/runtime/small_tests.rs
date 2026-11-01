@@ -794,3 +794,31 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     assert!(w.resident_bytes() <= w.capacity_bytes);
     assert!(!payload_files[0].exists());
 }
+
+#[tokio::test]
+async fn packed_versions_remain_independent_across_restart_and_exact_deletion() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), true, true);
+    let v1 = id(&w);
+    let mut v2 = v1.clone();
+    v2.version = Version::new("v2");
+    w.commit_cached_block(&v1, data()).await.unwrap();
+    w.commit_cached_block(&v2, data()).await.unwrap();
+    for key in [&v1, &v2] {
+        assert!(w.store.small().unwrap().contains(key));
+        assert_eq!(w.lru.block_candidates(key).len(), 1);
+    }
+    assert!(w.lru.superseded_candidates(&v2).is_empty());
+    w.store.maintain_small(true).await.unwrap();
+    drop(w);
+    let (_, w) = runtime(dir.path(), true, true);
+    assert!(w.lru.superseded_candidates(&v2).is_empty());
+    for key in [&v1, &v2] {
+        assert_eq!(w.store.get_bytes(key).await.unwrap(), data());
+    }
+    w.unlink_units(w.lru.block_candidates(&v1), 2).await;
+    assert!(!w.store.small().unwrap().contains(&v1));
+    assert!(w.store.small().unwrap().contains(&v2));
+    assert!(w.lru.block_candidates(&v1).is_empty());
+    assert_eq!(w.lru.block_candidates(&v2).len(), 1);
+}

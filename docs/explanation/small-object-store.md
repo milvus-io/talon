@@ -247,3 +247,18 @@ allocation includes the data and metadata files, excluding directory blocks.
 | Allocated bytes | 82,972,672 | 31,580,160 |
 | Recovery time | 300 ms | 134 ms |
 | Write time | 6,544 ms | 6,094 ms |
+
+
+### Independent keys and recovery policy
+
+Packed objects use their complete key, including version, as independent cache identities.
+Admitting a different version does not supersede another packed object, and packed
+objects are not members of the Worker's cross-version eviction index. Capacity,
+TTI, pinning, ownership cleanup and exact-key invalidation still apply. Ordinary
+whole/paged entries retain their existing version policy, including when mixed
+with packed objects in the same namespace.
+
+Origin-existence checks remain a separate optional background policy. Namespace
+startup constructs their reference-counted check table only when `stale_gc_enabled`
+is true; disabling it skips both recovery-time and subsequent admission bookkeeping.
+The full key and persisted record formats are unchanged.

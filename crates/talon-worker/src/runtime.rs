@@ -208,13 +208,42 @@ impl WorkerRuntime {
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
     ) -> Self {
-        let lru = Arc::new(Lru::new());
+        Self::new_with_l1_policy(
+            store,
+            index,
+            inflight,
+            backend,
+            block_size,
+            capacity_bytes,
+            l1_capacity_bytes,
+            l1_page_size_bytes,
+            metrics,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_l1_policy(
+        store: WholeBlockStore,
+        index: Arc<BlockIndex>,
+        inflight: Arc<InFlightLoads>,
+        backend: Arc<dyn BackendStore>,
+        block_size: u32,
+        capacity_bytes: u64,
+        l1_capacity_bytes: u64,
+        l1_page_size_bytes: u64,
+        metrics: WorkerMetrics,
+        track_checks: bool,
+    ) -> Self {
+        let lru = Arc::new(Lru::with_object_checks(track_checks));
         for (id, page, bytes) in index.snapshot_units() {
             let unit = match page {
                 Some(page) => CacheUnit::Page(id, page),
                 None => CacheUnit::Whole(id),
             };
-            let access = lru.insert(unit.clone(), bytes);
+            let independent = matches!(&unit, CacheUnit::Whole(id)
+                if store.small().is_some_and(|small| small.contains(id)));
+            let access = lru.insert_with_policy(unit.clone(), bytes, independent);
             index.set_access(&unit, access);
         }
         if let Some(small) = store.small() {
@@ -2046,7 +2075,14 @@ impl WorkerRuntime {
                             [(None, allocated)],
                         );
                         let unit = CacheUnit::Whole(id.clone());
-                        let access = runtime.lru.insert(unit.clone(), allocated);
+                        let independent = runtime
+                            .store
+                            .small()
+                            .is_some_and(|small| small.contains(&id));
+                        let access =
+                            runtime
+                                .lru
+                                .insert_with_policy(unit.clone(), allocated, independent);
                         runtime.index.set_access(&unit, access);
                         // Pin before releasing the gate used by candidate validation.
                         let _pin = runtime.lru.pin_guard(unit);
@@ -2056,7 +2092,7 @@ impl WorkerRuntime {
                         let superseded = runtime.lru.superseded_candidates(&id);
                         runtime.unlink_units(superseded, 2).await;
                         runtime.enforce_capacity().await;
-                        if !runtime.l1.remove_superseded(&id).is_empty() {
+                        if !independent && !runtime.l1.remove_superseded(&id).is_empty() {
                             runtime.refresh_l1_metrics();
                         }
                         Ok::<_, anyhow::Error>(())
@@ -2211,8 +2247,14 @@ impl WorkerRuntime {
         };
         if let Some(old_version) = old_version {
             let old_block = self.block_for(object, 0, &old_version);
-            self.unlink_units(self.lru.block_candidates(&old_block), 2)
-                .await;
+            if !self
+                .store
+                .small()
+                .is_some_and(|small| small.contains(&old_block))
+            {
+                self.unlink_units(self.lru.block_candidates(&old_block), 2)
+                    .await;
+            }
         }
         self.store_version(object, &version, len);
         tracing::info!(

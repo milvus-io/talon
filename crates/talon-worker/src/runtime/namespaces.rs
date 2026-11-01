@@ -131,7 +131,7 @@ impl NamespaceRuntimes {
             elapsed_ms = recovery_started.elapsed().as_millis() as u64,
             "cache index restored");
         let runtime_started = Instant::now();
-        let mut worker = WorkerRuntime::new_with_l1(
+        let mut worker = WorkerRuntime::new_with_l1_policy(
             store,
             index,
             Arc::new(InFlightLoads::new()),
@@ -141,6 +141,7 @@ impl NamespaceRuntimes {
             config.l1_capacity_bytes,
             config.l1_page_size_bytes,
             self.metrics.clone(),
+            config.stale_gc_enabled,
         )
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
