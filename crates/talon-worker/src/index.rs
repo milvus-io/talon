@@ -358,7 +358,7 @@ impl BlockIndex {
             let mut guard = entry.block.write().unwrap();
             let entry = guard.as_mut().expect("live directory entry");
             let shared = AccessHandle::default();
-            let mut add = |page, slot: &mut UnitSlot| {
+            let mut add = |page: Option<PageIndex>, slot: &mut UnitSlot| {
                 let access = shared.sibling();
                 match &mut slot.access {
                     Some(old) => old.policy = access.clone(),

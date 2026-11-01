@@ -12,7 +12,11 @@ pub(crate) struct RecoveredUnit {
 impl Lru {
     /// The input contains each resident unit exactly once. Sibling pages must
     /// share their idle clock, just as they do after ordinary admission.
-    pub(crate) fn from_recovered(units: Vec<RecoveredUnit>, blocks: usize, track_checks: bool) -> Self {
+    pub(crate) fn from_recovered(
+        units: Vec<RecoveredUnit>,
+        blocks: usize,
+        track_checks: bool,
+    ) -> Self {
         let workers = if units.len() < 4096 {
             1
         } else {
@@ -23,7 +27,12 @@ impl Lru {
         Self::recover_with_workers(units, blocks, workers, track_checks)
     }
 
-    fn recover_with_workers(units: Vec<RecoveredUnit>, blocks: usize, workers: usize, track_checks: bool) -> Self {
+    fn recover_with_workers(
+        units: Vec<RecoveredUnit>,
+        blocks: usize,
+        workers: usize,
+        track_checks: bool,
+    ) -> Self {
         let unit_index = || {
             let entries = units
                 .iter()
