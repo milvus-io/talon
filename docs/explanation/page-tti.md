@@ -83,7 +83,7 @@ TTI 是异步回收条件，不是物理空间释放期限。扫描间隔、删�
 | 模块 | 职责 |
 | --- | --- |
 | `page_lifecycle` | 分片 block registry、稳定 page handle、原子读取保护与时间、可恢复扫描游标 |
-| `page_access_store` / `page_access_shard` | 旧 block 元数据恢复、分片快照编解码与原子替换、cache root 独占锁 |
+| `page_access_store` / `page_access_shard` | 旧 block 元数据恢复、分片快照与 access journal、cache root 独占锁 |
 | `page_cleanup` | 物理目录游标扫描、崩溃临时文件和无 page 目录的限量清理 |
 | `page_gc` | 配置、mutation 所有权、指标 |
 | `background`、`runtime/background` | 统一后台调度、共享资源预算、GC/checkpoint/清理/eviction 注册与退出 |
@@ -130,23 +130,30 @@ unlink 成功或 NotFound 才扣除驻留字节；失败保留重试状态，重
 
 Namespace Worker 的 page 驻留状态现由 [paged catalog](paged-catalog.md) 恢复，
 不再写 `block.meta`，也不读取旧 `access.meta`。以下旧文件兼容规则仅适用于
-独立的旧格式 store；新 Worker 不支持旧 paged 缓存迁移。访问时间仍按分片 checkpoint。
+独立的旧格式 store；新 Worker 不支持旧 paged 缓存迁移。访问时间使用分片快照加增量 access journal；普通 whole-block store 的淘汰语义不变。
 
 ```text
 paged/
   ab/                         # BlockId 哈希的前两个十六进制字符，最多 256 个分组
-    access.shard              # 本分组所有驻留 block 的访问时间快照
+    access.shard              # 本分组的访问时间基线快照
+    access.log                # 固定文件，追加后续访问时间增量
     ab0123456789abcd.pages/
       0.page
       1.page
 ```
 
-page 数据文件格式不变。访问时间快照使用 `TLNSHR01` magic、page size、block 数量、
+page 数据文件格式不变。新快照用 `TLNSHR02` magic 和 generation 包裹原有 `TLNSHR01` 编码：page size、block 数量、
 长度前缀的 block 访问记录及整个文件的 XXH3-64 校验和。每条 block 记录沿用
 `TLNACC01` version 1 编码：完整 BlockId、page size、revision、采样 Unix ms、
 按 page index 排序的 `(u32 page, u64 last_access_ms)` 列表及独立校验和。
 恢复拒绝错误分片、重复 block、重复/越界 page、格式错误和部分损坏的快照。
-单分片快照上限为 64 MiB；超限保留 dirty 状态并报告 checkpoint 错误，不截断记录。
+单分片快照主体上限为 64 MiB；超限保留 dirty 状态并报告 checkpoint 错误，不截断记录。
+`access.log` 使用 `TLNPAL01` magic 和相同 generation；每个 frame 带长度、XXH3-64 校验、
+合并/替换标记及上述 block 记录。普通访问合并脏 page 时间，结构变化替换整个 block，
+空替换记录删除 block。恢复先读基线，再顺序应用同 generation 的日志；不完整的 EOF frame
+保留此前有效记录，完整 frame 校验失败则丢弃本分片的访问时间。未来时间的增量使对应
+page 的旧时间失效，不退回基线中的旧值。旧 `TLNSHR01` 快照可读；降级版本不能读取
+新格式，可能提前回收缓存，但不影响 payload 格式。
 
 启动时逐分片恢复访问时间；page 驻留状态来自 catalog replay。
 新文件不存在、损坏、缺少某条记录或包含未来时间时，该 page 没有有效访问时间，
@@ -174,15 +181,22 @@ TTI 开启时，每次成功读取仍取单调锚定时间；单次 sendfile 范
 实际全轮耗时可能因 I/O、数据规模和调度超过配置周期。显式 flush 和关闭时遍历全部
 分片，不等待后台 tick；关闭时保留共享预算，独立显式 flush 使用默认字节速率限制。未变脏且成员未变化的分片在构造快照前返回，不遍历 page，也不写盘。
 
-每次只构造一个分片的快照，registry 遍历每批最多 64 个 block。重写分片时包含
-其中未变脏的存量 block，避免覆盖丢失。小范围访问也可能重写整个分片；这是减少
-逐 block fsync 次数与额外顺序写入之间的取舍。删除的条目会在后续快照中移除。
+常规 flush 从现有 dirty 摘要中分批取得 block，每批最多 64 个，不扫描同分片的冷 block。
+在脏 block 内仍遍历其 page 状态以采样，但只编码脏 page；所以 CPU 成本取决于脏 block
+包含的 page 数量，写入量取决于脏 page 数量及 block 身份。结构变化发送完整 block 替换记录。
+已退役 block 的删除记录单独排队，每分片估算上限 1 MiB；溢出转为全量基线。
+
+首次保存、启动后的首次 flush、写入失败后的重试和删除队列溢出会构造完整分片基线。
+日志达到 `max(1 MiB, 基线大小)` 后，下次有待保存变化时合并为新基线；因此不再每分钟
+全量 dump，但仍有低频的分片全量遍历。正常 flush 直接追加固定 `access.log`，然后同步文件，
+不创建新的增量文件。合并时写临时 snapshot、同步、原子替换并同步目录，随后发布同 generation
+的空日志；两次发布之间崩溃时忽略旧 generation 日志。临时文件复用 `access.shard.tmp.` 前缀。
+
 采样前先取走 block 的 dirty 摘要，再原子取走每个 page 的 dirty 标记，再读取时间戳，并记录 block 结构 revision。
 随后发生的访问会留下新标记；保存失败或快照构造提前退出会恢复取走的标记及摘要。
 成功保存只确认已采样的标记和结构 revision，不清除并发访问留下的新标记。
-复制完成后释放状态锁，在 blocking pool 写临时文件、
-同步文件、原子替换、同步父目录。checkpoint 不持有 block mutation gate，不阻塞
-前台提交/删除；磁盘 I/O 期间的新访问、删除或新成员不能被误标为已保存。
+复制完成后释放状态锁，再执行磁盘 I/O。checkpoint 不持有 block mutation gate；
+磁盘 I/O 期间的新访问、删除或新成员不能被误标为已保存。
 调用者取消后，已接纳的 checkpoint 仍由 Worker 持有，完成发布及 dirty 状态更新。
 
 保存周期不是误差上限。失败或积压会增加未保存窗口；一次丢失的访问就可能让
