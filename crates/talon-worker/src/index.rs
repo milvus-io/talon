@@ -69,6 +69,7 @@ pub(crate) struct StoredBlock {
 }
 
 struct IndexedBlock {
+    independent: bool,
     meta: BlockMeta,
     units: IndexedUnits,
 }
@@ -242,7 +243,11 @@ impl From<BlockMeta> for IndexedBlock {
             BlockForm::Whole => IndexedUnits::Whole(UnitSlot::default()),
             BlockForm::Paged { present, .. } => IndexedUnits::Paged(PageSlots::new(present.len())),
         };
-        Self { meta, units }
+        Self {
+            meta,
+            units,
+            independent: false,
+        }
     }
 }
 
@@ -383,6 +388,11 @@ impl BlockIndex {
         self.resident_pages.load(Ordering::Relaxed)
     }
 
+    pub(crate) fn independent_key(&self, id: &BlockId) -> bool {
+        self.read_entry(id, |entry| entry.independent)
+            .unwrap_or(false)
+    }
+
     /// Look up a copy of a block's metadata.
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
         self.read_entry(id, |entry| entry.meta.clone())
@@ -521,9 +531,22 @@ impl BlockIndex {
         meta: BlockMeta,
         allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
     ) {
+        self.commit_allocated_with_policy(meta, allocated, false);
+    }
+
+    /// Carry the storage policy with residency, avoiding a second engine lookup
+    /// per recovered object. This flag is derived from the store, never persisted.
+    pub(crate) fn commit_allocated_with_policy(
+        &self,
+        meta: BlockMeta,
+        allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
+        independent: bool,
+    ) {
+        assert!(!independent || matches!(meta.form, BlockForm::Whole));
         let pages = materialized_pages(&meta);
         let id = meta.id.clone();
         let mut entry = IndexedBlock::from(meta);
+        entry.independent = independent;
         match &mut entry.units {
             IndexedUnits::Whole(slot) => {
                 for (page, bytes) in allocated {

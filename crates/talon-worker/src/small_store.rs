@@ -495,13 +495,14 @@ impl SegmentStore {
 
     pub(crate) fn restore_index(&self, index: &crate::BlockIndex) -> io::Result<()> {
         for (key, loc) in self.entries.read().unwrap().iter() {
-            index.commit_allocated(
+            index.commit_allocated_with_policy(
                 BlockMeta {
                     id: format::id(key)?,
                     form: BlockForm::Whole,
                     len: loc.len,
                 },
                 [(None, charge(key, loc.len))],
+                true,
             );
         }
         Ok(())

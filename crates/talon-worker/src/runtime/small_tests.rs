@@ -806,6 +806,7 @@ async fn packed_versions_remain_independent_across_restart_and_exact_deletion() 
     w.commit_cached_block(&v2, data()).await.unwrap();
     for key in [&v1, &v2] {
         assert!(w.store.small().unwrap().contains(key));
+        assert!(w.index.independent_key(key));
         assert_eq!(w.lru.block_candidates(key).len(), 1);
     }
     assert!(w.lru.superseded_candidates(&v2).is_empty());
@@ -814,6 +815,7 @@ async fn packed_versions_remain_independent_across_restart_and_exact_deletion() 
     let (_, w) = runtime(dir.path(), true, true);
     assert!(w.lru.superseded_candidates(&v2).is_empty());
     for key in [&v1, &v2] {
+        assert!(w.index.independent_key(key));
         assert_eq!(w.store.get_bytes(key).await.unwrap(), data());
     }
     w.unlink_units(w.lru.block_candidates(&v1), 2).await;

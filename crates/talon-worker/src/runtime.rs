@@ -242,7 +242,7 @@ impl WorkerRuntime {
                 None => CacheUnit::Whole(id),
             };
             let independent = matches!(&unit, CacheUnit::Whole(id)
-                if store.small().is_some_and(|small| small.contains(id)));
+                if index.independent_key(id));
             let access = lru.insert_with_policy(unit.clone(), bytes, independent);
             index.set_access(&unit, access);
         }
@@ -2066,19 +2066,20 @@ impl WorkerRuntime {
                         }
                         let allocated = runtime.store.put_payload(&id, bytes).await?;
                         talon_telemetry::record("talon.cache.committed_bytes", len);
-                        runtime.index.commit_allocated(
+                        let independent = runtime
+                            .store
+                            .small()
+                            .is_some_and(|small| small.contains(&id));
+                        runtime.index.commit_allocated_with_policy(
                             BlockMeta {
                                 id: id.clone(),
                                 form: BlockForm::Whole,
                                 len,
                             },
                             [(None, allocated)],
+                            independent,
                         );
                         let unit = CacheUnit::Whole(id.clone());
-                        let independent = runtime
-                            .store
-                            .small()
-                            .is_some_and(|small| small.contains(&id));
                         let access =
                             runtime
                                 .lru
@@ -2247,11 +2248,7 @@ impl WorkerRuntime {
         };
         if let Some(old_version) = old_version {
             let old_block = self.block_for(object, 0, &old_version);
-            if !self
-                .store
-                .small()
-                .is_some_and(|small| small.contains(&old_block))
-            {
+            if !self.index.independent_key(&old_block) {
                 self.unlink_units(self.lru.block_candidates(&old_block), 2)
                     .await;
             }
