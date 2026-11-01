@@ -234,10 +234,15 @@ impl Inner {
                 self.object_checks.remove(&block.object);
             }
         }
-        if entry.independent {
-            Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
-            return Some(entry.bytes);
+        if !entry.independent {
+            self.remove_version(unit);
         }
+        Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
+        Some(entry.bytes)
+    }
+
+    fn remove_version(&mut self, unit: &CacheUnit) {
+        let block = unit.block();
         let key = LogicalBlock::from(block);
         let versions = self.versions.get_mut(&key).expect("tracked logical block");
         let units = versions.get_mut(&block.version).expect("tracked version");
@@ -254,8 +259,6 @@ impl Inner {
         if versions.is_empty() {
             self.versions.remove(&key);
         }
-        Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
-        Some(entry.bytes)
     }
 }
 
@@ -343,9 +346,23 @@ impl Lru {
         }
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
+            let was_independent = e.independent;
+            e.independent = independent;
             e.bytes = bytes;
             e.access.touch();
             let access = e.access.clone();
+            if was_independent != independent {
+                if independent {
+                    g.remove_version(&unit);
+                } else {
+                    g.versions
+                        .entry(LogicalBlock::from(unit.block()))
+                        .or_default()
+                        .entry(unit.block().version.clone())
+                        .or_default()
+                        .insert(unit.page());
+                }
+            }
             g.block_access
                 .get_mut(unit.block())
                 .expect("tracked block")
@@ -901,6 +918,26 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn switching_whole_storage_policy_preserves_access_and_pins() {
+        let lru = Arc::new(Lru::new());
+        let unit = whole(1);
+        let access = lru.insert(unit.clone(), 10);
+        let pin = lru.pin_guard(unit.clone());
+        let updated = lru.insert_with_policy(unit.clone(), 20, true);
+        assert!(Arc::ptr_eq(&access.0, &updated.0));
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+        assert_eq!(lru.inner.lock().unwrap().entries[&unit].pins, 1);
+        let updated = lru.insert(unit.clone(), 30);
+        assert!(Arc::ptr_eq(&access.0, &updated.0));
+        assert_eq!(lru.inner.lock().unwrap().versions.len(), 1);
+        assert_eq!(lru.inner.lock().unwrap().entries[&unit].pins, 1);
+        drop(pin);
+        lru.remove_block(unit.block());
+        assert!(lru.is_empty());
+        assert_eq!(lru.total_bytes(), 0);
     }
 
     #[test]
