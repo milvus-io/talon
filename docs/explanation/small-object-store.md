@@ -97,8 +97,8 @@ remains O(number of metadata records). Small objects do not allocate generic
 consume O(number of objects) memory and must be reconstructed at startup. This is
 not a disk-only index or a claim of a fixed total RAM cost per object.
 
-Before serving, the worker attaches access tokens directly to recovered index
-entries and bulk-builds the LRU's independent membership, version, and block
+Before serving, the worker attaches access tokens directly to ordinary index
+entries and small-store locators, then bulk-builds their shared LRU membership, version, and block
 indexes. Large namespaces use at most three CPU threads (bounded by available
 parallelism, including the initializing thread); small namespaces stay serial.
 Ordered eviction and ownership queues are collected in bulk. Paged lifecycle

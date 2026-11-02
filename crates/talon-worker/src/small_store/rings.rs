@@ -252,7 +252,9 @@ impl SmallObjectStore {
     /// the shared bulk policy construction without registering in BlockIndex.
     pub(crate) fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) {
         for stream in self.streams() {
-            stream.restore_policy_units(units).expect("validated small object identity");
+            stream
+                .restore_policy_units(units)
+                .expect("validated small object identity");
         }
     }
 

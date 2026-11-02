@@ -616,7 +616,10 @@ impl SegmentStore {
         Ok(stats)
     }
 
-    fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) -> io::Result<()> {
+    fn restore_policy_units(
+        &self,
+        units: &mut Vec<crate::eviction::RecoveredUnit>,
+    ) -> io::Result<()> {
         units.reserve(self.entries.read().unwrap().len());
         for (key, loc) in self.entries.write().unwrap().iter_mut() {
             let access = AccessHandle::default();
