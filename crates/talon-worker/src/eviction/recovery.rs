@@ -163,7 +163,7 @@ mod tests {
         let old = block(1);
         let mut new = old.clone();
         new.version = Version::new("new");
-        let input = vec![
+        let input = [
             (CacheUnit::Page(old.clone(), PageIndex(0)), 0),
             (CacheUnit::Whole(block(2)), 19),
             (CacheUnit::Page(old.clone(), PageIndex(255)), 4096),
