@@ -1,5 +1,5 @@
 //! Independent append/rollover pipelines on the worker's existing rings.
-//! Every stream lives in ring-<slot>/. Slot zero serves non-ring callers; native
+//! Every stream lives in `ring-<slot>/`. Slot zero serves non-ring callers; native
 //! ring N owns slot N+1. Readers and lifecycle operations can address every slot.
 use super::*;
 use crate::miss::{InFlightGuard, InFlightLoads, LoadKey};
