@@ -491,7 +491,7 @@ mod tests {
         assert!(!worker.contains_block(&unowned));
         assert!(worker.contains_block(&owned));
         assert_eq!(worker.block_count(), 1);
-        assert!(worker.lru.block_candidates(&unowned).is_empty());
+        assert!(worker.block_candidates(&unowned).is_empty());
         assert_eq!(
             worker
                 .small
@@ -730,7 +730,7 @@ mod tests {
 
             // Hot cache hits and capacity-policy selections do not cause a new sweep.
             let ceiling = r.lru.ownership_admission_ceiling();
-            for candidate in r.lru.block_candidates(&owned) {
+            for candidate in r.block_candidates(&owned) {
                 r.lru.touch(&candidate.unit);
             }
             assert_eq!(r.lru.ownership_admission_ceiling(), ceiling);

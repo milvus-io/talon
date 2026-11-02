@@ -71,7 +71,7 @@ TTI GC 每轮完整扫描内存中的 page 元数据，并处理本轮所有回�
 检查 4096 个条目、保留 64 个候选，随后交还任务槽并立即续扫；批量配置不截断整轮。
 扫描在 blocking pool 执行，不读取 page 数据文件，实际删除仍受
 I/O 并发和删除速率限制，并在删除前重新校验访问和读者状态。
-后台任务名为 `tti_gc`（原 `page_gc`）。除 TTI 过期回收外，它还重试容量/旧版本淘汰失败的 page 删除，并清理空目录，因此关闭 TTI 不会停掉整个任务。TTI 关闭后仅查询删除重试和空目录待办索引；健康状态不遍历 resident pages。现有 `page_gc_*` 配置和共享回收指标名称保持不变。
+后台任务名为 `tti_gc`（原 `page_gc`）。除 TTI 过期回收外，它还重试容量淘汰或显式删除失败的 page，并清理空目录，因此关闭 TTI 不会停掉整个任务。TTI 关闭后仅查询删除重试和空目录待办索引；健康状态不遍历 resident pages。现有 `page_gc_*` 配置和共享回收指标名称保持不变。
 
 首次启动即可扫描；一轮扫描及删除尝试完成后，再等待 `page_gc_interval_minutes`，默认 10 分钟。失败的删除留到下一轮重试。并发新加入或已越过游标位置的 page 可以留到下一轮。
 
@@ -88,7 +88,7 @@ TTI 是异步回收条件，不是物理空间释放期限。扫描间隔、删�
 | `page_gc` | 配置、mutation 所有权、指标 |
 | `background`、`runtime/background` | 统一后台调度、共享资源预算、GC/checkpoint/清理/eviction 注册与退出 |
 | `runtime/page_maintenance` | 配置恢复、`gc_once`、checkpoint 和统一 page 删除协议 |
-| `runtime` | L1/L2/sendfile/cache-only 接入，提交事务及容量/旧版本淘汰 |
+| `runtime` | L1/L2/sendfile/cache-only 接入，提交事务、容量淘汰及显式删除 |
 | `eviction` | 非破坏性候选选择、成功 unlink 后记账、RAII 容量 pin |
 | `paged_store` / `index` / `memory_store` | 文件删除、FD 失效及成功后的 residency 更新 |
 | Worker `main` / `uring_serve` | 启动恢复、后台任务、SIGINT/SIGTERM 及 ring 停止 |
@@ -103,7 +103,7 @@ page 状态是 `Resident -> Evicting -> Absent`；unlink 失败恢复 `Resident`
 
 同一 block 的提交、删除和空目录清理共用 mutation gate。
 不同 block 独立执行；后端 fetch 在 gate 外。每次只获取一个 block gate，
-内存状态锁不跨 I/O 或 await。容量和旧版本 page 淘汰复用 TTI 的删除协议。
+内存状态锁不跨 I/O 或 await。容量淘汰和显式 page 删除复用 TTI 的删除协议。
 磁盘残留清理按物理目录摘要协调，不要求能解析 `block.meta`。固定 256 个目录锁分片
 由提交和删除以共享模式持有，再获取 block gate；清理以独占模式持有。
 不同 block 的正常 mutation 可以并行，清理会短暂阻塞同一分片的 mutation。
@@ -121,7 +121,7 @@ unlink 成功或 NotFound 才扣除驻留字节；失败保留重试状态，重
 读取 guard 保持到 bytes 或 FD 已安全取得；之后无需让慢客户端阻塞 TTI。
 已打开的 FD 可以在 unlink 后完成读取，最后一个 FD 关闭后内核才释放文件占用。
 提交和删除由独立的 Worker 任务持有，调用者取消不会在 blocking I/O 仍执行时释放 gate。
-提交后的容量及旧版本清理也由 Worker 任务持有，在释放 block gate 后继续完成。
+提交后的容量清理也由 Worker 任务持有，在释放 block gate 后继续完成。
 
 当完整 block admission 与已有同版本 paged 缓存相遇时，补齐 paged 内容而不切换物理形态，
 避免与 page GC/在途读取产生两套 residency 记账。
@@ -273,7 +273,7 @@ Worker 实际 Ready 并成功读取已有缓存，并覆盖异常退出恢复、
 - `gc_scanned_total`：检查过的 page 数；`gc_batch_seconds`：单次调度片耗时；
   `gc_scan_seconds`：最近完整扫描各调度片的累计活动时间，含删除等待，不含片间调度排队。
 - `tti_seconds`：配置的空闲过期时长；`0` 表示关闭按空闲时间回收。
-- `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|superseded|backend_deleted|ownership`；`ownership` 来自stale GC 中的[归属清理任务](ownership-gc.md)。
+- `gc_reclaimed_total`、`gc_reclaimed_bytes_total`：成功回收；`reason=tti|capacity|explicit|backend_deleted|ownership`；`ownership` 来自stale GC 中的[归属清理任务](ownership-gc.md)。
 - `gc_delete_errors_total`、`gc_pending_retries`：删除故障和最近完整扫描看到的重试量。
 - `access_dirty_blocks`、`access_oldest_dirty_seconds`：从 dirty block 摘要统计的待保存状态，
   包含待持久化的删除；无需再次遍历全部 pages。

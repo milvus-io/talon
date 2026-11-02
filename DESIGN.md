@@ -226,7 +226,7 @@ today; only the data-plane TCP scheduling layer diverges.
 decode header + key → look up every `(block_id, page_index)` touched by the
 range → send header → plain async socket write from shared `Bytes` pages. L1 is
 inclusive: every DRAM page has a whole-block L2 parent, and an L2
-eviction/delete/version replacement invalidates all child pages. No disk and no
+eviction/delete invalidates its child pages. No disk and no
 `sendfile` on an L1 hit; capacity is byte-bounded independently from page size.
 
 **L2 NVMe hit** (primary large-block path): decode header + key → `BlockIndex`
@@ -411,7 +411,9 @@ dedup (a correctness requirement — per-shard dedup would refetch the same
   identity and byte accounting remain exact. Capacity reclamation walks a live
   ordered queue in batches of 64 candidates, giving referenced units a second
   chance. A bounded second pass guarantees progress under continuous reads.
-  Explicit and superseded-version deletion remove queue nodes immediately;
+  Versions coexist as independent full cache keys; admission does not invalidate
+  other versions. No cross-version index is maintained.
+  Explicit deletion removes queue nodes immediately;
   there is no full-cache minimum search for each victim or stale-node backlog.
   Capacity is per-worker, with support for multiple cache dirs each with its own
   cap.

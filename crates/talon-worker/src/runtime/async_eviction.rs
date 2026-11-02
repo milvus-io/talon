@@ -729,7 +729,7 @@ mod tests {
                 .candidates_to_fit(2 * disk_unit(), &Default::default());
             assert_eq!(pending.len(), 1);
             // Independent GC has already brought usage to the background target.
-            r.unlink_units(r.lru.block_candidates(&block(2)), 2).await;
+            r.unlink_units(r.block_candidates(&block(2)), 2).await;
             r.unlink_units_to_target(pending, 1, 2 * disk_unit()).await;
             assert_eq!(r.resident_bytes(), 2 * disk_unit());
         }

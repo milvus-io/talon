@@ -85,13 +85,13 @@ async fn late_reader_cannot_overwrite_readmitted_identity_or_resurrect_delete() 
     put(&store, &id(1)).await;
     flush(&store).await;
     store.delete(&id(0)).await.unwrap();
-    policy.remove_block(&id(0));
+    policy.remove(&CacheUnit::Whole(id(0)));
     let new = put(&store, &id(0)).await;
     old.touch(); // arrives after the new token was queued
     new.restore(access_millis() - 10_000);
     store.access(&id(1)).unwrap().touch();
     store.delete(&id(1)).await.unwrap();
-    policy.remove_block(&id(1));
+    policy.remove(&CacheUnit::Whole(id(1)));
     flush(&store).await;
     let ages = log(dir.path());
     assert_eq!(ages.len(), 1);

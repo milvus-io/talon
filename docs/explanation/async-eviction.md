@@ -47,7 +47,7 @@ A zero rate disables that rate limit. MB means 1,000,000 bytes.
   examines at most 4096 entries and retains at most 64 candidates, then releases
   its task slot and immediately resumes pending work. The full pass is independent
   of configured batch limits. Pages added behind the cursor may wait for the next pass.
-  This task also retries failed capacity/superseded page deletions and cleans up
+  This task also retries failed capacity/explicit page deletions and cleans up
   empty page directories, so it continues running when TTI is disabled. With TTI
   disabled, it visits only retry/cleanup indexes, not all resident pages. The
   scheduler task label is now `tti_gc` (previously `page_gc`); update queries

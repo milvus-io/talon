@@ -109,9 +109,9 @@ Talon promises, for the write-through path:
   consistency.
 - **Monotonic reads.** A reader never observes an object move backwards. The
   version guard in `BlockId` provides this: blocks are keyed by the resolved
-  ETag/generation, and `write_object` refreshes the version cache and evicts
-  superseded blocks on commit, so the post-write version is what subsequent
-  reads resolve.
+  ETag/generation, and `write_object` refreshes the version cache, so subsequent
+  unversioned reads resolve the post-write version. Other cached versions remain
+  available to version-pinned reads.
 - **No cross-client write atomicity beyond the origin's.** Concurrent writers to
   one object resolve exactly as the origin resolves them — last writer wins,
   under the origin's own semantics. Talon adds no locking, no ordering, and no
@@ -181,7 +181,7 @@ avoids that.
 A locally-written object differs from a backend-sourced one: its version is
 known exactly, from the origin's PUT response, rather than inferred from a
 `HEAD`. The write path already exploits this — `write_object` stores the
-returned version and evicts superseded blocks — so a write does not need
+returned version while retaining other cached versions — so a write does not need
 revalidation to be correct.
 
 The freshness work must preserve this distinction rather than apply a uniform

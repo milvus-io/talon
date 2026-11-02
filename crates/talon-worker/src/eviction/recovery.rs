@@ -3,7 +3,6 @@
 use super::*;
 
 pub(crate) struct RecoveredUnit {
-    pub independent: bool,
     pub unit: Arc<CacheUnit>,
     pub bytes: u64,
     pub access: AccessHandle,
@@ -22,7 +21,7 @@ impl Lru {
         } else {
             std::thread::available_parallelism()
                 .map_or(1, usize::from)
-                .min(3)
+                .min(2)
         };
         Self::recover_with_workers(units, blocks, workers, track_checks)
     }
@@ -43,7 +42,6 @@ impl Lru {
                     (
                         u.unit.clone(),
                         Entry {
-                            independent: u.independent,
                             bytes: u.bytes,
                             position: position as u64,
                             revision: position as u64,
@@ -67,40 +65,11 @@ impl Lru {
             );
             (entries, queue)
         };
-        let version_index = || {
-            let started = std::time::Instant::now();
-            let mut versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>> =
-                HashMap::with_capacity(units.iter().filter(|u| !u.independent).count().min(blocks));
-            let mut checks = HashMap::with_capacity(if track_checks { blocks } else { 0 });
-            for u in &units {
-                let block = u.unit.block();
-                if !u.independent {
-                    versions
-                        .entry(LogicalBlock::from(block))
-                        .or_default()
-                        .entry(block.version.clone())
-                        .or_default()
-                        .insert(u.unit.page());
-                }
-                if track_checks {
-                    checks.entry(block.object.clone()).or_insert((0, None)).0 += 1;
-                }
-            }
-            tracing::info!(
-                units = units.len(),
-                workers,
-                phase = "versions",
-                version_blocks = versions.len(),
-                checked_objects = checks.len(),
-                elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
-                "cache policy index restored"
-            );
-            (versions, checks)
-        };
         let block_index = || {
             let started = std::time::Instant::now();
             let mut access: HashMap<BlockKey, BlockActivity> = HashMap::with_capacity(blocks);
             let mut queue = Vec::with_capacity(blocks);
+            let mut checks = HashMap::with_capacity(if track_checks { blocks } else { 0 });
             for (position, u) in units.iter().enumerate() {
                 let position = position as u64;
                 let key = BlockKey(u.unit.clone());
@@ -118,6 +87,12 @@ impl Lru {
                 });
                 activity.units += 1;
                 activity.revision = position;
+                if track_checks {
+                    checks
+                        .entry(u.unit.block().object.clone())
+                        .or_insert((0, None))
+                        .0 += 1;
+                }
             }
             let ownership = queue.iter().cloned().collect();
             let queue = queue.into_iter().collect();
@@ -128,28 +103,20 @@ impl Lru {
                 elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                 "cache policy index restored"
             );
-            (access, queue, ownership)
+            (access, queue, ownership, checks)
         };
-        // At most three CPU workers, including this thread. Small namespaces
+        // At most two CPU workers, including this thread. Small namespaces
         // avoid thread creation. No map is shared mutably during construction.
-        let (
-            (entries, queue),
-            (versions, object_checks),
-            (block_access, block_queue, ownership_queue),
-        ) = std::thread::scope(|scope| {
-            let block_task = (workers > 1).then(|| scope.spawn(block_index));
-            let version_task = (workers > 2).then(|| scope.spawn(version_index));
-            let units = unit_index();
-            let versions = match version_task {
-                Some(task) => task.join().expect("version recovery panicked"),
-                None => version_index(),
-            };
-            let blocks = match block_task {
-                Some(task) => task.join().expect("block recovery panicked"),
-                None => block_index(),
-            };
-            (units, versions, blocks)
-        });
+        let ((entries, queue), (block_access, block_queue, ownership_queue, object_checks)) =
+            std::thread::scope(|scope| {
+                let block_task = (workers > 1).then(|| scope.spawn(block_index));
+                let units = unit_index();
+                let blocks = match block_task {
+                    Some(task) => task.join().expect("block recovery panicked"),
+                    None => block_index(),
+                };
+                (units, blocks)
+            });
         let total_bytes = units
             .iter()
             .fold(0u64, |total, u| total.saturating_add(u.bytes));
@@ -158,7 +125,6 @@ impl Lru {
             inner: Mutex::new(Inner {
                 entries,
                 queue,
-                versions,
                 block_access,
                 block_queue,
                 ownership_queue,
@@ -187,6 +153,7 @@ impl Lru {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use talon_core::Version;
 
     fn block(n: u64) -> BlockId {
         BlockId::new(
@@ -198,8 +165,8 @@ mod tests {
     }
 
     #[test]
-    fn bulk_independent_keys_match_admission_with_optional_origin_checks() {
-        for workers in 1..=3 {
+    fn bulk_versions_match_admission_with_optional_origin_checks() {
+        for workers in 1..=2 {
             for track_checks in [false, true] {
                 let first = block(10);
                 let mut second = first.clone();
@@ -209,9 +176,8 @@ mod tests {
                     .into_iter()
                     .map(|id| {
                         let unit = CacheUnit::Whole(id.clone());
-                        let access = ordinary.insert_with_policy(unit.clone(), 100, true);
+                        let access = ordinary.insert(unit.clone(), 100);
                         RecoveredUnit {
-                            independent: true,
                             unit: Arc::new(unit),
                             bytes: 100,
                             access,
@@ -222,19 +188,27 @@ mod tests {
                 {
                     let a = ordinary.inner.lock().unwrap();
                     let b = recovered.inner.lock().unwrap();
-                    assert!(b.versions.is_empty());
-                    assert_eq!(b.versions.capacity(), 0);
                     assert_eq!(a.object_checks, b.object_checks);
                     if !track_checks {
                         assert_eq!(b.object_checks.capacity(), 0);
                     }
                     assert_eq!(a.total_bytes, b.total_bytes);
                 }
-                assert!(recovered.superseded_candidates(&second).is_empty());
-                assert_eq!(recovered.block_candidates(&first).len(), 1);
-                recovered.remove_block(&first);
-                assert_eq!(recovered.block_candidates(&second).len(), 1);
-                recovered.remove_block(&second);
+                assert_eq!(recovered.len(), 2);
+                assert_eq!(
+                    recovered
+                        .candidates([CacheUnit::Whole(first.clone())])
+                        .len(),
+                    1
+                );
+                recovered.remove(&CacheUnit::Whole(first.clone()));
+                assert_eq!(
+                    recovered
+                        .candidates([CacheUnit::Whole(second.clone())])
+                        .len(),
+                    1
+                );
+                recovered.remove(&CacheUnit::Whole(second.clone()));
                 assert!(recovered.is_empty());
                 assert!(recovered.inner.lock().unwrap().object_checks.is_empty());
             }
@@ -252,7 +226,7 @@ mod tests {
             (CacheUnit::Page(old.clone(), PageIndex(255)), 4096),
             (CacheUnit::Whole(new.clone()), 31),
         ];
-        for workers in 1..=3 {
+        for workers in 1..=2 {
             let ordinary = Lru::new();
             let mut shared = HashMap::new();
             let units = input
@@ -263,7 +237,6 @@ mod tests {
                         .entry(unit.block().clone())
                         .or_insert_with(AccessHandle::default);
                     RecoveredUnit {
-                        independent: false,
                         unit: Arc::new(unit.clone()),
                         bytes: *bytes,
                         access: access.sibling(),
@@ -281,7 +254,6 @@ mod tests {
                 assert_eq!(a.clock, b.clock);
                 assert_eq!(a.admission_ceiling, b.admission_ceiling);
                 assert_eq!(a.total_bytes, b.total_bytes);
-                assert!(a.versions == b.versions);
                 for (id, activity) in &a.block_access {
                     let restored = &b.block_access[id];
                     assert_eq!(
@@ -322,12 +294,13 @@ mod tests {
             }
             for lru in [&ordinary, &recovered] {
                 assert!(lru.pin(&input[0].0));
-                assert_eq!(lru.evict_superseded(&new), vec![input[2].0.clone()]);
+                assert_eq!(lru.len(), input.len());
+                assert_eq!(lru.remove(&input[2].0), Some(input[2].1));
                 lru.unpin(&input[0].0);
-                let candidate = lru.block_candidates(&old).pop().unwrap();
+                let candidate = lru.candidates([input[0].0.clone()]).pop().unwrap();
                 lru.touch(&input[0].0);
                 assert!(!lru.candidate_is_current(&candidate));
-                lru.remove_block(&old);
+                lru.remove(&input[0].0);
                 lru.insert(input[0].0.clone(), 7);
                 assert_eq!(lru.total_bytes(), 57);
                 assert_eq!(lru.len(), 3);
@@ -335,8 +308,7 @@ mod tests {
                 assert_eq!(lru.total_bytes(), 0);
                 let g = lru.inner.lock().unwrap();
                 assert!(
-                    g.versions.is_empty()
-                        && g.block_queue.is_empty()
+                    g.block_queue.is_empty()
                         && g.ownership_queue.is_empty()
                         && g.object_checks.is_empty()
                 );
@@ -363,13 +335,11 @@ mod tests {
                 Lru::recover_with_workers(
                     vec![
                         RecoveredUnit {
-                            independent: false,
                             unit: Arc::new(first.clone()),
                             bytes: 4096,
                             access: shared.clone(),
                         },
                         RecoveredUnit {
-                            independent: false,
                             unit: Arc::new(second.clone()),
                             bytes: 8192,
                             access: shared.sibling(),
@@ -413,7 +383,8 @@ mod tests {
             // without restoring residency of the original page.
             lru.insert(CacheUnit::Page(id.clone(), PageIndex(31)), 16384);
             assert!(!lru.inner.lock().unwrap().entries.contains_key(&first));
-            lru.remove_block(&id);
+            lru.remove(&second);
+            lru.remove(&CacheUnit::Page(id.clone(), PageIndex(31)));
             assert_eq!(lru.total_bytes(), 0);
             assert!(identity.upgrade().is_none());
             lru.insert(first, 7);

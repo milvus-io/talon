@@ -275,7 +275,7 @@ async fn small_background_reclaims_after_bounded_scans_of_hot_or_pinned_keys() {
         }
         w.maintain_small(true).await.unwrap();
         for block in &blocks[..3] {
-            w.unlink_units(w.lru.block_candidates(block), 2).await;
+            w.unlink_units(w.block_candidates(block), 2).await;
         }
         let before = w.resident_bytes();
         let config = WorkerConfig {
@@ -488,7 +488,7 @@ async fn small_and_ordinary_admissions_cannot_share_an_identity() {
     );
     w.delete_object(&object()).await.unwrap();
     assert_eq!(w.block_count(), 0);
-    assert!(w.lru.block_candidates(&block).is_empty());
+    assert!(w.block_candidates(&block).is_empty());
     assert_eq!(w.lru.len(), 0);
 
     for paged in [false, true] {
@@ -777,8 +777,8 @@ async fn small_tti_checkpoint_survives_restart_relocation_and_deletion() {
     assert!(dir.path().join("small/access.checkpoint").exists());
     // A stale snapshot still contains the deleted identity. Relocate the other
     // records without rewriting their access snapshot, then restart.
-    w.unlink_units(w.lru.block_candidates(&blocks[1]), 2).await;
-    w.unlink_units(w.lru.block_candidates(&blocks[2]), 2).await;
+    w.unlink_units(w.block_candidates(&blocks[1]), 2).await;
+    w.unlink_units(w.block_candidates(&blocks[2]), 2).await;
     assert!(w
         .small
         .as_ref()
@@ -987,7 +987,7 @@ async fn small_background_capacity_keeps_evicting_until_segment_threshold() {
             };
             let original_payloads = payloads();
             if predeleted {
-                w.unlink_units(w.lru.block_candidates(&blocks[0]), 2).await;
+                w.unlink_units(w.block_candidates(&blocks[0]), 2).await;
                 assert_eq!(
                     payloads(),
                     original_payloads,
@@ -1198,9 +1198,7 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
     for n in 0..2 {
         let mut block = id(first);
         block.object.object_path = format!("ns-object-{n}");
-        first
-            .unlink_units(first.lru.block_candidates(&block), 2)
-            .await;
+        first.unlink_units(first.block_candidates(&block), 2).await;
     }
     assert!(first.small.as_ref().unwrap().reclaimable_bytes().await > 0);
     let target = (before as f64 * config.async_eviction_low_watermark) as u64;
@@ -1237,7 +1235,7 @@ async fn capacity_reclaims_small_journal_history_below_automatic_threshold() {
                 .put(&block, Bytes::from_static(b"churn"))
                 .await
                 .unwrap();
-            w.unlink_units(w.lru.block_candidates(&block), 2).await;
+            w.unlink_units(w.block_candidates(&block), 2).await;
         }
         assert_eq!(w.block_count(), 0);
         assert!(w.resident_bytes() > capacity);
@@ -1331,7 +1329,7 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
             .sum::<u64>()
     };
     let before = payload_allocation();
-    w.unlink_units(w.lru.block_candidates(&tiny), 2).await;
+    w.unlink_units(w.block_candidates(&tiny), 2).await;
     assert_eq!(w.small.as_ref().unwrap().reclaimable_bytes().await, 0);
     w.small
         .as_ref()
@@ -1370,13 +1368,11 @@ async fn packed_versions_remain_independent_across_restart_and_exact_deletion() 
         assert!(w.small.as_ref().unwrap().contains(key));
         assert!(w.index.get(key).is_none());
         assert!(w.small.as_ref().unwrap().access(key).is_some());
-        assert_eq!(w.lru.block_candidates(key).len(), 1);
+        assert_eq!(w.block_candidates(key).len(), 1);
     }
-    assert!(w.lru.superseded_candidates(&v2).is_empty());
     w.maintain_small(true).await.unwrap();
     drop(w);
     let (_, w) = runtime(dir.path(), true, true);
-    assert!(w.lru.superseded_candidates(&v2).is_empty());
     for key in [&v1, &v2] {
         assert!(w.index.get(key).is_none());
         assert!(w.small.as_ref().unwrap().access(key).is_some());
@@ -1385,11 +1381,11 @@ async fn packed_versions_remain_independent_across_restart_and_exact_deletion() 
             data()
         );
     }
-    w.unlink_units(w.lru.block_candidates(&v1), 2).await;
+    w.unlink_units(w.block_candidates(&v1), 2).await;
     assert!(!w.small.as_ref().unwrap().contains(&v1));
     assert!(w.small.as_ref().unwrap().contains(&v2));
-    assert!(w.lru.block_candidates(&v1).is_empty());
-    assert_eq!(w.lru.block_candidates(&v2).len(), 1);
+    assert!(w.block_candidates(&v1).is_empty());
+    assert_eq!(w.block_candidates(&v2).len(), 1);
 }
 
 #[tokio::test]

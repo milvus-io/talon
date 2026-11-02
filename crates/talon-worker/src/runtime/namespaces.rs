@@ -1777,8 +1777,8 @@ mod tests {
         assert_eq!(paged.lru.total_bytes(), expected_paged);
         let tail = paged.paged.as_ref().unwrap().dir_for(&id).join("3.page");
         let tail_bytes = std::fs::metadata(tail).unwrap().blocks() * 512;
-        whole.unlink_units(whole.lru.block_candidates(&id), 2).await;
-        paged.unlink_units(paged.lru.block_candidates(&id), 2).await;
+        whole.unlink_units(whole.block_candidates(&id), 2).await;
+        paged.unlink_units(paged.block_candidates(&id), 2).await;
         assert!(
             tail_bytes > 1,
             "short tail still allocates a filesystem block"

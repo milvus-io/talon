@@ -422,8 +422,10 @@ impl WorkerRuntime {
                     }
                 }
                 runtime.invalidate_l1(id);
+                for unit in runtime.block_units(id) {
+                    runtime.lru.remove(&unit);
+                }
                 runtime.index.remove(id);
-                runtime.lru.remove_block(id);
                 claim.finish(runtime.page_clock.now());
                 runtime.metrics.record_eviction();
                 if pages > 0 {
@@ -435,7 +437,22 @@ impl WorkerRuntime {
         }).await;
     }
 
-    /// Capacity and superseded page eviction share the same commit protocol as TTI.
+    fn block_units(&self, id: &BlockId) -> Vec<CacheUnit> {
+        match self.index.get(id).map(|meta| meta.form) {
+            Some(BlockForm::Paged { present, .. }) => (0..present.len())
+                .map(PageIndex)
+                .filter(|page| present.is_present(*page))
+                .map(|page| CacheUnit::Page(id.clone(), page))
+                .collect(),
+            _ => vec![CacheUnit::Whole(id.clone())],
+        }
+    }
+
+    pub(super) fn block_candidates(&self, id: &BlockId) -> Vec<crate::eviction::EvictionCandidate> {
+        self.lru.candidates(self.block_units(id))
+    }
+
+    /// Capacity and explicit eviction share the same commit protocol as TTI.
     pub(super) async fn unlink_units(
         &self,
         units: Vec<crate::eviction::EvictionCandidate>,

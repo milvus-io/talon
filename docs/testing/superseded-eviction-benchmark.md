@@ -1,5 +1,8 @@
 # Superseded-version eviction: local cold-fill benchmark
 
+Historical results: cross-version eviction and its index have since been removed.
+The commands and test names below describe the measured revisions.
+
 The benchmark compares main `fc62db549cc5e2ecd3b014d823cd8f8aec52e65f` with the same source plus the logical-block version index in `eviction.rs`. The benchmark harness is identical in both builds. All runtime call sites retain their original superseded-version eviction behavior.
 
 The cold-fill timings below were collected for indexed revision `650a42e`. The subsequent sparse-index memory fix is validated separately below; these timings were not remeasured. That fix only shrinks page sets during removal, which this no-eviction cold-fill workload does not exercise.

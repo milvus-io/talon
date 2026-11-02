@@ -457,7 +457,6 @@ impl BlockIndex {
                     }
                 }
                 units.push(RecoveredUnit {
-                    independent: false,
                     unit: Arc::new(match page {
                         Some(page) => CacheUnit::Page(entry.meta.id.clone(), page),
                         None => CacheUnit::Whole(entry.meta.id.clone()),
@@ -1216,7 +1215,10 @@ mod tests {
             assert!(index
                 .page_reads_and_touch(&paged, PageIndex(1), PageIndex(2))
                 .is_none());
-            let candidates = lru.block_candidates(&paged);
+            let candidates = lru.candidates([
+                CacheUnit::Page(paged.clone(), PageIndex(0)),
+                CacheUnit::Page(paged.clone(), PageIndex(pages - 1)),
+            ]);
             assert_eq!(candidates.len(), 2);
             assert!(index
                 .page_reads_and_touch(&paged, PageIndex(0), PageIndex(1))
@@ -1233,7 +1235,10 @@ mod tests {
                 .page_reads_and_touch(&paged, PageIndex(pages - 1), PageIndex(pages))
                 .is_some());
             assert!(candidates.iter().all(|c| !lru.candidate_is_current(c)));
-            let candidate = lru.block_candidates(&whole).pop().unwrap();
+            let candidate = lru
+                .candidates([CacheUnit::Whole(whole.clone())])
+                .pop()
+                .unwrap();
             assert!(index.get_and_touch(&whole).is_some());
             assert!(!lru.candidate_is_current(&candidate));
         }
