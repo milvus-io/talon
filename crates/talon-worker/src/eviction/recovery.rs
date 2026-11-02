@@ -79,13 +79,13 @@ impl Lru {
             (versions, checks)
         };
         let block_index = || {
-            let mut access: HashMap<BlockId, BlockActivity> = HashMap::with_capacity(blocks);
+            let mut access: HashMap<BlockKey, BlockActivity> = HashMap::with_capacity(blocks);
             let mut queue = Vec::with_capacity(blocks);
             for (position, u) in units.iter().enumerate() {
                 let position = position as u64;
-                let block = u.unit.block();
-                let activity = access.entry(block.clone()).or_insert_with(|| {
-                    queue.push((position, block.clone()));
+                let key = BlockKey(u.unit.clone());
+                let activity = access.entry(key.clone()).or_insert_with(|| {
+                    queue.push((position, key));
                     BlockActivity {
                         units: 0,
                         pins: 0,
@@ -267,5 +267,95 @@ mod tests {
         let unit = CacheUnit::Whole(block(1));
         lru.insert(unit.clone(), 10);
         assert_eq!(lru.evict_to_fit(0), vec![unit]);
+    }
+
+    #[test]
+    fn shared_block_identity_survives_its_page_and_retires_with_last_sibling() {
+        for recover in [false, true] {
+            let id = block(11);
+            let first = CacheUnit::Page(id.clone(), PageIndex(7));
+            let second = CacheUnit::Page(id.clone(), PageIndex(19));
+            let lru = if recover {
+                let shared = AccessHandle::default();
+                Lru::recover_with_workers(
+                    vec![
+                        RecoveredUnit {
+                            independent: false,
+                            unit: Arc::new(first.clone()),
+                            bytes: 4096,
+                            access: shared.clone(),
+                        },
+                        RecoveredUnit {
+                            independent: false,
+                            unit: Arc::new(second.clone()),
+                            bytes: 8192,
+                            access: shared.sibling(),
+                        },
+                    ],
+                    1,
+                    2,
+                    true,
+                )
+            } else {
+                let lru = Lru::new();
+                lru.insert(first.clone(), 4096);
+                lru.insert(second.clone(), 8192);
+                lru
+            };
+            let identity = {
+                let inner = lru.inner.lock().unwrap();
+                let (key, activity) = inner.block_access.get_key_value(&id).unwrap();
+                let unit = inner.entries.get_key_value(&first).unwrap().0;
+                assert!(Arc::ptr_eq(&key.0, unit));
+                assert!(Arc::ptr_eq(
+                    &key.0,
+                    &inner.block_queue[&activity.position].0
+                ));
+                assert!(Arc::ptr_eq(
+                    &key.0,
+                    &inner.ownership_queue[&activity.ownership_position].0
+                ));
+                Arc::downgrade(&key.0)
+            };
+            let limit = lru.ownership_admission_ceiling();
+            let candidate = lru.next_ownership_block(&mut (0, limit), limit).unwrap().1;
+            assert_eq!(candidate.units, 2);
+            assert_eq!(lru.remove(&first), Some(4096));
+            assert_eq!(lru.inner.lock().unwrap().block_access[&id].units, 1);
+            assert!(identity.upgrade().is_some());
+            assert!(lru.pin(&second));
+            assert!(lru.evict_to_fit(0).is_empty());
+            lru.unpin(&second);
+            // A later admission requeues ownership using the retained identity,
+            // without restoring residency of the original page.
+            lru.insert(CacheUnit::Page(id.clone(), PageIndex(31)), 16384);
+            assert!(!lru.inner.lock().unwrap().entries.contains_key(&first));
+            lru.remove_block(&id);
+            assert_eq!(lru.total_bytes(), 0);
+            assert!(identity.upgrade().is_none());
+            lru.insert(first, 7);
+            assert_eq!(lru.total_bytes(), 7);
+            assert!(!lru.stale_candidate_is_current(&candidate));
+        }
+    }
+
+    #[test]
+    fn borrowed_block_keys_hash_like_the_complete_block_identity() {
+        let id = block(12);
+        let first = BlockKey(Arc::new(CacheUnit::Whole(id.clone())));
+        let second = BlockKey(Arc::new(CacheUnit::Page(id.clone(), PageIndex(9))));
+        assert_eq!(first, second);
+        let map = HashMap::from([(first, 1)]);
+        assert_eq!(map.get(&id), Some(&1));
+        assert_eq!(map.get(&second), Some(&1));
+        let mut changed = id.clone();
+        changed.version = Version::new("v2");
+        assert!(!map.contains_key(&changed));
+        let mut changed = id.clone();
+        changed.offset += 1;
+        assert!(!map.contains_key(&changed));
+        let mut changed = id;
+        changed.block_size /= 2;
+        assert!(!map.contains_key(&changed));
     }
 }

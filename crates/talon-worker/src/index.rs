@@ -358,8 +358,14 @@ impl BlockIndex {
             let mut guard = entry.block.write().unwrap();
             let entry = guard.as_mut().expect("live directory entry");
             let shared = AccessHandle::default();
+            let mut first = true;
             let mut add = |page: Option<PageIndex>, slot: &mut UnitSlot| {
-                let access = shared.sibling();
+                let access = if first {
+                    first = false;
+                    shared.clone()
+                } else {
+                    shared.sibling()
+                };
                 match &mut slot.access {
                     Some(old) => old.policy = access.clone(),
                     None => {
@@ -1083,6 +1089,14 @@ mod tests {
             assert!(index
                 .page_reads_and_touch(&paged, PageIndex(0), PageIndex(1))
                 .is_some());
+            // The first page reuses the template token, but its second-chance
+            // bit must remain independent of every sibling's bit.
+            for candidate in &candidates {
+                assert_eq!(
+                    lru.candidate_is_current(candidate),
+                    candidate.unit == CacheUnit::Page(paged.clone(), PageIndex(pages - 1))
+                );
+            }
             assert!(index
                 .page_reads_and_touch(&paged, PageIndex(pages - 1), PageIndex(pages))
                 .is_some());
