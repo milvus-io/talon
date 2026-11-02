@@ -17,6 +17,9 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use talon_core::{BlockId, ObjectId, PageIndex, Version};
 
+mod recovery;
+pub(crate) use recovery::RecoveredUnit;
+
 /// A single evictable cache unit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum CacheUnit {
@@ -38,6 +41,38 @@ impl CacheUnit {
             Self::Whole(_) => None,
             Self::Page(_, page) => Some(*page),
         }
+    }
+}
+
+/// Block identity borrowed from a resident unit. The block map and its scan
+/// queues share that unit's immutable strings, even if this particular page is
+/// removed before its siblings. This retains metadata only, never a data pin.
+#[derive(Clone, Debug)]
+struct BlockKey(Arc<CacheUnit>);
+
+impl AsRef<BlockId> for BlockKey {
+    fn as_ref(&self) -> &BlockId {
+        self.0.block()
+    }
+}
+
+impl std::borrow::Borrow<BlockId> for BlockKey {
+    fn borrow(&self) -> &BlockId {
+        self.as_ref()
+    }
+}
+
+impl PartialEq for BlockKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+
+impl Eq for BlockKey {}
+
+impl std::hash::Hash for BlockKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        std::hash::Hash::hash(self.as_ref(), state);
     }
 }
 
@@ -98,6 +133,11 @@ impl AccessHandle {
             },
             Ordering::Relaxed,
         );
+    }
+
+    /// Separate second-chance bit, with the same block-wide idle clock.
+    pub(crate) fn sibling(&self) -> Self {
+        Self(Arc::new(AtomicBool::new(false)), self.1.clone())
     }
 
     /// Coalesce hits until the eviction hand consumes this second chance.
@@ -174,9 +214,9 @@ struct Inner {
     /// indices avoids duplicating object paths and versions for every page.
     versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>>,
     // Reference counts track resident units, not outstanding reader tokens.
-    block_access: HashMap<BlockId, BlockActivity>,
-    block_queue: BTreeMap<u64, BlockId>,
-    ownership_queue: BTreeMap<u64, BlockId>,
+    block_access: HashMap<BlockKey, BlockActivity>,
+    block_queue: BTreeMap<u64, BlockKey>,
+    ownership_queue: BTreeMap<u64, BlockKey>,
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
     track_checks: bool,
     total_bytes: u64,
@@ -341,8 +381,6 @@ impl Lru {
                 let block = g.ownership_queue.remove(&previous).expect("queued block");
                 g.ownership_queue.insert(position, block);
             }
-        } else {
-            g.ownership_queue.insert(position, unit.block().clone());
         }
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
@@ -371,6 +409,7 @@ impl Lru {
             Self::add_bytes(&mut g.total_bytes, bytes);
             return access;
         }
+        let unit = Arc::new(unit);
         Self::add_bytes(&mut g.total_bytes, bytes);
         let block = unit.block();
         if !independent {
@@ -382,9 +421,11 @@ impl Lru {
                 .insert(unit.page());
         }
         if !g.block_access.contains_key(block) {
-            g.block_queue.insert(position, block.clone());
+            let key = BlockKey(unit.clone());
+            g.block_queue.insert(position, key.clone());
+            g.ownership_queue.insert(position, key.clone());
             g.block_access.insert(
-                block.clone(),
+                key,
                 BlockActivity {
                     units: 0,
                     pins: 0,
@@ -408,7 +449,6 @@ impl Lru {
                 .or_insert((0, None))
                 .0 += 1;
         }
-        let unit = Arc::new(unit);
         g.queue.insert(position, unit.clone());
         g.entries.insert(
             unit,
@@ -656,7 +696,10 @@ impl Lru {
             cursor.0 = position + 1;
             let activity = &g.block_access[block];
             let access = activity.access.load(Ordering::Relaxed);
-            let verified = g.object_checks.get(&block.object).and_then(|check| check.1);
+            let verified = g
+                .object_checks
+                .get(&block.as_ref().object)
+                .and_then(|check| check.1);
             if activity.pins != 0
                 || now.saturating_sub(access) <= age
                 || (consider_verified && verified.is_some_and(|at| now.saturating_sub(at) < age))
@@ -664,7 +707,7 @@ impl Lru {
                 continue;
             }
             out.push(StaleBlockCandidate {
-                block: block.clone(),
+                block: block.as_ref().clone(),
                 units: activity.units,
                 revision: activity.revision,
                 last_access: access,
@@ -704,7 +747,7 @@ impl Lru {
             activity.ownership_pending = false;
         }
         let candidate = StaleBlockCandidate {
-            block,
+            block: block.as_ref().clone(),
             units: activity.units,
             revision,
             last_access: activity.access.load(Ordering::Relaxed),

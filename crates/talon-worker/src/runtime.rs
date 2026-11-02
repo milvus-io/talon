@@ -241,15 +241,12 @@ impl WorkerRuntime {
         metrics: WorkerMetrics,
         track_checks: bool,
     ) -> Self {
-        let lru = Arc::new(Lru::with_object_checks(track_checks));
-        for (id, page, bytes) in index.snapshot_units() {
-            let unit = match page {
-                Some(page) => CacheUnit::Page(id, page),
-                None => CacheUnit::Whole(id),
-            };
-            let access = lru.insert(unit.clone(), bytes);
-            index.set_access(&unit, access);
+        let mut units = index.restore_policy_units();
+        let blocks = index.len() + small.as_ref().map_or(0, |small| small.len());
+        if let Some(small) = &small {
+            small.restore_policy_units(&mut units);
         }
+        let lru = Arc::new(Lru::from_recovered(units, blocks, track_checks));
         if let Some(small) = &small {
             small.bind_policy(lru.clone());
         }
@@ -430,13 +427,8 @@ impl WorkerRuntime {
         self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
             crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
         ));
-        for (id, page, _) in self.index.snapshot_units() {
-            if let Some(page) = page {
-                let state = self.page_lifecycle.block(&id);
-                let handle = state.register(page, None, self.page_clock.now(), false);
-                self.index.set_page_state(&id, page, handle);
-            }
-        }
+        self.index
+            .restore_page_states(&self.page_lifecycle, self.page_clock.now());
         self.paged = Some(Arc::new(paged));
         self
     }

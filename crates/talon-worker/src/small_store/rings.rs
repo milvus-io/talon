@@ -248,18 +248,22 @@ impl SmallObjectStore {
         Ok(total)
     }
 
-    /// Startup only, before serving or admitting writes. Restore the shared
-    /// eviction policy directly from locators, without a second residency index.
-    pub(crate) fn bind_policy(&self, policy: Arc<Lru>) {
-        assert!(
-            self.policy.set(policy.clone()).is_ok(),
-            "small store already bound to a runtime"
-        );
+    /// Startup only. Attach access tokens to locators and contribute units to
+    /// the shared bulk policy construction without registering in BlockIndex.
+    pub(crate) fn restore_policy_units(&self, units: &mut Vec<crate::eviction::RecoveredUnit>) {
         for stream in self.streams() {
             stream
-                .restore_policy(&policy)
+                .restore_policy_units(units)
                 .expect("validated small object identity");
         }
+    }
+
+    /// Bind the policy built from both stores, then restore persisted access ages.
+    pub(crate) fn bind_policy(&self, policy: Arc<Lru>) {
+        assert!(
+            self.policy.set(policy).is_ok(),
+            "small store already bound to a runtime"
+        );
         self.restore_access();
     }
 

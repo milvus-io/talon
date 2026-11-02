@@ -97,6 +97,22 @@ remains O(number of metadata records). Small objects do not allocate generic
 consume O(number of objects) memory and must be reconstructed at startup. This is
 not a disk-only index or a claim of a fixed total RAM cost per object.
 
+Before serving, the worker attaches access tokens directly to ordinary index
+entries and small-store locators, then bulk-builds their shared LRU membership, version, and block
+indexes. Large namespaces use at most three CPU threads (bounded by available
+parallelism, including the initializing thread); small namespaces stay serial.
+Ordered eviction and ownership queues are collected in bulk. Paged lifecycle
+initialization skips whole objects without cloning a full cache snapshot. These
+steps preserve resident byte charges, block-wide idle clocks, and eviction
+semantics; segment replay and BlockIndex publication remain serial.
+
+The LRU's block membership and its idle/ownership scan queues share an immutable
+identity from an existing cache unit, instead of copying its path and version
+into each structure. Removing that particular page leaves the identity alive
+until the last sibling is removed; it retains metadata only, not a data pin.
+Recovery reuses the first unit's access token and gives later pages independent
+second-chance bits sharing the same block idle clock.
+
 ## I/O and publication
 
 All runtime payload, index and manifest operations use a buffered async adapter.
