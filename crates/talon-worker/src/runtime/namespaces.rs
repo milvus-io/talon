@@ -344,7 +344,11 @@ impl WorkerRuntime {
             native = journal_service.is_native(),
             "cache journal runtime opened"
         );
-        let catalog = crate::catalog::Catalog::with_service(&journal_service)?;
+        let background_budget = crate::background::BackgroundBudget::new(config);
+        let catalog = crate::catalog::Catalog::with_service(
+            &journal_service,
+            Some(background_budget.clone()),
+        )?;
         let registry = Arc::new(NamespaceRuntimes {
             uring,
             membership: Arc::new(Mutex::new(None)),
@@ -368,7 +372,7 @@ impl WorkerRuntime {
             l1_budget: Arc::default(),
             whole_fds: Arc::new(FdCache::new(config.whole_fd_cache_capacity)),
             page_fds: Arc::new(FdCache::for_pages(config.page_fd_cache_capacity)),
-            background_budget: crate::background::BackgroundBudget::new(config),
+            background_budget,
         });
         let mut names = std::collections::BTreeSet::from([DEFAULT_NAMESPACE.to_owned()]);
         names.extend(config.namespaces.keys().cloned());
@@ -2298,6 +2302,66 @@ mod tests {
             a.background_budget.as_ref().unwrap(),
             b.background_budget.as_ref().unwrap()
         ));
+    }
+
+    #[tokio::test]
+    async fn journal_checkpoints_share_namespace_budget_after_background_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.background_io_concurrency = 1;
+        config.background_io_max_mb_per_sec = 0;
+        config.background_delete_max_per_sec = 0;
+        config.small_object_threshold_bytes = 8;
+        config.small_object_segment_bytes = 128 << 10;
+        let root = open(dir.path(), &config, Arc::default());
+        let namespace = root.for_namespace(&NamespaceId::named("a")).await.unwrap();
+        read(&namespace).await;
+        let small = root.small.as_ref().unwrap().clone();
+        small
+            .put(&block(16), Bytes::from_static(b"x"))
+            .await
+            .unwrap();
+        let background = super::super::background::WorkerBackground::start(root.clone(), &config);
+        background.begin_shutdown();
+        let permit = namespace.background_budget.as_ref().unwrap().io().await;
+        let worker = root.clone();
+        let mut checkpoint = tokio::spawn(async move { worker.checkpoint_catalog().await });
+        let mut small_checkpoint = tokio::spawn(async move { small.maintain(true).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            for path in [
+                ".paged-catalog/journal.00000000000000000002",
+                "default/shared/small/metadata/journal.00000000000000000002",
+            ] {
+                while !dir.path().join(path).exists() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let blocked = tokio::time::timeout(Duration::from_millis(20), &mut checkpoint).await;
+        let small_blocked =
+            tokio::time::timeout(Duration::from_millis(20), &mut small_checkpoint).await;
+        drop(permit);
+        assert!(
+            blocked.is_err(),
+            "catalog snapshot must share the namespace I/O permit"
+        );
+        assert!(
+            small_blocked.is_err(),
+            "background startup must preserve the small-store shared I/O permit"
+        );
+        tokio::time::timeout(Duration::from_secs(2), checkpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), small_checkpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        background.shutdown().await;
     }
 
     #[tokio::test]

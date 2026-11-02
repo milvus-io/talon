@@ -76,10 +76,133 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
 }
 
 #[tokio::test]
+async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
+    let config = talon_core::WorkerConfig {
+        block_size: 1 << 31,
+        l2_page_size_bytes: 1024,
+        l1_capacity_bytes: 0,
+        capacity_bytes: 16 << 30,
+        ..Default::default()
+    };
+    config.validate().unwrap();
+    let mut id = block(0);
+    id.block_size = config.block_size;
+    let count = id.page_count(config.l2_page_size_bytes as u32);
+    let block = model::Block {
+        id: id.clone(),
+        len: u64::from(id.block_size),
+        pages: (0..count).map(|page| (page, 4096)).collect(),
+    };
+    // This valid state exceeded the engine's single-frame limit before page
+    // chunks. Construct metadata directly instead of creating millions of files.
+    assert!(serde_json::to_vec(&block).unwrap().len() > 16 << 20);
+    let path = "default/shared/paged";
+    let mut state = State::default();
+    state.stores.insert(
+        path.into(),
+        model::Store {
+            page_size: 1024,
+            blocks: [(id.clone(), Arc::new(block))].into(),
+        },
+    );
+    let root = tempfile::tempdir().unwrap();
+    let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
+    let handle = service
+        .open_stream(PathBuf::from(DIRECTORY), state, StreamOptions::default())
+        .unwrap();
+    handle.checkpoint().await.unwrap();
+    // Tail replay must still mutate a block restored from multiple chunks.
+    let transaction = handle
+        .append(
+            Record::Begin {
+                intent: model::Intent {
+                    store: path.into(),
+                    block: id.clone(),
+                    operation: Operation::DeletePage { page: 0 },
+                },
+            },
+            Ack::Durable,
+        )
+        .await
+        .unwrap();
+    handle
+        .append(
+            Record::Complete {
+                transaction,
+                allocated: 0,
+            },
+            Ack::Durable,
+        )
+        .await
+        .unwrap();
+    drop(handle);
+    drop(service);
+    let catalog = open(root.path());
+    catalog
+        .journal
+        .query(move |state| {
+            let restored = &state.stores[path].blocks[&id];
+            assert_eq!(restored.pages.len(), count as usize - 1);
+            assert_eq!(restored.len, u64::from(id.block_size));
+            assert!(!restored.pages.contains_key(&0));
+            assert!(restored
+                .pages
+                .iter()
+                .map(|(&page, &bytes)| (page, bytes))
+                .eq((1..count).map(|page| (page, 4096))));
+            Ok(())
+        })
+        .await
+        .unwrap();
+}
+
+#[test]
+fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
+    use model::SnapshotRecord;
+    let path = "default/shared/paged";
+    let chunk = |page, len, continuation| SnapshotRecord::Block {
+        store: path.into(),
+        block: model::Block {
+            id: block(0),
+            len,
+            pages: [(page, 4096)].into(),
+        },
+        continuation,
+    };
+    let mut state = State::default();
+    state
+        .restore(SnapshotRecord::Store {
+            path: path.into(),
+            page_size: 4,
+        })
+        .unwrap();
+    assert!(state.restore(chunk(1, 16, true)).is_err());
+    // The old complete-block representation has no continuation flag.
+    let mut legacy = serde_json::to_value(chunk(0, 16, false)).unwrap();
+    legacy["Block"]
+        .as_object_mut()
+        .unwrap()
+        .remove("continuation");
+    state
+        .restore(State::decode_snapshot(&serde_json::to_vec(&legacy).unwrap()).unwrap())
+        .unwrap();
+    assert!(state.restore(chunk(0, 16, false)).is_err());
+    assert!(state.restore(chunk(0, 16, true)).is_err());
+    assert!(state.restore(chunk(1, 12, true)).is_err());
+    assert!(state.restore(chunk(16, 16, true)).is_err());
+    state.restore(chunk(2, 16, true)).unwrap();
+    assert!(state.restore(chunk(1, 16, true)).is_err());
+    assert_eq!(
+        state.stores[path].blocks[&block(0)].pages,
+        [(0, 4096), (2, 4096)].into()
+    );
+}
+
+#[tokio::test]
 async fn catalog_failure_does_not_poison_another_stream_on_the_root_service() {
     let root = tempfile::tempdir().unwrap();
     let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
-    let catalog = Catalog::with_service(&service).unwrap();
+    let catalog = Catalog::with_service(&service, None).unwrap();
     let other = service
         .open_stream(
             PathBuf::from(".independent-test"),

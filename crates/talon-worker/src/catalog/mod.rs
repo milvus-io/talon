@@ -47,14 +47,18 @@ pub(crate) fn service(lock: Arc<CacheRootLock>) -> anyhow::Result<Arc<JournalSer
 impl Catalog {
     #[cfg(test)]
     pub(crate) fn open(lock: Arc<CacheRootLock>) -> anyhow::Result<Arc<Self>> {
-        Self::with_service(&service(lock)?)
+        Self::with_service(&service(lock)?, None)
     }
 
-    pub(crate) fn with_service(service: &Arc<JournalService>) -> anyhow::Result<Arc<Self>> {
-        let journal = service.open_stream(
+    pub(crate) fn with_service(
+        service: &Arc<JournalService>,
+        maintenance: Option<Arc<dyn talon_journal::Maintenance>>,
+    ) -> anyhow::Result<Arc<Self>> {
+        let journal = service.open_stream_with_maintenance(
             PathBuf::from(DIRECTORY),
             State::default(),
             StreamOptions::default(),
+            maintenance,
         )?;
         let catalog = Arc::new(Self {
             root: service.root().to_owned(),

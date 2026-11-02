@@ -18,9 +18,12 @@ impl WorkerBackground {
     /// Ownership cleanup requires the resolved persistent identity in `config.node_id`.
     pub fn start(worker: Arc<WorkerRuntime>, config: &WorkerConfig) -> Self {
         let mut background = (*worker).clone();
-        background.background_budget = Some(BackgroundBudget::new(config));
+        let budget = background
+            .background_budget
+            .get_or_insert_with(|| BackgroundBudget::new(config))
+            .clone();
         if let Some(small) = &background.small {
-            small.set_background_budget(background.background_budget.clone().unwrap());
+            small.set_background_budget(budget);
         }
         background.page_gc_config.scan_batch_size = background
             .page_gc_config

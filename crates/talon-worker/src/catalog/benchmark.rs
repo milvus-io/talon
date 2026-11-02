@@ -26,7 +26,7 @@ fn restart_replay_and_index() {
             },
         )
         .unwrap();
-        let catalog = Catalog::with_service(&service).unwrap();
+        let catalog = Catalog::with_service(&service, None).unwrap();
         let replay_seconds = started.elapsed().as_secs_f64();
         let entries = catalog
             .journal
@@ -80,6 +80,7 @@ fn restart_replay_and_index() {
         );
         state
             .restore(model::SnapshotRecord::Block {
+                continuation: false,
                 store: "default/shared/paged".into(),
                 block: model::Block {
                     id,

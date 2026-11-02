@@ -223,9 +223,21 @@ pub(super) fn valid_store(path: &str) -> bool {
 
 #[derive(Serialize, Deserialize)]
 pub(super) enum SnapshotRecord {
-    Store { path: String, page_size: u32 },
-    Block { store: String, block: Block },
-    Pending { transaction: u64, intent: Intent },
+    Store {
+        path: String,
+        page_size: u32,
+    },
+    Block {
+        store: String,
+        block: Block,
+        // Older snapshots contain one complete block without this field.
+        #[serde(default)]
+        continuation: bool,
+    },
+    Pending {
+        transaction: u64,
+        intent: Intent,
+    },
 }
 
 enum Frozen {
@@ -236,28 +248,59 @@ enum Frozen {
 
 /// Freeze references to blocks; only a concurrently mutated block is copied.
 /// Encoding runs on the journal's snapshot CPU thread, one record at a time.
-pub(super) struct Snapshot(std::vec::IntoIter<Frozen>);
+pub(super) struct Snapshot {
+    records: std::vec::IntoIter<Frozen>,
+    block: Option<(Arc<str>, Arc<Block>, Option<u32>)>,
+}
+
+// A page mapping needs at most 35 JSON bytes (u32 index and u64 allocation).
+// Bound encoding independently of block geometry, without cloning the full map.
+const SNAPSHOT_PAGES: usize = 1024;
 
 impl Iterator for Snapshot {
     type Item = io::Result<Bytes>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        self.0.next().map(|record| {
-            let record = match record {
-                Frozen::Store(path, page_size) => SnapshotRecord::Store { path, page_size },
-                Frozen::Block(store, block) => SnapshotRecord::Block {
-                    store: store.to_string(),
-                    block: block.as_ref().clone(),
-                },
-                Frozen::Pending(transaction, intent) => SnapshotRecord::Pending {
-                    transaction,
-                    intent,
-                },
-            };
+        use std::ops::Bound::{Excluded, Unbounded};
+        let record = loop {
+            if let Some((store, block, after)) = &mut self.block {
+                let pages: BTreeMap<_, _> = block
+                    .pages
+                    .range((after.map_or(Unbounded, Excluded), Unbounded))
+                    .take(SNAPSHOT_PAGES)
+                    .map(|(&page, &bytes)| (page, bytes))
+                    .collect();
+                if let Some((&last, _)) = pages.last_key_value() {
+                    let continuation = after.is_some();
+                    *after = Some(last);
+                    break SnapshotRecord::Block {
+                        store: store.to_string(),
+                        block: Block {
+                            id: block.id.clone(),
+                            len: block.len,
+                            pages,
+                        },
+                        continuation,
+                    };
+                }
+                self.block = None;
+            }
+            match self.records.next()? {
+                Frozen::Store(path, page_size) => break SnapshotRecord::Store { path, page_size },
+                Frozen::Block(store, block) => self.block = Some((store, block, None)),
+                Frozen::Pending(transaction, intent) => {
+                    break SnapshotRecord::Pending {
+                        transaction,
+                        intent,
+                    }
+                }
+            }
+        };
+        Some(
             serde_json::to_vec(&record)
                 .map(Bytes::from)
-                .map_err(io::Error::other)
-        })
+                .map_err(io::Error::other),
+        )
     }
 }
 
@@ -319,7 +362,10 @@ impl Machine for State {
                 .iter()
                 .map(|(id, intent)| Frozen::Pending(*id, intent.clone())),
         );
-        Ok(Snapshot(records.into_iter()))
+        Ok(Snapshot {
+            records: records.into_iter(),
+            block: None,
+        })
     }
 
     fn decode_snapshot(bytes: &[u8]) -> io::Result<SnapshotRecord> {
@@ -334,7 +380,11 @@ impl Machine for State {
                 }
                 self.apply(0, Record::Store { path, page_size })
             }
-            SnapshotRecord::Block { store, block } => {
+            SnapshotRecord::Block {
+                store,
+                block,
+                continuation,
+            } => {
                 let store = self
                     .stores
                     .get_mut(&store)
@@ -345,11 +395,27 @@ impl Machine for State {
                         .pages
                         .keys()
                         .any(|page| *page >= block.id.page_count(store.page_size))
-                    || store.blocks.contains_key(&block.id)
                 {
-                    return Err(invalid("invalid/duplicate snapshot block"));
+                    return Err(invalid("invalid snapshot block"));
                 }
-                store.blocks.insert(block.id.clone(), Arc::new(block));
+                if continuation {
+                    let previous = store
+                        .blocks
+                        .get_mut(&block.id)
+                        .ok_or_else(|| invalid("snapshot continuation without block"))?;
+                    if previous.len != block.len
+                        || previous.pages.last_key_value().unwrap().0
+                            >= block.pages.first_key_value().unwrap().0
+                    {
+                        return Err(invalid("invalid/duplicate snapshot page chunk"));
+                    }
+                    Arc::make_mut(previous).pages.extend(block.pages);
+                } else {
+                    if store.blocks.contains_key(&block.id) {
+                        return Err(invalid("duplicate snapshot block"));
+                    }
+                    store.blocks.insert(block.id.clone(), Arc::new(block));
+                }
                 Ok(())
             }
             SnapshotRecord::Pending {

@@ -165,7 +165,7 @@ async fn snapshot_and_tail_recover_and_streams_remain_independent() {
     );
 }
 #[tokio::test]
-async fn pipelined_writes_precede_fsync_and_do_not_block_other_streams() {
+async fn batches_are_serialized_while_other_streams_progress() {
     let dir = tempfile::tempdir().unwrap();
     let s = service(dir.path());
     let a = stream(&s, "a");
@@ -178,15 +178,24 @@ async fn pipelined_writes_precede_fsync_and_do_not_block_other_streams() {
     let h = a.clone();
     let second = tokio::spawn(async move { h.append((2, 2), Ack::Durable).await });
     let progress = tokio::time::timeout(Duration::from_secs(2), async {
-        while a.inner.control.writes.load(Ordering::Relaxed) < 2 {
+        while s.admission.count.available_permits() > s.options.max_requests - 2 {
             tokio::task::yield_now().await;
         }
         b.append((3, 3), Ack::Durable).await.unwrap();
     })
     .await;
+    // The second request is admitted but must not extend the log past the
+    // paused first batch. Other streams still complete durable writes.
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let writes = a.inner.control.writes.load(Ordering::Relaxed);
+    let length = std::fs::metadata(dir.path().join("a/journal.00000000000000000001"))
+        .unwrap()
+        .len();
     let syncs = a.inner.control.syncs.load(Ordering::Relaxed);
     pause.resume.notify_one();
     progress.unwrap();
+    assert_eq!(writes, 1);
+    assert_eq!(length, 0);
     assert_eq!(syncs, 0);
     first.await.unwrap().unwrap();
     second.await.unwrap().unwrap();
@@ -317,18 +326,42 @@ async fn crash_child() {
     let s = service(Path::new(&root));
     let a = stream(&s, "a");
     a.append((1, 1), Ack::Durable).await.unwrap();
+    let stage = std::env::var("TALON_JOURNAL_CHILD_STAGE").unwrap();
+    if stage == "queued_append" {
+        let pause = Arc::new(Pause::default());
+        *a.inner.control.write_pause.lock().unwrap() = Some(pause.clone());
+        let h = a.clone();
+        let _first = tokio::spawn(async move { h.append((2, 2), Ack::Written).await });
+        pause.entered.notified().await;
+        let h = a.clone();
+        let _second = tokio::spawn(async move { h.append((3, 3), Ack::Durable).await });
+        while s.admission.count.available_permits() > s.options.max_requests - 2 {
+            tokio::task::yield_now().await;
+        }
+        // Let the shared reactor run while the first batch remains paused.
+        // With parallel writes the later batch creates an interior log hole.
+        let b = stream(&s, "b");
+        b.append((9, 9), Ack::Durable).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        std::env::set_var("TALON_JOURNAL_CRASH_STAGE", &stage);
+        crash(&stage);
+        unreachable!();
+    }
     a.checkpoint().await.unwrap();
     a.append((2, 2), Ack::Durable).await.unwrap();
     a.append((1, 0), Ack::Durable).await.unwrap();
-    std::env::set_var(
-        "TALON_JOURNAL_CRASH_STAGE",
-        std::env::var("TALON_JOURNAL_CHILD_STAGE").unwrap(),
-    );
+    std::env::set_var("TALON_JOURNAL_CRASH_STAGE", stage);
     a.checkpoint().await.unwrap();
 }
 #[test]
-fn process_loss_at_checkpoint_boundaries() {
-    for stage in ["rotate", "snapshot_file", "snapshot_current", "cleanup"] {
+fn process_loss_at_write_and_checkpoint_boundaries() {
+    for stage in [
+        "queued_append",
+        "rotate",
+        "snapshot_file",
+        "snapshot_current",
+        "cleanup",
+    ] {
         let dir = tempfile::tempdir().unwrap();
         let ready = dir.path().join("ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -355,24 +388,88 @@ fn process_loss_at_checkpoint_boundaries() {
         let a = stream(&s, "a");
         assert_eq!(
             a.query_blocking(|m| Ok(m.0.clone())).unwrap(),
-            BTreeMap::from([(2, 2)])
+            BTreeMap::from([if stage == "queued_append" {
+                (1, 1)
+            } else {
+                (2, 2)
+            }])
         );
     }
 }
 
-struct BlockSnapshot(Arc<tokio::sync::Semaphore>);
+struct BlockSnapshot {
+    gate: Arc<tokio::sync::Semaphore>,
+    entered: tokio::sync::Notify,
+}
+impl BlockSnapshot {
+    fn new(gate: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            gate,
+            entered: tokio::sync::Notify::new(),
+        }
+    }
+}
 impl Maintenance for BlockSnapshot {
     fn bytes(&self, _: usize) -> futures::future::LocalBoxFuture<'_, ()> {
         Box::pin(async {})
     }
     fn io(&self) -> futures::future::LocalBoxFuture<'_, Box<dyn Send>> {
-        Box::pin(
-            async move { Box::new(self.0.clone().acquire_owned().await.unwrap()) as Box<dyn Send> },
-        )
+        Box::pin(async move {
+            self.entered.notify_one();
+            Box::new(self.gate.clone().acquire_owned().await.unwrap()) as Box<dyn Send>
+        })
     }
     fn delete(&self) -> futures::future::LocalBoxFuture<'_, ()> {
         Box::pin(async {})
     }
+}
+#[tokio::test]
+async fn recovered_tail_uses_initial_maintenance_for_automatic_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = service(dir.path());
+    let a = stream(&s, "a");
+    a.append((1, 1), Ack::Durable).await.unwrap();
+    a.append((2, 2), Ack::Durable).await.unwrap();
+    drop(a);
+    drop(s);
+
+    let s = service(dir.path());
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let policy = Arc::new(BlockSnapshot::new(gate.clone()));
+    let a = s
+        .open_stream_with_maintenance(
+            "a".into(),
+            State::default(),
+            StreamOptions {
+                checkpoint_bytes: 96,
+                ..Default::default()
+            },
+            Some(policy.clone()),
+        )
+        .unwrap();
+    // Recovery alone starts this checkpoint, before any new request is sent.
+    tokio::time::timeout(Duration::from_secs(2), policy.entered.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        std::fs::metadata(dir.path().join("a/snapshot.tmp"))
+            .unwrap()
+            .len(),
+        0
+    );
+    let progress =
+        tokio::time::timeout(Duration::from_secs(2), a.append((1, 0), Ack::Durable)).await;
+    gate.add_permits(1);
+    progress.unwrap().unwrap();
+    a.checkpoint().await.unwrap();
+    drop(a);
+    drop(s);
+    let s = service(dir.path());
+    let a = stream(&s, "a");
+    assert_eq!(
+        a.query(|m| Ok(m.0.clone())).await.unwrap(),
+        BTreeMap::from([(2, 2)])
+    );
 }
 #[tokio::test]
 async fn automatic_snapshot_overlaps_tail_writes_and_recovers() {
@@ -389,7 +486,7 @@ async fn automatic_snapshot_overlaps_tail_writes_and_recovers() {
         )
         .unwrap();
     let gate = Arc::new(tokio::sync::Semaphore::new(0));
-    a.set_maintenance(Arc::new(BlockSnapshot(gate.clone())));
+    a.set_maintenance(Arc::new(BlockSnapshot::new(gate.clone())));
     a.append((1, 1), Ack::Written).await.unwrap();
     a.append((2, 2), Ack::Durable).await.unwrap();
     tokio::time::timeout(Duration::from_secs(2), async {
@@ -572,7 +669,7 @@ async fn service_bounds_snapshot_encoders_without_blocking_other_appends() {
     let mut checkpoints = Vec::new();
     for name in ["a", "b"] {
         let a = stream(&s, name);
-        a.set_maintenance(Arc::new(BlockSnapshot(gate.clone())));
+        a.set_maintenance(Arc::new(BlockSnapshot::new(gate.clone())));
         a.append((1, 1), Ack::Written).await.unwrap();
         checkpoints.push(tokio::spawn(async move { a.checkpoint().await }));
     }

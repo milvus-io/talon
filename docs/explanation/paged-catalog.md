@@ -81,6 +81,12 @@ Prepare/Commit names here correspond to the encoded `Begin`/`Complete` records.
 Store registration records page geometry. The first completed put creates the
 block record; removal of the last page retires that record. Snapshot block
 records contain identity, logical length and page-index-to-allocation mappings.
+Mappings are encoded in chunks of at most 1,024 pages, so even the largest legal
+block/page geometry stays below the journal frame limit. Continuation chunks
+must match the block identity and length and advance beyond the previous page;
+duplicates and out-of-order chunks fail recovery. Existing single-record block
+snapshots remain readable. Older readers cannot restore multi-chunk snapshots;
+downgrading to such a reader requires a fresh cache root.
 
 If a data mutation or journal operation fails, further catalog mutations fail
 until restart. This conservative boundary prevents reuse of a path with an

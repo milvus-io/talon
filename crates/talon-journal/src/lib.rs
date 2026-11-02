@@ -224,6 +224,16 @@ impl JournalService {
         machine: M,
         options: StreamOptions,
     ) -> io::Result<Handle<M>> {
+        self.open_stream_with_maintenance(relative_path, machine, options, None)
+    }
+    /// Install maintenance limits before recovery can trigger an automatic checkpoint.
+    pub fn open_stream_with_maintenance<M: Machine>(
+        self: &Arc<Self>,
+        relative_path: PathBuf,
+        machine: M,
+        options: StreamOptions,
+        maintenance: Option<Arc<dyn Maintenance>>,
+    ) -> io::Result<Handle<M>> {
         if relative_path.as_os_str().is_empty()
             || !relative_path
                 .components()
@@ -267,7 +277,7 @@ impl JournalService {
         let poison = failed.clone();
         let allocated = Arc::new(AtomicU64::new(0));
         let accounting = allocated.clone();
-        let maintenance = Arc::new(std::sync::RwLock::new(None));
+        let maintenance = Arc::new(std::sync::RwLock::new(maintenance));
         let policy = maintenance.clone();
         let recovery_threads = self.options.recovery_threads;
         let max_record = options.max_record_bytes;

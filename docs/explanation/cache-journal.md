@@ -57,6 +57,8 @@ pub trait Machine: Send + 'static {
 JournalService::open(root, keepalive, Options) -> io::Result<Arc<JournalService>>;
 JournalService::wait_for_retiring(root) -> io::Result<()>;
 service.open_stream(relative_path, machine, StreamOptions) -> io::Result<Handle<M>>;
+service.open_stream_with_maintenance(relative_path, machine, StreamOptions, policy)
+    -> io::Result<Handle<M>>;
 handle.query_blocking(|machine: &M| -> io::Result<R>) -> io::Result<R>;
 
 // Async serving/maintenance methods.
@@ -95,7 +97,11 @@ thread; global admission saturation still applies backpressure to all streams. D
 `Written` means the complete log record was written and applied, without a
 promise of crash durability. `Durable` additionally waits for group fsync after
 all earlier writes through its boundary have completed. Submission order alone
-is not a durability barrier. Later independent log writes can overlap that sync.
+is not a durability barrier. Each stream submits one log batch at a time, so
+later writes cannot extend the file past an unfinished earlier batch after
+process loss. Batching still combines queued records, and the next batch can
+overlap the preceding batch's sync. Other streams and snapshot writes progress
+independently.
 
 The common frame includes version/domain-independent magic, length and its
 complement, LSN or snapshot ordinal, and a checksum covering header and payload.
@@ -143,6 +149,11 @@ Background rate/I/O budgets belong to Worker policy. Shared snapshot/cleanup
 uses an optional crate-independent `Maintenance` hook whose futures run locally
 on the journal runtime (including its timers); it must not import
 Worker types or charge foreground log commits to the maintenance budget.
+Namespace initialization attaches the same Worker budget to the root paged
+catalog and its small-store streams before serving requests. The catalog receives
+its initial policy before its writer starts, including automatic checkpoints of
+a recovered tail and reconciliation checkpoints. Background startup preserves
+the namespace budget instead of replacing the default small-store budget.
 
 ## Implementation ownership and validation
 

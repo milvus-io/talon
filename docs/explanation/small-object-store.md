@@ -183,8 +183,8 @@ small-store adapter.
 
 Admission budgets cover queued and in-flight metadata requests: 1,024 requests
 and 8 MiB of encoded request bytes across the service, reserved before encoding and retained until
-completion. Batch copies are additionally bounded by four in-flight batches,
-each targeting 256 KiB and at most 256 requests (a final record can exceed the
+completion. Each stream submits one log batch at a time, targeting 256 KiB and
+at most 256 requests (a final record can exceed the
 byte target). The writer drains immediately available requests without a timer
 that delays low-load writes. Queue saturation applies asynchronous backpressure.
 Each stream retains independent state, checkpoint progress and failure isolation.
@@ -349,7 +349,7 @@ and credits pending reclamation in other namespaces before selecting more victim
 ## Validation
 
 Regression coverage includes queue count/byte permits retained after dequeue and
-cancellation, multiple submitted log batches, fsync ordering behind incomplete
+cancellation, serialized log batches with cross-stream progress, fsync ordering behind incomplete
 writes, snapshot creation overlapping insert/delete/seal, automatic log rotation,
 recovery of snapshot entries sealed later, snapshot/current crash boundaries,
 truncated final log frames, corrupt committed metadata, old-format rejection
