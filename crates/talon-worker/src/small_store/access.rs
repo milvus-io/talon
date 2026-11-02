@@ -7,8 +7,8 @@ pub(super) const FILE: &str = "access.checkpoint";
 const MAGIC: &[u8; 8] = b"TLSA0001";
 
 impl SmallObjectStore {
-    /// Startup only, after index/policy reconstruction and before serving.
-    pub(crate) fn restore_access(&self, index: &crate::BlockIndex) {
+    /// Startup only, after policy reconstruction and before serving.
+    pub(super) fn restore_access(&self) {
         let result = (|| -> io::Result<()> {
             let bytes = match std::fs::read(self.root.join(FILE)) {
                 Ok(bytes) => bytes,
@@ -24,10 +24,8 @@ impl SmallObjectStore {
             for mut record in format::frames(body)? {
                 let last = format::u64(&mut record)?;
                 let id = format::id(record)?;
-                if self.contains(&id) {
-                    if let Some(access) = index.whole_access(&id) {
-                        restored.push((access, last));
-                    }
+                if let Some(access) = self.lookup(&id)?.and_then(|loc| loc.access) {
+                    restored.push((access, last));
                 }
             }
             for (access, last) in restored {
@@ -44,7 +42,6 @@ impl SmallObjectStore {
 
     pub(crate) async fn checkpoint_access(
         self: &Arc<Self>,
-        index: Arc<crate::BlockIndex>,
         budget: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<()> {
         let store = self.clone();
@@ -56,13 +53,19 @@ impl SmallObjectStore {
                 let bytes = tokio::task::spawn_blocking(move || -> io::Result<Bytes> {
                     let mut bytes = MAGIC.to_vec();
                     for stream in snapshot_store.streams() {
-                        let keys: Vec<_> = stream.entries.read().unwrap().keys().cloned().collect();
-                        for key in keys {
-                            if let Some(access) = index.whole_access(&format::id(&key)?) {
-                                let mut record = access.last_access().to_le_bytes().to_vec();
-                                record.extend_from_slice(&key);
-                                format::frame(&mut bytes, &record)?;
-                            }
+                        let entries: Vec<_> = stream
+                            .entries
+                            .read()
+                            .unwrap()
+                            .iter()
+                            .filter_map(|(key, loc)| {
+                                loc.access.clone().map(|access| (key.clone(), access))
+                            })
+                            .collect();
+                        for (key, access) in entries {
+                            let mut record = access.last_access().to_le_bytes().to_vec();
+                            record.extend_from_slice(&key);
+                            format::frame(&mut bytes, &record)?;
                         }
                     }
                     Ok(bytes.into())

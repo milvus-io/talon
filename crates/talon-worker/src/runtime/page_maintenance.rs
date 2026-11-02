@@ -400,7 +400,7 @@ impl WorkerRuntime {
                 let id = &candidate.block;
                 let bytes = runtime.index.get(id).map_or(0, |meta| meta.resident_bytes());
                 let pages = claim.len();
-                if let Err(error) = runtime.store.delete(id).await {
+                if let Err(error) = runtime.delete_whole(id).await {
                     runtime.page_gc_metrics.delete_errors.inc();
                     tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
                     return;
@@ -490,7 +490,7 @@ impl WorkerRuntime {
                             if !state.inner.lock().unwrap().pages.is_empty() {
                                 return;
                             }
-                            if let Err(error) = runtime.store.delete(&id).await {
+                            if let Err(error) = runtime.delete_whole(&id).await {
                                 tracing::warn!(block = %id, %error, "whole block unlink failed");
                                 return;
                             }

@@ -111,7 +111,7 @@ impl WorkerRuntime {
         });
         let mut pending = stream::iter(jobs)
             .map(|(index, block, offset, len, block_len)| async move {
-                if self.load_range_cached(&block, offset, len) {
+                if self.load_range_cached(&block, offset, len, block_len) {
                     return (index, Ok(()));
                 }
                 // Only misses wait for payload capacity. The probe uses metadata,
@@ -184,7 +184,23 @@ impl WorkerRuntime {
     }
 
     /// Trust published residency metadata; LOAD does not verify cache files.
-    pub(super) fn load_range_cached(&self, block: &BlockId, offset: u64, len: u64) -> bool {
+    pub(super) fn load_range_cached(
+        &self,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+        block_len: u64,
+    ) -> bool {
+        if self.store.accepts_small(block, block_len) {
+            if let Ok(Some(loc)) = self.small_location(block) {
+                if offset.checked_add(len).is_some_and(|end| end <= loc.len()) {
+                    loc.touch();
+                    self.record_l2_hit();
+                    return true;
+                }
+            }
+            return false;
+        }
         let Some(meta) = self.index.get_and_touch(block) else {
             return false;
         };
@@ -228,7 +244,7 @@ impl WorkerRuntime {
         }
         let key = LoadKey::Whole(block.clone());
         loop {
-            if self.load_range_cached(block, 0, len) {
+            if self.load_range_cached(block, 0, len, len) {
                 return Ok(());
             }
             let (admission, flight) = self.inflight.admit_traced(key.clone());
@@ -1145,7 +1161,7 @@ mod tests {
             assert_eq!(runtime.l1.resident_bytes(), 0);
             assert_eq!(runtime.load_bytes.available_permits(), 8);
             assert_eq!(runtime.inflight_loads(), 0);
-            assert!(runtime.load_range_cached(&target, 0, 8));
+            assert!(runtime.load_range_cached(&target, 0, 8, 8));
         }
     }
 
@@ -1155,17 +1171,17 @@ mod tests {
             let (_root, _, runtime) = setup(paged);
             let target = block(16);
             runtime.load_block(&target, 5).await.unwrap();
-            assert!(runtime.load_range_cached(&target, 0, 5));
-            assert!(!runtime.load_range_cached(&target, 0, 8));
+            assert!(runtime.load_range_cached(&target, 0, 5, 8));
+            assert!(!runtime.load_range_cached(&target, 0, 8, 8));
             if paged {
                 let state = runtime.page_lifecycle.block(&target);
                 let _gate = state.gate.lock().await;
                 let candidate = state.candidate(PageIndex(1)).unwrap();
                 assert!(state.claim(&candidate, runtime.page_clock.now(), None));
                 // GC has claimed deletion, but has not unlinked or cleared the bit.
-                assert!(!runtime.load_range_cached(&target, 0, 5));
+                assert!(!runtime.load_range_cached(&target, 0, 5, 8));
                 state.abort(&candidate, 0);
-                assert!(runtime.load_range_cached(&target, 0, 5));
+                assert!(runtime.load_range_cached(&target, 0, 5, 8));
             }
         }
     }
@@ -1178,7 +1194,7 @@ mod tests {
             let target = block(0);
             runtime.load_block(&target, 8).await.unwrap();
             // Eviction removes both the file and its published residency.
-            assert!(runtime.load_range_cached(&target, 0, 8));
+            assert!(runtime.load_range_cached(&target, 0, 8, 8));
             if let Some(store) = &runtime.paged {
                 store.evict_page(&target, PageIndex(1)).unwrap();
                 runtime.index.clear_page(&target, PageIndex(1));
@@ -1200,7 +1216,7 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(backend.fetches.load(Ordering::SeqCst), calls + 1);
-            assert!(runtime.load_range_cached(&target, 0, 8));
+            assert!(runtime.load_range_cached(&target, 0, 8, 8));
             assert_eq!(runtime.load_bytes.available_permits(), 8);
         }
     }

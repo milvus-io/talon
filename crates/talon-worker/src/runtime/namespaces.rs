@@ -1526,6 +1526,14 @@ mod tests {
                 .join("default/scopes")
                 .join(format!("v1-{}", "a".repeat(64)));
             std::fs::create_dir_all(&scope).unwrap();
+            let whole = WholeBlockStore::open(&scope)
+                .unwrap()
+                .with_small_objects(
+                    cfg.small_object_threshold_bytes,
+                    cfg.small_object_segment_bytes,
+                    cfg.capacity_bytes,
+                )
+                .unwrap();
             if paged {
                 let store = PagedBlockStore::open(scope.join("paged"), 4).unwrap();
                 store.write_sidecar(&block(16), 16).unwrap();
@@ -1533,8 +1541,7 @@ mod tests {
                     .put_page(&block(16), PageIndex(0), Bytes::from_static(b"data"))
                     .unwrap();
             } else {
-                let store = WholeBlockStore::open(&scope).unwrap();
-                store
+                whole
                     .put(&block(16), Bytes::from_static(b"data"))
                     .await
                     .unwrap();

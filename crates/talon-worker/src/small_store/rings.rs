@@ -14,6 +14,7 @@ pub struct SmallObjectStore {
     pub(super) access_checkpoint: tokio::sync::Mutex<()>,
     pub(super) access_bytes: std::sync::atomic::AtomicU64,
     streams: RwLock<BTreeMap<usize, Stream>>,
+    policy: std::sync::OnceLock<Arc<Lru>>,
     // Only in-flight identities are retained; no second resident-object index.
     mutations: Arc<InFlightLoads>,
     pub(super) tasks: Arc<crate::page_gc::Mutations>,
@@ -36,8 +37,8 @@ impl SmallObjectStore {
         )?);
         let mut streams = BTreeMap::new();
         streams.insert(0, Arc::new(OnceCell::new_with(Some(legacy.clone()))));
-        // Recover all historical slots, even after reducing the ring count or
-        // disabling new small-object admissions. Never remap persisted files.
+        // Recover every slot after reducing the ring count. Worker startup
+        // separately validates routing geometry before opening this engine.
         for entry in std::fs::read_dir(&root)? {
             let entry = entry?;
             let name = entry.file_name();
@@ -89,6 +90,7 @@ impl SmallObjectStore {
             root,
             legacy,
             streams: RwLock::new(streams),
+            policy: std::sync::OnceLock::new(),
             mutations: Arc::new(InFlightLoads::new()),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
         })
@@ -147,23 +149,41 @@ impl SmallObjectStore {
         self.legacy.accepts(id, len)
     }
     pub fn contains(&self, id: &BlockId) -> bool {
-        self.owner(id).is_some()
+        self.lookup(id).ok().flatten().is_some()
     }
 
-    pub fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
-        for stream in self.streams() {
-            if let Some(handle) = stream.get(id)? {
-                return Ok(Some(handle));
+    /// Resolve residency and physical placement in one directory lookup per
+    /// stream. Encode once and borrow the stream registry without allocating a
+    /// temporary Vec. The worker validates routing compatibility at startup.
+    pub(crate) fn lookup(&self, id: &BlockId) -> io::Result<Option<Location>> {
+        if id.offset != 0 {
+            return Ok(None);
+        }
+        let key = format::key(id)?;
+        for stream in self
+            .streams
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.get())
+        {
+            if let Some(loc) = stream.entries.read().unwrap().get(key.as_slice()).cloned() {
+                return Ok(Some(loc));
             }
         }
         Ok(None)
     }
 
+    pub fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+        self.lookup(id)?
+            .map(|loc| loc.range(0, loc.len))
+            .transpose()
+    }
+
     pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
-        for stream in self.streams() {
-            if let Some(bytes) = stream.read(id).await? {
-                return Ok(Some(bytes));
-            }
+        if let Some(loc) = self.lookup(id)? {
+            loc.touch();
+            return Ok(Some(loc.read().await?));
         }
         Ok(None)
     }
@@ -182,7 +202,9 @@ impl SmallObjectStore {
                     Some(stream) => stream,
                     None => store.writer(slot).await?,
                 };
-                stream.put_inner(&id, value).await
+                stream
+                    .put_inner(&id, value, store.policy.get().cloned())
+                    .await
             })
             .await
     }
@@ -215,11 +237,52 @@ impl SmallObjectStore {
         Ok(total)
     }
 
-    pub(crate) fn restore_index(&self, index: &crate::BlockIndex) -> io::Result<()> {
+    /// Startup only, before serving or admitting writes. Restore the shared
+    /// eviction policy directly from locators, without a second residency index.
+    pub(crate) fn bind_policy(&self, policy: Arc<Lru>) {
+        assert!(
+            self.policy.set(policy.clone()).is_ok(),
+            "small store already bound to a runtime"
+        );
         for stream in self.streams() {
-            stream.restore_index(index)?;
+            stream
+                .restore_policy(&policy)
+                .expect("validated small object identity");
         }
-        Ok(())
+        self.restore_access();
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.streams
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.get())
+            .map(|s| s.entries.read().unwrap().len())
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn logical_bytes(&self) -> u64 {
+        self.streams
+            .read()
+            .unwrap()
+            .values()
+            .filter_map(|s| s.get())
+            .map(|s| {
+                s.entries
+                    .read()
+                    .unwrap()
+                    .values()
+                    .map(|loc| loc.len)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn access(&self, id: &BlockId) -> Option<AccessHandle> {
+        self.lookup(id).ok().flatten()?.access
     }
 
     /// Only threshold-eligible segments provide planning credit. Garbage in a

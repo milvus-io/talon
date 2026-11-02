@@ -89,16 +89,17 @@ pub struct WholeBlockStore {
 }
 
 impl WholeBlockStore {
-    /// Attach the independent packed store. Reopen existing segments even when
-    /// admission is disabled so threshold changes never hide resident objects.
+    /// Bind routing to this cache root. Changing the threshold requires a new
+    /// cache directory, so reads can route by size without probing both stores.
     pub fn with_small_objects(
         mut self,
         threshold: u64,
         segment_size: u64,
         capacity: u64,
     ) -> Result<Self> {
+        self.check_small_routing(threshold)?;
         let root = self.root.join("small");
-        if threshold > 0 || root.exists() {
+        if threshold > 0 {
             self.small = Some(Arc::new(crate::small_store::SmallObjectStore::open(
                 root,
                 threshold,
@@ -108,6 +109,50 @@ impl WholeBlockStore {
             )?));
         }
         Ok(self)
+    }
+
+    fn check_small_routing(&self, threshold: u64) -> Result<()> {
+        let path = self.root.join("small-routing.json");
+        // The version includes the single-directory residency model. Do not
+        // silently adopt old mixed layouts or reinterpret them after restart.
+        let expected = (1_u32, threshold);
+        match std::fs::read(&path) {
+            Ok(bytes) => {
+                let stored: (u32, u64) = serde_json::from_slice(&bytes).map_err(|e| {
+                    Error::Other(format!(
+                        "invalid small store routing at {}: {e}; use a new empty cache directory",
+                        path.display()
+                    ))
+                })?;
+                if stored != expected {
+                    return Err(Error::Other(format!("incompatible small store routing at {}: stored {stored:?}, requested {expected:?}; use a new empty cache directory", path.display())));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                for entry in std::fs::read_dir(&self.root)? {
+                    let entry = entry?;
+                    let name = entry.file_name();
+                    if name != "cache_geometry.json"
+                        && name != ".worker.lock"
+                        && name != "small-routing.json.tmp"
+                    {
+                        return Err(Error::Other(format!("cache directory {} predates small store routing metadata; use a new empty cache directory", self.root.display())));
+                    }
+                }
+                let tmp = path.with_extension("json.tmp");
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(true)
+                    .open(&tmp)?;
+                file.write_all(&serde_json::to_vec(&expected).expect("routing tuple serializes"))?;
+                file.sync_all()?;
+                std::fs::rename(tmp, &path)?;
+                std::fs::File::open(&self.root)?.sync_all()?;
+            }
+            Err(e) => return Err(e.into()),
+        }
+        Ok(())
     }
 
     pub(crate) fn small(&self) -> Option<&Arc<crate::small_store::SmallObjectStore>> {
@@ -156,14 +201,6 @@ impl WholeBlockStore {
         id: &BlockId,
         value: talon_uring::Payload,
     ) -> Result<u64> {
-        if let Some(small) = self
-            .small
-            .clone()
-            .filter(|s| s.accepts(id, value.len() as u64) || s.contains(id))
-        {
-            let id = id.clone();
-            return Ok(small.put(&id, value.into_bytes()).await?);
-        }
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
         let meta = BlockMeta {
@@ -332,9 +369,6 @@ impl WholeBlockStore {
         for entry in self.scan_allocated()? {
             index.commit_allocated(entry.meta, entry.allocated);
         }
-        if let Some(small) = &self.small {
-            small.restore_index(index)?;
-        }
         Ok(())
     }
 
@@ -440,20 +474,6 @@ impl WholeBlockStore {
     /// it is not on the hot serving path that motivated the fd cache; routing it
     /// through the cache is a follow-up, not a correctness matter.
     pub async fn get_range_bytes(&self, id: &BlockId, offset: u64, len: u64) -> Result<Bytes> {
-        if let Some(small) = self.small.clone().filter(|s| s.contains(id)) {
-            let id = id.clone();
-            {
-                let bytes = small
-                    .read(&id)
-                    .await?
-                    .ok_or_else(|| Error::NotFound(id.to_string()))?;
-                let end = offset
-                    .checked_add(len)
-                    .filter(|end| *end <= bytes.len() as u64)
-                    .ok_or_else(|| Error::Other("small object range out of bounds".into()))?;
-                return Ok(bytes.slice(offset as usize..end as usize));
-            }
-        }
         let path = self.path_for(id);
         let id = id.clone();
         if self.uring {
@@ -493,11 +513,6 @@ impl WholeBlockStore {
 #[async_trait]
 impl ObjectStore for WholeBlockStore {
     async fn get_block(&self, id: &BlockId) -> Result<BlockHandle> {
-        if let Some(small) = &self.small {
-            if let Some(handle) = small.get(id)? {
-                return Ok(handle);
-            }
-        }
         let (fd, len) = self.open_ro(id).await?;
         Ok(BlockHandle::from_shared(fd, 0, len))
     }
@@ -509,16 +524,6 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_range(&self, id: &BlockId, offset: u64, len: u64) -> Result<Vec<BlockHandle>> {
-        if let Some(small) = &self.small {
-            if let Some(mut handle) = small.get(id)? {
-                if offset.checked_add(len).map_or(true, |end| end > handle.len) {
-                    return Err(Error::Other("small object range out of bounds".into()));
-                }
-                handle.offset += offset;
-                handle.len = len;
-                return Ok(vec![handle]);
-            }
-        }
         let (fd, file_len) = self.open_ro(id).await?;
         if offset.checked_add(len).map_or(true, |end| end > file_len) {
             return Err(Error::Other(format!(
@@ -529,13 +534,6 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn get_bytes(&self, id: &BlockId) -> Result<Bytes> {
-        if let Some(small) = self.small.clone().filter(|s| s.contains(id)) {
-            let id = id.clone();
-            return small
-                .read(&id)
-                .await?
-                .ok_or_else(|| Error::NotFound(id.to_string()));
-        }
         let path = self.path_for(id);
         let id = id.clone();
         if self.uring {
@@ -570,10 +568,6 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
-        if let Some(small) = self.small.clone() {
-            let id = id.clone();
-            small.delete(&id).await?;
-        }
         let path = self.path_for(id);
         let meta_path = self.meta_path_for(id);
         let cached_path = path.clone();

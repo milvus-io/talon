@@ -267,7 +267,8 @@ pub struct WorkerConfig {
     pub capacity_bytes: u64,
     /// Target packed segment size, including its index.
     pub small_object_segment_bytes: u64,
-    /// Upper exclusive object size for packed storage; 0 disables new admissions.
+    /// Upper exclusive object size for packed storage; 0 disables the engine.
+    /// Changing this value requires a new empty cache directory.
     pub small_object_threshold_bytes: u64,
     /// Worker-wide whole-block cached descriptor limit, shared by namespaces.
     /// Zero disables caching. Startup-only; active readers and sockets hold extra FDs.
@@ -1126,7 +1127,7 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         secret: false,
         help: "L2 page size in bytes; 0 keeps whole-block L2, non-zero enables paged L2.",
     },
-    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("1048576"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; 0 disables new admissions." },
+    ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES", key: "small_object_threshold_bytes", default: Some("1048576"), cli: false, secret: false, help: "Upper exclusive object size for packed storage; 0 disables the engine. Changing this value requires a new empty cache directory." },
     ConfigVar { env: "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES", key: "small_object_segment_bytes", default: Some("67108864"), cli: false, secret: false, help: "Target packed segment size, including its index." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_ENABLED", key: "ownership_gc_enabled", default: Some("true"), cli: false, secret: false, help: "Reclaim misplaced cache blocks on membership changes and hourly admission checks." },
     ConfigVar { env: "TALON_WORKER_OWNERSHIP_GC_REPLICAS", key: "ownership_gc_replicas", default: Some("1"), cli: false, secret: false, help: "Number of placement candidates to retain; must cover every reader replica count." },

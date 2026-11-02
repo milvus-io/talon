@@ -363,10 +363,10 @@ async fn small_layout_probe() {
         )
         .unwrap(),
     );
-    let index = crate::BlockIndex::new();
-    store.restore_index(&index).unwrap();
+    let policy = crate::Lru::new();
+    store.restore_policy(&policy).unwrap();
     let packed_restore = start.elapsed();
-    assert_eq!(index.len(), 10_000);
+    assert_eq!(policy.len(), 10_000);
     let whole_usage = usage(&dir.path().join("whole"));
     let packed_usage = usage(&dir.path().join("packed"));
     println!(

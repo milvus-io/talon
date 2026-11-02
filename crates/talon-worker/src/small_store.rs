@@ -12,6 +12,8 @@ pub use rings::SmallObjectStore;
 #[cfg(test)]
 mod tests;
 
+use crate::eviction::AccessHandle;
+use crate::{CacheUnit, Lru};
 use bytes::Bytes;
 use format::{invalid, MAGIC};
 use std::collections::{BTreeMap, HashMap};
@@ -22,18 +24,43 @@ use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, RwLock, Weak};
 use std::time::{Duration, Instant};
-use talon_core::{BlockForm, BlockHandle, BlockId, BlockMeta};
+use talon_core::{BlockHandle, BlockId};
 
 #[derive(Clone)]
-struct Location {
+pub(crate) struct Location {
     fd: Arc<OwnedFd>,
     segment: u64,
     offset: u64,
     len: u64,
     checksum: u64,
+    // Shared with the eviction policy; relocation preserves this exact token.
+    access: Option<AccessHandle>,
 }
 impl Location {
-    async fn read(&self) -> io::Result<Bytes> {
+    pub(crate) fn len(&self) -> u64 {
+        self.len
+    }
+
+    pub(crate) fn touch(&self) {
+        if let Some(access) = &self.access {
+            access.touch();
+        }
+    }
+
+    pub(crate) fn range(&self, offset: u64, len: u64) -> io::Result<BlockHandle> {
+        if offset.checked_add(len).map_or(true, |end| end > self.len) {
+            return Err(invalid("small object range out of bounds"));
+        }
+        self.touch();
+        Ok(BlockHandle::from_shared(
+            self.fd.clone(),
+            self.offset + offset,
+            len,
+        ))
+    }
+
+    // Deliberately does not touch: relocation also reads through this snapshot.
+    pub(crate) async fn read(&self) -> io::Result<Bytes> {
         let bytes = disk_io::read(self.fd.clone(), self.offset, self.len as usize).await?;
         if xxhash_rust::xxh3::xxh3_64(&bytes) != self.checksum {
             return Err(invalid("small object payload checksum"));
@@ -78,7 +105,8 @@ struct State {
 
 /// One independently appended and sealed stream within a namespace/credential scope.
 /// The compact encoded identity is stored once here, without separate String
-/// allocations. Worker BlockIndex/LRU still own policy metadata in v1.
+/// allocations. Locators own access tokens shared with the eviction policy;
+/// small objects are never registered in the generic BlockIndex.
 struct SegmentStore {
     #[cfg(test)]
     seal_pause: Mutex<Option<Arc<tests::SealPause>>>,
@@ -233,6 +261,7 @@ impl SegmentStore {
             .is_some_and(|k| self.entries.read().unwrap().contains_key(k.as_slice()))
     }
 
+    #[cfg(test)]
     pub fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
         let key = format::key(id)?;
         // Clone the fd under the same lock that removes the locator. An unlink
@@ -245,6 +274,7 @@ impl SegmentStore {
             .map(|loc| BlockHandle::from_shared(loc.fd.clone(), loc.offset, loc.len)))
     }
 
+    #[cfg(test)]
     pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
         let loc = self
             .entries
@@ -263,13 +293,18 @@ impl SegmentStore {
         let store = self.clone();
         let id = id.clone();
         self.tasks
-            .run(async move { store.put_inner(&id, value).await })
+            .run(async move { store.put_inner(&id, value, None).await })
             .await
     }
 
     /// The public store holds the identity mutation guard through completion.
     /// Different identities reserve briefly, then submit independent I/O.
-    async fn put_inner(self: &Arc<Self>, id: &BlockId, value: Bytes) -> io::Result<u64> {
+    async fn put_inner(
+        self: &Arc<Self>,
+        id: &BlockId,
+        value: Bytes,
+        policy: Option<Arc<Lru>>,
+    ) -> io::Result<u64> {
         if value.is_empty()
             || value.len() > 128 << 20
             || id.offset != 0
@@ -291,17 +326,21 @@ impl SegmentStore {
             .acquire()
             .await
             .expect("append slots stay open");
-        let (loc, index, metadata, frame) = loop {
+        let (mut loc, index, metadata, frame) = loop {
             let changed = self.pipeline_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
             let mut state = self.state.lock().await;
             self.healthy(&state)?;
-            if let Some(old) = self.entries.read().unwrap().get(key.as_ref()) {
+            if let Some(old) = self.entries.write().unwrap().get_mut(key.as_ref()) {
                 if old.len != len || old.checksum != checksum {
                     return Err(invalid(
                         "different bytes for immutable small object identity",
                     ));
+                }
+                if let Some(policy) = &policy {
+                    old.access =
+                        Some(policy.insert_with_policy(CacheUnit::Whole(id.clone()), charge, true));
                 }
                 return Ok(charge);
             }
@@ -347,6 +386,7 @@ impl SegmentStore {
                 offset: s.bytes,
                 len,
                 checksum,
+                access: None,
             };
             let frame = append_frame(loc.offset, len, checksum, &key)?;
             let metadata = s.metadata;
@@ -417,7 +457,15 @@ impl SegmentStore {
         segment.records.insert(loc.offset, key.clone());
         state.allocated += added;
         state.live += charge;
-        self.entries.write().unwrap().insert(key, loc);
+        // Publish policy and locator together. The runtime's block gate keeps
+        // eviction from retiring this admission before its mutation completes.
+        let mut entries = self.entries.write().unwrap();
+        if let Some(policy) = policy {
+            loc.access =
+                Some(policy.insert_with_policy(CacheUnit::Whole(id.clone()), charge, true));
+        }
+        entries.insert(key, loc);
+        drop(entries);
         self.refresh_stats(&state);
         Ok(charge)
     }
@@ -493,17 +541,13 @@ impl SegmentStore {
         Ok(stats)
     }
 
-    pub(crate) fn restore_index(&self, index: &crate::BlockIndex) -> io::Result<()> {
-        for (key, loc) in self.entries.read().unwrap().iter() {
-            index.commit_allocated_with_policy(
-                BlockMeta {
-                    id: format::id(key)?,
-                    form: BlockForm::Whole,
-                    len: loc.len,
-                },
-                [(None, charge(key, loc.len))],
+    fn restore_policy(&self, policy: &Lru) -> io::Result<()> {
+        for (key, loc) in self.entries.write().unwrap().iter_mut() {
+            loc.access = Some(policy.insert_with_policy(
+                CacheUnit::Whole(format::id(key)?),
+                charge(key, loc.len),
                 true,
-            );
+            ));
         }
         Ok(())
     }
@@ -601,10 +645,9 @@ impl SegmentStore {
             if let Some(new) = replacement {
                 for (key, loc) in &entries {
                     let bytes = loc.read().await?;
-                    moved.push((
-                        key.clone(),
-                        self.append(&mut state, new, key, bytes, false).await?,
-                    ));
+                    let mut replacement = self.append(&mut state, new, key, bytes, false).await?;
+                    replacement.access = loc.access.clone();
+                    moved.push((key.clone(), replacement));
                 }
                 let s = state.segments.get_mut(&new).unwrap();
                 disk_io::sync(s.data.clone()).await?;
@@ -745,6 +788,7 @@ impl SegmentStore {
             offset,
             len,
             checksum,
+            access: None,
         };
         self.refresh_stats(state);
         Ok(loc)
@@ -921,7 +965,7 @@ impl SegmentStore {
         let bytes = data.metadata()?.len();
         let metadata = index.metadata()?.len();
         // A record consumes >= 37 index bytes; each delete adds 21. Include a
-        // bounded allowance for old geometry when the threshold is changed.
+        // bounded allowance for segments sealed under an older segment size.
         if metadata > 2 * (1u64 << 30) {
             return Err(invalid("small object index too large"));
         }
@@ -963,6 +1007,7 @@ impl SegmentStore {
                                     offset,
                                     len,
                                     checksum,
+                                    access: None,
                                 },
                             ),
                         )

@@ -57,6 +57,17 @@ impl BackendStore for Origin {
     }
 }
 fn runtime(root: &Path, paged: bool, l1: bool) -> (Arc<Origin>, WorkerRuntime) {
+    runtime_with_geometry(root, paged, l1, 128 << 10, 256 << 10, 16 << 20)
+}
+
+fn runtime_with_geometry(
+    root: &Path,
+    paged: bool,
+    l1: bool,
+    threshold: u64,
+    segment: u64,
+    capacity: u64,
+) -> (Arc<Origin>, WorkerRuntime) {
     let backend = Arc::new(Origin {
         fetches: AtomicUsize::new(0),
         short: AtomicBool::new(false),
@@ -64,7 +75,7 @@ fn runtime(root: &Path, paged: bool, l1: bool) -> (Arc<Origin>, WorkerRuntime) {
     });
     let store = WholeBlockStore::open(root)
         .unwrap()
-        .with_small_objects(128 << 10, 256 << 10, 16 << 20)
+        .with_small_objects(threshold, segment, capacity)
         .unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
@@ -74,10 +85,10 @@ fn runtime(root: &Path, paged: bool, l1: bool) -> (Arc<Origin>, WorkerRuntime) {
         Arc::new(InFlightLoads::new()),
         backend.clone(),
         1 << 20,
-        16 << 20,
+        capacity,
         if l1 { 1 << 20 } else { 0 },
         1024,
-        WorkerMetrics::new(16 << 20),
+        WorkerMetrics::new(capacity),
     );
     if paged {
         worker = worker.with_paged_store(PagedBlockStore::open(root.join("paged"), 1024).unwrap());
@@ -126,10 +137,12 @@ async fn small_read_fetches_once_and_returns_a_segment_range() {
             offset: 100,
             len: 500,
         };
-        assert_eq!(
-            w.serve_cached(&cached).await.unwrap(),
-            data().slice(100..600)
+        assert!(w.serve_cached(&cached).await.unwrap_err().is::<CacheMiss>());
+        assert!(
+            w.index.is_empty(),
+            "packed objects own their only residency directory"
         );
+        assert_eq!(w.block_count(), 1);
         assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
     }
 }
@@ -152,6 +165,180 @@ async fn small_load_deduplicates_whole_objects_and_does_not_populate_l1() {
             .unwrap();
         assert!(w.l1_page_count() > 0);
     }
+}
+
+#[tokio::test]
+async fn small_residency_and_reads_survive_restart_without_block_index() {
+    for paged in [false, true] {
+        for l1 in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (_, w) = runtime(dir.path(), paged, l1);
+            w.serve_versioned(&request(), &Version::new("v1"), 3072)
+                .await
+                .unwrap();
+            assert!(w.index.is_empty());
+            assert_eq!(w.block_count(), 1);
+            assert_eq!(w.logical_resident_bytes(), 3072);
+            w.store.maintain_small(true).await.unwrap();
+            drop(w);
+            let (origin, w) = runtime(dir.path(), paged, l1);
+            assert!(w.index.is_empty());
+            assert_eq!(w.block_count(), 1);
+            for _ in 0..2 {
+                let result = w
+                    .serve_versioned(&request(), &Version::new("v1"), 3072)
+                    .await
+                    .unwrap();
+                let bytes = match result {
+                    ServeOutcome::Bytes(bytes) => bytes.to_vec(),
+                    result => super::tests::read_handle(result),
+                };
+                assert_eq!(bytes, data().slice(100..600));
+            }
+            w.load_block(&id(&w), 3072).await.unwrap();
+            assert_eq!(origin.fetches.load(Ordering::SeqCst), 0);
+            assert!(w.index.is_empty());
+            assert_eq!(w.l1_page_count() > 0, l1);
+            // Cache-only requests intentionally retain the ordinary-store API.
+            let cached = CachedRangeRequest {
+                object: object(),
+                version: Version::new("v1"),
+                offset: 100,
+                len: 500,
+            };
+            assert!(w.serve_cached(&cached).await.unwrap_err().is::<CacheMiss>());
+            // At the threshold the object belongs to ordinary storage, which
+            // still participates in BlockIndex and cache-only reads.
+            let mut large = id(&w);
+            large.object.object_path = "at-threshold".into();
+            w.commit_cached_block(&large, Bytes::from(vec![7; 128 << 10]))
+                .await
+                .unwrap();
+            assert_eq!(w.index.len(), 1);
+            assert_eq!(w.block_count(), 2);
+            let cached = CachedRangeRequest {
+                object: large.object,
+                version: large.version,
+                offset: 100,
+                len: 500,
+            };
+            assert_eq!(
+                w.serve_cached(&cached).await.unwrap(),
+                Bytes::from(vec![7; 500])
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn small_routing_keeps_the_resolved_version_and_size_together() {
+    for paged in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, w) = runtime(dir.path(), paged, false);
+        let stat = w.resolve_object_stat(&object(), false).await.unwrap();
+        w.store_version(&object(), &Version::new("v2"), 1 << 20);
+        w.serve_at(&request(), &stat.version, Some(stat.len))
+            .await
+            .unwrap();
+        assert!(w.index.is_empty());
+        assert!(w.store.small().unwrap().contains(&id(&w)));
+        w.serve_range_at(&request(), &stat.version, Some(stat.len))
+            .await
+            .unwrap();
+        assert_eq!(origin.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(w.cached_version(&object()), Some(Version::new("v2")));
+    }
+}
+
+#[tokio::test]
+async fn small_and_ordinary_admissions_cannot_share_an_identity() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), true, false);
+    let block = id(&w);
+    w.write_object(&object(), data()).await.unwrap();
+    assert!(w
+        .serve_versioned(&request(), &block.version, 128 << 10)
+        .await
+        .is_err());
+    assert!(w
+        .commit_cached_block(&block, Bytes::from(vec![7; 128 << 10]))
+        .await
+        .is_err());
+    assert!(w.index.is_empty());
+    assert!(w.paged.as_ref().unwrap().scan().unwrap().is_empty());
+    assert_eq!(w.block_count(), 1);
+    assert_eq!(
+        w.store.small().unwrap().read(&block).await.unwrap(),
+        Some(data())
+    );
+    w.delete_object(&object()).await.unwrap();
+    assert_eq!(w.block_count(), 0);
+    assert!(w.lru.block_candidates(&block).is_empty());
+    assert_eq!(w.lru.len(), 0);
+
+    for paged in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, w) = runtime(dir.path(), paged, false);
+        let block = id(&w);
+        if paged {
+            w.commit_fetched_page(&block, PageIndex(0), 128 << 10, Bytes::from(vec![7; 1024]))
+                .await
+                .unwrap();
+        } else {
+            w.commit_cached_block(&block, Bytes::from(vec![7; 128 << 10]))
+                .await
+                .unwrap();
+        }
+        assert!(w.commit_cached_block(&block, data()).await.is_err());
+        assert!(!w.store.small().unwrap().contains(&block));
+        assert_eq!(w.index.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), false, false);
+    w.write_object(&object(), data()).await.unwrap();
+    w.store.maintain_small(true).await.unwrap();
+    drop(w);
+    let marker = dir.path().join("small-routing.json");
+    let original = std::fs::read(&marker).unwrap();
+    for threshold in [0, 64 << 10, 256 << 10] {
+        let error = WholeBlockStore::open(dir.path())
+            .unwrap()
+            .with_small_objects(threshold, 512 << 10, 16 << 20)
+            .err()
+            .unwrap();
+        assert!(error
+            .to_string()
+            .contains("incompatible small store routing"));
+        assert_eq!(std::fs::read(&marker).unwrap(), original);
+    }
+    let (_, recovered) = runtime(dir.path(), false, false);
+    assert_eq!(recovered.block_count(), 1);
+    drop(recovered);
+    std::fs::write(&marker, b"broken").unwrap();
+    let error = WholeBlockStore::open(dir.path())
+        .unwrap()
+        .with_small_objects(128 << 10, 256 << 10, 16 << 20)
+        .err()
+        .unwrap();
+    assert!(error.to_string().contains("invalid small store routing"));
+    std::fs::remove_file(&marker).unwrap();
+    let error = WholeBlockStore::open(dir.path())
+        .unwrap()
+        .with_small_objects(128 << 10, 256 << 10, 16 << 20)
+        .err()
+        .unwrap();
+    assert!(error
+        .to_string()
+        .contains("predates small store routing metadata"));
+    assert!(
+        !marker.exists(),
+        "a failed compatibility check must not adopt the old cache"
+    );
+    assert!(dir.path().join("small").exists());
 }
 
 #[tokio::test]
@@ -209,7 +396,7 @@ async fn small_cache_pressure_counts_dead_and_retired_bytes() {
     let (_, w) = runtime(dir.path(), false, false);
     w.write_object(&object(), data()).await.unwrap();
     w.store.maintain_small(true).await.unwrap();
-    let handle = w.store.get_block(&id(&w)).await.unwrap();
+    let handle = w.store.small().unwrap().get(&id(&w)).unwrap().unwrap();
     w.evict_to_target(0).await;
     assert!(w.index.is_empty());
     assert!(
@@ -234,7 +421,7 @@ async fn small_idle_eviction_uses_whole_object_access_and_preserves_open_fd() {
     let (_, mut w) = runtime(dir.path(), true, false);
     w.page_gc_config.tti_ms = 1000;
     w.write_object(&object(), data()).await.unwrap();
-    let handle = w.store.get_block(&id(&w)).await.unwrap();
+    let handle = w.store.small().unwrap().get(&id(&w)).unwrap().unwrap();
     w.gc_small_idle_at(crate::eviction::access_millis() + 2000)
         .await;
     assert!(!w.store.small().unwrap().contains(&id(&w)));
@@ -260,14 +447,7 @@ async fn small_range_from_large_object_still_uses_paged_storage() {
 #[tokio::test]
 async fn small_foreground_pressure_reclaims_after_admission_without_async_gc() {
     let dir = tempfile::tempdir().unwrap();
-    let (_, mut w) = runtime(dir.path(), false, false);
-    w.capacity_bytes = 1 << 20;
-    w.store = Arc::new(
-        WholeBlockStore::open(dir.path())
-            .unwrap()
-            .with_small_objects(128 << 10, 256 << 10, 1 << 20)
-            .unwrap(),
-    );
+    let (_, w) = runtime_with_geometry(dir.path(), false, false, 128 << 10, 256 << 10, 1 << 20);
     for n in 0..400 {
         let obj = ObjectId::new(Backend::S3, "bucket", format!("object-{n}"));
         w.write_object(&obj, data()).await.unwrap();
@@ -279,14 +459,7 @@ async fn small_foreground_pressure_reclaims_after_admission_without_async_gc() {
 #[tokio::test]
 async fn small_concurrent_admission_succeeds_under_capacity_pressure() {
     let dir = tempfile::tempdir().unwrap();
-    let (_, mut w) = runtime(dir.path(), false, false);
-    w.capacity_bytes = 1 << 20;
-    w.store = Arc::new(
-        WholeBlockStore::open(dir.path())
-            .unwrap()
-            .with_small_objects(128 << 10, 256 << 10, 1 << 20)
-            .unwrap(),
-    );
+    let (_, mut w) = runtime_with_geometry(dir.path(), false, false, 128 << 10, 256 << 10, 1 << 20);
     w.background_budget = Some(crate::background::BackgroundBudget::new(
         &talon_core::WorkerConfig::default(),
     ));
@@ -338,7 +511,12 @@ async fn small_tti_checkpoint_survives_restart_relocation_and_deletion() {
     }
     w.store.maintain_small(true).await.unwrap();
     let cold = crate::eviction::access_millis() - 7_200_000;
-    w.index.whole_access(&blocks[0]).unwrap().restore(cold);
+    w.store
+        .small()
+        .unwrap()
+        .access(&blocks[0])
+        .unwrap()
+        .restore(cold);
     w.checkpoint_small_access().await;
     assert!(dir.path().join("small/access.checkpoint").exists());
     // A stale snapshot still contains the deleted identity. Relocate the other
@@ -357,24 +535,26 @@ async fn small_tti_checkpoint_survives_restart_relocation_and_deletion() {
     recovered.page_gc_config.tti_ms = 3_600_000;
     assert_eq!(
         recovered
-            .index
-            .whole_access(&blocks[0])
+            .store
+            .small()
+            .unwrap()
+            .access(&blocks[0])
             .unwrap()
             .last_access(),
         cold
     );
-    assert!(recovered.index.get(&blocks[1]).is_none());
-    assert!(recovered.index.get(&blocks[2]).is_none());
+    assert!(!recovered.contains_block(&blocks[1]));
+    assert!(!recovered.contains_block(&blocks[2]));
     recovered
         .gc_small_idle_at(crate::eviction::access_millis())
         .await;
     assert!(
-        recovered.index.get(&blocks[0]).is_none(),
+        !recovered.contains_block(&blocks[0]),
         "cold object must expire immediately after restart"
     );
     for block in &blocks[3..] {
         assert!(
-            recovered.index.get(block).is_some(),
+            recovered.contains_block(block),
             "recent objects retain their idle window"
         );
     }
@@ -387,19 +567,35 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
     w.page_gc_config.tti_ms = 1000;
     w.write_object(&object(), data()).await.unwrap();
     let block = id(&w);
-    w.index
-        .whole_access(&block)
+    w.store
+        .small()
+        .unwrap()
+        .access(&block)
         .unwrap()
         .restore(crate::eviction::access_millis() - 10_000);
     w.serve_versioned(&request(), &Version::new("v1"), 3072)
         .await
         .unwrap();
-    let last = w.index.whole_access(&block).unwrap().last_access();
+    let last = w
+        .store
+        .small()
+        .unwrap()
+        .access(&block)
+        .unwrap()
+        .last_access();
     w.store.maintain_small(true).await.unwrap();
     w.checkpoint_small_access().await;
     drop(w);
     let (_, w) = runtime(dir.path(), false, false);
-    assert_eq!(w.index.whole_access(&block).unwrap().last_access(), last);
+    assert_eq!(
+        w.store
+            .small()
+            .unwrap()
+            .access(&block)
+            .unwrap()
+            .last_access(),
+        last
+    );
     drop(w);
     let path = dir.path().join("small/access.checkpoint");
     let mut corrupt = std::fs::read(&path).unwrap();
@@ -407,7 +603,15 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
     std::fs::write(path, corrupt).unwrap();
     let before = crate::eviction::access_millis();
     let (_, w) = runtime(dir.path(), false, false);
-    assert!(w.index.whole_access(&block).unwrap().last_access() >= before);
+    assert!(
+        w.store
+            .small()
+            .unwrap()
+            .access(&block)
+            .unwrap()
+            .last_access()
+            >= before
+    );
     assert_eq!(
         w.store
             .small()
@@ -419,9 +623,20 @@ async fn small_tti_hit_is_checkpointed_and_bad_snapshot_does_not_drop_data() {
         data()
     );
     // Future wall-clock values are clamped, not made immortal by clock rollback.
-    w.index.whole_access(&block).unwrap().restore(u64::MAX);
+    w.store
+        .small()
+        .unwrap()
+        .access(&block)
+        .unwrap()
+        .restore(u64::MAX);
     assert!(
-        w.index.whole_access(&block).unwrap().last_access() <= crate::eviction::access_millis()
+        w.store
+            .small()
+            .unwrap()
+            .access(&block)
+            .unwrap()
+            .last_access()
+            <= crate::eviction::access_millis()
     );
 }
 
@@ -459,11 +674,24 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
     .unwrap();
     // Change age after the periodic checkpoint; orderly shutdown must flush it.
     let cold = crate::eviction::access_millis() - 60_000;
-    w.index.whole_access(&block).unwrap().restore(cold);
+    w.store
+        .small()
+        .unwrap()
+        .access(&block)
+        .unwrap()
+        .restore(cold);
     service.shutdown().await;
     drop(w);
     let (_, w) = runtime(dir.path(), false, false);
-    assert_eq!(w.index.whole_access(&block).unwrap().last_access(), cold);
+    assert_eq!(
+        w.store
+            .small()
+            .unwrap()
+            .access(&block)
+            .unwrap()
+            .last_access(),
+        cold
+    );
 }
 
 #[tokio::test]
@@ -726,14 +954,7 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
 #[tokio::test]
 async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     let dir = tempfile::tempdir().unwrap();
-    let (_, mut w) = runtime(dir.path(), false, false);
-    w.capacity_bytes = 1 << 30;
-    w.store = Arc::new(
-        WholeBlockStore::open(dir.path())
-            .unwrap()
-            .with_small_objects(1 << 20, 64 << 20, w.capacity_bytes)
-            .unwrap(),
-    );
+    let (_, mut w) = runtime_with_geometry(dir.path(), false, false, 1 << 20, 64 << 20, 1 << 30);
     let mut tiny = id(&w);
     tiny.object.object_path = "tiny-victim".into();
     w.commit_cached_block(&tiny, Bytes::from(vec![1; 1024]))
@@ -806,7 +1027,8 @@ async fn packed_versions_remain_independent_across_restart_and_exact_deletion() 
     w.commit_cached_block(&v2, data()).await.unwrap();
     for key in [&v1, &v2] {
         assert!(w.store.small().unwrap().contains(key));
-        assert!(w.index.independent_key(key));
+        assert!(w.index.get(key).is_none());
+        assert!(w.store.small().unwrap().access(key).is_some());
         assert_eq!(w.lru.block_candidates(key).len(), 1);
     }
     assert!(w.lru.superseded_candidates(&v2).is_empty());
@@ -815,8 +1037,12 @@ async fn packed_versions_remain_independent_across_restart_and_exact_deletion() 
     let (_, w) = runtime(dir.path(), true, true);
     assert!(w.lru.superseded_candidates(&v2).is_empty());
     for key in [&v1, &v2] {
-        assert!(w.index.independent_key(key));
-        assert_eq!(w.store.get_bytes(key).await.unwrap(), data());
+        assert!(w.index.get(key).is_none());
+        assert!(w.store.small().unwrap().access(key).is_some());
+        assert_eq!(
+            w.store.small().unwrap().read(key).await.unwrap().unwrap(),
+            data()
+        );
     }
     w.unlink_units(w.lru.block_candidates(&v1), 2).await;
     assert!(!w.store.small().unwrap().contains(&v1));

@@ -22,7 +22,7 @@ small_object_segment_bytes = 67108864
 The equivalent environment variables are
 `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES` and
 `TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. Admission defaults to a 1 MiB
-threshold; setting it to zero disables new admissions. Segment size defaults
+threshold; setting it to zero disables the engine for a new cache directory. Segment size defaults
 to 64 MiB. An enabled engine requires capacity for four segments, and the LOAD
 payload budget must accommodate an entire eligible object.
 
@@ -33,9 +33,15 @@ qualify. READ and LOAD fetch an eligible object completely with the source
 version precondition; short responses are rejected before publication. Same-key
 fills coalesce. LOAD never populates L1.
 
-`SmallObjectStore` is an independent engine behind the worker's whole-block
-storage facade. Small objects remain logical `BlockForm::Whole` cache units,
-allowing capacity, stale, and ownership eviction to retain their existing policy.
+`SmallObjectStore` owns its residency directory. READ and LOAD choose the store
+from the complete object size; a packed hit resolves its segment extent and
+access token without consulting `BlockIndex`. Ordinary whole and paged entries
+remain in `BlockIndex`. Small objects register directly with the shared LRU as
+whole-object eviction units, retaining capacity, idle, and ownership policies
+without a second residency entry. The locator carries the shared access token;
+relocation preserves that token and recovery reconstructs policy from locators.
+`GetCachedRange` remains an ordinary whole/paged-store operation: an object
+resident only in small storage returns `CacheMiss`, without origin access.
 Packed keys do not participate in cross-version supersession. Page TTI applies to the whole small object using its
 shared access timestamp. With TTI enabled, `small/access.checkpoint` stores a
 checksummed snapshot of exact versioned identities and anchored Unix-millisecond
@@ -48,13 +54,19 @@ including objects relocated since the snapshot. Downtime counts toward idle age.
 A crash can lose access updates since the last successful checkpoint, so expiry
 is approximate. Missing or corrupt snapshots grant a fresh idle interval (with
 corruption logged), and future timestamps are clamped to startup time after a
-clock rollback. This file is advisory and never establishes residency. Existing paged
-residency is preserved rather than migrating an object during an active fill.
+clock rollback. This file is advisory and never establishes residency. Ordinary
+whole-block admissions preserve existing paged residency during an active fill.
+Admissions that would put the same identity in both small and ordinary storage
+are rejected under the block mutation gate.
 
 Each namespace and credential scope owns its own store under its existing cache
-root. Existing small segments reopen even when admission is disabled or the
-threshold changes. Rollback binaries ignore this directory, leaving a disposable
-cache to rewarm; do not run two owners against the same cache root.
+root. `small-routing.json` binds the routing format and small-object threshold
+to that root. A changed threshold (including enabling or disabling small storage),
+malformed marker, or an existing cache without the marker fails startup with an
+instruction to use a new empty cache directory. The worker neither migrates nor
+deletes incompatible data automatically. This prevents read-time probing for
+historical routing choices. Do not run two owners against the same cache root;
+use a fresh cache directory when rolling back to a binary with older routing.
 
 ## Files and identity
 
@@ -71,10 +83,10 @@ sendfile/splice hits do not read the entire payload merely to verify a checksum.
 The engine keeps one compact encoded identity shared by its lookup table and
 segment-local live-record directory. Recovery reads the index streams and stats
 each segment; it does not read all payloads or stat individual objects. Recovery
-remains O(number of metadata records). V1 still uses the worker's existing
-BlockIndex/LRU policy structures, so total RAM remains O(number of objects),
-including those structures' allocations. This is not a disk-only index or a
-claim of a fixed 32-byte total RAM cost per object.
+remains O(number of metadata records). Small objects do not allocate generic
+`BlockIndex` entries or paged metadata. Shared LRU queues and policy records still
+consume O(number of objects) memory and must be reconstructed at startup. This is
+not a disk-only index or a claim of a fixed total RAM cost per object.
 
 ## I/O and publication
 
@@ -131,7 +143,7 @@ stream, if used). These are cache misses, not lost origin writes. There is no pe
 allocation is included in physical capacity accounting. Each native ring uses a
 stable slot in `ring-<slot>/`, with independent segment IDs and MANIFEST. The root
 layout remains the legacy/non-ring stream. Startup discovers all historical
-slots even when the configured ring count is reduced or admission is disabled;
+slots even when the configured ring count is reduced;
 existing objects stay readable from any ring. Duplicate identities across slots
 fail recovery closed. A newly used ring directory is created and made durable
 through native asynchronous I/O before its first insertion. Old binaries do not
@@ -167,9 +179,10 @@ An in-flight response retains its old inode across replacement/unlink. This is
 necessary because sendfile completion does not imply peer consumption. Keeping
 an fd alone would not protect against an in-place truncate or overwrite.
 
-Worker capacity accounting replaces indexed small-record charges with measured
-segment and access-checkpoint allocations, including dead bytes and retired files retained by open
-handles. Like the whole-file store, admission writes and publishes the object
+Worker capacity accounting adds measured small-segment and access-checkpoint
+allocations to ordinary `BlockIndex` allocations, including dead bytes and
+retired files retained by open handles. Small-record policy charges are not
+added a second time to physical occupancy. Like the whole-file store, admission writes and publishes the object
 before best-effort capacity eviction. Capacity is a soft target: concurrent
 admissions, relocation copies, and retired files retained by readers can
 transiently exceed it. Crossing that target does not reject an admission;
