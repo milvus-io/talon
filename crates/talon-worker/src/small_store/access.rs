@@ -180,11 +180,11 @@ impl SmallObjectStore {
             let mut matched = 0;
             for (id, last) in ages {
                 if let Some(access) = self.lookup_entry(&id)?.and_then(|loc| loc.access) {
-                        access.restore(last);
-                        matched += 1;
-                        // Persist repaired zero/future ages rather than resetting
-                        // their idle window again on every subsequent restart.
-                        state.full |= last == 0 || last > access.last_access();
+                    access.restore(last);
+                    matched += 1;
+                    // Persist repaired zero/future ages rather than resetting
+                    // their idle window again on every subsequent restart.
+                    state.full |= last == 0 || last > access.last_access();
                 }
             }
             let residents: usize = self
@@ -222,7 +222,9 @@ impl SmallObjectStore {
         let encoded = format::key(id)?;
         for stream in self.streams() {
             let mut entries = stream.entries.write().unwrap();
-            let key = entries.get_key_value(encoded.as_slice()).map(|(key, _)| key.clone());
+            let key = entries
+                .get_key_value(encoded.as_slice())
+                .map(|(key, _)| key.clone());
             if let Some(key) = key {
                 let loc = entries.get_mut(key.as_ref()).unwrap();
                 if let Some(access) = loc.access.take() {
@@ -277,8 +279,14 @@ impl SmallObjectStore {
                                 .ok_or_else(|| invalid("access generation exhausted"))?;
                             bytes = header(MAGIC, state.generation);
                             for stream in prepare.streams() {
-                                let entries: Vec<_> = stream.entries.read().unwrap().iter()
-                                    .filter_map(|(key, loc)| loc.access.clone().map(|access| (key.clone(), access)))
+                                let entries: Vec<_> = stream
+                                    .entries
+                                    .read()
+                                    .unwrap()
+                                    .iter()
+                                    .filter_map(|(key, loc)| {
+                                        loc.access.clone().map(|access| (key.clone(), access))
+                                    })
                                     .collect();
                                 for (key, access) in entries {
                                     encode(&mut bytes, &key, access.sample_small())?;
@@ -288,7 +296,9 @@ impl SmallObjectStore {
                             for token in pending.keys.values() {
                                 token.consume();
                                 let id = format::id(&token.key)?;
-                                if let Some(access) = prepare.lookup(&id)?.and_then(|loc| loc.access) {
+                                if let Some(access) =
+                                    prepare.lookup_entry(&id)?.and_then(|loc| loc.access)
+                                {
                                     // Deleted/re-admitted keys have a different clock.
                                     if Arc::ptr_eq(access.clock(), &token.clock) {
                                         encode(&mut bytes, &token.key, access.last_access())?;

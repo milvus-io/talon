@@ -12,15 +12,18 @@ fn id(n: usize) -> BlockId {
     )
 }
 fn open(root: &Path) -> Arc<SmallObjectStore> {
+    open_with_policy(root).0
+}
+fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
     let store = Arc::new(
         SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 16 << 20, None).unwrap(),
     );
     let mut units = Vec::new();
     store.restore_policy_units(&mut units);
     let policy = Arc::new(crate::Lru::from_recovered(units, store.len(), true));
-    store.bind_policy(policy);
+    store.bind_policy(policy.clone());
     store.enable_access_tracking().unwrap();
-    store
+    (store, policy)
 }
 async fn put(store: &Arc<SmallObjectStore>, id: &BlockId) -> AccessHandle {
     store.put(id, Bytes::from_static(b"payload")).await.unwrap();
@@ -77,18 +80,18 @@ async fn sparse_hits_append_once_and_clean_flush_does_not_rewrite() {
 #[tokio::test]
 async fn late_reader_cannot_overwrite_readmitted_identity_or_resurrect_delete() {
     let dir = tempfile::tempdir().unwrap();
-    let store = open(dir.path());
+    let (store, policy) = open_with_policy(dir.path());
     let old = put(&store, &id(0)).await;
     put(&store, &id(1)).await;
     flush(&store).await;
     store.delete(&id(0)).await.unwrap();
-    store.policy.get().unwrap().remove_block(&id(0));
+    policy.remove_block(&id(0));
     let new = put(&store, &id(0)).await;
     old.touch(); // arrives after the new token was queued
     new.restore(access_millis() - 10_000);
     store.access(&id(1)).unwrap().touch();
     store.delete(&id(1)).await.unwrap();
-    store.policy.get().unwrap().remove_block(&id(1));
+    policy.remove_block(&id(1));
     flush(&store).await;
     let ages = log(dir.path());
     assert_eq!(ages.len(), 1);
@@ -302,7 +305,6 @@ async fn million_item_sparse_access_probe() {
                 access: Some(store.attach_access(key, AccessHandle::default(), false)),
             },
         );
-
     }
     let start = Instant::now();
     flush(&store).await;
@@ -346,8 +348,5 @@ async fn newly_recovered_key_without_age_is_saved_without_a_read() {
     assert_eq!(ages[&id(1)], recovered_age);
     drop(store);
     let store = open(dir.path());
-    assert_eq!(
-        store.access(&id(1)).unwrap().last_access(),
-        recovered_age
-    );
+    assert_eq!(store.access(&id(1)).unwrap().last_access(), recovered_age);
 }

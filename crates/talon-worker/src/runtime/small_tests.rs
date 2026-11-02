@@ -909,8 +909,10 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
         .unwrap();
     w.write_object(&object(), data()).await.unwrap();
     let block = id(&w);
-    w.index
-        .whole_access(&block)
+    w.small
+        .as_ref()
+        .unwrap()
+        .access(&block)
         .unwrap()
         .restore(crate::eviction::access_millis() - 60_000);
     let w = Arc::new(w);
@@ -939,7 +941,15 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
     service.shutdown().await;
     drop(w);
     let (_, w) = runtime(dir.path(), false, false);
-    assert_eq!(w.small.as_ref().unwrap().access(&block).unwrap().last_access(), touched);
+    assert_eq!(
+        w.small
+            .as_ref()
+            .unwrap()
+            .access(&block)
+            .unwrap()
+            .last_access(),
+        touched
+    );
 }
 
 #[tokio::test]
