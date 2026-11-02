@@ -429,6 +429,7 @@ mod tests {
     ) -> (Arc<WorkerRuntime>, MembershipFixture) {
         let mut fixture = MembershipFixture::new();
         fixture.config.block_size = 32;
+        fixture.config.small_object_threshold_bytes = 1 << 20;
         fixture.config.l2_page_size_bytes = if paged { 16 } else { 0 };
         fixture.config.l1_page_size_bytes = 16;
         fixture.config.l1_capacity_bytes = 0;

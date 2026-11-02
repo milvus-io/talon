@@ -193,13 +193,14 @@ def main():
             "TALON_COORDINATOR_UNHEALTHY_AFTER_MS": str(STATE_FAILURE_GRACE_MS)})
 
     def worker(port="w", cache="cache", identity=None, admin="wa"):
-        # Keep small-object packing enabled: this 8 MiB cache fits four 2 MiB
-        # segments, each large enough for the default 1 MiB threshold and index.
+        # Explicitly enable small-object packing: this 8 MiB cache fits four
+        # 2 MiB segments, each large enough for the 1 MiB threshold and index.
         env = {"TALON_WORKER_LISTEN": f"127.0.0.1:{ports[port]}",
                "TALON_WORKER_ADMIN_LISTEN": f"127.0.0.1:{ports[admin]}",
                "TALON_WORKER_COORDINATOR": f"127.0.0.1:{ports['c2']}",
                "TALON_WORKER_CLUSTER_ID": "rolling-test", "TALON_WORKER_CACHE_DIRS": str(root / cache),
                "TALON_WORKER_BLOCK_SIZE": "65536", "TALON_WORKER_CAPACITY_BYTES": str(8 << 20),
+               "TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES": str(1 << 20),
                "TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES": str(2 << 20),
                "TALON_WORKER_L2_PAGE_SIZE_BYTES": str(args.page_size), "TALON_WORKER_HEARTBEAT_INTERVAL_MS": str(HEARTBEAT_MS),
                "TALON_WORKER_AZURE_ACCOUNT": "test", "TALON_WORKER_AZURE_SAS": "test",

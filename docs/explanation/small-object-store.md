@@ -15,15 +15,16 @@ scope for v1.
 ## Configuration and routing
 
 ```toml
-small_object_threshold_bytes = 1048576
+small_object_threshold_bytes = 0
 small_object_segment_bytes = 67108864
 ```
 
 The equivalent environment variables are
 `TALON_WORKER_SMALL_OBJECT_THRESHOLD_BYTES` and
-`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. Admission defaults to a 1 MiB
-threshold; setting it to zero disables the engine for a new cache directory. Segment size defaults
-to 64 MiB. An enabled engine requires capacity for four segments, and the LOAD
+`TALON_WORKER_SMALL_OBJECT_SEGMENT_BYTES`. The engine is disabled by default
+(threshold zero). To enable it for a new cache directory, set the threshold
+explicitly, for example to `1048576` for objects smaller than 1 MiB. Segment size
+defaults to 64 MiB. An enabled engine requires capacity for four segments, and the LOAD
 payload budget must accommodate an entire eligible object.
 
 An eligible object has positive total size strictly below the threshold and
