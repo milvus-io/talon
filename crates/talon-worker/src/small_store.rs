@@ -28,7 +28,7 @@ use talon_core::{BlockHandle, BlockId};
 
 #[derive(Clone)]
 pub(crate) struct Location {
-    fd: Arc<OwnedFd>,
+    file: Arc<SegmentFile>,
     segment: u64,
     offset: u64,
     len: u64,
@@ -36,6 +36,61 @@ pub(crate) struct Location {
     // Shared with the eviction policy; relocation preserves this exact token.
     access: Option<AccessHandle>,
 }
+/// A resolved read owns an fd before the directory can publish an unlink.
+pub(crate) struct ReadLocation {
+    location: Location,
+    fd: Arc<OwnedFd>,
+}
+impl ReadLocation {
+    pub(crate) fn len(&self) -> u64 {
+        self.location.len
+    }
+
+    pub(crate) fn touch(&self) {
+        self.location.touch();
+    }
+
+    pub(crate) fn range(&self, offset: u64, len: u64) -> io::Result<BlockHandle> {
+        if offset.checked_add(len).map_or(true, |end| end > self.len()) {
+            return Err(invalid("small object range out of bounds"));
+        }
+        self.touch();
+        Ok(BlockHandle::from_shared(
+            self.fd.clone(),
+            self.location.offset + offset,
+            len,
+        ))
+    }
+
+    // Deliberately does not touch: relocation also reads through this snapshot.
+    pub(crate) async fn read(&self) -> io::Result<Bytes> {
+        let bytes =
+            disk_io::read(self.fd.clone(), self.location.offset, self.len() as usize).await?;
+        if xxhash_rust::xxh3::xxh3_64(&bytes) != self.location.checksum {
+            return Err(invalid("small object payload checksum"));
+        }
+        Ok(bytes)
+    }
+}
+
+/// Only writers and borrowed readers retain descriptors. Sealed locators keep
+/// a weak reference, so idle segments consume no fds regardless of their count.
+struct SegmentFile {
+    path: PathBuf,
+    fd: tokio::sync::Mutex<Weak<OwnedFd>>,
+}
+impl SegmentFile {
+    async fn open(&self) -> io::Result<Arc<OwnedFd>> {
+        let mut cached = self.fd.lock().await;
+        if let Some(fd) = cached.upgrade() {
+            return Ok(fd);
+        }
+        let fd = disk_io::open(self.path.clone(), disk_io::Open::Read).await?;
+        *cached = Arc::downgrade(&fd);
+        Ok(fd)
+    }
+}
+
 impl Location {
     pub(crate) fn len(&self) -> u64 {
         self.len
@@ -47,32 +102,19 @@ impl Location {
         }
     }
 
-    pub(crate) fn range(&self, offset: u64, len: u64) -> io::Result<BlockHandle> {
-        if offset.checked_add(len).map_or(true, |end| end > self.len) {
-            return Err(invalid("small object range out of bounds"));
-        }
-        self.touch();
-        Ok(BlockHandle::from_shared(
-            self.fd.clone(),
-            self.offset + offset,
-            len,
-        ))
-    }
-
-    // Deliberately does not touch: relocation also reads through this snapshot.
-    pub(crate) async fn read(&self) -> io::Result<Bytes> {
-        let bytes = disk_io::read(self.fd.clone(), self.offset, self.len as usize).await?;
-        if xxhash_rust::xxh3::xxh3_64(&bytes) != self.checksum {
-            return Err(invalid("small object payload checksum"));
-        }
-        Ok(bytes)
+    // Caller excludes locator replacement/unlink until this fd is retained.
+    async fn retain(self) -> io::Result<ReadLocation> {
+        Ok(ReadLocation {
+            fd: self.file.open().await?,
+            location: self,
+        })
     }
 }
 
 struct Segment {
-    data: Arc<OwnedFd>,
-    index: Arc<OwnedFd>,
-    fd: Arc<OwnedFd>,
+    data: Option<Arc<OwnedFd>>,
+    index: Option<Arc<OwnedFd>>,
+    file: Arc<SegmentFile>,
     // Reservation ends, including writes whose completions are still pending.
     bytes: u64,
     metadata: u64,
@@ -84,9 +126,30 @@ struct Segment {
     sealed: bool,
 }
 impl Segment {
+    async fn data(&self) -> io::Result<Arc<OwnedFd>> {
+        match &self.data {
+            Some(fd) => Ok(fd.clone()),
+            None => self.file.open().await,
+        }
+    }
+
+    async fn index(&self) -> io::Result<Arc<OwnedFd>> {
+        match &self.index {
+            Some(fd) => Ok(fd.clone()),
+            None => {
+                disk_io::open(self.file.path.with_extension("index"), disk_io::Open::Write).await
+            }
+        }
+    }
+
     async fn allocated(&self) -> io::Result<u64> {
-        Ok(disk_io::allocated(self.data.clone()).await?
-            + disk_io::allocated(self.index.clone()).await?)
+        Ok(disk_io::allocated(self.data().await?).await?
+            + disk_io::allocated(self.index().await?).await?)
+    }
+
+    fn close_writers(&mut self) {
+        self.data = None;
+        self.index = None;
     }
 }
 struct State {
@@ -122,6 +185,9 @@ struct SegmentStore {
     appends_drained: tokio::sync::Notify,
     append_slots: tokio::sync::Semaphore,
     entries: RwLock<HashMap<Arc<[u8]>, Location>>,
+    // Async opens run outside the directory lock, but must finish before GC
+    // replaces locators and unlinks their source paths.
+    readers: tokio::sync::RwLock<()>,
     tasks: Arc<crate::page_gc::Mutations>,
     cached_stats: RwLock<SmallStoreStats>,
     retired: Mutex<Vec<(Weak<OwnedFd>, u64)>>,
@@ -238,6 +304,7 @@ impl SegmentStore {
             appends_drained: tokio::sync::Notify::new(),
             append_slots: tokio::sync::Semaphore::new(32),
             entries: RwLock::new(HashMap::new()),
+            readers: tokio::sync::RwLock::new(()),
             tasks: Arc::new(crate::page_gc::Mutations::new(true)),
             cached_stats: RwLock::new(SmallStoreStats::default()),
             retired: Mutex::new(Vec::new()),
@@ -261,27 +328,27 @@ impl SegmentStore {
             .is_some_and(|k| self.entries.read().unwrap().contains_key(k.as_slice()))
     }
 
-    #[cfg(test)]
-    pub fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+    async fn lookup(&self, id: &BlockId) -> io::Result<Option<ReadLocation>> {
+        let _readers = self.readers.read().await;
         let key = format::key(id)?;
-        // Clone the fd under the same lock that removes the locator. An unlink
-        // can never occur between discovering a location and retaining its fd.
-        Ok(self
-            .entries
-            .read()
-            .unwrap()
-            .get(key.as_slice())
-            .map(|loc| BlockHandle::from_shared(loc.fd.clone(), loc.offset, loc.len)))
+        let loc = self.entries.read().unwrap().get(key.as_slice()).cloned();
+        match loc {
+            Some(loc) => Ok(Some(loc.retain().await?)),
+            None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    pub async fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+        self.lookup(id)
+            .await?
+            .map(|loc| loc.range(0, loc.len()))
+            .transpose()
     }
 
     #[cfg(test)]
     pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
-        let loc = self
-            .entries
-            .read()
-            .unwrap()
-            .get(format::key(id)?.as_slice())
-            .cloned();
+        let loc = self.lookup(id).await?;
         match loc {
             Some(loc) => Ok(Some(loc.read().await?)),
             None => Ok(None),
@@ -326,7 +393,7 @@ impl SegmentStore {
             .acquire()
             .await
             .expect("append slots stay open");
-        let (mut loc, index, metadata, frame) = loop {
+        let (mut loc, data, index, metadata, frame) = loop {
             let changed = self.pipeline_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -381,7 +448,7 @@ impl SegmentStore {
             }
             let s = state.segments.get_mut(&segment).unwrap();
             let loc = Location {
-                fd: s.fd.clone(),
+                file: s.file.clone(),
                 segment,
                 offset: s.bytes,
                 len,
@@ -390,12 +457,13 @@ impl SegmentStore {
             };
             let frame = append_frame(loc.offset, len, checksum, &key)?;
             let metadata = s.metadata;
-            let index = s.index.clone();
+            let data = s.data().await?;
+            let index = s.index().await?;
             s.bytes += len;
             s.metadata += frame.len() as u64;
             s.in_flight += 1;
             state.written += charge;
-            break (loc, index, metadata, frame);
+            break (loc, data, index, metadata, frame);
         };
         // No append state lock is held while any of these operations is in
         // flight. Both writes are submitted; always await both, even on error,
@@ -405,7 +473,7 @@ impl SegmentStore {
             self.pause_append().await;
             let (payload, record) = tokio::join!(
                 async {
-                    disk_io::write(loc.fd.clone(), value, loc.offset).await?;
+                    disk_io::write(data.clone(), value, loc.offset).await?;
                     #[cfg(test)]
                     tests::crash("append_payload");
                     Ok::<_, io::Error>(())
@@ -419,10 +487,8 @@ impl SegmentStore {
             );
             payload?;
             record?;
-            let (data_allocated, index_allocated) = tokio::join!(
-                disk_io::allocated(loc.fd.clone()),
-                disk_io::allocated(index)
-            );
+            let (data_allocated, index_allocated) =
+                tokio::join!(disk_io::allocated(data), disk_io::allocated(index));
             Ok::<_, io::Error>(data_allocated? + index_allocated?)
         }
         .await;
@@ -504,10 +570,11 @@ impl SegmentStore {
             record.extend_from_slice(&loc.offset.to_le_bytes());
             let mut frame = Vec::new();
             format::frame(&mut frame, &record)?;
-            disk_io::write(segment.index.clone(), frame.into(), segment.metadata).await?;
+            let index = segment.index().await?;
+            disk_io::write(index.clone(), frame.into(), segment.metadata).await?;
             segment.metadata += 12 + record.len() as u64;
             if segment.sealed {
-                disk_io::sync(segment.index.clone()).await?;
+                disk_io::sync(index).await?;
             }
             #[cfg(test)]
             tests::crash("delete_sync");
@@ -643,19 +710,23 @@ impl SegmentStore {
             };
             let mut moved = Vec::with_capacity(entries.len());
             if let Some(new) = replacement {
+                // Reuse one source descriptor for the whole copy, then release
+                // it before retired-reader accounting at unlink.
+                let _source = state.segments[&old].data().await?;
                 for (key, loc) in &entries {
-                    let bytes = loc.read().await?;
+                    let bytes = loc.clone().retain().await?.read().await?;
                     let mut replacement = self.append(&mut state, new, key, bytes, false).await?;
                     replacement.access = loc.access.clone();
                     moved.push((key.clone(), replacement));
                 }
                 let s = state.segments.get_mut(&new).unwrap();
-                disk_io::sync(s.data.clone()).await?;
-                disk_io::sync(s.index.clone()).await?;
+                disk_io::sync(s.data().await?).await?;
+                disk_io::sync(s.index().await?).await?;
                 let allocated = s.allocated().await?;
                 let previous = s.allocated;
                 s.allocated = allocated;
                 s.sealed = true;
+                s.close_writers();
                 state.allocated = state
                     .allocated
                     .saturating_sub(previous)
@@ -667,6 +738,7 @@ impl SegmentStore {
             self.manifest(&state, Some(old)).await?;
             #[cfg(test)]
             tests::crash("compact_manifest");
+            let _readers = self.readers.write().await;
             {
                 let mut directory = self.entries.write().unwrap();
                 for (key, loc) in moved {
@@ -685,10 +757,8 @@ impl SegmentStore {
             disk_io::remove(self.path(old, "data")).await?;
             disk_io::remove(self.path(old, "index")).await?;
             disk_io::sync_dir(self.root.clone()).await?;
-            self.retired
-                .lock()
-                .unwrap()
-                .push((Arc::downgrade(&segment.fd), allocated));
+            let readers = segment.file.fd.lock().await.clone();
+            self.retired.lock().unwrap().push((readers, allocated));
             state.allocated = state.allocated.saturating_sub(segment.allocated);
             // Relocation keeps the published live charge unchanged. Its extra
             // destination allocation must count as physical overhead while copying.
@@ -737,9 +807,12 @@ impl SegmentStore {
         disk_io::write(index.clone(), Bytes::from_static(MAGIC), 0).await?;
         let allocated = disk_io::allocated(index.clone()).await?;
         Ok(Segment {
-            fd: data.clone(),
-            data,
-            index,
+            file: Arc::new(SegmentFile {
+                path: self.path(id, "data"),
+                fd: tokio::sync::Mutex::new(Arc::downgrade(&data)),
+            }),
+            data: Some(data),
+            index: Some(index),
             bytes: 0,
             metadata: 8,
             in_flight: 0,
@@ -762,12 +835,12 @@ impl SegmentStore {
         let offset = segment.bytes;
         let checksum = xxhash_rust::xxh3::xxh3_64(&value);
         let len = value.len() as u64;
-        disk_io::write(segment.data.clone(), value, offset).await?;
+        disk_io::write(segment.data().await?, value, offset).await?;
         #[cfg(test)]
         tests::crash("append_payload");
         let frame = append_frame(offset, len, checksum, key)?;
         let frame_len = frame.len() as u64;
-        disk_io::write(segment.index.clone(), frame, segment.metadata).await?;
+        disk_io::write(segment.index().await?, frame, segment.metadata).await?;
         #[cfg(test)]
         tests::crash("append_index");
         segment.bytes += len;
@@ -783,7 +856,7 @@ impl SegmentStore {
         }
         state.written += charge(key, len);
         let loc = Location {
-            fd: segment.fd.clone(),
+            file: segment.file.clone(),
             segment: id,
             offset,
             len,
@@ -855,7 +928,7 @@ impl SegmentStore {
             let Some(id) = state.sealing else { break None };
             let s = &state.segments[&id];
             if s.in_flight == 0 {
-                break Some((id, s.data.clone(), s.index.clone()));
+                break Some((id, s.data().await?, s.index().await?));
             }
             drop(state);
             drained.await;
@@ -878,6 +951,7 @@ impl SegmentStore {
                 s.allocated = allocated;
                 // Publication lock excludes delete/GC until the manifest is durable.
                 s.sealed = true;
+                s.close_writers();
                 state.allocated = state
                     .allocated
                     .saturating_sub(previous)
@@ -974,7 +1048,10 @@ impl SegmentStore {
         if !encoded.starts_with(MAGIC) {
             return Err(invalid("small object index version"));
         }
-        let fd: Arc<OwnedFd> = Arc::new(data.try_clone()?.into());
+        let file = Arc::new(SegmentFile {
+            path: self.path(id, "data"),
+            fd: tokio::sync::Mutex::new(Weak::new()),
+        });
         let mut records = BTreeMap::new();
         let mut next_offset = 0;
         for mut frame in format::frames(&encoded[8..])? {
@@ -1002,7 +1079,7 @@ impl SegmentStore {
                             (
                                 frame.to_vec(),
                                 Location {
-                                    fd: fd.clone(),
+                                    file: file.clone(),
                                     segment: id,
                                     offset,
                                     len,
@@ -1047,9 +1124,9 @@ impl SegmentStore {
         state.segments.insert(
             id,
             Segment {
-                data: Arc::new(data.into()),
-                index: Arc::new(index.into()),
-                fd,
+                data: None,
+                index: None,
+                file,
                 bytes,
                 metadata,
                 in_flight: 0,

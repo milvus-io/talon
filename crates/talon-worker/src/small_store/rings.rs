@@ -149,13 +149,13 @@ impl SmallObjectStore {
         self.legacy.accepts(id, len)
     }
     pub fn contains(&self, id: &BlockId) -> bool {
-        self.lookup(id).ok().flatten().is_some()
+        self.lookup_entry(id).ok().flatten().is_some()
     }
 
     /// Resolve residency and physical placement in one directory lookup per
     /// stream. Encode once and borrow the stream registry without allocating a
     /// temporary Vec. The worker validates routing compatibility at startup.
-    pub(crate) fn lookup(&self, id: &BlockId) -> io::Result<Option<Location>> {
+    pub(crate) fn lookup_entry(&self, id: &BlockId) -> io::Result<Option<Location>> {
         if id.offset != 0 {
             return Ok(None);
         }
@@ -174,14 +174,27 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
-        self.lookup(id)?
-            .map(|loc| loc.range(0, loc.len))
+    pub(crate) async fn lookup(&self, id: &BlockId) -> io::Result<Option<ReadLocation>> {
+        if id.offset != 0 {
+            return Ok(None);
+        }
+        for stream in self.streams() {
+            if let Some(loc) = stream.lookup(id).await? {
+                return Ok(Some(loc));
+            }
+        }
+        Ok(None)
+    }
+
+    pub async fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+        self.lookup(id)
+            .await?
+            .map(|loc| loc.range(0, loc.len()))
             .transpose()
     }
 
     pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
-        if let Some(loc) = self.lookup(id)? {
+        if let Some(loc) = self.lookup(id).await? {
             loc.touch();
             return Ok(Some(loc.read().await?));
         }
@@ -282,7 +295,7 @@ impl SmallObjectStore {
 
     #[cfg(test)]
     pub(crate) fn access(&self, id: &BlockId) -> Option<AccessHandle> {
-        self.lookup(id).ok().flatten()?.access
+        self.lookup_entry(id).ok().flatten()?.access
     }
 
     /// Only threshold-eligible segments provide planning credit. Garbage in a
@@ -457,7 +470,7 @@ mod tests {
                 recovered.read(&id("b")).await.unwrap().unwrap().as_ref(),
                 b"ring one"
             );
-            let handle = recovered.get(&id("a")).unwrap().unwrap();
+            let handle = recovered.get(&id("a")).await.unwrap().unwrap();
             recovered.delete(&id("a")).await.unwrap();
             recovered.maintain(false).await.unwrap();
             assert!(!recovered.contains(&id("a")));

@@ -17,6 +17,7 @@ thread_local! {
 #[derive(Clone, Copy)]
 pub(super) enum Open {
     Read,
+    Write,
     Create,
     Replace,
 }
@@ -38,6 +39,9 @@ pub(super) async fn open(path: PathBuf, mode: Open) -> io::Result<Arc<OwnedFd>> 
             options.read(true);
             match mode {
                 Open::Read => {}
+                Open::Write => {
+                    options.write(true);
+                }
                 Open::Create => {
                     options.write(true).create_new(true);
                 }
@@ -58,6 +62,9 @@ pub(super) async fn open(path: PathBuf, mode: Open) -> io::Result<Arc<OwnedFd>> 
         options.read(true);
         match mode {
             Open::Read => {}
+            Open::Write => {
+                options.write(true);
+            }
             Open::Create => {
                 options.write(true).create_new(true);
             }

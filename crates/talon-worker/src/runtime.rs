@@ -729,7 +729,7 @@ impl WorkerRuntime {
             let known_len = object_len.or_else(|| self.cached_object_len(&request.object, version));
             if let Some(size) = known_len.filter(|size| self.store.accepts_small(&block, *size)) {
                 if !self.l1.is_enabled() {
-                    if let Some(loc) = self.small_location(&block)? {
+                    if let Some(loc) = self.small_location(&block).await? {
                         let len = available_range_len(loc.len(), offset_in_block, request.len)?;
                         let handle = loc.range(offset_in_block, len)?;
                         self.record_l2_hit();
@@ -1907,12 +1907,12 @@ impl WorkerRuntime {
         Ok(Some(slice(&pages, offset - page_start, len)?))
     }
 
-    fn small_location(
+    async fn small_location(
         &self,
         block: &BlockId,
-    ) -> std::io::Result<Option<crate::small_store::Location>> {
+    ) -> std::io::Result<Option<crate::small_store::ReadLocation>> {
         match self.store.small() {
-            Some(small) => small.lookup(block),
+            Some(small) => small.lookup(block).await,
             None => Ok(None),
         }
     }
@@ -1929,13 +1929,31 @@ impl WorkerRuntime {
         offset: u64,
         len: u64,
     ) -> anyhow::Result<Option<bytes::Bytes>> {
-        match self.small_location(block)? {
-            Some(loc) => self
-                .small_range_bytes(block, loc, offset, len)
-                .await
-                .map(Some),
-            None => Ok(None),
+        let Some(small) = self.store.small() else {
+            return Ok(None);
+        };
+        if self.l1.is_enabled() {
+            let Some(loc) = small.lookup_entry(block)? else {
+                return Ok(None);
+            };
+            let len = available_range_len(loc.len(), offset, len)?;
+            loc.touch();
+            if let Some(bytes) = self.l1.get_range(block, offset, len) {
+                self.metrics.record_l1_hit();
+                talon_telemetry::cache_tier("l1");
+                self.metrics.record_cache_hit();
+                return Ok(Some(bytes));
+            }
+            self.metrics.record_l1_miss();
         }
+        let Some(loc) = small.lookup(block).await? else {
+            return Ok(None);
+        };
+        let len = available_range_len(loc.len(), offset, len)?;
+        loc.touch();
+        self.record_l2_hit();
+        let bytes = loc.read().await?;
+        self.range_from_fetched(block, bytes, offset, len).map(Some)
     }
 
     async fn delete_whole(&self, block: &BlockId) -> talon_core::Result<()> {
@@ -1944,29 +1962,6 @@ impl WorkerRuntime {
             return Ok(());
         }
         self.store.delete(block).await
-    }
-
-    async fn small_range_bytes(
-        &self,
-        block: &BlockId,
-        loc: crate::small_store::Location,
-        offset: u64,
-        len: u64,
-    ) -> anyhow::Result<bytes::Bytes> {
-        let len = available_range_len(loc.len(), offset, len)?;
-        loc.touch();
-        if self.l1.is_enabled() {
-            if let Some(bytes) = self.l1.get_range(block, offset, len) {
-                self.metrics.record_l1_hit();
-                talon_telemetry::cache_tier("l1");
-                self.metrics.record_cache_hit();
-                return Ok(bytes);
-            }
-            self.metrics.record_l1_miss();
-        }
-        self.record_l2_hit();
-        let bytes = loc.read().await?;
-        self.range_from_fetched(block, bytes, offset, len)
     }
 
     /// Drop stale metadata after an index-hit/file-miss eviction race.
@@ -2002,6 +1997,10 @@ impl WorkerRuntime {
 
     /// Split an aligned byte window into pages and publish L1 residency changes.
     fn admit_l1_pages(&self, block: &BlockId, start: u64, bytes: bytes::Bytes) {
+        self.admit_l1_pages_inner(block, start, bytes, false);
+    }
+
+    fn admit_l1_pages_inner(&self, block: &BlockId, start: u64, bytes: bytes::Bytes, detach: bool) {
         if !self.l1.is_enabled() || bytes.is_empty() {
             return;
         }
@@ -2022,7 +2021,14 @@ impl WorkerRuntime {
             match self.l1.insert_page(
                 block.clone(),
                 PageIndex(page_number),
-                bytes.slice(chunk_start..chunk_end),
+                if detach {
+                    // Packed reads validate the entire object. Each cached page
+                    // must own only the bytes charged to that page, even after
+                    // its siblings are evicted.
+                    bytes::Bytes::copy_from_slice(&bytes[chunk_start..chunk_end])
+                } else {
+                    bytes.slice(chunk_start..chunk_end)
+                },
             ) {
                 MemoryInsert::Inserted { evicted } => {
                     self.metrics.record_l1_admission();
@@ -2052,12 +2058,18 @@ impl WorkerRuntime {
         len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         let len = available_range_len(bytes.len() as u64, offset, len)?;
+        let packed = self.store.accepts_small(block, bytes.len() as u64);
         if self.l1.is_enabled() && len > 0 {
             let (page_start, page_len) = self.page_window(offset, len, bytes.len() as u64)?;
             let pages = slice(&bytes, page_start, page_len)?;
-            self.admit_l1_pages(block, page_start, pages);
+            self.admit_l1_pages_inner(block, page_start, pages, packed);
         }
-        slice(&bytes, offset, len)
+        let requested = slice(&bytes, offset, len)?;
+        if packed && len < bytes.len() as u64 {
+            Ok(bytes::Bytes::copy_from_slice(&requested))
+        } else {
+            Ok(requested)
+        }
     }
 
     fn invalidate_l1(&self, block: &BlockId) {
@@ -2457,7 +2469,9 @@ impl WorkerRuntime {
             None
         };
         if let Some(phase) = phase.as_mut() {
-            **phase = async_eviction::SmallCapacityPhase::Selecting;
+            **phase = async_eviction::SmallCapacityPhase::Selecting {
+                empty_scan_remaining: self.lru.len().saturating_mul(2),
+            };
         }
         let budget = self.lru.len();
         let mut attempted = HashSet::new();

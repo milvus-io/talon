@@ -192,7 +192,11 @@ impl WorkerRuntime {
         block_len: u64,
     ) -> bool {
         if self.store.accepts_small(block, block_len) {
-            if let Ok(Some(loc)) = self.small_location(block) {
+            if let Some(loc) = self
+                .store
+                .small()
+                .and_then(|s| s.lookup_entry(block).ok().flatten())
+            {
                 if offset.checked_add(len).is_some_and(|end| end <= loc.len()) {
                     loc.touch();
                     self.record_l2_hit();

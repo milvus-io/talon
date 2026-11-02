@@ -24,7 +24,7 @@ impl SmallObjectStore {
             for mut record in format::frames(body)? {
                 let last = format::u64(&mut record)?;
                 let id = format::id(record)?;
-                if let Some(access) = self.lookup(&id)?.and_then(|loc| loc.access) {
+                if let Some(access) = self.lookup_entry(&id)?.and_then(|loc| loc.access) {
                     restored.push((access, last));
                 }
             }

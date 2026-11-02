@@ -107,6 +107,205 @@ fn id(worker: &WorkerRuntime) -> BlockId {
 }
 
 #[tokio::test]
+async fn small_l2_promotion_retains_only_each_pages_allocation() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, mut w) =
+        runtime_with_geometry(dir.path(), false, false, 1 << 20, 2 << 20, 16 << 20);
+    let block = id(&w);
+    let payload = Bytes::from(vec![7; 512 << 10]);
+    w.l1 = Arc::new(crate::MemoryStore::with_limits(512 << 10, 4096));
+    // Public admission, like LOAD, leaves L1 empty.
+    let admission = CachedBlockPutRequest {
+        block: block.clone(),
+        object_len: payload.len() as u64,
+        body_len: payload.len() as u64,
+    };
+    w.admit_cached_block(&admission, payload.clone())
+        .await
+        .unwrap();
+    assert_eq!(w.l1.len(), 0);
+    for page in 0..128 {
+        let request = RangeRequest {
+            object: object(),
+            offset: page * 4096,
+            len: 4096,
+        };
+        let ServeOutcome::Bytes(bytes) = w
+            .serve_versioned(&request, &block.version, payload.len() as u64)
+            .await
+            .unwrap()
+        else {
+            panic!("L1 enabled read must return bytes");
+        };
+        assert_eq!(bytes.as_ref(), &payload[..4096]);
+        assert_eq!(
+            bytes.try_into_mut().unwrap().capacity(),
+            4096,
+            "the response must not retain the full object or share a cached page"
+        );
+    }
+    assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(w.l1.resident_bytes(), 512 << 10);
+    let pages: Vec<_> = (0..128)
+        .map(|p| w.l1.get_page(&block, PageIndex(p)).unwrap())
+        .collect();
+    w.invalidate_l1(&block);
+    for page in pages {
+        let allocation = page
+            .try_into_mut()
+            .expect("each page owns its backing allocation");
+        assert_eq!(
+            allocation.capacity(),
+            4096,
+            "page must not retain the full 512 KiB read"
+        );
+    }
+    // A multi-page promotion must also detach siblings, so retaining just one
+    // of them after eviction cannot pin an entire promotion window.
+    drop(w.cached_small_range(&block, 0, 8192).await.unwrap());
+    let first = w.l1.get_page(&block, PageIndex(0)).unwrap();
+    let second = w.l1.get_page(&block, PageIndex(1)).unwrap();
+    w.invalidate_l1(&block);
+    assert_eq!(first.try_into_mut().unwrap().capacity(), 4096);
+    assert_eq!(second.try_into_mut().unwrap().capacity(), 4096);
+    // Detaching the result must not weaken full-object checksum validation.
+    let payload_path = std::fs::read_dir(dir.path().join("small"))
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| {
+            p.extension().is_some_and(|e| e == "data") && std::fs::metadata(p).unwrap().len() > 0
+        })
+        .unwrap();
+    use std::os::unix::fs::FileExt;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(payload_path)
+        .unwrap()
+        .write_all_at(&[9], payload.len() as u64 - 1)
+        .unwrap();
+    assert!(w
+        .cached_small_range(&block, 0, 1)
+        .await
+        .unwrap_err()
+        .to_string()
+        .contains("checksum"));
+}
+
+#[tokio::test]
+async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
+    for versioned in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let block = BlockId::new(object(), 0, 1 << 20, Version::new("v1"));
+        let store = WholeBlockStore::open(dir.path()).unwrap();
+        let store = if versioned {
+            store.with_small_objects(0, 256 << 10, 16 << 20).unwrap()
+        } else {
+            store
+        };
+        store.put(&block, data()).await.unwrap();
+        let allocated = store.scan_allocated().unwrap()[0].allocated.clone();
+        drop(store);
+        assert!(WholeBlockStore::open(dir.path())
+            .unwrap()
+            .with_small_objects(128 << 10, 256 << 10, 16 << 20)
+            .is_err());
+        let store = WholeBlockStore::open(dir.path()).unwrap();
+        assert_eq!(store.get_bytes(&block).await.unwrap(), data());
+        assert_eq!(store.scan_allocated().unwrap()[0].allocated, allocated);
+        assert!(!dir.path().join("small").exists());
+        drop(store);
+        if versioned {
+            let (_, worker) =
+                runtime_with_geometry(dir.path(), false, false, 0, 256 << 10, 16 << 20);
+            let admission = CachedBlockPutRequest {
+                block: block.clone(),
+                object_len: 3072,
+                body_len: 3072,
+            };
+            worker.admit_cached_block(&admission, data()).await.unwrap();
+            let bytes = worker.resident_bytes();
+            assert_eq!(worker.block_count(), 1);
+            assert_eq!(
+                worker.store.scan_allocated().unwrap()[0].allocated[0].1,
+                bytes
+            );
+            drop(worker);
+            let (_, worker) =
+                runtime_with_geometry(dir.path(), false, false, 0, 256 << 10, 16 << 20);
+            assert_eq!(worker.resident_bytes(), bytes);
+            assert_eq!(worker.block_count(), 1);
+        }
+    }
+}
+
+#[tokio::test]
+async fn small_background_reclaims_after_bounded_scans_of_hot_or_pinned_keys() {
+    for pinned in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, mut w) = runtime(dir.path(), false, false);
+        w.page_gc_config.scan_batch_size = 2;
+        w.page_gc_config.delete_batch_size = 1;
+        let mut blocks = Vec::new();
+        for n in 0..16 {
+            let mut block = id(&w);
+            block.object.object_path = format!("hot-{n}");
+            w.commit_cached_block(&block, Bytes::from(vec![n; 16 << 10]))
+                .await
+                .unwrap();
+            blocks.push(block);
+            if n == 3 {
+                w.store.maintain_small(true).await.unwrap();
+            }
+        }
+        w.store.maintain_small(true).await.unwrap();
+        for block in &blocks[..3] {
+            w.unlink_units(w.lru.block_candidates(block), 2).await;
+        }
+        let before = w.resident_bytes();
+        let config = WorkerConfig {
+            async_eviction_low_watermark: 0.1,
+            ..Default::default()
+        };
+        let target = (before as f64 * config.async_eviction_low_watermark) as u64;
+        let credit = w.small_reclaim_credit().await;
+        assert!(credit > 0 && credit < before - target);
+        assert!(w.lru.len() > w.page_gc_config.scan_batch_size);
+        let live = w.block_count();
+        let _pins: Vec<_> = if pinned {
+            blocks[3..]
+                .iter()
+                .map(|block| w.lru.pin_guard(CacheUnit::Whole(block.clone())).unwrap())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut cycle = async_eviction::EvictionCycle::new(before, &config);
+        for _ in 0..=w.lru.len() {
+            if !pinned {
+                // Ordinary reads renew second chances between every bounded scan.
+                for block in &blocks[3..] {
+                    assert!(w.cached_small_range(block, 0, 1).await.unwrap().is_some());
+                }
+            }
+            cycle.tick(&w).await;
+            w.maintain_small_background().await;
+            if w.resident_bytes() < before {
+                break;
+            }
+        }
+        assert!(
+            w.resident_bytes() < before,
+            "eligible garbage must not be gated forever by Selecting"
+        );
+        assert_eq!(
+            w.block_count(),
+            live,
+            "reclaim existing garbage without evicting hot or pinned survivors"
+        );
+    }
+}
+
+#[tokio::test]
 async fn small_read_fetches_once_and_returns_a_segment_range() {
     for paged in [false, true] {
         let dir = tempfile::tempdir().unwrap();
@@ -396,7 +595,14 @@ async fn small_cache_pressure_counts_dead_and_retired_bytes() {
     let (_, w) = runtime(dir.path(), false, false);
     w.write_object(&object(), data()).await.unwrap();
     w.store.maintain_small(true).await.unwrap();
-    let handle = w.store.small().unwrap().get(&id(&w)).unwrap().unwrap();
+    let handle = w
+        .store
+        .small()
+        .unwrap()
+        .get(&id(&w))
+        .await
+        .unwrap()
+        .unwrap();
     w.evict_to_target(0).await;
     assert!(w.index.is_empty());
     assert!(
@@ -421,7 +627,14 @@ async fn small_idle_eviction_uses_whole_object_access_and_preserves_open_fd() {
     let (_, mut w) = runtime(dir.path(), true, false);
     w.page_gc_config.tti_ms = 1000;
     w.write_object(&object(), data()).await.unwrap();
-    let handle = w.store.small().unwrap().get(&id(&w)).unwrap().unwrap();
+    let handle = w
+        .store
+        .small()
+        .unwrap()
+        .get(&id(&w))
+        .await
+        .unwrap()
+        .unwrap();
     w.gc_small_idle_at(crate::eviction::access_millis() + 2000)
         .await;
     assert!(!w.store.small().unwrap().contains(&id(&w)));
@@ -787,7 +1000,7 @@ async fn small_background_capacity_waits_for_retired_readers_without_extra_evict
             .await
             .unwrap();
         if n == 0 {
-            held = w.store.small().unwrap().get(&block).unwrap();
+            held = w.store.small().unwrap().get(&block).await.unwrap();
         }
     }
     w.store.maintain_small(true).await.unwrap();

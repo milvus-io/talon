@@ -664,6 +664,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_store_contract_with_small_engine_enabled() {
+        let root = tempfile::tempdir().unwrap();
+        let open = || {
+            WholeBlockStore::open(root.path())
+                .unwrap()
+                .with_small_objects(128 << 10, 256 << 10, 4 << 20)
+                .unwrap()
+        };
+        let id = block(1);
+        let store = open();
+        let value = Bytes::from_static(b"short whole block");
+        assert!(!store.contains(&id).await.unwrap());
+        store.put(&id, value.clone()).await.unwrap();
+        assert!(store.contains(&id).await.unwrap());
+        assert_eq!(store.get_bytes(&id).await.unwrap(), value);
+        assert!(store.path_for(&id).exists());
+        assert!(!store.small().unwrap().contains(&id));
+        drop(store);
+        let store = open();
+        assert!(store.contains(&id).await.unwrap());
+        assert_eq!(store.get_bytes(&id).await.unwrap(), value);
+        store.delete(&id).await.unwrap();
+        assert!(!store.contains(&id).await.unwrap());
+        drop(store);
+        assert!(!open().contains(&id).await.unwrap());
+    }
+
+    #[tokio::test]
     async fn put_get_delete_roundtrip() {
         let root = tmp_root();
         let store = WholeBlockStore::open(&root).unwrap();

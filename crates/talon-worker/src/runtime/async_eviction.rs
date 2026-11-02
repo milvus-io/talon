@@ -9,7 +9,9 @@ use talon_core::WorkerConfig;
 pub(super) enum SmallCapacityPhase {
     #[default]
     Idle,
-    Selecting,
+    Selecting {
+        empty_scan_remaining: usize,
+    },
     Reclaiming,
 }
 
@@ -119,7 +121,9 @@ impl WorkerRuntime {
             return;
         }
         if *phase == SmallCapacityPhase::Idle {
-            *phase = SmallCapacityPhase::Selecting;
+            *phase = SmallCapacityPhase::Selecting {
+                empty_scan_remaining: self.lru.len().saturating_mul(2),
+            };
         }
         let missing = self
             .resident_bytes()
@@ -128,7 +132,10 @@ impl WorkerRuntime {
         if missing == 0 {
             *phase = SmallCapacityPhase::Reclaiming;
         }
-        if *phase == SmallCapacityPhase::Selecting {
+        if let SmallCapacityPhase::Selecting {
+            empty_scan_remaining,
+        } = phase
+        {
             let policy_target = self.lru.total_bytes().saturating_sub(missing);
             let lru = self.lru.clone();
             let count = lru.len();
@@ -139,12 +146,19 @@ impl WorkerRuntime {
             })
             .await
             .expect("eviction scan panicked");
-            let no_victims = units.is_empty();
+            // Keep a bounded no-progress walk across ticks. Hot reference bits
+            // may be refreshed between every batch, so an individual scan need
+            // never reach its forced second pass. Partial reclaim must still run.
+            let logical_before = self.lru.total_bytes();
             self.unlink_units_to_target(units, 1, target).await;
+            if self.lru.total_bytes() >= logical_before {
+                *empty_scan_remaining = empty_scan_remaining.saturating_sub(scan);
+            } else {
+                *empty_scan_remaining = count.saturating_mul(2);
+            }
+            let exhausted = *empty_scan_remaining == 0;
             let excess = self.resident_bytes().saturating_sub(target);
-            if self.small_reclaim_credit().await >= excess
-                || (no_victims && scan >= count.saturating_mul(2))
-            {
+            if self.small_reclaim_credit().await >= excess || exhausted {
                 // Exhausted unpinned victims may yield only partial progress.
                 *phase = SmallCapacityPhase::Reclaiming;
             } else {

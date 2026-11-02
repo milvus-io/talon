@@ -112,7 +112,21 @@ and deletes of the same identity across rings, without a second resident-object
 index. Short shared directory locks remain. There is no preallocation, truncate,
 hole punching, or removal of fsync.
 
-Reads use a short directory lock to retain an fd. Accepted mutations and pipeline
+Sealed segments retain no idle data or index descriptors. Reads asynchronously
+open data files on demand and share a weakly cached descriptor with overlapping
+readers. Active, standby and sealing segments retain their writer descriptors;
+sealing releases them, and recovery closes each segment's files after replay.
+Thus descriptor residency follows concurrent reads and bounded writer pipelines,
+rather than the number of live sealed segments. `SmallObjectStore::get` is async.
+LOAD residency checks and L1 hits use only the in-memory directory.
+
+A read takes an asynchronous directory lease until its fd is retained. Compaction
+excludes new leases while replacing locators and unlinking files, so a pending
+open cannot race unlink. Returned handles retain the old inode independently.
+Packed byte reads still verify the complete object's checksum; promoted L1 pages
+each own only their charged bytes, even after sibling pages are evicted.
+
+Accepted mutations and pipeline
 tasks remain owned by the worker/ring if their caller stops waiting. A separate
 publication lock serializes seals, tombstones and compaction so a deletion cannot
 race a sealing fsync or manifest replacement. Compaction still holds the append
@@ -201,7 +215,8 @@ are cold. Capacity reclamation has two phases:
    exceeding the shared 50% garbage threshold (by payload plus index bytes) count
    toward this estimate. Below-threshold garbage provides no reclaim credit;
    continue selecting items until enough eligible segments exist.
-2. Once the estimate covers the remaining excess (or no unpinned victims remain),
+2. Once the estimate covers the remaining excess (or a bounded no-progress walk
+   spanning scheduler turns completes),
    stop selecting objects and reclaim the dirty segments. Empty segments go first;
    pressure relocation prefers more garbage but never bypasses the routine
    50% garbage threshold. Seal eligible active segments before relocation. Each
@@ -209,6 +224,9 @@ are cold. Capacity reclamation has two phases:
    phase across scheduler turns. Actual allocated bytes, not the estimate,
    determine when the low target is reached. If remaining items are pinned, keep
    the threshold and retry later rather than forcing a mostly-live rewrite.
+   Reads that renew second chances between every scan batch cannot indefinitely
+   defer existing eligible garbage or idle-segment maintenance. Successful
+   victim batches reset the no-progress budget, preserving batched relocation.
 
 This can evict more logical item bytes than the immediate physical deficit,
 especially when cold items are scattered across segments. That tradeoff prevents

@@ -92,6 +92,142 @@ fn read_handle(handle: &BlockHandle) -> Vec<u8> {
 }
 
 #[tokio::test]
+async fn sparse_segments_do_not_exhaust_file_descriptors() {
+    let dir = tempfile::tempdir().unwrap();
+    let child = tokio::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "small_store::tests::limited_fd_child",
+            "--nocapture",
+        ])
+        .env("TALON_SMALL_FD_TEST_ROOT", dir.path())
+        .kill_on_drop(true)
+        .output();
+    let output = tokio::time::timeout(Duration::from_secs(30), child)
+        .await
+        .expect("limited-fd child timed out")
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[tokio::test]
+async fn limited_fd_child() {
+    let Ok(path) = std::env::var("TALON_SMALL_FD_TEST_ROOT") else {
+        return;
+    };
+    let limit = libc::rlimit {
+        rlim_cur: 64,
+        rlim_max: 64,
+    };
+    // SAFETY: a separate test process changes only its own descriptor limit.
+    assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+    let count_fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
+    let baseline = count_fds();
+    let root = Path::new(&path);
+    let reopen = || {
+        Arc::new(
+            SmallObjectStore::open(root.to_owned(), 128 << 10, 256 << 10, 4 << 20, None).unwrap(),
+        )
+    };
+    let store = reopen();
+    for n in 0..96 {
+        store
+            .put(&id(&n.to_string()), Bytes::from(vec![n as u8; 4096]))
+            .await
+            .unwrap();
+        store.maintain(true).await.unwrap();
+        assert!(
+            count_fds() <= baseline + 8,
+            "sealing must release idle descriptors"
+        );
+    }
+    store.tasks.drain().await;
+    drop(store);
+    let store = reopen();
+    assert!(
+        count_fds() <= baseline + 2,
+        "recovery must not retain per-segment descriptors"
+    );
+    for n in 0..96 {
+        assert!(store.contains(&id(&n.to_string())));
+        assert_eq!(
+            store
+                .read(&id(&n.to_string()))
+                .await
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            vec![n as u8; 4096]
+        );
+    }
+    let held = store.get(&id("0")).await.unwrap().unwrap();
+    let another = store.get(&id("0")).await.unwrap().unwrap();
+    assert!(
+        Arc::ptr_eq(&held.fd, &another.fd),
+        "overlapping readers share a descriptor"
+    );
+    drop(another);
+    store.delete(&id("0")).await.unwrap();
+    store.maintain(false).await.unwrap();
+    assert_eq!(read_handle(&held), vec![0; 4096]);
+    assert!(store.stats().unwrap().retired_bytes > 0);
+    drop(held);
+    assert_eq!(store.stats().unwrap().retired_bytes, 0);
+    store
+        .put(&id("continued"), Bytes::from_static(b"after restart"))
+        .await
+        .unwrap();
+    store.maintain(true).await.unwrap();
+    store.tasks.drain().await;
+    drop(store);
+    let store = reopen();
+    assert!(!store.contains(&id("0")));
+    assert_eq!(
+        store.read(&id("continued")).await.unwrap().unwrap(),
+        "after restart"
+    );
+    assert!(count_fds() <= baseline + 2);
+}
+
+#[tokio::test]
+async fn pending_open_retains_old_inode_before_compaction_unlinks() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = open(dir.path());
+    put(&store, &id("held"), b"original").await.unwrap();
+    store.maintain(true).await.unwrap();
+    // Pause a lookup after taking its directory lease and before opening the
+    // sealed file; this is the interval in which unlink used to require an fd.
+    let lease = store.readers.read().await;
+    let loc = store
+        .entries
+        .read()
+        .unwrap()
+        .get(format::key(&id("held")).unwrap().as_slice())
+        .unwrap()
+        .clone();
+    assert!(loc.file.fd.lock().await.upgrade().is_none());
+    store.delete(&id("held")).await.unwrap();
+    let collector = store.clone();
+    let gc = tokio::spawn(async move { collector.maintain(false).await.unwrap() });
+    tokio::task::yield_now().await;
+    assert!(!gc.is_finished());
+    let retained = loc.retain().await.unwrap();
+    let handle = retained.range(0, retained.len()).unwrap();
+    drop(retained);
+    drop(lease);
+    assert!(gc.await.unwrap());
+    assert_eq!(read_handle(&handle), b"original");
+    assert!(store.stats().unwrap().retired_bytes > 0);
+    drop(handle);
+    assert_eq!(store.stats().unwrap().retired_bytes, 0);
+}
+
+#[tokio::test]
 async fn packed_ranges_recovery_and_threshold_changes() {
     let dir = tempfile::tempdir().unwrap();
     let store = open(dir.path());
@@ -109,7 +245,7 @@ async fn packed_ranges_recovery_and_threshold_changes() {
     assert!(!recovered.accepts(&id("1"), 3072));
     for n in 0..100 {
         assert_eq!(
-            read_handle(&recovered.get(&id(&n.to_string())).unwrap().unwrap()),
+            read_handle(&recovered.get(&id(&n.to_string())).await.unwrap().unwrap()),
             vec![n as u8; 3072]
         );
     }
@@ -140,14 +276,14 @@ async fn deletion_is_recovered_and_compaction_preserves_open_handles() {
             .unwrap();
     }
     store.maintain(true).await.unwrap();
-    let old = store.get(&id("9")).unwrap().unwrap();
+    let old = store.get(&id("9")).await.unwrap().unwrap();
     for n in 0..9 {
         store.delete(&id(&n.to_string())).await.unwrap();
     }
     assert!(store.maintain(false).await.unwrap());
     assert_eq!(read_handle(&old), vec![9; 4096]);
     assert!(store.stats().unwrap().retired_bytes > 0);
-    let new = store.get(&id("9")).unwrap().unwrap();
+    let new = store.get(&id("9")).await.unwrap().unwrap();
     assert_eq!(read_handle(&new), vec![9; 4096]);
     drop(old);
     assert_eq!(store.stats().unwrap().retired_bytes, 0);
@@ -233,10 +369,10 @@ async fn concurrent_read_delete_and_compaction_do_not_mutate_old_extents() {
     }
     store.maintain(true).await.unwrap();
     let reader = store.clone();
-    let thread = std::thread::spawn(move || {
+    let thread = tokio::spawn(async move {
         for _ in 0..100 {
             for n in 0..100 {
-                if let Some(handle) = reader.get(&id(&n.to_string())).unwrap() {
+                if let Some(handle) = reader.get(&id(&n.to_string())).await.unwrap() {
                     assert_eq!(read_handle(&handle), vec![n as u8; 1000]);
                 }
             }
@@ -246,7 +382,7 @@ async fn concurrent_read_delete_and_compaction_do_not_mutate_old_extents() {
         store.delete(&id(&n.to_string())).await.unwrap();
     }
     store.maintain(false).await.unwrap();
-    thread.join().unwrap();
+    thread.await.unwrap();
     for n in 0..90 {
         assert!(!store.contains(&id(&n.to_string())));
     }
@@ -261,7 +397,7 @@ async fn slow_sendfile_survives_retirement() {
     let payload = vec![0x5a; 120 << 10];
     put(&store, &id("wire"), &payload).await.unwrap();
     store.maintain(true).await.unwrap();
-    let handle = store.get(&id("wire")).unwrap().unwrap();
+    let handle = store.get(&id("wire")).await.unwrap().unwrap();
     let (tx, mut rx) = UnixStream::pair().unwrap();
     let size: libc::c_int = 4096;
     // SAFETY: a live socket and a pointer to an initialized integer.
@@ -447,7 +583,7 @@ fn native_small_io_uses_current_ring_without_blocking_fallback() {
                 .unwrap();
         }
         store.maintain(true).await.unwrap();
-        let old = store.get(&id("9")).unwrap().unwrap();
+        let old = store.get(&id("9")).await.unwrap().unwrap();
         for n in 0..9 {
             store.delete(&id(&n.to_string())).await.unwrap();
         }
@@ -771,8 +907,9 @@ async fn failed_reserved_index_prevents_peer_publication_and_keeps_durable_segme
         let mut state = store.state.lock().await;
         let active = state.active.unwrap();
         // Only later reservations receive this read-only index descriptor.
-        state.segments.get_mut(&active).unwrap().index =
-            Arc::new(File::open(store.path(active, "index")).unwrap().into());
+        state.segments.get_mut(&active).unwrap().index = Some(Arc::new(
+            File::open(store.path(active, "index")).unwrap().into(),
+        ));
     }
     assert!(put(&store, &id("b"), b"failed").await.is_err());
     pause.resume.notify_one();
