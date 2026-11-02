@@ -169,7 +169,7 @@ async fn small_l2_promotion_retains_only_each_pages_allocation() {
     assert_eq!(first.try_into_mut().unwrap().capacity(), 4096);
     assert_eq!(second.try_into_mut().unwrap().capacity(), 4096);
     // Detaching the result must not weaken full-object checksum validation.
-    let payload_path = std::fs::read_dir(dir.path().join("small"))
+    let payload_path = std::fs::read_dir(dir.path().join("small/ring-0"))
         .unwrap()
         .map(|e| e.unwrap().path())
         .find(|p| {
@@ -965,7 +965,7 @@ async fn small_background_capacity_keeps_evicting_until_segment_threshold() {
                 2,
                 "keep selecting items until the segment reaches its garbage threshold"
             );
-            let allocated = std::fs::read_dir(dir.path().join("small"))
+            let allocated = std::fs::read_dir(dir.path().join("small/ring-0"))
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .filter(|p| {
@@ -1042,7 +1042,7 @@ async fn small_capacity_batches_same_segment_victims_before_one_rewrite() {
     }
     w.store.maintain_small(true).await.unwrap();
     let payload_files = || {
-        let mut files: Vec<_> = std::fs::read_dir(dir.path().join("small"))
+        let mut files: Vec<_> = std::fs::read_dir(dir.path().join("small/ring-0"))
             .unwrap()
             .map(|e| e.unwrap().path())
             .filter(|p| {
@@ -1185,7 +1185,7 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     }
     w.store.maintain_small(true).await.unwrap();
     let files = || {
-        let mut paths: Vec<_> = std::fs::read_dir(dir.path().join("small"))
+        let mut paths: Vec<_> = std::fs::read_dir(dir.path().join("small/ring-0"))
             .unwrap()
             .map(|e| e.unwrap().path())
             .collect();

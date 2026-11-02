@@ -1,6 +1,6 @@
 //! Independent append/rollover pipelines on the worker's existing rings.
-//! Slot zero retains the legacy root and serves non-ring callers. Native ring N
-//! owns slot N+1. Readers and lifecycle operations can address every slot.
+//! Every stream lives in ring-<slot>/. Slot zero serves non-ring callers; native
+//! ring N owns slot N+1. Readers and lifecycle operations can address every slot.
 use super::*;
 use crate::miss::{InFlightGuard, InFlightLoads, LoadKey};
 use tokio::sync::OnceCell;
@@ -9,7 +9,9 @@ type Stream = Arc<OnceCell<Arc<SegmentStore>>>;
 
 pub struct SmallObjectStore {
     pub(super) root: PathBuf,
-    legacy: Arc<SegmentStore>,
+    threshold: u64,
+    segment_size: u64,
+    root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     allocation_unit: u64,
     pub(super) access_checkpoint: tokio::sync::Mutex<()>,
     pub(super) access_bytes: std::sync::atomic::AtomicU64,
@@ -28,15 +30,9 @@ impl SmallObjectStore {
         capacity: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<Self> {
-        let legacy = Arc::new(SegmentStore::open(
-            root.clone(),
-            threshold,
-            segment_size,
-            capacity,
-            root_lock.clone(),
-        )?);
-        let mut streams = BTreeMap::new();
-        streams.insert(0, Arc::new(OnceCell::new_with(Some(legacy.clone()))));
+        validate_geometry(threshold, segment_size, capacity)?;
+        std::fs::create_dir_all(&root)?;
+        let mut streams: BTreeMap<usize, Stream> = BTreeMap::new();
         // Recover every slot after reducing the ring count. Worker startup
         // separately validates routing geometry before opening this engine.
         for entry in std::fs::read_dir(&root)? {
@@ -48,7 +44,7 @@ impl SmallObjectStore {
             let slot = name
                 .parse::<usize>()
                 .map_err(|_| invalid("small object ring directory"))?;
-            if slot == 0 || slot.to_string() != name || !entry.file_type()?.is_dir() {
+            if slot.to_string() != name || !entry.file_type()?.is_dir() {
                 return Err(invalid("small object ring directory"));
             }
             let stream = Arc::new(SegmentStore::open(
@@ -88,7 +84,9 @@ impl SmallObjectStore {
             access_checkpoint: tokio::sync::Mutex::new(()),
             access_bytes: std::sync::atomic::AtomicU64::new(access_bytes),
             root,
-            legacy,
+            threshold,
+            segment_size,
+            root_lock,
             streams: RwLock::new(streams),
             policy: std::sync::OnceLock::new(),
             mutations: Arc::new(InFlightLoads::new()),
@@ -122,9 +120,9 @@ impl SmallObjectStore {
             disk_io::sync_dir(self.root.clone()).await?;
             Ok(Arc::new(SegmentStore::empty(
                 root,
-                self.legacy.threshold,
-                self.legacy.segment_size,
-                self.legacy._root_lock.clone(),
+                self.threshold,
+                self.segment_size,
+                self.root_lock.clone(),
             )))
         })
         .await
@@ -146,7 +144,7 @@ impl SmallObjectStore {
     }
 
     pub fn accepts(&self, id: &BlockId, len: u64) -> bool {
-        self.legacy.accepts(id, len)
+        accepts_object(self.threshold, id, len)
     }
     pub fn contains(&self, id: &BlockId) -> bool {
         self.lookup_entry(id).ok().flatten().is_some()
@@ -556,32 +554,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_root_and_duplicate_detection() {
+    async fn non_ring_stream_recovery_and_duplicate_detection() {
         let dir = tempfile::tempdir().unwrap();
-        let legacy = Arc::new(
-            SegmentStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None).unwrap(),
-        );
-        legacy
-            .put(&id("old"), Bytes::from_static(b"legacy"))
+        let store = open(dir.path());
+        assert!(store.streams().is_empty());
+        store
+            .put(&id("default"), Bytes::from_static(b"non-ring"))
             .await
             .unwrap();
-        legacy.maintain(true).await.unwrap();
-        legacy.tasks.drain().await;
-        drop(legacy);
+        store.maintain(true).await.unwrap();
+        drop(store);
+        let default = dir.path().join("ring-0");
+        assert!(default.join("MANIFEST").exists());
+        assert!(!dir.path().join("MANIFEST").exists());
         let store = open(dir.path());
         assert_eq!(
-            store.read(&id("old")).await.unwrap().unwrap().as_ref(),
-            b"legacy"
+            store.read(&id("default")).await.unwrap().unwrap().as_ref(),
+            b"non-ring"
         );
         drop(store);
         let ring = dir.path().join("ring-1");
         std::fs::create_dir(&ring).unwrap();
         for file in ["MANIFEST", "1.data", "1.index"] {
-            std::fs::copy(dir.path().join(file), ring.join(file)).unwrap();
+            std::fs::copy(default.join(file), ring.join(file)).unwrap();
         }
         assert!(
             SmallObjectStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn empty_store_validates_geometry_before_creating_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        for (threshold, segment_size, capacity) in [
+            (128 << 10, 128 << 10, 4 << 20),
+            (128 << 10, 256 << 10, 512 << 10),
+        ] {
+            let error = SmallObjectStore::open(
+                dir.path().join("small"),
+                threshold,
+                segment_size,
+                capacity,
+                None,
+            )
+            .err()
+            .expect("invalid geometry must fail even without existing streams");
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        }
     }
 }

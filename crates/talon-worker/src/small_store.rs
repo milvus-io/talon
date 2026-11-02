@@ -176,6 +176,7 @@ struct SegmentStore {
     #[cfg(test)]
     append_pause: Mutex<Option<Arc<tests::AppendPause>>>,
     root: PathBuf,
+    #[cfg(test)]
     threshold: u64,
     segment_size: u64,
     state: tokio::sync::Mutex<State>,
@@ -204,6 +205,23 @@ pub struct SmallStoreStats {
     pub segments: usize,
 }
 
+fn validate_geometry(threshold: u64, segment_size: u64, capacity: u64) -> io::Result<()> {
+    if segment_size < threshold.saturating_add(format::MAX_KEY as u64 + 64)
+        || segment_size > 1 << 30
+        || threshold > 128 << 20
+        || (capacity != 0 && segment_size.saturating_mul(4) > capacity)
+    {
+        return Err(invalid("small object segment/capacity geometry"));
+    }
+    Ok(())
+}
+
+/// Only a complete short FIRST block proves this is a small object. A
+/// short last block of a large object must remain in the large-object store.
+fn accepts_object(threshold: u64, id: &BlockId, len: u64) -> bool {
+    threshold > 0 && id.offset == 0 && len > 0 && len < threshold && len < u64::from(id.block_size)
+}
+
 impl SegmentStore {
     pub fn open(
         root: PathBuf,
@@ -212,13 +230,7 @@ impl SegmentStore {
         capacity: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<Self> {
-        if segment_size < threshold.saturating_add(format::MAX_KEY as u64 + 64)
-            || segment_size > 1 << 30
-            || threshold > 128 << 20
-            || (capacity != 0 && segment_size.saturating_mul(4) > capacity)
-        {
-            return Err(invalid("small object segment/capacity geometry"));
-        }
+        validate_geometry(threshold, segment_size, capacity)?;
         std::fs::create_dir_all(&root)?;
         let manifest = root.join("MANIFEST");
         let ids = match std::fs::read(&manifest) {
@@ -274,7 +286,7 @@ impl SegmentStore {
     /// made durable asynchronously. Existing streams always use open/recovery.
     fn empty(
         root: PathBuf,
-        threshold: u64,
+        _threshold: u64,
         segment_size: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> Self {
@@ -284,7 +296,8 @@ impl SegmentStore {
             #[cfg(test)]
             append_pause: Mutex::new(None),
             root,
-            threshold,
+            #[cfg(test)]
+            threshold: _threshold,
             segment_size,
             state: tokio::sync::Mutex::new(State {
                 segments: BTreeMap::new(),
@@ -312,14 +325,9 @@ impl SegmentStore {
         }
     }
 
-    /// Only a complete short FIRST block proves this is a small object. A
-    /// short last block of a large object must remain in the large-object store.
+    #[cfg(test)]
     pub fn accepts(&self, id: &BlockId, len: u64) -> bool {
-        self.threshold > 0
-            && id.offset == 0
-            && len > 0
-            && len < self.threshold
-            && len < u64::from(id.block_size)
+        accepts_object(self.threshold, id, len)
     }
 
     pub fn contains(&self, id: &BlockId) -> bool {

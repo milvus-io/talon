@@ -154,15 +154,15 @@ and seals the current active segment. An abrupt exit can lose up to two data-bea
 unsealed segments per writer stream; the empty spare is also discarded. The
 unsealed-data bound scales with the number of rings (plus a non-ring fallback
 stream, if used). These are cache misses, not lost origin writes. There is no per-insert fsync. Spare index
-allocation is included in physical capacity accounting. Each native ring uses a
-stable slot in `ring-<slot>/`, with independent segment IDs and MANIFEST. The root
-layout remains the legacy/non-ring stream. Startup discovers all historical
-slots even when the configured ring count is reduced;
+allocation is included in physical capacity accounting. Every writer stream uses
+`ring-<slot>/`, with independent segment IDs and MANIFEST. Slot zero serves callers
+without a native ring; native ring N uses slot N+1. Shared configuration belongs
+to the store, and each stream is created on its first insertion. Startup discovers
+all existing slots even when the configured ring count is reduced;
 existing objects stay readable from any ring. Duplicate identities across slots
 fail recovery closed. A newly used ring directory is created and made durable
-through native asynchronous I/O before its first insertion. Old binaries do not
-discover the new ring subdirectories, so those objects become cache misses on
-downgrade; files are not migrated or deleted automatically.
+through asynchronous I/O before its first insertion. Root-level segment files are
+not part of this layout; no prior on-disk format is supported or migrated.
 
 Deleting a sealed record appends and synchronizes a tombstone before removing
 the locator. A failed mutation stops further mutations for that engine until
