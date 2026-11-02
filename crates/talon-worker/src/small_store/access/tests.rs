@@ -289,6 +289,10 @@ async fn million_item_sparse_access_probe() {
             .unwrap()
             .into(),
     );
+    let file = Arc::new(SegmentFile {
+        path: dir.path().join("probe.data"),
+        fd: tokio::sync::Mutex::new(Arc::downgrade(&fd)),
+    });
     let stream = store.streams().remove(0);
     for n in 0..count {
         let mut block = id(n);
@@ -297,7 +301,7 @@ async fn million_item_sparse_access_probe() {
         stream.entries.write().unwrap().insert(
             key.clone(),
             Location {
-                fd: fd.clone(),
+                file: file.clone(),
                 segment: 1,
                 offset: n as u64,
                 len: 1,
