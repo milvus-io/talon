@@ -74,7 +74,8 @@ fn runtime_with_geometry(
         ranges: Mutex::new(Vec::new()),
     });
     let store = WholeBlockStore::open(root).unwrap();
-    let small = cache_routing::open_small_store(root, threshold, segment, capacity, None, None).unwrap();
+    let small =
+        cache_routing::open_small_store(root, threshold, segment, capacity, None, None).unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
     let mut worker = WorkerRuntime::new_with_l1_policy(
@@ -197,19 +198,29 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
         let block = BlockId::new(object(), 0, 1 << 20, Version::new("v1"));
         let store = WholeBlockStore::open(dir.path()).unwrap();
         if versioned {
-            assert!(
-                cache_routing::open_small_store(dir.path(), 0, 256 << 10, 16 << 20, None, None)
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(cache_routing::open_small_store(
+                dir.path(),
+                0,
+                256 << 10,
+                16 << 20,
+                None,
+                None
+            )
+            .unwrap()
+            .is_none());
         }
         store.put(&block, data()).await.unwrap();
         let allocated = store.scan_allocated().unwrap()[0].allocated.clone();
         drop(store);
-        assert!(
-            cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
-                .is_err()
-        );
+        assert!(cache_routing::open_small_store(
+            dir.path(),
+            128 << 10,
+            256 << 10,
+            16 << 20,
+            None,
+            None
+        )
+        .is_err());
         let store = WholeBlockStore::open(dir.path()).unwrap();
         assert_eq!(store.get_bytes(&block).await.unwrap(), data());
         assert_eq!(store.scan_allocated().unwrap()[0].allocated, allocated);
@@ -518,14 +529,16 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     assert_eq!(recovered.block_count(), 1);
     drop(recovered);
     std::fs::write(&marker, b"broken").unwrap();
-    let error = cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
-        .err()
-        .unwrap();
+    let error =
+        cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
+            .err()
+            .unwrap();
     assert!(error.to_string().contains("invalid small store routing"));
     std::fs::remove_file(&marker).unwrap();
-    let error = cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
-        .err()
-        .unwrap();
+    let error =
+        cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
+            .err()
+            .unwrap();
     assert!(error
         .to_string()
         .contains("predates small store routing metadata"));

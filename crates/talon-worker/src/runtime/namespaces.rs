@@ -733,14 +733,17 @@ mod tests {
         // Bind current routing first so this fixture specifically exercises
         // rejection of paged data without journal metadata.
         let cfg = config();
-        WholeBlockStore::open(dir.path().join("default/shared"))
-            .unwrap()
-            .with_small_objects(
-                cfg.small_object_threshold_bytes,
-                cfg.small_object_segment_bytes,
-                cfg.capacity_bytes,
-            )
-            .unwrap();
+        let root = dir.path().join("default/shared");
+        WholeBlockStore::open(&root).unwrap();
+        cache_routing::open_small_store(
+            &root,
+            cfg.small_object_threshold_bytes,
+            cfg.small_object_segment_bytes,
+            cfg.capacity_bytes,
+            None,
+            None,
+        )
+        .unwrap();
         let legacy = PagedBlockStore::open(dir.path().join("default/shared/paged"), 4).unwrap();
         legacy.write_sidecar(&block(16), 16).unwrap();
         legacy

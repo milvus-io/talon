@@ -127,7 +127,6 @@ async fn limited_fd_child() {
     // SAFETY: a separate test process changes only its own descriptor limit.
     assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
     let count_fds = || std::fs::read_dir("/proc/self/fd").unwrap().count();
-    let baseline = count_fds();
     let root = Path::new(&path);
     let reopen = || {
         Arc::new(
@@ -135,6 +134,9 @@ async fn limited_fd_child() {
         )
     };
     let store = reopen();
+    // Include the store's fixed journal/runtime descriptors before measuring
+    // growth from sealed segments and recovery.
+    let baseline = count_fds();
     for n in 0..96 {
         store
             .put(&id(&n.to_string()), Bytes::from(vec![n as u8; 4096]))
