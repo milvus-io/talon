@@ -149,14 +149,6 @@ sorting compares the full bytes on fingerprint collisions. No separate global
 key HashSet is built. All validation finishes before orphan payload cleanup or
 abandoned-segment resolution, and no runtime is published on failure.
 
-Before sharing the Worker index, small-object keys are decoded and index entries
-are constructed on the same bounded CPU helper as the paged catalog. Allocation
-charges use an inline single-unit value; recovery does not allocate a Vec per
-small object. A decode error leaves the existing index unchanged. Successful
-entries are merged with exclusive ownership, without per-object index locks or
-atomic counter updates. The final hash-map merge and uniqueness sort remain
-serial; this does not claim fully parallel recovery.
-
 The LRU's block membership and its idle/ownership scan queues share an immutable
 identity from an existing cache unit, instead of copying its path and version
 into each structure. Removing that particular page leaves the identity alive
@@ -378,7 +370,3 @@ Origin-existence checks remain a separate optional background policy. Namespace
 startup constructs their reference-counted check table only when `stale_gc_enabled`
 is true; disabling it skips both recovery-time and subsequent admission bookkeeping.
 The full key and persisted record formats are unchanged.
-
-Packed residency carries its independent-key policy into BlockIndex during both
-serial and bulk recovery. Attaching access tokens reads that flag directly,
-without re-encoding each object key or querying the engine locator again.

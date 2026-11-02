@@ -25,12 +25,23 @@ pub(crate) async fn run<M: Machine>(
     let mut durable = Vec::new();
     let mut barrier: Option<Request<M>> = None;
     let mut checkpoint: Option<LocalBoxFuture<'static, io::Result<disk::Snapshot>>> = None;
-    let mut checkpoint_request: Option<Request<M>> = None;
+    let mut checkpoint_completion: Option<watch::Sender<bool>> = None;
+    let mut pending_checkpoint: Option<watch::Sender<bool>> = None;
     let mut closed = false;
     let mut next_lsn = disk.lsn;
     let result=async {
         loop {
             if failed.load(Ordering::Acquire) {return Err(stopped());}
+            // Coalesce callers by snapshot cut and release queue admission.
+            // Appends holding maintenance permits must remain admissible while
+            // a snapshot waits for those permits; no per-caller list is retained.
+            if matches!(barrier.as_ref().map(|r| &r.command), Some(Command::Checkpoint(_))) {
+                let request = barrier.take().unwrap();
+                if let Command::Checkpoint(done) = request.command {
+                    let completion = pending_checkpoint.get_or_insert_with(|| watch::channel(false).0);
+                    let _ = done.send(completion.subscribe());
+                }
+            }
             if sync.is_none() && !durable.is_empty() {
                 let requests=std::mem::take(&mut durable);let sync_io=disk.sync();
                 sync=Some(Box::pin(async move {(requests,sync_io.await)}));
@@ -40,14 +51,14 @@ pub(crate) async fn run<M: Machine>(
                     disk.sync().await?;
                     let request=barrier.take().unwrap();
                     if let Command::Query(query)=request.command {query(&machine);}
-                } else if checkpoint.is_none() && (barrier.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
+                } else if checkpoint.is_none() && (pending_checkpoint.is_some() || disk.offset>=disk.options.checkpoint_bytes) {
                     let snapshot=machine.snapshot()?;
                     let generation=disk.rotate().await?;
                     checkpoint=Some(disk.snapshot::<M>(generation,disk.lsn,snapshot,policy.read().unwrap().clone(),snapshot_slots.clone()));
-                    checkpoint_request=barrier.take();
+                    checkpoint_completion=pending_checkpoint.take();
                 }
             }
-            if closed && write.is_none() && sync.is_none() && checkpoint.is_none() && barrier.is_none() {return Ok(());}
+            if closed && write.is_none() && sync.is_none() && checkpoint.is_none() && barrier.is_none() && pending_checkpoint.is_none() {return Ok(());}
             tokio::select! {
                 result=async {sync.as_mut().unwrap().await}, if sync.is_some()=>{
                     sync=None;let (requests,result)=result;result?;
@@ -55,7 +66,7 @@ pub(crate) async fn run<M: Machine>(
                 }
                 result=async {checkpoint.as_mut().unwrap().await}, if checkpoint.is_some()=>{
                     checkpoint=None;disk.publish_snapshot(result?).await?;
-                    if let Some(request)=checkpoint_request.take() {if let Command::Checkpoint(done)=request.command {let _=done.send(Ok(()));}}
+                    if let Some(completion)=checkpoint_completion.take() {completion.send_replace(true);}
                 }
                 result=async {write.as_mut().unwrap().await}, if write.is_some()=>{
                     write=None;
@@ -95,6 +106,13 @@ pub(crate) async fn run<M: Machine>(
             }
         }
     }.await;
+    // Waiting callers can hold the maintenance permit needed by the snapshot.
+    // Fail their replies before draining I/O, while retaining the stream lease.
+    drop(receive);
+    drop(barrier);
+    drop(checkpoint_completion);
+    drop(pending_checkpoint);
+    drop(durable);
     // Accepted native I/O retains its buffers/descriptors and lease even after
     // another operation failed. Do not race a reopen against abandoned writes.
     if let Some(write) = write {

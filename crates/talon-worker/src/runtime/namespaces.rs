@@ -111,6 +111,7 @@ impl NamespaceRuntimes {
             config.capacity_bytes,
             Some(self.root_lock.clone()),
             Some(&self.journal_service),
+            Some(self.background_budget.clone()),
         )?;
         let store = store.with_uring(self.uring)?;
         let mut index = Arc::new(BlockIndex::new());
@@ -214,9 +215,6 @@ impl NamespaceRuntimes {
         worker.load_bytes = self.load_bytes.clone();
         worker.load_inflight_bytes = config.load_inflight_bytes;
         worker.background_budget = Some(self.background_budget.clone());
-        if let Some(small) = &worker.small {
-            small.set_background_budget(self.background_budget.clone());
-        }
         Ok(worker)
     }
 
@@ -744,6 +742,7 @@ mod tests {
             cfg.small_object_threshold_bytes,
             cfg.small_object_segment_bytes,
             cfg.capacity_bytes,
+            None,
             None,
             None,
         )
@@ -1633,6 +1632,7 @@ mod tests {
                 cfg.small_object_threshold_bytes,
                 cfg.small_object_segment_bytes,
                 cfg.capacity_bytes,
+                None,
                 None,
                 None,
             )

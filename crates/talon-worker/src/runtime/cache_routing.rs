@@ -14,6 +14,7 @@ pub(super) fn open_small_store(
     capacity: u64,
     root_lock: Option<Arc<CacheRootLock>>,
     service: Option<&Arc<talon_journal::JournalService>>,
+    maintenance: Option<Arc<crate::background::BackgroundBudget>>,
 ) -> Result<Option<Arc<SmallObjectStore>>> {
     check_small_routing(root, threshold)?;
     if threshold == 0 {
@@ -26,6 +27,7 @@ pub(super) fn open_small_store(
         capacity,
         root_lock,
         service,
+        maintenance,
     )?)))
 }
 

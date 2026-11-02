@@ -208,7 +208,7 @@ impl SegmentStore {
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<Self> {
         validate_geometry(threshold, segment_size, capacity)?;
-        let (journal, model) = journal::Journal::open(root.clone(), root_lock.clone())?;
+        let (journal, model) = journal::Journal::open(root.clone(), root_lock.clone(), None)?;
         let mut streams = SmallObjectStore::recover_streams(
             &journal,
             &model,
@@ -633,14 +633,10 @@ impl SegmentStore {
                     let s = &state.segments[&id];
                     (
                         id,
-                        if s.live == 0 {
-                            0
-                        } else {
-                            s.live_payload.saturating_mul(2)
-                                + (s.live - s.live_payload)
-                                + 16 * s.records.len() as u64
-                                + 29
-                        },
+                        s.live_payload.saturating_mul(2)
+                            + (s.live - s.live_payload)
+                            + 36 * s.records.len() as u64
+                            + 49,
                     )
                 })
             };

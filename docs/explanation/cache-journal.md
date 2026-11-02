@@ -86,7 +86,10 @@ Callers must not independently apply records after awaiting append.
 
 Defaults are 1,024 requests and 8 MiB encoded request bytes per service, including
 queued and in-flight work. Producers acquire admission before encoding; permits
-survive dequeue and caller cancellation through completion. Additional batch
+survive dequeue and caller cancellation through append/query completion.
+Checkpoint requests release queue admission when accepted and share one
+completion notification per snapshot cut, so waiting for maintenance cannot
+consume the admission needed by a permit-holding writer. Additional batch
 copies, snapshot chunks, and replay windows have separate explicit bounds.
 The I/O scheduler allows unrelated streams to progress during data fsync and
 snapshot encoding. CPU work in a machine callback still occupies the shared
@@ -102,6 +105,8 @@ later writes cannot extend the file past an unfinished earlier batch after
 process loss. Batching still combines queued records, and the next batch can
 overlap the preceding batch's sync. Other streams and snapshot writes progress
 independently.
+Checkpoint requests queued during a snapshot wait for a later snapshot cut
+while tail writes and queries continue.
 
 The common frame includes version/domain-independent magic, length and its
 complement, LSN or snapshot ordinal, and a checksum covering header and payload.
@@ -150,10 +155,12 @@ uses an optional crate-independent `Maintenance` hook whose futures run locally
 on the journal runtime (including its timers); it must not import
 Worker types or charge foreground log commits to the maintenance budget.
 Namespace initialization attaches the same Worker budget to the root paged
-catalog and its small-store streams before serving requests. The catalog receives
-its initial policy before its writer starts, including automatic checkpoints of
-a recovered tail and reconciliation checkpoints. Background startup preserves
+catalog and its small-store streams before their writers start, including
+automatic checkpoints of a recovered tail and reconciliation checkpoints.
+Background startup preserves
 the namespace budget instead of replacing the default small-store budget.
+Small-store pressure reclamation checkpoints journal history when payload
+reclamation cannot meet the target, releasing its I/O permit before waiting.
 
 ## Implementation ownership and validation
 

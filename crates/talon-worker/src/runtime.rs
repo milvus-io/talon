@@ -2515,7 +2515,7 @@ impl WorkerRuntime {
             .as_ref()
             .and_then(|s| s.stats().ok())
             .map_or(0, |s| s.segments);
-        for _ in 0..segments {
+        for _ in 0..segments.saturating_add(1) {
             if self.resident_bytes() <= target || self.small_readers_cover_excess(target) {
                 break;
             }

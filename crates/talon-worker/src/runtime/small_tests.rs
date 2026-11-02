@@ -75,7 +75,8 @@ fn runtime_with_geometry(
     });
     let store = WholeBlockStore::open(root).unwrap();
     let small =
-        cache_routing::open_small_store(root, threshold, segment, capacity, None, None).unwrap();
+        cache_routing::open_small_store(root, threshold, segment, capacity, None, None, None)
+            .unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
     let mut worker = WorkerRuntime::new_with_l1_policy(
@@ -204,6 +205,7 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
                 256 << 10,
                 16 << 20,
                 None,
+                None,
                 None
             )
             .unwrap()
@@ -217,6 +219,7 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
             128 << 10,
             256 << 10,
             16 << 20,
+            None,
             None,
             None
         )
@@ -516,10 +519,17 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     let marker = dir.path().join("small-routing.json");
     let original = std::fs::read(&marker).unwrap();
     for threshold in [0, 64 << 10, 256 << 10] {
-        let error =
-            cache_routing::open_small_store(dir.path(), threshold, 512 << 10, 16 << 20, None, None)
-                .err()
-                .unwrap();
+        let error = cache_routing::open_small_store(
+            dir.path(),
+            threshold,
+            512 << 10,
+            16 << 20,
+            None,
+            None,
+            None,
+        )
+        .err()
+        .unwrap();
         assert!(error
             .to_string()
             .contains("incompatible small store routing"));
@@ -529,16 +539,30 @@ async fn small_routing_rejects_incompatible_or_unversioned_cache_at_startup() {
     assert_eq!(recovered.block_count(), 1);
     drop(recovered);
     std::fs::write(&marker, b"broken").unwrap();
-    let error =
-        cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
-            .err()
-            .unwrap();
+    let error = cache_routing::open_small_store(
+        dir.path(),
+        128 << 10,
+        256 << 10,
+        16 << 20,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(error.to_string().contains("invalid small store routing"));
     std::fs::remove_file(&marker).unwrap();
-    let error =
-        cache_routing::open_small_store(dir.path(), 128 << 10, 256 << 10, 16 << 20, None, None)
-            .err()
-            .unwrap();
+    let error = cache_routing::open_small_store(
+        dir.path(),
+        128 << 10,
+        256 << 10,
+        16 << 20,
+        None,
+        None,
+        None,
+    )
+    .err()
+    .unwrap();
     assert!(error
         .to_string()
         .contains("predates small store routing metadata"));
@@ -1193,6 +1217,74 @@ async fn small_capacity_shares_pending_reclaim_credit_across_namespaces() {
 }
 
 #[tokio::test]
+async fn capacity_reclaims_small_journal_history_below_automatic_threshold() {
+    for background in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let capacity = 1 << 20;
+        let (_, mut w) =
+            runtime_with_geometry(dir.path(), false, false, 128 << 10, 256 << 10, capacity);
+        let small = w.small.as_ref().unwrap().clone();
+        let mut block = id(&w);
+        block.object.object_path = "x".repeat(1024);
+        let log = dir
+            .path()
+            .join("small/metadata/journal.00000000000000000001");
+        while std::fs::metadata(&log).unwrap().len() <= capacity * 2 {
+            small
+                .put(&block, Bytes::from_static(b"churn"))
+                .await
+                .unwrap();
+            w.unlink_units(w.lru.block_candidates(&block), 2).await;
+        }
+        assert_eq!(w.block_count(), 0);
+        assert!(w.resident_bytes() > capacity);
+        assert!(std::fs::metadata(&log).unwrap().len() < 64 << 20);
+        drop(small);
+        if !background {
+            drop(w);
+            w = runtime_with_geometry(dir.path(), false, false, 128 << 10, 256 << 10, capacity).1;
+            assert_eq!(w.small.as_ref().unwrap().stats().unwrap().segments, 0);
+        }
+        let small = w.small.as_ref().unwrap().clone();
+        let config = WorkerConfig {
+            background_io_concurrency: 1,
+            background_io_max_mb_per_sec: 0,
+            background_delete_max_per_sec: 0,
+            ..Default::default()
+        };
+        let budget = crate::background::BackgroundBudget::new(&config);
+        small.set_background_budget(budget.clone());
+        w.background_budget = Some(budget.clone());
+        tokio::time::timeout(Duration::from_secs(5), async {
+            if background {
+                let mut cycle = async_eviction::EvictionCycle::new(capacity, &config);
+                for _ in 0..32 {
+                    cycle.tick(&w).await;
+                    if w.resident_bytes() <= capacity {
+                        break;
+                    }
+                }
+            } else {
+                w.enforce_capacity().await;
+            }
+        })
+        .await
+        .expect("pressure checkpoint must release the sole maintenance I/O permit");
+        assert!(
+            w.resident_bytes() <= capacity,
+            "empty store retained history: background={background}, resident={}, segments={}",
+            w.resident_bytes(),
+            small.stats().unwrap().segments,
+        );
+        assert!(
+            !log.exists(),
+            "obsolete journal generation was not reclaimed"
+        );
+        assert_eq!(budget.available_io(), 1);
+    }
+}
+
+#[tokio::test]
 async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     let dir = tempfile::tempdir().unwrap();
     let (_, mut w) = runtime_with_geometry(dir.path(), false, false, 1 << 20, 64 << 20, 1 << 30);
@@ -1215,6 +1307,7 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     let files = || {
         let mut paths: Vec<_> = crate::small_store::tests::files(&dir.path().join("small"))
             .into_iter()
+            .filter(|p| p.extension().is_some_and(|e| e == "data"))
             .collect();
         paths.sort();
         paths
@@ -1228,16 +1321,21 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
         .collect();
     assert_eq!(payload_files.len(), 1);
     assert!(std::fs::metadata(payload_files[0]).unwrap().len() > 63 << 20);
-    let before = w.resident_bytes();
+    let payload_allocation = || {
+        files()
+            .iter()
+            .map(|p| std::os::unix::fs::MetadataExt::blocks(&std::fs::metadata(p).unwrap()) * 512)
+            .sum::<u64>()
+    };
+    let before = payload_allocation();
     w.unlink_units(w.lru.block_candidates(&tiny), 2).await;
     assert_eq!(w.small.as_ref().unwrap().reclaimable_bytes().await, 0);
-    assert!(!w
-        .small
+    w.small
         .as_ref()
         .unwrap()
         .reclaim_with_budget(u64::MAX, None)
         .await
-        .unwrap());
+        .unwrap();
     w.capacity_bytes = before - 4096;
     // Exhausted/unavailable victims must not force a below-threshold rewrite.
     w.enforce_capacity().await;
@@ -1245,10 +1343,7 @@ async fn small_pressure_does_not_rewrite_64mb_segment_for_one_kib_tombstone() {
     let mut cycle = async_eviction::EvictionCycle::new(before, &config);
     cycle.tick(&w).await;
     assert_eq!(w.block_count(), 64);
-    assert!(
-        w.resident_bytes() >= before,
-        "new tombstone log allocation remains charged"
-    );
+    assert_eq!(payload_allocation(), before);
     assert_eq!(files(), original);
     // Once unpinned, capacity enforcement keeps evicting items until the same
     // threshold permits an actual rewrite, even for a small capacity deficit.

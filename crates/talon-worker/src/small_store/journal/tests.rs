@@ -157,3 +157,106 @@ async fn shared_snapshot_budget_uses_the_journal_runtime_timer() {
     let recovered = self::store(dir.path());
     assert!(recovered.contains(&id("paced")));
 }
+
+#[tokio::test]
+async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let service =
+        JournalService::open(dir.path().to_owned(), Arc::new(()), Options::default()).unwrap();
+    let root = dir.path().join("small");
+    let handle = service
+        .open_stream(
+            "small/metadata".into(),
+            Model {
+                next: 1,
+                ..Default::default()
+            },
+            StreamOptions {
+                checkpoint_bytes: u64::MAX,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let key: Arc<[u8]> = format::key(&id(&"k".repeat(60 << 10))).unwrap().into();
+    let log = root.join("metadata/journal.00000000000000000001");
+    let mut offset = 0;
+    // Build a valid large tail without checkpointing it, as can remain after
+    // process loss while the preceding generation's snapshot is in progress.
+    while std::fs::metadata(&log).unwrap().len() < StreamOptions::default().checkpoint_bytes {
+        handle
+            .append(
+                Event::Insert {
+                    slot: 0,
+                    segment: 1,
+                    offset,
+                    record: Record {
+                        key: key.clone(),
+                        len: 1,
+                        checksum: 0,
+                    },
+                },
+                Ack::Written,
+            )
+            .await
+            .unwrap();
+        handle
+            .append(Event::Delete { segment: 1, offset }, Ack::Written)
+            .await
+            .unwrap();
+        offset += 1;
+    }
+    handle
+        .append(Event::SetNext { next: 2 }, Ack::Durable)
+        .await
+        .unwrap();
+    drop(handle);
+    drop(service);
+    JournalService::wait_for_retiring(dir.path()).unwrap();
+
+    let service =
+        JournalService::open(dir.path().to_owned(), Arc::new(()), Options::default()).unwrap();
+    let budget = crate::background::BackgroundBudget::new(&WorkerConfig {
+        background_io_concurrency: 1,
+        background_io_max_mb_per_sec: 0,
+        background_delete_max_per_sec: 0,
+        ..Default::default()
+    });
+    let permit = budget.io().await;
+    let store = Arc::new(
+        crate::small_store::SmallObjectStore::open_with_service(
+            root.clone(),
+            128 << 10,
+            256 << 10,
+            4 << 20,
+            None,
+            Some(&service),
+            Some(budget),
+        )
+        .unwrap(),
+    );
+    let snapshot = root.join("metadata/snapshot.tmp");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !root.join("metadata/journal.00000000000000000002").exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let snapshot_exists = snapshot.exists();
+    let retained = log.exists();
+    drop(permit);
+    assert!(
+        !snapshot_exists,
+        "recovery snapshot must wait for the shared I/O permit"
+    );
+    assert!(
+        retained,
+        "recovery must retain the old log until snapshot publication"
+    );
+    tokio::time::timeout(Duration::from_secs(5), store.maintain(true))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(!log.exists());
+}

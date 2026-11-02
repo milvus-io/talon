@@ -33,6 +33,7 @@ impl Journal {
     pub fn open(
         root: PathBuf,
         lease: Option<Arc<crate::page_access_store::CacheRootLock>>,
+        maintenance: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<(Arc<Self>, Model)> {
         reject_legacy(&root)?;
         let keepalive: Arc<dyn Send + Sync> = match lease {
@@ -40,11 +41,12 @@ impl Journal {
             None => Arc::new(()),
         };
         let service = JournalService::open(root.clone(), keepalive, Options::default())?;
-        Self::open_with_service(root, &service, PathBuf::from("metadata"))
+        Self::open_with_service(root, &service, PathBuf::from("metadata"), maintenance)
     }
     pub fn open_shared(
         root: PathBuf,
         service: &Arc<JournalService>,
+        maintenance: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<(Arc<Self>, Model)> {
         reject_legacy(&root)?;
         std::fs::create_dir_all(&root)?;
@@ -54,25 +56,27 @@ impl Journal {
             .strip_prefix(service.root())
             .map_err(|_| invalid("small store outside journal cache root"))?
             .to_owned();
-        Self::open_with_service(root, service, relative)
+        Self::open_with_service(root, service, relative, maintenance)
     }
     fn open_with_service(
         root: PathBuf,
         service: &Arc<JournalService>,
         relative_metadata: PathBuf,
+        maintenance: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<(Arc<Self>, Model)> {
         reject_legacy(&root)?;
         std::fs::create_dir_all(root.join("data"))?;
         std::fs::File::open(root.join("data"))?.sync_all()?;
         std::fs::File::open(&root)?.sync_all()?;
         let replay_started = std::time::Instant::now();
-        let handle = service.open_stream(
+        let handle = service.open_stream_with_maintenance(
             relative_metadata,
             Model {
                 next: 1,
                 ..Default::default()
             },
             StreamOptions::default(),
+            maintenance.map(|budget| budget as Arc<dyn talon_journal::Maintenance>),
         )?;
         let replay_ms = replay_started.elapsed().as_secs_f64() * 1000.0;
         let clone_started = std::time::Instant::now();

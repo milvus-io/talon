@@ -29,7 +29,15 @@ impl SmallObjectStore {
         capacity: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<Self> {
-        Self::open_with_service(root, threshold, segment_size, capacity, root_lock, None)
+        Self::open_with_service(
+            root,
+            threshold,
+            segment_size,
+            capacity,
+            root_lock,
+            None,
+            None,
+        )
     }
     pub(crate) fn open_with_service(
         root: PathBuf,
@@ -38,12 +46,13 @@ impl SmallObjectStore {
         capacity: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
         service: Option<&Arc<talon_journal::JournalService>>,
+        maintenance: Option<Arc<crate::background::BackgroundBudget>>,
     ) -> io::Result<Self> {
         validate_geometry(threshold, segment_size, capacity)?;
         let journal_started = Instant::now();
         let (journal, model) = match service {
-            Some(service) => journal::Journal::open_shared(root.clone(), service)?,
-            None => journal::Journal::open(root.clone(), root_lock.clone())?,
+            Some(service) => journal::Journal::open_shared(root.clone(), service, maintenance)?,
+            None => journal::Journal::open(root.clone(), root_lock.clone(), maintenance)?,
         };
         let journal_ms = journal_started.elapsed().as_secs_f64() * 1000.0;
         let locators_started = Instant::now();
@@ -385,6 +394,11 @@ impl SmallObjectStore {
                     }
                     reclaimed |= stream.maintain_inner(false, true, budget.clone()).await?;
                 }
+                drop(_io);
+                if !reclaimed && before.saturating_sub(store.stats()?.allocated_bytes) < bytes {
+                    store.journal.checkpoint().await?;
+                    reclaimed |= store.stats()?.allocated_bytes < before;
+                }
                 Ok(reclaimed)
             })
             .await
@@ -447,6 +461,56 @@ mod tests {
                 ring.drain().await;
                 result
             })
+    }
+
+    #[test]
+    fn relocation_budget_covers_payload_and_actual_journal_bytes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            for survivor in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let store = open(dir.path());
+                store
+                    .put(&id("deleted"), Bytes::from(vec![1; 4096]))
+                    .await
+                    .unwrap();
+                if survivor {
+                    store
+                        .put(&id("survivor"), Bytes::from(vec![2; 2048]))
+                        .await
+                        .unwrap();
+                }
+                store.maintain(true).await.unwrap();
+                store.delete(&id("deleted")).await.unwrap();
+                let log_bytes = || {
+                    super::super::tests::files(dir.path())
+                        .into_iter()
+                        .filter(|p| {
+                            p.file_name()
+                                .unwrap()
+                                .to_string_lossy()
+                                .starts_with("journal.")
+                        })
+                        .map(|p| std::fs::metadata(p).unwrap().len())
+                        .sum::<u64>()
+                };
+                let before = log_bytes();
+                let budget = crate::background::BackgroundBudget::new(&talon_core::WorkerConfig {
+                    background_io_max_mb_per_sec: 0,
+                    background_delete_max_per_sec: 0,
+                    ..Default::default()
+                });
+                assert!(store
+                    .maintain_with_budget(false, Some(budget.clone()))
+                    .await
+                    .unwrap());
+                let payload_io = if survivor { 2 * 2048 } else { 0 };
+                assert_eq!(budget.charged_bytes(), payload_io + log_bytes() - before);
+            }
+        });
     }
 
     #[test]

@@ -18,7 +18,7 @@ use std::{
         Arc, Mutex,
     },
 };
-use tokio::sync::{mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{mpsc, oneshot, watch, OwnedSemaphorePermit, Semaphore};
 
 pub type Lsn = u64;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -120,7 +120,7 @@ enum Command<M: Machine> {
         done: oneshot::Sender<io::Result<Lsn>>,
     },
     Query(Query<M>),
-    Checkpoint(oneshot::Sender<io::Result<()>>),
+    Checkpoint(oneshot::Sender<watch::Receiver<bool>>),
 }
 struct Request<M: Machine> {
     command: Command<M>,
@@ -245,6 +245,7 @@ impl JournalService {
         }
         if options.checkpoint_bytes == 0
             || options.max_record_bytes == 0
+            || options.max_record_bytes > frame::MAX_RECORD
             || options.max_record_bytes > self.options.max_bytes.saturating_sub(frame::HEADER)
         {
             return Err(invalid("invalid journal stream limits"));
@@ -442,7 +443,13 @@ impl<M: Machine> Handle<M> {
         let permits = self.inner.service.admission.acquire(1).await?;
         let (done, wait) = oneshot::channel();
         self.send(Command::Checkpoint(done), permits).await?;
-        wait.await.map_err(|_| stopped())?
+        let mut completion = wait.await.map_err(|_| stopped())?;
+        loop {
+            if *completion.borrow_and_update() {
+                return Ok(());
+            }
+            completion.changed().await.map_err(|_| stopped())?;
+        }
     }
 }
 fn invalid(message: &str) -> io::Error {

@@ -421,6 +421,8 @@ impl Disk {
     ) -> LocalBoxFuture<'static, io::Result<Snapshot>> {
         let root = self.root.clone();
         let accounting = self.accounting.clone();
+        #[cfg(test)]
+        let control = self.control.clone();
         Box::pin(async move {
             // One shared service bounds snapshot encoder threads/buffers even
             // if thousands of namespaces cross the rotation threshold together.
@@ -460,7 +462,13 @@ impl Disk {
                     }
                 })?;
             let temp = root.join("snapshot.tmp");
-            let f = create(&temp).await?;
+            let f = {
+                let _io = match &policy {
+                    Some(p) => Some(p.io().await),
+                    None => None,
+                };
+                create(&temp).await?
+            };
             let mut offset = 0;
             let mut records = 0;
             let mut encoded_all = false;
@@ -493,6 +501,14 @@ impl Disk {
             if !encoded_all {
                 return Err(io::Error::other("snapshot encoder stopped"));
             }
+            #[cfg(test)]
+            crate::tests::pause(&control.snapshot_finalize_pause).await;
+            // Acquire outside the writer loop, which must keep serving callers
+            // that can hold this permit. Retain it through CURRENT and cleanup.
+            let io = match &policy {
+                Some(p) => Some(p.io().await),
+                None => None,
+            };
             f.sync_all().await?;
             let allocated = f.metadata().await?.blocks() * 512;
             f.close().await?;
@@ -509,6 +525,7 @@ impl Disk {
                 bytes: offset,
                 records,
                 policy,
+                _io: io,
             })
         })
     }
@@ -549,4 +566,5 @@ pub(crate) struct Snapshot {
     bytes: u64,
     records: u64,
     policy: Option<Arc<dyn Maintenance>>,
+    _io: Option<Box<dyn Send>>,
 }

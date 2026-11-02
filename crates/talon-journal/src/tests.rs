@@ -9,6 +9,7 @@ pub(crate) struct Pause {
 pub(crate) struct Control {
     pub write_pause: Mutex<Option<Arc<Pause>>>,
     pub sync_pause: Mutex<Option<Arc<Pause>>>,
+    pub snapshot_finalize_pause: Mutex<Option<Arc<Pause>>>,
     pub writes: AtomicUsize,
     pub syncs: AtomicUsize,
     pub fail_sync: AtomicBool,
@@ -424,6 +425,206 @@ impl Maintenance for BlockSnapshot {
     }
 }
 #[tokio::test]
+async fn queued_checkpoint_does_not_block_append_holding_snapshot_permit() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = JournalService::open(
+        dir.path().to_owned(),
+        Arc::new(()),
+        Options {
+            max_requests: 1,
+            require_native: true,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let gate = Arc::new(Semaphore::new(1));
+    let permit = gate.clone().acquire_owned().await.unwrap();
+    let policy = Arc::new(BlockSnapshot::new(gate.clone()));
+    let a = s
+        .open_stream_with_maintenance(
+            "a".into(),
+            State::default(),
+            StreamOptions {
+                checkpoint_bytes: 96,
+                ..Default::default()
+            },
+            Some(policy.clone()),
+        )
+        .unwrap();
+    a.append((1, 1), Ack::Durable).await.unwrap();
+    a.append((2, 2), Ack::Durable).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), policy.entered.notified())
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while s.admission.count.available_permits() != s.options.max_requests {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut checkpoint = Box::pin(a.checkpoint());
+    assert!(futures::poll!(checkpoint.as_mut()).is_pending());
+    let h = a.clone();
+    let mut append = tokio::spawn(async move {
+        let _permit = permit;
+        h.append((3, 3), Ack::Durable).await
+    });
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut append).await;
+    if result.is_err() {
+        gate.add_permits(1);
+        append.await.unwrap().unwrap();
+    }
+    tokio::time::timeout(Duration::from_secs(2), checkpoint)
+        .await
+        .unwrap()
+        .unwrap();
+    result
+        .expect("queued checkpoint blocked the holder of its snapshot permit")
+        .unwrap()
+        .unwrap();
+    assert_eq!(a.query(|m| Ok(m.0[&3])).await.unwrap(), 3);
+    assert!(!dir.path().join("a/journal.00000000000000000002").exists());
+    drop(a);
+    drop(s);
+    let s = service(dir.path());
+    assert_eq!(stream(&s, "a").query(|m| Ok(m.0.len())).await.unwrap(), 3);
+}
+
+#[tokio::test]
+async fn snapshot_finalization_holds_budget_through_publication_and_cleanup() {
+    struct Policy {
+        gate: Arc<Semaphore>,
+        unbudgeted_deletes: AtomicUsize,
+        deletes: AtomicUsize,
+    }
+    impl Maintenance for Policy {
+        fn bytes(&self, _: usize) -> LocalBoxFuture<'_, ()> {
+            Box::pin(async {})
+        }
+        fn io(&self) -> LocalBoxFuture<'_, Box<dyn Send>> {
+            Box::pin(async move {
+                Box::new(self.gate.clone().acquire_owned().await.unwrap()) as Box<dyn Send>
+            })
+        }
+        fn delete(&self) -> LocalBoxFuture<'_, ()> {
+            Box::pin(async move {
+                self.deletes.fetch_add(1, Ordering::Relaxed);
+                if self.gate.available_permits() != 0 {
+                    self.unbudgeted_deletes.fetch_add(1, Ordering::Relaxed);
+                }
+            })
+        }
+    }
+    for populated in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let s = service(dir.path());
+        let a = stream(&s, "a");
+        let policy = Arc::new(Policy {
+            gate: Arc::new(Semaphore::new(1)),
+            unbudgeted_deletes: AtomicUsize::new(0),
+            deletes: AtomicUsize::new(0),
+        });
+        a.set_maintenance(policy.clone());
+        if populated {
+            a.append((1, 1), Ack::Durable).await.unwrap();
+        }
+        let pause = Arc::new(Pause::default());
+        *a.inner.control.snapshot_finalize_pause.lock().unwrap() = Some(pause.clone());
+        let h = a.clone();
+        let checkpoint = tokio::spawn(async move { h.checkpoint().await });
+        tokio::time::timeout(Duration::from_secs(2), pause.entered.notified())
+            .await
+            .unwrap();
+        let permit = policy.gate.clone().acquire_owned().await.unwrap();
+        let current = std::fs::read(dir.path().join("a/CURRENT")).unwrap();
+        pause.resume.notify_one();
+        let progress =
+            tokio::time::timeout(Duration::from_secs(2), a.append((2, 2), Ack::Durable)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let unpublished = !dir.path().join("a/snapshot.00000000000000000002").exists()
+            && std::fs::read(dir.path().join("a/CURRENT")).unwrap() == current
+            && dir.path().join("a/journal.00000000000000000001").exists();
+        drop(permit);
+        tokio::time::timeout(Duration::from_secs(2), checkpoint)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        progress
+            .expect("waiting for maintenance must not block tail acknowledgements")
+            .unwrap();
+        assert!(
+            unpublished,
+            "snapshot finalized without the maintenance permit"
+        );
+        assert!(policy.deletes.load(Ordering::Relaxed) > 0);
+        assert_eq!(policy.unbudgeted_deletes.load(Ordering::Relaxed), 0);
+        assert_eq!(policy.gate.available_permits(), 1);
+    }
+}
+
+#[tokio::test]
+async fn poisoned_writer_releases_waiters_before_draining_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = service(dir.path());
+    let gate = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = gate.clone().acquire_owned().await.unwrap();
+    let policy = Arc::new(BlockSnapshot::new(gate.clone()));
+    let a = s
+        .open_stream_with_maintenance(
+            "a".into(),
+            State::default(),
+            StreamOptions {
+                checkpoint_bytes: 96,
+                ..Default::default()
+            },
+            Some(policy.clone()),
+        )
+        .unwrap();
+    a.append((1, 1), Ack::Durable).await.unwrap();
+    a.append((2, 2), Ack::Durable).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(2), policy.entered.notified())
+        .await
+        .unwrap();
+
+    let pause = Arc::new(Pause::default());
+    *a.inner.control.write_pause.lock().unwrap() = Some(pause.clone());
+    let h = a.clone();
+    let writing = tokio::spawn(async move { h.append((3, 3), Ack::Written).await });
+    pause.entered.notified().await;
+    let h = a.clone();
+    let mut queued = tokio::spawn(async move {
+        let _permit = permit;
+        h.append((4, 4), Ack::Durable).await
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while s.admission.count.available_permits() > s.options.max_requests - 2 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    a.poison();
+    pause.resume.notify_one();
+    let result = tokio::time::timeout(Duration::from_secs(2), &mut queued).await;
+    // Release a stuck writer before reporting failure, so teardown cannot hang.
+    if result.is_err() {
+        gate.add_permits(1);
+        assert!(queued.await.unwrap().is_err());
+    }
+    let _ = writing.await.unwrap();
+    drop(a);
+    drop(s);
+    let reopened = service(dir.path());
+    assert!(result
+        .expect("queued acknowledgement retained the snapshot permit")
+        .unwrap()
+        .is_err());
+    drop(reopened);
+}
+
+#[tokio::test]
 async fn recovered_tail_uses_initial_maintenance_for_automatic_snapshot() {
     let dir = tempfile::tempdir().unwrap();
     let s = service(dir.path());
@@ -451,12 +652,7 @@ async fn recovered_tail_uses_initial_maintenance_for_automatic_snapshot() {
     tokio::time::timeout(Duration::from_secs(2), policy.entered.notified())
         .await
         .unwrap();
-    assert_eq!(
-        std::fs::metadata(dir.path().join("a/snapshot.tmp"))
-            .unwrap()
-            .len(),
-        0
-    );
+    assert!(!dir.path().join("a/snapshot.tmp").exists());
     let progress =
         tokio::time::timeout(Duration::from_secs(2), a.append((1, 0), Ack::Durable)).await;
     gate.add_permits(1);
@@ -659,6 +855,43 @@ fn stream_paths_reject_symlink_ancestors_and_traversal() {
             .is_err());
     }
     assert!(std::fs::read_dir(outside.path()).unwrap().next().is_none());
+}
+
+#[tokio::test]
+async fn stream_record_limit_rejects_frames_larger_than_the_format_supports() {
+    let dir = tempfile::tempdir().unwrap();
+    let service = JournalService::open(
+        dir.path().to_owned(),
+        Arc::new(()),
+        Options {
+            require_native: true,
+            max_bytes: frame::HEADER + frame::MAX_RECORD + 1,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let rejected = service.open_stream(
+        "bounded".into(),
+        State::default(),
+        StreamOptions {
+            max_record_bytes: frame::MAX_RECORD + 1,
+            ..Default::default()
+        },
+    );
+    assert_eq!(rejected.err().unwrap().kind(), io::ErrorKind::InvalidData);
+    assert!(!dir.path().join("bounded").exists());
+    let handle = service
+        .open_stream(
+            "bounded".into(),
+            State::default(),
+            StreamOptions {
+                max_record_bytes: frame::MAX_RECORD,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    handle.append((1, 2), Ack::Durable).await.unwrap();
+    assert_eq!(handle.query(|s| Ok(s.0[&1])).await.unwrap(), 2);
 }
 
 #[tokio::test]
