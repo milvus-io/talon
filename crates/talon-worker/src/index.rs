@@ -478,9 +478,12 @@ impl BlockIndex {
                 }
             }
         }
-        tracing::info!(blocks = entries.len(), units = units.len(),
+        tracing::info!(
+            blocks = entries.len(),
+            units = units.len(),
             tokens_ms = started.elapsed().as_secs_f64() * 1000.0,
-            "ordinary cache policy token recovery");
+            "ordinary cache policy token recovery"
+        );
         units
     }
 
