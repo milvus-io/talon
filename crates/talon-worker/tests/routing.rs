@@ -137,7 +137,7 @@ async fn exchange(stream: &mut TcpStream, request: &[u8]) -> (FrameHeader, Vec<u
     (header, body)
 }
 
-async fn three_bucket_worker(backend: Backend) {
+async fn three_bucket_worker(backend: Backend, small: bool) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let state = Fixture {
@@ -187,6 +187,7 @@ async fn three_bucket_worker(backend: Backend) {
         .map(|line| format!("credential_broker_request.{line}\n"))
         .collect::<String>();
     let config = root.path().join("worker.toml");
+    let threshold = if small { 1 << 20 } else { 0 };
     std::fs::write(
         &config,
         format!(
@@ -197,6 +198,7 @@ admin_listen = "{admin}"
 coordinator = "{coord_addr}"
 heartbeat_interval_ms = 100
 ownership_gc_enabled = false
+small_object_threshold_bytes = {threshold}
 cache_dirs = [{}]
 
 [[buckets]]
@@ -290,6 +292,9 @@ credentials_source = "iam"
                 assert_eq!(body, bucket.as_bytes());
                 break;
             }
+            let (header, body) = exchange(&mut stream, &request).await;
+            assert!(!header.flags.contains(Flags::ERROR));
+            assert_eq!(body, bucket.as_bytes());
             let cached = data::encode_cached_request(
                 2,
                 &data::CachedRangeRequest {
@@ -301,8 +306,16 @@ credentials_source = "iam"
             )
             .unwrap();
             let (header, body) = exchange(&mut stream, &cached).await;
-            assert!(!header.flags.contains(Flags::ERROR));
-            assert_eq!(body, bucket.as_bytes());
+            if small {
+                assert!(header.flags.contains(Flags::ERROR));
+                assert_eq!(
+                    data::decode_error_payload(&body).code,
+                    DataErrorCode::CacheMiss
+                );
+            } else {
+                assert!(!header.flags.contains(Flags::ERROR));
+                assert_eq!(body, bucket.as_bytes());
+            }
         }
         let calls_before = state.calls.lock().unwrap().len();
         for key in [
@@ -385,7 +398,7 @@ credentials_source = "iam"
                 .filter(|path| path.ends_with(&format!("/{bucket}/same-key")))
                 .count(),
             2,
-            "one HEAD+GET, then cache-only hit"
+            "one HEAD+GET; subsequent reads and cache-only requests never fetch"
         );
     }
     assert_eq!(calls.iter().filter(|p| p.as_str() == "/broker").count(), 1);
@@ -394,13 +407,19 @@ credentials_source = "iam"
 
 #[tokio::test]
 async fn s3_worker_routes_mixed_bucket_credentials() {
-    three_bucket_worker(Backend::S3).await;
+    for small in [false, true] {
+        three_bucket_worker(Backend::S3, small).await;
+    }
 }
 #[tokio::test]
 async fn gcs_worker_routes_mixed_bucket_credentials() {
-    three_bucket_worker(Backend::Gcs).await;
+    for small in [false, true] {
+        three_bucket_worker(Backend::Gcs, small).await;
+    }
 }
 #[tokio::test]
 async fn azure_worker_routes_mixed_bucket_credentials() {
-    three_bucket_worker(Backend::Azure).await;
+    for small in [false, true] {
+        three_bucket_worker(Backend::Azure, small).await;
+    }
 }

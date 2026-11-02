@@ -100,8 +100,15 @@ impl NamespaceRuntimes {
             Err(error) => return Err(error.into()),
         }
         let store = WholeBlockStore::open_with_fd_cache(&root, self.whole_fds.clone())?
-            .with_root_lock(self.root_lock.clone())
-            .with_uring(self.uring)?;
+            .with_root_lock(self.root_lock.clone());
+        let small = cache_routing::open_small_store(
+            &root,
+            config.small_object_threshold_bytes,
+            config.small_object_segment_bytes,
+            config.capacity_bytes,
+            Some(self.root_lock.clone()),
+        )?;
+        let store = store.with_uring(self.uring)?;
         let index = Arc::new(BlockIndex::new());
         let paged = if config.l2_page_size_bytes > 0 {
             checked_dir(&root.join("paged"))?;
@@ -126,8 +133,9 @@ impl NamespaceRuntimes {
             elapsed_ms = recovery_started.elapsed().as_millis() as u64,
             "cache index restored");
         let runtime_started = Instant::now();
-        let mut worker = WorkerRuntime::new_with_l1(
+        let mut worker = WorkerRuntime::new_with_l1_policy(
             store,
+            small,
             index,
             Arc::new(InFlightLoads::new()),
             self.backend.clone(),
@@ -136,6 +144,7 @@ impl NamespaceRuntimes {
             config.l1_capacity_bytes,
             config.l1_page_size_bytes,
             self.metrics.clone(),
+            config.stale_gc_enabled,
         )
         .with_backend_kind(config.backend.as_deref().unwrap_or("azure").parse()?)
         .with_rate_limiter(self.limiter.clone())
@@ -651,6 +660,8 @@ mod tests {
     }
     fn config() -> WorkerConfig {
         WorkerConfig {
+            // These fixtures exercise whole-file and paged storage at tiny capacities.
+            small_object_threshold_bytes: 0,
             block_size: 16,
             capacity_bytes: 1024 * disk_unit(),
             l1_capacity_bytes: 0,
@@ -1518,6 +1529,15 @@ mod tests {
                 .join("default/scopes")
                 .join(format!("v1-{}", "a".repeat(64)));
             std::fs::create_dir_all(&scope).unwrap();
+            let whole = WholeBlockStore::open(&scope).unwrap();
+            cache_routing::open_small_store(
+                &scope,
+                cfg.small_object_threshold_bytes,
+                cfg.small_object_segment_bytes,
+                cfg.capacity_bytes,
+                None,
+            )
+            .unwrap();
             if paged {
                 let store = PagedBlockStore::open(scope.join("paged"), 4).unwrap();
                 store.write_sidecar(&block(16), 16).unwrap();
@@ -1525,8 +1545,7 @@ mod tests {
                     .put_page(&block(16), PageIndex(0), Bytes::from_static(b"data"))
                     .unwrap();
             } else {
-                let store = WholeBlockStore::open(&scope).unwrap();
-                store
+                whole
                     .put(&block(16), Bytes::from_static(b"data"))
                     .await
                     .unwrap();

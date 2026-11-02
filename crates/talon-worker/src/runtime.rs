@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 
 mod async_eviction;
 mod background;
+mod cache_routing;
 mod load;
 mod namespaces;
 mod origin_head;
@@ -16,13 +17,16 @@ pub use background::WorkerBackground;
 mod page_maintenance;
 #[cfg(test)]
 mod page_tti_tests;
+#[cfg(test)]
+mod small_tests;
 use crate::page_gc::{Mutations, PageGcConfig, PageGcMetrics};
 use crate::page_lifecycle::{AccessClock, PageLifecycle, ScanCursor};
+use crate::small_store::SmallObjectStore;
 
 use futures::stream::FuturesUnordered;
 use futures::StreamExt;
 use talon_core::{
-    Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId,
+    Backend, BackendStore, BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectId, ObjectStat,
     ObjectStore, PageIndex, Version, UNCHECKED_VERSION,
 };
 use talon_transport::data::{CachedBlockPutRequest, CachedRangeRequest, RangeRequest};
@@ -100,8 +104,10 @@ pub struct WorkerRuntime {
     /// Fine-grained DRAM page cache. L1 is inclusive: every page has an L2
     /// whole-block parent.
     l1: Arc<MemoryStore>,
-    /// Persistent local-NVMe cache.
+    /// Ordinary whole-block local-NVMe cache.
     store: Arc<WholeBlockStore>,
+    /// Packed small-object L2 cache, independent of whole-block and paged storage.
+    small: Option<Arc<SmallObjectStore>>,
     /// Per-page L2 cache, enabled when the worker runs in paged mode. When set,
     /// a miss materializes only the pages a read touches instead of the whole
     /// (256 MiB default) block, and eviction reclaims individual pages.
@@ -148,6 +154,8 @@ pub struct WorkerRuntime {
     background_budget: Option<Arc<crate::background::BackgroundBudget>>,
     page_scan: Arc<tokio::sync::Mutex<ScanCursor>>,
     page_checkpoint: Arc<tokio::sync::Mutex<usize>>,
+    small_idle_cursor: Arc<tokio::sync::Mutex<(u64, u64)>>,
+    small_capacity_eviction: Arc<tokio::sync::Mutex<async_eviction::SmallCapacityPhase>>,
     page_cleanup: Arc<tokio::sync::Mutex<crate::page_cleanup::CleanupCursor>>,
 }
 
@@ -204,7 +212,36 @@ impl WorkerRuntime {
         l1_page_size_bytes: u64,
         metrics: WorkerMetrics,
     ) -> Self {
-        let lru = Arc::new(Lru::new());
+        Self::new_with_l1_policy(
+            store,
+            None,
+            index,
+            inflight,
+            backend,
+            block_size,
+            capacity_bytes,
+            l1_capacity_bytes,
+            l1_page_size_bytes,
+            metrics,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_l1_policy(
+        store: WholeBlockStore,
+        small: Option<Arc<SmallObjectStore>>,
+        index: Arc<BlockIndex>,
+        inflight: Arc<InFlightLoads>,
+        backend: Arc<dyn BackendStore>,
+        block_size: u32,
+        capacity_bytes: u64,
+        l1_capacity_bytes: u64,
+        l1_page_size_bytes: u64,
+        metrics: WorkerMetrics,
+        track_checks: bool,
+    ) -> Self {
+        let lru = Arc::new(Lru::with_object_checks(track_checks));
         for (id, page, bytes) in index.snapshot_units() {
             let unit = match page {
                 Some(page) => CacheUnit::Page(id, page),
@@ -212,6 +249,9 @@ impl WorkerRuntime {
             };
             let access = lru.insert(unit.clone(), bytes);
             index.set_access(&unit, access);
+        }
+        if let Some(small) = &small {
+            small.bind_policy(lru.clone());
         }
         let l1 = Arc::new(MemoryStore::with_limits(
             l1_capacity_bytes,
@@ -234,6 +274,7 @@ impl WorkerRuntime {
                 crate::page_cleanup::CleanupCursor::new(store.root().join("paged")),
             )),
             store: Arc::new(store),
+            small,
             paged: None,
             index,
             inflight,
@@ -260,6 +301,8 @@ impl WorkerRuntime {
             background_budget: None,
             page_scan: Arc::new(tokio::sync::Mutex::new(ScanCursor::default())),
             page_checkpoint: Arc::new(tokio::sync::Mutex::new(0)),
+            small_idle_cursor: Arc::new(tokio::sync::Mutex::new((0, 0))),
+            small_capacity_eviction: Arc::new(tokio::sync::Mutex::new(Default::default())),
         }
     }
 
@@ -518,13 +561,17 @@ impl WorkerRuntime {
         // Resolve using the cache first; on a precondition failure (the object
         // was overwritten within the version-cache window) drop the stale entry
         // and retry once against a force-resolved version.
-        let version = self.resolve_version(&request.object, false).await?;
-        match self.serve_range_at(request, &version, None).await {
+        let stat = self.resolve_object_stat(&request.object, false).await?;
+        match self
+            .serve_range_at(request, &stat.version, Some(stat.len))
+            .await
+        {
             Ok(bytes) => Ok(bytes),
             Err(error) if is_version_mismatch(&error) => {
                 self.invalidate_version(&request.object);
-                let version = self.resolve_version(&request.object, true).await?;
-                self.serve_range_at(request, &version, None).await
+                let stat = self.resolve_object_stat(&request.object, true).await?;
+                self.serve_range_at(request, &stat.version, Some(stat.len))
+                    .await
             }
             Err(error) => Err(error),
         }
@@ -548,13 +595,13 @@ impl WorkerRuntime {
         if request.len == 0 {
             return Ok(ServeOutcome::Bytes(bytes::Bytes::new()));
         }
-        let version = self.resolve_version(&request.object, false).await?;
-        match self.serve_at(request, &version, None).await {
+        let stat = self.resolve_object_stat(&request.object, false).await?;
+        match self.serve_at(request, &stat.version, Some(stat.len)).await {
             Ok(outcome) => Ok(outcome),
             Err(error) if is_version_mismatch(&error) => {
                 self.invalidate_version(&request.object);
-                let version = self.resolve_version(&request.object, true).await?;
-                self.serve_at(request, &version, None).await
+                let stat = self.resolve_object_stat(&request.object, true).await?;
+                self.serve_at(request, &stat.version, Some(stat.len)).await
             }
             Err(error) => Err(error),
         }
@@ -686,6 +733,28 @@ impl WorkerRuntime {
         if end <= start_block + block_size {
             let block = self.block_for(&request.object, request.offset, version);
             let offset_in_block = request.offset - block.offset;
+            let known_len = object_len.or_else(|| self.cached_object_len(&request.object, version));
+            if let Some(size) = known_len.filter(|size| self.accepts_small(&block, *size)) {
+                if !self.l1.is_enabled() {
+                    if let Some(loc) = self.small_location(&block).await? {
+                        let len = available_range_len(loc.len(), offset_in_block, request.len)?;
+                        let handle = loc.range(offset_in_block, len)?;
+                        self.record_l2_hit();
+                        return Ok(ServeOutcome::Sendfile(handle));
+                    }
+                }
+                return Ok(ServeOutcome::Bytes(
+                    self.small_object_range(
+                        request,
+                        &block,
+                        offset_in_block,
+                        request.len,
+                        size,
+                        false,
+                    )
+                    .await?,
+                ));
+            }
             // Paged mode: pages live in their own files, so a read spanning N
             // pages is N contiguous runs. Each run is still `sendfile`-able, so
             // serve the whole span zero-copy rather than stitching pages in
@@ -965,12 +1034,16 @@ impl WorkerRuntime {
     /// false; otherwise issues a backend `head()`, caches the result, and
     /// returns it. `force` bypasses the cache (used after a precondition
     /// failure) so the retry always sees the newest version (#163).
-    async fn resolve_version(&self, object: &ObjectId, force: bool) -> anyhow::Result<Version> {
+    async fn resolve_object_stat(
+        &self,
+        object: &ObjectId,
+        force: bool,
+    ) -> anyhow::Result<ObjectStat> {
         talon_telemetry::observe("talon.version.resolve", "internal", async {
             if !force {
-                if let Some(version) = self.cached_version(object) {
+                if let Some(stat) = self.cached_object_stat(object) {
                     talon_telemetry::text("talon.version.source", "cache");
-                    return Ok(version);
+                    return Ok(stat);
                 }
             }
             talon_telemetry::text(
@@ -988,17 +1061,26 @@ impl WorkerRuntime {
             );
             }
             self.store_version(object, &stat.version, stat.len);
-            Ok(stat.version)
+            Ok(stat)
         })
         .await
     }
 
     /// Return a cached version for `object` if one is within the TTL.
     fn cached_version(&self, object: &ObjectId) -> Option<Version> {
+        self.cached_object_stat(object).map(|stat| stat.version)
+    }
+
+    // Read version and length under one lock: a concurrent version refresh must
+    // not change store selection for an already-resolved request.
+    fn cached_object_stat(&self, object: &ObjectId) -> Option<ObjectStat> {
         let cache = self.version_cache.lock().unwrap();
         let entry = cache.get(object)?;
         if entry.resolved_at.elapsed() < self.version_ttl {
-            Some(entry.version.clone())
+            Some(ObjectStat {
+                version: entry.version.clone(),
+                len: entry.object_len,
+            })
         } else {
             None
         }
@@ -1048,6 +1130,13 @@ impl WorkerRuntime {
         len: u64,
         object_len: Option<u64>,
     ) -> anyhow::Result<bytes::Bytes> {
+        let known_len =
+            object_len.or_else(|| self.cached_object_len(&request.object, &block.version));
+        if let Some(size) = known_len.filter(|size| self.accepts_small(block, *size)) {
+            return self
+                .small_object_range(request, block, offset, len, size, false)
+                .await;
+        }
         if self.paged.is_some() {
             return self
                 .paged_block_range(
@@ -1068,6 +1157,87 @@ impl WorkerRuntime {
 
         self.metrics.record_cache_miss();
         self.load_block_range(request, block, offset, len).await
+    }
+
+    /// Small objects are fetched whole even for a range read. Never infer an
+    /// object's size from the requested range length.
+    async fn small_object_range(
+        &self,
+        request: &RangeRequest,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+        object_len: u64,
+        warm_only: bool,
+    ) -> anyhow::Result<bytes::Bytes> {
+        let len = available_range_len(object_len, offset, len)?;
+        if warm_only && self.load_range_cached(block, 0, object_len, object_len) {
+            return Ok(bytes::Bytes::new());
+        }
+        if !warm_only {
+            if let Some(bytes) = self.cached_small_range(block, offset, len).await? {
+                return Ok(bytes);
+            }
+        }
+        let runtime = self.clone();
+        let request = request.clone();
+        let block = block.clone();
+        self.page_mutations
+            .run(async move {
+                let key = LoadKey::Whole(block.clone());
+                loop {
+                    if warm_only && runtime.load_range_cached(&block, 0, object_len, object_len) {
+                        return Ok(bytes::Bytes::new());
+                    }
+                    if !warm_only {
+                        if let Some(bytes) = runtime.cached_small_range(&block, offset, len).await?
+                        {
+                            return Ok(bytes);
+                        }
+                    }
+                    let (admission, flight) = runtime.inflight.admit_traced(key.clone());
+                    if let Some(_guard) = admission {
+                        runtime.metrics.record_cache_miss();
+                        let started = Instant::now();
+                        let result = runtime
+                            .backend()?
+                            .fetch_range_if_match(
+                                &request.object,
+                                0,
+                                object_len,
+                                (block.version.as_str() != UNCHECKED_VERSION)
+                                    .then_some(&block.version),
+                            )
+                            .await;
+                        let bytes = match result {
+                            Ok(bytes) => {
+                                runtime.metrics.record_backend_fetch_success(
+                                    bytes.len() as u64,
+                                    started.elapsed(),
+                                );
+                                bytes
+                            }
+                            Err(e) => {
+                                runtime
+                                    .metrics
+                                    .record_backend_fetch_error(started.elapsed());
+                                return Err(e.into());
+                            }
+                        };
+                        anyhow::ensure!(
+                            bytes.len() as u64 == object_len,
+                            "short small object fetch"
+                        );
+                        runtime.commit_cached_block(&block, bytes.clone()).await?;
+                        if warm_only {
+                            return Ok(bytes::Bytes::new());
+                        }
+                        return runtime.range_from_fetched(&block, bytes, offset, len);
+                    }
+                    talon_telemetry::wait_for(&flight, runtime.inflight.wait(&key)).await;
+                }
+            })
+            .await
     }
 
     /// Serve a block-relative range in paged mode: L1, then per-page L2 files,
@@ -1101,6 +1271,15 @@ impl WorkerRuntime {
             .paged_page_size()
             .ok_or_else(|| anyhow::anyhow!("paged read on a runtime without a paged store"))?;
 
+        if let Some(size) = known_block_len
+            .or_else(|| self.cached_object_len(&request.object, &block.version))
+            .filter(|size| self.accepts_small(block, *size))
+        {
+            return self
+                .small_object_range(request, block, offset, len, size, warm_only)
+                .await;
+        }
+
         // A write-through commits the whole block as one file (read-after-write
         // must hit). Serve such a block from the whole-block store rather than
         // re-fetching it a page at a time from the origin.
@@ -1121,10 +1300,6 @@ impl WorkerRuntime {
         if len == 0 {
             return Ok(bytes::Bytes::new());
         }
-
-        // Ensure the block has an index entry so page presence can be tracked.
-        // Idempotent: a concurrent reader's entry (and its bitmap) is preserved.
-        self.index.init_paged(block.clone(), page_size, block_len);
 
         let pages = touched_pages(offset, len, page_size);
         let mut page_slots: Vec<Option<(bytes::Bytes, bool)>> = vec![None; pages.len()];
@@ -1512,6 +1687,15 @@ impl WorkerRuntime {
                         } else {
                             state.gate.lock().await
                         };
+                        if runtime
+                            .small
+                            .as_ref()
+                            .is_some_and(|small| small.contains(&id))
+                        {
+                            anyhow::bail!(
+                                "page admission conflicts with small store residency for {id}"
+                            );
+                        }
                         if matches!(
                             runtime.index.get(&id).map(|m| m.form),
                             Some(BlockForm::Whole)
@@ -1730,6 +1914,69 @@ impl WorkerRuntime {
         Ok(Some(slice(&pages, offset - page_start, len)?))
     }
 
+    fn accepts_small(&self, id: &BlockId, len: u64) -> bool {
+        self.small
+            .as_ref()
+            .is_some_and(|small| small.accepts(id, len))
+    }
+
+    async fn small_location(
+        &self,
+        block: &BlockId,
+    ) -> std::io::Result<Option<crate::small_store::ReadLocation>> {
+        match self.small.as_ref() {
+            Some(small) => small.lookup(block).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Management scans include each store's own residency directory. This is
+    /// never a substitute for the locator lookup used by the read path.
+    fn contains_block(&self, block: &BlockId) -> bool {
+        self.small.as_ref().is_some_and(|s| s.contains(block)) || self.index.get(block).is_some()
+    }
+
+    async fn cached_small_range(
+        &self,
+        block: &BlockId,
+        offset: u64,
+        len: u64,
+    ) -> anyhow::Result<Option<bytes::Bytes>> {
+        let Some(small) = self.small.as_ref() else {
+            return Ok(None);
+        };
+        if self.l1.is_enabled() {
+            let Some(loc) = small.lookup_entry(block)? else {
+                return Ok(None);
+            };
+            let len = available_range_len(loc.len(), offset, len)?;
+            loc.touch();
+            if let Some(bytes) = self.l1.get_range(block, offset, len) {
+                self.metrics.record_l1_hit();
+                talon_telemetry::cache_tier("l1");
+                self.metrics.record_cache_hit();
+                return Ok(Some(bytes));
+            }
+            self.metrics.record_l1_miss();
+        }
+        let Some(loc) = small.lookup(block).await? else {
+            return Ok(None);
+        };
+        let len = available_range_len(loc.len(), offset, len)?;
+        loc.touch();
+        self.record_l2_hit();
+        let bytes = loc.read().await?;
+        self.range_from_fetched(block, bytes, offset, len).map(Some)
+    }
+
+    async fn delete_whole(&self, block: &BlockId) -> talon_core::Result<()> {
+        if let Some(small) = self.small.as_ref().filter(|s| s.contains(block)) {
+            small.delete(block).await?;
+            return Ok(());
+        }
+        self.store.delete(block).await
+    }
+
     /// Drop stale metadata after an index-hit/file-miss eviction race.
     fn forget_missing_l2_parent(&self, block: &BlockId) {
         self.invalidate_l1(block);
@@ -1763,6 +2010,10 @@ impl WorkerRuntime {
 
     /// Split an aligned byte window into pages and publish L1 residency changes.
     fn admit_l1_pages(&self, block: &BlockId, start: u64, bytes: bytes::Bytes) {
+        self.admit_l1_pages_inner(block, start, bytes, false);
+    }
+
+    fn admit_l1_pages_inner(&self, block: &BlockId, start: u64, bytes: bytes::Bytes, detach: bool) {
         if !self.l1.is_enabled() || bytes.is_empty() {
             return;
         }
@@ -1783,7 +2034,14 @@ impl WorkerRuntime {
             match self.l1.insert_page(
                 block.clone(),
                 PageIndex(page_number),
-                bytes.slice(chunk_start..chunk_end),
+                if detach {
+                    // Packed reads validate the entire object. Each cached page
+                    // must own only the bytes charged to that page, even after
+                    // its siblings are evicted.
+                    bytes::Bytes::copy_from_slice(&bytes[chunk_start..chunk_end])
+                } else {
+                    bytes.slice(chunk_start..chunk_end)
+                },
             ) {
                 MemoryInsert::Inserted { evicted } => {
                     self.metrics.record_l1_admission();
@@ -1813,12 +2071,18 @@ impl WorkerRuntime {
         len: u64,
     ) -> anyhow::Result<bytes::Bytes> {
         let len = available_range_len(bytes.len() as u64, offset, len)?;
+        let packed = self.accepts_small(block, bytes.len() as u64);
         if self.l1.is_enabled() && len > 0 {
             let (page_start, page_len) = self.page_window(offset, len, bytes.len() as u64)?;
             let pages = slice(&bytes, page_start, page_len)?;
-            self.admit_l1_pages(block, page_start, pages);
+            self.admit_l1_pages_inner(block, page_start, pages, packed);
         }
-        slice(&bytes, offset, len)
+        let requested = slice(&bytes, offset, len)?;
+        if packed && len < bytes.len() as u64 {
+            Ok(bytes::Bytes::copy_from_slice(&requested))
+        } else {
+            Ok(requested)
+        }
     }
 
     fn invalidate_l1(&self, block: &BlockId) {
@@ -1908,6 +2172,22 @@ impl WorkerRuntime {
                     .scope(async move {
                         let state = runtime.page_lifecycle.block(&id);
                         let gate = state.gate.lock().await;
+                        let independent = runtime.accepts_small(&id, len);
+                        if independent && runtime.index.get(&id).is_some() {
+                            anyhow::bail!(
+                                "small admission conflicts with ordinary store residency for {id}"
+                            );
+                        }
+                        if !independent
+                            && runtime
+                                .small
+                                .as_ref()
+                                .is_some_and(|small| small.contains(&id))
+                        {
+                            anyhow::bail!(
+                                "block admission conflicts with small store residency for {id}"
+                            );
+                        }
                         // Keep same-version paged residency and complete the admission
                         // even when the original requester stops waiting.
                         let paged = !state.inner.lock().unwrap().pages.is_empty();
@@ -1929,19 +2209,28 @@ impl WorkerRuntime {
                             talon_telemetry::record("talon.cache.committed_bytes", len);
                             return Ok::<_, anyhow::Error>(());
                         }
-                        let allocated = runtime.store.put_payload(&id, bytes).await?;
-                        talon_telemetry::record("talon.cache.committed_bytes", len);
-                        runtime.index.commit_allocated(
-                            BlockMeta {
-                                id: id.clone(),
-                                form: BlockForm::Whole,
-                                len,
-                            },
-                            [(None, allocated)],
-                        );
                         let unit = CacheUnit::Whole(id.clone());
-                        let access = runtime.lru.insert(unit.clone(), allocated);
-                        runtime.index.set_access(&unit, access);
+                        if independent {
+                            runtime
+                                .small
+                                .as_ref()
+                                .expect("small store enabled")
+                                .put(&id, bytes.into_bytes())
+                                .await?;
+                        } else {
+                            let allocated = runtime.store.put_payload(&id, bytes).await?;
+                            runtime.index.commit_allocated(
+                                BlockMeta {
+                                    id: id.clone(),
+                                    form: BlockForm::Whole,
+                                    len,
+                                },
+                                [(None, allocated)],
+                            );
+                            let access = runtime.lru.insert(unit.clone(), allocated);
+                            runtime.index.set_access(&unit, access);
+                        }
+                        talon_telemetry::record("talon.cache.committed_bytes", len);
                         // Pin before releasing the gate used by candidate validation.
                         let _pin = runtime.lru.pin_guard(unit);
                         drop(gate);
@@ -1950,7 +2239,7 @@ impl WorkerRuntime {
                         let superseded = runtime.lru.superseded_candidates(&id);
                         runtime.unlink_units(superseded, 2).await;
                         runtime.enforce_capacity().await;
-                        if !runtime.l1.remove_superseded(&id).is_empty() {
+                        if !independent && !runtime.l1.remove_superseded(&id).is_empty() {
                             runtime.refresh_l1_metrics();
                         }
                         Ok::<_, anyhow::Error>(())
@@ -2105,8 +2394,10 @@ impl WorkerRuntime {
         };
         if let Some(old_version) = old_version {
             let old_block = self.block_for(object, 0, &old_version);
-            self.unlink_units(self.lru.block_candidates(&old_block), 2)
-                .await;
+            if !self.small.as_ref().is_some_and(|s| s.contains(&old_block)) {
+                self.unlink_units(self.lru.block_candidates(&old_block), 2)
+                    .await;
+            }
         }
         self.store_version(object, &version, len);
         tracing::info!(
@@ -2153,6 +2444,7 @@ impl WorkerRuntime {
     /// configured capacity, unlinking each evicted block's file and index entry.
     /// A `capacity_bytes` of `0` disables enforcement.
     async fn enforce_capacity(&self) {
+        let capacity = self.capacity_bytes;
         if self.capacity_bytes == 0 {
             return;
         }
@@ -2164,28 +2456,52 @@ impl WorkerRuntime {
             workers.sort_by_key(|worker| worker.namespace != self.namespace);
             for worker in &workers {
                 let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
-                if total <= self.capacity_bytes {
+                if total <= capacity {
+                    break;
+                }
+                let other_credit = Self::other_small_reclaim_credit(&workers, worker).await;
+                let total: u64 = workers.iter().map(|worker| worker.resident_bytes()).sum();
+                if total <= capacity {
                     break;
                 }
                 let target = worker
                     .resident_bytes()
-                    .saturating_sub(total - self.capacity_bytes);
+                    .saturating_sub((total - capacity).saturating_sub(other_credit));
                 worker.evict_to_target(target).await;
             }
         } else {
-            self.evict_to_target(self.capacity_bytes).await;
+            self.evict_to_target(capacity).await;
         }
     }
 
     /// Capacity reclamation for foreground admissions, bounded by initial residency.
     async fn evict_to_target(&self, target: u64) {
-        // A selected page can become protected or fail to unlink. Refill from
-        // other units using actual residency, attempting each unit at most once.
-        // Bound the pass even if concurrent admissions keep adding new units.
+        let mut phase = if self.small.as_ref().is_some() {
+            Some(self.small_capacity_eviction.lock().await)
+        } else {
+            None
+        };
+        if let Some(phase) = phase.as_mut() {
+            **phase = async_eviction::SmallCapacityPhase::Selecting {
+                empty_scan_remaining: self.lru.len().saturating_mul(2),
+            };
+        }
         let budget = self.lru.len();
         let mut attempted = HashSet::new();
-        while attempted.len() < budget {
-            let mut evicted = self.lru.candidates_to_fit(target, &attempted);
+        // Finish victim selection before relocation. Previously one compaction
+        // per bounded batch could repeatedly copy the same surviving payloads.
+        while attempted.len() < budget && self.resident_bytes() > target {
+            let credit = self.small_reclaim_credit().await;
+            let missing = self
+                .resident_bytes()
+                .saturating_sub(target)
+                .saturating_sub(credit);
+            if missing == 0 {
+                break;
+            }
+            let mut evicted = self
+                .lru
+                .candidates_to_fit(self.lru.total_bytes().saturating_sub(missing), &attempted);
             evicted.truncate(budget - attempted.len());
             if evicted.is_empty() {
                 break;
@@ -2193,21 +2509,140 @@ impl WorkerRuntime {
             attempted.extend(evicted.iter().map(|c| c.unit.clone()));
             self.unlink_units_to_target(evicted, 1, target).await;
         }
+        if let Some(phase) = phase.as_mut() {
+            **phase = async_eviction::SmallCapacityPhase::Reclaiming;
+        }
+        let segments = self
+            .small
+            .as_ref()
+            .and_then(|s| s.stats().ok())
+            .map_or(0, |s| s.segments);
+        for _ in 0..segments {
+            if self.resident_bytes() <= target || self.small_readers_cover_excess(target) {
+                break;
+            }
+            match self.reclaim_small_to_target(target, None).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                Err(error) => {
+                    tracing::warn!(%error, "small object pressure reclamation failed");
+                    break;
+                }
+            }
+        }
+        if let Some(phase) = phase.as_mut() {
+            **phase = async_eviction::SmallCapacityPhase::Idle;
+        }
     }
 
-    /// Number of blocks currently indexed.
+    async fn other_small_reclaim_credit(workers: &[Arc<Self>], namespace: &Self) -> u64 {
+        let mut credit = 0;
+        for worker in workers {
+            if !std::ptr::eq(worker.as_ref(), namespace) {
+                credit += worker.small_reclaim_credit().await;
+            }
+        }
+        credit
+    }
+
+    async fn small_reclaim_credit(&self) -> u64 {
+        match self.small.as_ref() {
+            Some(small) => {
+                small.reclaimable_bytes().await + small.stats().map_or(0, |s| s.retired_bytes)
+            }
+            None => 0,
+        }
+    }
+
+    async fn checkpoint_small_access(&self) {
+        if self.page_gc_config.tti_ms == 0 {
+            return;
+        }
+        if let Some(small) = self.small.as_ref() {
+            if let Err(error) = small
+                .checkpoint_access(self.background_budget.clone())
+                .await
+            {
+                tracing::warn!(%error, "small object access checkpoint failed");
+            }
+        }
+    }
+
+    async fn reclaim_small_to_target(
+        &self,
+        target: u64,
+        budget: Option<Arc<crate::background::BackgroundBudget>>,
+    ) -> std::io::Result<bool> {
+        let excess = self.resident_bytes().saturating_sub(target);
+        if excess == 0 {
+            return Ok(false);
+        }
+        match self.small.as_ref() {
+            Some(small) => small.reclaim_with_budget(excess, budget).await,
+            None => Ok(false),
+        }
+    }
+
+    // Already unlinked inodes cannot be freed by evicting more objects. Wait for
+    // their readers when they cover the remaining excess over the target.
+    fn small_readers_cover_excess(&self, target: u64) -> bool {
+        self.small
+            .as_ref()
+            .and_then(|s| s.stats().ok())
+            .is_some_and(|s| {
+                let excess = self.resident_bytes().saturating_sub(target);
+                excess > 0 && s.retired_bytes >= excess
+            })
+    }
+
+    async fn gc_small_idle_at(&self, now: u64) {
+        let Some(small) = self.small.as_ref().cloned() else {
+            return;
+        };
+        let age = self.page_gc_config.tti_ms;
+        if age == 0 {
+            return;
+        }
+        let mut cursor = self.small_idle_cursor.lock().await;
+        let mut position = *cursor;
+        let lru = self.lru.clone();
+        let scan = self.page_gc_config.scan_batch_size.min(4096);
+        let deletes = self.page_gc_config.delete_batch_size.min(256);
+        let (next, candidates) = tokio::task::spawn_blocking(move || {
+            let candidates = lru.idle_candidates(&mut position, now, age, scan, deletes);
+            (
+                position,
+                candidates
+                    .into_iter()
+                    .filter(|c| small.contains(&c.block))
+                    .collect::<Vec<_>>(),
+            )
+        })
+        .await
+        .expect("small object idle scan panicked");
+        *cursor = next;
+        for candidate in candidates {
+            self.unlink_stale_block_for(candidate, None).await;
+        }
+    }
+
+    /// Number of blocks across the ordinary and packed residency directories.
     pub fn block_count(&self) -> u64 {
-        self.index.len() as u64
+        self.index.len() as u64 + self.small.as_ref().map_or(0, |s| s.len() as u64)
     }
 
     /// Allocated disk bytes of indexed cache data files, excluding sidecars.
     pub fn resident_bytes(&self) -> u64 {
-        self.index.resident_bytes()
+        let indexed = self.index.resident_bytes();
+        match self.small.as_ref().and_then(|s| s.stats().ok()) {
+            Some(stats) => indexed.saturating_add(stats.allocated_bytes),
+            None => indexed,
+        }
     }
 
     #[cfg(test)]
     pub(crate) fn logical_resident_bytes(&self) -> u64 {
-        self.index.logical_resident_bytes()
+        self.index.logical_resident_bytes() + self.small.as_ref().map_or(0, |s| s.logical_bytes())
     }
 
     /// Number of pages resident in L1.
@@ -3593,7 +4028,7 @@ mod tests {
     }
 
     /// Read the bytes a `Sendfile` outcome would transmit, straight from its fd.
-    fn read_handle(outcome: ServeOutcome) -> Vec<u8> {
+    pub(super) fn read_handle(outcome: ServeOutcome) -> Vec<u8> {
         use std::io::{Read, Seek, SeekFrom};
         match outcome {
             ServeOutcome::Sendfile(handle) => {

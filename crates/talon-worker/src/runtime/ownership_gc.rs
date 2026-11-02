@@ -187,21 +187,21 @@ impl OwnershipGc {
                 .as_ref()
                 .unwrap()
                 .clone();
-            let success =
-                if self.owns(&candidate.block) || worker.index.get(&candidate.block).is_none() {
-                    true
-                } else if !worker.lru.stale_candidate_is_current(&candidate) {
-                    false
-                } else {
-                    if let Some(budget) = &worker.background_budget {
-                        let credits = budget.delete_slice(candidate.units as u64 - paid).await;
-                        self.pass.as_mut().unwrap().attempt.as_mut().unwrap().2 += credits;
-                        if paid + credits < candidate.units as u64 {
-                            return;
-                        }
+            let success = if self.owns(&candidate.block) || !worker.contains_block(&candidate.block)
+            {
+                true
+            } else if !worker.lru.stale_candidate_is_current(&candidate) {
+                false
+            } else {
+                if let Some(budget) = &worker.background_budget {
+                    let credits = budget.delete_slice(candidate.units as u64 - paid).await;
+                    self.pass.as_mut().unwrap().attempt.as_mut().unwrap().2 += credits;
+                    if paid + credits < candidate.units as u64 {
+                        return;
                     }
-                    self.reclaim_block(worker, candidate.clone(), &view).await
-                };
+                }
+                self.reclaim_block(worker, candidate.clone(), &view).await
+            };
             let pass = self.pass.as_mut().unwrap();
             pass.attempt = None;
             if success {
@@ -302,7 +302,7 @@ impl OwnershipGc {
             .await;
         // Protection, activity races and errors retain the block. A concurrent
         // replacement is conservatively retried, then excluded by its revision.
-        worker.index.get(&id).is_none()
+        !worker.contains_block(&id)
     }
 }
 
@@ -429,6 +429,7 @@ mod tests {
     ) -> (Arc<WorkerRuntime>, MembershipFixture) {
         let mut fixture = MembershipFixture::new();
         fixture.config.block_size = 32;
+        fixture.config.small_object_threshold_bytes = 1 << 20;
         fixture.config.l2_page_size_bytes = if paged { 16 } else { 0 };
         fixture.config.l1_page_size_bytes = 16;
         fixture.config.l1_capacity_bytes = 0;
@@ -445,6 +446,63 @@ mod tests {
             .unwrap(),
         );
         (worker, fixture)
+    }
+
+    #[tokio::test]
+    async fn small_ownership_gc_uses_store_residency_and_respects_policy_pins() {
+        let root = tempfile::tempdir().unwrap();
+        let (worker, fixture) = namespace_runtime(root.path(), false);
+        let nodes = ["a", "b"].map(|name| NodeInfo {
+            id: NodeId::new(name),
+            address: String::new(),
+            role: NodeRole::Worker,
+        });
+        let table = CachePlacementTable::new(&nodes);
+        let find = |owner: &str| {
+            (0..10_000)
+                .map(|n| {
+                    BlockId::new(
+                        ObjectId::new(Backend::S3, "bucket", format!("packed-{n}")),
+                        0,
+                        32,
+                        Version::new("v1"),
+                    )
+                })
+                .find(|id| table.primary(id).unwrap().id.0 == owner)
+                .unwrap()
+        };
+        let owned = find("a");
+        let unowned = find("b");
+        for id in [&owned, &unowned] {
+            worker
+                .commit_cached_block(id, Bytes::from_static(b"packed"))
+                .await
+                .unwrap();
+        }
+        assert!(worker.index.is_empty());
+        assert_eq!(worker.block_count(), 2);
+        let pin = worker.lru.pin_guard(CacheUnit::Whole(unowned.clone()));
+        fixture.publish(&worker);
+        let mut gc = OwnershipGc::new(&fixture.config);
+        gc.run_round(&worker).await;
+        assert!(worker.contains_block(&unowned));
+        drop(pin);
+        gc.run_round(&worker).await;
+        assert!(!worker.contains_block(&unowned));
+        assert!(worker.contains_block(&owned));
+        assert_eq!(worker.block_count(), 1);
+        assert!(worker.lru.block_candidates(&unowned).is_empty());
+        assert_eq!(
+            worker
+                .small
+                .as_ref()
+                .unwrap()
+                .read(&owned)
+                .await
+                .unwrap()
+                .unwrap(),
+            b"packed"[..]
+        );
     }
 
     #[tokio::test]

@@ -54,6 +54,7 @@
 
 - [Design (v1)](./explanation/design.md)
 - [Page TTI](./explanation/page-tti.md)
+- [Packed small-object cache](./explanation/small-object-store.md)
 - [Retained membership and rolling upgrades](./explanation/worker-rolling-upgrade.md)
 - [Background maintenance and eviction](./explanation/async-eviction.md)
 - [Data-plane runtime: choosing io_uring](./explanation/data-plane-runtime.md)

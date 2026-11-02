@@ -64,14 +64,12 @@ impl From<&BlockId> for LogicalBlock {
 #[derive(Clone)]
 pub struct AccessHandle(Arc<AtomicBool>, Arc<AtomicU64>);
 
-/// Process-local monotonic age. Restarted residents start a fresh idle window.
+/// Anchored wall time: monotonic within a process and portable across restarts.
 pub(crate) fn access_millis() -> u64 {
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START
-        .get_or_init(std::time::Instant::now)
-        .elapsed()
-        .as_millis() as u64
-        + 1
+    static CLOCK: OnceLock<crate::page_lifecycle::AccessClock> = OnceLock::new();
+    CLOCK
+        .get_or_init(crate::page_lifecycle::AccessClock::new)
+        .now()
 }
 
 impl Default for AccessHandle {
@@ -84,6 +82,24 @@ impl Default for AccessHandle {
 }
 
 impl AccessHandle {
+    pub(crate) fn last_access(&self) -> u64 {
+        self.1.load(Ordering::Relaxed)
+    }
+
+    /// Startup only, before serving. A clock rollback must not postpone expiry
+    /// beyond one fresh idle window; a missing/invalid age starts that window.
+    pub(crate) fn restore(&self, last_access: u64) {
+        let now = access_millis();
+        self.1.store(
+            if last_access == 0 {
+                now
+            } else {
+                last_access.min(now)
+            },
+            Ordering::Relaxed,
+        );
+    }
+
     /// Coalesce hits until the eviction hand consumes this second chance.
     /// This is advisory recency only, so relaxed ordering is sufficient.
     pub fn touch(&self) {
@@ -125,6 +141,7 @@ struct BlockActivity {
 }
 
 struct Entry {
+    independent: bool,
     bytes: u64,
     position: u64,
     revision: u64,
@@ -161,6 +178,7 @@ struct Inner {
     block_queue: BTreeMap<u64, BlockId>,
     ownership_queue: BTreeMap<u64, BlockId>,
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
+    track_checks: bool,
     total_bytes: u64,
     clock: u64,
     // Unlike clock, this does not advance for capacity-policy rotations or reads.
@@ -210,14 +228,21 @@ impl Inner {
             self.block_access.remove(block);
             self.block_queue.remove(&position);
         }
-        let check = self
-            .object_checks
-            .get_mut(&block.object)
-            .expect("tracked object");
-        check.0 -= 1;
-        if check.0 == 0 {
-            self.object_checks.remove(&block.object);
+        if let Some(check) = self.object_checks.get_mut(&block.object) {
+            check.0 -= 1;
+            if check.0 == 0 {
+                self.object_checks.remove(&block.object);
+            }
         }
+        if !entry.independent {
+            self.remove_version(unit);
+        }
+        Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
+        Some(entry.bytes)
+    }
+
+    fn remove_version(&mut self, unit: &CacheUnit) {
+        let block = unit.block();
         let key = LogicalBlock::from(block);
         let versions = self.versions.get_mut(&key).expect("tracked logical block");
         let units = versions.get_mut(&block.version).expect("tracked version");
@@ -234,8 +259,6 @@ impl Inner {
         if versions.is_empty() {
             self.versions.remove(&key);
         }
-        Lru::subtract_bytes(&mut self.total_bytes, entry.bytes);
-        Some(entry.bytes)
     }
 }
 
@@ -255,6 +278,10 @@ impl Lru {
 
     /// Create an empty tracker.
     pub fn new() -> Self {
+        Self::with_object_checks(true)
+    }
+
+    pub(crate) fn with_object_checks(track_checks: bool) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 entries: HashMap::new(),
@@ -264,6 +291,7 @@ impl Lru {
                 block_queue: BTreeMap::new(),
                 ownership_queue: BTreeMap::new(),
                 object_checks: HashMap::new(),
+                track_checks,
                 total_bytes: 0,
                 clock: 0,
                 admission_ceiling: 0,
@@ -290,6 +318,17 @@ impl Lru {
     /// Insert or update a unit, returning its stable access token. Updating an
     /// existing admission preserves its pins and token.
     pub fn insert(&self, unit: CacheUnit, bytes: u64) -> AccessHandle {
+        self.insert_with_policy(unit, bytes, false)
+    }
+
+    /// Packed objects are independent full keys, with no cross-version eviction.
+    pub(crate) fn insert_with_policy(
+        &self,
+        unit: CacheUnit,
+        bytes: u64,
+        independent: bool,
+    ) -> AccessHandle {
+        assert!(!independent || matches!(unit, CacheUnit::Whole(_)));
         let mut g = self.inner.lock().unwrap();
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
@@ -307,9 +346,23 @@ impl Lru {
         }
         if let Some(e) = g.entries.get_mut(&unit) {
             let old = e.bytes;
+            let was_independent = e.independent;
+            e.independent = independent;
             e.bytes = bytes;
             e.access.touch();
             let access = e.access.clone();
+            if was_independent != independent {
+                if independent {
+                    g.remove_version(&unit);
+                } else {
+                    g.versions
+                        .entry(LogicalBlock::from(unit.block()))
+                        .or_default()
+                        .entry(unit.block().version.clone())
+                        .or_default()
+                        .insert(unit.page());
+                }
+            }
             g.block_access
                 .get_mut(unit.block())
                 .expect("tracked block")
@@ -320,12 +373,14 @@ impl Lru {
         }
         Self::add_bytes(&mut g.total_bytes, bytes);
         let block = unit.block();
-        g.versions
-            .entry(LogicalBlock::from(block))
-            .or_default()
-            .entry(block.version.clone())
-            .or_default()
-            .insert(unit.page());
+        if !independent {
+            g.versions
+                .entry(LogicalBlock::from(block))
+                .or_default()
+                .entry(block.version.clone())
+                .or_default()
+                .insert(unit.page());
+        }
         if !g.block_access.contains_key(block) {
             g.block_queue.insert(position, block.clone());
             g.block_access.insert(
@@ -347,15 +402,18 @@ impl Lru {
         let access = AccessHandle(Arc::new(AtomicBool::new(false)), activity.access.clone());
         // New pages also refresh the shared block idle age.
         access.1.fetch_max(access_millis(), Ordering::Relaxed);
-        g.object_checks
-            .entry(block.object.clone())
-            .or_insert((0, None))
-            .0 += 1;
+        if g.track_checks {
+            g.object_checks
+                .entry(block.object.clone())
+                .or_insert((0, None))
+                .0 += 1;
+        }
         let unit = Arc::new(unit);
         g.queue.insert(position, unit.clone());
         g.entries.insert(
             unit,
             Entry {
+                independent,
                 bytes,
                 position,
                 revision: position,
@@ -498,6 +556,12 @@ impl Lru {
     /// Old-version candidates; removal is committed by the caller after I/O.
     pub(crate) fn superseded_candidates(&self, keep: &BlockId) -> Vec<EvictionCandidate> {
         let mut g = self.inner.lock().unwrap();
+        if g.entries
+            .get(&CacheUnit::Whole(keep.clone()))
+            .is_some_and(|e| e.independent)
+        {
+            return Vec::new();
+        }
         let Some(versions) = g.versions.get(&LogicalBlock::from(keep)) else {
             return Vec::new();
         };
@@ -526,6 +590,10 @@ impl Lru {
     /// Snapshot resident units for an explicit block invalidation.
     pub(crate) fn block_candidates(&self, block: &BlockId) -> Vec<EvictionCandidate> {
         let mut g = self.inner.lock().unwrap();
+        let whole = CacheUnit::Whole(block.clone());
+        if g.entries.get(&whole).is_some_and(|e| e.independent) {
+            return vec![g.snapshot(whole)];
+        }
         let Some(units) = g
             .versions
             .get(&LogicalBlock::from(block))
@@ -553,6 +621,28 @@ impl Lru {
         scan_budget: usize,
         delete_budget: usize,
     ) -> Vec<StaleBlockCandidate> {
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), true)
+    }
+
+    pub(crate) fn idle_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        scan_budget: usize,
+        delete_budget: usize,
+    ) -> Vec<StaleBlockCandidate> {
+        self.age_candidates(cursor, now, age, (scan_budget, delete_budget), false)
+    }
+
+    fn age_candidates(
+        &self,
+        cursor: &mut (u64, u64),
+        now: u64,
+        age: u64,
+        (scan_budget, delete_budget): (usize, usize),
+        consider_verified: bool,
+    ) -> Vec<StaleBlockCandidate> {
         let mut out = Vec::new();
         if cursor.0 >= cursor.1 {
             *cursor = (0, self.inner.lock().unwrap().clock);
@@ -566,10 +656,10 @@ impl Lru {
             cursor.0 = position + 1;
             let activity = &g.block_access[block];
             let access = activity.access.load(Ordering::Relaxed);
-            let verified = g.object_checks[&block.object].1;
+            let verified = g.object_checks.get(&block.object).and_then(|check| check.1);
             if activity.pins != 0
                 || now.saturating_sub(access) <= age
-                || verified.is_some_and(|at| now.saturating_sub(at) < age)
+                || (consider_verified && verified.is_some_and(|at| now.saturating_sub(at) < age))
             {
                 continue;
             }
@@ -651,6 +741,11 @@ impl Lru {
     /// Called under the block mutation gate after its complete on-disk deletion.
     pub(crate) fn remove_block(&self, block: &BlockId) {
         let mut g = self.inner.lock().unwrap();
+        let whole = CacheUnit::Whole(block.clone());
+        if g.entries.get(&whole).is_some_and(|e| e.independent) {
+            g.remove(&whole);
+            return;
+        }
         let Some(pages) = g
             .versions
             .get(&LogicalBlock::from(block))
@@ -712,6 +807,12 @@ impl Lru {
     /// regardless of the number of pages in this block or the rest of the cache.
     pub fn evict_superseded(&self, keep: &BlockId) -> Vec<CacheUnit> {
         let mut g = self.inner.lock().unwrap();
+        if g.entries
+            .get(&CacheUnit::Whole(keep.clone()))
+            .is_some_and(|e| e.independent)
+        {
+            return Vec::new();
+        }
         let Some(versions) = g.versions.get(&LogicalBlock::from(keep)) else {
             return Vec::new();
         };
@@ -817,6 +918,64 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn switching_whole_storage_policy_preserves_access_and_pins() {
+        let lru = Arc::new(Lru::new());
+        let unit = whole(1);
+        let access = lru.insert(unit.clone(), 10);
+        let pin = lru.pin_guard(unit.clone());
+        let updated = lru.insert_with_policy(unit.clone(), 20, true);
+        assert!(Arc::ptr_eq(&access.0, &updated.0));
+        assert!(lru.inner.lock().unwrap().versions.is_empty());
+        assert_eq!(lru.inner.lock().unwrap().entries[&unit].pins, 1);
+        let updated = lru.insert(unit.clone(), 30);
+        assert!(Arc::ptr_eq(&access.0, &updated.0));
+        assert_eq!(lru.inner.lock().unwrap().versions.len(), 1);
+        assert_eq!(lru.inner.lock().unwrap().entries[&unit].pins, 1);
+        drop(pin);
+        lru.remove_block(unit.block());
+        assert!(lru.is_empty());
+        assert_eq!(lru.total_bytes(), 0);
+    }
+
+    #[test]
+    fn independent_keys_skip_version_index_and_preserve_exact_deletion() {
+        for track_checks in [false, true] {
+            let lru = Lru::with_object_checks(track_checks);
+            let v1 = blk(1);
+            let mut v2 = v1.clone();
+            v2.version = Version::new("v2");
+            for id in [&v1, &v2] {
+                lru.insert_with_policy(CacheUnit::Whole(id.clone()), 4096, true);
+            }
+            assert!(lru.inner.lock().unwrap().versions.is_empty());
+            assert_eq!(
+                lru.inner.lock().unwrap().object_checks.len(),
+                usize::from(track_checks)
+            );
+            assert!(lru.superseded_candidates(&v2).is_empty());
+            assert!(lru.evict_superseded(&v2).is_empty());
+            let mut paged = v1.clone();
+            paged.version = Version::new("v3");
+            lru.insert(CacheUnit::Page(paged.clone(), PageIndex(0)), 100);
+            assert!(lru.superseded_candidates(&paged).is_empty());
+            assert!(lru.superseded_candidates(&v2).is_empty());
+            assert_eq!(lru.block_candidates(&v1).len(), 1);
+            if track_checks {
+                assert!(lru.stale_check_due(&v1.object, 100, 10));
+                lru.stale_verified(&v1.object, 100);
+                assert!(!lru.stale_check_due(&v2.object, 101, 10));
+            }
+            lru.remove_block(&v1);
+            assert!(lru.block_candidates(&v1).is_empty());
+            assert_eq!(lru.block_candidates(&v2).len(), 1);
+            lru.remove_block(&v2);
+            lru.remove_block(&paged);
+            assert!(lru.is_empty());
+            assert!(lru.inner.lock().unwrap().object_checks.is_empty());
+        }
     }
 
     #[test]
