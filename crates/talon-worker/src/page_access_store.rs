@@ -194,7 +194,7 @@ impl PageAccessStore {
 
 /// Held for the entire worker lifetime, even when TTI is disabled.
 pub struct CacheRootLock {
-    _file: File,
+    file: File,
     pub(crate) root: std::path::PathBuf,
 }
 impl CacheRootLock {
@@ -206,7 +206,7 @@ impl CacheRootLock {
             .read(true)
             .write(true)
             .open(root.join(".worker.lock"))?;
-        // SAFETY: file owns a valid descriptor. flock is released on close/process exit.
+        // SAFETY: file owns a valid descriptor.
         if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
             return Err(anyhow::anyhow!(
                 "cache root {} is already in use or cannot be locked: {}",
@@ -215,9 +215,19 @@ impl CacheRootLock {
             ));
         }
         Ok(Self {
-            _file: file,
+            file,
             root: root.to_owned(),
         })
+    }
+}
+
+impl Drop for CacheRootLock {
+    fn drop(&mut self) {
+        // Closing alone leaves the lock held by descriptors inherited across fork.
+        // SAFETY: self.file owns the descriptor until this destructor returns.
+        if unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) } != 0 {
+            tracing::warn!(root = %self.root.display(), error = %std::io::Error::last_os_error(), "failed to unlock cache root");
+        }
     }
 }
 
@@ -261,6 +271,21 @@ mod tests {
         let lock = CacheRootLock::acquire(dir.path()).unwrap();
         assert!(CacheRootLock::acquire(dir.path()).is_err());
         drop(lock);
+        assert!(CacheRootLock::acquire(dir.path()).is_ok());
+    }
+    #[test]
+    fn root_lock_release_does_not_wait_for_inherited_descriptors() {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = CacheRootLock::acquire(dir.path()).unwrap();
+        // A forked child shares this open file description until exec closes it.
+        let inherited = lock.file.try_clone().unwrap();
+        assert!(CacheRootLock::acquire(dir.path()).is_err());
+
+        drop(lock);
+        let reopened = CacheRootLock::acquire(dir.path()).unwrap();
+        drop(inherited);
+        assert!(CacheRootLock::acquire(dir.path()).is_err());
+        drop(reopened);
         assert!(CacheRootLock::acquire(dir.path()).is_ok());
     }
     #[test]
