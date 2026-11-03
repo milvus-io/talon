@@ -118,6 +118,7 @@ impl WorkerRuntime {
 
     pub(crate) async fn drain_page_mutations(&self) {
         self.page_mutations.drain().await;
+        self.store.drain().await;
     }
 
     /// Complete one disk cleanup pass, including when page TTI or paged reads are disabled.
@@ -715,19 +716,29 @@ mod tests {
             ..Default::default()
         };
         let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
-        let catalog = Catalog::open(lock.clone()).unwrap();
-        let path = "default/shared/paged";
+        let scope = root.join("default/shared");
+        std::fs::create_dir_all(&scope).unwrap();
+        let service = crate::catalog::service(lock.clone()).unwrap();
+        let catalog =
+            Catalog::with_service(&service, &scope, crate::catalog::transaction_budget(), None)
+                .unwrap();
+        let path = "paged";
         catalog
             .register(path, config.l2_page_size_bytes as u32)
             .unwrap();
-        let paged = PagedBlockStore::open(root.join(path), config.l2_page_size_bytes as u32)
+        let paged = PagedBlockStore::open(scope.join(path), config.l2_page_size_bytes as u32)
             .unwrap()
             .with_catalog(catalog.clone(), path.into())
             .with_root_lock(lock.clone());
         let worker = WorkerRuntime::new(
-            WholeBlockStore::open(root.join("default/shared"))
-                .unwrap()
-                .with_root_lock(lock),
+            WholeBlockStore::open_with_catalog(
+                &scope,
+                Arc::new(crate::fd_cache::FdCache::new(
+                    config.whole_fd_cache_capacity,
+                )),
+                catalog.clone(),
+            )
+            .unwrap(),
             Arc::new(BlockIndex::new()),
             Arc::new(InFlightLoads::new()),
             Arc::new(UnusedOrigin),
@@ -771,7 +782,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn whole_eviction_survives_paged_catalog_failure() {
+    async fn whole_eviction_retains_catalog_failure_accounting() {
         for stale in [false, true] {
             let root = tempfile::tempdir().unwrap();
             let (worker, catalog, config) = runtime(root.path());
@@ -790,20 +801,18 @@ mod tests {
                 worker.index.get(&block()).unwrap().form,
                 BlockForm::Whole
             ));
-            assert!(worker.resident_bytes() > 0);
-            assert!(catalog
-                .recover("default/shared/paged")
-                .unwrap()
-                .unwrap()
-                .is_empty());
+            let allocated = worker.resident_bytes();
+            assert!(allocated > 0);
+            assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
             catalog.poison();
 
             evict(&worker, &config, stale).await;
 
-            assert!(worker.store.scan_allocated().unwrap().is_empty());
-            assert!(worker.index.get(&block()).is_none());
-            assert!(worker.lru.is_empty());
-            assert_eq!(worker.resident_bytes(), 0);
+            assert!(worker.store.scan_allocated().is_err());
+            assert!(worker.store.contains(&block()).await.unwrap());
+            assert!(worker.index.get(&block()).is_some());
+            assert!(!worker.lru.is_empty());
+            assert_eq!(worker.resident_bytes(), allocated);
         }
     }
 
@@ -840,11 +849,7 @@ mod tests {
                     if poisoned { allocated } else { 0 }
                 );
                 if !poisoned {
-                    assert!(catalog
-                        .recover("default/shared/paged")
-                        .unwrap()
-                        .unwrap()
-                        .is_empty());
+                    assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
                 }
             }
         }

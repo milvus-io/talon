@@ -1,29 +1,51 @@
-# Paged cache catalog
+# File cache catalog
 
-Namespace-backed Workers persist paged residency in a cache-root catalog.
+Each namespace/credential scope persists paged and whole-block residency in its
+own catalog, matching its `BlockIndex` lifetime and identity boundary.
 The `.paged-catalog` name is reserved and cannot be used as a namespace.
 The catalog is a business adapter over the common `talon-journal` engine; see
 [the shared cache journal contract](cache-journal.md) for service ownership,
 framing, durability and checkpoint publication.
 Workers do not write one `block.meta` per block. Normal paged recovery reads a snapshot
 and the subsequent journal, without listing block/page directories or statting
-every page. Whole-block caching and access-time checkpoints remain separate.
+every page. Whole-block recovery uses the same snapshot and journal without
+enumerating block files or reading per-block sidecars. Access-time checkpoints
+remain separate.
 
 This is a new cache format. Existing paged directories without a registered
-catalog are rejected; use a new empty cache root. There is no legacy migration
-or automatic deletion of the old cache. An older Worker cannot safely write a
+catalog, and the former root-level `.paged-catalog`, are rejected; use a new
+empty cache root. There is no legacy migration or automatic deletion of the old
+cache. An older Worker cannot safely write a
 catalog-backed cache root. Standalone low-level store fixtures still support
-the sidecar layout; the Worker namespace startup path always uses the catalog.
+the paged sidecar layout; the Worker namespace startup path always uses the catalog.
+
+Whole blocks live at `<scope>/whole/<shard>/<digest>.blk`. Their catalog store
+has `page_size = 0`; each block records its logical length and one allocation
+count (`st_blocks * 512`, measured when written). `PutWhole` and `DeleteBlock`
+use durable Begin/Complete records. A pending write or delete discards the block
+on restart; cleanup also removes `<digest>.blk.catalog.<transaction>` by exact
+path before recording Resolve. Refill can then safely reuse the identity.
+Writes and deletes keep ownership through completion when a requester cancels.
+
+Whole stores always require a catalog, including standalone stores. First
+registration rejects legacy hash-shard directories and unregistered `whole/`
+data. It neither imports nor deletes old data. Registered stores do not enumerate
+the scope or data directories during recovery. Existing paged/small journal
+roots with no whole data can register an empty whole store on first startup.
 
 ## Layout and ownership
 
 ```text
 <cache-root>/
   .worker.lock
-  .paged-catalog/
+  <namespace>/shared/.paged-catalog/
     CURRENT
     <snapshot files selected by CURRENT>
     <log files selected by CURRENT>
+  <namespace>/shared/whole/
+    ab/
+      <digest>.blk
+      <digest>.blk.catalog.<transaction>   # only while a put is incomplete
   <namespace>/shared/paged/
     ab/
       access.shard
@@ -33,21 +55,23 @@ the sidecar layout; the Worker namespace startup path always uses the catalog.
         <page>.page.catalog.<transaction>   # only while a put is incomplete
 ```
 
-Credential scopes use `<namespace>/scopes/<scope>/paged` and share the same
-writer. Every record identifies its store, so equal BlockIds in different
+Credential scopes use `<namespace>/scopes/<scope>/` with the same layout.
+Each catalog records only its local `whole` and `paged` stores; nested and
+cross-scope store paths are rejected. Equal BlockIds in different
 namespaces/scopes remain isolated. BlockId includes the source version.
 
-`NamespaceRuntimes` creates one `JournalService` for the cache root. The paged
-catalog and each small-store namespace/scope open independent typed streams on
+`NamespaceRuntimes` creates one `JournalService` for the cache root. Each
+namespace/scope's catalog and small store open independent typed streams on
 that same service. The service owns the dedicated runtime/ring and the root
 lease; neither adapter starts another journal thread. Stream state, checkpoints,
-LSNs and failure status remain independent. Small objects are not entered into
-the paged catalog.
+LSNs and failure status remain independent across scopes. Whole and paged stores
+within one scope share a catalog and its failure state. Small objects are not
+entered into that catalog. Shutdown checkpoints every initialized scope.
 
 The shared engine bounds queued and in-flight requests by both count and encoded
-bytes, reserving admission before encoding. Paged business admission separately
-bounds 1,024 transactions across Begin, data I/O and Complete. All paged log
-records request `Ack::Durable`; success follows the covering fsync. Ordered queries
+bytes, reserving admission before encoding. Catalog business admission separately
+bounds 1,024 transactions across all scopes, spanning Begin, data I/O and Complete.
+All catalog log records request `Ack::Durable`; success follows the covering fsync. Ordered queries
 also cross a durable barrier before reading the state machine. Native io_uring
 is preferred, with explicit independent-thread legacy compatibility where
 required by the host. Native validation sets `require_native`.
@@ -147,8 +171,8 @@ initialization and access-time restoration still have ordered work, so this is
 not a claim that every startup stage saturates all CPUs.
 
 The writer retains catalog metadata alongside the runtime index. Startup still
-discovers namespaces/scopes and restores whole-block caches and access-time
-shards. Thus the guarantee concerns paged block/page enumeration, not zero
+discovers namespaces/scopes and restores access-time shards. Thus the guarantee
+concerns whole-block and paged block/page enumeration, not zero
 filesystem operations or zero startup work. Access timestamps remain sampled
 in `access.shard`; ordinary read hits do not write residency log records.
 

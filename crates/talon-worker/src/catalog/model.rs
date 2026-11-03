@@ -1,4 +1,4 @@
-//! Paged residency state and codec; the shared journal owns ordering and I/O.
+//! File-cache residency state and codec; the shared journal owns ordering and I/O.
 use crate::index::StoredBlock;
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,7 @@ pub(super) struct Block {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) enum Operation {
     Put { page: u32, len: u64 },
+    PutWhole { len: u64 },
     DeletePage { page: u32 },
     DeleteBlock,
 }
@@ -43,6 +44,7 @@ pub(super) enum Record {
 
 #[derive(Default)]
 pub(super) struct Store {
+    /// Zero denotes whole blocks, represented by one allocation at index zero.
     pub(super) page_size: u32,
     pub(super) blocks: HashMap<BlockId, Arc<Block>>,
 }
@@ -57,12 +59,15 @@ impl State {
     fn apply_record(&mut self, lsn: u64, record: Record) -> anyhow::Result<()> {
         match record {
             Record::Store { path, page_size } => {
-                anyhow::ensure!(page_size > 0 && valid_store(&path), "invalid catalog store");
-                let store = self.stores.entry(path).or_default();
                 anyhow::ensure!(
-                    store.page_size == 0 || store.page_size == page_size,
-                    "catalog geometry changed"
+                    valid_store(&path)
+                        && (Path::new(&path).file_name().unwrap() == "whole") == (page_size == 0),
+                    "invalid catalog store"
                 );
+                if let Some(store) = self.stores.get(&path) {
+                    anyhow::ensure!(store.page_size == page_size, "catalog geometry changed");
+                }
+                let store = self.stores.entry(path).or_default();
                 store.page_size = page_size;
             }
             Record::Begin { intent } => {
@@ -76,14 +81,21 @@ impl State {
                     .ok_or_else(|| anyhow::anyhow!("unknown catalog store"))?;
                 if let Operation::Put { page, len } = intent.operation {
                     anyhow::ensure!(
-                        page < intent.block.page_count(store.page_size)
+                        store.page_size > 0
+                            && page < intent.block.page_count(store.page_size)
                             && len <= u64::from(intent.block.block_size),
                         "invalid page intent"
                     );
                 }
+                if let Operation::PutWhole { len } = intent.operation {
+                    anyhow::ensure!(
+                        store.page_size == 0 && len <= u64::from(intent.block.block_size),
+                        "invalid whole block intent"
+                    );
+                }
                 if let Operation::DeletePage { page } = intent.operation {
                     anyhow::ensure!(
-                        page < intent.block.page_count(store.page_size),
+                        store.page_size > 0 && page < intent.block.page_count(store.page_size),
                         "invalid delete page"
                     );
                 }
@@ -92,7 +104,8 @@ impl State {
                         other.store == intent.store
                             && other.block == intent.block
                             && match (&other.operation, &intent.operation) {
-                                (Operation::DeleteBlock, _) | (_, Operation::DeleteBlock) => true,
+                                (Operation::DeleteBlock | Operation::PutWhole { .. }, _)
+                                | (_, Operation::DeleteBlock | Operation::PutWhole { .. }) => true,
                                 (
                                     Operation::Put { page: a, .. }
                                     | Operation::DeletePage { page: a },
@@ -124,7 +137,7 @@ impl State {
                             store.blocks.remove(&intent.block);
                         }
                     }
-                    Operation::DeleteBlock => {
+                    Operation::DeleteBlock | Operation::PutWhole { .. } => {
                         store.blocks.remove(&intent.block);
                     }
                 }
@@ -139,6 +152,16 @@ impl State {
                     .ok_or_else(|| anyhow::anyhow!("unknown catalog transaction"))?;
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
+                    Operation::PutWhole { len } => {
+                        store.blocks.insert(
+                            intent.block.clone(),
+                            Arc::new(Block {
+                                id: intent.block,
+                                len,
+                                pages: [(0, allocated)].into(),
+                            }),
+                        );
+                    }
                     Operation::Put { page, len } => {
                         let block = store.blocks.entry(intent.block.clone()).or_insert_with(|| {
                             Arc::new(Block {
@@ -190,6 +213,16 @@ impl State {
             .filter(|b| !b.pages.is_empty())
             .collect();
         Ok(Some(crate::recovery::map(blocks, threads, |b| {
+            if store.page_size == 0 {
+                return StoredBlock {
+                    meta: BlockMeta {
+                        id: b.id.clone(),
+                        len: b.len,
+                        form: BlockForm::Whole,
+                    },
+                    allocated: vec![(None, b.pages[&0])],
+                };
+            }
             let mut present = PresentBitmap::new(b.id.page_count(store.page_size));
             for page in b.pages.keys() {
                 present.set(PageIndex(*page));
@@ -214,11 +247,7 @@ impl State {
 }
 
 pub(super) fn valid_store(path: &str) -> bool {
-    let p = Path::new(path);
-    !p.is_absolute()
-        && p.components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)))
-        && p.file_name().is_some_and(|n| n == "paged")
+    matches!(path, "paged" | "whole")
 }
 
 #[derive(Serialize, Deserialize)]
@@ -391,10 +420,14 @@ impl Machine for State {
                     .ok_or_else(|| invalid("unknown snapshot store"))?;
                 if block.len > u64::from(block.id.block_size)
                     || block.pages.is_empty()
-                    || block
-                        .pages
-                        .keys()
-                        .any(|page| *page >= block.id.page_count(store.page_size))
+                    || if store.page_size == 0 {
+                        continuation || block.pages.len() != 1 || !block.pages.contains_key(&0)
+                    } else {
+                        block
+                            .pages
+                            .keys()
+                            .any(|page| *page >= block.id.page_count(store.page_size))
+                    }
                 {
                     return Err(invalid("invalid snapshot block"));
                 }

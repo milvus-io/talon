@@ -490,6 +490,7 @@ mod tests {
             assert_eq!(r.lru.total_bytes(), 0);
             assert!(r.index.get(&block(0)).is_none());
             assert!(r.index.get(&block(1)).is_none());
+            drop(r);
             let recovered = runtime(root.path(), paged, origin);
             assert_eq!(recovered.logical_resident_bytes(), 0);
         }

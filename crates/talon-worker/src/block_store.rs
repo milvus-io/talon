@@ -7,7 +7,7 @@
 //!
 //! # Layout
 //!
-//! Each block maps to `<root>/<shard>/<digest>.blk`, where `digest` is a stable
+//! Each block maps to `<root>/whole/<shard>/<digest>.blk`, where `digest` is a stable
 //! hash of the block's identity ([`BlockId`]'s `Display`, which includes object
 //! path, version, offset, and block size) and `shard` is the first two hex
 //! digits of that digest. Sharding keeps any single directory from growing
@@ -18,6 +18,9 @@
 //! [`PagedBlockStore`](crate::PagedBlockStore), which the worker uses instead of
 //! this store when `l2_page_size_bytes` is set.
 
+#[cfg(test)]
+mod journal_tests;
+
 use crate::fd_cache::{CachedFd, FdCache};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,15 +30,19 @@ use std::io::{Read, Write};
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use talon_core::{
-    BlockForm, BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result,
-};
+use talon_core::{BlockHandle, BlockId, BlockMeta, Error, ObjectStore, PageIndex, Result};
 
-/// Process-wide monotonic counter making staging temp filenames unique, so two
-/// concurrent writers of the same block never share a `.tmp` path (issue #113).
-static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
+pub(crate) fn block_path(root: &Path, id: &BlockId) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    let hex = format!("{:016x}", hasher.finish());
+    root.join(&hex[..2]).join(format!("{hex}.blk"))
+}
+
+fn catalog_error(error: anyhow::Error) -> Error {
+    Error::Other(format!("whole block catalog: {error:#}"))
+}
 
 /// Run blocking filesystem work on Tokio's blocking pool, so a large read or
 /// write-plus-fsync never stalls the async reactor thread and the other
@@ -79,12 +86,16 @@ where
 }
 
 /// A local, file-backed store for whole blocks.
+#[derive(Clone)]
 pub struct WholeBlockStore {
     uring: bool,
     direct_alignment: Option<talon_uring::DirectIoAlignment>,
     root: PathBuf,
     fd_cache: Arc<FdCache>,
-    root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
+    catalog: Arc<crate::catalog::Catalog>,
+    catalog_path: String,
+    mutations: Arc<crate::page_gc::Mutations>,
+    gates: Arc<[tokio::sync::Mutex<()>; 64]>,
 }
 
 impl WholeBlockStore {
@@ -107,125 +118,174 @@ impl WholeBlockStore {
         id: &BlockId,
         value: talon_uring::Payload,
     ) -> Result<u64> {
-        let path = self.path_for(id);
-        let meta_path = self.meta_path_for(id);
-        let meta = BlockMeta {
-            id: id.clone(),
-            form: BlockForm::Whole,
-            len: value.len() as u64,
-        };
         if self.uring {
             talon_uring::require_ring()?;
-            let alignment = self.direct_alignment.expect("native store alignment");
-            let root_lock = self.root_lock.clone();
-            let fds = self.fd_cache.clone();
-            let encoded = serde_json::to_vec(&meta)
-                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
-            return talon_uring::spawn_local(async move {
-                let _root_lock = root_lock;
-                let allocated = talon_uring::atomic_write_payload(&path, value, alignment).await?;
-                fds.invalidate(&path);
-                // Match the existing whole-block commit's best-effort sidecar.
-                if let Err(error) = talon_uring::atomic_write(&meta_path, encoded.into()).await {
-                    tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
-                }
-                Ok(allocated)
-            }).await.map_err(|e| std::io::Error::other(format!("ring commit task stopped: {e}")))?;
         }
-        let value = value.into_bytes();
-        // The write + fsync of a whole block is blocking disk I/O; keep it off
-        // the reactor thread (issue #115).
-        let commit_path = path.clone();
-        let root_lock = self.root_lock.clone();
-        let allocated = spawn_blocking_io(move || {
-            let _root_lock = root_lock;
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let pid = std::process::id();
-            // Write to a per-writer-unique temp file then rename, so a present
-            // `.blk` is always complete (crash-atomic commit) AND two concurrent
-            // writers of the same block never truncate each other's staging file
-            // (issue #113). Both writers stage identical content; whichever
-            // renames last wins with a complete file, and the loser's rename is
-            // a harmless overwrite of the same bytes.
-            let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-            let tmp = path.with_extension(format!("blk.tmp.{pid}.{seq}"));
-            let allocated = {
-                let mut f = std::fs::File::create(&tmp)?;
-                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&value))?;
-                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
-                f.metadata()?.blocks() * 512
-            };
-            // Rename our own unique temp into place. If a concurrent writer
-            // already renamed theirs, this atomically replaces it with identical
-            // bytes.
-            if let Err(e) = talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&tmp, &path)) {
-                // Best-effort cleanup of our staging file on failure so a failed
-                // commit never leaks a `.tmp`.
-                let _ = std::fs::remove_file(&tmp);
-                return Err(e.into());
-            }
-            // Write the sidecar (id + form + len) so the index can be rebuilt on
-            // startup (issue #114). Same unique-temp-then-rename discipline. The
-            // block file is already committed; a missing sidecar only costs a
-            // re-fetch of that block after a restart, so a sidecar failure is
-            // logged but does not fail the commit.
-            let encoded = serde_json::to_vec(&meta)
-                .map_err(|e| Error::Other(format!("encode block sidecar: {e}")))?;
-            let meta_seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-            let meta_tmp = meta_path.with_extension(format!("meta.tmp.{pid}.{meta_seq}"));
-            if let Err(error) = (|| -> std::io::Result<()> {
-                let mut f = std::fs::File::create(&meta_tmp)?;
-                talon_telemetry::sync_io("talon.cache.write", || f.write_all(&encoded))?;
-                talon_telemetry::sync_io("talon.cache.fsync", || f.sync_all())?;
-                talon_telemetry::sync_io("talon.cache.rename", || std::fs::rename(&meta_tmp, &meta_path))
-            })() {
-                let _ = std::fs::remove_file(&meta_tmp);
-                tracing::warn!(%error, "failed to write block sidecar; block will re-fetch after restart");
-            }
-            Ok(allocated)
-        })
-        .await?;
-        // The commit renamed a fresh file over `path`, so it is a NEW inode and
-        // any descriptor cached for the superseded file is stale. Invalidate
-        // AFTER the rename: doing it before would leave a window in which a
-        // concurrent reader re-caches the old inode and then serves its bytes
-        // indefinitely. Readers racing this call either miss (and open the
-        // committed file) or hold a handle on the previous inode, which stays
-        // readable until they finish — the same semantics as before the cache.
-        self.fd_cache.invalidate(&commit_path);
-        Ok(allocated)
+        let store = self.clone();
+        let id = id.clone();
+        self.mutations
+            .run(async move {
+                let _gate = store.gate(&id).lock().await;
+                let transaction = store
+                    .catalog
+                    .begin(
+                        &store.catalog_path,
+                        &id,
+                        crate::catalog::Operation::PutWhole {
+                            len: value.len() as u64,
+                        },
+                    )
+                    .await
+                    .map_err(catalog_error)?;
+                #[cfg(test)]
+                crate::page_access_store::crash_barrier("whole_begin")?;
+                let path = store.path_for(&id);
+                let staged = path.with_extension(format!("blk.catalog.{}", transaction.id));
+                let result: Result<u64> = if store.uring {
+                    let alignment = store.direct_alignment.expect("native store alignment");
+                    talon_uring::spawn_local(async move {
+                        talon_uring::atomic_write_payload_staged(&path, &staged, value, alignment)
+                            .await
+                            .map_err(Error::from)
+                    })
+                    .await
+                    .map_err(|error| Error::Other(format!("whole block task stopped: {error}")))
+                    .and_then(|result| result)
+                } else {
+                    spawn_blocking_io(move || {
+                        let dir = path.parent().unwrap();
+                        std::fs::create_dir_all(dir)?;
+                        std::fs::File::open(dir.parent().unwrap())?.sync_all()?;
+                        let mut file = std::fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&staged)?;
+                        talon_telemetry::sync_io("talon.cache.write", || {
+                            file.write_all(&value.into_bytes())
+                        })?;
+                        talon_telemetry::sync_io("talon.cache.fsync", || file.sync_all())?;
+                        let allocated = file.metadata()?.blocks() * 512;
+                        #[cfg(test)]
+                        crate::page_access_store::crash_barrier("whole_staged")?;
+                        talon_telemetry::sync_io("talon.cache.rename", || {
+                            std::fs::rename(&staged, &path)
+                        })?;
+                        std::fs::File::open(dir)?.sync_all()?;
+                        Ok(allocated)
+                    })
+                    .await
+                };
+                store.fd_cache.invalidate(&store.path_for(&id));
+                match result {
+                    Ok(allocated) => {
+                        #[cfg(test)]
+                        crate::page_access_store::crash_barrier("whole_published")?;
+                        store
+                            .catalog
+                            .complete(transaction, allocated)
+                            .await
+                            .map_err(catalog_error)?;
+                        #[cfg(test)]
+                        crate::page_access_store::crash_barrier("whole_complete")?;
+                        Ok(allocated)
+                    }
+                    Err(error) => {
+                        store.catalog.poison();
+                        Err(error)
+                    }
+                }
+            })
+            .await
     }
 
-    /// Retain the root lease through detached blocking disk mutations.
-    pub fn with_root_lock(mut self, lock: Arc<crate::page_access_store::CacheRootLock>) -> Self {
-        self.root_lock = Some(lock);
-        self
+    fn gate(&self, id: &BlockId) -> &tokio::sync::Mutex<()> {
+        let mut hasher = DefaultHasher::new();
+        id.hash(&mut hasher);
+        &self.gates[hasher.finish() as usize % self.gates.len()]
     }
 
-    /// Open (creating if needed) a store rooted at `root`.
+    pub(crate) async fn drain(&self) {
+        self.mutations.drain().await;
+    }
+
+    /// Open a standalone journaled store, retaining an exclusive root lease.
     pub fn open(root: impl Into<PathBuf>) -> Result<Self> {
-        Self::open_with_fd_cache(
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        let lock = Arc::new(
+            crate::page_access_store::CacheRootLock::acquire(&root).map_err(catalog_error)?,
+        );
+        Self::open_locked(root, lock)
+    }
+
+    pub fn open_locked(
+        root: impl Into<PathBuf>,
+        lock: Arc<crate::page_access_store::CacheRootLock>,
+    ) -> Result<Self> {
+        let root = root.into();
+        std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(root)?;
+        let service = crate::catalog::service(lock).map_err(catalog_error)?;
+        let catalog = crate::catalog::Catalog::with_service(
+            &service,
+            &root,
+            crate::catalog::transaction_budget(),
+            None,
+        )
+        .map_err(catalog_error)?;
+        Self::open_with_catalog(
             root,
             Arc::new(FdCache::new(
                 talon_core::WorkerConfig::default().whole_fd_cache_capacity,
             )),
+            catalog,
         )
     }
 
-    pub(crate) fn open_with_fd_cache(
+    pub(crate) fn open_with_catalog(
         root: impl Into<PathBuf>,
         fd_cache: Arc<FdCache>,
+        catalog: Arc<crate::catalog::Catalog>,
     ) -> Result<Self> {
         let root = root.into();
         std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(root)?;
+        let data = root.join("whole");
+        let catalog_path = catalog.store_path(&data).map_err(catalog_error)?;
+        if !catalog
+            .registered(&catalog_path, 0)
+            .map_err(catalog_error)?
+        {
+            // Only first registration inspects the scope. Never adopt legacy
+            // sidecars or unregistered data, even when paged mode is enabled.
+            for entry in std::fs::read_dir(&root)? {
+                let entry = entry?;
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name == "whole"
+                    || (name.len() == 2 && name.bytes().all(|c| c.is_ascii_hexdigit()))
+                {
+                    return Err(Error::Other("whole cache has no journal; use a new empty cache directory (legacy migration is not supported)".into()));
+                }
+            }
+            catalog.register(&catalog_path, 0).map_err(catalog_error)?;
+        }
+        std::fs::create_dir_all(&data)?;
+        if std::fs::symlink_metadata(&data)?.file_type().is_symlink() {
+            return Err(Error::Other(
+                "whole cache directory must not be a symlink".into(),
+            ));
+        }
+        std::fs::File::open(&root)?.sync_all()?;
         Ok(Self {
             uring: false,
             direct_alignment: None,
-            root_lock: None,
             root,
             fd_cache,
+            catalog,
+            catalog_path,
+            mutations: Arc::new(crate::page_gc::Mutations::new(true)),
+            gates: Arc::new(std::array::from_fn(|_| tokio::sync::Mutex::new(()))),
         })
     }
 
@@ -234,32 +294,15 @@ impl WholeBlockStore {
         &self.root
     }
 
-    /// Stable filesystem path for a block: `<root>/<shard>/<digest>.blk`.
+    pub(crate) async fn checkpoint_catalog(&self) -> anyhow::Result<()> {
+        self.catalog.checkpoint().await
+    }
+
     fn path_for(&self, id: &BlockId) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        let digest = hasher.finish();
-        let hex = format!("{digest:016x}");
-        self.root.join(&hex[0..2]).join(format!("{hex}.blk"))
+        block_path(&self.root.join("whole"), id)
     }
 
-    /// Sidecar metadata path for a block: `<root>/<shard>/<digest>.meta`.
-    ///
-    /// The `.blk` filename is a one-way digest of the [`BlockId`], so the id
-    /// cannot be recovered from the block file alone. This sidecar stores the
-    /// serialized [`BlockMeta`] (id, form, len) next to each committed block so
-    /// the index can be rebuilt on startup from on-disk cache (issue #114).
-    fn meta_path_for(&self, id: &BlockId) -> PathBuf {
-        self.path_for(id).with_extension("meta")
-    }
-
-    /// Scan the cache directory and return the [`BlockMeta`] of every committed
-    /// block, reconstructed from the on-disk `.meta` sidecars.
-    ///
-    /// Used at worker startup to repopulate the in-memory [`crate::BlockIndex`]
-    /// so a restart does not re-download blocks already resident on local disk. A
-    /// sidecar without a matching `.blk` (or vice versa) is skipped, and a
-    /// malformed sidecar is ignored rather than failing the whole scan.
+    /// Return residency from the journal without enumerating or statting data files.
     pub fn scan(&self) -> Result<Vec<BlockMeta>> {
         Ok(self
             .scan_allocated()?
@@ -268,8 +311,6 @@ impl WholeBlockStore {
             .collect())
     }
 
-    /// Restore indexed logical metadata and measured data-file allocations.
-    /// Intended for startup while the cache directory is exclusively owned.
     pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
         for entry in self.scan_allocated()? {
             index.commit_allocated(entry.meta, entry.allocated);
@@ -277,65 +318,17 @@ impl WholeBlockStore {
         Ok(())
     }
 
-    /// Startup-only bulk restoration before the index is shared with requests.
     pub(crate) fn restore_index_exclusive(&self, index: &mut crate::BlockIndex) -> Result<()> {
         index.restore_allocated(self.scan_allocated()?, crate::recovery::workers());
         Ok(())
     }
 
     pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
-        let mut out = Vec::new();
-        let shards = match std::fs::read_dir(&self.root) {
-            Ok(rd) => rd,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e.into()),
-        };
-        for shard in shards.flatten() {
-            // Paged recovery is owned by its catalog; never enumerate its
-            // directories as part of the whole-block sidecar scan.
-            if shard.file_name() == "paged" {
-                continue;
-            }
-            if !shard.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                continue;
-            }
-            let Ok(entries) = std::fs::read_dir(shard.path()) else {
-                continue;
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) != Some("meta") {
-                    continue;
-                }
-                // Require the matching block file to still be present.
-                let allocated = match std::fs::metadata(path.with_extension("blk")) {
-                    Ok(file) if file.is_file() => file.blocks() * 512,
-                    _ => continue,
-                };
-                match std::fs::read(&path) {
-                    Ok(bytes) => match serde_json::from_slice::<BlockMeta>(&bytes) {
-                        Ok(meta) if matches!(meta.form, BlockForm::Whole) => {
-                            out.push(crate::index::StoredBlock {
-                                meta,
-                                allocated: vec![(None, allocated)],
-                            })
-                        }
-                        Ok(_) => {
-                            tracing::warn!(path = %path.display(), "skipping non-whole block sidecar");
-                        }
-                        Err(error) => {
-                            tracing::warn!(path = %path.display(), %error, "skipping malformed block sidecar");
-                        }
-                    },
-                    Err(error) => {
-                        tracing::warn!(path = %path.display(), %error, "skipping unreadable block sidecar");
-                    }
-                }
-            }
-        }
-        Ok(out)
+        self.catalog
+            .recover(&self.catalog_path)
+            .map_err(catalog_error)?
+            .ok_or_else(|| Error::Other("whole cache is not registered".into()))
     }
-
     /// Open a present block file read-only, returning a shared fd and its byte
     /// length.
     ///
@@ -484,31 +477,54 @@ impl ObjectStore for WholeBlockStore {
     }
 
     async fn delete(&self, id: &BlockId) -> Result<()> {
-        let path = self.path_for(id);
-        let meta_path = self.meta_path_for(id);
-        let cached_path = path.clone();
-        let root_lock = self.root_lock.clone();
-        let result = spawn_blocking_io(move || {
-            let _root_lock = root_lock;
-            // Remove the sidecar too so a deleted block is not resurrected by a
-            // startup scan.
-            let _ = std::fs::remove_file(&meta_path);
-            match std::fs::remove_file(&path) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(e.into()),
-            }
-        })
-        .await;
-        // Drop the cached descriptor after the unlink, so the cache cannot pin
-        // an unlinked inode and a reader racing the delete cannot re-cache the
-        // doomed file. Invalidate even on error: the entry may already be
-        // stale. Handles already in flight keep the file alive until they
-        // finish, matching the pre-cache behaviour of a mid-request eviction.
-        self.fd_cache.invalidate(&cached_path);
-        result
+        let store = self.clone();
+        let id = id.clone();
+        self.mutations
+            .run(async move {
+                let _gate = store.gate(&id).lock().await;
+                let transaction = store
+                    .catalog
+                    .begin(
+                        &store.catalog_path,
+                        &id,
+                        crate::catalog::Operation::DeleteBlock,
+                    )
+                    .await
+                    .map_err(catalog_error)?;
+                #[cfg(test)]
+                crate::page_access_store::crash_barrier("whole_delete_begin")?;
+                let path = store.path_for(&id);
+                let result = spawn_blocking_io(move || {
+                    match std::fs::remove_file(&path) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        result => result?,
+                    }
+                    match std::fs::File::open(path.parent().unwrap()) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        file => file?.sync_all()?,
+                    }
+                    Ok(())
+                })
+                .await;
+                store.fd_cache.invalidate(&store.path_for(&id));
+                match result {
+                    Ok(()) => {
+                        #[cfg(test)]
+                        crate::page_access_store::crash_barrier("whole_deleted")?;
+                        store
+                            .catalog
+                            .complete(transaction, 0)
+                            .await
+                            .map_err(catalog_error)
+                    }
+                    Err(error) => {
+                        store.catalog.poison();
+                        Err(error)
+                    }
+                }
+            })
+            .await
     }
-
     async fn contains(&self, id: &BlockId) -> Result<bool> {
         let path = self.path_for(id);
         spawn_blocking_io(move || Ok(path.exists())).await
@@ -529,7 +545,7 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
     use std::sync::Arc;
-    use talon_core::{Backend, ObjectId, Version};
+    use talon_core::{Backend, BlockForm, ObjectId, Version};
 
     fn block(n: u64) -> BlockId {
         BlockId::new(
@@ -558,20 +574,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recovery_measures_allocated_blocks_instead_of_file_length() {
+    async fn recovery_uses_committed_allocation_without_statting_data() {
         let root = tempfile::tempdir().unwrap();
         let store = WholeBlockStore::open(root.path()).unwrap();
         let id = block(0);
         store.put(&id, Bytes::from(vec![0; 6000])).await.unwrap();
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(store.path_for(&id))
-            .unwrap();
-        file.set_len(6000).unwrap();
-        file.sync_all().unwrap();
-        let allocated = file.metadata().unwrap().blocks() * 512;
-        assert!(allocated < 6000, "fixture is a sparse file");
+        let allocated = std::fs::metadata(store.path_for(&id)).unwrap().blocks() * 512;
+        let shard = store.path_for(&id).parent().unwrap().to_owned();
+        store.catalog.checkpoint().await.unwrap();
+        drop(store);
+        // Recovery must neither enumerate the shard nor stat its data files.
+        std::fs::rename(&shard, root.path().join("hidden")).unwrap();
+        std::fs::write(&shard, b"not a directory").unwrap();
+        let store = WholeBlockStore::open(root.path()).unwrap();
         let index = crate::BlockIndex::new();
         store.restore_index(&index).unwrap();
         assert_eq!(index.get(&id).unwrap().len, 6000);
@@ -634,7 +649,7 @@ mod tests {
         let leaked: Vec<_> = std::fs::read_dir(&shard)
             .unwrap()
             .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().contains(".tmp"))
+            .filter(|e| e.file_name().to_string_lossy().contains(".catalog."))
             .collect();
         assert!(leaked.is_empty(), "leaked staging temp files: {leaked:?}");
 
@@ -642,10 +657,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn scan_rebuilds_metadata_for_committed_blocks() {
-        // Commit several blocks, then scan reconstructs each BlockMeta (id +
-        // Whole + len) from the on-disk sidecars — the basis for rebuilding the
-        // index on startup (issue #114).
+    async fn journal_rebuilds_metadata_for_committed_blocks() {
         let root = tmp_root();
         let store = WholeBlockStore::open(&root).unwrap();
         let committed = [
@@ -670,24 +682,16 @@ mod tests {
             assert_eq!(found.len, data.len() as u64);
         }
 
-        // A fresh store over the same root rebuilds the same set (restart).
+        for (id, _) in &committed {
+            assert!(!store.path_for(id).with_extension("meta").exists());
+        }
+        store.catalog.checkpoint().await.unwrap();
+        drop(store);
         let reopened = WholeBlockStore::open(&root).unwrap();
         assert_eq!(reopened.scan().unwrap().len(), 3);
-
-        // A mismatched form cannot supply per-page allocation costs.
-        let mut invalid = metas[0].clone();
-        invalid.form = BlockForm::Paged {
-            page_size: 4,
-            present: talon_core::PresentBitmap::new(1),
-        };
-        std::fs::write(
-            store.meta_path_for(&invalid.id),
-            serde_json::to_vec(&invalid).unwrap(),
-        )
-        .unwrap();
         let index = crate::BlockIndex::new();
         reopened.restore_index(&index).unwrap();
-        assert_eq!(index.snapshot_units().len(), 2);
+        assert_eq!(index.snapshot_units().len(), 3);
 
         std::fs::remove_dir_all(&root).ok();
     }
@@ -709,7 +713,7 @@ mod tests {
             .unwrap();
         assert_eq!(store.scan().unwrap().len(), 2);
 
-        // Deleting a block removes it (and its sidecar) from the scan.
+        // Deleting a block removes its journal residency.
         store.delete(&block(1)).await.unwrap();
         let metas = store.scan().unwrap();
         assert_eq!(metas.len(), 1);

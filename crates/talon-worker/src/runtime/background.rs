@@ -268,9 +268,9 @@ impl WorkerBackground {
             }
             namespace.checkpoint_small_access().await;
             namespace.checkpoint_access_times().await;
-        }
-        if let Err(error) = self.worker.checkpoint_catalog().await {
-            tracing::error!(%error, "cache catalog shutdown checkpoint failed");
+            if let Err(error) = namespace.checkpoint_catalog().await {
+                tracing::error!(%error, "cache catalog shutdown checkpoint failed");
+            }
         }
     }
 }

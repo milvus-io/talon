@@ -324,6 +324,10 @@ mod tests {
         use talon_core::{Backend, BlockId, ObjectId, ObjectStore, PageIndex, Version};
 
         let root = tempfile::tempdir().unwrap();
+        let service = crate::catalog::service(Arc::new(
+            crate::page_access_store::CacheRootLock::acquire(root.path()).unwrap(),
+        ))
+        .unwrap();
         let whole_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARDS));
         let page_fds = Arc::new(FdCache::with_capacity(FD_CACHE_SHARDS, FD_CACHE_SHARDS));
         let id = BlockId::new(
@@ -335,8 +339,20 @@ mod tests {
         let mut stores = Vec::new();
         for n in 0..64 {
             let path = root.path().join(n.to_string());
-            let whole =
-                crate::WholeBlockStore::open_with_fd_cache(&path, whole_fds.clone()).unwrap();
+            std::fs::create_dir_all(&path).unwrap();
+            let catalog = crate::catalog::Catalog::with_service(
+                &service,
+                &path,
+                crate::catalog::transaction_budget(),
+                None,
+            )
+            .unwrap();
+            let whole = crate::WholeBlockStore::open_with_catalog(
+                &path,
+                whole_fds.clone(),
+                catalog.clone(),
+            )
+            .unwrap();
             let paged = crate::PagedBlockStore::open_with_fd_cache(
                 path.join("paged"),
                 16,

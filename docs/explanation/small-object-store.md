@@ -160,8 +160,8 @@ second-chance bits sharing the same block idle clock.
 
 The Worker creates one `talon-journal::JournalService` per cache root, with a
 dedicated Monoio thread named `cache-journal`. Each namespace/credential scope
-opens an independent small-store stream on that service; the paged catalog uses
-a separate stream on the same service. No private small-store journal engine
+opens an independent small-store stream on that service; that scope's whole/paged
+catalog uses a separate stream on the same service. No private small-store journal engine
 remains. Data rings send metadata requests through a bounded MPSC queue;
 Tokio maintenance callers use the same service. Each stream owns its log descriptor,
 file offsets, replay order, and fsync completion notifications. Payload I/O remains

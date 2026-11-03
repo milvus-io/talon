@@ -11,14 +11,14 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
         .apply(
             1,
             Record::Store {
-                path: "default/shared/paged".into(),
+                path: "paged".into(),
                 page_size: 4,
             },
         )
         .unwrap();
     let begin = || Record::Begin {
         intent: model::Intent {
-            store: "default/shared/paged".into(),
+            store: "paged".into(),
             block: block(0),
             operation: Operation::Put { page: 0, len: 16 },
         },
@@ -52,20 +52,16 @@ fn frozen_snapshot_preserves_pages_and_pending_transaction_ids() {
             .restore(State::decode_snapshot(&bytes.unwrap()).unwrap())
             .unwrap();
     }
-    let entries = restored.entries("default/shared/paged").unwrap().unwrap();
+    let entries = restored.entries("paged").unwrap().unwrap();
     assert_eq!(entries[0].allocated, vec![(Some(PageIndex(0)), 4096)]);
     assert!(restored.pending.contains_key(&4));
     restored
         .apply(6, Record::Resolve { transaction: 4 })
         .unwrap();
     assert!(restored.pending.is_empty());
-    assert!(restored
-        .entries("default/shared/paged")
-        .unwrap()
-        .unwrap()
-        .is_empty());
+    assert!(restored.entries("paged").unwrap().unwrap().is_empty());
     assert_eq!(
-        state.entries("default/shared/paged").unwrap().unwrap()[0].allocated,
+        state.entries("paged").unwrap().unwrap()[0].allocated,
         vec![(Some(PageIndex(0)), 8192)]
     );
     let record = begin();
@@ -96,7 +92,7 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     // This valid state exceeded the engine's single-frame limit before page
     // chunks. Construct metadata directly instead of creating millions of files.
     assert!(serde_json::to_vec(&block).unwrap().len() > 16 << 20);
-    let path = "default/shared/paged";
+    let path = "paged";
     let mut state = State::default();
     state.stores.insert(
         path.into(),
@@ -159,7 +155,7 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
 #[test]
 fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     use model::SnapshotRecord;
-    let path = "default/shared/paged";
+    let path = "paged";
     let chunk = |page, len, continuation| SnapshotRecord::Block {
         store: path.into(),
         block: model::Block {
@@ -202,35 +198,41 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
 async fn catalog_failure_does_not_poison_another_stream_on_the_root_service() {
     let root = tempfile::tempdir().unwrap();
     let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
-    let catalog = Catalog::with_service(&service, None).unwrap();
-    let other = service
-        .open_stream(
-            PathBuf::from(".independent-test"),
-            State::default(),
-            StreamOptions::default(),
-        )
-        .unwrap();
-    catalog.register("default/shared/paged", 4).unwrap();
-    catalog.poison();
-    assert!(catalog
-        .begin("default/shared/paged", &block(0), Operation::DeleteBlock)
+    let catalog = scoped(&service, "a/shared");
+    let other = scoped(&service, "a/scopes/test");
+    let paged = store(&catalog);
+    let other_paged = store(&other);
+    let dir = paged.dir_for(&block(0));
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(&dir, b"obstruction").unwrap();
+    assert!(paged
+        .commit_page(&block(0), PageIndex(0), 4, Bytes::from_static(b"data"))
         .await
         .is_err());
-    other
-        .append(
-            Record::Store {
-                path: "other/shared/paged".into(),
-                page_size: 4,
-            },
-            Ack::Durable,
-        )
+    assert!(catalog.checkpoint().await.is_err());
+    other_paged
+        .commit_page(&block(0), PageIndex(0), 4, Bytes::from_static(b"safe"))
         .await
         .unwrap();
     other.checkpoint().await.unwrap();
-    assert!(other
-        .query(|state| Ok(state.stores.contains_key("other/shared/paged")))
-        .await
-        .unwrap());
+    assert_eq!(other.recover("paged").unwrap().unwrap().len(), 1);
+    drop(paged);
+    drop(other_paged);
+    drop(catalog);
+    drop(other);
+    std::fs::remove_file(dir).unwrap();
+    let catalog = scoped(&service, "a/shared");
+    let other = scoped(&service, "a/scopes/test");
+    assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
+    assert_eq!(other.recover("paged").unwrap().unwrap().len(), 1);
+    assert_eq!(
+        store(&other)
+            .get_page_bytes(&block(0), PageIndex(0), 4)
+            .await
+            .unwrap()
+            .as_ref(),
+        b"safe"
+    );
 }
 
 fn block(n: u64) -> BlockId {
@@ -252,7 +254,7 @@ fn many_pending_intents_reconcile_inside_tokio_startup() {
     if std::env::var_os(CHILD).is_some() {
         let root = tempfile::tempdir().unwrap();
         let catalog = open(root.path());
-        let path = "default/shared/paged";
+        let path = "paged";
         catalog.register(path, 4).unwrap();
         for n in 0..256 {
             futures::executor::block_on(catalog.begin(
@@ -300,15 +302,49 @@ fn many_pending_intents_reconcile_inside_tokio_startup() {
     }
 }
 
-fn store(root: &Path, catalog: &Arc<Catalog>, name: &str) -> Arc<PagedBlockStore> {
-    let path = format!("{name}/shared/paged");
-    if catalog.recover(&path).unwrap().is_none() {
-        catalog.register(&path, 4).unwrap();
+fn scoped(service: &Arc<JournalService>, scope: &str) -> Arc<Catalog> {
+    let root = service.root().join(scope);
+    std::fs::create_dir_all(&root).unwrap();
+    Catalog::with_service(service, &root, transaction_budget(), None).unwrap()
+}
+
+#[tokio::test]
+async fn scoped_catalogs_share_transaction_admission() {
+    let root = tempfile::tempdir().unwrap();
+    let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let mut catalogs = Vec::new();
+    for scope in ["a/shared", "a/scopes/test"] {
+        let path = root.path().join(scope);
+        std::fs::create_dir_all(&path).unwrap();
+        let catalog = Catalog::with_service(&service, &path, admission.clone(), None).unwrap();
+        catalog.register("paged", 4).unwrap();
+        catalogs.push(catalog);
+    }
+    let block = block(0);
+    let first = catalogs[0]
+        .begin("paged", &block, Operation::Put { page: 0, len: 16 })
+        .await
+        .unwrap();
+    let second = catalogs[1].begin("paged", &block, Operation::Put { page: 0, len: 16 });
+    tokio::pin!(second);
+    assert!(futures::poll!(&mut second).is_pending());
+    catalogs[0].complete(first, 4096).await.unwrap();
+    let second = tokio::time::timeout(std::time::Duration::from_secs(2), second)
+        .await
+        .unwrap()
+        .unwrap();
+    catalogs[1].complete(second, 4096).await.unwrap();
+}
+
+fn store(catalog: &Arc<Catalog>) -> Arc<PagedBlockStore> {
+    if catalog.recover("paged").unwrap().is_none() {
+        catalog.register("paged", 4).unwrap();
     }
     Arc::new(
-        PagedBlockStore::open(root.join(&path), 4)
+        PagedBlockStore::open(catalog.root.join("paged"), 4)
             .unwrap()
-            .with_catalog(catalog.clone(), path),
+            .with_catalog(catalog.clone(), "paged".into()),
     )
 }
 
@@ -316,7 +352,7 @@ fn store(root: &Path, catalog: &Arc<Catalog>, name: &str) -> Arc<PagedBlockStore
 async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     let root = tempfile::tempdir().unwrap();
     let catalog = open(root.path());
-    let paged = store(root.path(), &catalog, "default");
+    let paged = store(&catalog);
     paged
         .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"aaaa"))
         .await
@@ -335,18 +371,18 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
         .unwrap();
     paged.delete_block_async(&block(1)).await.unwrap();
     assert!(!paged.dir_for(&block(0)).join("block.meta").exists());
-    let before = catalog.recover("default/shared/paged").unwrap().unwrap();
+    let before = catalog.recover("paged").unwrap().unwrap();
     assert_eq!(before.len(), 1);
     assert_eq!(before[0].allocated.len(), 1);
     let expected = before[0].allocated.clone();
     drop(paged);
     drop(catalog);
     // If recovery enumerates or stats data, this replacement makes it fail.
-    let data = root.path().join("default/shared/paged");
+    let data = root.path().join("paged");
     std::fs::rename(&data, root.path().join("hidden-data")).unwrap();
     std::fs::write(&data, b"not a directory").unwrap();
     let catalog = open(root.path());
-    let recovered = catalog.recover("default/shared/paged").unwrap().unwrap();
+    let recovered = catalog.recover("paged").unwrap().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].allocated, expected);
     assert_eq!(recovered[0].meta.id, block(0));
@@ -358,17 +394,13 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
     for checkpoint in [false, true] {
         let root = tempfile::tempdir().unwrap();
         let catalog = open(root.path());
-        let paged = store(root.path(), &catalog, "default");
+        let paged = store(&catalog);
         paged
             .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"old!"))
             .await
             .unwrap();
         let id = catalog
-            .begin(
-                "default/shared/paged",
-                &block(0),
-                Operation::Put { page: 0, len: 16 },
-            )
+            .begin("paged", &block(0), Operation::Put { page: 0, len: 16 })
             .await
             .unwrap();
         let dir = paged.dir_for(&block(0));
@@ -382,12 +414,8 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
         let catalog = open(root.path());
         assert!(!temp.exists());
         assert!(!dir.join("0.page").exists());
-        assert!(catalog
-            .recover("default/shared/paged")
-            .unwrap()
-            .unwrap()
-            .is_empty());
-        let paged = store(root.path(), &catalog, "default");
+        assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
+        let paged = store(&catalog);
         paged
             .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"new!"))
             .await
@@ -395,14 +423,7 @@ async fn pending_put_is_cleaned_by_exact_path_including_replaced_page() {
         drop(paged);
         drop(catalog);
         let catalog = open(root.path());
-        assert_eq!(
-            catalog
-                .recover("default/shared/paged")
-                .unwrap()
-                .unwrap()
-                .len(),
-            1
-        );
+        assert_eq!(catalog.recover("paged").unwrap().unwrap().len(), 1);
         assert_eq!(std::fs::read(dir.join("0.page")).unwrap(), b"new!");
     }
 }
@@ -412,13 +433,13 @@ async fn pending_deletes_survive_checkpoint_and_recreation() {
     for operation in [Operation::DeletePage { page: 0 }, Operation::DeleteBlock] {
         let root = tempfile::tempdir().unwrap();
         let catalog = open(root.path());
-        let paged = store(root.path(), &catalog, "default");
+        let paged = store(&catalog);
         paged
             .commit_page(&block(0), PageIndex(0), 16, Bytes::from_static(b"data"))
             .await
             .unwrap();
         catalog
-            .begin("default/shared/paged", &block(0), operation.clone())
+            .begin("paged", &block(0), operation.clone())
             .await
             .unwrap();
         catalog.checkpoint().await.unwrap();
@@ -427,20 +448,18 @@ async fn pending_deletes_survive_checkpoint_and_recreation() {
         drop(catalog);
         let catalog = open(root.path());
         assert!(!path.exists());
-        assert!(catalog
-            .recover("default/shared/paged")
-            .unwrap()
-            .unwrap()
-            .is_empty());
+        assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
     }
 }
 
 #[tokio::test]
 async fn checkpoint_replays_only_subsequent_log_and_keeps_namespaces_separate() {
     let root = tempfile::tempdir().unwrap();
-    let catalog = open(root.path());
-    let a = store(root.path(), &catalog, "a");
-    let b = store(root.path(), &catalog, "b");
+    let service = service(Arc::new(CacheRootLock::acquire(root.path()).unwrap())).unwrap();
+    let catalog_a = scoped(&service, "a/shared");
+    let catalog_b = scoped(&service, "b/shared");
+    let a = store(&catalog_a);
+    let b = store(&catalog_b);
     let mut tasks = Vec::new();
     for n in 0..32 {
         let paged = if n % 2 == 0 { a.clone() } else { b.clone() };
@@ -454,30 +473,34 @@ async fn checkpoint_replays_only_subsequent_log_and_keeps_namespaces_separate() 
     for task in tasks {
         task.await.unwrap();
     }
-    catalog.checkpoint().await.unwrap();
+    catalog_a.checkpoint().await.unwrap();
+    catalog_b.checkpoint().await.unwrap();
+    let before_b = std::fs::read(catalog_b.root.join(DIRECTORY).join("CURRENT")).unwrap();
+    catalog_a.checkpoint().await.unwrap();
+    assert_eq!(
+        std::fs::read(catalog_b.root.join(DIRECTORY).join("CURRENT")).unwrap(),
+        before_b,
+        "another namespace's checkpoint must not rotate this stream"
+    );
     a.delete_block_async(&block(0)).await.unwrap();
     b.commit_page(&block(32), PageIndex(0), 4, Bytes::from_static(b"more"))
         .await
         .unwrap();
     drop(a);
     drop(b);
-    drop(catalog);
-    let catalog = open(root.path());
-    assert_eq!(
-        catalog.recover("a/shared/paged").unwrap().unwrap().len(),
-        15
-    );
-    assert_eq!(
-        catalog.recover("b/shared/paged").unwrap().unwrap().len(),
-        17
-    );
+    drop(catalog_a);
+    drop(catalog_b);
+    let catalog_a = scoped(&service, "a/shared");
+    let catalog_b = scoped(&service, "b/shared");
+    assert_eq!(catalog_a.recover("paged").unwrap().unwrap().len(), 15);
+    assert_eq!(catalog_b.recover("paged").unwrap().unwrap().len(), 17);
 }
 
 #[tokio::test]
 async fn failed_file_mutation_blocks_further_admissions_until_recovery() {
     let root = tempfile::tempdir().unwrap();
     let catalog = open(root.path());
-    let paged = store(root.path(), &catalog, "default");
+    let paged = store(&catalog);
     let dir = paged.dir_for(&block(0));
     std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
     std::fs::write(&dir, b"obstruction").unwrap();
@@ -493,9 +516,86 @@ async fn failed_file_mutation_blocks_further_admissions_until_recovery() {
     drop(catalog);
     std::fs::remove_file(dir).unwrap();
     let catalog = open(root.path());
-    assert!(catalog
-        .recover("default/shared/paged")
-        .unwrap()
-        .unwrap()
-        .is_empty());
+    assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
+}
+
+#[test]
+fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
+    let mut state = State::default();
+    for (path, page_size) in [
+        ("whole", 4),
+        ("paged", 0),
+        ("../whole", 0),
+        ("other/shared/whole", 0),
+        ("other/shared/paged", 4),
+    ] {
+        assert!(state
+            .apply(
+                1,
+                Record::Store {
+                    path: path.into(),
+                    page_size
+                }
+            )
+            .is_err());
+    }
+    state
+        .apply(
+            1,
+            Record::Store {
+                path: "whole".into(),
+                page_size: 0,
+            },
+        )
+        .unwrap();
+    for operation in [
+        Operation::Put { page: 0, len: 4 },
+        Operation::DeletePage { page: 0 },
+        Operation::PutWhole { len: 65 },
+    ] {
+        assert!(state
+            .apply(
+                2,
+                Record::Begin {
+                    intent: model::Intent {
+                        store: "whole".into(),
+                        block: block(0),
+                        operation
+                    }
+                }
+            )
+            .is_err());
+    }
+    for (pages, continuation) in [
+        (vec![(1, 4096)], false),
+        (vec![(0, 4096), (1, 4096)], false),
+        (vec![(0, 4096)], true),
+    ] {
+        assert!(state
+            .restore(model::SnapshotRecord::Block {
+                store: "whole".into(),
+                block: model::Block {
+                    id: block(0),
+                    len: 4,
+                    pages: pages.into_iter().collect()
+                },
+                continuation,
+            })
+            .is_err());
+    }
+    state
+        .restore(model::SnapshotRecord::Block {
+            store: "whole".into(),
+            block: model::Block {
+                id: block(0),
+                len: 4,
+                pages: [(0, 4096)].into(),
+            },
+            continuation: false,
+        })
+        .unwrap();
+    assert_eq!(
+        state.entries("whole").unwrap().unwrap()[0].allocated,
+        vec![(None, 4096)]
+    );
 }

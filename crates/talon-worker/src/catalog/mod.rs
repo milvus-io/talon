@@ -1,4 +1,4 @@
-//! Paged residency adapter for the shared cache-root journal service.
+//! One namespace/scope's whole-block and paged residency journal.
 //! Data files are bracketed by durable intents and completions. Only the
 //! shared engine owns journal framing, checkpoint publication and the I/O ring.
 #[cfg(test)]
@@ -20,6 +20,10 @@ use talon_journal::{Ack, Handle, JournalService, Options, StreamOptions};
 
 pub(crate) const DIRECTORY: &str = ".paged-catalog";
 const TRANSACTIONS: usize = 1024;
+
+pub(crate) fn transaction_budget() -> Arc<tokio::sync::Semaphore> {
+    Arc::new(tokio::sync::Semaphore::new(TRANSACTIONS))
+}
 
 /// Business admission spans both journal records and data I/O. Engine admission
 /// separately bounds encoded requests across all streams on this cache root.
@@ -47,23 +51,28 @@ pub(crate) fn service(lock: Arc<CacheRootLock>) -> anyhow::Result<Arc<JournalSer
 impl Catalog {
     #[cfg(test)]
     pub(crate) fn open(lock: Arc<CacheRootLock>) -> anyhow::Result<Arc<Self>> {
-        Self::with_service(&service(lock)?, None)
+        let service = service(lock)?;
+        Self::with_service(&service, service.root(), transaction_budget(), None)
     }
 
     pub(crate) fn with_service(
         service: &Arc<JournalService>,
+        root: &Path,
+        admission: Arc<tokio::sync::Semaphore>,
         maintenance: Option<Arc<dyn talon_journal::Maintenance>>,
     ) -> anyhow::Result<Arc<Self>> {
+        let root = root.canonicalize()?;
+        let relative = root.strip_prefix(service.root())?.join(DIRECTORY);
         let journal = service.open_stream_with_maintenance(
-            PathBuf::from(DIRECTORY),
+            relative,
             State::default(),
             StreamOptions::default(),
             maintenance,
         )?;
         let catalog = Arc::new(Self {
-            root: service.root().to_owned(),
+            root,
             journal,
-            admission: Arc::new(tokio::sync::Semaphore::new(TRANSACTIONS)),
+            admission,
         });
         catalog.reconcile()?;
         Ok(catalog)

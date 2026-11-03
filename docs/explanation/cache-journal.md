@@ -10,11 +10,15 @@ in the same Worker, extending the cache persistence described in
 ## Ownership and isolation
 
 One `JournalService` per cache root owns a dedicated Monoio runtime and I/O
-thread. It hosts heterogeneous typed streams on that runtime. The paged catalog
-uses one root-level stream; each small-store namespace/credential scope uses its
-own stream. Each stream owns its own LSN sequence, CURRENT, snapshot, log files,
-state machine and failure state. They share bounded service admission and the
-I/O runtime, not object identity, business transactions or checkpoint state.
+thread. It hosts heterogeneous typed streams on that runtime. Each
+namespace/credential scope owns a catalog stream for its whole-block and paged
+`BlockIndex`, plus a separate small-store stream for packed-object locators.
+Catalogs live at `<namespace>/shared/.paged-catalog` or
+`<namespace>/scopes/<scope>/.paged-catalog`. Each stream owns its own LSN sequence,
+CURRENT, snapshot, log files, state machine and failure state. They share bounded
+service admission and the I/O runtime, not object identity, business transactions
+or checkpoint state. Catalogs also share a root-wide 1,024-transaction limit
+covering Begin, data I/O and Complete.
 
 The service receives `Arc<dyn Send + Sync>` as an opaque lifetime lease. It does
 not depend on Worker locking types. Accepted operations and shutdown retain that
@@ -136,12 +140,15 @@ not remove the O(live records + replay tail) work of restoring an in-memory inde
 
 ## Adapter responsibilities
 
-The paged catalog retains store registration, page/block identity, Begin and
+The file cache catalog retains paged/whole store registration, page/block identity, Begin and
 Complete/Resolve records, pending intents, allocation accounting and startup
 reconciliation by exact data path. Begin and Complete/Resolve request `Durable`.
 Its business admission permit spans Begin, data I/O and Complete. Pending
 transaction IDs are explicit snapshot payload fields, not overloaded snapshot
 frame LSNs. Startup resolves pending operations and checkpoints before serving.
+Whole and paged stores share this stream's failure status: a failed file mutation
+stops further catalog mutations until restart. Failed eviction preserves runtime
+residency and accounting. Small-store streams remain independent.
 
 Small store retains per-ring data segment reservation, concurrent append,
 pre-created spare segments, payload fsync, seal/delete/atomic replacement,
@@ -154,8 +161,8 @@ Background rate/I/O budgets belong to Worker policy. Shared snapshot/cleanup
 uses an optional crate-independent `Maintenance` hook whose futures run locally
 on the journal runtime (including its timers); it must not import
 Worker types or charge foreground log commits to the maintenance budget.
-Namespace initialization attaches the same Worker budget to the root paged
-catalog and its small-store streams before their writers start, including
+Namespace initialization attaches the same Worker budget to each scoped
+catalog and its small-store stream before their writers start, including
 automatic checkpoints of a recovered tail and reconciliation checkpoints.
 Background startup preserves
 the namespace budget instead of replacing the default small-store budget.

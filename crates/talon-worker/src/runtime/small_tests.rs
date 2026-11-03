@@ -73,10 +73,11 @@ fn runtime_with_geometry(
         short: AtomicBool::new(false),
         ranges: Mutex::new(Vec::new()),
     });
-    let store = WholeBlockStore::open(root).unwrap();
+    std::fs::create_dir_all(root).unwrap();
     let small =
         cache_routing::open_small_store(root, threshold, segment, capacity, None, None, None)
             .unwrap();
+    let store = WholeBlockStore::open(root).unwrap();
     let index = Arc::new(BlockIndex::new());
     store.restore_index(&index).unwrap();
     let mut worker = WorkerRuntime::new_with_l1_policy(
@@ -197,7 +198,6 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
     for versioned in [false, true] {
         let dir = tempfile::tempdir().unwrap();
         let block = BlockId::new(object(), 0, 1 << 20, Version::new("v1"));
-        let store = WholeBlockStore::open(dir.path()).unwrap();
         if versioned {
             assert!(cache_routing::open_small_store(
                 dir.path(),
@@ -211,6 +211,7 @@ async fn small_routing_rejects_whole_only_upgrade_without_orphaning_files() {
             .unwrap()
             .is_none());
         }
+        let store = WholeBlockStore::open(dir.path()).unwrap();
         store.put(&block, data()).await.unwrap();
         let allocated = store.scan_allocated().unwrap()[0].allocated.clone();
         drop(store);

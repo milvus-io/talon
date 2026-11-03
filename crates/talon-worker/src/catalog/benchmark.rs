@@ -26,13 +26,14 @@ fn restart_replay_and_index() {
             },
         )
         .unwrap();
-        let catalog = Catalog::with_service(&service, None).unwrap();
+        let catalog =
+            Catalog::with_service(&service, service.root(), transaction_budget(), None).unwrap();
         let replay_seconds = started.elapsed().as_secs_f64();
         let entries = catalog
             .journal
             .query_blocking(move |state| {
                 state
-                    .entries_with_threads("default/shared/paged", threads)
+                    .entries_with_threads("paged", threads)
                     .map_err(std::io::Error::other)
             })
             .unwrap()
@@ -62,7 +63,7 @@ fn restart_replay_and_index() {
         .apply(
             0,
             Record::Store {
-                path: "default/shared/paged".into(),
+                path: "paged".into(),
                 page_size: 131072,
             },
         )
@@ -81,7 +82,7 @@ fn restart_replay_and_index() {
         state
             .restore(model::SnapshotRecord::Block {
                 continuation: false,
-                store: "default/shared/paged".into(),
+                store: "paged".into(),
                 block: model::Block {
                     id,
                     len: 4 * 1024 * 1024,

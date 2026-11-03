@@ -59,9 +59,12 @@ process-wide background I/O and deletion budgets.
 
 ```text
 cache_root/
-  default/shared/<hash-prefix>/<hash>.blk
-  analytics/shared/<hash-prefix>/<hash>.blk
+  default/shared/.paged-catalog/...
+  default/shared/whole/<hash-prefix>/<hash>.blk
+  analytics/shared/.paged-catalog/...
+  analytics/shared/whole/<hash-prefix>/<hash>.blk
   analytics/shared/paged/<hash-prefix>/<hash>.pages/...
+  analytics/scopes/<scope>/.paged-catalog/...
 ```
 
 Namespace identity does not enter `BlockId` or its hash. Equal object/version/block
@@ -71,6 +74,11 @@ version cache, access checkpoints and garbage collection. Streamed PUT staging
 also uses the namespace's `shared` directory. PUT and DELETE affect the requesting
 namespace's local cache. Origin keys and credentials remain shared: namespace selection
 does not create a separate object-store namespace or isolate origin mutations.
+
+Each namespace/credential scope has its own whole/paged residency journal,
+matching its block index. Log sequence numbers, snapshots and journal failure
+state are independent; the cache-root journal I/O service and admission budget
+remain shared. Packed objects use a separate index and journal in the same scope.
 
 Disk capacity, L1 capacity, LOAD concurrency, the LOAD payload byte budget and
 background I/O/deletion budgets remain process-wide. Open-file caches are shared
