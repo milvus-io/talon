@@ -60,7 +60,7 @@ fn runtime(root: &Path, l1: bool, capacity: u64, tti: u64) -> WorkerRuntime {
     let paged = PagedBlockStore::open(root.join("paged"), 16).unwrap();
     let index = Arc::new(BlockIndex::new());
     for entry in paged.scan_allocated().unwrap() {
-        index.commit_allocated(entry.meta, entry.allocated);
+        index.commit_stored(entry);
     }
     WorkerRuntime::new_with_l1(
         WholeBlockStore::open(root.join("whole")).unwrap(),

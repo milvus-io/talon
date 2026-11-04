@@ -252,7 +252,7 @@ mod tests {
         let store = WholeBlockStore::open(root.join("whole")).unwrap();
         let index = Arc::new(BlockIndex::new());
         for entry in store.scan_allocated().unwrap() {
-            index.commit_allocated(entry.meta, entry.allocated);
+            index.commit_stored(entry);
         }
         let r = WorkerRuntime::new(
             store,

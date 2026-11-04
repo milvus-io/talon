@@ -307,13 +307,13 @@ impl WholeBlockStore {
         Ok(self
             .scan_allocated()?
             .into_iter()
-            .map(|entry| entry.meta)
+            .map(|entry| entry.meta.into())
             .collect())
     }
 
     pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
         for entry in self.scan_allocated()? {
-            index.commit_allocated(entry.meta, entry.allocated);
+            index.commit_stored(entry);
         }
         Ok(())
     }

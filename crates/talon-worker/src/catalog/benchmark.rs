@@ -84,7 +84,7 @@ fn restart_replay_and_index() {
                 continuation: false,
                 store: "paged".into(),
                 block: model::Block {
-                    id,
+                    id: Arc::new(id),
                     len: 4 * 1024 * 1024,
                     pages: (0..32).map(|p| (p, 131072)).collect(),
                 },

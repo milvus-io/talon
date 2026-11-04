@@ -855,7 +855,7 @@ mod tests {
                 paged.restore_index_with_workers(&index, workers).unwrap();
             } else {
                 for entry in paged.scan_allocated().unwrap() {
-                    index.commit_allocated(entry.meta, entry.allocated);
+                    index.commit_stored(entry);
                 }
             }
             let elapsed = started.elapsed();

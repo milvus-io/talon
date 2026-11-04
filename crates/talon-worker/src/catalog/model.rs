@@ -1,5 +1,8 @@
 //! File-cache residency state and codec; the shared journal owns ordering and I/O.
-use crate::index::StoredBlock;
+use crate::{
+    index::{StoredBlock, StoredMeta},
+    page_table::PageMap,
+};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use std::{
@@ -8,14 +11,14 @@ use std::{
     path::Path,
     sync::Arc,
 };
-use talon_core::{BlockForm, BlockId, BlockMeta, PageIndex, PresentBitmap};
+use talon_core::{BlockForm, BlockId, PageIndex, PresentBitmap};
 use talon_journal::Machine;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Block {
-    pub id: BlockId,
+    pub id: Arc<BlockId>,
     pub len: u64,
-    pub pages: BTreeMap<u32, u64>,
+    pub pages: PageMap<u64>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -46,7 +49,7 @@ pub(super) enum Record {
 pub(super) struct Store {
     /// Zero denotes whole blocks, represented by one allocation at index zero.
     pub(super) page_size: u32,
-    pub(super) blocks: HashMap<BlockId, Arc<Block>>,
+    pub(super) blocks: HashMap<Arc<BlockId>, Arc<Block>>,
 }
 
 #[derive(Default)]
@@ -153,23 +156,27 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::PutWhole { len } => {
-                        store.blocks.insert(
-                            intent.block.clone(),
-                            Arc::new(Block {
-                                id: intent.block,
-                                len,
-                                pages: [(0, allocated)].into(),
-                            }),
-                        );
+                        let entry = store.blocks.entry(Arc::new(intent.block));
+                        let id = entry.key().clone();
+                        entry.insert_entry(Arc::new(Block {
+                            id,
+                            len,
+                            pages: [(0, allocated)].into(),
+                        }));
                     }
                     Operation::Put { page, len } => {
-                        let block = store.blocks.entry(intent.block.clone()).or_insert_with(|| {
-                            Arc::new(Block {
-                                id: intent.block,
-                                len,
-                                pages: BTreeMap::new(),
-                            })
-                        });
+                        use std::collections::hash_map::Entry;
+                        let block = match store.blocks.entry(Arc::new(intent.block)) {
+                            Entry::Occupied(entry) => entry.into_mut(),
+                            Entry::Vacant(entry) => {
+                                let id = entry.key().clone();
+                                entry.insert(Arc::new(Block {
+                                    id,
+                                    len,
+                                    pages: PageMap::default(),
+                                }))
+                            }
+                        };
                         let block = Arc::make_mut(block);
                         block.len = len;
                         block.pages.insert(page, allocated);
@@ -215,7 +222,7 @@ impl State {
         Ok(Some(crate::recovery::map(blocks, threads, |b| {
             if store.page_size == 0 {
                 return StoredBlock {
-                    meta: BlockMeta {
+                    meta: StoredMeta {
                         id: b.id.clone(),
                         len: b.len,
                         form: BlockForm::Whole,
@@ -228,7 +235,7 @@ impl State {
                 present.set(PageIndex(*page));
             }
             StoredBlock {
-                meta: BlockMeta {
+                meta: StoredMeta {
                     id: b.id.clone(),
                     len: b.len,
                     form: BlockForm::Paged {
@@ -293,7 +300,7 @@ impl Iterator for Snapshot {
         use std::ops::Bound::{Excluded, Unbounded};
         let record = loop {
             if let Some((store, block, after)) = &mut self.block {
-                let pages: BTreeMap<_, _> = block
+                let pages: PageMap<_> = block
                     .pages
                     .range((after.map_or(Unbounded, Excluded), Unbounded))
                     .take(SNAPSHOT_PAGES)

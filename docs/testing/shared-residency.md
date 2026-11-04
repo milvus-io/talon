@@ -99,3 +99,11 @@ The original services were restored and the original Worker was ready afterward.
 **The 1 GB target is not met.** RSS is still approximately 7.37 GB, or 3,811 bytes
 per object. Further work must budget the complete retained representation against
 approximately 500 bytes per object and verify read throughput, tail latency and CPU.
+
+The fifth layer stores one catalog page inline and shares the recovered block
+identity with the residency directory and metadata. Catalog snapshots retain the
+same ordered JSON map encoding and copy-on-write isolation. Repeated whole-block
+writes preserve the canonical identity. Online first admission still constructs
+separate catalog and runtime identities; that path needs further consolidation.
+Validation passed 657 Worker tests (8 ignored) and Clippy. Its RSS has not yet
+been measured. Memory is now the first milestone; read performance follows.

@@ -82,7 +82,7 @@ impl Entry {
     }
 }
 
-fn materialized_pages(meta: &BlockMeta) -> u64 {
+fn materialized_pages(meta: &StoredMeta) -> u64 {
     match &meta.form {
         BlockForm::Whole => 0,
         BlockForm::Paged { present, .. } => u64::from(present.count()),
@@ -91,12 +91,39 @@ fn materialized_pages(meta: &BlockMeta) -> u64 {
 
 /// Data-file allocation discovered during startup; never persisted in sidecars.
 pub(crate) struct StoredBlock {
-    pub meta: BlockMeta,
+    pub meta: StoredMeta,
     pub allocated: Vec<(Option<PageIndex>, u64)>,
 }
 
+#[derive(Clone)]
+pub(crate) struct StoredMeta {
+    pub id: Arc<BlockId>,
+    pub form: BlockForm,
+    pub len: u64,
+}
+
+impl From<BlockMeta> for StoredMeta {
+    fn from(meta: BlockMeta) -> Self {
+        Self {
+            id: Arc::new(meta.id),
+            form: meta.form,
+            len: meta.len,
+        }
+    }
+}
+
+impl From<StoredMeta> for BlockMeta {
+    fn from(meta: StoredMeta) -> Self {
+        Self {
+            id: Arc::unwrap_or_clone(meta.id),
+            form: meta.form,
+            len: meta.len,
+        }
+    }
+}
+
 struct IndexedBlock {
-    meta: BlockMeta,
+    meta: StoredMeta,
     units: IndexedUnits,
 }
 
@@ -158,8 +185,8 @@ impl IndexedUnits {
     }
 }
 
-impl From<BlockMeta> for IndexedBlock {
-    fn from(meta: BlockMeta) -> Self {
+impl From<StoredMeta> for IndexedBlock {
+    fn from(meta: StoredMeta) -> Self {
         let units = match &meta.form {
             BlockForm::Whole => IndexedUnits::Whole(Arc::default()),
             BlockForm::Paged { .. } => IndexedUnits::Paged(Arc::default()),
@@ -170,7 +197,7 @@ impl From<BlockMeta> for IndexedBlock {
 
 impl IndexedBlock {
     fn allocated(
-        meta: BlockMeta,
+        meta: StoredMeta,
         allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
     ) -> Self {
         let mut entry = Self::from(meta);
@@ -425,7 +452,7 @@ impl BlockIndex {
         &mut self,
         input: Vec<T>,
         threads: usize,
-        decode: impl Fn(T) -> Result<(BlockMeta, A), E> + Sync,
+        decode: impl Fn(T) -> Result<(StoredMeta, A), E> + Sync,
     ) -> Result<(), E>
     where
         A: IntoIterator<Item = (Option<PageIndex>, u64)>,
@@ -444,8 +471,24 @@ impl BlockIndex {
         entries.reserve(built.len());
         let bytes = self.resident_bytes.get_mut();
         let pages = self.resident_pages.get_mut();
-        for (id, entry, added_bytes, added_pages) in built {
-            let slot = entries.entry(Arc::new(id)).or_default();
+        for (id, mut entry, added_bytes, added_pages) in built {
+            let slot = match entries.entry(id) {
+                std::collections::hash_map::Entry::Occupied(slot) => {
+                    Arc::get_mut(&mut entry)
+                        .unwrap()
+                        .block
+                        .get_mut()
+                        .unwrap()
+                        .as_mut()
+                        .unwrap()
+                        .meta
+                        .id = slot.key().clone();
+                    slot.into_mut()
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(DirectoryEntry::default())
+                }
+            };
             if let Some(old) = slot.resident.replace(entry) {
                 let old = old
                     .block
@@ -647,8 +690,8 @@ impl BlockIndex {
                 units.push(RecoveredUnit {
                     independent: false,
                     unit: Arc::new(match page {
-                        Some(page) => CacheUnit::Page(entry.meta.id.clone(), page),
-                        None => CacheUnit::Whole(entry.meta.id.clone()),
+                        Some(page) => CacheUnit::Page(entry.meta.id.as_ref().clone(), page),
+                        None => CacheUnit::Whole(entry.meta.id.as_ref().clone()),
                     }),
                     bytes: slot.allocated,
                     access,
@@ -733,10 +776,7 @@ impl BlockIndex {
             entries
                 .iter()
                 .map(|entry| {
-                    entry
-                        .as_ref()
-                        .expect("live directory entry")
-                        .meta
+                    BlockMeta::from(entry.as_ref().expect("live directory entry").meta.clone())
                         .resident_bytes()
                 })
                 .sum()
@@ -750,7 +790,7 @@ impl BlockIndex {
 
     /// Look up a copy of a block's metadata.
     pub fn get(&self, id: &BlockId) -> Option<BlockMeta> {
-        self.read_entry(id, |entry| entry.meta.clone())
+        self.read_entry(id, |entry| entry.meta.clone().into())
     }
 
     /// Resolve metadata and mark a whole-block read in the same index lookup.
@@ -761,7 +801,7 @@ impl BlockIndex {
                     access.touch();
                 }
             });
-            entry.meta.clone()
+            entry.meta.clone().into()
         })
     }
 
@@ -814,7 +854,7 @@ impl BlockIndex {
                 .iter()
                 .map(|entry| {
                     let e = entry.as_ref().expect("live directory entry");
-                    (e.meta.id.clone(), e.meta.len)
+                    (e.meta.id.as_ref().clone(), e.meta.len)
                 })
                 .collect()
         })
@@ -833,7 +873,7 @@ impl BlockIndex {
                 let meta = &entry.meta;
                 match &meta.form {
                     BlockForm::Whole => out.push((
-                        meta.id.clone(),
+                        meta.id.as_ref().clone(),
                         None,
                         entry
                             .units
@@ -845,7 +885,7 @@ impl BlockIndex {
                             let page = PageIndex(p);
                             if present.is_present(page) {
                                 out.push((
-                                    meta.id.clone(),
+                                    meta.id.as_ref().clone(),
                                     Some(page),
                                     entry
                                         .units
@@ -871,6 +911,18 @@ impl BlockIndex {
         meta: BlockMeta,
         allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
     ) {
+        self.commit_shared(meta.into(), allocated);
+    }
+
+    pub(crate) fn commit_stored(&self, block: StoredBlock) {
+        self.commit_shared(block.meta, block.allocated);
+    }
+
+    fn commit_shared(
+        &self,
+        meta: StoredMeta,
+        allocated: impl IntoIterator<Item = (Option<PageIndex>, u64)>,
+    ) {
         let pages = materialized_pages(&meta);
         let id = meta.id.clone();
         let mut entry = IndexedBlock::allocated(meta, allocated);
@@ -878,7 +930,15 @@ impl BlockIndex {
         let mut entries = self.entries.write().unwrap();
         // Structural mutations take directory -> entry. Ordinary operations
         // never reacquire the directory while holding an entry lock.
-        let slot = entries.entry(Arc::new(id)).or_default();
+        let slot = match entries.entry(id) {
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                entry.meta.id = slot.key().clone();
+                slot.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(DirectoryEntry::default())
+            }
+        };
         let previous = slot.resident.as_ref().map(|old| {
             old.block
                 .write()
@@ -944,8 +1004,9 @@ impl BlockIndex {
             return false;
         }
         let page_count = id.page_count(page_size);
+        let id = Arc::new(id);
         let mut entry = Entry::new(
-            BlockMeta {
+            StoredMeta {
                 id: id.clone(),
                 form: BlockForm::Paged {
                     page_size,
@@ -956,7 +1017,15 @@ impl BlockIndex {
             .into(),
         );
         let mut entries = self.entries.write().unwrap();
-        let slot = entries.entry(Arc::new(id)).or_default();
+        let slot = match entries.entry(id) {
+            std::collections::hash_map::Entry::Occupied(slot) => {
+                entry.block.get_mut().unwrap().as_mut().unwrap().meta.id = slot.key().clone();
+                slot.into_mut()
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(DirectoryEntry::default())
+            }
+        };
         if slot.resident.is_some() {
             return false;
         }
@@ -1087,7 +1156,7 @@ impl BlockIndex {
         self.replace_bytes(removed.units.allocated_bytes(), 0);
         self.resident_pages
             .fetch_sub(materialized_pages(&removed.meta), Ordering::Relaxed);
-        Some(removed.meta)
+        Some(removed.meta.into())
     }
 }
 
@@ -1207,6 +1276,44 @@ mod tests {
     }
 
     #[test]
+    fn recovery_and_readmission_share_the_catalog_identity() {
+        let id = Arc::new(block(1));
+        let mut index = BlockIndex::new();
+        index.restore_allocated(
+            vec![StoredBlock {
+                meta: StoredMeta {
+                    id: id.clone(),
+                    len: 4096,
+                    form: BlockForm::Whole,
+                },
+                allocated: vec![(None, 4096)],
+            }],
+            1,
+        );
+        for bytes in [8192, 16384] {
+            let entries = index.entries.read().unwrap();
+            let (key, slot) = entries.get_key_value(id.as_ref()).unwrap();
+            assert!(Arc::ptr_eq(key, &id));
+            assert!(Arc::ptr_eq(
+                &slot
+                    .resident
+                    .as_ref()
+                    .unwrap()
+                    .block
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .meta
+                    .id,
+                &id
+            ));
+            drop(entries);
+            index.commit_allocated(whole_meta(id.as_ref().clone(), bytes), [(None, bytes)]);
+        }
+    }
+
+    #[test]
     fn exclusive_parallel_recovery_matches_commits_and_retires_replacements() {
         fn input() -> Vec<StoredBlock> {
             (0..5000)
@@ -1222,12 +1329,13 @@ mod tests {
                                 page_size: 1 << 20,
                                 present,
                             },
-                        },
+                        }
+                        .into(),
                         allocated: vec![(Some(PageIndex(7)), 8192), (Some(PageIndex(0)), 0)],
                     }
                 })
                 .chain(std::iter::once(StoredBlock {
-                    meta: whole_meta(block(3), 10),
+                    meta: whole_meta(block(3), 10).into(),
                     allocated: vec![(None, 4096)],
                 }))
                 .collect()
@@ -1240,7 +1348,7 @@ mod tests {
         }
         let retired = parallel.entry(&block(0)).unwrap();
         for block in input() {
-            serial.commit_allocated(block.meta, block.allocated);
+            serial.commit_stored(block);
         }
         parallel.restore_allocated(input(), 4);
         assert!(retired.block.read().unwrap().is_none());
@@ -1261,7 +1369,7 @@ mod tests {
             if n == 2048 {
                 return Err("invalid recovery record");
             }
-            Ok((whole_meta(block(n), 32), [(None, 8192)]))
+            Ok((whole_meta(block(n), 32).into(), [(None, 8192)]))
         });
         assert_eq!(error, Err("invalid recovery record"));
         assert_eq!(index.len(), 1);
