@@ -746,7 +746,7 @@ async fn stale_whole_capacity_candidate_must_recheck_pressure() {
     let pending = r.lru.candidates_to_fit(disk_unit(), &HashSet::new());
     assert_eq!(pending.len(), 1);
     // Another request has already relieved pressure by evicting B.
-    r.unlink_units(r.lru.block_candidates(&b), 1).await;
+    r.unlink_units(r.block_candidates(&b), 1).await;
     assert_eq!(r.logical_resident_bytes(), 16);
     let _pin = r.lru.pin_guard(CacheUnit::Whole(a.clone())).unwrap();
     r.unlink_units(pending, 1).await;

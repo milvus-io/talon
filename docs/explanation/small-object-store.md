@@ -53,7 +53,7 @@ without a second residency entry. The locator carries the shared access token;
 relocation preserves that token and recovery reconstructs policy from locators.
 `GetCachedRange` remains an ordinary whole/paged-store operation: an object
 resident only in small storage returns `CacheMiss`, without origin access.
-Packed keys do not participate in cross-version supersession. Page TTI applies
+All stores retain different versions independently. Page TTI applies
 to the whole small object using its shared access timestamp, including when
 paged L2 is disabled. With TTI enabled, reads update memory and coalesce dirty
 notifications per resident token. Tokens share the store's encoded key and do
@@ -172,9 +172,9 @@ not constant-time startup or a disk-only index.
 
 Before serving, the worker attaches access tokens directly to ordinary index
 entries and small-store locators, then bulk-builds their shared LRU membership
-and block indexes. Only ordinary
-whole/paged entries enter the cross-version index; packed keys are independent.
-The object-existence check table is built only when stale GC is enabled. Large namespaces use at most three CPU threads (bounded by available
+and block indexes. Every version remains an independent cache identity; no
+cross-version index is built.
+The object-existence check table is built only when stale GC is enabled. Large namespaces use at most two CPU threads (bounded by available
 parallelism, including the initializing thread); small namespaces stay serial.
 Ordered eviction and ownership queues are collected in bulk. Paged lifecycle
 initialization skips whole objects without cloning a full cache snapshot. These
@@ -412,14 +412,16 @@ TTI coverage limits, is recorded in
 
 ### Independent keys and recovery policy
 
-Packed objects use their complete key, including version, as independent cache identities.
-Admitting a different version does not supersede another packed object, and packed
-objects are not members of the Worker's cross-version eviction index. Capacity,
-TTI, pinning, ownership cleanup and exact-key invalidation still apply. Ordinary
-whole/paged entries retain their existing version policy, including when mixed
-with packed objects in the same namespace.
+All stores use their complete key, including version, as independent cache identities.
+Admission does not invalidate other versions in small, whole, paged and L1 storage.
+LRU maintains no cross-version index. Capacity, TTI, pinning, ownership cleanup
+and exact-key invalidation still apply. Origin reads retain their version preconditions.
 
 Origin-existence checks remain a separate optional background policy. Namespace
 startup constructs their reference-counted check table only when `stale_gc_enabled`
 is true; disabling it skips both recovery-time and subsequent admission bookkeeping.
 The full key and persisted record formats are unchanged.
+
+Small-store recovery attaches policy tokens directly to its locators; ordinary
+whole/page recovery attaches them to BlockIndex entries. Exact block deletion
+uses the existing residency index to enumerate its pages.

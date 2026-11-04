@@ -885,7 +885,7 @@ mod recovery_tests {
         store.restore_policy_units(&mut units);
         let serial = crate::Lru::new();
         for unit in &units {
-            serial.insert_with_policy(unit.unit.as_ref().clone(), unit.bytes, true);
+            serial.insert(unit.unit.as_ref().clone(), unit.bytes);
         }
         let policy = Arc::new(crate::Lru::from_recovered(units, store.len(), true));
         store.bind_policy(policy.clone());
@@ -894,7 +894,7 @@ mod recovery_tests {
         for n in 1025..3075 {
             assert!(store.contains(&id(n)));
             assert!(store.access(&id(n)).is_some());
-            assert_eq!(policy.block_candidates(&id(n)).len(), 1);
+            assert_eq!(policy.candidates([CacheUnit::Whole(id(n))]).len(), 1);
         }
         assert_eq!(
             store.read(&id(1025)).await.unwrap().unwrap(),

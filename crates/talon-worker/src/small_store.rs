@@ -361,8 +361,7 @@ impl SegmentStore {
                     ));
                 }
                 if let Some(policy) = &policy {
-                    old.access =
-                        Some(policy.insert_with_policy(CacheUnit::Whole(id.clone()), charge, true));
+                    old.access = Some(policy.insert(CacheUnit::Whole(id.clone()), charge));
                 }
                 return Ok(charge);
             }
@@ -489,8 +488,7 @@ impl SegmentStore {
         // eviction from retiring this admission before its mutation completes.
         let mut entries = self.entries.write().unwrap();
         if let Some(policy) = policy {
-            loc.access =
-                Some(policy.insert_with_policy(CacheUnit::Whole(id.clone()), charge, true));
+            loc.access = Some(policy.insert(CacheUnit::Whole(id.clone()), charge));
         }
         entries.insert(key, loc);
         drop(entries);
@@ -580,7 +578,6 @@ impl SegmentStore {
             units.push(crate::eviction::RecoveredUnit {
                 unit: Arc::new(CacheUnit::Whole(format::id(key)?)),
                 bytes: charge(key, loc.len),
-                independent: true,
                 access: access.clone(),
             });
             loc.access = Some(access);

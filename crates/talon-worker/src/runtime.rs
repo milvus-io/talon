@@ -1727,8 +1727,6 @@ impl WorkerRuntime {
                         let _read = state.acquire(page);
                         let _pin = runtime.lru.pin_guard(unit);
                         drop(_gate);
-                        let superseded = runtime.lru.superseded_candidates(&id);
-                        runtime.unlink_units(superseded, 2).await;
                         runtime.enforce_capacity().await;
                         Ok::<_, anyhow::Error>(())
                     })
@@ -2170,13 +2168,13 @@ impl WorkerRuntime {
                     .scope(async move {
                         let state = runtime.page_lifecycle.block(&id);
                         let gate = state.gate.lock().await;
-                        let independent = runtime.accepts_small(&id, len);
-                        if independent && runtime.index.get(&id).is_some() {
+                        let use_small_store = runtime.accepts_small(&id, len);
+                        if use_small_store && runtime.index.get(&id).is_some() {
                             anyhow::bail!(
                                 "small admission conflicts with ordinary store residency for {id}"
                             );
                         }
-                        if !independent
+                        if !use_small_store
                             && runtime
                                 .small
                                 .as_ref()
@@ -2208,7 +2206,7 @@ impl WorkerRuntime {
                             return Ok::<_, anyhow::Error>(());
                         }
                         let unit = CacheUnit::Whole(id.clone());
-                        if independent {
+                        if use_small_store {
                             runtime
                                 .small
                                 .as_ref()
@@ -2237,12 +2235,7 @@ impl WorkerRuntime {
                         drop(gate);
                         drop(state);
                         runtime.page_lifecycle.retire_empty(&id);
-                        let superseded = runtime.lru.superseded_candidates(&id);
-                        runtime.unlink_units(superseded, 2).await;
                         runtime.enforce_capacity().await;
-                        if !independent && !runtime.l1.remove_superseded(&id).is_empty() {
-                            runtime.refresh_l1_metrics();
-                        }
                         Ok::<_, anyhow::Error>(())
                     })
                     .await;
@@ -2382,7 +2375,6 @@ impl WorkerRuntime {
             }
             return self.write_object(object, bytes::Bytes::from(body)).await;
         }
-        let old_version = self.cached_version(object);
         let version = match self.backend()?.put_file(object, path, len).await {
             Ok(version) => {
                 self.metrics.record_backend_write_success(len);
@@ -2393,13 +2385,6 @@ impl WorkerRuntime {
                 return Err(error.into());
             }
         };
-        if let Some(old_version) = old_version {
-            let old_block = self.block_for(object, 0, &old_version);
-            if !self.small.as_ref().is_some_and(|s| s.contains(&old_block)) {
-                self.unlink_units(self.lru.block_candidates(&old_block), 2)
-                    .await;
-            }
-        }
         self.store_version(object, &version, len);
         tracing::info!(
             object = %object.to_path(),
@@ -2433,8 +2418,7 @@ impl WorkerRuntime {
         // drop the cached version so the next read re-resolves.
         if let Some(version) = self.cached_version(object) {
             let block = self.block_for(object, 0, &version);
-            self.unlink_units(self.lru.block_candidates(&block), 2)
-                .await;
+            self.unlink_units(self.block_candidates(&block), 2).await;
         }
         self.invalidate_version(object);
         tracing::info!(object = %object.to_path(), "deleted object");
@@ -4397,17 +4381,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn large_staged_write_streams_without_entering_single_block_cache() {
+    async fn large_staged_write_streams_and_preserves_cached_versions() {
         let root = tmp_root();
         let backend = Arc::new(StreamPutBackend {
             uploaded: std::sync::Mutex::new(None),
         });
         let metrics = WorkerMetrics::new(1024);
-        let runtime = runtime_with(Arc::clone(&backend), metrics.clone(), &root, 8);
+        let runtime = runtime_with(Arc::clone(&backend), metrics.clone(), &root, 8)
+            .with_version_ttl(Duration::from_secs(60));
         let staged = tempfile::NamedTempFile::new().unwrap();
         staged.as_file().set_len(4097).unwrap();
         staged.as_file().write_all_at(b"x", 4096).unwrap();
         let object = ObjectId::new(Backend::S3, "bucket", "large.bin");
+        let old_version = Version::new("old");
+        let old_block = runtime.block_for(&object, 0, &old_version);
+        runtime
+            .commit_cached_block(&old_block, Bytes::from_static(b"old-data"))
+            .await
+            .unwrap();
+        runtime.store_version(&object, &old_version, 8);
 
         let version = runtime
             .write_object_file(&object, staged.path(), 4097)
@@ -4416,7 +4408,20 @@ mod tests {
 
         assert_eq!(version, Version::new("stream-v1"));
         assert_eq!(*backend.uploaded.lock().unwrap(), Some((4097, b'x')));
-        assert_eq!(runtime.block_count(), 0);
+        assert_eq!(runtime.block_count(), 1);
+        assert_eq!(runtime.cached_version(&object), Some(version));
+        assert_eq!(
+            runtime
+                .serve_cached(&CachedRangeRequest {
+                    object,
+                    version: old_version,
+                    offset: 0,
+                    len: 8,
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"old-data")
+        );
         assert!(metrics
             .render()
             .contains("talon_worker_backend_write_bytes_total{backend=\"azure\"} 4097"));
@@ -4614,7 +4619,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overwrite_at_source_invalidates_stale_cache() {
+    async fn overwrite_at_source_reads_new_version_and_preserves_cached_version() {
         // First read caches under version "v1". The source is then overwritten
         // (new etag "v2" + new bytes); the next read must resolve the new
         // version, miss the stale block, and serve the fresh bytes (issue #119).
@@ -4645,15 +4650,12 @@ mod tests {
             2,
             "overwrite must trigger a fresh backend fetch, not serve the stale block"
         );
-        // The superseded v1 block is evicted on commit of v2, so only the fresh
-        // version remains resident — version churn no longer accumulates stale
-        // .blk files (issue #159).
-        assert_eq!(runtime.block_count(), 1);
+        assert_eq!(runtime.block_count(), 2);
         std::fs::remove_dir_all(root).ok();
     }
 
     #[tokio::test]
-    async fn source_overwrite_replaces_old_version_in_both_tiers() {
+    async fn source_overwrite_preserves_both_versions_in_both_tiers() {
         let root = tmp_root();
         let backend = Arc::new(VersionedBackend {
             version: std::sync::Mutex::new("v1".into()),
@@ -4666,7 +4668,7 @@ mod tests {
             Arc::new(InFlightLoads::new()),
             Arc::clone(&backend) as Arc<dyn BackendStore>,
             8,
-            1024,
+            1024 * 1024,
             16,
             4,
             WorkerMetrics::new(1024),
@@ -4691,9 +4693,14 @@ mod tests {
             runtime.serve_range(&full_request).await.unwrap(),
             Bytes::from_static(b"new-data")
         );
-        assert_eq!(runtime.block_count(), 1, "old L2 version must be removed");
-        assert_eq!(runtime.l1_page_count(), 2, "old L1 pages must be removed");
-        assert_eq!(runtime.l1_resident_bytes(), 8);
+        assert_eq!(runtime.block_count(), 2);
+        assert_eq!(runtime.l1_page_count(), 4);
+        assert_eq!(runtime.l1_resident_bytes(), 16);
+        let old = runtime.block_for(&full_request.object, 0, &Version::new("v1"));
+        assert_eq!(
+            runtime.l1.get_page(&old, PageIndex(0)).unwrap(),
+            Bytes::from_static(b"old-")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -4988,6 +4995,14 @@ mod tests {
         *backend.version.lock().unwrap() = "v2".into();
         *backend.body.lock().unwrap() = Bytes::from_static(b"new-new-new-new-");
 
+        let version_v2 = Version::new("v2");
+        let fresh = runtime
+            .serve_versioned(&request(0), &version_v2, 16)
+            .await
+            .unwrap();
+        assert!(matches!(fresh, ServeOutcome::Bytes(ref bytes) if bytes.as_ref() == b"new-"));
+        assert_eq!(runtime.block_count(), 2);
+
         let cached = runtime
             .serve_versioned(&request(0), &version_v1, 16)
             .await
@@ -5006,7 +5021,7 @@ mod tests {
             cached_bytes.extend(bytes);
         }
         assert_eq!(cached_bytes, b"old-");
-        assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+        assert_eq!(backend.fetches.load(Ordering::SeqCst), 2);
 
         let error = runtime
             .serve_versioned(&request(missing_offset), &version_v1, 16)
@@ -5030,6 +5045,60 @@ mod tests {
             ServeOutcome::Bytes(ref bytes) if bytes == &Bytes::from_static(b"new-")
         ));
         assert_eq!(backend.heads.load(Ordering::SeqCst), 1);
+        drop(runtime);
+        let store = WholeBlockStore::open(&root).unwrap();
+        let index = Arc::new(BlockIndex::new());
+        store.restore_index(&index).unwrap();
+        let paged_store = paged.then(|| PagedBlockStore::open(root.join("paged"), 4).unwrap());
+        if let Some(store) = &paged_store {
+            store.restore_index(&index).unwrap();
+        }
+        let mut restarted = WorkerRuntime::new(
+            store,
+            index,
+            Arc::new(InFlightLoads::new()),
+            backend.clone(),
+            8,
+            0,
+            WorkerMetrics::new(1024),
+        );
+        if let Some(store) = paged_store {
+            restarted = restarted.with_paged_store(store);
+        }
+        for (version, expected) in [(&version_v1, b"old-"), (&version_v2, b"new-")] {
+            assert_eq!(
+                restarted
+                    .serve_cached(&CachedRangeRequest {
+                        object: object.clone(),
+                        version: version.clone(),
+                        offset: 0,
+                        len: 4,
+                    })
+                    .await
+                    .unwrap()
+                    .as_ref(),
+                expected
+            );
+        }
+        let old_block = restarted.block_for(&object, 0, &version_v1);
+        let new_block = restarted.block_for(&object, 0, &version_v2);
+        restarted
+            .unlink_units(restarted.block_candidates(&old_block), 2)
+            .await;
+        assert!(restarted.block_candidates(&old_block).is_empty());
+        assert!(!restarted.block_candidates(&new_block).is_empty());
+        assert_eq!(
+            restarted
+                .serve_cached(&CachedRangeRequest {
+                    object,
+                    version: version_v2,
+                    offset: 0,
+                    len: 4,
+                })
+                .await
+                .unwrap(),
+            Bytes::from_static(b"new-")
+        );
         std::fs::remove_dir_all(root).ok();
     }
 
@@ -6118,7 +6187,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn overwriting_an_object_reclaims_the_old_versions_pages() {
+    async fn overwriting_an_object_preserves_the_old_versions_pages() {
         let root = tmp_root();
         let backend = Arc::new(VersionedBackend {
             version: std::sync::Mutex::new("v1".into()),
@@ -6144,9 +6213,8 @@ mod tests {
         let got = runtime.serve_range(&req(&object, 0, 8)).await.unwrap();
 
         assert_eq!(got, Bytes::from_static(b"bbbbbbbb"));
-        // The superseded version's pages were reclaimed, not left resident.
-        assert_eq!(runtime.block_count(), 1, "old version dropped");
-        assert_eq!(runtime.logical_resident_bytes(), 8);
+        assert_eq!(runtime.block_count(), 2);
+        assert_eq!(runtime.logical_resident_bytes(), 16);
         std::fs::remove_dir_all(root).ok();
     }
 

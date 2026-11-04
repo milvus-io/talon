@@ -355,31 +355,6 @@ impl MemoryStore {
         }
         victims
     }
-
-    /// Remove all pages for old versions of the same logical block as `keep`.
-    pub fn remove_superseded(&self, keep: &BlockId) -> Vec<MemoryPageKey> {
-        let mut inner = self.inner.lock().unwrap();
-        let victims: Vec<_> = inner
-            .entries
-            .keys()
-            .filter(|key| {
-                let id = &key.block;
-                id.object == keep.object
-                    && id.offset == keep.offset
-                    && id.block_size == keep.block_size
-                    && id.version != keep.version
-            })
-            .cloned()
-            .collect();
-        for victim in &victims {
-            if let Some(entry) = inner.entries.remove(victim) {
-                inner.resident_bytes = inner
-                    .resident_bytes
-                    .saturating_sub(entry.value.len() as u64);
-            }
-        }
-        victims
-    }
 }
 
 impl Default for MemoryStore {
@@ -419,7 +394,7 @@ mod tests {
         assert!(a.remove_page(&id, PageIndex(1)));
         assert_eq!(budget.residency(), (1, 4));
         a.insert_page(id.clone(), PageIndex(0), Bytes::from_static(b"abcd"));
-        a.remove_superseded(&block("shared", "v2"));
+        a.remove_block(&id);
         assert_eq!(budget.residency(), (1, 4));
         a.insert_page(id.clone(), PageIndex(0), Bytes::from_static(b"abcd"));
         a.remove_block(&id);
@@ -509,7 +484,7 @@ mod tests {
     }
 
     #[test]
-    fn block_and_version_invalidation_remove_all_matching_pages() {
+    fn exact_block_invalidation_preserves_other_versions() {
         let store = MemoryStore::with_limits(32, 4);
         let old = block("same", "v1");
         let keep = block("same", "v2");
@@ -520,7 +495,8 @@ mod tests {
         }
         store.insert_page(other.clone(), PageIndex(0), Bytes::from_static(b"data"));
 
-        assert_eq!(store.remove_superseded(&keep).len(), 2);
+        assert_eq!(store.len(), 5);
+        assert_eq!(store.remove_block(&old).len(), 2);
         assert!(store.get_page(&old, PageIndex(0)).is_none());
         assert!(store.get_page(&keep, PageIndex(0)).is_some());
         assert_eq!(store.remove_block(&keep).len(), 2);
