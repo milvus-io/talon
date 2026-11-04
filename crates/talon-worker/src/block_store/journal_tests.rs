@@ -146,11 +146,11 @@ async fn whole_and_paged_share_snapshot_with_independent_residency() {
     let whole = WholeBlockStore::open(root.path()).unwrap();
     let recovered = whole.scan_allocated().unwrap();
     assert_eq!(recovered.len(), 1);
-    assert_eq!(*recovered[0].meta.id, block(1));
+    assert_eq!(recovered[0].meta.id.materialize(), block(1));
     assert_eq!(recovered[0].allocated, allocated);
     let pages = whole.catalog.recover("paged").unwrap().unwrap();
     assert_eq!(pages.len(), 1);
-    assert_eq!(*pages[0].meta.id, block(0));
+    assert_eq!(pages[0].meta.id.materialize(), block(0));
     assert_eq!(pages[0].allocated[0].0, Some(PageIndex(1)));
 }
 

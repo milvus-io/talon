@@ -5,6 +5,7 @@
 //! implementation, with room to add tiered/persistent backends later.
 
 pub mod background;
+mod block_key;
 pub mod block_store;
 pub mod capacity;
 mod catalog;

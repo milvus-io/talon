@@ -1,4 +1,5 @@
 use super::*;
+use crate::block_key::{BlockIdentity, BlockKey};
 use crate::PagedBlockStore;
 use bytes::Bytes;
 use talon_core::{Backend, ObjectId, PageIndex, Version};
@@ -40,9 +41,9 @@ fn repeated_whole_put_preserves_canonical_identity() {
             )
             .unwrap();
         let (key, value) = state.stores["whole"].blocks.iter().next().unwrap();
-        assert!(Arc::ptr_eq(key, &value.id));
+        assert!(key.ptr_eq(&value.id));
         if let Some(old) = previous {
-            assert!(Arc::ptr_eq(&old, key));
+            assert!(BlockKey::ptr_eq(&old, key));
         }
         previous = Some(key.clone());
     }
@@ -129,7 +130,7 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     id.block_size = config.block_size;
     let count = id.page_count(config.l2_page_size_bytes as u32);
     let block = model::Block {
-        id: Arc::new(id.clone()),
+        id: BlockKey::new(&id),
         len: u64::from(id.block_size),
         pages: (0..count).map(|page| (page, 4096)).collect(),
     };
@@ -142,7 +143,7 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
         path.into(),
         model::Store {
             page_size: 1024,
-            blocks: [(Arc::new(id.clone()), Arc::new(block))].into(),
+            blocks: [(BlockKey::new(&id), Arc::new(block))].into(),
         },
     );
     let root = tempfile::tempdir().unwrap();
@@ -181,7 +182,7 @@ async fn large_block_checkpoint_reopens_without_an_oversized_frame() {
     catalog
         .journal
         .query(move |state| {
-            let restored = &state.stores[path].blocks[&id];
+            let restored = &state.stores[path].blocks[&id as &dyn BlockIdentity];
             assert_eq!(restored.pages.len(), count as usize - 1);
             assert_eq!(restored.len, u64::from(id.block_size));
             assert!(!restored.pages.contains_key(&0));
@@ -203,7 +204,7 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     let chunk = |page, len, continuation| SnapshotRecord::Block {
         store: path.into(),
         block: model::Block {
-            id: Arc::new(block(0)),
+            id: BlockKey::new(&block(0)),
             len,
             pages: [(page, 4096)].into(),
         },
@@ -233,7 +234,7 @@ fn snapshot_page_chunks_validate_identity_order_and_legacy_records() {
     state.restore(chunk(2, 16, true)).unwrap();
     assert!(state.restore(chunk(1, 16, true)).is_err());
     assert_eq!(
-        state.stores[path].blocks[&block(0)].pages,
+        state.stores[path].blocks[&block(0) as &dyn BlockIdentity].pages,
         [(0, 4096), (2, 4096)].into()
     );
 }
@@ -429,7 +430,7 @@ async fn replay_restores_exact_residency_and_allocation_without_listing_data() {
     let recovered = catalog.recover("paged").unwrap().unwrap();
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered[0].allocated, expected);
-    assert_eq!(*recovered[0].meta.id, block(0));
+    assert_eq!(recovered[0].meta.id.materialize(), block(0));
     assert_eq!(recovered[0].meta.len, 16);
 }
 
@@ -619,7 +620,7 @@ fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
             .restore(model::SnapshotRecord::Block {
                 store: "whole".into(),
                 block: model::Block {
-                    id: Arc::new(block(0)),
+                    id: BlockKey::new(&block(0)),
                     len: 4,
                     pages: pages.into_iter().collect()
                 },
@@ -631,7 +632,7 @@ fn whole_geometry_rejects_page_operations_and_malformed_snapshots() {
         .restore(model::SnapshotRecord::Block {
             store: "whole".into(),
             block: model::Block {
-                id: Arc::new(block(0)),
+                id: BlockKey::new(&block(0)),
                 len: 4,
                 pages: [(0, 4096)].into(),
             },

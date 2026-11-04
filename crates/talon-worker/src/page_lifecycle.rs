@@ -887,7 +887,7 @@ impl PageLifecycle {
                 page.handle.bind_work(work.clone());
             }
             let block = Arc::new(BlockState {
-                id,
+                id: Arc::new(id.materialize()),
                 gate: Arc::new(PageMutationGate {
                     directory: self.directory_gate(hash.finish()),
                     block: tokio::sync::RwLock::new(()),

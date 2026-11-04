@@ -50,14 +50,14 @@ impl CacheUnit {
     }
 }
 
-type BlockKey = Arc<BlockId>;
+use crate::block_key::{BlockIdentity, BlockKey};
 
 pub(crate) trait UnitKey {
-    fn block(&self) -> &BlockId;
+    fn block(&self) -> &dyn BlockIdentity;
     fn page(&self) -> Option<PageIndex>;
 }
 impl UnitKey for CacheUnit {
-    fn block(&self) -> &BlockId {
+    fn block(&self) -> &dyn BlockIdentity {
         self.block()
     }
     fn page(&self) -> Option<PageIndex> {
@@ -71,7 +71,7 @@ pub(crate) struct SharedUnit {
     pub page: Option<PageIndex>,
 }
 impl UnitKey for SharedUnit {
-    fn block(&self) -> &BlockId {
+    fn block(&self) -> &dyn BlockIdentity {
         &self.block
     }
     fn page(&self) -> Option<PageIndex> {
@@ -81,8 +81,8 @@ impl UnitKey for SharedUnit {
 impl SharedUnit {
     pub(crate) fn materialize(&self) -> CacheUnit {
         match self.page {
-            Some(page) => CacheUnit::Page(self.block.as_ref().clone(), page),
-            None => CacheUnit::Whole(self.block.as_ref().clone()),
+            Some(page) => CacheUnit::Page(self.block.materialize(), page),
+            None => CacheUnit::Whole(self.block.materialize()),
         }
     }
 }
@@ -93,7 +93,7 @@ impl From<CacheUnit> for SharedUnit {
             CacheUnit::Page(block, page) => (block, Some(page)),
         };
         Self {
-            block: Arc::new(block),
+            block: BlockKey::new(&block),
             page,
         }
     }
@@ -382,7 +382,7 @@ impl Inner {
     fn superseded_units(&self, keep: &BlockId) -> Vec<CacheUnit> {
         self.versions
             .blocks(keep)
-            .filter(|block| block.version != keep.version)
+            .filter(|block| block.view().version != keep.version.as_str())
             .flat_map(|block| {
                 self.index
                     .policy_units(block)
@@ -572,7 +572,7 @@ impl Lru {
             block: g
                 .index
                 .shared_identity(block)
-                .unwrap_or_else(|| Arc::new(block.clone())),
+                .unwrap_or_else(|| BlockKey::new(block)),
             page: unit.page(),
         };
         if !independent {
@@ -795,7 +795,7 @@ impl Lru {
             let access = activity.access.load(Ordering::Relaxed);
             let verified = g
                 .object_checks
-                .get(&block.as_ref().object)
+                .get(&block.view().object.materialize())
                 .and_then(|check| check.1);
             if activity.pins != 0
                 || now.saturating_sub(access) <= age
@@ -804,7 +804,7 @@ impl Lru {
                 continue;
             }
             out.push(StaleBlockCandidate {
-                block: block.as_ref().clone(),
+                block: block.materialize(),
                 units: activity.units,
                 revision: activity.revision,
                 last_access: access,
@@ -848,7 +848,7 @@ impl Lru {
             .expect("tracked block");
         let activity = g.index.policy_block_get(&block).expect("tracked block");
         let candidate = StaleBlockCandidate {
-            block: block.as_ref().clone(),
+            block: block.materialize(),
             units: activity.units,
             revision: activity.revision,
             last_access: activity.access.load(Ordering::Relaxed),

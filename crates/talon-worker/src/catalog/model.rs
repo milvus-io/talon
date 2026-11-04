@@ -1,4 +1,5 @@
 //! File-cache residency state and codec; the shared journal owns ordering and I/O.
+use crate::block_key::{BlockIdentity, BlockKey};
 use crate::{
     index::{StoredBlock, StoredMeta},
     page_table::PageMap,
@@ -16,7 +17,7 @@ use talon_journal::Machine;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(super) struct Block {
-    pub id: Arc<BlockId>,
+    pub id: BlockKey,
     pub len: u64,
     pub pages: PageMap<u64>,
 }
@@ -49,7 +50,7 @@ pub(super) enum Record {
 pub(super) struct Store {
     /// Zero denotes whole blocks, represented by one allocation at index zero.
     pub(super) page_size: u32,
-    pub(super) blocks: HashMap<Arc<BlockId>, Arc<Block>>,
+    pub(super) blocks: HashMap<BlockKey, Arc<Block>>,
 }
 
 #[derive(Default)]
@@ -129,19 +130,21 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::Put { page, .. } | Operation::DeletePage { page } => {
-                        if let Some(block) = store.blocks.get_mut(&intent.block) {
+                        if let Some(block) =
+                            store.blocks.get_mut(&intent.block as &dyn BlockIdentity)
+                        {
                             Arc::make_mut(block).pages.remove(&page);
                         }
                         if store
                             .blocks
-                            .get(&intent.block)
+                            .get(&intent.block as &dyn BlockIdentity)
                             .is_some_and(|b| b.pages.is_empty())
                         {
-                            store.blocks.remove(&intent.block);
+                            store.blocks.remove(&intent.block as &dyn BlockIdentity);
                         }
                     }
                     Operation::DeleteBlock | Operation::PutWhole { .. } => {
-                        store.blocks.remove(&intent.block);
+                        store.blocks.remove(&intent.block as &dyn BlockIdentity);
                     }
                 }
             }
@@ -156,7 +159,9 @@ impl State {
                 let store = self.stores.get_mut(&intent.store).unwrap();
                 match intent.operation {
                     Operation::PutWhole { len } => {
-                        let entry = store.blocks.entry(Arc::new(intent.block));
+                        let entry = store
+                            .blocks
+                            .entry(BlockKey::new(&intent.block as &dyn BlockIdentity));
                         let id = entry.key().clone();
                         let block = Arc::new(Block {
                             id,
@@ -174,7 +179,10 @@ impl State {
                     }
                     Operation::Put { page, len } => {
                         use std::collections::hash_map::Entry;
-                        let block = match store.blocks.entry(Arc::new(intent.block)) {
+                        let block = match store
+                            .blocks
+                            .entry(BlockKey::new(&intent.block as &dyn BlockIdentity))
+                        {
                             Entry::Occupied(entry) => entry.into_mut(),
                             Entry::Vacant(entry) => {
                                 let id = entry.key().clone();
@@ -190,19 +198,21 @@ impl State {
                         block.pages.insert(page, allocated);
                     }
                     Operation::DeletePage { page } => {
-                        if let Some(block) = store.blocks.get_mut(&intent.block) {
+                        if let Some(block) =
+                            store.blocks.get_mut(&intent.block as &dyn BlockIdentity)
+                        {
                             Arc::make_mut(block).pages.remove(&page);
                         }
                         if store
                             .blocks
-                            .get(&intent.block)
+                            .get(&intent.block as &dyn BlockIdentity)
                             .is_some_and(|b| b.pages.is_empty())
                         {
-                            store.blocks.remove(&intent.block);
+                            store.blocks.remove(&intent.block as &dyn BlockIdentity);
                         }
                     }
                     Operation::DeleteBlock => {
-                        store.blocks.remove(&intent.block);
+                        store.blocks.remove(&intent.block as &dyn BlockIdentity);
                     }
                 }
             }
@@ -238,7 +248,7 @@ impl State {
                     allocated: vec![(None, b.pages[&0])],
                 };
             }
-            let mut present = PresentBitmap::new(b.id.page_count(store.page_size));
+            let mut present = PresentBitmap::new(b.id.view().page_count(store.page_size));
             for page in b.pages.keys() {
                 present.set(PageIndex(*page));
             }
@@ -433,7 +443,7 @@ impl Machine for State {
                     .stores
                     .get_mut(&store)
                     .ok_or_else(|| invalid("unknown snapshot store"))?;
-                if block.len > u64::from(block.id.block_size)
+                if block.len > u64::from(block.id.view().block_size)
                     || block.pages.is_empty()
                     || if store.page_size == 0 {
                         continuation || block.pages.len() != 1 || !block.pages.contains_key(&0)
@@ -441,7 +451,7 @@ impl Machine for State {
                         block
                             .pages
                             .keys()
-                            .any(|page| *page >= block.id.page_count(store.page_size))
+                            .any(|page| *page >= block.id.view().page_count(store.page_size))
                     }
                 {
                     return Err(invalid("invalid snapshot block"));

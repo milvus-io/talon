@@ -1,5 +1,6 @@
 //! Manual benchmark of the shared engine with the real paged adapter.
 use super::*;
+use crate::block_key::BlockKey;
 use std::time::Instant;
 use talon_core::{Backend, ObjectId, Version};
 use talon_journal::Machine;
@@ -84,7 +85,7 @@ fn restart_replay_and_index() {
                 continuation: false,
                 store: "paged".into(),
                 block: model::Block {
-                    id: Arc::new(id),
+                    id: BlockKey::new(&id),
                     len: 4 * 1024 * 1024,
                     pages: (0..32).map(|p| (p, 131072)).collect(),
                 },

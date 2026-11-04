@@ -11,6 +11,7 @@
 //! directory read lock. Writers retain an Arc and release the directory before
 //! locking the entry. Removal/replacement retires the old entry under its write
 //! lock, so writers racing with retirement retry their lookup.
+use crate::block_key::{BlockIdentity, BlockKey};
 
 mod directory;
 use directory::Directory;
@@ -92,7 +93,7 @@ pub(crate) struct StoredBlock {
 
 #[derive(Clone)]
 pub(crate) struct StoredMeta {
-    pub id: Arc<BlockId>,
+    pub id: BlockKey,
     pub form: BlockForm,
     pub len: u64,
 }
@@ -100,7 +101,7 @@ pub(crate) struct StoredMeta {
 impl From<BlockMeta> for StoredMeta {
     fn from(meta: BlockMeta) -> Self {
         Self {
-            id: Arc::new(meta.id),
+            id: BlockKey::new(&meta.id),
             form: meta.form,
             len: meta.len,
         }
@@ -110,7 +111,7 @@ impl From<BlockMeta> for StoredMeta {
 impl From<StoredMeta> for BlockMeta {
     fn from(meta: StoredMeta) -> Self {
         Self {
-            id: Arc::unwrap_or_clone(meta.id),
+            id: meta.id.materialize(),
             form: meta.form,
             len: meta.len,
         }
@@ -127,7 +128,7 @@ struct IndexedBlock {
 }
 
 struct ResidentMeta {
-    id: Arc<BlockId>,
+    id: BlockKey,
     len: u64,
     page_size: u32,
     page_count: u32,
@@ -340,7 +341,7 @@ impl BlockIndex {
         });
     }
 
-    pub(crate) fn policy_block_get(&self, id: &BlockId) -> Option<BlockActivity> {
+    pub(crate) fn policy_block_get(&self, id: &dyn BlockIdentity) -> Option<BlockActivity> {
         let entries = self.entries.read().unwrap();
         let entry = entries.get(id)?;
         Some(BlockActivity {
@@ -351,24 +352,28 @@ impl BlockIndex {
 
     pub(crate) fn policy_block_update<T>(
         &self,
-        id: &BlockId,
+        id: &dyn BlockIdentity,
         update: impl FnOnce(&mut BlockPolicy) -> T,
     ) -> Option<T> {
         let mut entries = self.entries.write().unwrap();
         Some(update(entries.get_mut(id)?.activity.as_deref_mut()?))
     }
 
-    pub(crate) fn policy_block_insert(&self, id: &BlockId, activity: BlockPolicy) -> Arc<BlockId> {
+    pub(crate) fn policy_block_insert(
+        &self,
+        id: &dyn BlockIdentity,
+        activity: BlockPolicy,
+    ) -> BlockKey {
         let mut entries = self.entries.write().unwrap();
         let id = entries
             .get_key_value(id)
             .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| Arc::new(id.clone()));
+            .unwrap_or_else(|| BlockKey::new(id));
         entries.get_or_insert(id.clone()).1.activity = Some(Box::new(activity));
         id
     }
 
-    pub(crate) fn policy_block_remove(&self, id: &BlockId) {
+    pub(crate) fn policy_block_remove(&self, id: &dyn BlockIdentity) {
         let mut entries = self.entries.write().unwrap();
         let Some(entry) = entries.get_mut(id) else {
             return;
@@ -394,7 +399,10 @@ impl BlockIndex {
         }
     }
 
-    pub(crate) fn policy_units(&self, id: &BlockId) -> Vec<(Option<PageIndex>, PolicyState)> {
+    pub(crate) fn policy_units(
+        &self,
+        id: &dyn BlockIdentity,
+    ) -> Vec<(Option<PageIndex>, PolicyState)> {
         let entries = self.entries.read().unwrap();
         let Some(entry) = entries.get(id) else {
             return Vec::new();
@@ -415,7 +423,7 @@ impl BlockIndex {
         units
     }
 
-    pub(crate) fn shared_identity(&self, id: &BlockId) -> Option<Arc<BlockId>> {
+    pub(crate) fn shared_identity(&self, id: &dyn BlockIdentity) -> Option<BlockKey> {
         self.entries
             .read()
             .unwrap()
@@ -423,7 +431,7 @@ impl BlockIndex {
             .map(|(id, _)| id.clone())
     }
 
-    pub(crate) fn policy_has_versioned_units(&self, id: &BlockId) -> bool {
+    pub(crate) fn policy_has_versioned_units(&self, id: &dyn BlockIdentity) -> bool {
         let entries = self.entries.read().unwrap();
         let Some(entry) = entries.get(id) else {
             return false;
@@ -629,7 +637,7 @@ impl BlockIndex {
     pub(crate) fn lifecycle_or_insert(
         &self,
         id: &BlockId,
-        create: impl FnOnce(Arc<BlockId>, Option<PageTable>) -> Arc<BlockState>,
+        create: impl FnOnce(BlockKey, Option<PageTable>) -> Arc<BlockState>,
     ) -> Arc<BlockState> {
         if let Some(block) = self.lifecycle(id) {
             return block;
@@ -638,7 +646,7 @@ impl BlockIndex {
         let key = entries
             .get_key_value(id)
             .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| Arc::new(id.clone()));
+            .unwrap_or_else(|| BlockKey::new(id));
         let (_, slot) = entries.get_or_insert(key.clone());
         if let Some(block) = &slot.lifecycle {
             return block.clone();
@@ -854,7 +862,7 @@ impl BlockIndex {
                 entry.materialized_pages() > 0
             };
             if paged {
-                lifecycle.block(&id);
+                lifecycle.block(&id.materialize());
             }
         }
     }
@@ -957,7 +965,7 @@ impl BlockIndex {
                 .iter()
                 .map(|entry| {
                     let e = entry.as_ref().expect("live directory entry");
-                    (e.meta.id.as_ref().clone(), e.meta.len)
+                    (e.meta.id.materialize(), e.meta.len)
                 })
                 .collect()
         })
@@ -975,16 +983,14 @@ impl BlockIndex {
                 let entry = guard.as_ref().expect("live directory entry");
                 let meta = &entry.meta;
                 match &entry.units {
-                    IndexedUnits::Whole(slot) => out.push((
-                        meta.id.as_ref().clone(),
-                        None,
-                        slot.read().unwrap().allocated,
-                    )),
+                    IndexedUnits::Whole(slot) => {
+                        out.push((meta.id.materialize(), None, slot.read().unwrap().allocated))
+                    }
                     IndexedUnits::Paged(pages) => {
                         for (&page, slot) in pages.read().unwrap().iter() {
                             if slot.unit.resident {
                                 out.push((
-                                    meta.id.as_ref().clone(),
+                                    meta.id.materialize(),
                                     Some(PageIndex(page)),
                                     slot.unit.allocated,
                                 ));
@@ -1089,7 +1095,7 @@ impl BlockIndex {
             return false;
         }
         let page_count = id.page_count(page_size);
-        let id = Arc::new(id);
+        let id = BlockKey::new(&id);
         let mut entry = Entry::new(
             StoredMeta {
                 id: id.clone(),
@@ -1359,7 +1365,7 @@ mod tests {
 
     #[test]
     fn recovery_and_readmission_share_the_catalog_identity() {
-        let id = Arc::new(block(1));
+        let id = BlockKey::new(&block(1));
         let mut index = BlockIndex::new();
         index.restore_allocated(
             vec![StoredBlock {
@@ -1374,9 +1380,9 @@ mod tests {
         );
         for bytes in [8192, 16384] {
             let entries = index.entries.read().unwrap();
-            let (key, slot) = entries.get_key_value(id.as_ref()).unwrap();
-            assert!(Arc::ptr_eq(key, &id));
-            assert!(Arc::ptr_eq(
+            let (key, slot) = entries.get_key_value(&id).unwrap();
+            assert!(key.ptr_eq(&id));
+            assert!(BlockKey::ptr_eq(
                 &slot
                     .resident
                     .as_ref()
@@ -1391,7 +1397,7 @@ mod tests {
                 &id
             ));
             drop(entries);
-            index.commit_allocated(whole_meta(id.as_ref().clone(), bytes), [(None, bytes)]);
+            index.commit_allocated(whole_meta(id.materialize(), bytes), [(None, bytes)]);
         }
     }
 

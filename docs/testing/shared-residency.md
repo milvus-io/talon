@@ -181,3 +181,10 @@ enabled. A policy admission generation isolates retained tokens from a later
 remove/reinsert of the same resident page; reader protection remains independent.
 Validation passed 667 Worker tests (8 ignored), Clippy and an independent
 correctness review. This layer has not been measured on the QTP fixture.
+
+The twelfth layer packs the three identity strings into one immutable buffer.
+Catalog, residency and policy share the compact key; borrowed lookups compare
+all fields without allocating a public BlockId. Public interfaces and journal
+JSON are unchanged. Validation passed 668 Worker tests (8 ignored), Clippy,
+a release build and independent identity/compatibility review. Further cold-page
+changes are deferred; the next measurement compares reads against the #669 binary.

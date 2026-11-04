@@ -98,7 +98,10 @@ impl Lru {
                     versions.insert(u.unit.block.clone());
                 }
                 if track_checks {
-                    checks.entry(block.object.clone()).or_insert((0, None)).0 += 1;
+                    checks
+                        .entry(block.view().object.materialize())
+                        .or_insert((0, None))
+                        .0 += 1;
                 }
             }
             tracing::info!(
@@ -434,11 +437,11 @@ mod tests {
                 let inner = lru.inner.lock().unwrap();
                 let activity = inner.index.policy_block_get(&id).unwrap();
                 let key = &inner.block_queue[&activity.position];
-                assert!(Arc::ptr_eq(
+                assert!(BlockKey::ptr_eq(
                     key,
                     &inner.ownership_queue[&activity.ownership_position]
                 ));
-                Arc::downgrade(key)
+                key.downgrade()
             };
             let limit = lru.ownership_admission_ceiling();
             let candidate = lru.next_ownership_block(&mut (0, limit), limit).unwrap().1;
@@ -454,7 +457,7 @@ mod tests {
                     .units,
                 1
             );
-            assert!(identity.upgrade().is_some());
+            assert!(identity());
             assert!(lru.pin(&second));
             assert!(lru.evict_to_fit(0).is_empty());
             lru.unpin(&second);
@@ -464,7 +467,7 @@ mod tests {
             assert!(lru.inner.lock().unwrap().index.policy_get(&first).is_none());
             lru.remove_block(&id);
             assert_eq!(lru.total_bytes(), 0);
-            assert!(identity.upgrade().is_none());
+            assert!(!identity());
             lru.insert(first, 7);
             assert_eq!(lru.total_bytes(), 7);
             assert!(!lru.stale_candidate_is_current(&candidate));

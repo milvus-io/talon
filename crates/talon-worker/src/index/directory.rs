@@ -1,12 +1,14 @@
-use super::{BlockId, DirectoryEntry};
+use super::DirectoryEntry;
+use crate::block_key::{BlockIdentity, BlockKey};
 use std::collections::{hash_map::Entry, HashMap};
-use std::sync::Arc;
+#[cfg(test)]
+use talon_core::BlockId;
 
 /// Keep large records out of spare hash buckets. Slots never escape the
 /// directory lock; externally retained resident/lifecycle objects use Arcs.
 #[derive(Default)]
 pub(super) struct Directory {
-    keys: HashMap<Arc<BlockId>, usize>,
+    keys: HashMap<BlockKey, usize>,
     slots: Vec<DirectoryEntry>,
     free: Vec<usize>,
 }
@@ -24,17 +26,17 @@ impl Directory {
         self.slots
             .reserve(additional.saturating_sub(self.free.len()));
     }
-    pub fn get(&self, id: &BlockId) -> Option<&DirectoryEntry> {
+    pub fn get(&self, id: &dyn BlockIdentity) -> Option<&DirectoryEntry> {
         Some(&self.slots[*self.keys.get(id)?])
     }
-    pub fn get_mut(&mut self, id: &BlockId) -> Option<&mut DirectoryEntry> {
+    pub fn get_mut(&mut self, id: &dyn BlockIdentity) -> Option<&mut DirectoryEntry> {
         Some(&mut self.slots[*self.keys.get(id)?])
     }
-    pub fn get_key_value(&self, id: &BlockId) -> Option<(&Arc<BlockId>, &DirectoryEntry)> {
+    pub fn get_key_value(&self, id: &dyn BlockIdentity) -> Option<(&BlockKey, &DirectoryEntry)> {
         let (key, slot) = self.keys.get_key_value(id)?;
         Some((key, &self.slots[*slot]))
     }
-    pub fn get_or_insert(&mut self, id: Arc<BlockId>) -> (Arc<BlockId>, &mut DirectoryEntry) {
+    pub fn get_or_insert(&mut self, id: BlockKey) -> (BlockKey, &mut DirectoryEntry) {
         let (key, slot) = match self.keys.entry(id) {
             Entry::Occupied(entry) => (entry.key().clone(), *entry.get()),
             Entry::Vacant(entry) => {
@@ -49,12 +51,12 @@ impl Directory {
         };
         (key, &mut self.slots[slot])
     }
-    pub fn remove(&mut self, id: &BlockId) -> Option<DirectoryEntry> {
+    pub fn remove(&mut self, id: &dyn BlockIdentity) -> Option<DirectoryEntry> {
         let slot = self.keys.remove(id)?;
         self.free.push(slot);
         Some(std::mem::take(&mut self.slots[slot]))
     }
-    pub fn iter(&self) -> impl Iterator<Item = (&Arc<BlockId>, &DirectoryEntry)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&BlockKey, &DirectoryEntry)> {
         self.keys
             .iter()
             .map(|(key, slot)| (key, &self.slots[*slot]))
@@ -62,7 +64,7 @@ impl Directory {
     pub fn values(&self) -> impl Iterator<Item = &DirectoryEntry> {
         self.keys.values().map(|slot| &self.slots[*slot])
     }
-    pub fn retain(&mut self, mut keep: impl FnMut(&Arc<BlockId>, &mut DirectoryEntry) -> bool) {
+    pub fn retain(&mut self, mut keep: impl FnMut(&BlockKey, &mut DirectoryEntry) -> bool) {
         self.keys.retain(|key, slot| {
             if keep(key, &mut self.slots[*slot]) {
                 return true;
@@ -90,7 +92,7 @@ mod tests {
     #[test]
     fn removal_and_recovery_reuse_only_retired_slots() {
         let id = |n| {
-            Arc::new(BlockId::new(
+            BlockKey::new(&BlockId::new(
                 ObjectId::new(Backend::S3, "b", format!("o/{n}")),
                 0,
                 256,
@@ -103,7 +105,7 @@ mod tests {
         }
         let canonical = directory.get_key_value(&id(30)).unwrap().0.clone();
         let replacement = directory.get_or_insert(id(30)).0;
-        assert!(Arc::ptr_eq(&canonical, &replacement));
+        assert!(canonical.ptr_eq(&replacement));
         for n in (0..100).step_by(2) {
             assert_eq!(directory.remove(&id(n)).unwrap().policy.len, n);
         }

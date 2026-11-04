@@ -177,7 +177,11 @@ impl Catalog {
                 Ok(state
                     .stores
                     .get(&store)
-                    .and_then(|store| store.blocks.get(&block))
+                    .and_then(|store| {
+                        store
+                            .blocks
+                            .get(&block as &dyn crate::block_key::BlockIdentity)
+                    })
                     .map(|block| block.pages.keys().copied().collect())
                     .unwrap_or_default())
             })

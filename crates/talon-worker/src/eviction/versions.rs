@@ -1,8 +1,8 @@
 //! One shared block identity per version; page membership stays in BlockIndex.
 use super::BlockKey;
+use crate::block_key::BlockIdentity;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use talon_core::BlockId;
 
 #[derive(Default, PartialEq, Eq)]
 pub(super) struct VersionIndex {
@@ -10,7 +10,8 @@ pub(super) struct VersionIndex {
     overflow: HashMap<u64, Vec<BlockKey>>,
 }
 
-fn digest(block: &BlockId) -> u64 {
+fn digest(block: &dyn BlockIdentity) -> u64 {
+    let block = block.view();
     let mut hash = DefaultHasher::new();
     block.object.hash(&mut hash);
     block.offset.hash(&mut hash);
@@ -18,7 +19,8 @@ fn digest(block: &BlockId) -> u64 {
     hash.finish()
 }
 
-fn same_logical(a: &BlockId, b: &BlockId) -> bool {
+fn same_logical(a: &dyn BlockIdentity, b: &dyn BlockIdentity) -> bool {
+    let (a, b) = (a.view(), b.view());
     a.object == b.object && a.offset == b.offset && a.block_size == b.block_size
 }
 
@@ -58,28 +60,31 @@ impl VersionIndex {
             Entry::Occupied(_) => {}
         }
     }
-    pub fn blocks<'a>(&'a self, block: &'a BlockId) -> impl Iterator<Item = &'a BlockKey> {
+    pub fn blocks<'a>(
+        &'a self,
+        block: &'a dyn BlockIdentity,
+    ) -> impl Iterator<Item = &'a BlockKey> {
         self.blocks_at(digest(block), block)
     }
     fn blocks_at<'a>(
         &'a self,
         hash: u64,
-        block: &'a BlockId,
+        block: &'a dyn BlockIdentity,
     ) -> impl Iterator<Item = &'a BlockKey> {
         self.first
             .get(&hash)
             .into_iter()
             .chain(self.overflow.get(&hash).into_iter().flatten())
-            .filter(move |candidate| same_logical(candidate, block))
+            .filter(move |candidate| same_logical(*candidate, block))
     }
-    pub fn remove(&mut self, block: &BlockId) {
+    pub fn remove(&mut self, block: &dyn BlockIdentity) {
         self.remove_at(digest(block), block);
     }
-    fn remove_at(&mut self, hash: u64, block: &BlockId) {
+    fn remove_at(&mut self, hash: u64, block: &dyn BlockIdentity) {
         if self
             .first
             .get(&hash)
-            .is_some_and(|first| first.as_ref() == block)
+            .is_some_and(|first| first.view() == block.view())
         {
             match self.overflow.get_mut(&hash).and_then(Vec::pop) {
                 Some(next) => {
@@ -90,7 +95,7 @@ impl VersionIndex {
                 }
             }
         } else if let Some(rest) = self.overflow.get_mut(&hash) {
-            if let Some(position) = rest.iter().position(|other| other.as_ref() == block) {
+            if let Some(position) = rest.iter().position(|other| other.view() == block.view()) {
                 rest.swap_remove(position);
             }
         }
@@ -103,13 +108,13 @@ impl VersionIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
-    use talon_core::{Backend, ObjectId, Version};
+
+    use talon_core::{Backend, BlockId, ObjectId, Version};
 
     #[test]
     fn digest_collisions_do_not_cross_logical_blocks_or_lose_versions() {
         let block = |path, version| {
-            Arc::new(BlockId::new(
+            BlockKey::new(&BlockId::new(
                 ObjectId::new(Backend::S3, "bucket", path),
                 0,
                 256,
