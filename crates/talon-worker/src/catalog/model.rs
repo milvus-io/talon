@@ -158,11 +158,19 @@ impl State {
                     Operation::PutWhole { len } => {
                         let entry = store.blocks.entry(Arc::new(intent.block));
                         let id = entry.key().clone();
-                        entry.insert_entry(Arc::new(Block {
+                        let block = Arc::new(Block {
                             id,
                             len,
                             pages: [(0, allocated)].into(),
-                        }));
+                        });
+                        match entry {
+                            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                                entry.insert(block);
+                            }
+                            std::collections::hash_map::Entry::Vacant(entry) => {
+                                entry.insert(block);
+                            }
+                        }
                     }
                     Operation::Put { page, len } => {
                         use std::collections::hash_map::Entry;
