@@ -1,6 +1,8 @@
-//! Atomic directory-shard access snapshots. Page files remain the residency authority.
+//! Advisory shard snapshots and append-only access deltas.
+mod journal;
 use crate::page_access_store::{AccessRecovery, AccessSnapshot, PageAccessStore};
 use crate::page_lifecycle::disk_shard;
+pub(crate) use journal::{encode_delta, flush, JournalState};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Read;
@@ -10,6 +12,7 @@ use tokio::io::AsyncWriteExt;
 use xxhash_rust::xxh3::xxh3_64;
 
 const MAGIC: &[u8; 8] = b"TLNSHR01";
+pub(crate) const LOG_NAME: &str = "access.log";
 pub(crate) const FILE_NAME: &str = "access.shard";
 pub(crate) const TEMP_PREFIX: &str = "access.shard.tmp.";
 // A malformed or exceptionally large shard must not allocate unbounded memory.
@@ -17,6 +20,7 @@ pub(crate) const MAX_BYTES: usize = 64 * 1024 * 1024;
 pub(crate) struct ShardRecovery {
     pub records: HashMap<BlockId, AccessRecovery>,
     pub corrupt: bool,
+    pub journal: JournalState,
 }
 
 pub(crate) fn load(dir: &Path, shard: usize, page_size: u32, now: u64) -> Option<ShardRecovery> {
@@ -25,12 +29,13 @@ pub(crate) fn load(dir: &Path, shard: usize, page_size: u32, now: u64) -> Option
         let mut bytes = Vec::new();
         match File::open(&path) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            file => file?.take(MAX_BYTES as u64 + 1).read_to_end(&mut bytes)?,
+            file => file?.take(MAX_BYTES as u64 + 17).read_to_end(&mut bytes)?,
         };
         anyhow::ensure!(
-            bytes.len() >= 24 && bytes.len() <= MAX_BYTES,
+            bytes.len() >= 24 && bytes.len() <= MAX_BYTES + 16,
             "invalid shard length"
         );
+        let (bytes, generation) = journal::unwrap_snapshot(&bytes)?;
         let end = bytes.len() - 8;
         anyhow::ensure!(
             xxh3_64(&bytes[..end]) == u64::from_le_bytes(bytes[end..].try_into()?),
@@ -64,9 +69,26 @@ pub(crate) fn load(dir: &Path, shard: usize, page_size: u32, now: u64) -> Option
             );
         }
         anyhow::ensure!(input.is_empty(), "trailing shard data");
+        let mut state = JournalState {
+            generation,
+            snapshot_bytes: bytes.len() as u64,
+            ..Default::default()
+        };
+        if generation > 0 {
+            journal::replay(
+                dir,
+                generation,
+                shard,
+                page_size,
+                now,
+                &mut records,
+                &mut state,
+            )?;
+        }
         Ok(Some(ShardRecovery {
             records,
             corrupt: false,
+            journal: state,
         }))
     })();
     match result {
@@ -76,6 +98,7 @@ pub(crate) fn load(dir: &Path, shard: usize, page_size: u32, now: u64) -> Option
             Some(ShardRecovery {
                 records: HashMap::new(),
                 corrupt: true,
+                journal: JournalState::default(),
             })
         }
     }
@@ -118,8 +141,18 @@ pub(crate) fn encode<'a>(
 }
 
 /// The caller retains the shard gate and mutation ownership across every await.
+#[cfg(test)]
 pub(crate) async fn publish(
     dir: &Path,
+    bytes: Vec<u8>,
+    resources: Option<&crate::background::BackgroundBudget>,
+) -> anyhow::Result<usize> {
+    publish_named(dir, FILE_NAME, bytes, resources).await
+}
+
+async fn publish_named(
+    dir: &Path,
+    name: &str,
     bytes: Vec<u8>,
     resources: Option<&crate::background::BackgroundBudget>,
 ) -> anyhow::Result<usize> {
@@ -152,7 +185,7 @@ pub(crate) async fn publish(
     file.sync_all().await?;
     #[cfg(test)]
     crate::page_access_store::checkpoint_fault("rename")?;
-    let target = dir.join(FILE_NAME);
+    let target = dir.join(name);
     tokio::task::spawn_blocking(move || temp_path.persist(target)).await??;
     #[cfg(test)]
     crate::page_access_store::checkpoint_fault("directory_sync")?;
