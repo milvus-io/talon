@@ -3,6 +3,69 @@ use crate::small_store::{tests::files, SegmentStore};
 use std::time::Duration;
 use talon_core::{Backend, BlockId, ObjectId, Version, WorkerConfig};
 
+#[tokio::test]
+async fn identity_is_shared_by_live_and_recovered_journal_locator_and_policy() {
+    use crate::block_key::BlockIdentity;
+    use crate::{small_store::SmallObjectStore, BlockIndex, Lru};
+    let dir = tempfile::tempdir().unwrap();
+    let block = id("shared/路径");
+    for recovered in [false, true] {
+        let store = Arc::new(
+            SmallObjectStore::open(dir.path().to_owned(), 128 << 10, 256 << 10, 4 << 20, None)
+                .unwrap(),
+        );
+        let mut units = Vec::new();
+        store.restore_policy_units(&mut units);
+        let policy = Arc::new(Lru::from_recovered(
+            Arc::new(BlockIndex::new()),
+            units,
+            store.len(),
+            true,
+            true,
+        ));
+        store.bind_policy(policy.clone());
+        if !recovered {
+            store
+                .put(&block, Bytes::from_static(b"shared"))
+                .await
+                .unwrap();
+        }
+        let stream = store
+            .streams()
+            .into_iter()
+            .find(|s| s.contains(&block))
+            .unwrap();
+        let journal_key = stream
+            .journal
+            .handle
+            .query_blocking(|m| {
+                Ok(m.segments
+                    .values()
+                    .flat_map(|s| s.records.values())
+                    .next()
+                    .unwrap()
+                    .key
+                    .clone())
+            })
+            .unwrap();
+        let locator_key = stream
+            .entries
+            .read()
+            .unwrap()
+            .get_key_value(&block as &dyn BlockIdentity)
+            .unwrap()
+            .0
+            .clone();
+        assert!(journal_key.ptr_eq(&locator_key));
+        assert!(journal_key.ptr_eq(&policy.shared_identity(&block)));
+        assert_eq!(
+            store.read(&block).await.unwrap().unwrap(),
+            Bytes::from_static(b"shared")
+        );
+        store.maintain(true).await.unwrap();
+    }
+}
+
 #[test]
 fn legacy_snapshot_headers_preserve_the_original_durability_boundary() {
     use talon_journal::Machine;
@@ -32,7 +95,7 @@ fn flush_boundaries_reject_record_splits_and_regression() {
                 segment: 1,
                 offset,
                 record: Record {
-                    key: format::key(&id(key)).unwrap().into(),
+                    key: crate::block_key::BlockKey::new(&id(key)),
                     len: 5,
                     checksum: 0,
                 },
@@ -242,7 +305,7 @@ async fn recovered_small_store_tail_uses_initial_snapshot_budget() {
             },
         )
         .unwrap();
-    let key: Arc<[u8]> = format::key(&id(&"k".repeat(60 << 10))).unwrap().into();
+    let key = crate::block_key::BlockKey::new(&id(&"k".repeat(60 << 10)));
     let log = root.join("metadata/journal.00000000000000000001");
     let mut offset = 0;
     // Build a valid large tail without checkpointing it, as can remain after

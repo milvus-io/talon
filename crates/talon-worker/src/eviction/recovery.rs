@@ -130,7 +130,7 @@ impl Lru {
                     .is_none()
                 {
                     let key = index.policy_block_insert(
-                        u.unit.block(),
+                        u.unit.block.clone(),
                         BlockPolicy {
                             pins: 0,
                             position,

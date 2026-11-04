@@ -242,7 +242,7 @@ async fn legacy_snapshot_migrates_and_log_threshold_compacts() {
     store.maintain(true).await.unwrap();
     let cold = access_millis() - 30_000;
     let mut bytes = LEGACY.to_vec();
-    encode(&mut bytes, &format::key(&id(0)).unwrap(), cold).unwrap();
+    encode(&mut bytes, &id(0), cold).unwrap();
     std::fs::write(dir.path().join(FILE), bytes).unwrap();
     drop(store);
     let store = open(dir.path());
@@ -367,7 +367,7 @@ async fn million_item_sparse_access_probe() {
     for n in 0..count {
         let mut block = id(n);
         block.object.object_path = format!("{n:092}"); // bucket + path + version = 100 bytes
-        let key: Arc<[u8]> = Arc::from(format::key(&block).unwrap());
+        let key = BlockKey::new(&block);
         stream.entries.write().unwrap().insert(
             key.clone(),
             Location {

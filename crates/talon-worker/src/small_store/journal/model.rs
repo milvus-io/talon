@@ -1,10 +1,11 @@
 //! The writer's checkpointable metadata state. Segment maps use copy-on-write
 //! so a snapshot can be encoded off the I/O thread while mutations continue.
 use super::*;
+use crate::block_key::BlockKey;
 
 #[derive(Clone)]
 pub(crate) struct Record {
-    pub key: Arc<[u8]>,
+    pub key: BlockKey,
     pub len: u64,
     pub checksum: u64,
 }
@@ -27,7 +28,7 @@ impl SegmentMeta {
             8 + self
                 .records
                 .range(..self.durable_end)
-                .map(|(_, r)| 37 + r.key.len() as u64)
+                .map(|(_, r)| 37 + format::key_len(&r.key) as u64)
                 .sum::<u64>()
         }
     }
@@ -87,7 +88,7 @@ impl Event {
                 for n in [*slot as u64, *segment, *offset, record.len, record.checksum] {
                     b.extend_from_slice(&n.to_le_bytes());
                 }
-                b.extend_from_slice(&record.key);
+                format::encode_key(&mut b, &record.key)?;
             }
             Self::Delete { segment, offset } => {
                 b.push(1);
@@ -132,11 +133,12 @@ impl Event {
                 let offset = format::u64(&mut b)?;
                 let len = format::u64(&mut b)?;
                 let checksum = format::u64(&mut b)?;
-                let id = format::id(b)?;
-                if len > 128 << 20 || !crate::small_store::accepts_object(u64::MAX, &id, len) {
+                let id = format::view(b)?;
+                if len == 0 || len > 128 << 20 || id.offset != 0 || len >= u64::from(id.block_size)
+                {
                     return Err(invalid("journal extent"));
                 }
-                let key = Arc::from(b);
+                let key = BlockKey::new(&id);
                 b = &[];
                 Self::Insert {
                     slot,
@@ -227,7 +229,7 @@ impl Model {
                     return Err(invalid("overlapping journal extent"));
                 }
                 s.bytes = s.bytes.max(end);
-                s.metadata += 37 + record.key.len() as u64;
+                s.metadata += 37 + format::key_len(&record.key) as u64;
                 s.records.insert(offset, record);
             }
             Event::Delete { segment, offset } => {
@@ -371,7 +373,7 @@ impl talon_journal::Machine for Model {
     type Snapshot = Snapshot;
     fn encoded_len(event: &Event) -> io::Result<usize> {
         Ok(match event {
-            Event::Insert { record, .. } => 41 + record.key.len(),
+            Event::Insert { record, .. } => 41 + format::key_len(&record.key),
             Event::Delete { .. } | Event::Replace { .. } | Event::Flush { .. } => 17,
             Event::Seal { .. } | Event::SetNext { .. } | Event::Recover { .. } => 9,
         })

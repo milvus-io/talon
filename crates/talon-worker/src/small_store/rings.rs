@@ -221,16 +221,13 @@ impl SmallObjectStore {
     }
 
     /// Resolve residency and physical placement in one directory lookup per
-    /// stream. Encode once and borrow the stream registry without allocating a
-    /// temporary Vec. The worker validates routing compatibility at startup.
-    pub(crate) fn lookup_entry(
-        &self,
-        id: &(impl SmallStoreKey + ?Sized),
-    ) -> io::Result<Option<Location>> {
-        if !id.exact_range() && id.block().offset != 0 {
+    /// stream, borrowing both the identity and stream registry.
+    /// The worker validates routing compatibility at startup.
+    pub(crate) fn lookup_entry(&self, id: &dyn BlockIdentity) -> io::Result<Option<Location>> {
+        if id.view().offset != 0 {
             return Ok(None);
         }
-        let key = format::key(id)?;
+        format::validate_key(id)?;
         for stream in self
             .streams
             .read()
@@ -238,7 +235,7 @@ impl SmallObjectStore {
             .values()
             .filter_map(|s| s.get())
         {
-            if let Some(loc) = stream.entries.read().unwrap().get(key.as_slice()).cloned() {
+            if let Some(loc) = stream.entries.read().unwrap().get(id).cloned() {
                 return Ok(Some(loc));
             }
         }
@@ -789,8 +786,21 @@ mod tests {
     }
 }
 
-fn validate_recovered_keys(keys: &mut [(u64, &[u8])]) -> io::Result<()> {
-    keys.sort_unstable();
+fn validate_recovered_keys(keys: &mut [(u64, &BlockKey)]) -> io::Result<()> {
+    fn parts(key: crate::block_key::BlockRef<'_>) -> (&str, &str, &str, u64, u32, &str) {
+        (
+            key.object.backend.prefix(),
+            key.object.bucket,
+            key.object.object_path,
+            key.offset,
+            key.block_size,
+            key.version,
+        )
+    }
+    keys.sort_unstable_by(|a, b| {
+        a.0.cmp(&b.0)
+            .then_with(|| parts(a.1.view()).cmp(&parts(b.1.view())))
+    });
     if keys.windows(2).any(|pair| pair[0].1 == pair[1].1) {
         return Err(invalid("duplicate recovered object"));
     }
@@ -816,13 +826,12 @@ mod recovery_tests {
 
     #[test]
     fn fingerprint_collisions_compare_complete_keys() {
-        let mut distinct = [(0, b"b".as_slice()), (0, b"a".as_slice())];
+        let a = BlockKey::new(&id(1));
+        let b = BlockKey::new(&id(2));
+        let same = BlockKey::new(&id(1));
+        let mut distinct = [(0, &b), (0, &a)];
         validate_recovered_keys(&mut distinct).unwrap();
-        let mut duplicate = [
-            (0, b"a".as_slice()),
-            (0, b"b".as_slice()),
-            (0, b"a".as_slice()),
-        ];
+        let mut duplicate = [(0, &a), (0, &b), (0, &same)];
         assert!(validate_recovered_keys(&mut duplicate).is_err());
     }
 

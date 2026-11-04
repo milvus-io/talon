@@ -369,16 +369,12 @@ impl BlockIndex {
         Some(update(entries.get_mut(id)?.activity.as_deref_mut()?))
     }
 
-    pub(crate) fn policy_block_insert(
-        &self,
-        id: &dyn BlockIdentity,
-        activity: BlockPolicy,
-    ) -> BlockKey {
+    pub(crate) fn policy_block_insert(&self, id: BlockKey, activity: BlockPolicy) -> BlockKey {
         let mut entries = self.entries.write().unwrap();
         let id = entries
-            .get_key_value(id)
+            .get_key_value(&id)
             .map(|(id, _)| id.clone())
-            .unwrap_or_else(|| BlockKey::new(id));
+            .unwrap_or(id);
         entries.get_or_insert(id.clone()).1.activity = Some(Box::new(activity));
         id
     }

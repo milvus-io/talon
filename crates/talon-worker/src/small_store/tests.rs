@@ -209,7 +209,7 @@ async fn pending_open_retains_old_inode_before_compaction_unlinks() {
         .entries
         .read()
         .unwrap()
-        .get(format::key(&id("held")).unwrap().as_slice())
+        .get(&id("held") as &dyn BlockIdentity)
         .unwrap()
         .clone();
     assert!(loc.file.fd.lock().await.upgrade().is_none());

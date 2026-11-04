@@ -55,6 +55,9 @@ pub(crate) enum UnitKind {
 pub(crate) trait UnitKey {
     fn block(&self) -> &dyn BlockIdentity;
     fn kind(&self) -> UnitKind;
+    fn shared_block(&self) -> BlockKey {
+        BlockKey::new(self.block())
+    }
 }
 impl UnitKey for CacheUnit {
     fn block(&self) -> &dyn BlockIdentity {
@@ -80,6 +83,9 @@ impl UnitKey for SharedUnit {
     }
     fn kind(&self) -> UnitKind {
         self.kind
+    }
+    fn shared_block(&self) -> BlockKey {
+        self.block.clone()
     }
 }
 impl SharedUnit {
@@ -403,7 +409,7 @@ impl Inner {
         Some(entry.bytes)
     }
 
-    fn remove_version(&mut self, unit: &CacheUnit) {
+    fn remove_version(&mut self, unit: &impl UnitKey) {
         let block = unit.block();
         if !self.index.policy_has_versioned_units(block) {
             self.versions.remove(block);
@@ -490,15 +496,24 @@ impl Lru {
         self.insert_with_policy(unit, bytes, false)
     }
 
+    pub(crate) fn shared_identity(&self, id: &dyn BlockIdentity) -> BlockKey {
+        self.inner
+            .lock()
+            .unwrap()
+            .index
+            .shared_identity(id)
+            .unwrap_or_else(|| BlockKey::new(id))
+    }
+
     /// Packed objects are independent full keys, with no cross-version eviction.
     pub(crate) fn insert_with_policy(
         &self,
-        unit: CacheUnit,
+        unit: impl UnitKey,
         bytes: u64,
         independent: bool,
     ) -> AccessHandle {
-        let independent = independent || matches!(unit, CacheUnit::ExactRange(_));
-        assert!(!independent || matches!(unit, CacheUnit::Whole(_) | CacheUnit::ExactRange(_)));
+        let independent = independent || unit.kind() == UnitKind::ExactRange;
+        assert!(!independent || !matches!(unit.kind(), UnitKind::Page(_)));
         let mut g = self.inner.lock().unwrap();
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
@@ -570,7 +585,7 @@ impl Lru {
         let block = unit.block();
         if g.track_blocks && g.index.policy_block_get(block).is_none() {
             let key = g.index.policy_block_insert(
-                block,
+                unit.shared_block(),
                 BlockPolicy {
                     pins: 0,
                     position,
@@ -596,7 +611,7 @@ impl Lru {
         }
         if g.track_checks {
             g.object_checks
-                .entry(block.object.clone())
+                .entry(block.view().object.materialize())
                 .or_insert((0, None))
                 .0 += 1;
         }
@@ -604,7 +619,7 @@ impl Lru {
             block: g
                 .index
                 .shared_identity(block)
-                .unwrap_or_else(|| BlockKey::new(block)),
+                .unwrap_or_else(|| unit.shared_block()),
             kind: unit.kind(),
         };
         if !independent {
