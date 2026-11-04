@@ -22,9 +22,10 @@ Ordered shard traversal and access checkpoints continue to reference that object
 
 Residency replacement still retires the old index entry. Page updates that retained
 that entry cannot mutate a new admission through an old metadata incarnation.
-The current lock order is lifecycle registry -> block lifecycle -> index directory;
-ordinary index reads do not acquire block lifecycle locks. Sharing page storage
-must update this order before introducing those reads.
+The shared page layer uses registry -> directory -> lifecycle bookkeeping -> page
+table for retirement. Scans release the page and bookkeeping locks before entering
+retirement. Ordinary reads take directory -> resident entry -> page table, and
+never acquire the lifecycle bookkeeping mutex.
 
 The journal, access snapshot and request formats are unchanged. Tests cover pending
 fills excluded from residency, gate identity across removal/reinsertion, retirement
@@ -36,3 +37,16 @@ otherwise rejects its creation with EPERM.
 Re-run the same fixture after the complete stack and report startup, steady RSS,
 restored counts and cached-content checks. A reduction below 1 GB is a target to
 measure, not an outcome established by these structural changes.
+
+The second layer shares a page table and one PageState between residency and
+lifecycle. One-page blocks store their entry inline; multiple pages use an ordered
+BTreeMap. Reads take the table read lock, independently of lifecycle bookkeeping.
+Clearing residency refunds allocation and clears access, but leaves a bound page
+for the deletion claim to finish. A removed handle stays closed; recreating the
+page gets a fresh handle, so an old candidate cannot modify the new generation.
+Startup binds existing page objects by block instead of copying a second table.
+
+The second layer passed 651 Worker library tests (8 ignored) and Clippy. The shared
+fixture regression covers read/delete arbitration, a failed-unlink retry, container
+transitions and stale candidates after re-admission. Neither layer changes disk
+formats or has yet established the post-change RSS on the QTP fixture.

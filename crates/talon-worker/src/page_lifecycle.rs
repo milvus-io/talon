@@ -2,7 +2,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use talon_core::{BlockId, PageIndex};
 
@@ -187,19 +187,31 @@ pub(crate) struct PageState {
     state: AtomicU64,
     last_access: AtomicU64,
     dirty_since: AtomicU64,
-    work: Arc<BlockWork>,
+    work: OnceLock<Arc<BlockWork>>,
 }
 impl PageState {
+    pub(crate) fn is_bound(&self) -> bool {
+        self.work.get().is_some()
+    }
+    pub(crate) fn bind_work(&self, work: Arc<BlockWork>) {
+        if let Some(old) = self.work.get() {
+            assert!(Arc::ptr_eq(old, &work));
+        } else {
+            self.work.set(work).ok().expect("page work bound twice");
+        }
+    }
+
     #[cfg(test)]
     fn new(access: Option<u64>) -> Self {
         Self::with_work(access, Arc::default())
     }
+    #[cfg(test)]
     fn with_work(access: Option<u64>, work: Arc<BlockWork>) -> Self {
         Self {
             state: AtomicU64::new(0),
             last_access: AtomicU64::new(access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1))),
             dirty_since: AtomicU64::new(UNKNOWN),
-            work,
+            work: OnceLock::from(work),
         }
     }
     pub fn last_access(&self) -> Option<u64> {
@@ -228,7 +240,7 @@ impl PageState {
                     // must also see this timestamp. Only the first dirty touch
                     // per page/checkpoint notifies the coalesced block summary.
                     if self.dirty_since.fetch_min(now, Ordering::Release) == UNKNOWN {
-                        self.work.dirty(now);
+                        self.work.get().expect("registered page").dirty(now);
                     }
                     break;
                 }
@@ -284,14 +296,30 @@ impl PageState {
 }
 
 pub(crate) struct PageEntry {
+    pub(crate) unit: crate::index::UnitSlot,
     pub handle: Arc<PageState>,
     // Only candidate selection changes this counter. It prevents one selection
     // from making an older candidate valid by consuming the ACCESSED bit again.
     selection: u64,
 }
-#[derive(Default)]
+impl PageEntry {
+    pub(crate) fn unbound() -> Self {
+        Self {
+            unit: Default::default(),
+            selection: 0,
+            handle: Arc::new(PageState {
+                state: AtomicU64::new(0),
+                last_access: AtomicU64::new(UNKNOWN),
+                dirty_since: AtomicU64::new(UNKNOWN),
+                work: OnceLock::new(),
+            }),
+        }
+    }
+}
+pub(crate) type PageTable = Arc<RwLock<crate::page_table::PageMap>>;
+
 pub(crate) struct BlockPages {
-    pub pages: BTreeMap<u32, PageEntry>,
+    pub pages: PageTable,
     // Structural changes only: hot reads never lock or modify their block.
     pub revision: u64,
     pub checkpointed_revision: u64,
@@ -337,7 +365,7 @@ impl BlockPageClaim {
 
     pub fn finish(mut self, now: u64) {
         let mut g = self.block.inner.lock().unwrap();
-        g.pages.clear();
+        g.pages.write().unwrap().clear();
         g.retries.clear();
         g.cleanup_pending = false;
         g.work.pending();
@@ -356,16 +384,27 @@ impl Drop for BlockPageClaim {
 }
 
 impl BlockState {
+    pub(crate) fn retire_if_empty(&self) -> bool {
+        let state = self.inner.lock().unwrap();
+        if !state.pages.read().unwrap().is_empty() || state.cleanup_pending {
+            return false;
+        }
+        state.work.retire();
+        true
+    }
+
     /// Caller holds the block mutation gate and rechecks block activity after
     /// claiming. CAS with each reader counter prevents partial block eviction.
     pub fn claim_all_pages(self: &Arc<Self>) -> Option<BlockPageClaim> {
         let g = self.inner.lock().unwrap();
+        let table = g.pages.clone();
+        let pages = table.read().unwrap();
         let mut claim = BlockPageClaim {
             block: self.clone(),
-            handles: Vec::with_capacity(g.pages.len()),
+            handles: Vec::with_capacity(pages.len()),
             committed: false,
         };
-        for entry in g.pages.values() {
+        for entry in pages.values() {
             let flags = entry.handle.state.load(Ordering::Acquire);
             if flags & (READERS | CLOSED) != 0
                 || entry
@@ -388,13 +427,13 @@ impl BlockState {
         dirty: bool,
     ) -> Arc<PageState> {
         let mut g = self.inner.lock().unwrap();
+        let table = g.pages.clone();
+        let mut pages = table.write().unwrap();
         g.cleanup_pending = false;
         let work = g.work.clone();
         // A duplicate same-version fill preserves existing guards and identity.
-        let e = g.pages.entry(page.0).or_insert_with(|| PageEntry {
-            handle: Arc::new(PageState::with_work(access, work)),
-            selection: 0,
-        });
+        let e = pages.get_or_insert_with(page.0, PageEntry::unbound);
+        e.handle.bind_work(work);
         if dirty {
             if let Some(access) = access {
                 e.handle.touch(access);
@@ -418,13 +457,17 @@ impl BlockState {
             .lock()
             .unwrap()
             .pages
+            .read()
+            .unwrap()
             .get(&page.0)?
             .handle
             .acquire()
     }
     pub fn candidate(self: &Arc<Self>, page: PageIndex) -> Option<GcCandidate> {
-        let mut g = self.inner.lock().unwrap();
-        let e = g.pages.get_mut(&page.0)?;
+        let g = self.inner.lock().unwrap();
+        let table = g.pages.clone();
+        let mut pages = table.write().unwrap();
+        let e = pages.get_mut(&page.0)?;
         let flags = e.handle.state.load(Ordering::Acquire);
         if flags & CLOSED != 0 {
             return None;
@@ -467,7 +510,9 @@ impl BlockState {
     /// point; timestamp validation follows successful exclusive ownership.
     pub fn claim(&self, c: &GcCandidate, now: u64, tti: Option<u64>) -> bool {
         let g = self.inner.lock().unwrap();
-        let Some(e) = g.pages.get(&c.page.0) else {
+        let table = g.pages.clone();
+        let pages = table.read().unwrap();
+        let Some(e) = pages.get(&c.page.0) else {
             return false;
         };
         if !Arc::ptr_eq(&e.handle, &c.handle) || e.selection != c.selection {
@@ -490,16 +535,18 @@ impl BlockState {
     }
     pub fn finish(&self, c: &GcCandidate, now: u64) {
         let mut g = self.inner.lock().unwrap();
-        if g.pages.get(&c.page.0).is_some_and(|e| {
+        let table = g.pages.clone();
+        let mut pages = table.write().unwrap();
+        if pages.get(&c.page.0).is_some_and(|e| {
             Arc::ptr_eq(&e.handle, &c.handle)
                 && e.selection == c.selection
                 && e.handle.state.load(Ordering::Acquire) & CLOSED != 0
         }) {
             // Removed handles stay closed forever, even after the same page is
             // admitted again. Outstanding old handles cannot pin a new file.
-            g.pages.remove(&c.page.0);
+            pages.remove(&c.page.0);
             g.retries.remove(&c.page.0);
-            g.cleanup_pending = g.pages.is_empty();
+            g.cleanup_pending = pages.is_empty();
             if g.cleanup_pending {
                 g.work.pending();
             }
@@ -508,7 +555,9 @@ impl BlockState {
     }
     pub fn abort(&self, c: &GcCandidate, reason: usize) {
         let mut g = self.inner.lock().unwrap();
-        if let Some(e) = g.pages.get(&c.page.0) {
+        let table = g.pages.clone();
+        let pages = table.read().unwrap();
+        if let Some(e) = pages.get(&c.page.0) {
             if Arc::ptr_eq(&e.handle, &c.handle) && e.selection == c.selection {
                 e.handle
                     .state
@@ -585,7 +634,11 @@ impl Drop for PageCheckpoint {
             self.handle
                 .dirty_since
                 .fetch_min(self.dirty_since, Ordering::Release);
-            self.handle.work.dirty(self.dirty_since);
+            self.handle
+                .work
+                .get()
+                .expect("registered page")
+                .dirty(self.dirty_since);
         }
     }
 }
@@ -702,28 +755,33 @@ impl PageLifecycle {
         // Drop the lookup's temporary owner before checking for external users.
         drop(block);
         if let Some(block) = g.ordered.get(&n) {
-            let state = block.inner.lock().unwrap();
-            if !state.pages.is_empty()
-                || state.cleanup_pending
-                || !self.index.retire_lifecycle(id, block)
-            {
+            if !self.index.retire_lifecycle(id, block) {
                 return;
             }
-            state.work.retire();
-            drop(state);
             g.ordered.remove(&n);
             g.removed(id);
         }
     }
+
     pub fn block(&self, id: &BlockId) -> Arc<BlockState> {
         let mut hash = DefaultHasher::new();
         id.hash(&mut hash);
         let shard = disk_shard(id);
         let mut g = self.shards[shard].lock().unwrap();
-        self.index.lifecycle_or_insert(id, |id| {
+        self.index.lifecycle_or_insert(id, |id, pages| {
             g.next += 1;
             g.membership += 1;
             let n = g.next;
+            let pages = pages.unwrap_or_default();
+            let work = Arc::new(BlockWork {
+                shard: self.work[shard].clone(),
+                slot: n,
+                retired: AtomicBool::new(false),
+                dirty_since: AtomicU64::new(UNKNOWN),
+            });
+            for page in pages.read().unwrap().values() {
+                page.handle.bind_work(work.clone());
+            }
             let block = Arc::new(BlockState {
                 id,
                 gate: Arc::new(PageMutationGate {
@@ -731,13 +789,12 @@ impl PageLifecycle {
                     block: tokio::sync::RwLock::new(()),
                 }),
                 inner: Mutex::new(BlockPages {
-                    work: Arc::new(BlockWork {
-                        shard: self.work[shard].clone(),
-                        slot: n,
-                        retired: AtomicBool::new(false),
-                        dirty_since: AtomicU64::new(UNKNOWN),
-                    }),
-                    ..Default::default()
+                    pages,
+                    work,
+                    revision: 0,
+                    checkpointed_revision: 0,
+                    cleanup_pending: false,
+                    retries: BTreeSet::new(),
                 }),
             });
             g.ordered.insert(n, block.clone());
@@ -794,18 +851,19 @@ impl PageLifecycle {
                 cursor.page = 0;
             }
             let mut state = block.inner.lock().unwrap();
-            if state.pages.is_empty() && state.cleanup_pending {
+            let table = state.pages.clone();
+            let mut pages = table.write().unwrap();
+            if pages.is_empty() && state.cleanup_pending {
                 report.empty.push(block.clone());
             }
-            if state.pages.is_empty()
-                && !state.cleanup_pending
-                && self.index.retire_lifecycle(&block.id, block)
-            {
-                let id = (*block.id).clone();
-                state.work.retire();
+            if pages.is_empty() && !state.cleanup_pending {
+                let id = block.id.clone();
+                drop(pages);
                 drop(state);
-                registry.ordered.remove(&slot);
-                registry.removed(&id);
+                if self.index.retire_lifecycle(&id, block) {
+                    registry.ordered.remove(&slot);
+                    registry.removed(&id);
+                }
                 cursor.block = slot + 1;
                 cursor.page = 0;
                 work += 1;
@@ -815,8 +873,7 @@ impl PageLifecycle {
             let mut in_block = 0;
             let start = cursor.page.min(u32::MAX as u64) as u32;
             let keys: Vec<_> = if tti.is_some() {
-                state
-                    .pages
+                pages
                     .range(start..)
                     .map(|(&page, _)| page)
                     .take(64)
@@ -832,12 +889,12 @@ impl PageLifecycle {
                 in_block += 1;
                 report.checked += 1;
                 cursor.page = u64::from(page) + 1;
-                let flags = state.pages[&page].handle.state.load(Ordering::Acquire);
+                let flags = pages[&page].handle.state.load(Ordering::Acquire);
                 let retry = PageState::retry(flags);
                 if retry.is_none() {
                     state.retries.remove(&page);
                 }
-                let entry = state.pages.get_mut(&page).unwrap();
+                let entry = pages.get_mut(&page).unwrap();
                 if retry.is_some() {
                     report.retries += 1;
                 }
@@ -861,7 +918,7 @@ impl PageLifecycle {
                     break;
                 }
             }
-            if !state.pages.is_empty() && state.retries.is_empty() && !state.cleanup_pending {
+            if !pages.is_empty() && state.retries.is_empty() && !state.cleanup_pending {
                 self.work[cursor.shard]
                     .pending
                     .lock()
@@ -1052,8 +1109,9 @@ mod tests {
             let candidate = block.candidate(PageIndex(0)).unwrap();
             assert!(block.claim(&candidate, 100, None));
             block.abort(&candidate, reason);
-            let mut state = block.inner.lock().unwrap();
-            let entry = state.pages.get_mut(&0).unwrap();
+            let state = block.inner.lock().unwrap();
+            let mut pages = state.pages.write().unwrap();
+            let entry = pages.get_mut(&0).unwrap();
             let observed = entry.handle.state.load(Ordering::Acquire);
             assert_eq!(PageState::retry(observed), Some(reason));
             // Pause selection after inspecting eligibility. Completion through
@@ -1062,6 +1120,7 @@ mod tests {
             assert!(block
                 .select(PageIndex(0), entry, reason, observed)
                 .is_none());
+            drop(pages);
             drop(state);
             let (candidates, _) = life.scan(&mut ScanCursor::default(), 100, 100, None, 10);
             assert!(candidates.is_empty());
@@ -1167,17 +1226,24 @@ mod tests {
         {
             let state = block.inner.lock().unwrap();
             assert_eq!(
-                state.pages[&0].handle.state.load(Ordering::Acquire) & READERS,
+                state.pages.read().unwrap()[&0]
+                    .handle
+                    .state
+                    .load(Ordering::Acquire)
+                    & READERS,
                 1
             );
-            assert_eq!(state.pages[&0].handle.last_access(), Some(20));
+            assert_eq!(
+                state.pages.read().unwrap()[&0].handle.last_access(),
+                Some(20)
+            );
         }
         assert!(!block.claim(&stale, 100, None));
         let current = block.candidate(PageIndex(0)).unwrap();
         assert!(!block.claim(&current, 100, None));
         drop(b);
         assert_eq!(
-            block.inner.lock().unwrap().pages[&0]
+            block.inner.lock().unwrap().pages.read().unwrap()[&0]
                 .handle
                 .state
                 .load(Ordering::Acquire)

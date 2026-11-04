@@ -434,8 +434,7 @@ impl WorkerRuntime {
         self.page_cleanup = Arc::new(tokio::sync::Mutex::new(
             crate::page_cleanup::CleanupCursor::new(paged.root().to_owned()),
         ));
-        self.index
-            .restore_page_states(&self.page_lifecycle, self.page_clock.now());
+        self.index.restore_page_states(&self.page_lifecycle);
         self.paged = Some(Arc::new(paged));
         self
     }
@@ -1709,7 +1708,7 @@ impl WorkerRuntime {
                         runtime
                             .index
                             .init_paged(id.clone(), paged.page_size(), block_len);
-                        let handle = state.register(
+                        state.register(
                             page,
                             Some(runtime.page_clock.now()),
                             runtime.page_clock.now(),
@@ -1719,7 +1718,6 @@ impl WorkerRuntime {
                         let unit = CacheUnit::Page(id.clone(), page);
                         let access = runtime.lru.insert(unit.clone(), allocated);
                         runtime.index.set_access(&unit, access);
-                        runtime.index.set_page_state(&id, page, handle);
                         if !warm_only && runtime.l1.is_enabled() {
                             runtime.admit_l1_page(&id, page, bytes.into_bytes());
                         }
@@ -2189,7 +2187,7 @@ impl WorkerRuntime {
                         }
                         // Keep same-version paged residency and complete the admission
                         // even when the original requester stops waiting.
-                        let paged = !state.inner.lock().unwrap().pages.is_empty();
+                        let paged = !state.inner.lock().unwrap().pages.read().unwrap().is_empty();
                         if paged {
                             drop(gate);
                             let size = runtime.paged_page_size().expect("paged state");

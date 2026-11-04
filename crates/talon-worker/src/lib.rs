@@ -25,6 +25,7 @@ pub mod page_access_store;
 mod page_cleanup;
 pub mod page_gc;
 mod page_lifecycle;
+mod page_table;
 pub mod paged_store;
 pub mod rate_limit;
 mod recovery;
