@@ -35,6 +35,9 @@ struct Args {
     /// Read at most this many bytes from each sampled object, preserving its identity.
     #[arg(long)]
     read_bytes: Option<u64>,
+    /// Use version-pinned reads, which support small store and may fetch on a miss.
+    #[arg(long)]
+    versioned_read: bool,
     #[arg(long, default_value_t = 1 << 20)]
     block_size: u32,
     /// Sample every Nth object from the same shuffled histogram for verification.
@@ -83,13 +86,13 @@ fn packet(args: &Args, i: u64) -> Vec<u8> {
             },
         )
         .unwrap(),
-        "fetch" => encode_versioned_request(
+        mode if mode == "fetch" || args.versioned_read => encode_versioned_request(
             1,
             &VersionedRangeRequest {
                 request: RangeRequest {
                     object,
                     offset: 0,
-                    len: args.size,
+                    len: read_len(args),
                 },
                 version,
                 object_len: args.size,
@@ -159,6 +162,7 @@ async fn main() {
     assert!(args.sample_step > 0);
     assert!(args.read_bytes.map_or(true, |bytes| bytes > 0
         && matches!(args.mode.as_str(), "read" | "verify")));
+    assert!(!args.versioned_read || matches!(args.mode.as_str(), "read" | "verify"));
     let mut sizes = Vec::new();
     if let Some(path) = &args.histogram {
         let histogram: Vec<(u64, usize)> =
@@ -312,7 +316,7 @@ async fn main() {
     };
     println!(
         "{}",
-        json!({"name":args.name,"mode":args.mode,"size":args.size,"read_bytes":args.read_bytes,"count":args.count,"concurrency":args.concurrency,"served":served,"started":wall,"elapsed":elapsed,"measured_seconds":seconds,"successes":good,"measured_bytes":good_bytes,"warmup_successes":warm,"qps":good as f64/seconds,"p50_us":pct(0.5),"p95_us":pct(0.95),"p99_us":pct(0.99),"p999_us":pct(0.999),"errors":errors.len(),"error_examples":errors.iter().take(4).collect::<Vec<_>>()})
+        json!({"name":args.name,"mode":args.mode,"size":args.size,"read_bytes":args.read_bytes,"versioned_read":args.versioned_read,"count":args.count,"concurrency":args.concurrency,"served":served,"started":wall,"elapsed":elapsed,"measured_seconds":seconds,"successes":good,"measured_bytes":good_bytes,"warmup_successes":warm,"qps":good as f64/seconds,"p50_us":pct(0.5),"p95_us":pct(0.95),"p99_us":pct(0.99),"p999_us":pct(0.999),"errors":errors.len(),"error_examples":errors.iter().take(4).collect::<Vec<_>>()})
     );
     if !errors.is_empty() || (args.mode != "read" && good != args.count) {
         std::process::exit(1);
