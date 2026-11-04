@@ -188,3 +188,45 @@ all fields without allocating a public BlockId. Public interfaces and journal
 JSON are unchanged. Validation passed 668 Worker tests (8 ignored), Clippy,
 a release build and independent identity/compatibility review. Further cold-page
 changes are deferred; the next measurement compares reads against the #669 binary.
+
+The read comparison is complete for local Worker `6109fff`. One warm startup per
+version measured recovery at 19.373 s for #669 and 7.972 s for the current Worker;
+readiness was 24.407 s and 13.270 s. Ready RSS was 10,404,851,712 and 1,607,770,112
+bytes. The current startup high-water RSS was 1,773,813,760 bytes; its highest
+sampled RSS during reads was 1,691,234,304 bytes. The 1 GB target remains unmet.
+The requested cold-page rewrite was not implemented.
+
+Both versions ran on the same 2-vCPU Worker with small store, L1, TTI, stale GC
+and ownership GC disabled. Each version completed its first background file
+cleanup before timed reads, requiring approximately eight additional minutes
+after readiness. All measured cases had zero cleanup progress. A preceding run
+that overlapped cleanup was discarded.
+
+The client drew reads from the same pool of 17,123 sampled objects, with
+byte-for-byte verification, five seconds of warmup and twenty measured seconds per case.
+The short workload reads at most 4096 bytes, preserving each object's identity;
+the full workload reads its entire payload. Values below are medians of three
+runs in one process per version. Baseline ran first, then current, so the test
+does not eliminate host drift or represent full-population random reads.
+
+| Read | Connections | #669 QPS | Current QPS | #669 P99 | Current P99 |
+|---|---:|---:|---:|---:|---:|
+| Up to 4 KiB | 64 | 28,922 | 28,990 | 3.248 ms | 3.239 ms |
+| Up to 4 KiB | 128 | 30,539 | 30,656 | 6.468 ms | 6.392 ms |
+| Full object | 64 | 7,341 | 7,330 | 21.268 ms | 21.273 ms |
+| Full object | 128 | 7,348 | 7,341 | 90.385 ms | 89.991 ms |
+
+High-concurrency throughput, P99 and CPU per request were effectively unchanged.
+Single-connection results varied substantially; the first baseline short-read
+case also recorded 830,558,208 OS read bytes despite prewarming. One current
+short-read/64-connection run had P99.9 of 6.775 ms, against 3.828–3.997 ms across
+the baseline runs; the other current runs were 3.842 and 3.948 ms. These results
+do not establish that extreme-tail latency can never regress.
+
+All 9,277,215 measured requests passed with zero errors, misses, origin fetches
+or evictions. Both startups restored exactly 1,934,887 blocks/pages and
+238,434,308,096 allocated bytes. Original services were restored and ready.
+No branch was pushed and no remote PR was created. The current Worker SHA256 is
+`ca70b892a78fc535fa978a88555d68bf8aa887ba6829f917bfa3fb17369b8bd1`.
+Raw results, CPU samples, metrics and the detailed report are retained locally
+under `target/benchmarks/shared-residency-20261104/read-steady/`.
