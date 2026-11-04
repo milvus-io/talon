@@ -150,3 +150,11 @@ and page counts survive directory detachment, even if an old policy/lifecycle
 owner subsequently removes shared slots before retirement finishes. Tests cover
 that deterministic interleaving and pending/zero-byte transitions. Validation
 passed 662 Worker tests (8 ignored) and Clippy; RSS has not yet been measured.
+
+The ninth layer stores directory records in a dense array. Hash buckets retain
+only the canonical identity and a slot number. Slot references never escape the
+directory lock; external resident and lifecycle owners retain their original
+Arcs, so free-slot reuse does not change generation identity. Removal and recovery
+reuse cleared slots. Capacity follows the historical peak, as with the previous
+HashMap. Validation passed 663 Worker tests (8 ignored), Clippy and independent
+correctness/cleaness reviews. This combined binary still needs an RSS measurement.

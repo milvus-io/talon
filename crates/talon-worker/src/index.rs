@@ -12,7 +12,8 @@
 //! locking the entry. Removal/replacement retires the old entry under its write
 //! lock, so writers racing with retirement retry their lookup.
 
-use std::collections::HashMap;
+mod directory;
+use directory::Directory;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
@@ -40,7 +41,7 @@ pub enum Presence {
 /// A thread-safe index of resident blocks.
 #[derive(Default)]
 pub struct BlockIndex {
-    entries: RwLock<HashMap<Arc<BlockId>, DirectoryEntry>>,
+    entries: RwLock<Directory>,
     resident_blocks: AtomicU64,
     resident_bytes: AtomicU64,
     resident_pages: AtomicU64,
@@ -363,7 +364,7 @@ impl BlockIndex {
             .get_key_value(id)
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| Arc::new(id.clone()));
-        entries.entry(id.clone()).or_default().activity = Some(activity);
+        entries.get_or_insert(id.clone()).1.activity = Some(activity);
         id
     }
 
@@ -442,7 +443,7 @@ impl BlockIndex {
         let directory = if let Some(directory) = entries.get_mut(unit.block()) {
             directory
         } else {
-            entries.entry(unit.block.clone()).or_default()
+            entries.get_or_insert(unit.block.clone()).1
         };
         let resident = directory
             .resident
@@ -590,23 +591,16 @@ impl BlockIndex {
         let bytes = self.resident_bytes.get_mut();
         let pages = self.resident_pages.get_mut();
         for (id, mut entry, added_bytes, added_pages) in built {
-            let slot = match entries.entry(id) {
-                std::collections::hash_map::Entry::Occupied(slot) => {
-                    Arc::get_mut(&mut entry)
-                        .unwrap()
-                        .block
-                        .get_mut()
-                        .unwrap()
-                        .as_mut()
-                        .unwrap()
-                        .meta
-                        .id = slot.key().clone();
-                    slot.into_mut()
-                }
-                std::collections::hash_map::Entry::Vacant(slot) => {
-                    slot.insert(DirectoryEntry::default())
-                }
-            };
+            let (key, slot) = entries.get_or_insert(id);
+            Arc::get_mut(&mut entry)
+                .unwrap()
+                .block
+                .get_mut()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .meta
+                .id = key;
             if let Some(old) = slot.resident.replace(entry) {
                 let old = old
                     .block
@@ -642,7 +636,7 @@ impl BlockIndex {
             .get_key_value(id)
             .map(|(id, _)| id.clone())
             .unwrap_or_else(|| Arc::new(id.clone()));
-        let slot = entries.entry(key.clone()).or_default();
+        let (_, slot) = entries.get_or_insert(key.clone());
         if let Some(block) = &slot.lifecycle {
             return block.clone();
         }
@@ -1026,15 +1020,8 @@ impl BlockIndex {
         let mut entries = self.entries.write().unwrap();
         // Structural mutations take directory -> entry. Ordinary operations
         // never reacquire the directory while holding an entry lock.
-        let slot = match entries.entry(id) {
-            std::collections::hash_map::Entry::Occupied(slot) => {
-                entry.meta.id = slot.key().clone();
-                slot.into_mut()
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(DirectoryEntry::default())
-            }
-        };
+        let (key, slot) = entries.get_or_insert(id);
+        entry.meta.id = key;
         let previous = slot.resident.as_ref().map(|old| {
             old.block
                 .write()
@@ -1109,15 +1096,8 @@ impl BlockIndex {
             .into(),
         );
         let mut entries = self.entries.write().unwrap();
-        let slot = match entries.entry(id) {
-            std::collections::hash_map::Entry::Occupied(slot) => {
-                entry.block.get_mut().unwrap().as_mut().unwrap().meta.id = slot.key().clone();
-                slot.into_mut()
-            }
-            std::collections::hash_map::Entry::Vacant(slot) => {
-                slot.insert(DirectoryEntry::default())
-            }
-        };
+        let (key, slot) = entries.get_or_insert(id);
+        entry.block.get_mut().unwrap().as_mut().unwrap().meta.id = key;
         if slot.resident.is_some() {
             return false;
         }
