@@ -12,7 +12,9 @@
 //! are deferred per DESIGN.md.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 #[cfg(test)]
@@ -100,11 +102,12 @@ impl From<CacheUnit> for SharedUnit {
 /// Stable recency token for one resident unit. Keeping this token does not pin
 /// data. After removal it cannot affect a new admission of the same identity.
 #[derive(Clone)]
-pub struct AccessHandle(
-    Arc<AtomicBool>,
-    Option<Arc<AtomicU64>>,
-    Option<Arc<crate::small_store::DirtyAccess>>,
-);
+pub struct AccessHandle {
+    pub(crate) state: Arc<crate::page_lifecycle::PageState>,
+    clock: Option<Arc<AtomicU64>>,
+    dirty: Option<Arc<crate::small_store::DirtyAccess>>,
+    generation: u64,
+}
 
 /// Anchored wall time: monotonic within a process and portable across restarts.
 pub(crate) fn access_millis() -> u64 {
@@ -121,31 +124,58 @@ impl Default for AccessHandle {
 }
 
 impl AccessHandle {
+    pub(crate) fn with_state(
+        state: Arc<crate::page_lifecycle::PageState>,
+        clock: Option<Arc<AtomicU64>>,
+    ) -> Self {
+        let generation = state.policy_generation();
+        Self {
+            state,
+            clock,
+            dirty: None,
+            generation,
+        }
+    }
+    pub(crate) fn bind_state(mut self, state: Arc<crate::page_lifecycle::PageState>) -> Self {
+        if !Arc::ptr_eq(&self.state, &state) {
+            self.generation = state.policy_generation();
+            self.state = state;
+        }
+        self
+    }
+    pub(crate) fn retire(&self) {
+        self.state.retire_policy(self.generation);
+    }
+    fn referenced(&self) -> bool {
+        self.state.referenced(self.generation)
+    }
+    fn take_reference(&self) -> bool {
+        self.state.take_reference(self.generation)
+    }
     pub(crate) fn new(track_clock: bool) -> Self {
-        Self(
-            Arc::new(AtomicBool::new(false)),
+        Self::with_state(
+            Arc::default(),
             track_clock.then(|| Arc::new(AtomicU64::new(access_millis()))),
-            None,
         )
     }
     pub(crate) fn clock(&self) -> &Arc<AtomicU64> {
-        self.1.as_ref().expect("access tracking enabled")
+        self.clock.as_ref().expect("access tracking enabled")
     }
 
     pub(crate) fn track_small(mut self, dirty: Arc<crate::small_store::DirtyAccess>) -> Self {
-        self.2 = Some(dirty);
+        self.dirty = Some(dirty);
         self
     }
 
     pub(crate) fn sample_small(&self) -> u64 {
-        if let Some(dirty) = &self.2 {
+        if let Some(dirty) = &self.dirty {
             dirty.consume();
         }
         self.last_access()
     }
 
     pub(crate) fn last_access(&self) -> u64 {
-        self.1
+        self.clock
             .as_ref()
             .map_or(0, |clock| clock.load(Ordering::Relaxed))
     }
@@ -165,25 +195,24 @@ impl AccessHandle {
     }
 
     /// Separate second-chance bit, with the same block-wide idle clock.
+    #[cfg(test)]
     pub(crate) fn sibling(&self) -> Self {
-        Self(Arc::new(AtomicBool::new(false)), self.1.clone(), None)
+        Self::with_state(Arc::default(), self.clock.clone())
     }
 
     /// Coalesce hits until the eviction hand consumes this second chance.
     /// This is advisory recency only, so relaxed ordering is sufficient.
     pub fn touch(&self) {
-        if let Some(clock) = &self.1 {
+        if let Some(clock) = &self.clock {
             let now = access_millis();
             if clock.load(Ordering::Relaxed) < now {
                 clock.fetch_max(now, Ordering::Relaxed);
             }
         }
-        if let Some(dirty) = &self.2 {
+        if let Some(dirty) = &self.dirty {
             dirty.touch();
         }
-        if !self.0.load(Ordering::Relaxed) {
-            self.0.store(true, Ordering::Relaxed);
-        }
+        self.state.reference(self.generation);
     }
 }
 
@@ -305,8 +334,7 @@ impl Inner {
             .policy_get(&unit)
             .expect("tracked cache unit")
             .access
-            .0
-            .store(false, Ordering::Relaxed);
+            .take_reference();
         let revision = self.rotate(&unit);
         self.index
             .policy_update(&unit, |entry| entry.revision = revision);
@@ -467,8 +495,8 @@ impl Lru {
                 e.bytes = bytes;
             });
             let mut access = e.access.clone();
-            if independent && access.1.is_none() {
-                access.1 = Some(Arc::new(AtomicU64::new(access_millis())));
+            if independent && access.clock.is_none() {
+                access.clock = Some(Arc::new(AtomicU64::new(access_millis())));
                 let unit = SharedUnit {
                     block: g
                         .index
@@ -529,9 +557,9 @@ impl Lru {
         });
         let clock =
             clock.or_else(|| independent.then(|| Arc::new(AtomicU64::new(access_millis()))));
-        let access = AccessHandle(Arc::new(AtomicBool::new(false)), clock, None);
+        let access = AccessHandle::with_state(Arc::default(), clock);
         // New pages also refresh the shared block idle age.
-        if let Some(clock) = &access.1 {
+        if let Some(clock) = &access.clock {
             clock.fetch_max(access_millis(), Ordering::Relaxed);
         }
         if g.track_checks {
@@ -563,8 +591,7 @@ impl Lru {
                 },
                 access: access.clone(),
             },
-        );
-        access
+        )
     }
 
     /// Compatibility lookup for callers without a resolved access token.
@@ -668,7 +695,7 @@ impl Lru {
                     // a touch after its snapshot must still invalidate it.
                     let eligible =
                         entry.pins == 0 && !selected.contains(&unit) && !excluded.contains(&unit);
-                    let referenced = eligible && entry.access.0.swap(false, Ordering::Relaxed);
+                    let referenced = eligible && entry.access.take_reference();
                     let victim = eligible && (second_pass || !referenced);
                     let bytes = entry.bytes;
                     let revision = g.rotate(&unit);
@@ -893,7 +920,7 @@ impl Lru {
             .is_some_and(|entry| {
                 entry.pins == 0
                     && entry.revision == candidate.revision
-                    && !entry.access.0.load(Ordering::Relaxed)
+                    && !entry.access.referenced()
             })
     }
 
@@ -956,7 +983,7 @@ impl Lru {
                     let position = *position;
                     let unit = unit.clone();
                     let e = g.index.policy_get(&unit).expect("queued entry");
-                    let referenced = e.access.0.swap(false, Ordering::Relaxed);
+                    let referenced = e.access.take_reference();
                     if e.pins == 0 && (second_pass || !referenced) {
                         let unit = unit.materialize();
                         g.remove(&unit);
@@ -1011,7 +1038,7 @@ mod tests {
         new_block.version = Version::new("v2");
         let new = CacheUnit::Page(new_block.clone(), PageIndex(0));
         let token = lru.insert(old.clone(), 4096);
-        assert!(token.1.is_none());
+        assert!(token.clock.is_none());
         token.touch();
         assert!(lru.pin(&old));
         lru.insert(new.clone(), 8192);
@@ -1035,7 +1062,7 @@ mod tests {
             let access = lru.insert(unit.clone(), 10);
             let pin = lru.pin_guard(unit.clone());
             let updated = lru.insert_with_policy(unit.clone(), 20, true);
-            assert!(updated.1.is_some());
+            assert!(updated.clock.is_some());
             assert!(lru
                 .inner
                 .lock()
@@ -1044,9 +1071,9 @@ mod tests {
                 .policy_get(&unit)
                 .unwrap()
                 .access
-                .1
+                .clock
                 .is_some());
-            assert!(Arc::ptr_eq(&access.0, &updated.0));
+            assert!(Arc::ptr_eq(&access.state, &updated.state));
             assert!(lru.inner.lock().unwrap().versions.is_empty());
             assert_eq!(
                 lru.inner
@@ -1059,7 +1086,7 @@ mod tests {
                 1
             );
             let updated = lru.insert(unit.clone(), 30);
-            assert!(Arc::ptr_eq(&access.0, &updated.0));
+            assert!(Arc::ptr_eq(&access.state, &updated.state));
             assert_eq!(lru.inner.lock().unwrap().versions.len(), 1);
             assert_eq!(
                 lru.inner

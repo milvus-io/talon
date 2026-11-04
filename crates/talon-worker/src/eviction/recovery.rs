@@ -218,7 +218,7 @@ mod tests {
         index.init_paged(id.clone(), 1 << 20, 1 << 20);
         index.mark_page_allocated(&id, PageIndex(0), 4096);
         let units = index.restore_policy_units(false);
-        assert!(units.iter().all(|unit| unit.access.1.is_none()));
+        assert!(units.iter().all(|unit| unit.access.clock.is_none()));
         let lru = Lru::from_recovered(index.clone(), units, 1, false, false);
         assert!(index.policy_block_get(&id).is_none());
         assert_eq!(lru.total_bytes(), 4096);
@@ -227,7 +227,7 @@ mod tests {
             .is_some());
         let unit = CacheUnit::Page(id, PageIndex(0));
         let access = lru.insert(unit.clone(), 8192);
-        assert!(access.1.is_none());
+        assert!(access.clock.is_none());
         assert_eq!(lru.evict_to_fit(0), [unit]);
         let g = lru.inner.lock().unwrap();
         assert!(g.block_queue.is_empty());

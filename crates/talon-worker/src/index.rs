@@ -438,7 +438,7 @@ impl BlockIndex {
         entry.policy.len > usize::from(independent_whole)
     }
 
-    pub(crate) fn policy_insert(&self, unit: &SharedUnit, entry: PolicyEntry) {
+    pub(crate) fn policy_insert(&self, unit: &SharedUnit, entry: PolicyEntry) -> AccessHandle {
         let mut entries = self.entries.write().unwrap();
         let directory = if let Some(directory) = entries.get_mut(unit.block()) {
             directory
@@ -456,32 +456,34 @@ impl BlockIndex {
                 })
             })
             .unwrap_or_default();
-        let put = |slot: &mut UnitSlot| {
+        let put = |slot: &mut UnitSlot, access: AccessHandle| {
             let fresh = slot.policy.replace(entry.state).is_none();
-            slot.access = Some(entry.access);
-            fresh
+            slot.access = Some(access.clone());
+            (fresh, access)
         };
-        let fresh = match unit.page() {
+        let (fresh, access) = match unit.page() {
             None => {
                 let slot = directory
                     .policy
                     .whole
                     .get_or_insert_with(|| resident.0.unwrap_or_default());
-                put(&mut slot.write().unwrap())
+                put(&mut slot.write().unwrap(), entry.access)
             }
             Some(page) => {
                 let pages = directory
                     .policy
                     .pages
                     .get_or_insert_with(|| resident.1.unwrap_or_default());
-                put(&mut pages
-                    .write()
-                    .unwrap()
-                    .get_or_insert_with(page.0, PageEntry::unbound)
-                    .unit)
+                let mut pages = pages.write().unwrap();
+                let page = pages.get_or_insert_with(page.0, || {
+                    PageEntry::with_handle(entry.access.state.clone())
+                });
+                let access = entry.access.bind_state(page.handle.clone());
+                put(&mut page.unit, access)
             }
         };
         directory.policy.len += usize::from(fresh);
+        access
     }
 
     pub(crate) fn policy_update<T>(
@@ -546,6 +548,7 @@ impl BlockIndex {
                 removed
             }
         };
+        removed.access.retire();
         directory.policy.len -= 1;
         if directory.policy.len == 0 {
             directory.policy = PolicyUnits::default();
@@ -787,35 +790,34 @@ impl BlockIndex {
         for entry in entries.values().filter_map(|entry| entry.resident.as_ref()) {
             let mut guard = entry.block.write().unwrap();
             let entry = guard.as_mut().expect("live directory entry");
-            let shared = AccessHandle::new(track_clock);
-            let mut first = true;
-            let mut add = |page: Option<PageIndex>, slot: &mut UnitSlot| {
-                let access = if first {
-                    first = false;
-                    shared.clone()
-                } else {
-                    shared.sibling()
+            let clock =
+                track_clock.then(|| Arc::new(AtomicU64::new(crate::eviction::access_millis())));
+            let mut add =
+                |page: Option<PageIndex>,
+                 slot: &mut UnitSlot,
+                 handle: Option<Arc<crate::page_lifecycle::PageState>>| {
+                    let access =
+                        AccessHandle::with_state(handle.unwrap_or_default(), clock.clone());
+                    slot.access = Some(access.clone());
+                    units.push(RecoveredUnit {
+                        independent: false,
+                        unit: crate::eviction::SharedUnit {
+                            block: entry.meta.id.clone(),
+                            page,
+                        },
+                        bytes: slot.allocated,
+                        access,
+                    });
                 };
-                slot.access = Some(access.clone());
-                units.push(RecoveredUnit {
-                    independent: false,
-                    unit: crate::eviction::SharedUnit {
-                        block: entry.meta.id.clone(),
-                        page,
-                    },
-                    bytes: slot.allocated,
-                    access,
-                });
-            };
             match &entry.units {
                 IndexedUnits::Whole(_) => {
-                    entry.units.write(None, |slot| add(None, slot));
+                    entry.units.write(None, |slot| add(None, slot, None));
                 }
                 IndexedUnits::Paged(pages) => {
                     for (&page, state) in pages.write().unwrap().iter_mut() {
                         let page = PageIndex(page);
                         if state.unit.resident {
-                            add(Some(page), &mut state.unit);
+                            add(Some(page), &mut state.unit, Some(state.handle.clone()));
                         }
                     }
                 }
@@ -1677,6 +1679,40 @@ mod tests {
         );
         assert!(index.clear_page(&id, PageIndex(7)));
         assert_eq!((index.resident_bytes(), index.page_count()), (0, 0));
+    }
+
+    #[test]
+    fn retained_page_tokens_do_not_touch_a_new_policy_admission() {
+        let index = Arc::new(BlockIndex::new());
+        let id = block(1);
+        index.init_paged(id.clone(), 4096, 4096);
+        index.mark_page_allocated(&id, PageIndex(0), 4096);
+        let lru = index.restore_lru();
+        let unit = CacheUnit::Page(id.clone(), PageIndex(0));
+        let old = lru.insert(unit.clone(), 4096);
+        let (reader, _) = index
+            .page_reads_and_touch(&id, PageIndex(0), PageIndex(1))
+            .unwrap();
+        let life = crate::page_lifecycle::PageLifecycle::with_index(index.clone(), false);
+        let block = life.block(&id);
+        for _ in 0..3 {
+            lru.remove(&unit);
+            let current = lru.insert(unit.clone(), 4096);
+            let candidate = lru.block_candidates(&id).pop().unwrap();
+            old.touch();
+            assert!(
+                lru.candidate_is_current(&candidate),
+                "retired token reached a later admission"
+            );
+            current.touch();
+            assert!(!lru.candidate_is_current(&candidate));
+            assert!(
+                block.claim_all_pages().is_none(),
+                "policy generations must preserve existing page readers"
+            );
+        }
+        reader.record_access_and_release(None);
+        assert!(block.claim_all_pages().is_some());
     }
 
     #[test]

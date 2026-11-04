@@ -174,3 +174,10 @@ zero evictions occurred, and 17,123 content checks passed. Original services wer
 restored. Binary SHA256:
 `0788aaaca95fe986fe6b57934ffd69e813f4e8490d4e7c4feb506dd751a158b2`.
 The 1 GB target is still unmet; read performance has not been compared.
+
+The eleventh layer shares page lifetime and capacity recency in one allocation.
+Access ages and checkpoint bookkeeping are allocated only when age tracking is
+enabled. A policy admission generation isolates retained tokens from a later
+remove/reinsert of the same resident page; reader protection remains independent.
+Validation passed 667 Worker tests (8 ignored), Clippy and an independent
+correctness review. This layer has not been measured on the QTP fixture.

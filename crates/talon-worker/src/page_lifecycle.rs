@@ -189,26 +189,91 @@ impl Drop for BlockCheckpoint {
     }
 }
 
+#[derive(Default)]
 pub(crate) struct PageState {
     state: AtomicU64,
+    recency: AtomicU64,
+    access: OnceLock<Box<PageAccess>>,
+}
+
+struct PageAccess {
     last_access: AtomicU64,
     dirty_since: AtomicU64,
     work: OnceLock<Arc<BlockWork>>,
 }
+impl Default for PageAccess {
+    fn default() -> Self {
+        Self {
+            last_access: AtomicU64::new(UNKNOWN),
+            dirty_since: AtomicU64::new(UNKNOWN),
+            work: OnceLock::new(),
+        }
+    }
+}
 impl PageState {
+    pub(crate) fn policy_generation(&self) -> u64 {
+        let old = self
+            .recency
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                Some(
+                    (old & !1)
+                        .checked_add(2)
+                        .expect("policy generation exhausted"),
+                )
+            })
+            .unwrap();
+        (old & !1) + 2
+    }
+    pub(crate) fn retire_policy(&self, generation: u64) {
+        let _ = self
+            .recency
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                (current & !1 == generation).then(|| {
+                    generation
+                        .checked_add(2)
+                        .expect("policy generation exhausted")
+                })
+            });
+    }
+    pub(crate) fn referenced(&self, generation: u64) -> bool {
+        self.recency.load(Ordering::Relaxed) == generation | 1
+    }
+    pub(crate) fn reference(&self, generation: u64) {
+        let _ = self.recency.compare_exchange(
+            generation,
+            generation | 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        );
+    }
+    pub(crate) fn take_reference(&self, generation: u64) -> bool {
+        self.recency
+            .compare_exchange(
+                generation | 1,
+                generation,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+    }
+    fn access(&self) -> &PageAccess {
+        self.access.get_or_init(Box::default)
+    }
     pub(crate) fn is_bound(&self) -> bool {
         self.state.load(Ordering::Relaxed) & BOUND != 0
     }
     pub(crate) fn bind_work(&self, work: Arc<BlockWork>) {
         if work.track_access {
-            if let Some(old) = self.work.get() {
+            let access = self.access();
+            if let Some(old) = access.work.get() {
                 assert!(Arc::ptr_eq(old, &work));
             } else {
-                self.work
+                access
+                    .work
                     .set(work.clone())
                     .ok()
                     .expect("page work bound twice");
-                let dirty = self.dirty_since.load(Ordering::Acquire);
+                let dirty = access.dirty_since.load(Ordering::Acquire);
                 if dirty != UNKNOWN {
                     work.dirty(dirty);
                 }
@@ -225,27 +290,31 @@ impl PageState {
     fn with_work(access: Option<u64>, work: Arc<BlockWork>) -> Self {
         Self {
             state: AtomicU64::new(BOUND),
-            last_access: AtomicU64::new(access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1))),
-            dirty_since: AtomicU64::new(UNKNOWN),
-            work: OnceLock::from(work),
+            recency: AtomicU64::new(0),
+            access: OnceLock::from(Box::new(PageAccess {
+                last_access: AtomicU64::new(access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1))),
+                dirty_since: AtomicU64::new(UNKNOWN),
+                work: OnceLock::from(work),
+            })),
         }
     }
     pub fn last_access(&self) -> Option<u64> {
-        let t = self.last_access.load(Ordering::Acquire);
+        let t = self.access.get()?.last_access.load(Ordering::Acquire);
         (t != UNKNOWN).then_some(t)
     }
     #[cfg(test)]
     fn dirty_since(&self) -> Option<u64> {
-        let t = self.dirty_since.load(Ordering::Acquire);
+        let t = self.access.get()?.dirty_since.load(Ordering::Acquire);
         (t != UNKNOWN).then_some(t)
     }
     fn touch(&self, now: u64) {
+        let access = self.access();
         let now = now.min(UNKNOWN - 1);
         // Out-of-order readers must not move access time backwards. Coalesce
         // same-millisecond hits without another timestamp or dirty-state write.
-        let mut old = self.last_access.load(Ordering::Relaxed);
+        let mut old = access.last_access.load(Ordering::Relaxed);
         while old == UNKNOWN || old < now {
-            match self.last_access.compare_exchange_weak(
+            match access.last_access.compare_exchange_weak(
                 old,
                 now,
                 Ordering::Release,
@@ -255,8 +324,8 @@ impl PageState {
                     // Always a release RMW: a checkpoint consuming this marker
                     // must also see this timestamp. Only the first dirty touch
                     // per page/checkpoint notifies the coalesced block summary.
-                    if self.dirty_since.fetch_min(now, Ordering::Release) == UNKNOWN {
-                        if let Some(work) = self.work.get() {
+                    if access.dirty_since.fetch_min(now, Ordering::Release) == UNKNOWN {
+                        if let Some(work) = access.work.get() {
                             work.dirty(now);
                         }
                     }
@@ -322,15 +391,13 @@ pub(crate) struct PageEntry {
 }
 impl PageEntry {
     pub(crate) fn unbound() -> Self {
+        Self::with_handle(Arc::default())
+    }
+    pub(crate) fn with_handle(handle: Arc<PageState>) -> Self {
         Self {
             unit: Default::default(),
             selection: 0,
-            handle: Arc::new(PageState {
-                state: AtomicU64::new(0),
-                last_access: AtomicU64::new(UNKNOWN),
-                dirty_since: AtomicU64::new(UNKNOWN),
-                work: OnceLock::new(),
-            }),
+            handle,
         }
     }
 }
@@ -457,20 +524,23 @@ impl BlockState {
         let mut pages = table.write().unwrap();
         g.cleanup_pending = false;
         let work = g.work.clone();
+        let track_access = work.track_access;
         // A duplicate same-version fill preserves existing guards and identity.
         let e = pages.get_or_insert_with(page.0, PageEntry::unbound);
         e.handle.bind_work(work);
         if dirty {
-            if let Some(access) = access {
+            if let Some(access) = access.filter(|_| track_access) {
                 e.handle.touch(access);
             }
             e.handle.state.fetch_or(ACCESSED, Ordering::Release);
         } else {
             // Startup recovery runs before publication to serving threads.
-            e.handle.last_access.store(
-                access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1)),
-                Ordering::Relaxed,
-            );
+            if track_access {
+                e.handle.access().last_access.store(
+                    access.map_or(UNKNOWN, |t| t.min(UNKNOWN - 1)),
+                    Ordering::Relaxed,
+                );
+            }
         }
         let handle = e.handle.clone();
         if dirty {
@@ -639,7 +709,9 @@ pub(crate) struct PageCheckpoint {
 }
 impl PageCheckpoint {
     pub fn new(page: u32, handle: &Arc<PageState>) -> Self {
-        let dirty_since = handle.dirty_since.swap(UNKNOWN, Ordering::AcqRel);
+        let dirty_since = handle.access.get().map_or(UNKNOWN, |access| {
+            access.dirty_since.swap(UNKNOWN, Ordering::AcqRel)
+        });
         Self {
             page,
             access: handle.last_access(),
@@ -657,10 +729,11 @@ impl PageCheckpoint {
 impl Drop for PageCheckpoint {
     fn drop(&mut self) {
         if self.dirty_since != UNKNOWN {
-            self.handle
+            let access = self.handle.access();
+            access
                 .dirty_since
                 .fetch_min(self.dirty_since, Ordering::Release);
-            if let Some(work) = self.handle.work.get() {
+            if let Some(work) = access.work.get() {
                 work.dirty(self.dirty_since);
             }
         }
@@ -1359,6 +1432,47 @@ mod tests {
     }
 
     #[test]
+    fn page_and_capacity_selection_keep_independent_flags_without_age_tracking() {
+        let index = Arc::new(crate::BlockIndex::new());
+        index.init_paged(id(), 16, 16);
+        index.mark_page_allocated(&id(), PageIndex(0), 0);
+        let lru = index.restore_lru();
+        let life = PageLifecycle::with_index(index.clone(), false);
+        let block = life.block(&id());
+        let handle = block.register(PageIndex(0), Some(10), 10, true);
+        assert!(
+            handle.access.get().is_none(),
+            "disabled TTI must not allocate ages during fill"
+        );
+        let capacity = lru.block_candidates(&id()).pop().unwrap();
+        let page = block.candidate(PageIndex(0)).unwrap();
+        let (reader, _) = index
+            .page_reads_and_touch(&id(), PageIndex(0), PageIndex(1))
+            .unwrap();
+        assert!(
+            handle.recency.load(Ordering::Relaxed) & 1 != 0,
+            "index reads and capacity share this flag word"
+        );
+        assert!(!block.claim(&page, 10, None));
+        reader.record_access_and_release(None);
+        assert!(!lru.candidate_is_current(&capacity));
+        lru.block_candidates(&id());
+        assert!(handle.recency.load(Ordering::Relaxed) & 1 == 0);
+        assert!(
+            !block.claim(&page, 10, None),
+            "capacity selection must not erase GC access evidence"
+        );
+        lru.touch(&crate::eviction::CacheUnit::Page(id(), PageIndex(0)));
+        let page = block.candidate(PageIndex(0)).unwrap();
+        assert!(
+            handle.recency.load(Ordering::Relaxed) & 1 != 0,
+            "GC selection must not erase capacity recency"
+        );
+        assert!(block.claim(&page, 10, None));
+        assert!(handle.access.get().is_none());
+    }
+
+    #[test]
     fn cold_pages_keep_read_arbitration_without_maintenance_state() {
         let index = Arc::new(crate::BlockIndex::new());
         index.init_paged(id(), 16, 32);
@@ -1374,7 +1488,7 @@ mod tests {
         let handle = block.inner.lock().unwrap().pages.read().unwrap()[&0]
             .handle
             .clone();
-        assert!(handle.work.get().is_none());
+        assert!(handle.access.get().is_none());
         assert!(block.claim_all_pages().is_none());
         let gate = block.gate.clone();
         drop(block);
