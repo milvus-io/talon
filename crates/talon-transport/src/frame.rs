@@ -86,6 +86,10 @@ pub enum MsgType {
     /// A version-pinned origin-backed range fetch attributed to a namespace.
     /// The reply is an ordinary `GetRange` frame, like every range fetch.
     GetVersionedRangeNamespace = 11,
+    /// Version-pinned exact read, cached only as the complete requested range.
+    GetExactRange = 12,
+    /// An exact read attributed to a namespace.
+    GetExactRangeNamespace = 13,
 }
 
 impl MsgType {
@@ -104,6 +108,8 @@ impl MsgType {
             9 => MsgType::GetCachedRangeNamespace,
             10 => MsgType::GetVersionedRange,
             11 => MsgType::GetVersionedRangeNamespace,
+            12 => MsgType::GetExactRange,
+            13 => MsgType::GetExactRangeNamespace,
             other => return Err(FrameError::UnknownMsgType(other)),
         })
     }

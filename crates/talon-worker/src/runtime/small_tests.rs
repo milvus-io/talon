@@ -1412,3 +1412,395 @@ async fn object_store_contract_with_small_engine_enabled() {
     drop(worker);
     assert!(!open().store.contains(&id).await.unwrap());
 }
+
+fn exact_unit(request: &RangeRequest) -> CacheUnit {
+    CacheUnit::ExactRange(BlockId::new(
+        request.object.clone(),
+        request.offset,
+        request.len as u32,
+        Version::new("v1"),
+    ))
+}
+
+fn exact_bytes(outcome: ServeOutcome) -> Vec<u8> {
+    match outcome {
+        ServeOutcome::Bytes(bytes) => bytes.to_vec(),
+        other => super::tests::read_handle(other),
+    }
+}
+
+#[tokio::test]
+async fn exact_reads_fetch_only_requested_bytes_and_match_both_coordinates() {
+    for paged in [false, true] {
+        for l1 in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let (backend, w) = runtime(dir.path(), paged, l1);
+            let version = Version::new("v1");
+            let mut ranges = Vec::new();
+            for (offset, len) in [(100, 500), (100, 499), (101, 499), (101, 500)] {
+                let request = RangeRequest {
+                    object: object(),
+                    offset,
+                    len,
+                };
+                ranges.push((offset, len));
+                for _ in 0..2 {
+                    let bytes = exact_bytes(w.serve_exact(&request, &version, 3072).await.unwrap());
+                    assert_eq!(
+                        bytes,
+                        data().slice(offset as usize..(offset + len) as usize)
+                    );
+                    assert_eq!(*backend.ranges.lock().unwrap(), ranges);
+                }
+            }
+            assert_eq!(w.logical_resident_bytes(), 1998);
+            assert!(w.index.is_empty());
+            assert_eq!(w.l1_page_count(), 0);
+            assert!(w.store.scan().unwrap().is_empty());
+            if let Some(paged) = &w.paged {
+                assert!(paged.scan().unwrap().is_empty());
+            }
+            // Ordinary small-object reads have their own key and fetch the entire object.
+            w.serve_versioned(&request(), &version, 3072).await.unwrap();
+            ranges.push((0, 3072));
+            w.serve_exact(&request(), &version, 3072).await.unwrap();
+            assert_eq!(*backend.ranges.lock().unwrap(), ranges);
+            assert_eq!(w.block_count(), 5);
+        }
+    }
+}
+
+#[tokio::test]
+async fn exact_reads_coalesce_and_reject_short_or_wrong_version_fetches() {
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, w) = runtime(dir.path(), true, true);
+    let request = request();
+    let version = Version::new("v1");
+    let results =
+        futures::future::join_all((0..16).map(|_| w.serve_exact(&request, &version, 3072))).await;
+    for result in results {
+        assert_eq!(exact_bytes(result.unwrap()), data().slice(100..600));
+    }
+    assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+    let mismatch = w
+        .serve_exact(&request, &Version::new("v2"), 3072)
+        .await
+        .err()
+        .unwrap();
+    assert!(matches!(
+        mismatch.downcast_ref::<Error>(),
+        Some(Error::VersionMismatch { .. })
+    ));
+    let other = RangeRequest {
+        offset: 200,
+        ..request.clone()
+    };
+    backend.short.store(true, Ordering::SeqCst);
+    assert!(w.serve_exact(&other, &version, 3072).await.is_err());
+    assert!(!w.small.as_ref().unwrap().contains(&exact_unit(&other)));
+    backend.short.store(false, Ordering::SeqCst);
+    assert_eq!(
+        exact_bytes(w.serve_exact(&other, &version, 3072).await.unwrap()),
+        data().slice(200..700)
+    );
+}
+
+#[tokio::test]
+async fn exact_ranges_recover_and_participate_in_tti_and_explicit_eviction() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), true, true);
+    let unit = exact_unit(&request());
+    w.serve_exact(&request(), &Version::new("v1"), 3072)
+        .await
+        .unwrap();
+    w.maintain_small(true).await.unwrap();
+    drop(w);
+    let (backend, mut w) = runtime(dir.path(), true, true);
+    assert_eq!(w.block_count(), 1);
+    assert_eq!(
+        exact_bytes(
+            w.serve_exact(&request(), &Version::new("v1"), 3072)
+                .await
+                .unwrap()
+        ),
+        data().slice(100..600)
+    );
+    assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+    w.page_gc_config.tti_ms = 100;
+    w.small
+        .as_ref()
+        .unwrap()
+        .access(&unit)
+        .unwrap()
+        .restore(crate::eviction::access_millis() - 1000);
+    w.gc_small_idle_at(crate::eviction::access_millis()).await;
+    assert!(!w.small.as_ref().unwrap().contains(&unit));
+    w.serve_exact(&request(), &Version::new("v1"), 3072)
+        .await
+        .unwrap();
+    assert_eq!(backend.fetches.load(Ordering::SeqCst), 1);
+    let candidates = w.lru.block_candidates(unit.block());
+    assert_eq!(candidates.len(), 1);
+    w.unlink_units(candidates, 3).await;
+    assert!(!w.small.as_ref().unwrap().contains(&unit));
+    assert_eq!(w.block_count(), 0);
+}
+
+#[tokio::test]
+async fn exact_range_access_age_survives_checkpoint_and_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, w) = runtime(dir.path(), true, false);
+    let unit = exact_unit(&request());
+    w.serve_exact(&request(), &Version::new("v1"), 3072)
+        .await
+        .unwrap();
+    let age = crate::eviction::access_millis() - 1234;
+    let small = w.small.as_ref().unwrap();
+    small.access(&unit).unwrap().restore(age);
+    small.checkpoint_access(None).await.unwrap();
+    w.maintain_small(true).await.unwrap();
+    drop(w);
+    let (backend, recovered) = runtime(dir.path(), true, false);
+    let small = recovered.small.as_ref().unwrap();
+    assert_eq!(small.access(&unit).unwrap().last_access(), age);
+    assert!(!small.contains(unit.block()));
+    assert_eq!(
+        exact_bytes(
+            recovered
+                .serve_exact(&request(), &Version::new("v1"), 3072)
+                .await
+                .unwrap()
+        ),
+        data().slice(100..600)
+    );
+    assert_eq!(backend.fetches.load(Ordering::SeqCst), 0);
+}
+
+struct ExactLargeOrigin(Mutex<Vec<(u64, u64)>>);
+#[async_trait]
+impl BackendStore for ExactLargeOrigin {
+    async fn head(&self, _: &ObjectId) -> talon_core::Result<talon_core::ObjectStat> {
+        panic!("pinned exact read must not HEAD")
+    }
+    async fn fetch_range(&self, _: &ObjectId, offset: u64, len: u64) -> talon_core::Result<Bytes> {
+        self.0.lock().unwrap().push((offset, len));
+        Ok(Bytes::from(
+            (offset..offset + len)
+                .map(|n| (n % 251) as u8)
+                .collect::<Vec<_>>(),
+        ))
+    }
+    async fn fetch_range_if_match(
+        &self,
+        obj: &ObjectId,
+        offset: u64,
+        len: u64,
+        version: Option<&Version>,
+    ) -> talon_core::Result<Bytes> {
+        assert_eq!(version, Some(&Version::new("v1")));
+        self.fetch_range(obj, offset, len).await
+    }
+    async fn put(&self, _: &ObjectId, _: Bytes) -> talon_core::Result<Version> {
+        unreachable!()
+    }
+    async fn delete(&self, _: &ObjectId) -> talon_core::Result<()> {
+        unreachable!()
+    }
+}
+
+#[tokio::test]
+async fn exact_reads_accept_one_mib_without_block_splitting_and_reject_invalid_ranges() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, mut w) = runtime_with_geometry(dir.path(), true, true, 1 << 20, 2 << 20, 16 << 20);
+    let backend = Arc::new(ExactLargeOrigin(Mutex::new(Vec::new())));
+    w.backend = Arc::new(OnceLock::from(backend.clone() as Arc<dyn BackendStore>));
+    let request = RangeRequest {
+        object: object(),
+        offset: (1 << 20) - 17,
+        len: 1 << 20,
+    };
+    let version = Version::new("v1");
+    let expected: Vec<_> = (request.offset..request.offset + request.len)
+        .map(|n| (n % 251) as u8)
+        .collect();
+    for _ in 0..2 {
+        assert_eq!(
+            exact_bytes(w.serve_exact(&request, &version, 3 << 20).await.unwrap()),
+            expected
+        );
+    }
+    assert_eq!(*backend.0.lock().unwrap(), [(request.offset, request.len)]);
+    assert!(w.index.is_empty());
+    assert_eq!(w.l1_page_count(), 0);
+    for (offset, len) in [(0, (1 << 20) + 1), (u64::MAX, 2), (3 << 20, 1)] {
+        assert!(w
+            .serve_exact(
+                &RangeRequest {
+                    object: object(),
+                    offset,
+                    len
+                },
+                &version,
+                3 << 20
+            )
+            .await
+            .is_err());
+    }
+    assert_eq!(backend.0.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn exact_cache_identity_does_not_alias_an_ordinary_block_with_same_coordinates() {
+    let dir = tempfile::tempdir().unwrap();
+    let (_, mut w) = runtime_with_geometry(dir.path(), true, true, 1 << 20, 2 << 20, 16 << 20);
+    let backend = Arc::new(ExactLargeOrigin(Mutex::new(Vec::new())));
+    w.backend = Arc::new(OnceLock::from(backend.clone() as Arc<dyn BackendStore>));
+    let full = RangeRequest {
+        object: object(),
+        offset: 0,
+        len: 1 << 20,
+    };
+    let version = Version::new("v1");
+    w.serve_exact(&full, &version, 3 << 20).await.unwrap();
+    let ordinary = RangeRequest {
+        len: 10,
+        ..full.clone()
+    };
+    w.serve_versioned(&ordinary, &version, 3 << 20)
+        .await
+        .unwrap();
+    assert_eq!(*backend.0.lock().unwrap(), [(0, 1 << 20), (0, 1024)]);
+    let exact = exact_unit(&full);
+    let candidates = w
+        .lru
+        .block_candidates(exact.block())
+        .into_iter()
+        .filter(|candidate| candidate.unit == exact)
+        .collect();
+    w.unlink_units(candidates, 3).await;
+    assert!(!w.small.as_ref().unwrap().contains(&exact_unit(&full)));
+    w.serve_versioned(&ordinary, &version, 3 << 20)
+        .await
+        .unwrap();
+    assert_eq!(backend.0.lock().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn exact_reads_over_tcp_cover_miss_sendfile_hit_and_oversize_rejection() {
+    use talon_core::{NodeId, NodeInfo, NodeRole};
+    use talon_transport::{data, envelope, Flags, FrameHeader, HEADER_LEN};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let dir = tempfile::tempdir().unwrap();
+    let (backend, worker) = runtime(dir.path(), true, true);
+    let obs = Arc::new(
+        crate::WorkerObservability::new(
+            "c".into(),
+            NodeInfo {
+                id: NodeId::new("w"),
+                address: "127.0.0.1:1".into(),
+                role: NodeRole::Worker,
+            },
+            "127.0.0.1:2".into(),
+            16 << 20,
+            worker.index.clone(),
+            worker.inflight.clone(),
+        )
+        .unwrap(),
+    );
+    obs.readiness().set_backend_ready(true);
+    obs.readiness().set_store_ready(true);
+    obs.readiness().set_control_registered(true);
+    let worker = Arc::new(worker);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (socket, _) = listener.accept().await.unwrap();
+        crate::tokio_conn::handle_conn(socket, worker, obs)
+            .await
+            .unwrap();
+    });
+    let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+    for n in 0..3 {
+        let request = data::VersionedRangeRequest {
+            request: if n == 2 {
+                RangeRequest {
+                    len: (1 << 20) + 1,
+                    ..request()
+                }
+            } else {
+                request()
+            },
+            version: Version::new("v1"),
+            object_len: 2 << 20,
+        };
+        let mut frame = if n == 1 {
+            data::encode_exact_namespace_request(
+                n,
+                &data::NamespaceScopedVersionedRange {
+                    namespace: talon_core::NamespaceId::default(),
+                    request,
+                },
+            )
+            .unwrap()
+        } else {
+            data::encode_exact_request(n, &request).unwrap()
+        };
+        envelope::encode(&mut frame, None, None).unwrap();
+        let version = frame[2];
+        socket.write_all(&frame).await.unwrap();
+        let mut header = [0; HEADER_LEN];
+        socket.read_exact(&mut header).await.unwrap();
+        let header = FrameHeader::decode(&header).unwrap();
+        assert_eq!(header.request_id, n);
+        assert_eq!(header.version, version);
+        let mut body = vec![0; header.length as usize];
+        socket.read_exact(&mut body).await.unwrap();
+        if n == 2 {
+            assert!(header.flags.contains(Flags::ERROR));
+            assert_eq!(
+                data::decode_error_payload(&body).code,
+                talon_transport::DataErrorCode::InvalidRequest
+            );
+        } else {
+            assert!(!header.flags.contains(Flags::ERROR));
+            assert_eq!(body, data().slice(100..600));
+        }
+    }
+    assert_eq!(*backend.ranges.lock().unwrap(), [(100, 500)]);
+    drop(socket);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn exact_read_requires_small_store_and_keeps_cancelled_fill_owned() {
+    let dir = tempfile::tempdir().unwrap();
+    let (origin, w) = runtime_with_geometry(dir.path(), true, false, 0, 2 << 20, 16 << 20);
+    assert!(w
+        .serve_exact(&request(), &Version::new("v1"), 3072)
+        .await
+        .is_err());
+    assert_eq!(origin.fetches.load(Ordering::SeqCst), 0);
+    let dir = tempfile::tempdir().unwrap();
+    let (origin, w) = runtime(dir.path(), true, false);
+    let w = Arc::new(w);
+    let task = tokio::spawn({
+        let w = w.clone();
+        async move { w.serve_exact(&request(), &Version::new("v1"), 3072).await }
+    });
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while origin.fetches.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    task.abort();
+    let _ = task.await;
+    let bytes = exact_bytes(
+        w.serve_exact(&request(), &Version::new("v1"), 3072)
+            .await
+            .unwrap(),
+    );
+    assert_eq!(bytes, data().slice(100..600));
+    assert_eq!(origin.fetches.load(Ordering::SeqCst), 1);
+}

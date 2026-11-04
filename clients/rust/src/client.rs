@@ -407,6 +407,73 @@ impl Client {
         result
     }
 
+    /// Read exactly `[offset, offset + length)` through the packed small store.
+    ///
+    /// Both coordinates are part of cache identity: overlapping ranges never hit.
+    /// A miss fetches only these bytes, even across a block boundary. Lengths above
+    /// 1 MiB, overflow, and ranges beyond EOF are errors. Zero length returns empty.
+    /// `known_stat` and request options have the same semantics as [`read`](Self::read).
+    /// Workers must have small-object storage enabled and support exact reads.
+    pub async fn read_exact(
+        &self,
+        object: &ObjectId,
+        offset: u64,
+        length: u64,
+        known_stat: Option<&ObjectStat>,
+        options: &crate::RequestOptions<'_>,
+    ) -> Result<Vec<u8>, Error> {
+        if length > talon_core::MAX_EXACT_READ_LEN {
+            return Err(Error::InvalidArgument(
+                "exact read length exceeds 1 MiB".into(),
+            ));
+        }
+        let end = offset
+            .checked_add(length)
+            .ok_or_else(|| Error::InvalidArgument("exact read range overflows u64".into()))?;
+        let context = options
+            .credential_context()
+            .map_err(Error::InvalidArgument)?;
+        let namespace = options
+            .namespace_id()
+            .map_err(|error| Error::InvalidArgument(error.to_string()))?;
+        let op = talon_telemetry::Operation::new("talon.read_exact", "internal", options.parent);
+        let result = context
+            .scope(op.scope(async {
+                if length == 0 {
+                    return Ok(Vec::new());
+                }
+                let stat = match known_stat {
+                    Some(stat) => stat.clone(),
+                    None => self.stat_inner(object, &namespace).await?,
+                };
+                if end > stat.size || stat.version.trim().is_empty() {
+                    return Err(Error::InvalidArgument(
+                        "exact read exceeds object size or has an empty version".into(),
+                    ));
+                }
+                let mut bytes = vec![0; length as usize];
+                let _permit = self
+                    .block_read_permits
+                    .acquire()
+                    .await
+                    .expect("client never closes its read budget");
+                self.reader
+                    .read_exact_range_into(
+                        object,
+                        &Version::new(stat.version),
+                        offset,
+                        &mut bytes,
+                        stat.size,
+                        &namespace,
+                    )
+                    .await?;
+                Ok(bytes)
+            }))
+            .await;
+        op.outcome(if result.is_ok() { "success" } else { "error" });
+        result
+    }
+
     async fn read_inner(
         &self,
         object: &ObjectId,
@@ -1263,6 +1330,109 @@ mod tests {
                 .unwrap(),
             stat_calls,
         )
+    }
+
+    #[tokio::test]
+    async fn exact_read_rejects_oversize_and_overflow_before_stat() {
+        let (client, stats) = read_client(2 << 20).await;
+        let object = parse_uri("s3://bucket/object").unwrap();
+        let options = RequestOptions::default();
+        for (offset, len) in [(0, (1 << 20) + 1), (u64::MAX, 1)] {
+            assert!(matches!(
+                client
+                    .read_exact(&object, offset, len, None, &options)
+                    .await,
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        assert!(client
+            .read_exact(&object, 0, 0, None, &options)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(stats.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn exact_read_uses_one_rpc_across_blocks_with_namespace_and_version() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let worker = listener.local_addr().unwrap().to_string();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            for (offset, length, named) in [(7, 33, true), (7, 1 << 20, true), (15, 45, false)] {
+                let mut header = [0; HEADER_LEN];
+                socket.read_exact(&mut header).await.unwrap();
+                let h = FrameHeader::decode(&header).unwrap();
+                let mut frame = header.to_vec();
+                frame.resize(HEADER_LEN + h.length as usize, 0);
+                socket.read_exact(&mut frame[HEADER_LEN..]).await.unwrap();
+                let request = if named {
+                    let (_, scoped) =
+                        talon_transport::data::decode_exact_namespace_request(&frame).unwrap();
+                    assert_eq!(
+                        scoped.namespace,
+                        talon_core::NamespaceId::named("analytics")
+                    );
+                    scoped.request
+                } else {
+                    talon_transport::data::decode_exact_request(&frame)
+                        .unwrap()
+                        .1
+                };
+                assert_eq!(request.version, Version::new("test-version"));
+                assert_eq!(request.object_len, 2 << 20);
+                assert_eq!(
+                    (request.request.offset, request.request.len),
+                    (offset, length)
+                );
+                let bytes: Vec<_> = (offset..offset + length).map(|i| (i % 251) as u8).collect();
+                socket
+                    .write_all(&response_header_ok(h.request_id, bytes.len() as u32))
+                    .await
+                    .unwrap();
+                socket.write_all(&bytes).await.unwrap();
+            }
+        });
+        let stats = Arc::new(AtomicUsize::new(0));
+        let coordinator = mock_read_coordinator(worker, 2 << 20, stats.clone()).await;
+        let client = ClientBuilder::default()
+            .with_coordinator(coordinator)
+            .with_block_size(8)
+            .build()
+            .unwrap();
+        let object = parse_uri("s3://bucket/object").unwrap();
+        let stat = ObjectStat {
+            size: 2 << 20,
+            version: "test-version".into(),
+        };
+        let options = RequestOptions::default().with_namespace("analytics");
+        for length in [33, 1 << 20] {
+            let bytes = client
+                .read_exact(&object, 7, length, Some(&stat), &options)
+                .await
+                .unwrap();
+            assert_eq!(
+                bytes,
+                (7..7 + length).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+            );
+        }
+        assert!(matches!(
+            client
+                .read_exact(&object, stat.size, 1, Some(&stat), &options)
+                .await,
+            Err(Error::InvalidArgument(_))
+        ));
+        assert_eq!(stats.load(Ordering::SeqCst), 0);
+        let implicit = client
+            .read_exact(&object, 15, 45, None, &RequestOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            implicit,
+            (15..60).map(|i| (i % 251) as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(stats.load(Ordering::SeqCst), 1);
+        server.await.unwrap();
     }
 
     #[test]

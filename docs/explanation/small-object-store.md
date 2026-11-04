@@ -81,6 +81,35 @@ use a fresh cache directory when rolling back to a binary with older routing.
 Legacy `MANIFEST`, `ring-*`, and per-segment index/data layouts are also
 rejected; journal format changes require a new empty cache directory.
 
+## Exact range reads
+
+Rust `Client::read_exact(object, offset, length, known_stat, options)` fetches
+only the requested bytes on a miss. Length is explicit and at most 1 MiB
+(1,048,576 bytes, inclusive); larger requests and arithmetic overflow fail in
+the client before metadata lookup or a data RPC. Zero length returns empty.
+Ranges beyond the supplied or resolved object size are errors, without EOF
+clamping. A range crossing a block boundary remains one request.
+
+Workers require small-object storage to be enabled. Exact ranges bypass the
+ordinary object-size admission threshold, whole/page storage, and L1. Their
+record must fit the configured segment, including key metadata. The default
+64 MiB segment accommodates the maximum request. Ordinary READ and LOAD keep
+their existing routing and exclusive threshold semantics.
+
+Placement hashes the original object, version, unaligned offset, and requested
+length. Packed keys additionally distinguish exact ranges from ordinary small
+objects; namespace and credential scopes still select separate cache roots.
+Only identical coordinates and version hit: a shorter overlapping request must
+fetch again. Concurrent identical misses coalesce and use the source version
+precondition. Short origin responses are rejected before publication.
+
+Exact ranges share small-store capacity, reclamation, access snapshots, recovery,
+and eviction. Hits retain segment descriptors for sendfile/splice. Existing
+ordinary-key encodings are unchanged; exact keys reserve the high bit of the
+backend tag. Older workers reject the new wire operations, and older binaries
+cannot recover a cache containing these keys. Use a fresh cache root when
+rolling back after admitting exact ranges.
+
 ## Files and identity
 
 ```text

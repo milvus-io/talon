@@ -33,6 +33,8 @@ use talon_core::{BlockId, PageIndex};
 pub enum LoadKey {
     /// A whole-block load.
     Whole(BlockId),
+    /// An exact range, isolated from ordinary block fills.
+    ExactRange(BlockId),
     /// A single page of a paged block.
     Page(BlockId, PageIndex),
 }

@@ -526,11 +526,15 @@ impl WorkerRuntime {
                 MsgType::GetRangeNamespace
                     | MsgType::GetCachedRangeNamespace
                     | MsgType::GetVersionedRangeNamespace
+                    | MsgType::GetExactRangeNamespace
             ) {
                 frame.reserve(HEADER_LEN + payload.len());
                 frame.extend_from_slice(&header.encode());
                 frame.extend_from_slice(payload);
                 Some(match header.msg_type {
+                    MsgType::GetExactRangeNamespace => {
+                        data::decode_exact_namespace_request(&frame)?.1.namespace
+                    }
                     MsgType::GetRangeNamespace => {
                         data::decode_namespace_request(&frame)?.1.namespace
                     }
@@ -614,6 +618,14 @@ fn request_target(
     let object = match header.msg_type {
         MsgType::GetRange => data::decode_request(&frame)?.1.object,
         MsgType::GetRangeNamespace => data::decode_namespace_request(&frame)?.1.request.object,
+        MsgType::GetExactRange => data::decode_exact_request(&frame)?.1.request.object,
+        MsgType::GetExactRangeNamespace => {
+            data::decode_exact_namespace_request(&frame)?
+                .1
+                .request
+                .request
+                .object
+        }
         MsgType::GetVersionedRange => data::decode_versioned_request(&frame)?.1.request.object,
         MsgType::GetVersionedRangeNamespace => {
             data::decode_versioned_namespace_request(&frame)?
@@ -2485,6 +2497,49 @@ mod tests {
             .unwrap()
             .unwrap();
         background.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_reads_keep_namespace_and_credential_scope_isolation() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = config();
+        config.small_object_threshold_bytes = 1 << 20;
+        config.small_object_segment_bytes = 2 << 20;
+        config.capacity_bytes = 32 << 20;
+        let http = Arc::new(CredentialHttp::default());
+        let root = open_broker(dir.path(), &config, http);
+        let request = talon_transport::data::VersionedRangeRequest {
+            request: request(),
+            version: Version::new("v1"),
+            object_len: 64,
+        };
+        let frame = |namespace| {
+            talon_transport::data::encode_exact_namespace_request(
+                1,
+                &talon_transport::data::NamespaceScopedVersionedRange {
+                    namespace: NamespaceId::named(namespace),
+                    request: request.clone(),
+                },
+            )
+            .unwrap()
+        };
+        let a = select_broker(&root, "role-a", frame("a")).await.unwrap();
+        let b = select_broker(&root, "role-b", frame("a")).await.unwrap();
+        let c = select_broker(&root, "role-a", frame("b")).await.unwrap();
+        a.serve_exact(&request.request, &request.version, request.object_len)
+            .await
+            .unwrap();
+        assert_eq!(a.block_count(), 1);
+        assert_eq!(b.block_count(), 0);
+        assert_eq!(c.block_count(), 0);
+        b.serve_exact(&request.request, &request.version, request.object_len)
+            .await
+            .unwrap();
+        c.serve_exact(&request.request, &request.version, request.object_len)
+            .await
+            .unwrap();
+        assert_eq!(b.block_count(), 1);
+        assert_eq!(c.block_count(), 1);
     }
 
     #[tokio::test]

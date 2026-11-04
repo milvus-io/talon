@@ -240,6 +240,25 @@ fn vectors() -> Vec<Vector> {
             .expect("encode versioned range request"),
         },
         Vector {
+            name: "data.exact_range_request",
+            note: "Exact read: unaligned offset and length identify one packed range",
+            bytes: data::encode_exact_request(11, &VersionedRangeRequest {
+                request: RangeRequest { object: object("container", "path/to/object"), offset: 65537, len: 4095 },
+                version: Version::new("etag-v1"), object_len: 100_000,
+            }).expect("encode exact range request"),
+        },
+        Vector {
+            name: "data.exact_range_namespace_request",
+            note: "Namespace-attributed exact read with the same version-pinned range layout",
+            bytes: data::encode_exact_namespace_request(12, &data::NamespaceScopedVersionedRange {
+                namespace: talon_core::NamespaceId::named("acme"),
+                request: VersionedRangeRequest {
+                    request: RangeRequest { object: object("container", "path/to/object"), offset: 65537, len: 4095 },
+                    version: Version::new("etag-v1"), object_len: 100_000,
+                },
+            }).expect("encode exact namespace request"),
+        },
+        Vector {
             name: "data.response_header_ok",
             note: "Success response header; the raw payload bytes follow unwrapped so the worker can sendfile them",
             bytes: data::response_header_ok(9, 4096).to_vec(),

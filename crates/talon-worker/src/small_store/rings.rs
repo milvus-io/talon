@@ -186,12 +186,16 @@ impl SmallObjectStore {
         .cloned()
     }
 
-    fn owner(&self, id: &BlockId) -> Option<Arc<SegmentStore>> {
+    fn owner(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<Arc<SegmentStore>> {
         self.streams().into_iter().find(|s| s.contains(id))
     }
 
-    async fn mutation(&self, id: &BlockId) -> InFlightGuard {
-        let key = LoadKey::Whole(id.clone());
+    async fn mutation(&self, id: &(impl SmallStoreKey + ?Sized)) -> InFlightGuard {
+        let key = if id.exact_range() {
+            LoadKey::ExactRange(id.block().clone())
+        } else {
+            LoadKey::Whole(id.block().clone())
+        };
         loop {
             if let Some(guard) = self.mutations.admit_owned(key.clone()) {
                 return guard;
@@ -204,18 +208,21 @@ impl SmallObjectStore {
         self.journal.set_budget(budget);
     }
 
-    pub fn accepts(&self, id: &BlockId, len: u64) -> bool {
+    pub fn accepts(&self, id: &(impl SmallStoreKey + ?Sized), len: u64) -> bool {
         self.fallback.accepts(id, len)
     }
-    pub fn contains(&self, id: &BlockId) -> bool {
+    pub fn contains(&self, id: &(impl SmallStoreKey + ?Sized)) -> bool {
         self.lookup_entry(id).ok().flatten().is_some()
     }
 
     /// Resolve residency and physical placement in one directory lookup per
     /// stream. Encode once and borrow the stream registry without allocating a
     /// temporary Vec. The worker validates routing compatibility at startup.
-    pub(crate) fn lookup_entry(&self, id: &BlockId) -> io::Result<Option<Location>> {
-        if id.offset != 0 {
+    pub(crate) fn lookup_entry(
+        &self,
+        id: &(impl SmallStoreKey + ?Sized),
+    ) -> io::Result<Option<Location>> {
+        if !id.exact_range() && id.block().offset != 0 {
             return Ok(None);
         }
         let key = format::key(id)?;
@@ -233,8 +240,11 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub(crate) async fn lookup(&self, id: &BlockId) -> io::Result<Option<ReadLocation>> {
-        if id.offset != 0 {
+    pub(crate) async fn lookup(
+        &self,
+        id: &(impl SmallStoreKey + ?Sized),
+    ) -> io::Result<Option<ReadLocation>> {
+        if !id.exact_range() && id.block().offset != 0 {
             return Ok(None);
         }
         for stream in self.streams() {
@@ -245,14 +255,14 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub async fn get(&self, id: &BlockId) -> io::Result<Option<BlockHandle>> {
+    pub async fn get(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<BlockHandle>> {
         self.lookup(id)
             .await?
             .map(|loc| loc.range(0, loc.len()))
             .transpose()
     }
 
-    pub async fn read(&self, id: &BlockId) -> io::Result<Option<Bytes>> {
+    pub async fn read(&self, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<Option<Bytes>> {
         if let Some(loc) = self.lookup(id).await? {
             loc.touch();
             return Ok(Some(loc.read().await?));
@@ -260,11 +270,15 @@ impl SmallObjectStore {
         Ok(None)
     }
 
-    pub async fn put(self: &Arc<Self>, id: &BlockId, value: Bytes) -> io::Result<u64> {
+    pub async fn put(
+        self: &Arc<Self>,
+        id: &(impl SmallStoreKey + ?Sized),
+        value: Bytes,
+    ) -> io::Result<u64> {
         // Capture before an owned task can run on a different Tokio thread.
         let slot = talon_uring::ring_id().map_or(0, |id| id + 1);
         let store = self.clone();
-        let id = id.clone();
+        let id = id.cache_unit();
         self.tasks
             .run(async move {
                 let _guard = store.mutation(&id).await;
@@ -281,9 +295,9 @@ impl SmallObjectStore {
             .await
     }
 
-    pub async fn delete(self: &Arc<Self>, id: &BlockId) -> io::Result<()> {
+    pub async fn delete(self: &Arc<Self>, id: &(impl SmallStoreKey + ?Sized)) -> io::Result<()> {
         let store = self.clone();
-        let id = id.clone();
+        let id = id.cache_unit();
         self.tasks
             .run(async move {
                 let _guard = store.mutation(&id).await;
@@ -358,7 +372,7 @@ impl SmallObjectStore {
     }
 
     #[cfg(test)]
-    pub(crate) fn access(&self, id: &BlockId) -> Option<AccessHandle> {
+    pub(crate) fn access(&self, id: &(impl SmallStoreKey + ?Sized)) -> Option<AccessHandle> {
         self.lookup_entry(id).ok().flatten()?.access
     }
 

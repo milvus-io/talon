@@ -214,7 +214,9 @@ async fn handle_request(
         MsgType::GetRange
         | MsgType::GetRangeNamespace
         | MsgType::GetVersionedRange
-        | MsgType::GetVersionedRangeNamespace => {}
+        | MsgType::GetVersionedRangeNamespace
+        | MsgType::GetExactRange
+        | MsgType::GetExactRangeNamespace => {}
         // A data listener serves only GetRange/Put/Delete; anything else is
         // rejected before any per-request work.
         _ => {
@@ -286,6 +288,10 @@ async fn handle_request(
 
     let end = req.offset.checked_add(req.len);
     if end.is_none()
+        || (matches!(
+            h.msg_type,
+            MsgType::GetExactRange | MsgType::GetExactRangeNamespace
+        ) && req.len > talon_core::MAX_EXACT_READ_LEN)
         || expected_version
             .as_ref()
             .map(|(_, size)| *size)
@@ -294,7 +300,7 @@ async fn handle_request(
         let mut err = data::encode_typed_error(
             h.request_id,
             DataErrorCode::InvalidRequest,
-            "range overflows u64 or exceeds supplied object length",
+            "range exceeds the object size, u64 bounds, or the 1 MiB exact-read limit",
         );
         err[2] = response_version;
         talon_telemetry::outcome("error");
@@ -343,6 +349,14 @@ async fn handle_request(
     }
 
     let outcome = match expected_version.as_ref() {
+        Some((version, size))
+            if matches!(
+                h.msg_type,
+                MsgType::GetExactRange | MsgType::GetExactRangeNamespace
+            ) =>
+        {
+            worker.serve_exact(&req, version, *size).await
+        }
         Some((version, size)) => worker.serve_versioned(&req, version, *size).await,
         None => worker.serve(&req).await,
     };
@@ -443,8 +457,12 @@ fn decode_range_with_namespace(
             let (frame, scoped) = data::decode_namespace_request(&buf)?;
             Ok((frame, scoped.request, None, scoped.namespace))
         }
-        MsgType::GetVersionedRange => {
-            let (frame, versioned) = data::decode_versioned_request(&buf)?;
+        MsgType::GetVersionedRange | MsgType::GetExactRange => {
+            let (frame, versioned) = if header.msg_type == MsgType::GetExactRange {
+                data::decode_exact_request(&buf)?
+            } else {
+                data::decode_versioned_request(&buf)?
+            };
             Ok((
                 frame,
                 versioned.request,
@@ -452,8 +470,12 @@ fn decode_range_with_namespace(
                 NamespaceId::Unattributed,
             ))
         }
-        MsgType::GetVersionedRangeNamespace => {
-            let (frame, scoped) = data::decode_versioned_namespace_request(&buf)?;
+        MsgType::GetVersionedRangeNamespace | MsgType::GetExactRangeNamespace => {
+            let (frame, scoped) = if header.msg_type == MsgType::GetExactRangeNamespace {
+                data::decode_exact_namespace_request(&buf)?
+            } else {
+                data::decode_versioned_namespace_request(&buf)?
+            };
             Ok((
                 frame,
                 scoped.request.request,
@@ -1330,6 +1352,47 @@ mod tests {
             obs.metrics().clone(),
         ));
         (worker, obs)
+    }
+
+    #[test]
+    fn exact_range_decoder_preserves_the_operation_and_namespace() {
+        let request = data::VersionedRangeRequest {
+            request: RangeRequest {
+                object: ObjectId::new(talon_core::Backend::S3, "b", "k"),
+                offset: 19,
+                len: 23,
+            },
+            version: Version::new("v1"),
+            object_len: 100,
+        };
+        for scoped in [false, true] {
+            let frame = if scoped {
+                data::encode_exact_namespace_request(
+                    7,
+                    &data::NamespaceScopedVersionedRange {
+                        namespace: NamespaceId::named("a"),
+                        request: request.clone(),
+                    },
+                )
+                .unwrap()
+            } else {
+                data::encode_exact_request(7, &request).unwrap()
+            };
+            let header = FrameHeader::decode(&frame).unwrap();
+            let (decoded, range, pinned, namespace) =
+                decode_range_with_namespace(&header, &frame[HEADER_LEN..]).unwrap();
+            assert_eq!(decoded.msg_type, header.msg_type);
+            assert_eq!(range, request.request);
+            assert_eq!(pinned, Some((request.version.clone(), 100)));
+            assert_eq!(
+                namespace,
+                if scoped {
+                    NamespaceId::named("a")
+                } else {
+                    NamespaceId::Unattributed
+                }
+            );
+        }
     }
 
     /// Drive `fut` on an io_uring ring with a Tokio context entered.

@@ -25,6 +25,8 @@ pub(crate) use recovery::RecoveredUnit;
 pub enum CacheUnit {
     /// A whole block, evicted as one unit.
     Whole(BlockId),
+    /// One exact byte range; block offset and size are the requested coordinates.
+    ExactRange(BlockId),
     /// One page of a paged block.
     Page(BlockId, PageIndex),
 }
@@ -32,13 +34,13 @@ pub enum CacheUnit {
 impl CacheUnit {
     pub(crate) fn block(&self) -> &BlockId {
         match self {
-            Self::Whole(block) | Self::Page(block, _) => block,
+            Self::Whole(block) | Self::ExactRange(block) | Self::Page(block, _) => block,
         }
     }
 
     fn page(&self) -> Option<PageIndex> {
         match self {
-            Self::Whole(_) => None,
+            Self::Whole(_) | Self::ExactRange(_) => None,
             Self::Page(_, page) => Some(*page),
         }
     }
@@ -368,7 +370,8 @@ impl Lru {
         bytes: u64,
         independent: bool,
     ) -> AccessHandle {
-        assert!(!independent || matches!(unit, CacheUnit::Whole(_)));
+        let independent = independent || matches!(unit, CacheUnit::ExactRange(_));
+        assert!(!independent || matches!(unit, CacheUnit::Whole(_) | CacheUnit::ExactRange(_)));
         let mut g = self.inner.lock().unwrap();
         let position = g.clock;
         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
@@ -630,16 +633,22 @@ impl Lru {
     /// Snapshot resident units for an explicit block invalidation.
     pub(crate) fn block_candidates(&self, block: &BlockId) -> Vec<EvictionCandidate> {
         let mut g = self.inner.lock().unwrap();
+        let mut candidates = Vec::new();
+        let exact = CacheUnit::ExactRange(block.clone());
+        if g.entries.contains_key(&exact) {
+            candidates.push(g.snapshot(exact));
+        }
         let whole = CacheUnit::Whole(block.clone());
         if g.entries.get(&whole).is_some_and(|e| e.independent) {
-            return vec![g.snapshot(whole)];
+            candidates.push(g.snapshot(whole));
+            return candidates;
         }
         let Some(units) = g
             .versions
             .get(&LogicalBlock::from(block))
             .and_then(|versions| versions.get(&block.version))
         else {
-            return Vec::new();
+            return candidates;
         };
         let units: Vec<_> = units
             .iter()
@@ -648,7 +657,8 @@ impl Lru {
                 Some(page) => CacheUnit::Page(block.clone(), *page),
             })
             .collect();
-        units.into_iter().map(|unit| g.snapshot(unit)).collect()
+        candidates.extend(units.into_iter().map(|unit| g.snapshot(unit)));
+        candidates
     }
 
     /// Visit each block once, regardless of its number of cached pages. The
@@ -784,6 +794,7 @@ impl Lru {
     /// Called under the block mutation gate after its complete on-disk deletion.
     pub(crate) fn remove_block(&self, block: &BlockId) {
         let mut g = self.inner.lock().unwrap();
+        g.remove(&CacheUnit::ExactRange(block.clone()));
         let whole = CacheUnit::Whole(block.clone());
         if g.entries.get(&whole).is_some_and(|e| e.independent) {
             g.remove(&whole);
@@ -961,6 +972,40 @@ mod tests {
 
     fn whole(n: u64) -> CacheUnit {
         CacheUnit::Whole(blk(n))
+    }
+
+    #[test]
+    fn exact_ranges_coexist_with_regular_units_and_skip_version_eviction() {
+        for ordinary in [whole(1), CacheUnit::Page(blk(1), PageIndex(0))] {
+            for independent in [false, true] {
+                if independent && matches!(ordinary, CacheUnit::Page(..)) {
+                    continue;
+                }
+                let lru = Lru::new();
+                let block = blk(1);
+                let exact = CacheUnit::ExactRange(block.clone());
+                lru.insert(exact.clone(), 20);
+                lru.insert_with_policy(ordinary.clone(), 10, independent);
+                let candidates: HashSet<_> = lru
+                    .block_candidates(&block)
+                    .into_iter()
+                    .map(|candidate| candidate.unit)
+                    .collect();
+                assert_eq!(candidates, HashSet::from([exact.clone(), ordinary.clone()]));
+                let mut newer = block.clone();
+                newer.version = Version::new("v2");
+                assert!(lru
+                    .superseded_candidates(&newer)
+                    .iter()
+                    .all(|candidate| candidate.unit == ordinary));
+                lru.evict_superseded(&newer);
+                assert!(lru.inner.lock().unwrap().entries.contains_key(&exact));
+                lru.remove_block(&block);
+                assert!(lru.is_empty());
+                assert_eq!(lru.total_bytes(), 0);
+                assert!(lru.inner.lock().unwrap().block_access.is_empty());
+            }
+        }
     }
 
     #[test]

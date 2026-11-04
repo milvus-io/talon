@@ -536,6 +536,44 @@ impl WorkerClient {
         dst: &mut [u8],
         object_len: u64,
     ) -> Result<usize, WorkerError> {
+        self.fetch_pinned_range_into(object, version, offset, dst, object_len, false)
+            .await
+    }
+
+    /// Fetch exactly the requested range; misses never round up to pages.
+    pub async fn fetch_exact_range_into(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        dst: &mut [u8],
+        object_len: u64,
+    ) -> Result<usize, WorkerError> {
+        if dst.len() as u64 > talon_core::MAX_EXACT_READ_LEN
+            || offset
+                .checked_add(dst.len() as u64)
+                .map_or(true, |end| end > object_len)
+            || version.0.trim().is_empty()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "invalid exact read range or version",
+            )
+            .into());
+        }
+        self.fetch_pinned_range_into(object, version, offset, dst, object_len, true)
+            .await
+    }
+
+    async fn fetch_pinned_range_into(
+        &self,
+        object: &ObjectId,
+        version: &Version,
+        offset: u64,
+        dst: &mut [u8],
+        object_len: u64,
+        exact: bool,
+    ) -> Result<usize, WorkerError> {
         let request = VersionedRangeRequest {
             request: RangeRequest {
                 object: object.clone(),
@@ -546,7 +584,21 @@ impl WorkerClient {
             object_len,
         };
         let request_id = RequestId::next();
-        let mut output = self.encode_versioned_range_request(request_id.0, request)?;
+        let mut output = if exact {
+            if self.namespace.is_unattributed() {
+                talon_transport::data::encode_exact_request(request_id.0, &request)?
+            } else {
+                talon_transport::data::encode_exact_namespace_request(
+                    request_id.0,
+                    &NamespaceScopedVersionedRange {
+                        namespace: self.namespace.clone(),
+                        request,
+                    },
+                )?
+            }
+        } else {
+            self.encode_versioned_range_request(request_id.0, request)?
+        };
         match self.exchange_into(&mut output, dst).await {
             Ok(n) => Ok(n),
             Err((true, error)) if error.is_transport_failure() => {
