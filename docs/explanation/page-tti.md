@@ -128,29 +128,30 @@ unlink 成功或 NotFound 才扣除驻留字节；失败保留重试状态，重
 
 ## 访问时间文件
 
+Namespace Worker 的 page 驻留状态现由 [paged catalog](paged-catalog.md) 恢复，
+不再写 `block.meta`，也不读取旧 `access.meta`。以下旧文件兼容规则仅适用于
+独立的旧格式 store；新 Worker 不支持旧 paged 缓存迁移。访问时间仍按分片 checkpoint。
+
 ```text
 paged/
   ab/                         # BlockId 哈希的前两个十六进制字符，最多 256 个分组
     access.shard              # 本分组所有驻留 block 的访问时间快照
     ab0123456789abcd.pages/
-      block.meta
       0.page
-      access.meta             # 升级前的旧文件；新版本不再写入
+      1.page
 ```
 
-page 与 `block.meta` 格式不变。新快照使用 `TLNSHR01` magic、page size、block 数量、
+page 数据文件格式不变。访问时间快照使用 `TLNSHR01` magic、page size、block 数量、
 长度前缀的 block 访问记录及整个文件的 XXH3-64 校验和。每条 block 记录沿用
 `TLNACC01` version 1 编码：完整 BlockId、page size、revision、采样 Unix ms、
 按 page index 排序的 `(u32 page, u64 last_access_ms)` 列表及独立校验和。
 恢复拒绝错误分片、重复 block、重复/越界 page、格式错误和部分损坏的快照。
 单分片快照上限为 64 MiB；超限保留 dirty 状态并报告 checkpoint 错误，不截断记录。
 
-启动时逐分片恢复。**只有 `access.shard` 不存在时才读取旧 `access.meta`**；
-新文件存在但损坏、缺少某条记录或包含未来时间时，不回退到旧文件。
-首次开启 TTI 会将恢复得到的访问时间写入新格式，包含未发生新访问的 block。
-旧文件保留到相应 block 目录被清理，因此迁移中断可重试，无需原地改写旧文件。
-回退旧 Worker 会重新使用旧访问时间，可能提前淘汰；本地缓存可重新回源。
-page 文件扫描始终是驻留事实来源：没有 page 文件的记录被忽略，没有有效时间的文件可回收。
+启动时逐分片恢复访问时间；page 驻留状态来自 catalog replay。
+新文件不存在、损坏、缺少某条记录或包含未来时间时，该 page 没有有效访问时间，
+可由 TTI 回收，不会通过逐 block 打开旧 `access.meta` 恢复。
+独立旧格式 store 的兼容读取仍保留，但不用于 namespace Worker 的启动。
 
 访问只修改内存。索引的现有 page 策略条目同时持有稳定 page handle，L1/L2/sendfile
 命中在同一次索引查询中取得读取保护，不再查询生命周期 registry 或 block 内的 page 表。

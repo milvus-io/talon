@@ -18,7 +18,13 @@ impl WorkerBackground {
     /// Ownership cleanup requires the resolved persistent identity in `config.node_id`.
     pub fn start(worker: Arc<WorkerRuntime>, config: &WorkerConfig) -> Self {
         let mut background = (*worker).clone();
-        background.background_budget = Some(BackgroundBudget::new(config));
+        let budget = background
+            .background_budget
+            .get_or_insert_with(|| BackgroundBudget::new(config))
+            .clone();
+        if let Some(small) = &background.small {
+            small.set_background_budget(budget);
+        }
         background.page_gc_config.scan_batch_size = background
             .page_gc_config
             .scan_batch_size
@@ -262,6 +268,9 @@ impl WorkerBackground {
             }
             namespace.checkpoint_small_access().await;
             namespace.checkpoint_access_times().await;
+            if let Err(error) = namespace.checkpoint_catalog().await {
+                tracing::error!(%error, "cache catalog shutdown checkpoint failed");
+            }
         }
     }
 }

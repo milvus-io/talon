@@ -80,6 +80,7 @@ impl WorkerRuntime {
                                     ..Default::default()
                                 }
                             }),
+                            None if paged.journaled() => Default::default(),
                             None => PageAccessStore::load(
                                 &paged.dir_for(&state.id),
                                 &state.id,
@@ -117,6 +118,7 @@ impl WorkerRuntime {
 
     pub(crate) async fn drain_page_mutations(&self) {
         self.page_mutations.drain().await;
+        self.store.drain().await;
     }
 
     /// Complete one disk cleanup pass, including when page TTI or paged reads are disabled.
@@ -405,7 +407,7 @@ impl WorkerRuntime {
                     tracing::warn!(block = %id, %error, "stale block unlink failed; retaining accounting");
                     return;
                 }
-                if let Some(paged) = &runtime.paged {
+                if let Some(paged) = runtime.paged.as_ref().filter(|_| pages > 0) {
                     if let Err(error) = paged.delete_block_async(id).await {
                         runtime.page_gc_metrics.delete_errors.inc();
                         tracing::warn!(block = %id, %error, "stale paged block unlink failed; retaining accounting");
@@ -456,22 +458,23 @@ impl WorkerRuntime {
                 (unit, page)
             })
             .collect();
-        let work = futures::stream::iter(candidates.into_iter().map(|(unit, candidate)| async move {
-            let retired = match &unit.unit {
-                CacheUnit::Page(id, _) | CacheUnit::Whole(id) => id.clone(),
-            };
-            match unit.unit.clone() {
-                CacheUnit::Page(_, _) => {
-                    if self.lru.candidate_is_current(&unit) {
-                        if let Some(c) = candidate {
-                            self.evict_page_candidate_to_target(c, reason, target).await;
+        let work =
+            futures::stream::iter(candidates.into_iter().map(|(unit, candidate)| async move {
+                let retired = match &unit.unit {
+                    CacheUnit::Page(id, _) | CacheUnit::Whole(id) => id.clone(),
+                };
+                match unit.unit.clone() {
+                    CacheUnit::Page(_, _) => {
+                        if self.lru.candidate_is_current(&unit) {
+                            if let Some(c) = candidate {
+                                self.evict_page_candidate_to_target(c, reason, target).await;
+                            }
                         }
                     }
-                }
-                CacheUnit::Whole(id) => {
-                    let state = self.page_lifecycle.block(&id);
-                    let runtime = self.clone();
-                    self.page_mutations
+                    CacheUnit::Whole(id) => {
+                        let state = self.page_lifecycle.block(&id);
+                        let runtime = self.clone();
+                        self.page_mutations
                         .run(async move {
                             runtime.background_delete().await;
                             let _background_io = runtime.background_io().await;
@@ -494,22 +497,16 @@ impl WorkerRuntime {
                                 tracing::warn!(block = %id, %error, "whole block unlink failed");
                                 return;
                             }
-                            if let Some(paged) = &runtime.paged {
-                                if let Err(error) = paged.delete_block_async(&id).await {
-                                    tracing::warn!(block = %id, %error, "paged directory unlink failed");
-                                    return;
-                                }
-                            }
                             runtime.invalidate_l1(&id);
                             runtime.index.remove(&id);
                             runtime.lru.remove(&CacheUnit::Whole(id));
                             runtime.metrics.record_eviction();
                         })
                         .await;
+                    }
                 }
-            }
-            self.page_lifecycle.retire_empty(&retired);
-        }));
+                self.page_lifecycle.retire_empty(&retired);
+            }));
         let concurrency = if reason == 1 {
             self.page_gc_config.io_concurrency
         } else {
@@ -684,5 +681,177 @@ async fn before_deadline<F: std::future::Future>(
             .await
             .ok(),
         None => Some(work.await),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::catalog::Catalog;
+    use crate::page_access_store::CacheRootLock;
+    use bytes::Bytes;
+    use talon_core::{ObjectStat, WorkerConfig};
+
+    struct UnusedOrigin;
+
+    #[async_trait::async_trait]
+    impl BackendStore for UnusedOrigin {
+        async fn fetch_range(&self, _: &ObjectId, _: u64, _: u64) -> talon_core::Result<Bytes> {
+            panic!("cache eviction must not fetch origin data")
+        }
+
+        async fn head(&self, _: &ObjectId) -> talon_core::Result<ObjectStat> {
+            panic!("cache eviction must not stat origin data")
+        }
+    }
+
+    fn runtime(root: &Path) -> (WorkerRuntime, Arc<Catalog>, WorkerConfig) {
+        let config = WorkerConfig {
+            small_object_threshold_bytes: 0,
+            block_size: 16,
+            capacity_bytes: 1 << 20,
+            l1_capacity_bytes: 0,
+            l2_page_size_bytes: 4,
+            page_tti_hours: 0,
+            ..Default::default()
+        };
+        let lock = Arc::new(CacheRootLock::acquire(root).unwrap());
+        let scope = root.join("default/shared");
+        std::fs::create_dir_all(&scope).unwrap();
+        let service = crate::catalog::service(lock.clone()).unwrap();
+        let catalog =
+            Catalog::with_service(&service, &scope, crate::catalog::transaction_budget(), None)
+                .unwrap();
+        let path = "paged";
+        catalog
+            .register(path, config.l2_page_size_bytes as u32)
+            .unwrap();
+        let paged = PagedBlockStore::open(scope.join(path), config.l2_page_size_bytes as u32)
+            .unwrap()
+            .with_catalog(catalog.clone(), path.into())
+            .with_root_lock(lock.clone());
+        let worker = WorkerRuntime::new(
+            WholeBlockStore::open_with_catalog(
+                &scope,
+                Arc::new(crate::fd_cache::FdCache::new(
+                    config.whole_fd_cache_capacity,
+                )),
+                catalog.clone(),
+            )
+            .unwrap(),
+            Arc::new(BlockIndex::new()),
+            Arc::new(InFlightLoads::new()),
+            Arc::new(UnusedOrigin),
+            config.block_size,
+            config.capacity_bytes,
+            WorkerMetrics::new(config.capacity_bytes),
+        )
+        .with_paged_store(paged)
+        .with_page_gc(PageGcConfig::from(&config))
+        .unwrap();
+        (worker, catalog, config)
+    }
+
+    fn block() -> BlockId {
+        BlockId::new(
+            ObjectId::new(Backend::S3, "bucket", "key"),
+            0,
+            16,
+            Version::new("v1"),
+        )
+    }
+
+    async fn evict(worker: &WorkerRuntime, config: &WorkerConfig, stale: bool) {
+        if stale {
+            let candidates = worker.lru.stale_gc_candidates(
+                &mut (0, 0),
+                crate::eviction::access_millis() + 1,
+                0,
+                16,
+                16,
+            );
+            assert_eq!(candidates.len(), 1);
+            worker
+                .unlink_stale_block(candidates.into_iter().next().unwrap())
+                .await;
+        } else {
+            super::super::async_eviction::EvictionCycle::new(worker.resident_bytes(), config)
+                .tick(worker)
+                .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn whole_eviction_retains_catalog_failure_accounting() {
+        for stale in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let (worker, catalog, config) = runtime(root.path());
+            worker
+                .admit_cached_block(
+                    &CachedBlockPutRequest {
+                        block: block(),
+                        object_len: 16,
+                        body_len: 16,
+                    },
+                    Bytes::from_static(&[1; 16]),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                worker.index.get(&block()).unwrap().form,
+                BlockForm::Whole
+            ));
+            let allocated = worker.resident_bytes();
+            assert!(allocated > 0);
+            assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
+            catalog.poison();
+
+            evict(&worker, &config, stale).await;
+
+            assert!(worker.store.scan_allocated().is_err());
+            assert!(worker.store.contains(&block()).await.unwrap());
+            assert!(worker.index.get(&block()).is_some());
+            assert!(!worker.lru.is_empty());
+            assert_eq!(worker.resident_bytes(), allocated);
+        }
+    }
+
+    #[tokio::test]
+    async fn paged_eviction_retains_catalog_failure_accounting() {
+        for stale in [false, true] {
+            for poisoned in [false, true] {
+                let root = tempfile::tempdir().unwrap();
+                let (worker, catalog, config) = runtime(root.path());
+                worker
+                    .commit_fetched_page(&block(), PageIndex(0), 16, Bytes::from_static(b"data"))
+                    .await
+                    .unwrap();
+                let allocated = worker.resident_bytes();
+                assert!(allocated > 0);
+                if poisoned {
+                    catalog.poison();
+                }
+
+                evict(&worker, &config, stale).await;
+
+                assert_eq!(
+                    worker
+                        .paged
+                        .as_ref()
+                        .unwrap()
+                        .has_page(&block(), PageIndex(0)),
+                    poisoned
+                );
+                assert_eq!(worker.index.get(&block()).is_some(), poisoned);
+                assert_eq!(!worker.lru.is_empty(), poisoned);
+                assert_eq!(
+                    worker.resident_bytes(),
+                    if poisoned { allocated } else { 0 }
+                );
+                if !poisoned {
+                    assert!(catalog.recover("paged").unwrap().unwrap().is_empty());
+                }
+            }
+        }
     }
 }

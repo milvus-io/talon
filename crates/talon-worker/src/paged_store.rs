@@ -40,6 +40,17 @@ use talon_core::{
 /// store's discipline, issue #113).
 static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
+pub(crate) fn block_dir(root: &Path, id: &BlockId) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    id.hash(&mut hasher);
+    let hex = format!("{:016x}", hasher.finish());
+    root.join(&hex[..2]).join(format!("{hex}.pages"))
+}
+
+fn catalog_error(error: anyhow::Error) -> Error {
+    Error::Other(format!("cache catalog: {error:#}"))
+}
+
 /// Run blocking filesystem work on Tokio's blocking pool, so page I/O never
 /// stalls the async reactor thread and the connections multiplexed on it
 /// (issue #115).
@@ -96,9 +107,152 @@ pub struct PagedBlockStore {
     /// to a 64 GiB hot set. Entries are shared across namespaces and scopes.
     fd_cache: Arc<FdCache>,
     root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
+    catalog: Option<(Arc<crate::catalog::Catalog>, String)>,
 }
 
 impl PagedBlockStore {
+    pub(crate) fn journaled(&self) -> bool {
+        self.catalog.is_some()
+    }
+
+    async fn commit_catalog_page(
+        self: &Arc<Self>,
+        id: &BlockId,
+        page: PageIndex,
+        len: u64,
+        payload: talon_uring::Payload,
+    ) -> Result<u64> {
+        let (catalog, store) = self.catalog.as_ref().unwrap();
+        let transaction = catalog
+            .begin(
+                store,
+                id,
+                crate::catalog::Operation::Put { page: page.0, len },
+            )
+            .await
+            .map_err(catalog_error)?;
+        let path = self.page_path(id, page);
+        let staged = self
+            .dir_for(id)
+            .join(format!("{}.page.catalog.{}", page.0, transaction.id));
+        let result: Result<u64> = if self.uring {
+            let alignment = self.direct_alignment.expect("native store alignment");
+            talon_uring::spawn_local(async move {
+                talon_uring::atomic_write_payload_staged(&path, &staged, payload, alignment)
+                    .await
+                    .map_err(Error::from)
+            })
+            .await
+            .map_err(|e| Error::Other(format!("journaled page task stopped: {e}")))?
+        } else {
+            spawn_blocking_io(move || {
+                let dir = path.parent().unwrap();
+                std::fs::create_dir_all(dir)?;
+                for parent in [dir.parent().and_then(Path::parent), dir.parent()]
+                    .into_iter()
+                    .flatten()
+                {
+                    std::fs::File::open(parent)?.sync_all()?;
+                }
+                let mut file = std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&staged)?;
+                file.write_all(&payload.into_bytes())?;
+                file.sync_all()?;
+                let allocated = file.metadata()?.blocks() * 512;
+                std::fs::rename(&staged, &path)?;
+                std::fs::File::open(dir)?.sync_all()?;
+                Ok(allocated)
+            })
+            .await
+        };
+        self.fd_cache.invalidate(&self.page_path(id, page));
+        match result {
+            Ok(allocated) => {
+                catalog
+                    .complete(transaction, allocated)
+                    .await
+                    .map_err(catalog_error)?;
+                Ok(allocated)
+            }
+            Err(error) => {
+                catalog.poison();
+                Err(error)
+            }
+        }
+    }
+
+    async fn delete_catalog(
+        &self,
+        id: &BlockId,
+        operation: crate::catalog::Operation,
+    ) -> Result<()> {
+        let (catalog, store) = self.catalog.as_ref().unwrap();
+        let pages = if matches!(operation, crate::catalog::Operation::DeleteBlock) {
+            catalog.pages(store, id).await.map_err(catalog_error)?
+        } else {
+            Vec::new()
+        };
+        let transaction = catalog
+            .begin(store, id, operation.clone())
+            .await
+            .map_err(catalog_error)?;
+        let dir = self.dir_for(id);
+        self.fd_cache.invalidate_prefix(&dir);
+        let result = spawn_blocking_io(move || {
+            let (result, parent) = match operation {
+                crate::catalog::Operation::DeletePage { page } => (
+                    std::fs::remove_file(dir.join(format!("{page}.page"))),
+                    dir.clone(),
+                ),
+                crate::catalog::Operation::DeleteBlock => {
+                    for page in pages {
+                        match std::fs::remove_file(dir.join(format!("{page}.page"))) {
+                            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                            result => result?,
+                        }
+                    }
+                    match std::fs::File::open(&dir) {
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        file => file?.sync_all()?,
+                    }
+                    (std::fs::remove_dir(&dir), dir.parent().unwrap().to_owned())
+                }
+                _ => unreachable!(),
+            };
+            match result {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                result => result?,
+            }
+            match std::fs::File::open(parent) {
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                file => file?.sync_all()?,
+            }
+            Ok(())
+        })
+        .await;
+        match result {
+            Ok(()) => catalog
+                .complete(transaction, 0)
+                .await
+                .map_err(catalog_error),
+            Err(error) => {
+                catalog.poison();
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn with_catalog(
+        mut self,
+        catalog: Arc<crate::catalog::Catalog>,
+        path: String,
+    ) -> Self {
+        self.catalog = Some((catalog, path));
+        self
+    }
+
     /// Select native I/O and probe this cache directory before accepting writes.
     pub fn with_uring(mut self, enabled: bool) -> std::io::Result<Self> {
         self.direct_alignment = enabled
@@ -134,6 +288,9 @@ impl PagedBlockStore {
         block_len: u64,
         value: talon_uring::Payload,
     ) -> Result<u64> {
+        if self.catalog.is_some() {
+            return self.commit_catalog_page(id, page, block_len, value).await;
+        }
         let disk = self.clone();
         let id = id.clone();
         if self.uring {
@@ -211,6 +368,7 @@ impl PagedBlockStore {
             uring: false,
             direct_alignment: None,
             root_lock: None,
+            catalog: None,
             root,
             page_size,
             fd_cache,
@@ -229,11 +387,7 @@ impl PagedBlockStore {
 
     /// Directory holding a block's page files: `<root>/<shard>/<digest>.pages`.
     pub(crate) fn dir_for(&self, id: &BlockId) -> PathBuf {
-        let mut hasher = DefaultHasher::new();
-        id.hash(&mut hasher);
-        let digest = hasher.finish();
-        let hex = format!("{digest:016x}");
-        self.root.join(&hex[0..2]).join(format!("{hex}.pages"))
+        block_dir(&self.root, id)
     }
 
     /// Path of a single page file within a block directory.
@@ -257,6 +411,9 @@ impl PagedBlockStore {
     /// Called once when a paged block is first touched. Best-effort: a missing
     /// sidecar only costs a re-fetch of that block's pages after a restart.
     pub fn write_sidecar(&self, id: &BlockId, len: u64) -> Result<()> {
+        if self.catalog.is_some() {
+            return Err(Error::Other("journaled stores require commit_page".into()));
+        }
         let dir = self.dir_for(id);
         std::fs::create_dir_all(&dir)?;
         let meta_path = self.meta_path_for(id);
@@ -309,9 +466,40 @@ impl PagedBlockStore {
     /// Restore indexed logical metadata and measured data-file allocations.
     /// Intended for startup while the cache directory is exclusively owned.
     pub fn restore_index(&self, index: &crate::BlockIndex) -> Result<()> {
+        if let Some((catalog, path)) = &self.catalog {
+            let entries = catalog
+                .recover(path)
+                .map_err(catalog_error)?
+                .ok_or_else(|| Error::Other("unregistered catalog store".into()))?;
+            for entry in entries {
+                if !matches!(entry.meta.form, BlockForm::Paged { page_size, .. } if page_size == self.page_size)
+                {
+                    return Err(Error::Other("catalog page geometry mismatch".into()));
+                }
+                index.commit_allocated(entry.meta, entry.allocated);
+            }
+            return Ok(());
+        }
         // Metadata reads wait on disk even with only two CPUs. Bound I/O
         // concurrency independently of CPU count, shared across all shards.
         self.restore_index_with_workers(index, 16)
+    }
+
+    /// Startup has exclusive ownership of the index, including whole entries
+    /// recovered earlier. Build page tables on CPU workers before merging them.
+    pub(crate) fn restore_index_exclusive(&self, index: &mut crate::BlockIndex) -> Result<()> {
+        if self.catalog.is_none() {
+            return self.restore_index(index);
+        }
+        let entries = self.scan_allocated()?;
+        for entry in &entries {
+            if !matches!(entry.meta.form, BlockForm::Paged { page_size, .. } if page_size == self.page_size)
+            {
+                return Err(Error::Other("catalog page geometry mismatch".into()));
+            }
+        }
+        index.restore_allocated(entries, crate::recovery::workers());
+        Ok(())
     }
 
     pub(crate) fn restore_index_with_workers(
@@ -365,6 +553,12 @@ impl PagedBlockStore {
     }
 
     pub(crate) fn scan_allocated(&self) -> Result<Vec<crate::index::StoredBlock>> {
+        if let Some((catalog, path)) = &self.catalog {
+            return catalog
+                .recover(path)
+                .map_err(catalog_error)?
+                .ok_or_else(|| Error::Other("unregistered catalog store".into()));
+        }
         let mut out = Vec::new();
         for shard in self.shard_paths()? {
             self.scan_shard(&shard, &mut |entry| out.push(entry))?;
@@ -457,6 +651,9 @@ impl PagedBlockStore {
     }
 
     fn put_page_allocated(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<u64> {
+        if self.catalog.is_some() {
+            return Err(Error::Other("journaled stores require commit_page".into()));
+        }
         let dir = self.dir_for(id);
         std::fs::create_dir_all(&dir)?;
         let path = self.page_path(id, page);
@@ -486,6 +683,9 @@ impl PagedBlockStore {
 
     /// Commit one page's bytes off the async reactor thread.
     pub async fn put_page_async(&self, id: &BlockId, page: PageIndex, value: Bytes) -> Result<()> {
+        if self.catalog.is_some() {
+            return Err(Error::Other("journaled stores require commit_page".into()));
+        }
         let dir = self.dir_for(id);
         let path = self.page_path(id, page);
         let invalidate_path = path.clone();
@@ -563,6 +763,11 @@ impl PagedBlockStore {
 
     /// Remove a single page off the async reactor thread. Idempotent.
     pub async fn evict_page_async(&self, id: &BlockId, page: PageIndex) -> Result<()> {
+        if self.catalog.is_some() {
+            return self
+                .delete_catalog(id, crate::catalog::Operation::DeletePage { page: page.0 })
+                .await;
+        }
         let path = self.page_path(id, page);
         self.fd_cache.invalidate(&path);
         let root_lock = self.root_lock.clone();
@@ -579,6 +784,11 @@ impl PagedBlockStore {
 
     /// Remove an entire paged block off the async reactor thread. Idempotent.
     pub async fn delete_block_async(&self, id: &BlockId) -> Result<()> {
+        if self.catalog.is_some() {
+            return self
+                .delete_catalog(id, crate::catalog::Operation::DeleteBlock)
+                .await;
+        }
         let dir = self.dir_for(id);
         self.fd_cache.invalidate_prefix(&dir);
         let dir = dir.clone();
@@ -708,6 +918,11 @@ impl PagedBlockStore {
     /// Remove a single page (e.g. page-level eviction), leaving the block dir
     /// and other pages intact. Idempotent.
     pub fn evict_page(&self, id: &BlockId, page: PageIndex) -> Result<()> {
+        if self.catalog.is_some() {
+            return Err(Error::Other(
+                "journaled stores require async eviction".into(),
+            ));
+        }
         let path = self.page_path(id, page);
         self.fd_cache.invalidate(&path);
         match std::fs::remove_file(&path) {
@@ -719,6 +934,11 @@ impl PagedBlockStore {
 
     /// Remove an entire paged block (all pages + directory). Idempotent.
     pub fn delete_block(&self, id: &BlockId) -> Result<()> {
+        if self.catalog.is_some() {
+            return Err(Error::Other(
+                "journaled stores require async eviction".into(),
+            ));
+        }
         let dir = self.dir_for(id);
         self.fd_cache.invalidate_prefix(&dir);
         match std::fs::remove_dir_all(&dir) {

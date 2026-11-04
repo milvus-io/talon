@@ -17,19 +17,23 @@ thread_local! {
 #[derive(Clone, Copy)]
 pub(super) enum Open {
     Read,
-    Write,
     Create,
     Replace,
 }
 
 pub(super) async fn create_dir(path: PathBuf) -> io::Result<()> {
-    if talon_uring::on_ring() {
-        return receive(talon_uring::spawn_local(async move {
+    let result = if talon_uring::on_ring() {
+        receive(talon_uring::spawn_local(async move {
             monoio::fs::create_dir(path).await
         }))
-        .await;
+        .await
+    } else {
+        blocking(move || std::fs::create_dir(path)).await
+    };
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+        result => result,
     }
-    blocking(move || std::fs::create_dir(path)).await
 }
 
 pub(super) async fn open(path: PathBuf, mode: Open) -> io::Result<Arc<OwnedFd>> {
@@ -39,9 +43,6 @@ pub(super) async fn open(path: PathBuf, mode: Open) -> io::Result<Arc<OwnedFd>> 
             options.read(true);
             match mode {
                 Open::Read => {}
-                Open::Write => {
-                    options.write(true);
-                }
                 Open::Create => {
                     options.write(true).create_new(true);
                 }
@@ -62,9 +63,6 @@ pub(super) async fn open(path: PathBuf, mode: Open) -> io::Result<Arc<OwnedFd>> 
         options.read(true);
         match mode {
             Open::Read => {}
-            Open::Write => {
-                options.write(true);
-            }
             Open::Create => {
                 options.write(true).create_new(true);
             }

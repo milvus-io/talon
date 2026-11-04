@@ -4199,7 +4199,7 @@ mod namespace_tests {
     use super::*;
     #[test]
     fn reserved_namespace_names_fail_configuration_validation() {
-        for name in ["worker_identity", ".worker.lock"] {
+        for name in ["worker_identity", ".worker.lock", ".paged-catalog"] {
             let mut cfg = WorkerConfig::default();
             cfg.namespaces
                 .insert(name.into(), NamespaceCacheConfig::default());

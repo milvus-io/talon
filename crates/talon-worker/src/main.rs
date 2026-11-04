@@ -2238,9 +2238,7 @@ mod tests {
             release: tokio::sync::Notify::new(),
         });
         let worker = Arc::new(WorkerRuntime::new(
-            WholeBlockStore::open(&root)
-                .unwrap()
-                .with_root_lock(lock.clone()),
+            WholeBlockStore::open_locked(&root, lock.clone()).unwrap(),
             index,
             inflight,
             origin.clone(),

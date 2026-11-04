@@ -7,6 +7,7 @@
 pub mod background;
 pub mod block_store;
 pub mod capacity;
+mod catalog;
 pub mod connection_admission;
 mod data_error;
 pub mod eviction;
@@ -26,6 +27,7 @@ pub mod page_gc;
 mod page_lifecycle;
 pub mod paged_store;
 pub mod rate_limit;
+mod recovery;
 pub mod runtime;
 pub mod sendfile;
 pub mod small_store;

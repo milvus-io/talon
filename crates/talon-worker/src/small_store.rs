@@ -1,24 +1,25 @@
 //! Packed small-object cache. Published payload extents are never overwritten.
 //!
-//! Each segment has raw `.data` bytes and a checksummed `.index` stream. Only
-//! sealed segments appear in MANIFEST; a crash may lose the bounded active
-//! and sealing segments. Deletes of sealed entries are synced before becoming invisible.
-//! Compaction publishes a replacement manifest before unlinking old files.
+//! Data streams append independently; one bounded native writer owns the
+//! namespace metadata log and snapshots. Durable prefixes survive before sealing.
+//! Relocation commits are durable before old payload files are unlinked.
 mod access;
 mod disk_io;
+mod flush;
 mod format;
+mod journal;
 mod rings;
 pub use rings::SmallObjectStore;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 use crate::eviction::AccessHandle;
 use crate::{CacheUnit, Lru};
 use bytes::Bytes;
-use format::{invalid, MAGIC};
-use std::collections::{BTreeMap, HashMap};
+use format::invalid;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::OpenOptions;
-use std::io::{self, Read};
+use std::io;
 use std::os::fd::OwnedFd;
 use std::os::unix::fs::MetadataExt;
 use std::path::PathBuf;
@@ -113,12 +114,12 @@ impl Location {
 
 struct Segment {
     data: Option<Arc<OwnedFd>>,
-    index: Option<Arc<OwnedFd>>,
     file: Arc<SegmentFile>,
     // Reservation ends, including writes whose completions are still pending.
     bytes: u64,
+    durable_end: u64,
     metadata: u64,
-    in_flight: usize,
+    in_flight: BTreeSet<u64>,
     live: u64,
     live_payload: u64,
     allocated: u64,
@@ -133,23 +134,12 @@ impl Segment {
         }
     }
 
-    async fn index(&self) -> io::Result<Arc<OwnedFd>> {
-        match &self.index {
-            Some(fd) => Ok(fd.clone()),
-            None => {
-                disk_io::open(self.file.path.with_extension("index"), disk_io::Open::Write).await
-            }
-        }
-    }
-
     async fn allocated(&self) -> io::Result<u64> {
-        Ok(disk_io::allocated(self.data().await?).await?
-            + disk_io::allocated(self.index().await?).await?)
+        disk_io::allocated(self.data().await?).await
     }
 
     fn close_writers(&mut self) {
         self.data = None;
-        self.index = None;
     }
 }
 struct State {
@@ -158,12 +148,11 @@ struct State {
     standby: Option<u64>,
     sealing: Option<u64>,
     pipeline_running: bool,
-    next: u64,
     allocated: u64,
     live: u64,
     written: u64,
     poisoned: bool,
-    last_seal: Instant,
+    last_flush: Instant,
 }
 
 /// One independently appended and sealed stream within a namespace/credential scope.
@@ -175,8 +164,10 @@ struct SegmentStore {
     seal_pause: Mutex<Option<Arc<tests::SealPause>>>,
     #[cfg(test)]
     append_pause: Mutex<Option<Arc<tests::AppendPause>>>,
-    root: PathBuf,
     #[cfg(test)]
+    flush_pause: Mutex<Option<Arc<tests::AppendPause>>>,
+    slot: usize,
+    journal: Arc<journal::Journal>,
     threshold: u64,
     segment_size: u64,
     state: tokio::sync::Mutex<State>,
@@ -205,17 +196,6 @@ pub struct SmallStoreStats {
     pub segments: usize,
 }
 
-fn validate_geometry(threshold: u64, segment_size: u64, capacity: u64) -> io::Result<()> {
-    if segment_size < threshold.saturating_add(format::MAX_KEY as u64 + 64)
-        || segment_size > 1 << 30
-        || threshold > 128 << 20
-        || (capacity != 0 && segment_size.saturating_mul(4) > capacity)
-    {
-        return Err(invalid("small object segment/capacity geometry"));
-    }
-    Ok(())
-}
-
 /// Only a complete short FIRST block proves this is a small object. A
 /// short last block of a large object must remain in the large-object store.
 fn accepts_object(threshold: u64, id: &BlockId, len: u64) -> bool {
@@ -223,6 +203,7 @@ fn accepts_object(threshold: u64, id: &BlockId, len: u64) -> bool {
 }
 
 impl SegmentStore {
+    #[cfg(test)]
     pub fn open(
         root: PathBuf,
         threshold: u64,
@@ -231,73 +212,40 @@ impl SegmentStore {
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
     ) -> io::Result<Self> {
         validate_geometry(threshold, segment_size, capacity)?;
-        std::fs::create_dir_all(&root)?;
-        let manifest = root.join("MANIFEST");
-        let ids = match std::fs::read(&manifest) {
-            Ok(bytes) => decode_manifest(&bytes)?,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Vec::new(),
-            Err(e) => return Err(e),
-        };
-        let mut store = Self::empty(root, threshold, segment_size, root_lock);
-        // Orphaned active/replacement files are never recovered. Determine IDs
-        // before removing them so IDs cannot be reused during this startup.
-        for item in std::fs::read_dir(&store.root)? {
-            let path = item?.path();
-            if !matches!(
-                path.extension().and_then(|s| s.to_str()),
-                Some("data" | "index")
-            ) {
-                continue;
-            }
-            let Some(id) = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .and_then(|s| s.parse::<u64>().ok())
-            else {
-                continue;
-            };
-            store.state.get_mut().next = store.state.get_mut().next.max(
-                id.checked_add(1)
-                    .ok_or_else(|| invalid("segment id overflow"))?,
-            );
-            if !ids.contains(&id) {
-                std::fs::remove_file(path)?;
-            }
+        let (journal, model) = journal::Journal::open(root.clone(), root_lock.clone(), None)?;
+        let mut streams = SmallObjectStore::recover_streams(
+            &journal,
+            &model,
+            threshold,
+            segment_size,
+            root_lock,
+        )?;
+        if streams.len() != 1 {
+            return Err(invalid("test stream has foreign slot"));
         }
-        for id in ids {
-            // Fail closed on malformed metadata, including a torn delete. Do
-            // not replay a valid prefix that might resurrect a deleted object.
-            store.recover(id)?;
-        }
-        let stats = SmallStoreStats {
-            live_bytes: store.state.get_mut().live,
-            allocated_bytes: store.state.get_mut().allocated,
-            dead_bytes: store.state.get_mut().written.saturating_sub(
-                store.state.get_mut().live + 8 * store.state.get_mut().segments.len() as u64,
-            ),
-            segments: store.state.get_mut().segments.len(),
-            retired_bytes: 0,
-        };
-        *store.cached_stats.write().unwrap() = stats;
+        let mut store = streams.remove(&0).unwrap();
+        store.refresh_recovered_stats();
         Ok(store)
     }
 
-    /// Construct a new ring stream after its directory has been created and
-    /// made durable asynchronously. Existing streams always use open/recovery.
+    /// Construct an empty stream sharing the namespace metadata writer.
     fn empty(
-        root: PathBuf,
-        _threshold: u64,
+        threshold: u64,
         segment_size: u64,
         root_lock: Option<Arc<crate::page_access_store::CacheRootLock>>,
+        slot: usize,
+        journal: Arc<journal::Journal>,
     ) -> Self {
         Self {
             #[cfg(test)]
             seal_pause: Mutex::new(None),
             #[cfg(test)]
             append_pause: Mutex::new(None),
-            root,
             #[cfg(test)]
-            threshold: _threshold,
+            flush_pause: Mutex::new(None),
+            slot,
+            journal,
+            threshold,
             segment_size,
             state: tokio::sync::Mutex::new(State {
                 segments: BTreeMap::new(),
@@ -305,12 +253,11 @@ impl SegmentStore {
                 standby: None,
                 sealing: None,
                 pipeline_running: false,
-                next: 1,
                 allocated: 0,
                 live: 0,
                 written: 0,
                 poisoned: false,
-                last_seal: Instant::now(),
+                last_flush: Instant::now(),
             }),
             publication: tokio::sync::Mutex::new(()),
             pipeline_changed: tokio::sync::Notify::new(),
@@ -325,7 +272,6 @@ impl SegmentStore {
         }
     }
 
-    #[cfg(test)]
     pub fn accepts(&self, id: &BlockId, len: u64) -> bool {
         accepts_object(self.threshold, id, len)
     }
@@ -401,7 +347,7 @@ impl SegmentStore {
             .acquire()
             .await
             .expect("append slots stay open");
-        let (mut loc, data, index, metadata, frame) = loop {
+        let (mut loc, data) = loop {
             let changed = self.pipeline_changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
@@ -463,15 +409,12 @@ impl SegmentStore {
                 checksum,
                 access: None,
             };
-            let frame = append_frame(loc.offset, len, checksum, &key)?;
-            let metadata = s.metadata;
             let data = s.data().await?;
-            let index = s.index().await?;
             s.bytes += len;
-            s.metadata += frame.len() as u64;
-            s.in_flight += 1;
+            s.metadata += 37 + key.len() as u64;
+            s.in_flight.insert(loc.offset);
             state.written += charge;
-            break (loc, data, index, metadata, frame);
+            break (loc, data);
         };
         // No append state lock is held while any of these operations is in
         // flight. Both writes are submitted; always await both, even on error,
@@ -487,7 +430,21 @@ impl SegmentStore {
                     Ok::<_, io::Error>(())
                 },
                 async {
-                    disk_io::write(index.clone(), frame, metadata).await?;
+                    self.journal
+                        .append(
+                            journal::Event::Insert {
+                                slot: self.slot,
+                                segment: loc.segment,
+                                offset: loc.offset,
+                                record: journal::Record {
+                                    key: key.clone(),
+                                    len,
+                                    checksum,
+                                },
+                            },
+                            false,
+                        )
+                        .await?;
                     #[cfg(test)]
                     tests::crash("append_index");
                     Ok::<_, io::Error>(())
@@ -495,9 +452,7 @@ impl SegmentStore {
             );
             payload?;
             record?;
-            let (data_allocated, index_allocated) =
-                tokio::join!(disk_io::allocated(data), disk_io::allocated(index));
-            Ok::<_, io::Error>(data_allocated? + index_allocated?)
+            disk_io::allocated(data).await
         }
         .await;
         let mut state = self.state.lock().await;
@@ -505,10 +460,8 @@ impl SegmentStore {
             .segments
             .get_mut(&loc.segment)
             .expect("in-flight segment is retained");
-        segment.in_flight -= 1;
-        if segment.in_flight == 0 {
-            self.appends_drained.notify_waiters();
-        }
+        segment.in_flight.remove(&loc.offset);
+        self.appends_drained.notify_waiters();
         let allocated = match result {
             Ok(allocated) => allocated,
             Err(error) => {
@@ -565,7 +518,7 @@ impl SegmentStore {
     async fn delete_inner(&self, id: &BlockId) -> io::Result<()> {
         let key = format::key(id)?;
         // A tombstone must be either included in the sealing fsync or synced
-        // after publication. Never append to an index concurrently with seal.
+        // after publication. Serialize logical publication with seal/relocation.
         let _publication = self.publication.lock().await;
         let mut state = self.state.lock().await;
         self.healthy(&state)?;
@@ -574,16 +527,16 @@ impl SegmentStore {
         };
         let result = async {
             let segment = state.segments.get_mut(&loc.segment).unwrap();
-            let mut record = vec![1];
-            record.extend_from_slice(&loc.offset.to_le_bytes());
-            let mut frame = Vec::new();
-            format::frame(&mut frame, &record)?;
-            let index = segment.index().await?;
-            disk_io::write(index.clone(), frame.into(), segment.metadata).await?;
-            segment.metadata += 12 + record.len() as u64;
-            if segment.sealed {
-                disk_io::sync(index).await?;
-            }
+            self.journal
+                .append(
+                    journal::Event::Delete {
+                        segment: loc.segment,
+                        offset: loc.offset,
+                    },
+                    loc.offset < segment.durable_end,
+                )
+                .await?;
+            segment.metadata += 21;
             #[cfg(test)]
             tests::crash("delete_sync");
             let removed = charge(&key, loc.len);
@@ -641,7 +594,13 @@ impl SegmentStore {
     pub async fn maintain(self: &Arc<Self>, checkpoint: bool) -> io::Result<bool> {
         let store = self.clone();
         self.tasks
-            .run(async move { store.maintain_inner(checkpoint, false, None).await })
+            .run(async move {
+                let result = store.maintain_inner(checkpoint, false, None).await?;
+                if checkpoint {
+                    store.journal.checkpoint().await?;
+                }
+                Ok(result)
+            })
             .await
     }
 
@@ -656,15 +615,14 @@ impl SegmentStore {
             state
                 .active
                 .and_then(|id| state.segments.get(&id))
-                .is_some_and(|s| s.in_flight == 0 && meets_reclaim_threshold(s))
+                .is_some_and(|s| s.in_flight.is_empty() && meets_reclaim_threshold(s))
         } else {
             false
         };
-        if checkpoint
-            || pressure_seal
-            || self.state.lock().await.last_seal.elapsed() >= Duration::from_secs(30)
-        {
+        if checkpoint || pressure_seal {
             self.checkpoint().await?;
+        } else if self.flush_due().await {
+            self.flush().await?;
         }
         let _publication = self.publication.lock().await;
         // Pay before taking the mutation lock. A segment selected here cannot
@@ -677,11 +635,10 @@ impl SegmentStore {
                     let s = &state.segments[&id];
                     (
                         id,
-                        if s.live == 0 {
-                            0
-                        } else {
-                            s.live_payload.saturating_mul(2) + (s.live - s.live_payload) + 8
-                        },
+                        s.live_payload.saturating_mul(2)
+                            + (s.live - s.live_payload)
+                            + 36 * s.records.len() as u64
+                            + 49,
                     )
                 })
             };
@@ -736,11 +693,12 @@ impl SegmentStore {
                 }
                 let s = state.segments.get_mut(&new).unwrap();
                 disk_io::sync(s.data().await?).await?;
-                disk_io::sync(s.index().await?).await?;
+                self.sync_data_directory(new).await?;
                 let allocated = s.allocated().await?;
                 let previous = s.allocated;
                 s.allocated = allocated;
                 s.sealed = true;
+                s.durable_end = s.bytes;
                 s.close_writers();
                 state.allocated = state
                     .allocated
@@ -750,7 +708,15 @@ impl SegmentStore {
             }
             #[cfg(test)]
             tests::crash("compact_copy");
-            self.manifest(&state, Some(old)).await?;
+            self.journal
+                .append(
+                    journal::Event::Replace {
+                        old,
+                        new: replacement,
+                    },
+                    true,
+                )
+                .await?;
             #[cfg(test)]
             tests::crash("compact_manifest");
             let _readers = self.readers.write().await;
@@ -767,11 +733,9 @@ impl SegmentStore {
             let allocated = segment.allocated().await?;
             if let Some(budget) = &budget {
                 budget.delete().await;
-                budget.delete().await;
             }
             disk_io::remove(self.path(old, "data")).await?;
-            disk_io::remove(self.path(old, "index")).await?;
-            disk_io::sync_dir(self.root.clone()).await?;
+            disk_io::sync_dir(self.path(old, "data").parent().unwrap().to_owned()).await?;
             let readers = segment.file.fd.lock().await.clone();
             self.retired.lock().unwrap().push((readers, allocated));
             state.allocated = state.allocated.saturating_sub(segment.allocated);
@@ -801,14 +765,18 @@ impl SegmentStore {
         }
     }
     fn path(&self, id: u64, extension: &str) -> PathBuf {
-        self.root.join(format!("{id}.{extension}"))
+        debug_assert_eq!(extension, "data");
+        self.journal.data_path(id)
+    }
+    async fn sync_data_directory(&self, id: u64) -> io::Result<()> {
+        let shard = self.path(id, "data").parent().unwrap().to_owned();
+        disk_io::sync_dir(shard.clone()).await?;
+        // Shards are created lazily. Their names must be durable too before
+        // publishing a seal/relocation that references a child payload file.
+        disk_io::sync_dir(shard.parent().unwrap().to_owned()).await
     }
     async fn create(&self, state: &mut State) -> io::Result<u64> {
-        let id = state.next;
-        state.next = state
-            .next
-            .checked_add(1)
-            .ok_or_else(|| invalid("segment id overflow"))?;
+        let id = self.journal.allocate()?;
         let segment = self.create_segment(id).await?;
         state.allocated += segment.allocated;
         state.segments.insert(id, segment);
@@ -817,20 +785,19 @@ impl SegmentStore {
     }
 
     async fn create_segment(&self, id: u64) -> io::Result<Segment> {
+        disk_io::create_dir(self.path(id, "data").parent().unwrap().to_owned()).await?;
         let data = disk_io::open(self.path(id, "data"), disk_io::Open::Create).await?;
-        let index = disk_io::open(self.path(id, "index"), disk_io::Open::Create).await?;
-        disk_io::write(index.clone(), Bytes::from_static(MAGIC), 0).await?;
-        let allocated = disk_io::allocated(index.clone()).await?;
+        let allocated = disk_io::allocated(data.clone()).await?;
         Ok(Segment {
             file: Arc::new(SegmentFile {
                 path: self.path(id, "data"),
                 fd: tokio::sync::Mutex::new(Arc::downgrade(&data)),
             }),
             data: Some(data),
-            index: Some(index),
             bytes: 0,
+            durable_end: 0,
             metadata: 8,
-            in_flight: 0,
+            in_flight: BTreeSet::new(),
             live: 0,
             live_payload: 0,
             allocated,
@@ -853,9 +820,22 @@ impl SegmentStore {
         disk_io::write(segment.data().await?, value, offset).await?;
         #[cfg(test)]
         tests::crash("append_payload");
-        let frame = append_frame(offset, len, checksum, key)?;
-        let frame_len = frame.len() as u64;
-        disk_io::write(segment.index().await?, frame, segment.metadata).await?;
+        self.journal
+            .append(
+                journal::Event::Insert {
+                    slot: self.slot,
+                    segment: id,
+                    offset,
+                    record: journal::Record {
+                        key: key.clone(),
+                        len,
+                        checksum,
+                    },
+                },
+                false,
+            )
+            .await?;
+        let frame_len = 37 + key.len() as u64;
         #[cfg(test)]
         tests::crash("append_index");
         segment.bytes += len;
@@ -912,13 +892,10 @@ impl SegmentStore {
         // Prepare the next spare before flushing the previous segment. No
         // filesystem operation in this phase holds the append state lock.
         let next = {
-            let mut state = self.state.lock().await;
+            let state = self.state.lock().await;
             self.healthy(&state)?;
             if state.standby.is_none() {
-                let id = state.next;
-                state.next = id
-                    .checked_add(1)
-                    .ok_or_else(|| invalid("segment id overflow"))?;
+                let id = self.journal.allocate()?;
                 Some(id)
             } else {
                 None
@@ -942,44 +919,49 @@ impl SegmentStore {
             self.healthy(&state)?;
             let Some(id) = state.sealing else { break None };
             let s = &state.segments[&id];
-            if s.in_flight == 0 {
-                break Some((id, s.data().await?, s.index().await?));
+            if s.in_flight.is_empty() {
+                break Some((id, s.data().await?, s.records.is_empty()));
             }
             drop(state);
             drained.await;
         };
-        if let Some((id, data, index)) = snapshot {
+        if let Some((id, data, empty)) = snapshot {
             #[cfg(test)]
             self.pause_seal().await;
             disk_io::sync(data.clone()).await?;
             #[cfg(test)]
             tests::crash("seal_data");
-            disk_io::sync(index.clone()).await?;
+            self.sync_data_directory(id).await?;
             #[cfg(test)]
             tests::crash("seal_index");
-            let allocated = disk_io::allocated(data).await? + disk_io::allocated(index).await?;
-            let body = {
+            // Empty segments need no recovery entry. Their payload files are
+            // harmless orphans; GC may still unlink them in this process.
+            if !empty {
+                self.journal
+                    .append(journal::Event::Seal { segment: id }, true)
+                    .await?;
+            }
+            let allocated = disk_io::allocated(data).await?;
+            {
                 let mut state = self.state.lock().await;
                 self.healthy(&state)?;
                 let s = state.segments.get_mut(&id).unwrap();
                 let previous = s.allocated;
                 s.allocated = allocated;
-                // Publication lock excludes delete/GC until the manifest is durable.
+                // Publication lock excludes delete/GC until the seal record is durable.
                 s.sealed = true;
+                s.durable_end = s.bytes;
                 s.close_writers();
                 state.allocated = state
                     .allocated
                     .saturating_sub(previous)
                     .saturating_add(allocated);
                 self.refresh_stats(&state);
-                Self::manifest_body(&state, None)
-            };
-            self.write_manifest(body).await?;
+            }
             #[cfg(test)]
             tests::crash("seal_manifest");
             let mut state = self.state.lock().await;
             state.sealing = None;
-            state.last_seal = Instant::now();
         }
         Ok(())
     }
@@ -997,7 +979,6 @@ impl SegmentStore {
                 continue;
             }
             let Some(id) = state.active.take() else {
-                state.last_seal = Instant::now();
                 return Ok(());
             };
             state.sealing = Some(id);
@@ -1018,141 +999,91 @@ impl SegmentStore {
         }
     }
 
-    async fn manifest(&self, state: &State, exclude: Option<u64>) -> io::Result<()> {
-        self.write_manifest(Self::manifest_body(state, exclude))
-            .await
-    }
-
-    fn manifest_body(state: &State, exclude: Option<u64>) -> Vec<u8> {
-        let mut body = MAGIC.to_vec();
-        for (&id, segment) in &state.segments {
-            if segment.sealed && Some(id) != exclude {
-                body.extend_from_slice(&id.to_le_bytes());
-            }
-        }
-        body.extend_from_slice(&xxhash_rust::xxh3::xxh3_64(&body).to_le_bytes());
-        body
-    }
-
-    async fn write_manifest(&self, body: Vec<u8>) -> io::Result<()> {
-        let tmp = self.root.join("MANIFEST.tmp");
-        let file = disk_io::open(tmp.clone(), disk_io::Open::Replace).await?;
-        disk_io::write(file.clone(), body.into(), 0).await?;
-        disk_io::sync(file).await?;
-        disk_io::rename(tmp, self.root.join("MANIFEST")).await?;
-        disk_io::sync_dir(self.root.clone()).await
-    }
-    fn recover(&mut self, id: u64) -> io::Result<()> {
-        let data = OpenOptions::new()
+    fn recover<'a>(
+        &mut self,
+        id: u64,
+        meta: &'a journal::SegmentMeta,
+        keys: &mut Vec<(u64, &'a [u8])>,
+    ) -> io::Result<()> {
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .open(self.path(id, "data"))?;
-        let index = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(self.path(id, "index"))?;
-        let bytes = data.metadata()?.len();
-        let metadata = index.metadata()?.len();
-        // A record consumes >= 37 index bytes; each delete adds 21. Include a
-        // bounded allowance for segments sealed under an older segment size.
-        if metadata > 2 * (1u64 << 30) {
-            return Err(invalid("small object index too large"));
+        let metadata = file.metadata()?;
+        if metadata.len() < meta.durable_end || (meta.sealed && metadata.len() != meta.bytes) {
+            return Err(invalid("segment length disagrees with metadata"));
         }
-        let mut encoded = Vec::new();
-        (&index).read_to_end(&mut encoded)?;
-        if !encoded.starts_with(MAGIC) {
-            return Err(invalid("small object index version"));
-        }
+        drop(file);
         let file = Arc::new(SegmentFile {
             path: self.path(id, "data"),
             fd: tokio::sync::Mutex::new(Weak::new()),
         });
-        let mut records = BTreeMap::new();
-        let mut next_offset = 0;
-        for mut frame in format::frames(&encoded[8..])? {
-            let mut kind = [0];
-            frame.read_exact(&mut kind)?;
-            let offset = format::u64(&mut frame)?;
-            match kind[0] {
-                0 => {
-                    let len = format::u64(&mut frame)?;
-                    let checksum = format::u64(&mut frame)?;
-                    let identity = format::id(frame)?;
-                    if offset != next_offset
-                        || len == 0
-                        || len > 128 << 20
-                        || offset.checked_add(len).map_or(true, |end| end > bytes)
-                        || identity.offset != 0
-                        || len >= u64::from(identity.block_size)
-                    {
-                        return Err(invalid("small object extent"));
-                    }
-                    next_offset = offset + len;
-                    if records
-                        .insert(
-                            offset,
-                            (
-                                frame.to_vec(),
-                                Location {
-                                    file: file.clone(),
-                                    segment: id,
-                                    offset,
-                                    len,
-                                    checksum,
-                                    access: None,
-                                },
-                            ),
-                        )
-                        .is_some()
-                    {
-                        return Err(invalid("duplicate small object offset"));
-                    }
-                }
-                1 => {
-                    if !frame.is_empty() || records.remove(&offset).is_none() {
-                        return Err(invalid("small object tombstone"));
-                    }
-                }
-                _ => return Err(invalid("small object record type")),
-            }
-        }
-        if next_offset != bytes {
-            return Err(invalid("small object trailing payload"));
-        }
+        let allocated = metadata.blocks() * 512;
+        let records = meta
+            .records
+            .range(..meta.durable_end)
+            .map(|(&offset, record)| (offset, record.key.clone()))
+            .collect();
         let mut live = 0;
         let mut live_payload = 0;
-        let mut segment_records = BTreeMap::new();
-        for (offset, (key, loc)) in records {
-            live += charge(&key, loc.len);
-            live_payload += loc.len;
-            let key: Arc<[u8]> = key.into();
-            segment_records.insert(offset, key.clone());
-            if self.entries.get_mut().unwrap().insert(key, loc).is_some() {
+        for (&offset, record) in meta.records.range(..meta.durable_end) {
+            live += charge(&record.key, record.len);
+            live_payload += record.len;
+            keys.push((xxhash_rust::xxh3::xxh3_64(&record.key), &record.key));
+            if self
+                .entries
+                .get_mut()
+                .unwrap()
+                .insert(
+                    record.key.clone(),
+                    Location {
+                        file: file.clone(),
+                        segment: id,
+                        offset,
+                        len: record.len,
+                        checksum: record.checksum,
+                        access: None,
+                    },
+                )
+                .is_some()
+            {
                 return Err(invalid("duplicate small object identity"));
             }
         }
-        let allocated = (data.metadata()?.blocks() + index.metadata()?.blocks()) * 512;
         let state = self.state.get_mut();
         state.allocated += allocated;
         state.live += live;
-        state.written += bytes + metadata;
+        let recovered_metadata = meta.recovered_metadata();
+        state.written += meta.durable_end + recovered_metadata;
         state.segments.insert(
             id,
             Segment {
                 data: None,
-                index: None,
                 file,
-                bytes,
-                metadata,
-                in_flight: 0,
+                bytes: meta.durable_end,
+                durable_end: meta.durable_end,
+                metadata: recovered_metadata,
+                in_flight: BTreeSet::new(),
                 live,
                 live_payload,
                 allocated,
-                records: segment_records,
+                records,
                 sealed: true,
             },
         );
         Ok(())
+    }
+    fn refresh_recovered_stats(&mut self) {
+        let state = self.state.get_mut();
+        *self.cached_stats.get_mut().unwrap() = SmallStoreStats {
+            live_bytes: state.live,
+            allocated_bytes: state.allocated,
+            retired_bytes: 0,
+            dead_bytes: state
+                .written
+                .saturating_sub(state.live + 8 * state.segments.len() as u64),
+            segments: state.segments.len(),
+        };
     }
     fn refresh_stats(&self, state: &State) {
         *self.cached_stats.write().unwrap() = SmallStoreStats {
@@ -1201,41 +1132,22 @@ fn reclaimable(state: &State, id: u64) -> bool {
     Some(id) != state.standby
         && Some(id) != state.sealing
         && state.segments.get(&id).is_some_and(|segment| {
-            segment.in_flight == 0
+            segment.in_flight.is_empty()
                 && meets_reclaim_threshold(segment)
                 && (segment.live == 0 || segment.sealed)
         })
 }
 
-fn append_frame(offset: u64, len: u64, checksum: u64, key: &[u8]) -> io::Result<Bytes> {
-    let mut record = vec![0];
-    record.extend_from_slice(&offset.to_le_bytes());
-    record.extend_from_slice(&len.to_le_bytes());
-    record.extend_from_slice(&checksum.to_le_bytes());
-    record.extend_from_slice(key);
-    let mut frame = Vec::new();
-    format::frame(&mut frame, &record)?;
-    Ok(frame.into())
-}
-
 fn charge(key: &[u8], len: u64) -> u64 {
     len + key.len() as u64 + 37
 }
-fn decode_manifest(bytes: &[u8]) -> io::Result<Vec<u64>> {
-    if bytes.len() < 16 || bytes.len() % 8 != 0 || !bytes.starts_with(MAGIC) {
-        return Err(invalid("small object manifest version/length"));
+fn validate_geometry(threshold: u64, segment_size: u64, capacity: u64) -> io::Result<()> {
+    if segment_size < threshold.saturating_add(format::MAX_KEY as u64 + 64)
+        || segment_size > 1 << 30
+        || threshold > 128 << 20
+        || (capacity != 0 && segment_size.saturating_mul(4) > capacity)
+    {
+        return Err(invalid("small object segment/capacity geometry"));
     }
-    let split = bytes.len() - 8;
-    let checksum = u64::from_le_bytes(bytes[split..].try_into().unwrap());
-    if checksum != xxhash_rust::xxh3::xxh3_64(&bytes[..split]) {
-        return Err(invalid("small object manifest checksum"));
-    }
-    let ids: Vec<_> = bytes[8..split]
-        .chunks_exact(8)
-        .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
-        .collect();
-    if ids.windows(2).any(|pair| pair[0] >= pair[1]) {
-        return Err(invalid("small object manifest order"));
-    }
-    Ok(ids)
+    Ok(())
 }

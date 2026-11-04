@@ -296,7 +296,11 @@ impl Rate {
     }
     pub(crate) async fn charge(&self, units: u64) {
         if let Some(at) = self.reserve(units) {
-            tokio::time::sleep_until(at.into()).await;
+            if talon_uring::on_ring() {
+                talon_uring::sleep(at.saturating_duration_since(std::time::Instant::now())).await;
+            } else {
+                tokio::time::sleep_until(at.into()).await;
+            }
         }
     }
 }
@@ -307,6 +311,8 @@ pub(crate) struct BackgroundBudget {
     io: Arc<Semaphore>,
     bytes: Rate,
     deletes: Rate,
+    #[cfg(test)]
+    charged_bytes: std::sync::atomic::AtomicU64,
 }
 impl BackgroundBudget {
     pub fn new(config: &WorkerConfig) -> Arc<Self> {
@@ -314,11 +320,18 @@ impl BackgroundBudget {
             io: Arc::new(Semaphore::new(config.background_io_concurrency)),
             bytes: Rate::new(config.background_io_max_mb_per_sec * 1_000_000),
             deletes: Rate::new(config.background_delete_max_per_sec),
+            #[cfg(test)]
+            charged_bytes: Default::default(),
         })
     }
     #[cfg(test)]
     pub fn available_io(&self) -> usize {
         self.io.available_permits()
+    }
+    #[cfg(test)]
+    pub fn charged_bytes(&self) -> u64 {
+        self.charged_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn io(&self) -> OwnedSemaphorePermit {
@@ -362,7 +375,30 @@ impl BackgroundBudget {
 
     /// Await before each bounded read/write chunk.
     pub async fn bytes(&self, bytes: usize) {
+        #[cfg(test)]
+        self.charged_bytes
+            .fetch_add(bytes as u64, std::sync::atomic::Ordering::Relaxed);
         self.bytes.charge(bytes as u64).await;
+    }
+}
+
+impl talon_journal::Maintenance for BackgroundBudget {
+    fn bytes(&self, bytes: usize) -> futures::future::LocalBoxFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(at) = self.bytes.reserve(bytes as u64) {
+                monoio::time::sleep(at.saturating_duration_since(std::time::Instant::now())).await;
+            }
+        })
+    }
+    fn io(&self) -> futures::future::LocalBoxFuture<'_, Box<dyn Send>> {
+        Box::pin(async move { Box::new(self.io().await) as Box<dyn Send> })
+    }
+    fn delete(&self) -> futures::future::LocalBoxFuture<'_, ()> {
+        Box::pin(async move {
+            if let Some(at) = self.deletes.reserve(1) {
+                monoio::time::sleep(at.saturating_duration_since(std::time::Instant::now())).await;
+            }
+        })
     }
 }
 

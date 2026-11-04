@@ -1,0 +1,18 @@
+[package]
+name = "talon-journal"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+description = "Shared bounded cache journal service, checkpoints and recovery"
+
+[dependencies]
+bytes.workspace = true
+futures.workspace = true
+monoio = { workspace = true, features = ["mkdirat", "renameat", "unlinkat"] }
+tokio.workspace = true
+tracing.workspace = true
+xxhash-rust.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

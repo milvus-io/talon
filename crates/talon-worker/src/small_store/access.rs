@@ -10,27 +10,41 @@ impl SmallObjectStore {
     /// Startup only, after policy reconstruction and before serving.
     pub(super) fn restore_access(&self) {
         let result = (|| -> io::Result<()> {
+            let read_started = std::time::Instant::now();
             let bytes = match std::fs::read(self.root.join(FILE)) {
                 Ok(bytes) => bytes,
                 Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(e) => return Err(e),
             };
+            let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+            let frames_started = std::time::Instant::now();
             let body = bytes
                 .strip_prefix(MAGIC.as_slice())
                 .ok_or_else(|| invalid("small access snapshot version"))?;
             let mut restored = Vec::new();
+            let frames = format::frames(body)?;
+            let records = frames.len();
+            let frames_ms = frames_started.elapsed().as_secs_f64() * 1000.0;
+            let lookup_started = std::time::Instant::now();
             // Validate the entire snapshot before applying any ages. This file
             // never establishes presence and must not resurrect a deleted key.
-            for mut record in format::frames(body)? {
+            for mut record in frames {
                 let last = format::u64(&mut record)?;
                 let id = format::id(record)?;
                 if let Some(access) = self.lookup_entry(&id)?.and_then(|loc| loc.access) {
                     restored.push((access, last));
                 }
             }
+            let decode_lookup_ms = lookup_started.elapsed().as_secs_f64() * 1000.0;
+            let matched = restored.len();
+            let apply_started = std::time::Instant::now();
             for (access, last) in restored {
                 access.restore(last);
             }
+            tracing::info!(root = %self.root.display(), bytes = bytes.len(), records,
+                matched, read_ms, frames_ms, decode_lookup_ms,
+                apply_ms = apply_started.elapsed().as_secs_f64() * 1000.0,
+                "small access recovery phases");
             Ok(())
         })();
         if let Err(error) = result {
