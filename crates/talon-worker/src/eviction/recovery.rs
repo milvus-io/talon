@@ -13,6 +13,7 @@ impl Lru {
     /// The input contains each resident unit exactly once. Sibling pages must
     /// share their idle clock, just as they do after ordinary admission.
     pub(crate) fn from_recovered(
+        index: Arc<crate::BlockIndex>,
         units: Vec<RecoveredUnit>,
         blocks: usize,
         track_checks: bool,
@@ -24,10 +25,27 @@ impl Lru {
                 .map_or(1, usize::from)
                 .min(3)
         };
-        Self::recover_with_workers(units, blocks, workers, track_checks)
+        Self::recover(index, units, blocks, workers, track_checks)
     }
 
+    #[cfg(test)]
     fn recover_with_workers(
+        units: Vec<RecoveredUnit>,
+        blocks: usize,
+        workers: usize,
+        track_checks: bool,
+    ) -> Self {
+        Self::recover(
+            Arc::new(crate::BlockIndex::new()),
+            units,
+            blocks,
+            workers,
+            track_checks,
+        )
+    }
+
+    fn recover(
+        index: Arc<crate::BlockIndex>,
         units: Vec<RecoveredUnit>,
         blocks: usize,
         workers: usize,
@@ -36,23 +54,21 @@ impl Lru {
         let started = std::time::Instant::now();
         let unit_index = || {
             let started = std::time::Instant::now();
-            let entries = units
-                .iter()
-                .enumerate()
-                .map(|(position, u)| {
-                    (
-                        u.unit.clone(),
-                        Entry {
+            for (position, u) in units.iter().enumerate() {
+                index.policy_insert(
+                    &u.unit,
+                    PolicyEntry {
+                        state: PolicyState {
                             independent: u.independent,
                             bytes: u.bytes,
                             position: position as u64,
                             revision: position as u64,
-                            access: u.access.clone(),
                             pins: 0,
                         },
-                    )
-                })
-                .collect();
+                        access: u.access.clone(),
+                    },
+                );
+            }
             let queue = units
                 .iter()
                 .enumerate()
@@ -65,7 +81,7 @@ impl Lru {
                 elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
                 "cache policy index restored"
             );
-            (entries, queue)
+            queue
         };
         let version_index = || {
             let started = std::time::Instant::now();
@@ -132,31 +148,28 @@ impl Lru {
         };
         // At most three CPU workers, including this thread. Small namespaces
         // avoid thread creation. No map is shared mutably during construction.
-        let (
-            (entries, queue),
-            (versions, object_checks),
-            (block_access, block_queue, ownership_queue),
-        ) = std::thread::scope(|scope| {
-            let block_task = (workers > 1).then(|| scope.spawn(block_index));
-            let version_task = (workers > 2).then(|| scope.spawn(version_index));
-            let units = unit_index();
-            let versions = match version_task {
-                Some(task) => task.join().expect("version recovery panicked"),
-                None => version_index(),
-            };
-            let blocks = match block_task {
-                Some(task) => task.join().expect("block recovery panicked"),
-                None => block_index(),
-            };
-            (units, versions, blocks)
-        });
+        let (queue, (versions, object_checks), (block_access, block_queue, ownership_queue)) =
+            std::thread::scope(|scope| {
+                let block_task = (workers > 1).then(|| scope.spawn(block_index));
+                let version_task = (workers > 2).then(|| scope.spawn(version_index));
+                let units = unit_index();
+                let versions = match version_task {
+                    Some(task) => task.join().expect("version recovery panicked"),
+                    None => version_index(),
+                };
+                let blocks = match block_task {
+                    Some(task) => task.join().expect("block recovery panicked"),
+                    None => block_index(),
+                };
+                (units, versions, blocks)
+            });
         let total_bytes = units
             .iter()
             .fold(0u64, |total, u| total.saturating_add(u.bytes));
         let clock = units.len() as u64;
         let lru = Self {
             inner: Mutex::new(Inner {
-                entries,
+                index,
                 queue,
                 versions,
                 block_access,
@@ -303,8 +316,9 @@ mod tests {
                         )
                     );
                 }
-                for (unit, entry) in &a.entries {
-                    let restored = &b.entries[unit];
+                for unit in a.queue.values() {
+                    let entry = a.index.policy_get(unit).unwrap();
+                    let restored = b.index.policy_get(unit).unwrap();
                     assert_eq!(
                         (entry.bytes, entry.position, entry.revision, entry.pins),
                         (
@@ -346,7 +360,7 @@ mod tests {
 
     #[test]
     fn empty_recovery_accepts_first_admission() {
-        let lru = Lru::from_recovered(Vec::new(), 0, true);
+        let lru = Lru::from_recovered(Arc::new(crate::BlockIndex::new()), Vec::new(), 0, true);
         let unit = CacheUnit::Whole(block(1));
         lru.insert(unit.clone(), 10);
         assert_eq!(lru.evict_to_fit(0), vec![unit]);
@@ -388,7 +402,7 @@ mod tests {
             let identity = {
                 let inner = lru.inner.lock().unwrap();
                 let (key, activity) = inner.block_access.get_key_value(&id).unwrap();
-                let unit = inner.entries.get_key_value(&first).unwrap().0;
+                let unit = &inner.queue[&inner.index.policy_get(&first).unwrap().position];
                 assert!(Arc::ptr_eq(&key.0, unit));
                 assert!(Arc::ptr_eq(
                     &key.0,
@@ -412,7 +426,7 @@ mod tests {
             // A later admission requeues ownership using the retained identity,
             // without restoring residency of the original page.
             lru.insert(CacheUnit::Page(id.clone(), PageIndex(31)), 16384);
-            assert!(!lru.inner.lock().unwrap().entries.contains_key(&first));
+            assert!(lru.inner.lock().unwrap().index.policy_get(&first).is_none());
             lru.remove_block(&id);
             assert_eq!(lru.total_bytes(), 0);
             assert!(identity.upgrade().is_none());

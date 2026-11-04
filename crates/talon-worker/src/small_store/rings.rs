@@ -887,7 +887,12 @@ mod recovery_tests {
         for unit in &units {
             serial.insert_with_policy(unit.unit.as_ref().clone(), unit.bytes, true);
         }
-        let policy = Arc::new(crate::Lru::from_recovered(units, store.len(), true));
+        let policy = Arc::new(crate::Lru::from_recovered(
+            Arc::new(crate::BlockIndex::new()),
+            units,
+            store.len(),
+            true,
+        ));
         store.bind_policy(policy.clone());
         assert_eq!(policy.len(), 2050);
         assert_eq!(policy.total_bytes(), serial.total_bytes());

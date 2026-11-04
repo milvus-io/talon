@@ -50,3 +50,19 @@ The second layer passed 651 Worker library tests (8 ignored) and Clippy. The sha
 fixture regression covers read/delete arbitration, a failed-unlink retry, container
 transitions and stale candidates after re-admission. Neither layer changes disk
 formats or has yet established the post-change RSS on the QTP fixture.
+
+The third layer removes the LRU unit HashMap. A unit slot stores policy membership,
+bytes, pins and queue revisions beside its access token. LRU retains its ordered
+queues and secondary version index. A policy-only admission does not count as
+resident data, which also supports packed small objects.
+
+The directory retains policy references through `clear_page` / `index.remove`
+until LRU removal completes. Replacing residency preserves the prior policy slot
+until its admission is removed; the old allocation remains independent so delayed
+index retirement cannot subtract a replacement's bytes. Ordinary admissions share
+the resident slot. The policy lock precedes directory, entry and page-table locks.
+Unbound policy-only nodes are reclaimed on removal, even while a sibling remains.
+The third layer passed 654 Worker tests (8 ignored) and Clippy. Regressions cover
+pin and token preservation, delayed index retirement, policy-only residency
+isolation and bounded page churn. Independent concurrency and cleaness reviews
+found no remaining defect in this layer.

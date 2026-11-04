@@ -579,7 +579,8 @@ async fn small_layout_probe() {
     );
     let mut units = Vec::new();
     store.restore_policy_units(&mut units).unwrap();
-    let policy = crate::Lru::from_recovered(units, 10_000, true);
+    let policy =
+        crate::Lru::from_recovered(Arc::new(crate::BlockIndex::new()), units, 10_000, true);
     let packed_restore = start.elapsed();
     assert_eq!(policy.len(), 10_000);
     let whole_usage = usage(&dir.path().join("whole"));

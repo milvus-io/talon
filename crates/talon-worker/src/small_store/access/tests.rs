@@ -20,7 +20,12 @@ fn open_with_policy(root: &Path) -> (Arc<SmallObjectStore>, Arc<Lru>) {
     );
     let mut units = Vec::new();
     store.restore_policy_units(&mut units);
-    let policy = Arc::new(crate::Lru::from_recovered(units, store.len(), true));
+    let policy = Arc::new(crate::Lru::from_recovered(
+        Arc::new(crate::BlockIndex::new()),
+        units,
+        store.len(),
+        true,
+    ));
     store.bind_policy(policy.clone());
     store.enable_access_tracking().unwrap();
     (store, policy)

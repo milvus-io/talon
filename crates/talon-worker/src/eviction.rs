@@ -36,7 +36,7 @@ impl CacheUnit {
         }
     }
 
-    fn page(&self) -> Option<PageIndex> {
+    pub(crate) fn page(&self) -> Option<PageIndex> {
         match self {
             Self::Whole(_) => None,
             Self::Page(_, page) => Some(*page),
@@ -204,13 +204,26 @@ struct BlockActivity {
     access: Arc<AtomicU64>,
 }
 
-struct Entry {
+#[derive(Clone, Copy)]
+pub(crate) struct PolicyState {
     independent: bool,
     bytes: u64,
     position: u64,
     revision: u64,
-    access: AccessHandle,
     pins: u32,
+}
+
+#[derive(Clone)]
+pub(crate) struct PolicyEntry {
+    pub state: PolicyState,
+    pub access: AccessHandle,
+}
+
+impl std::ops::Deref for PolicyEntry {
+    type Target = PolicyState;
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
 }
 
 /// Byte-accounted second-chance eviction with strict pinning. Reads use stable
@@ -232,7 +245,7 @@ impl Drop for LruPin {
 }
 
 struct Inner {
-    entries: HashMap<Arc<CacheUnit>, Entry>,
+    index: Arc<crate::BlockIndex>,
     queue: BTreeMap<u64, Arc<CacheUnit>>,
     /// Only live units are indexed. `None` denotes a whole block; storing page
     /// indices avoids duplicating object paths and versions for every page.
@@ -252,7 +265,7 @@ struct Inner {
 impl Inner {
     /// Move a resident unit to the back of the second-chance queue.
     fn rotate(&mut self, unit: &CacheUnit) -> u64 {
-        let entry = self.entries.get_mut(unit).expect("tracked cache unit");
+        let entry = self.index.policy_get(unit).expect("tracked cache unit");
         let queued = self
             .queue
             .remove(&entry.position)
@@ -262,24 +275,28 @@ impl Inner {
             .clock
             .checked_add(1)
             .expect("eviction sequence exhausted");
-        entry.position = position;
+        self.index
+            .policy_update(unit, |entry| entry.position = position);
         self.queue.insert(position, queued);
         position
     }
 
     fn snapshot(&mut self, unit: CacheUnit) -> EvictionCandidate {
-        self.entries[&unit].access.0.store(false, Ordering::Relaxed);
-        let revision = self.rotate(&unit);
-        self.entries
-            .get_mut(&unit)
+        self.index
+            .policy_get(&unit)
             .expect("tracked cache unit")
-            .revision = revision;
+            .access
+            .0
+            .store(false, Ordering::Relaxed);
+        let revision = self.rotate(&unit);
+        self.index
+            .policy_update(&unit, |entry| entry.revision = revision);
         EvictionCandidate { unit, revision }
     }
 
     /// All removal paths must update both maps under the same lock.
     fn remove(&mut self, unit: &CacheUnit) -> Option<u64> {
-        let entry = self.entries.remove(unit)?;
+        let entry = self.index.policy_remove(unit)?;
         self.queue.remove(&entry.position);
         let block = unit.block();
         let activity = self.block_access.get_mut(block).expect("tracked block");
@@ -348,7 +365,7 @@ impl Lru {
     pub(crate) fn with_object_checks(track_checks: bool) -> Self {
         Self {
             inner: Mutex::new(Inner {
-                entries: HashMap::new(),
+                index: Arc::new(crate::BlockIndex::new()),
                 queue: BTreeMap::new(),
                 versions: HashMap::new(),
                 block_access: HashMap::new(),
@@ -371,12 +388,12 @@ impl Lru {
 
     /// Number of units currently tracked.
     pub fn len(&self) -> usize {
-        self.inner.lock().unwrap().entries.len()
+        self.inner.lock().unwrap().queue.len()
     }
 
     /// Whether the tracker holds no units.
     pub fn is_empty(&self) -> bool {
-        self.inner.lock().unwrap().entries.is_empty()
+        self.inner.lock().unwrap().queue.is_empty()
     }
 
     /// Insert or update a unit, returning its stable access token. Updating an
@@ -406,11 +423,13 @@ impl Lru {
                 g.ownership_queue.insert(position, block);
             }
         }
-        if let Some(e) = g.entries.get_mut(&unit) {
+        if let Some(e) = g.index.policy_get(&unit) {
             let old = e.bytes;
             let was_independent = e.independent;
-            e.independent = independent;
-            e.bytes = bytes;
+            g.index.policy_update(&unit, |e| {
+                e.independent = independent;
+                e.bytes = bytes;
+            });
             e.access.touch();
             let access = e.access.clone();
             if was_independent != independent {
@@ -478,15 +497,17 @@ impl Lru {
                 .0 += 1;
         }
         g.queue.insert(position, unit.clone());
-        g.entries.insert(
-            unit,
-            Entry {
-                independent,
-                bytes,
-                position,
-                revision: position,
+        g.index.policy_insert(
+            &unit,
+            PolicyEntry {
+                state: PolicyState {
+                    independent,
+                    bytes,
+                    position,
+                    revision: position,
+                    pins: 0,
+                },
                 access: access.clone(),
-                pins: 0,
             },
         );
         access
@@ -495,7 +516,7 @@ impl Lru {
     /// Compatibility lookup for callers without a resolved access token.
     /// Data-path reads should touch the token obtained with their index lookup.
     pub fn touch(&self, unit: &CacheUnit) {
-        if let Some(e) = self.inner.lock().unwrap().entries.get(unit) {
+        if let Some(e) = self.inner.lock().unwrap().index.policy_get(unit) {
             e.access.touch();
         }
     }
@@ -505,9 +526,8 @@ impl Lru {
     /// Returns `true` if the unit exists.
     pub fn pin(&self, unit: &CacheUnit) -> bool {
         let mut g = self.inner.lock().unwrap();
-        match g.entries.get_mut(unit) {
-            Some(e) => {
-                e.pins += 1;
+        match g.index.policy_update(unit, |e| e.pins += 1) {
+            Some(()) => {
                 g.block_access
                     .get_mut(unit.block())
                     .expect("tracked block")
@@ -528,14 +548,18 @@ impl Lru {
     /// Release one pin previously taken with [`pin`](Self::pin).
     pub fn unpin(&self, unit: &CacheUnit) {
         let mut g = self.inner.lock().unwrap();
-        if let Some(e) = g.entries.get_mut(unit) {
-            if e.pins > 0 {
-                e.pins -= 1;
-                g.block_access
-                    .get_mut(unit.block())
-                    .expect("tracked block")
-                    .pins -= 1;
+        if g.index.policy_update(unit, |e| {
+            if e.pins == 0 {
+                return false;
             }
+            e.pins -= 1;
+            true
+        }) == Some(true)
+        {
+            g.block_access
+                .get_mut(unit.block())
+                .expect("tracked block")
+                .pins -= 1;
         }
     }
 
@@ -588,7 +612,7 @@ impl Lru {
                         return out;
                     };
                     let unit = unit.clone();
-                    let entry = &g.entries[unit.as_ref()];
+                    let entry = g.index.policy_get(unit.as_ref()).expect("queued entry");
                     // Do not consume recency for an already selected unit:
                     // a touch after its snapshot must still invalidate it.
                     let eligible = entry.pins == 0
@@ -601,10 +625,8 @@ impl Lru {
                     if eligible {
                         // Consuming recency must invalidate any older snapshot,
                         // even when this walk grants the unit another chance.
-                        g.entries
-                            .get_mut(unit.as_ref())
-                            .expect("queued entry")
-                            .revision = revision;
+                        g.index
+                            .policy_update(unit.as_ref(), |entry| entry.revision = revision);
                     }
                     if victim {
                         selected_bytes = selected_bytes.saturating_add(bytes);
@@ -624,8 +646,8 @@ impl Lru {
     /// Old-version candidates; removal is committed by the caller after I/O.
     pub(crate) fn superseded_candidates(&self, keep: &BlockId) -> Vec<EvictionCandidate> {
         let mut g = self.inner.lock().unwrap();
-        if g.entries
-            .get(&CacheUnit::Whole(keep.clone()))
+        if g.index
+            .policy_get(&CacheUnit::Whole(keep.clone()))
             .is_some_and(|e| e.independent)
         {
             return Vec::new();
@@ -650,7 +672,7 @@ impl Lru {
                     }
                 })
             })
-            .filter(|unit| g.entries[unit].pins == 0)
+            .filter(|unit| g.index.policy_get(unit).expect("tracked unit").pins == 0)
             .collect();
         units.into_iter().map(|unit| g.snapshot(unit)).collect()
     }
@@ -659,7 +681,7 @@ impl Lru {
     pub(crate) fn block_candidates(&self, block: &BlockId) -> Vec<EvictionCandidate> {
         let mut g = self.inner.lock().unwrap();
         let whole = CacheUnit::Whole(block.clone());
-        if g.entries.get(&whole).is_some_and(|e| e.independent) {
+        if g.index.policy_get(&whole).is_some_and(|e| e.independent) {
             return vec![g.snapshot(whole)];
         }
         let Some(units) = g
@@ -813,7 +835,7 @@ impl Lru {
     pub(crate) fn remove_block(&self, block: &BlockId) {
         let mut g = self.inner.lock().unwrap();
         let whole = CacheUnit::Whole(block.clone());
-        if g.entries.get(&whole).is_some_and(|e| e.independent) {
+        if g.index.policy_get(&whole).is_some_and(|e| e.independent) {
             g.remove(&whole);
             return;
         }
@@ -854,8 +876,8 @@ impl Lru {
         self.inner
             .lock()
             .unwrap()
-            .entries
-            .get(&candidate.unit)
+            .index
+            .policy_get(&candidate.unit)
             .is_some_and(|entry| {
                 entry.pins == 0
                     && entry.revision == candidate.revision
@@ -878,8 +900,8 @@ impl Lru {
     /// regardless of the number of pages in this block or the rest of the cache.
     pub fn evict_superseded(&self, keep: &BlockId) -> Vec<CacheUnit> {
         let mut g = self.inner.lock().unwrap();
-        if g.entries
-            .get(&CacheUnit::Whole(keep.clone()))
+        if g.index
+            .policy_get(&CacheUnit::Whole(keep.clone()))
             .is_some_and(|e| e.independent)
         {
             return Vec::new();
@@ -907,7 +929,7 @@ impl Lru {
                     }
                 })
             })
-            .filter(|unit| g.entries.get(unit).expect("indexed cache unit").pins == 0)
+            .filter(|unit| g.index.policy_get(unit).expect("indexed cache unit").pins == 0)
             .collect();
         for unit in &victims {
             g.remove(unit);
@@ -945,7 +967,7 @@ impl Lru {
                     };
                     let position = *position;
                     let unit = unit.clone();
-                    let e = g.entries.get(unit.as_ref()).expect("queued entry");
+                    let e = g.index.policy_get(unit.as_ref()).expect("queued entry");
                     let referenced = e.access.0.swap(false, Ordering::Relaxed);
                     if e.pins == 0 && (second_pass || !referenced) {
                         g.remove(&unit);
@@ -954,9 +976,10 @@ impl Lru {
                         g.queue.remove(&position);
                         let next = g.clock;
                         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
-                        let entry = g.entries.get_mut(unit.as_ref()).expect("queued entry");
-                        entry.position = next;
-                        entry.revision = next;
+                        g.index.policy_update(unit.as_ref(), |entry| {
+                            entry.position = next;
+                            entry.revision = next;
+                        });
                         g.queue.insert(next, unit);
                     }
                 }
@@ -1000,11 +1023,29 @@ mod tests {
         let updated = lru.insert_with_policy(unit.clone(), 20, true);
         assert!(Arc::ptr_eq(&access.0, &updated.0));
         assert!(lru.inner.lock().unwrap().versions.is_empty());
-        assert_eq!(lru.inner.lock().unwrap().entries[&unit].pins, 1);
+        assert_eq!(
+            lru.inner
+                .lock()
+                .unwrap()
+                .index
+                .policy_get(&unit)
+                .unwrap()
+                .pins,
+            1
+        );
         let updated = lru.insert(unit.clone(), 30);
         assert!(Arc::ptr_eq(&access.0, &updated.0));
         assert_eq!(lru.inner.lock().unwrap().versions.len(), 1);
-        assert_eq!(lru.inner.lock().unwrap().entries[&unit].pins, 1);
+        assert_eq!(
+            lru.inner
+                .lock()
+                .unwrap()
+                .index
+                .policy_get(&unit)
+                .unwrap()
+                .pins,
+            1
+        );
         drop(pin);
         lru.remove_block(unit.block());
         assert!(lru.is_empty());
@@ -1316,9 +1357,12 @@ mod tests {
                 lru.remove(&whole(i % 8));
             }
             let g = lru.inner.lock().unwrap();
-            assert_eq!(g.queue.len(), g.entries.len());
+            assert!(g
+                .queue
+                .values()
+                .all(|unit| g.index.policy_get(unit).is_some()));
             for (position, unit) in &g.queue {
-                assert_eq!(g.entries[unit].position, *position);
+                assert_eq!(g.index.policy_get(unit).unwrap().position, *position);
             }
         }
         lru.evict_to_fit(0);

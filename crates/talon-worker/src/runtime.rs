@@ -247,7 +247,12 @@ impl WorkerRuntime {
         if let Some(small) = &small {
             small.restore_policy_units(&mut units);
         }
-        let lru = Arc::new(Lru::from_recovered(units, blocks, track_checks));
+        let lru = Arc::new(Lru::from_recovered(
+            index.clone(),
+            units,
+            blocks,
+            track_checks,
+        ));
         let lru_ms = lru_started.elapsed().as_secs_f64() * 1000.0;
         let access_started = Instant::now();
         if let Some(small) = &small {
