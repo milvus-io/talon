@@ -578,7 +578,7 @@ impl SegmentStore {
         for (key, loc) in self.entries.write().unwrap().iter_mut() {
             let access = AccessHandle::default();
             units.push(crate::eviction::RecoveredUnit {
-                unit: Arc::new(CacheUnit::Whole(format::id(key)?)),
+                unit: CacheUnit::Whole(format::id(key)?).into(),
                 bytes: charge(key, loc.len),
                 independent: true,
                 access: access.clone(),

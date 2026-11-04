@@ -17,7 +17,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock, RwLockReadGuard};
 
 use crate::eviction::{
-    AccessHandle, BlockActivity, BlockPolicy, CacheUnit, PolicyEntry, PolicyState,
+    AccessHandle, BlockActivity, BlockPolicy, CacheUnit, PolicyEntry, PolicyState, SharedUnit,
+    UnitKey,
 };
 use crate::page_lifecycle::{BlockState, PageEntry, PageReadGuard, PageTable};
 
@@ -313,7 +314,7 @@ impl BlockIndex {
         }
     }
 
-    pub(crate) fn policy_get(&self, unit: &CacheUnit) -> Option<PolicyEntry> {
+    pub(crate) fn policy_get(&self, unit: &impl crate::eviction::UnitKey) -> Option<PolicyEntry> {
         let entries = self.entries.read().unwrap();
         let policy = &entries.get(unit.block())?.policy;
         let read = |slot: &UnitSlot| {
@@ -328,12 +329,56 @@ impl BlockIndex {
         }
     }
 
-    pub(crate) fn policy_insert(&self, unit: &CacheUnit, entry: PolicyEntry) {
+    pub(crate) fn policy_units(&self, id: &BlockId) -> Vec<(Option<PageIndex>, PolicyState)> {
+        let entries = self.entries.read().unwrap();
+        let Some(entry) = entries.get(id) else {
+            return Vec::new();
+        };
+        let mut units = Vec::with_capacity(entry.policy.len);
+        if let Some(whole) = &entry.policy.whole {
+            if let Some(policy) = whole.read().unwrap().policy {
+                units.push((None, policy));
+            }
+        }
+        if let Some(pages) = &entry.policy.pages {
+            for (&page, slot) in pages.read().unwrap().iter() {
+                if let Some(policy) = slot.unit.policy {
+                    units.push((Some(PageIndex(page)), policy));
+                }
+            }
+        }
+        units
+    }
+
+    pub(crate) fn shared_identity(&self, id: &BlockId) -> Option<Arc<BlockId>> {
+        self.entries
+            .read()
+            .unwrap()
+            .get_key_value(id)
+            .map(|(id, _)| id.clone())
+    }
+
+    pub(crate) fn policy_has_versioned_units(&self, id: &BlockId) -> bool {
+        let entries = self.entries.read().unwrap();
+        let Some(entry) = entries.get(id) else {
+            return false;
+        };
+        let independent_whole = entry.policy.whole.as_ref().is_some_and(|whole| {
+            whole
+                .read()
+                .unwrap()
+                .policy
+                .is_some_and(|policy| policy.independent)
+        });
+        entry.policy.len > usize::from(independent_whole)
+    }
+
+    pub(crate) fn policy_insert(&self, unit: &SharedUnit, entry: PolicyEntry) {
         let mut entries = self.entries.write().unwrap();
         let directory = if let Some(directory) = entries.get_mut(unit.block()) {
             directory
         } else {
-            entries.entry(Arc::new(unit.block().clone())).or_default()
+            entries.entry(unit.block.clone()).or_default()
         };
         let resident = directory
             .resident
@@ -376,7 +421,7 @@ impl BlockIndex {
 
     pub(crate) fn policy_update<T>(
         &self,
-        unit: &CacheUnit,
+        unit: &impl crate::eviction::UnitKey,
         update: impl FnOnce(&mut PolicyState) -> T,
     ) -> Option<T> {
         let entries = self.entries.read().unwrap();
@@ -399,7 +444,10 @@ impl BlockIndex {
         }
     }
 
-    pub(crate) fn policy_remove(&self, unit: &CacheUnit) -> Option<PolicyEntry> {
+    pub(crate) fn policy_remove(
+        &self,
+        unit: &impl crate::eviction::UnitKey,
+    ) -> Option<PolicyEntry> {
         let mut entries = self.entries.write().unwrap();
         let directory = entries.get_mut(unit.block())?;
         let take = |slot: &mut UnitSlot| {
@@ -686,10 +734,10 @@ impl BlockIndex {
                 slot.access = Some(access.clone());
                 units.push(RecoveredUnit {
                     independent: false,
-                    unit: Arc::new(match page {
-                        Some(page) => CacheUnit::Page(entry.meta.id.as_ref().clone(), page),
-                        None => CacheUnit::Whole(entry.meta.id.as_ref().clone()),
-                    }),
+                    unit: crate::eviction::SharedUnit {
+                        block: entry.meta.id.clone(),
+                        page,
+                    },
                     bytes: slot.allocated,
                     access,
                 });

@@ -885,7 +885,7 @@ mod recovery_tests {
         store.restore_policy_units(&mut units);
         let serial = crate::Lru::new();
         for unit in &units {
-            serial.insert_with_policy(unit.unit.as_ref().clone(), unit.bytes, true);
+            serial.insert_with_policy(unit.unit.materialize(), unit.bytes, true);
         }
         let policy = Arc::new(crate::Lru::from_recovered(
             Arc::new(crate::BlockIndex::new()),

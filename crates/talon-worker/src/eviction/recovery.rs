@@ -4,7 +4,7 @@ use super::*;
 
 pub(crate) struct RecoveredUnit {
     pub independent: bool,
-    pub unit: Arc<CacheUnit>,
+    pub unit: SharedUnit,
     pub bytes: u64,
     pub access: AccessHandle,
 }
@@ -85,18 +85,14 @@ impl Lru {
         };
         let version_index = || {
             let started = std::time::Instant::now();
-            let mut versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>> =
-                HashMap::with_capacity(units.iter().filter(|u| !u.independent).count().min(blocks));
+            let mut versions = VersionIndex::with_capacity(
+                units.iter().filter(|u| !u.independent).count().min(blocks),
+            );
             let mut checks = HashMap::with_capacity(if track_checks { blocks } else { 0 });
             for u in &units {
                 let block = u.unit.block();
                 if !u.independent {
-                    versions
-                        .entry(LogicalBlock::from(block))
-                        .or_default()
-                        .entry(block.version.clone())
-                        .or_default()
-                        .insert(u.unit.page());
+                    versions.insert(u.unit.block.clone());
                 }
                 if track_checks {
                     checks.entry(block.object.clone()).or_insert((0, None)).0 += 1;
@@ -223,7 +219,7 @@ mod tests {
                         let access = ordinary.insert_with_policy(unit.clone(), 100, true);
                         RecoveredUnit {
                             independent: true,
-                            unit: Arc::new(unit),
+                            unit: unit.into(),
                             bytes: 100,
                             access,
                         }
@@ -275,7 +271,7 @@ mod tests {
                         .or_insert_with(AccessHandle::default);
                     RecoveredUnit {
                         independent: false,
-                        unit: Arc::new(unit.clone()),
+                        unit: unit.clone().into(),
                         bytes: *bytes,
                         access: access.sibling(),
                     }
@@ -377,13 +373,13 @@ mod tests {
                     vec![
                         RecoveredUnit {
                             independent: false,
-                            unit: Arc::new(first.clone()),
+                            unit: first.clone().into(),
                             bytes: 4096,
                             access: shared.clone(),
                         },
                         RecoveredUnit {
                             independent: false,
-                            unit: Arc::new(second.clone()),
+                            unit: second.clone().into(),
                             bytes: 8192,
                             access: shared.sibling(),
                         },

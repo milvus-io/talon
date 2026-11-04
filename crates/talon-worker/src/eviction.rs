@@ -15,10 +15,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
-use talon_core::{BlockId, ObjectId, PageIndex, Version};
+#[cfg(test)]
+use talon_core::Version;
+use talon_core::{BlockId, ObjectId, PageIndex};
 
 mod recovery;
+mod versions;
 pub(crate) use recovery::RecoveredUnit;
+use versions::VersionIndex;
 
 /// A single evictable cache unit.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -46,20 +50,49 @@ impl CacheUnit {
 
 type BlockKey = Arc<BlockId>;
 
-/// Version-independent identity; offsets and block sizes must remain distinct.
-#[derive(PartialEq, Eq, Hash)]
-struct LogicalBlock {
-    object: ObjectId,
-    offset: u64,
-    block_size: u32,
+pub(crate) trait UnitKey {
+    fn block(&self) -> &BlockId;
+    fn page(&self) -> Option<PageIndex>;
+}
+impl UnitKey for CacheUnit {
+    fn block(&self) -> &BlockId {
+        self.block()
+    }
+    fn page(&self) -> Option<PageIndex> {
+        self.page()
+    }
 }
 
-impl From<&BlockId> for LogicalBlock {
-    fn from(block: &BlockId) -> Self {
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct SharedUnit {
+    pub block: BlockKey,
+    pub page: Option<PageIndex>,
+}
+impl UnitKey for SharedUnit {
+    fn block(&self) -> &BlockId {
+        &self.block
+    }
+    fn page(&self) -> Option<PageIndex> {
+        self.page
+    }
+}
+impl SharedUnit {
+    pub(crate) fn materialize(&self) -> CacheUnit {
+        match self.page {
+            Some(page) => CacheUnit::Page(self.block.as_ref().clone(), page),
+            None => CacheUnit::Whole(self.block.as_ref().clone()),
+        }
+    }
+}
+impl From<CacheUnit> for SharedUnit {
+    fn from(unit: CacheUnit) -> Self {
+        let (block, page) = match unit {
+            CacheUnit::Whole(block) => (block, None),
+            CacheUnit::Page(block, page) => (block, Some(page)),
+        };
         Self {
-            object: block.object.clone(),
-            offset: block.offset,
-            block_size: block.block_size,
+            block: Arc::new(block),
+            page,
         }
     }
 }
@@ -188,7 +221,7 @@ impl std::ops::Deref for BlockActivity {
 
 #[derive(Clone, Copy)]
 pub(crate) struct PolicyState {
-    independent: bool,
+    pub(crate) independent: bool,
     bytes: u64,
     position: u64,
     revision: u64,
@@ -228,10 +261,8 @@ impl Drop for LruPin {
 
 struct Inner {
     index: Arc<crate::BlockIndex>,
-    queue: BTreeMap<u64, Arc<CacheUnit>>,
-    /// Only live units are indexed. `None` denotes a whole block; storing page
-    /// indices avoids duplicating object paths and versions for every page.
-    versions: HashMap<LogicalBlock, HashMap<Version, HashSet<Option<PageIndex>>>>,
+    queue: BTreeMap<u64, SharedUnit>,
+    versions: VersionIndex,
     block_queue: BTreeMap<u64, BlockKey>,
     ownership_queue: BTreeMap<u64, BlockKey>,
     object_checks: HashMap<ObjectId, (usize, Option<u64>)>,
@@ -307,22 +338,29 @@ impl Inner {
 
     fn remove_version(&mut self, unit: &CacheUnit) {
         let block = unit.block();
-        let key = LogicalBlock::from(block);
-        let versions = self.versions.get_mut(&key).expect("tracked logical block");
-        let units = versions.get_mut(&block.version).expect("tracked version");
-        let removed = units.remove(&unit.page());
-        debug_assert!(removed, "tracked cache unit missing from version index");
-        if units.is_empty() {
-            versions.remove(&block.version);
-        } else if units.capacity() > 32 && units.len() < units.capacity() / 4 {
-            // Release historical page capacity when a block becomes sparse.
-            // Leave growth headroom and skip tiny sets to avoid reallocating
-            // on every removal or when residency oscillates near a threshold.
-            units.shrink_to(units.len() * 2);
+        if !self.index.policy_has_versioned_units(block) {
+            self.versions.remove(block);
         }
-        if versions.is_empty() {
-            self.versions.remove(&key);
-        }
+    }
+
+    fn superseded_units(&self, keep: &BlockId) -> Vec<CacheUnit> {
+        self.versions
+            .blocks(keep)
+            .filter(|block| block.version != keep.version)
+            .flat_map(|block| {
+                self.index
+                    .policy_units(block)
+                    .into_iter()
+                    .filter(|(_, state)| !state.independent && state.pins == 0)
+                    .map(|(page, _)| {
+                        SharedUnit {
+                            block: block.clone(),
+                            page,
+                        }
+                        .materialize()
+                    })
+            })
+            .collect()
     }
 }
 
@@ -350,7 +388,7 @@ impl Lru {
             inner: Mutex::new(Inner {
                 index: Arc::new(crate::BlockIndex::new()),
                 queue: BTreeMap::new(),
-                versions: HashMap::new(),
+                versions: VersionIndex::default(),
                 block_queue: BTreeMap::new(),
                 ownership_queue: BTreeMap::new(),
                 object_checks: HashMap::new(),
@@ -425,12 +463,11 @@ impl Lru {
                 if independent {
                     g.remove_version(&unit);
                 } else {
-                    g.versions
-                        .entry(LogicalBlock::from(unit.block()))
-                        .or_default()
-                        .entry(unit.block().version.clone())
-                        .or_default()
-                        .insert(unit.page());
+                    let key = g
+                        .index
+                        .shared_identity(unit.block())
+                        .expect("tracked block");
+                    g.versions.insert(key);
                 }
             }
             g.index
@@ -439,17 +476,8 @@ impl Lru {
             Self::add_bytes(&mut g.total_bytes, bytes);
             return access;
         }
-        let unit = Arc::new(unit);
         Self::add_bytes(&mut g.total_bytes, bytes);
         let block = unit.block();
-        if !independent {
-            g.versions
-                .entry(LogicalBlock::from(block))
-                .or_default()
-                .entry(block.version.clone())
-                .or_default()
-                .insert(unit.page());
-        }
         if g.index.policy_block_get(block).is_none() {
             let key = g.index.policy_block_insert(
                 block,
@@ -480,6 +508,13 @@ impl Lru {
                 .entry(block.object.clone())
                 .or_insert((0, None))
                 .0 += 1;
+        }
+        let unit = SharedUnit {
+            block: g.index.shared_identity(block).expect("tracked block"),
+            page: unit.page(),
+        };
+        if !independent {
+            g.versions.insert(unit.block.clone());
         }
         g.queue.insert(position, unit.clone());
         g.index.policy_insert(
@@ -593,12 +628,12 @@ impl Lru {
                         return out;
                     };
                     let unit = unit.clone();
-                    let entry = g.index.policy_get(unit.as_ref()).expect("queued entry");
+                    let entry = g.index.policy_get(&unit).expect("queued entry");
+                    let unit = unit.materialize();
                     // Do not consume recency for an already selected unit:
                     // a touch after its snapshot must still invalidate it.
-                    let eligible = entry.pins == 0
-                        && !selected.contains(unit.as_ref())
-                        && !excluded.contains(unit.as_ref());
+                    let eligible =
+                        entry.pins == 0 && !selected.contains(&unit) && !excluded.contains(&unit);
                     let referenced = eligible && entry.access.0.swap(false, Ordering::Relaxed);
                     let victim = eligible && (second_pass || !referenced);
                     let bytes = entry.bytes;
@@ -607,13 +642,13 @@ impl Lru {
                         // Consuming recency must invalidate any older snapshot,
                         // even when this walk grants the unit another chance.
                         g.index
-                            .policy_update(unit.as_ref(), |entry| entry.revision = revision);
+                            .policy_update(&unit, |entry| entry.revision = revision);
                     }
                     if victim {
                         selected_bytes = selected_bytes.saturating_add(bytes);
-                        selected.insert((*unit).clone());
+                        selected.insert(unit.clone());
                         out.push(EvictionCandidate {
-                            unit: (*unit).clone(),
+                            unit: unit.clone(),
                             revision,
                         });
                     }
@@ -633,50 +668,20 @@ impl Lru {
         {
             return Vec::new();
         }
-        let Some(versions) = g.versions.get(&LogicalBlock::from(keep)) else {
-            return Vec::new();
-        };
-        let units: Vec<_> = versions
-            .iter()
-            .filter(|(version, _)| *version != &keep.version)
-            .flat_map(|(version, units)| {
-                units.iter().map(move |page| {
-                    let block = BlockId::new(
-                        keep.object.clone(),
-                        keep.offset,
-                        keep.block_size,
-                        version.clone(),
-                    );
-                    match page {
-                        None => CacheUnit::Whole(block),
-                        Some(page) => CacheUnit::Page(block, *page),
-                    }
-                })
-            })
-            .filter(|unit| g.index.policy_get(unit).expect("tracked unit").pins == 0)
-            .collect();
+        let units = g.superseded_units(keep);
         units.into_iter().map(|unit| g.snapshot(unit)).collect()
     }
 
     /// Snapshot resident units for an explicit block invalidation.
     pub(crate) fn block_candidates(&self, block: &BlockId) -> Vec<EvictionCandidate> {
         let mut g = self.inner.lock().unwrap();
-        let whole = CacheUnit::Whole(block.clone());
-        if g.index.policy_get(&whole).is_some_and(|e| e.independent) {
-            return vec![g.snapshot(whole)];
-        }
-        let Some(units) = g
-            .versions
-            .get(&LogicalBlock::from(block))
-            .and_then(|versions| versions.get(&block.version))
-        else {
-            return Vec::new();
-        };
-        let units: Vec<_> = units
-            .iter()
-            .map(|page| match page {
+        let units: Vec<_> = g
+            .index
+            .policy_units(block)
+            .into_iter()
+            .map(|(page, _)| match page {
                 None => CacheUnit::Whole(block.clone()),
-                Some(page) => CacheUnit::Page(block.clone(), *page),
+                Some(page) => CacheUnit::Page(block.clone(), page),
             })
             .collect();
         units.into_iter().map(|unit| g.snapshot(unit)).collect()
@@ -820,20 +825,7 @@ impl Lru {
     /// Called under the block mutation gate after its complete on-disk deletion.
     pub(crate) fn remove_block(&self, block: &BlockId) {
         let mut g = self.inner.lock().unwrap();
-        let whole = CacheUnit::Whole(block.clone());
-        if g.index.policy_get(&whole).is_some_and(|e| e.independent) {
-            g.remove(&whole);
-            return;
-        }
-        let Some(pages) = g
-            .versions
-            .get(&LogicalBlock::from(block))
-            .and_then(|versions| versions.get(&block.version))
-        else {
-            return;
-        };
-        let pages: Vec<_> = pages.iter().copied().collect();
-        for page in pages {
+        for (page, _) in g.index.policy_units(block) {
             let unit = match page {
                 Some(page) => CacheUnit::Page(block.clone(), page),
                 None => CacheUnit::Whole(block.clone()),
@@ -892,31 +884,7 @@ impl Lru {
         {
             return Vec::new();
         }
-        let Some(versions) = g.versions.get(&LogicalBlock::from(keep)) else {
-            return Vec::new();
-        };
-        if versions.len() == 1 && versions.contains_key(&keep.version) {
-            return Vec::new();
-        }
-        let victims: Vec<CacheUnit> = versions
-            .iter()
-            .filter(|(version, _)| *version != &keep.version)
-            .flat_map(|(version, units)| {
-                units.iter().map(move |page| {
-                    let block = BlockId::new(
-                        keep.object.clone(),
-                        keep.offset,
-                        keep.block_size,
-                        version.clone(),
-                    );
-                    match page {
-                        None => CacheUnit::Whole(block),
-                        Some(page) => CacheUnit::Page(block, *page),
-                    }
-                })
-            })
-            .filter(|unit| g.index.policy_get(unit).expect("indexed cache unit").pins == 0)
-            .collect();
+        let victims = g.superseded_units(keep);
         for unit in &victims {
             g.remove(unit);
         }
@@ -953,16 +921,17 @@ impl Lru {
                     };
                     let position = *position;
                     let unit = unit.clone();
-                    let e = g.index.policy_get(unit.as_ref()).expect("queued entry");
+                    let e = g.index.policy_get(&unit).expect("queued entry");
                     let referenced = e.access.0.swap(false, Ordering::Relaxed);
                     if e.pins == 0 && (second_pass || !referenced) {
+                        let unit = unit.materialize();
                         g.remove(&unit);
-                        evicted.push((*unit).clone());
+                        evicted.push(unit);
                     } else {
                         g.queue.remove(&position);
                         let next = g.clock;
                         g.clock = g.clock.checked_add(1).expect("eviction sequence exhausted");
-                        g.index.policy_update(unit.as_ref(), |entry| {
+                        g.index.policy_update(&unit, |entry| {
                             entry.position = next;
                             entry.revision = next;
                         });
@@ -1616,9 +1585,15 @@ mod tests {
         assert!(lru.evict_superseded(&keep).is_empty());
         {
             let g = lru.inner.lock().unwrap();
-            let versions = &g.versions[&LogicalBlock::from(&keep)];
-            assert_eq!(versions.len(), 1);
-            assert_eq!(versions[&keep.version], HashSet::from([None]));
+            assert_eq!(g.versions.blocks(&keep).count(), 1);
+            assert_eq!(
+                g.index
+                    .policy_units(&keep)
+                    .iter()
+                    .map(|(page, _)| *page)
+                    .collect::<Vec<_>>(),
+                [None]
+            );
         }
         // The same identities can be admitted again after either removal path.
         lru.insert(page0.clone(), 40);
@@ -1653,10 +1628,16 @@ mod tests {
         assert_eq!(lru.len(), 8);
         assert_eq!(lru.total_bytes(), 8 * page_bytes);
         let g = lru.inner.lock().unwrap();
-        for versions in g.versions.values() {
-            let pages = &versions[&Version::new("v1")];
-            assert_eq!(pages, &HashSet::from([Some(PageIndex(0))]));
-            assert!(pages.capacity() <= 64, "sparse set retains peak capacity");
+        for n in 0..8 {
+            assert_eq!(g.versions.blocks(&blk(n)).count(), 1);
+            assert_eq!(
+                g.index
+                    .policy_units(&blk(n))
+                    .iter()
+                    .map(|(page, _)| *page)
+                    .collect::<Vec<_>>(),
+                [Some(PageIndex(0))]
+            );
         }
     }
 
@@ -1690,9 +1671,14 @@ mod tests {
             assert_eq!(lru.total_bytes(), 2);
             assert!(lru.evict_superseded(&keep).is_empty());
             let g = lru.inner.lock().unwrap();
-            let pages = &g.versions[&LogicalBlock::from(&old)][&old.version];
-            assert_eq!(pages, &HashSet::from([Some(PageIndex(0))]));
-            assert!(pages.capacity() <= 64, "sparse set retains peak capacity");
+            assert_eq!(
+                g.index
+                    .policy_units(&old)
+                    .iter()
+                    .map(|(page, _)| *page)
+                    .collect::<Vec<_>>(),
+                [Some(PageIndex(0))]
+            );
         }
 
         lru.unpin(&hot);

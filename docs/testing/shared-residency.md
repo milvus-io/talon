@@ -116,3 +116,29 @@ gates prevent retirement. Page handles keep their reader count through retiremen
 and rebinding. Enabling TTI before serving still restores every resident page's age.
 Validation passed 659 Worker tests (8 ignored) and Clippy, including retained
 readers, gates, retry cancellation and access tracking bound after an earlier read.
+
+The seventh layer shares identities in the capacity queue and retains one block
+reference per version. A global digest table stores the common single-version
+case inline; extra versions and digest collisions use an overflow list. Queries
+and removals still compare complete identities. Page membership comes from the
+resident policy slots. Removing a page checks aggregate membership without a
+second page scan. Independent whole-object policy remains excluded from version
+eviction. Validation passed 660 Worker tests (8 ignored) and Clippy. One full-suite
+run hit a connection reset in the unchanged cross-ring echo test; the rerun passed.
+
+Two warm runs of the combined catalog, lifecycle and policy changes restored
+1,934,887 blocks/pages in 10.052 s and 10.058 s. Ready RSS was 2,352,439,296 and
+2,359,775,232 bytes; startup high-water RSS was 2,487,496,704 and 2,495,078,400 bytes.
+The 17,123-object content check passed. Small store and TTI remained disabled,
+evictions stayed zero, and the original services were restored afterward.
+Measured binary SHA256:
+`98c9462924ca125b206e4014d1f8bfd4e5e88c5b290e5812376279c6ec94828c`.
+The final source additionally narrows the insertion interface and makes the
+version-membership removal check constant-time; that binary has not been measured.
+
+A separate heaptrack capture of the measured binary retained 1,994,000,654 requested
+heap bytes. The leading allocations were the residency directory (406.85 MB),
+page tables (232.19 MB), block identities (216.71 MB plus strings), resident entries
+(201.23 MB), catalog records (123.83 MB) and PageState (108.35 MB). Profiler RSS is
+not the normal-process RSS. The next work consolidates resident representations;
+the 1,000,000,000-byte target remains unmet and read performance is still pending.
