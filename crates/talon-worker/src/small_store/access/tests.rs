@@ -217,10 +217,43 @@ async fn legacy_snapshot_migrates_and_log_threshold_compacts() {
     store.access(&id(0)).unwrap().touch();
     flush(&store).await;
     assert_eq!(log(dir.path()).len(), 1);
-    store.access_disk.lock().unwrap().log_bytes = COMPACT_BYTES;
+    store.access_disk.lock().unwrap().log_bytes = MIN_COMPACT_BYTES;
     flush(&store).await;
     assert_eq!(store.access_disk.lock().unwrap().generation, 2);
     assert!(log(dir.path()).is_empty());
+}
+
+#[tokio::test]
+async fn log_compaction_requires_one_mib_and_half_the_snapshot_size() {
+    for (snapshot_bytes, threshold) in [
+        (64 << 10, 1 << 20),
+        (1536 << 10, 1 << 20),
+        (2 << 20, 1 << 20),
+        (4 << 20, 2 << 20),
+        ((4 << 20) + 1, (2 << 20) + 1),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(dir.path());
+        put(&store, &id(0)).await;
+        flush(&store).await;
+        let baseline = std::fs::read(dir.path().join(FILE)).unwrap();
+        {
+            let mut state = store.access_disk.lock().unwrap();
+            state.snapshot_bytes = snapshot_bytes;
+            state.log_bytes = threshold - 1;
+        }
+        flush(&store).await;
+        assert_eq!(store.access_disk.lock().unwrap().generation, 1);
+        assert_eq!(std::fs::read(dir.path().join(FILE)).unwrap(), baseline);
+
+        store.access_disk.lock().unwrap().log_bytes = threshold;
+        flush(&store).await;
+        assert_eq!(store.access_disk.lock().unwrap().generation, 2);
+        assert_eq!(
+            std::fs::metadata(dir.path().join(LOG)).unwrap().len(),
+            HEADER
+        );
+    }
 }
 
 #[tokio::test]

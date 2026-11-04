@@ -13,7 +13,7 @@ const LEGACY: &[u8; 8] = b"TLSA0001";
 const MAGIC: &[u8; 8] = b"TLSA0002";
 const LOG_MAGIC: &[u8; 8] = b"TLSL0001";
 const HEADER: u64 = 16;
-const COMPACT_BYTES: u64 = 64 << 20;
+const MIN_COMPACT_BYTES: u64 = 1 << 20;
 const MAX_DIRTY_KEYS: usize = 262_144;
 const MAX_DIRTY_BYTES: usize = 64 << 20;
 
@@ -267,7 +267,8 @@ impl SmallObjectStore {
                             std::mem::take(&mut *prepare.access_dirty.pending.lock().unwrap());
                         let full = state.full
                             || overflow
-                            || state.log_bytes >= COMPACT_BYTES.max(state.snapshot_bytes);
+                            || state.log_bytes
+                                >= MIN_COMPACT_BYTES.max(state.snapshot_bytes.div_ceil(2));
                         // Failure after consuming dirty state must retry from all live
                         // timestamps, including a partial append or ambiguous rename.
                         prepare.access_disk.lock().unwrap().full = true;

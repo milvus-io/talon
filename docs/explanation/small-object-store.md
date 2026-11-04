@@ -62,7 +62,7 @@ keys to `small/access.log`; graceful shutdown performs the same flush. A clean
 cycle does not traverse the resident index or write either access file.
 
 `small/access.checkpoint` is a full base snapshot. The first flush, migration
-from `TLSA0001`, or a log reaching `max(64 MiB, base snapshot size)` rebuilds it
+from `TLSA0001`, or a log reaching `max(1 MiB, base snapshot size / 2)` rebuilds it
 from current residents. This remains O(N) CPU, memory and sequential writes,
 but is removed from the normal periodic flush. Recovery also requests a base
 checkpoint when a resident key has no saved age, or an age needed clock repair,
