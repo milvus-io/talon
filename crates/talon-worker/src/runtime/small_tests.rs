@@ -909,6 +909,12 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
         .unwrap();
     w.write_object(&object(), data()).await.unwrap();
     let block = id(&w);
+    w.small
+        .as_ref()
+        .unwrap()
+        .access(&block)
+        .unwrap()
+        .restore(crate::eviction::access_millis() - 60_000);
     let w = Arc::new(w);
     let service = WorkerBackground::start(
         w.clone(),
@@ -928,14 +934,10 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
     })
     .await
     .unwrap();
-    // Change age after the periodic checkpoint; orderly shutdown must flush it.
-    let cold = crate::eviction::access_millis() - 60_000;
-    w.small
-        .as_ref()
-        .unwrap()
-        .access(&block)
-        .unwrap()
-        .restore(cold);
+    // A real access after the periodic checkpoint must be flushed on shutdown.
+    let access = w.small.as_ref().unwrap().access(&block).unwrap();
+    access.touch();
+    let touched = access.last_access();
     service.shutdown().await;
     drop(w);
     let (_, w) = runtime(dir.path(), false, false);
@@ -946,7 +948,7 @@ async fn small_tti_background_and_shutdown_checkpoint_without_paged_cache() {
             .access(&block)
             .unwrap()
             .last_access(),
-        cold
+        touched
     );
 }
 

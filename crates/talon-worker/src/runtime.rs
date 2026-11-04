@@ -2215,6 +2215,9 @@ impl WorkerRuntime {
                                 .expect("small store enabled")
                                 .put(&id, bytes.into_bytes())
                                 .await?;
+                            if runtime.page_gc_config.tti_ms > 0 {
+                                runtime.small.as_ref().unwrap().track_access(&id)?;
+                            }
                         } else {
                             let allocated = runtime.store.put_payload(&id, bytes).await?;
                             runtime.index.commit_allocated(
