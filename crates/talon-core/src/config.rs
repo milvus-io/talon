@@ -263,6 +263,8 @@ pub struct WorkerConfig {
     pub block_size: u32,
     /// One or more cache directory roots on local NVMe.
     pub cache_dirs: Vec<PathBuf>,
+    /// Clear incompatible local cache state during startup. Defaults to true.
+    pub reset_incompatible_cache: bool,
     /// Total cache capacity in bytes across all cache dirs.
     pub capacity_bytes: u64,
     /// Target packed segment size, including its index.
@@ -600,6 +602,7 @@ impl Default for WorkerConfig {
             heartbeat_interval_ms: 5_000,
             block_size: 256 << 20,
             cache_dirs: vec![PathBuf::from("/var/cache/talon")],
+            reset_incompatible_cache: true,
             capacity_bytes: 64 << 30,
             small_object_segment_bytes: 67108864,
             small_object_threshold_bytes: 0,
@@ -697,6 +700,8 @@ pub struct WorkerConfigPatch {
     pub block_size: Option<u32>,
     /// Override for [`WorkerConfig::cache_dirs`].
     pub cache_dirs: Option<Vec<PathBuf>>,
+    /// Override for [`WorkerConfig::reset_incompatible_cache`].
+    pub reset_incompatible_cache: Option<bool>,
     /// Override for [`WorkerConfig::capacity_bytes`].
     pub capacity_bytes: Option<u64>,
     pub small_object_segment_bytes: Option<u64>,
@@ -835,6 +840,9 @@ impl Patch for WorkerConfigPatch {
             heartbeat_interval_ms: self.heartbeat_interval_ms.or(base.heartbeat_interval_ms),
             block_size: self.block_size.or(base.block_size),
             cache_dirs: self.cache_dirs.or(base.cache_dirs),
+            reset_incompatible_cache: self
+                .reset_incompatible_cache
+                .or(base.reset_incompatible_cache),
             capacity_bytes: self.capacity_bytes.or(base.capacity_bytes),
             small_object_segment_bytes: self
                 .small_object_segment_bytes
@@ -1079,6 +1087,14 @@ pub const WORKER_ENV_SCHEMA: &[ConfigVar] = &[
         cli: false,
         secret: false,
         help: "Colon-separated cache directories.",
+    },
+    ConfigVar {
+        env: "TALON_WORKER_RESET_INCOMPATIBLE_CACHE",
+        key: "reset_incompatible_cache",
+        default: Some("true"),
+        cli: true,
+        secret: false,
+        help: "On incompatible local identity, cache geometry, layout, or metadata format, delete all worker data and metadata in the first cache directory and start empty. Invalid persisted metadata also triggers reset. Compatible caches are retained. Keeps the directory lock and filesystem lost+found directory; does not change coordinator membership or origin data. Lock, permission, capacity and ordinary I/O failures still abort startup. Interrupted resets require this option to finish. Destructive; enabled by default. Set false to reject incompatible local state without clearing it.",
     },
     ConfigVar {
         env: "TALON_WORKER_CAPACITY_BYTES",
@@ -1356,6 +1372,7 @@ pub(crate) mod worker_env {
     pub const HEARTBEAT_INTERVAL_MS: &str = "TALON_WORKER_HEARTBEAT_INTERVAL_MS";
     pub const BLOCK_SIZE: &str = "TALON_WORKER_BLOCK_SIZE";
     pub const CACHE_DIRS: &str = "TALON_WORKER_CACHE_DIRS";
+    pub const RESET_INCOMPATIBLE_CACHE: &str = "TALON_WORKER_RESET_INCOMPATIBLE_CACHE";
     pub const WHOLE_FD_CACHE_CAPACITY: &str = "TALON_WORKER_WHOLE_FD_CACHE_CAPACITY";
     pub const PAGE_FD_CACHE_CAPACITY: &str = "TALON_WORKER_PAGE_FD_CACHE_CAPACITY";
     pub const CAPACITY_BYTES: &str = "TALON_WORKER_CAPACITY_BYTES";
@@ -1507,6 +1524,9 @@ impl WorkerConfigPatch {
                 .transpose()?,
             cache_dirs: get(worker_env::CACHE_DIRS)
                 .map(|v| v.split(':').map(PathBuf::from).collect()),
+            reset_incompatible_cache: get(worker_env::RESET_INCOMPATIBLE_CACHE)
+                .map(|v| parse_bool(v, worker_env::RESET_INCOMPATIBLE_CACHE))
+                .transpose()?,
             capacity_bytes: get(worker_env::CAPACITY_BYTES)
                 .map(|v| parse_u64(v, worker_env::CAPACITY_BYTES))
                 .transpose()?,
@@ -1737,6 +1757,9 @@ impl WorkerConfig {
                 .unwrap_or(d.heartbeat_interval_ms),
             block_size: merged.block_size.unwrap_or(d.block_size),
             cache_dirs: merged.cache_dirs.unwrap_or(d.cache_dirs),
+            reset_incompatible_cache: merged
+                .reset_incompatible_cache
+                .unwrap_or(d.reset_incompatible_cache),
             capacity_bytes: merged.capacity_bytes.unwrap_or(d.capacity_bytes),
             small_object_segment_bytes: merged
                 .small_object_segment_bytes
@@ -2514,6 +2537,44 @@ mod tests {
         );
         let patch = WorkerConfigPatch::from_toml("ownership_gc_replicas = 0").unwrap();
         assert!(WorkerConfig::resolve(patch, Default::default(), Default::default()).is_err());
+    }
+
+    #[test]
+    fn reset_incompatible_cache_defaults_on_and_respects_precedence() {
+        assert!(WorkerConfig::default().reset_incompatible_cache);
+        assert!(
+            WorkerConfig::resolve(Default::default(), Default::default(), Default::default())
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        let file = WorkerConfigPatch::from_toml("reset_incompatible_cache = false").unwrap();
+        assert!(
+            !WorkerConfig::resolve(file.clone(), Default::default(), Default::default())
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        let env = WorkerConfigPatch::from_env_with(|key| {
+            (key == worker_env::RESET_INCOMPATIBLE_CACHE).then(|| "true".to_owned())
+        })
+        .unwrap();
+        assert!(
+            WorkerConfig::resolve(file.clone(), env.clone(), Default::default())
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        let cli = WorkerConfigPatch {
+            reset_incompatible_cache: Some(false),
+            ..Default::default()
+        };
+        assert!(
+            !WorkerConfig::resolve(file, env, cli)
+                .unwrap()
+                .reset_incompatible_cache
+        );
+        assert!(WorkerConfigPatch::from_env_with(|key| {
+            (key == worker_env::RESET_INCOMPATIBLE_CACHE).then(|| "invalid".to_owned())
+        })
+        .is_err());
     }
 
     #[test]

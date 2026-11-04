@@ -106,7 +106,9 @@ impl Catalog {
             .query_blocking(move |state| match state.stores.get(&path) {
                 None => Ok(false),
                 Some(store) if store.page_size == page_size => Ok(true),
-                Some(_) => Err(std::io::Error::other("catalog page geometry changed")),
+                Some(_) => Err(crate::cache_reset::incompatible(
+                    "catalog page geometry changed",
+                )),
             })?)
     }
 

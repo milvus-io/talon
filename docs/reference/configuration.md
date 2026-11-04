@@ -362,6 +362,14 @@ Colon-separated cache directories.
 - **Default:** `/var/cache/talon`
 - **CLI flag:** not settable via CLI (config file or environment only)
 
+### `reset_incompatible_cache`
+
+On incompatible local identity, cache geometry, layout, or metadata format, delete all worker data and metadata in the first cache directory and start empty. Invalid persisted metadata also triggers reset. Compatible caches are retained. Keeps the directory lock and filesystem lost+found directory; does not change coordinator membership or origin data. Lock, permission, capacity and ordinary I/O failures still abort startup. Interrupted resets require this option to finish. Destructive; enabled by default. Set false to reject incompatible local state without clearing it.
+
+- **Environment variable:** `TALON_WORKER_RESET_INCOMPATIBLE_CACHE`
+- **Default:** `true`
+- **CLI flag:** `--reset-incompatible-cache`
+
 ### `capacity_bytes`
 
 Worker cache capacity (bytes). Startup fails if this exceeds the total filesystem capacity of the first cache directory (the active cache root), or if capacity cannot be queried. This checks total size, not free space or per-directory quotas; leave headroom for metadata and other files.

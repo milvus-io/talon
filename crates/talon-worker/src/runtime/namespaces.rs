@@ -1,5 +1,6 @@
 //! Cache namespaces own their cache state; placement continues to hash BlockId.
 use super::*;
+use crate::cache_reset::incompatible;
 use crate::fd_cache::FdCache;
 use crate::page_access_store::CacheRootLock;
 use std::{collections::BTreeMap, path::Path, sync::RwLock};
@@ -82,11 +83,18 @@ impl NamespaceRuntimes {
         let identity_path = root.join("cache_geometry.json");
         let geometry = (config.block_size, config.l2_page_size_bytes);
         match std::fs::read(&identity_path) {
-            Ok(bytes) => anyhow::ensure!(
-                serde_json::from_slice::<(u32, u64)>(&bytes)? == geometry,
-                "cache geometry changed for namespace {}; use a new empty namespace cache directory",
-                namespace.effective_name()
-            ),
+            Ok(bytes) => {
+                let stored = serde_json::from_slice::<(u32, u64)>(&bytes).map_err(|error| {
+                    incompatible(format!(
+                        "invalid cache geometry at {}: {error}",
+                        identity_path.display()
+                    ))
+                })?;
+                anyhow::ensure!(stored == geometry, incompatible(format!(
+                    "cache geometry changed for namespace {}; use a new empty namespace cache directory",
+                    namespace.effective_name()
+                )));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 use std::io::Write;
                 let temp = root.join(".cache_geometry.tmp");
@@ -125,8 +133,10 @@ impl NamespaceRuntimes {
             let path = catalog.store_path(&root.join("paged"))?;
             let registered = catalog.registered(&path, config.l2_page_size_bytes as u32)?;
             if !registered {
-                anyhow::ensure!(!root.join("paged").try_exists()?,
-                    "paged cache has no journal; use a new empty cache directory (legacy migration is not supported)");
+                anyhow::ensure!(
+                    !root.join("paged").try_exists()?,
+                    incompatible("paged cache has no journal; use a new empty cache directory (legacy migration is not supported)")
+                );
                 catalog.register(&path, config.l2_page_size_bytes as u32)?;
             }
             checked_dir(&root.join("paged"))?;
@@ -276,8 +286,10 @@ fn checked_dir(path: &Path) -> anyhow::Result<()> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => anyhow::ensure!(
             meta.is_dir() && !meta.file_type().is_symlink(),
-            "namespace cache path must be a real directory: {}",
-            path.display()
+            incompatible(format!(
+                "namespace cache path must be a real directory: {}",
+                path.display()
+            ))
         ),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             std::fs::create_dir(path)?;
@@ -290,6 +302,14 @@ fn checked_dir(path: &Path) -> anyhow::Result<()> {
         Err(error) => return Err(error.into()),
     }
     Ok(())
+}
+
+fn existing_directory(path: &Path) -> std::io::Result<bool> {
+    match std::fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_dir()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
 }
 
 impl WorkerRuntime {
@@ -343,7 +363,9 @@ impl WorkerRuntime {
                 .root()
                 .join(crate::catalog::DIRECTORY)
                 .try_exists()?,
-            "root-level cache catalog is unsupported; use a new empty cache directory"
+            incompatible(
+                "root-level cache catalog is unsupported; use a new empty cache directory"
+            )
         );
         tracing::info!(
             native = journal_service.is_native(),
@@ -386,16 +408,28 @@ impl WorkerRuntime {
                 let name = entry
                     .file_name()
                     .into_string()
-                    .map_err(|_| anyhow::anyhow!("invalid namespace directory"))?;
+                    .map_err(|_| incompatible("invalid namespace directory"))?;
                 // Never silently strand an old flat cache or adopt it as a namespace.
-                anyhow::ensure!(entry.path().join("shared").is_dir() || entry.path().join("scopes").is_dir() || (entry.file_type()?.is_dir() && std::fs::read_dir(entry.path())?.next().is_none()), "legacy/unrecognized cache directory {}; configure a new cache root for namespace storage", entry.path().display());
+                let recognized = existing_directory(&entry.path().join("shared"))?
+                    || existing_directory(&entry.path().join("scopes"))?
+                    || (entry.file_type()?.is_dir()
+                        && std::fs::read_dir(entry.path())?
+                            .next()
+                            .transpose()?
+                            .is_none());
+                anyhow::ensure!(recognized, incompatible(format!(
+                    "legacy/unrecognized cache directory {}; configure a new cache root for namespace storage",
+                    entry.path().display()
+                )));
                 names.insert(name);
             }
         }
         anyhow::ensure!(names.len() <= MAX_CACHE_RUNTIMES, "too many namespaces");
         for name in names {
             let namespace = NamespaceId::named(&name);
-            namespace.validate()?;
+            namespace
+                .validate()
+                .map_err(|error| incompatible(error.to_string()))?;
             let namespace_root = registry.journal_service.root().join(&name);
             checked_dir(&namespace_root)?;
             let has_shared = match std::fs::symlink_metadata(namespace_root.join("shared")) {
@@ -433,8 +467,9 @@ impl WorkerRuntime {
                     let scope = entry
                         .file_name()
                         .into_string()
-                        .map_err(|_| anyhow::anyhow!("invalid credential scope directory"))?
-                        .parse()?;
+                        .map_err(|_| incompatible("invalid credential scope directory"))?
+                        .parse::<talon_core::backend::AccessScope>()
+                        .map_err(|error| incompatible(error.to_string()))?;
                     anyhow::ensure!(
                         registry.workers.read().unwrap().len() < MAX_CACHE_RUNTIMES,
                         "too many cache runtimes"
@@ -730,6 +765,161 @@ mod tests {
             page_access_checkpoint_interval_minutes: 1,
             ..Default::default()
         }
+    }
+
+    async fn open_with_reset(
+        root: &Path,
+        cfg: &WorkerConfig,
+        enabled: bool,
+    ) -> anyhow::Result<WorkerRuntime> {
+        use crate::cache_reset::{classify_open_error, open_or_reset};
+        let lock = Arc::new(CacheRootLock::acquire(root)?);
+        open_or_reset(lock, enabled, |lock| async move {
+            lock.load_identity(
+                &cfg.cluster_id,
+                cfg.node_id.as_deref(),
+                cfg.block_size,
+                cfg.l2_page_size_bytes,
+            )
+            .map_err(classify_open_error)?;
+            WorkerRuntime::open_namespaces(
+                cfg,
+                lock,
+                Arc::new(Origin::default()),
+                WorkerMetrics::new(0),
+            )
+            .map_err(classify_open_error)
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn incompatible_cache_reset_covers_layout_geometry_and_journal_formats() {
+        for case in [
+            "namespace-geometry",
+            "small-routing",
+            "flat-layout",
+            "root-catalog",
+            "whole-without-journal",
+            "paged-without-journal",
+            "journal-version",
+            "small-journal-version",
+            "legacy-small",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut cfg = config();
+            cfg.small_object_threshold_bytes = 8;
+            cfg.small_object_segment_bytes = 128 << 10;
+            cfg.namespaces.insert("late".into(), Default::default());
+            let root = Arc::new(open_with_reset(dir.path(), &cfg, false).await.unwrap());
+            root.commit_fetched_page(&block(16), PageIndex(0), 16, Bytes::from_static(b"data"))
+                .await
+                .unwrap();
+            let scope = format!("v1-{}", "a".repeat(64));
+            // Persist a credential scope too, so a reset must remove more than shared data.
+            let scoped = root
+                .registry()
+                .unwrap()
+                .resolve(
+                    &NamespaceId::named("late"),
+                    Some(scope.parse().unwrap()),
+                    Arc::new(Origin::default()),
+                )
+                .await
+                .unwrap();
+            drop(scoped);
+            drop(root);
+            talon_journal::JournalService::wait_for_retiring(dir.path()).unwrap();
+            let identity = std::fs::read(dir.path().join("worker_identity")).unwrap();
+            let shared = dir.path().join("late/shared");
+            match case {
+                "namespace-geometry" => {
+                    std::fs::write(shared.join("cache_geometry.json"), b"[16,8]").unwrap()
+                }
+                "small-routing" => {
+                    std::fs::write(shared.join("small-routing.json"), b"[2,8]").unwrap()
+                }
+                "flat-layout" => std::fs::create_dir_all(dir.path().join("ab/old")).unwrap(),
+                "root-catalog" => {
+                    std::fs::create_dir(dir.path().join(crate::catalog::DIRECTORY)).unwrap()
+                }
+                "whole-without-journal" | "paged-without-journal" => {
+                    std::fs::remove_dir_all(shared.join(crate::catalog::DIRECTORY)).unwrap();
+                    if case == "paged-without-journal" {
+                        std::fs::remove_dir_all(shared.join("whole")).unwrap();
+                    }
+                }
+                "journal-version" => {
+                    std::fs::write(shared.join(".paged-catalog/CURRENT"), b"future version")
+                        .unwrap()
+                }
+                "small-journal-version" => {
+                    std::fs::write(shared.join("small/metadata/CURRENT"), b"future version")
+                        .unwrap()
+                }
+                "legacy-small" => std::fs::write(shared.join("small/MANIFEST"), b"legacy").unwrap(),
+                _ => unreachable!(),
+            }
+            let sentinel = dir.path().join(".residual-metadata");
+            std::fs::write(&sentinel, b"old").unwrap();
+            let error = open_with_reset(dir.path(), &cfg, false)
+                .await
+                .err()
+                .unwrap();
+            assert!(
+                error.is::<crate::cache_reset::IncompatibleCache>(),
+                "{case}: {error:#}"
+            );
+            assert!(sentinel.exists(), "{case}");
+            let worker = Arc::new(
+                open_with_reset(dir.path(), &cfg, true)
+                    .await
+                    .unwrap_or_else(|error| panic!("{case}: {error:#}")),
+            );
+            assert!(!sentinel.exists(), "{case}");
+            assert!(!dir.path().join("late/scopes").exists(), "{case}");
+            assert!(
+                worker
+                    .namespace_runtimes()
+                    .iter()
+                    .all(|worker| worker.index.is_empty()),
+                "{case}"
+            );
+            assert_ne!(
+                std::fs::read(dir.path().join("worker_identity")).unwrap(),
+                identity,
+                "{case}"
+            );
+            assert!(CacheRootLock::acquire(dir.path()).is_err(), "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn compatible_cache_reset_mode_preserves_identity_and_cached_payload() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = config();
+        let root = open_with_reset(dir.path(), &cfg, false).await.unwrap();
+        root.commit_fetched_page(&block(16), PageIndex(0), 16, Bytes::from_static(b"data"))
+            .await
+            .unwrap();
+        drop(root);
+        let identity = std::fs::read(dir.path().join("worker_identity")).unwrap();
+        let reopened = open_with_reset(dir.path(), &cfg, true).await.unwrap();
+        assert_eq!(
+            std::fs::read(dir.path().join("worker_identity")).unwrap(),
+            identity
+        );
+        assert_eq!(
+            reopened
+                .paged
+                .as_ref()
+                .unwrap()
+                .get_page_bytes(&block(16), PageIndex(0), 4)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"data"
+        );
     }
 
     #[tokio::test]

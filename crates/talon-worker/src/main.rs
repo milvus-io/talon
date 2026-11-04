@@ -137,6 +137,9 @@ struct Args {
     /// Import a stable node identity; thereafter must match worker_identity.
     #[arg(long)]
     node_id: Option<String>,
+    /// Delete incompatible local cache data and metadata, then start empty.
+    #[arg(long, num_args = 0..=1, default_missing_value = "true", require_equals = true)]
+    reset_incompatible_cache: Option<bool>,
     /// Heartbeat interval in milliseconds; detected failures retain readiness
     /// for at most three intervals since the last accepted heartbeat, capped at 15s.
     #[arg(long)]
@@ -168,6 +171,7 @@ impl Args {
             control_listen: self.control_listen,
             cluster_id: self.cluster_id,
             node_id: self.node_id,
+            reset_incompatible_cache: self.reset_incompatible_cache,
             control_tls: None,
             namespace_policy_path: None,
             heartbeat_interval_ms: self.heartbeat_interval_ms,
@@ -522,7 +526,7 @@ async fn run() -> anyhow::Result<()> {
     };
     let env = WorkerConfigPatch::from_env()?;
     let cli = args.into_patch();
-    let mut cfg = WorkerConfig::resolve(file, env, cli)?;
+    let cfg = WorkerConfig::resolve(file, env, cli)?;
 
     tracing::info!(
         listen = %cfg.listen,
@@ -557,12 +561,26 @@ async fn run() -> anyhow::Result<()> {
     let cache_root_lock = Arc::new(talon_worker::page_access_store::CacheRootLock::acquire(
         &root,
     )?);
-    let identity = cache_root_lock.load_identity(
-        &cfg.cluster_id,
-        cfg.node_id.as_deref(),
-        cfg.block_size,
-        cfg.l2_page_size_bytes,
-    )?;
+    talon_worker::cache_reset::open_or_reset(
+        cache_root_lock,
+        cfg.reset_incompatible_cache,
+        |lock| run_worker(cfg.clone(), lock),
+    )
+    .await
+}
+
+async fn run_worker(
+    mut cfg: WorkerConfig,
+    cache_root_lock: Arc<talon_worker::page_access_store::CacheRootLock>,
+) -> anyhow::Result<()> {
+    let identity = cache_root_lock
+        .load_identity(
+            &cfg.cluster_id,
+            cfg.node_id.as_deref(),
+            cfg.block_size,
+            cfg.l2_page_size_bytes,
+        )
+        .map_err(talon_worker::cache_reset::classify_open_error)?;
     cfg.node_id = Some(identity.worker_id);
     let index = Arc::new(BlockIndex::new());
     let inflight = Arc::new(InFlightLoads::new());
@@ -879,7 +897,8 @@ async fn run() -> anyhow::Result<()> {
         backend,
         observability.metrics().clone(),
         origin_uring,
-    )?;
+    )
+    .map_err(talon_worker::cache_reset::classify_open_error)?;
     let worker = Arc::new(runtime);
     observability.attach_namespace_runtime(&worker);
     tracing::info!(
@@ -1440,6 +1459,27 @@ fn handle_revision_update(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn reset_incompatible_cache_cli_preserves_explicit_false() {
+        use clap::Parser;
+        for (args, expected) in [
+            (vec!["worker"], None),
+            (vec!["worker", "--reset-incompatible-cache"], Some(true)),
+            (
+                vec!["worker", "--reset-incompatible-cache=false"],
+                Some(false),
+            ),
+        ] {
+            assert_eq!(
+                super::Args::try_parse_from(args)
+                    .unwrap()
+                    .into_patch()
+                    .reset_incompatible_cache,
+                expected
+            );
+        }
+    }
+
     #[test]
     fn native_origin_requires_native_data_plane() {
         assert!(super::validate_origin_runtime(false, true).is_ok());

@@ -5,7 +5,7 @@ use std::io::{Read, Write};
 use anyhow::{ensure, Context};
 use serde::{Deserialize, Serialize};
 
-use crate::page_access_store::CacheRootLock;
+use crate::{cache_reset::incompatible, page_access_store::CacheRootLock};
 
 const IDENTITY_FILE: &str = "worker_identity";
 
@@ -39,6 +39,7 @@ impl CacheRootLock {
             configured_id.map_or(true, |id| !id.trim().is_empty()),
             "identity worker_id must not be empty"
         );
+        self.check_reset_complete()?;
         let path = self.root.join(IDENTITY_FILE);
         let identity = match File::open(&path) {
             Ok(file) => {
@@ -46,10 +47,13 @@ impl CacheRootLock {
                 file.take(16 * 1024 + 1).read_to_end(&mut bytes)?;
                 ensure!(
                     bytes.len() <= 16 * 1024,
-                    "worker identity exceeds size limit"
+                    incompatible("worker identity exceeds size limit")
                 );
-                serde_json::from_slice::<WorkerIdentity>(&bytes)
-                    .context("corrupt worker_identity; refusing to replace directory identity")?
+                serde_json::from_slice::<WorkerIdentity>(&bytes).map_err(|error| {
+                    incompatible(format!(
+                        "corrupt worker_identity; refusing to replace directory identity: {error}"
+                    ))
+                })?
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 let has_cache =
@@ -70,7 +74,9 @@ impl CacheRootLock {
                     })?;
                 ensure!(
                     !has_cache || configured_id.is_some(),
-                    "existing cache has no worker_identity; explicitly import its old node_id"
+                    incompatible(
+                        "existing cache has no worker_identity; explicitly import its old node_id"
+                    )
                 );
                 let worker_id = match configured_id {
                     Some(id) => id.to_owned(),
@@ -102,24 +108,26 @@ impl CacheRootLock {
         };
         ensure!(
             identity.format_version == 1,
-            "unsupported worker identity format {}",
-            identity.format_version
+            incompatible(format!(
+                "unsupported worker identity format {}",
+                identity.format_version
+            ))
         );
         ensure!(
             identity.cluster_id == cluster,
-            "worker identity belongs to a different cluster"
+            incompatible("worker identity belongs to a different cluster")
         );
         ensure!(
             !identity.worker_id.trim().is_empty(),
-            "corrupt worker identity: empty worker_id"
+            incompatible("corrupt worker identity: empty worker_id")
         );
         ensure!(
             configured_id.map_or(true, |id| id == identity.worker_id),
-            "configured node_id conflicts with directory identity"
+            incompatible("configured node_id conflicts with directory identity")
         );
         ensure!(
             identity.block_size == block_size && identity.page_size == page_size,
-            "cache geometry conflicts with directory identity"
+            incompatible("cache geometry conflicts with directory identity")
         );
         Ok(identity)
     }
